@@ -70,10 +70,10 @@ cats endpoint ls CAT</code></pre>
 <p>Every Cat already has a <code>web</code> Endpoint for port 8080. <code>cats expose CAT PORT</code> reconfigures it; use another <code>--name</code> to add a URL.</p>
 
 <h2 id="operation-commands">Operation commands</h2>
-<pre><code>cats operation ls
-cats operation get ID
+<pre><code>cats operation get ID
 cats operation wait ID</code></pre>
-<p>Mutations normally wait up to 120 seconds. With <code>--no-wait</code>, save the returned ID and use <code>operation wait</code> or <code>operation get</code>. Safe retries should use the same resource intent; the API attaches idempotency keys to mutations.</p>
+<p>Cat create returns an accepted Operation ID. <code>operation get</code> reads that exact Operation in the selected Workspace; <code>operation wait</code> polls it for up to 120 seconds and exits unsuccessfully for <code>failed</code> or <code>superseded</code>. Both commands use the strict Runtime Reconciliation decoder.</p>
+<p><code>operation ls</code> remains unavailable and sends no HTTP request: the runtime authority deliberately exposes no unbounded Operation list. The old global Operation URL is retired.</p>
 
 <h2 id="automation">Automation guidance</h2>
 <ul>

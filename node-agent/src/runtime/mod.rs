@@ -17,8 +17,8 @@
 //! is itself idempotent at the process level.
 
 /// Crate-visible, unlike its sibling modules: the startup path that scans the
-/// local inventory before registering with the control plane (ADR-0028 §5)
-/// lives outside `runtime`.
+/// V1 local inventory before registering with the control plane lives outside
+/// `runtime`.
 pub(crate) mod adopt;
 mod blockd_control;
 mod fake;
@@ -26,6 +26,7 @@ mod ledger;
 mod lifecycle;
 mod metering;
 mod proxy;
+pub mod reconciliation;
 mod residue;
 mod supervisor;
 
@@ -54,6 +55,7 @@ use crate::admission::{resume_commitment_bytes, WakeAdmission, WakeBudget, WakeL
 use crate::ch::{self, BlockPath, ChConfig, ChRuntime, GUEST_VSOCK_PORT};
 use crate::guest_client::{GuestClient, GuestShell};
 use crate::proc::ProcHandle;
+use crate::state_directory::StateDirectory;
 
 use blockd_control::{blockd_log_path, BlockdProc};
 use ledger::Ledger;
@@ -86,7 +88,7 @@ pub enum VmmMode {
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: String,
-    pub state_dir: PathBuf,
+    pub state_dir: StateDirectory,
     pub blockd_bin: PathBuf,
     pub guest_agent_bin: PathBuf,
     /// Opaque selections passed to blockd without interpreting provider data.
@@ -118,7 +120,7 @@ pub(crate) fn real_child_node_config(root: &Path, node_id: &str) -> NodeConfig {
     let parts = cats_test_support::NodeConfigBuilder::new(root, node_id).into_parts();
     NodeConfig {
         node_id: parts.node_id,
-        state_dir: parts.state_dir,
+        state_dir: parts.state_dir.into(),
         blockd_bin: parts.blockd_bin,
         guest_agent_bin: parts.guest_agent_bin,
         metadata_store: parts.metadata_store,
@@ -140,7 +142,7 @@ pub(crate) fn stub_node_config(state_dir: &Path, vmm: VmmMode) -> NodeConfig {
     let adapter = AdapterSelection::new("unused", cats_storage::AdapterConfig::default());
     NodeConfig {
         node_id: "node-a".to_string(),
-        state_dir: state_dir.to_path_buf(),
+        state_dir: state_dir.to_path_buf().into(),
         blockd_bin: PathBuf::from("unused-blockd"),
         guest_agent_bin: PathBuf::from("unused-guest-agent"),
         metadata_store: adapter.clone(),
@@ -329,8 +331,8 @@ const VOLUME_DIR_PREFIX: &str = "vol-";
 /// The `--data-dir` the blockd serving `disk_id` for this Cat was given.
 ///
 /// Spawn, teardown, the runtime ledger and re-adoption all name this directory,
-/// and re-adoption only accepts a record whose recorded `data_dir` still exists
-/// (ADR-0028 §3 step 4). Four independent spellings of the same `format!` would
+/// and V1 re-adoption only accepts a record whose recorded `data_dir` still
+/// exists. Four independent spellings of the same `format!` would
 /// make that check silently vacuous the first time one of them drifted, so
 /// there is exactly one.
 fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
@@ -340,7 +342,7 @@ fn volume_data_dir(cat_dir: &Path, disk_id: &str) -> PathBuf {
 /// Where a FakeVmm Cat's Guest state is saved when it goes Warm.
 ///
 /// Written by `warm_cat`, required by `restore_cat` before it will restore, and
-/// checked by re-adoption's Warm proof (ADR-0028 §3) — one spelling, for the
+/// checked by V1 re-adoption's Warm proof — one spelling, for the
 /// same reason [`volume_data_dir`] has one.
 fn warm_state_file(cat_dir: &Path) -> PathBuf {
     cat_dir.join("warm-state.json")
@@ -445,8 +447,8 @@ pub struct NodeRuntime {
     /// dropping node-wide serialization where no node-global resource is used.
     cat_ops: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cats: Mutex<HashMap<String, CatRuntime>>,
-    /// On-disk mirror of `cats`, rewritten once per job after the final state
-    /// has settled (ADR-0028 §1). Local recovery aid only: it never grants a
+    /// V1 on-disk mirror of `cats`, rewritten once per job after the final state
+    /// has settled. Local recovery aid only: it never grants a
     /// storage write right and is never consulted for authority.
     ledger: Ledger,
     journal: Mutex<HashMap<String, NodeJobResult>>,
@@ -537,6 +539,7 @@ impl Drop for StopPermit<'_> {
 
 impl NodeRuntime {
     pub fn new(cfg: NodeConfig) -> Result<Self> {
+        cfg.state_dir.ensure_child_inheritance()?;
         let cfg_wake_budget = cfg.wake_budget;
         let ledger = Ledger::open(&cfg.state_dir.join("runtime-ledger"))?;
         Ok(Self {

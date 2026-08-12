@@ -66,10 +66,8 @@ variable "deploy_instances" {
     association is removed, not its software.
 
     Never subset an apply that changes worker_runtime_secret_data: this
-    association is the only path that writes the shared token onto a host and
-    the control plane accepts exactly one, so an omitted worker keeps the old
-    token and is rejected the moment the control plane picks up the new one.
-    Credential rotation deploys every worker in one drained window.
+    association is the only path that removes a retired secret or compatibility
+    value from an existing host. Roll that cleanup through every drained worker.
   EOT
   type        = set(string)
   default     = null
@@ -91,7 +89,7 @@ variable "instance_role_name" {
 }
 
 variable "worker_runtime_secret_data" {
-  description = "Runtime credentials overlaid onto the existing worker environment file through Secrets Manager."
+  description = "Optional compatibility values overlaid onto worker.env. Signed workers receive no shared Control bearer."
   type        = map(string)
   sensitive   = true
 
@@ -102,16 +100,15 @@ variable "worker_runtime_secret_data" {
     condition = (
       length(setsubtract(
         toset(keys(var.worker_runtime_secret_data)),
-        toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"])
+        toset(["CATS_POSTGRES_URL"])
       )) == 0 &&
-      try(length(trimspace(var.worker_runtime_secret_data["CATS_AUTH_TOKEN"])) > 0, false) &&
       alltrue([
         for value in values(var.worker_runtime_secret_data) :
         length(trimspace(value)) > 0 &&
         !strcontains(value, "\n") && !strcontains(value, "\r")
       ])
     )
-    error_message = "worker_runtime_secret_data must contain a non-empty single-line CATS_AUTH_TOKEN, and nothing but that and an optional legacy CATS_POSTGRES_URL."
+    error_message = "worker_runtime_secret_data may contain only a non-empty single-line legacy CATS_POSTGRES_URL; signed workers must not receive CATS_AUTH_TOKEN."
   }
 }
 
@@ -182,7 +179,7 @@ variable "worker_managed_environment" {
         "CATS_NODE_ADVERTISE_URL",
       ]),
     )) == 0
-    error_message = "Secrets go through worker_runtime_secret_data; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker and this map is rewritten fleet-wide on every deployment."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker and this map is rewritten fleet-wide on every deployment."
   }
 
   validation {
@@ -227,9 +224,8 @@ variable "worker_base_environment" {
     worker.env yet -- control plane and gateway URLs, region, ChunkStore
     bucket, guest network CIDR. An existing file is never rewritten, so
     operator edits survive. Secrets belong in worker_runtime_secret_data;
-    CATS_METERING_CGROUP_ROOT is discovered on the host; node identity
-    (CATS_NODE_ID, CATS_NODE_ADVERTISE_URL) is derived per worker at seed time
-    and must not be set here.
+    CATS_METERING_CGROUP_ROOT is discovered on the host; Node identity is a
+    provisioner-owned artifact and must not be set here.
   EOT
   type        = map(string)
   default     = {}
@@ -244,7 +240,7 @@ variable "worker_base_environment" {
       toset(keys(var.worker_base_environment)),
       toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]),
     )) == 0
-    error_message = "Secrets must go through worker_runtime_secret_data, not worker_base_environment."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
   }
 
   # Everything in this map reaches every fresh host identically, and a second
@@ -254,6 +250,6 @@ variable "worker_base_environment" {
       toset(keys(var.worker_base_environment)),
       toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
     )) == 0
-    error_message = "Node identity is per worker: CATS_NODE_ID comes from the instances key and CATS_NODE_ADVERTISE_URL from the host's IMDS at seed time."
+    error_message = "Node identity is provisioner-owned artifact data; environment and IMDS values are forbidden."
   }
 }

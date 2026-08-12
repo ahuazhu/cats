@@ -44,6 +44,8 @@ use vmm_sys_util::event::{
     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
 
+use cats_api::runtime_reconciliation::{Id, GUEST_DEVICE_SERIAL_MAX_BYTES_V1};
+
 use crate::engine::{ChunkEngine, EngineError};
 
 /// virtio-blk works in 512-byte sectors regardless of the advertised block size.
@@ -102,10 +104,41 @@ pub enum VhostUserBlkError {
     BadQueueCount(usize),
     #[error("vhost-user queue size must be a power of two in 1..=32768, got {0}")]
     BadQueueSize(u16),
+    #[error("vhost-user Guest device serial must be a canonical Id of 1..=20 UTF-8 bytes")]
+    BadGuestDeviceSerial,
     #[error("bind vhost-user socket {path}: {message}")]
     Bind { path: String, message: String },
     #[error("vhost-user daemon: {0}")]
     Daemon(String),
+}
+
+/// Exact Cloud Hypervisor V53 virtio-blk serial returned by GET_ID. The
+/// zero-padded 20-byte transport representation is derived once from the
+/// shared GuestDeviceIdentity value; it is never reconstructed from volume id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhostUserDeviceId([u8; VIRTIO_BLK_ID_BYTES as usize]);
+
+impl VhostUserDeviceId {
+    pub fn from_guest_device_serial(serial: &Id) -> Result<Self, VhostUserBlkError> {
+        let bytes = serial.as_str().as_bytes();
+        if bytes.is_empty() || bytes.len() > GUEST_DEVICE_SERIAL_MAX_BYTES_V1 {
+            return Err(VhostUserBlkError::BadGuestDeviceSerial);
+        }
+        let mut padded = [0; VIRTIO_BLK_ID_BYTES as usize];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self(padded))
+    }
+
+    fn test_default() -> Self {
+        let mut padded = [0; VIRTIO_BLK_ID_BYTES as usize];
+        let value = b"cats-vhost-test";
+        padded[..value.len()].copy_from_slice(value);
+        Self(padded)
+    }
+
+    fn padded_bytes(self) -> [u8; VIRTIO_BLK_ID_BYTES as usize] {
+        self.0
+    }
 }
 
 /// Frontend tunables. Multi-queue is the reason this frontend exists, but the
@@ -115,6 +148,7 @@ pub enum VhostUserBlkError {
 pub struct VhostUserOptions {
     pub num_queues: usize,
     pub queue_size: u16,
+    pub guest_device_serial: VhostUserDeviceId,
 }
 
 impl Default for VhostUserOptions {
@@ -122,6 +156,7 @@ impl Default for VhostUserOptions {
         Self {
             num_queues: 1,
             queue_size: DEFAULT_QUEUE_SIZE,
+            guest_device_serial: VhostUserDeviceId::test_default(),
         }
     }
 }
@@ -153,9 +188,23 @@ pub fn serve_unix(
 /// Bind the vhost-user socket without accepting yet. Callers that must publish
 /// readiness before a VMM starts (the node agent) bind first, then serve.
 pub fn bind(socket: &Path, options: VhostUserOptions) -> Result<Listener, VhostUserBlkError> {
+    bind_with_replacement(socket, options, true)
+}
+
+/// Bind only if the exact socket name is absent. Signed Runtime reconciliation
+/// uses this after a full inventory proved absence; it must never unlink an
+/// unverified process merely because the path collides.
+pub fn bind_new(socket: &Path, options: VhostUserOptions) -> Result<Listener, VhostUserBlkError> {
+    bind_with_replacement(socket, options, false)
+}
+
+fn bind_with_replacement(
+    socket: &Path,
+    options: VhostUserOptions,
+    replace_existing: bool,
+) -> Result<Listener, VhostUserBlkError> {
     options.validate()?;
-    // `Listener::new(.., true)` unlinks a stale socket left by a killed backend.
-    Listener::new(socket, true).map_err(|e| VhostUserBlkError::Bind {
+    Listener::new(socket, replace_existing).map_err(|e| VhostUserBlkError::Bind {
         path: socket.display().to_string(),
         message: e.to_string(),
     })
@@ -198,7 +247,7 @@ struct Inner {
     mem: RwLock<Option<GuestMemoryAtomic<GuestMem>>>,
     event_idx: AtomicBool,
     /// Reported by VIRTIO_BLK_T_GET_ID; `blkid`-style tools show it as the
-    /// device serial. The volume id is the stable Cats identity.
+    /// device serial. This is the exact sealed GuestDeviceIdentity serial.
     device_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
 }
 
@@ -210,17 +259,13 @@ pub struct BlkBackend {
 
 impl BlkBackend {
     pub fn new(engine: Arc<ChunkEngine>, options: VhostUserOptions) -> Self {
-        let mut device_id = [0u8; VIRTIO_BLK_ID_BYTES as usize];
-        let volume = engine.volume_id().as_bytes();
-        let len = volume.len().min(device_id.len());
-        device_id[..len].copy_from_slice(&volume[..len]);
         Self {
             inner: Arc::new(Inner {
                 engine,
                 options,
                 mem: RwLock::new(None),
                 event_idx: AtomicBool::new(false),
-                device_id,
+                device_id: options.guest_device_serial.padded_bytes(),
             }),
         }
     }

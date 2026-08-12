@@ -15,7 +15,116 @@ SKILLS=(
 )
 
 usage() {
-  echo "usage: $0 {fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
+  echo "usage: $0 {provenance|fmt|skills|deps|check|build|clippy|test|doc|fast|full|linux}" >&2
+}
+
+prepare_native_test_process() {
+  local hard_nofile
+  local native_tool
+
+  if [[ "$(uname -s)" == Linux ]]; then
+    case ":$PATH:" in
+      *:/usr/sbin:*) ;;
+      *) export PATH="$PATH:/usr/sbin" ;;
+    esac
+    for native_tool in mkfs.ext4 debugfs e2fsck; do
+      command -v "$native_tool" >/dev/null 2>&1 || {
+        echo "Linux native tests need e2fsprogs: $native_tool is not in PATH" >&2
+        return 1
+      }
+    done
+  fi
+
+  hard_nofile="$(ulimit -Hn)" || return 1
+  ulimit -Sn "$hard_nofile" || {
+    echo "cannot raise the test process open-file limit to $hard_nofile" >&2
+    return 1
+  }
+  echo "==> test process limits (threads=4 nofile=$(ulimit -Sn))"
+}
+
+source_git() {
+  GIT_OPTIONAL_LOCKS=0 git \
+    -c safe.directory="$REPO_ROOT" \
+    -c core.hooksPath=/dev/null \
+    -c core.fsmonitor=false \
+    -C "$REPO_ROOT" \
+    "$@"
+}
+
+source_fingerprint() {
+  local head
+  local tracked
+  local untracked
+
+  head="$(source_git rev-parse HEAD)" || return 1
+  tracked="$(source_git diff --binary HEAD -- | source_git hash-object --stdin)" || return 1
+  untracked="$({
+    source_git ls-files --others --exclude-standard -z
+  } | while IFS= read -r -d '' path; do
+    printf 'untracked\0%s\0' "$path"
+    source_git hash-object -- "$path" || exit 1
+  done | source_git hash-object --stdin)" || return 1
+
+  printf '%s\0%s\0%s\n' "$head" "$tracked" "$untracked" | source_git hash-object --stdin
+}
+
+validate_source_provenance() {
+  [[ "$SOURCE_PROVENANCE_ROOT" == /* && "$SOURCE_PROVENANCE_ROOT" != *$'\n'* ]] || {
+    echo "source provenance root must be a non-empty absolute path" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_HEAD" =~ ^[0-9a-f]{40}$ || "$SOURCE_PROVENANCE_HEAD" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "source provenance head must be a lowercase Git object ID" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_DIRTY" == true || "$SOURCE_PROVENANCE_DIRTY" == false ]] || {
+    echo "source provenance dirty flag must be true or false" >&2
+    return 1
+  }
+  [[ "$SOURCE_PROVENANCE_FINGERPRINT" =~ ^[0-9a-f]{40}$ || "$SOURCE_PROVENANCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "source provenance fingerprint must be a lowercase Git object ID" >&2
+    return 1
+  }
+}
+
+load_source_provenance() {
+  local root_set="${CATS_SOURCE_PROVENANCE_ROOT+x}"
+  local head_set="${CATS_SOURCE_PROVENANCE_HEAD+x}"
+  local dirty_set="${CATS_SOURCE_PROVENANCE_DIRTY+x}"
+  local fingerprint_set="${CATS_SOURCE_PROVENANCE_FINGERPRINT+x}"
+
+  if [[ -n "$root_set$head_set$dirty_set$fingerprint_set" ]]; then
+    [[ "$root_set" == x && "$head_set" == x && "$dirty_set" == x && "$fingerprint_set" == x ]] || {
+      echo "source provenance overrides must set root, head, dirty and fingerprint together" >&2
+      return 1
+    }
+    SOURCE_PROVENANCE_ROOT="$CATS_SOURCE_PROVENANCE_ROOT"
+    SOURCE_PROVENANCE_HEAD="$CATS_SOURCE_PROVENANCE_HEAD"
+    SOURCE_PROVENANCE_DIRTY="$CATS_SOURCE_PROVENANCE_DIRTY"
+    SOURCE_PROVENANCE_FINGERPRINT="$CATS_SOURCE_PROVENANCE_FINGERPRINT"
+    validate_source_provenance
+    return
+  fi
+
+  local status
+  SOURCE_PROVENANCE_ROOT="$(source_git rev-parse --show-toplevel)" || return 1
+  SOURCE_PROVENANCE_HEAD="$(source_git rev-parse HEAD)" || return 1
+  status="$(source_git status --porcelain=v1 --untracked-files=all)" || return 1
+  SOURCE_PROVENANCE_DIRTY=false
+  if [[ -n "$status" ]]; then
+    SOURCE_PROVENANCE_DIRTY=true
+  fi
+  SOURCE_PROVENANCE_FINGERPRINT="$(source_fingerprint)" || return 1
+  validate_source_provenance
+}
+
+print_source_provenance() {
+  echo "==> source provenance"
+  printf 'source.root=%s\n' "$SOURCE_PROVENANCE_ROOT"
+  printf 'source.head=%s\n' "$SOURCE_PROVENANCE_HEAD"
+  printf 'source.dirty=%s\n' "$SOURCE_PROVENANCE_DIRTY"
+  printf 'source.fingerprint=%s\n' "$SOURCE_PROVENANCE_FINGERPRINT"
 }
 
 run_fmt() {
@@ -168,8 +277,9 @@ with_test_postgres() {
 }
 
 run_test() {
+  prepare_native_test_process || return 1
   echo "==> cargo test"
-  with_test_postgres cargo test --workspace --locked
+  with_test_postgres cargo test --workspace --locked -- --test-threads=4
 }
 
 run_doc() {
@@ -196,48 +306,18 @@ run_full() {
 }
 
 run_linux() {
-  command -v docker >/dev/null 2>&1 || {
-    echo "docker is required for the Linux quality gate" >&2
-    return 1
-  }
-  local platform="${CATS_LINUX_PLATFORM:-linux/arm64}"
-  local target_volume="${CATS_LINUX_TARGET_VOLUME:-cats-target-linux}"
-  local jobs="${CATS_LINUX_JOBS:-2}"
-
-  # The tests need PostgreSQL and the build container cannot run docker
-  # itself, so the server rides alongside on a private network.
-  local network="cats-linux-net-$$"
-  local pg="cats-linux-pg-$$"
-  docker network create "$network" >/dev/null
-  docker run --rm -d --name "$pg" --network "$network" \
-    -e POSTGRES_PASSWORD=cats postgres:16 >/dev/null
-
-  local status=0
-  docker run --rm --platform "$platform" \
-    -e CARGO_BUILD_JOBS="$jobs" \
-    -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${pg}:5432/postgres" \
-    --network "$network" \
-    -v "$REPO_ROOT:/work" -w /work \
-    -v cats-cargo-registry:/usr/local/cargo/registry \
-    -v "$target_volume:/target" \
-    rust:1.97.1-bookworm \
-    sh -c 'apt-get update -qq &&
-           apt-get install -qy --no-install-recommends e2fsprogs jq &&
-           rustup component add clippy rustfmt &&
-           ./scripts/quality.sh skills &&
-           cargo fmt --all -- --check &&
-           cargo check --workspace --all-targets --locked --target-dir /target &&
-           cargo build --workspace --locked --target-dir /target &&
-           cargo clippy --workspace --all-targets --locked --target-dir /target -- -D warnings &&
-           cargo test --workspace --locked --target-dir /target &&
-           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir /target' || status=$?
-
-  docker rm -f "$pg" >/dev/null 2>&1 || true
-  docker network rm "$network" >/dev/null 2>&1 || true
-  return "$status"
+  export CATS_SOURCE_PROVENANCE_ROOT="$SOURCE_PROVENANCE_ROOT"
+  export CATS_SOURCE_PROVENANCE_HEAD="$SOURCE_PROVENANCE_HEAD"
+  export CATS_SOURCE_PROVENANCE_DIRTY="$SOURCE_PROVENANCE_DIRTY"
+  export CATS_SOURCE_PROVENANCE_FINGERPRINT="$SOURCE_PROVENANCE_FINGERPRINT"
+  exec "$REPO_ROOT/scripts/linux-gate.sh"
 }
 
+load_source_provenance
+print_source_provenance
+
 case "${1:-full}" in
+  provenance) ;;
   fmt) run_fmt ;;
   skills) run_skills ;;
   deps) run_deps ;;

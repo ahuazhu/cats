@@ -41,7 +41,6 @@ jobs:
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_APPLICATION_KEY: ${{ vars.TF_STATE_APPLICATION_KEY }}
       EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
-      ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}
       PRODUCTION_TFVARS_B64: ${{ vars.PRODUCTION_TFVARS_B64 }}
       # The platform stack's database_master_user_secret_arn output. Not a
       # secret -- it is an ARN -- but it is the authority this deployment reads
@@ -50,10 +49,16 @@ jobs:
       # Optional staged cutover. Empty preserves the direct-RDS storage DSN and
       # client-side session setup; setting it changes only the storage host.
       RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}
+      # Platform stack output; non-secret, but mandatory so controld cannot
+      # silently point at a different object namespace than blockd.
+      CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}
       # PKCS#8 Ed25519 signing key, base64-encoded so GitHub can carry the PEM
       # without line-ending changes. Only cats-controld receives the decoded
       # file; workers get its public half through the infrastructure stack.
       ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}
+      # Canonical A23 public trust bundle emitted by the central provisioner.
+      # Base64 preserves its exact JSON bytes through GitHub configuration.
+      RUNTIME_PROVISIONER_TRUST_BUNDLE_B64: ${{ secrets.RUNTIME_PROVISIONER_TRUST_BUNDLE_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -144,10 +149,10 @@ jobs:
             TF_STATE_BUCKET \
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
-            ROUTE_CACHE_TABLE_NAME \
             PRODUCTION_TFVARS_B64 \
             RDS_MASTER_USER_SECRET_ARN \
-            ROUTE_GRANT_PRIVATE_KEY_PEM_B64
+            ROUTE_GRANT_PRIVATE_KEY_PEM_B64 \
+            RUNTIME_PROVISIONER_TRUST_BUNDLE_B64
           do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing required repository configuration $name"
@@ -159,6 +164,11 @@ jobs:
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
           printf '%s' "$ROUTE_GRANT_PRIVATE_KEY_PEM_B64" \
             | base64 --decode > "$RUNNER_TEMP/route-grant-private.pem"
+          printf '%s' "$RUNTIME_PROVISIONER_TRUST_BUNDLE_B64" \
+            | base64 --decode > "$RUNNER_TEMP/runtime-provisioner-trust.v1.json"
+          test "$(wc -c < "$RUNNER_TEMP/runtime-provisioner-trust.v1.json")" -le 16384
+          jq -e 'type == "object"' \
+            "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" >/dev/null
           openssl pkey \
             -in "$RUNNER_TEMP/route-grant-private.pem" \
             -text -noout \
@@ -175,14 +185,6 @@ jobs:
             -in "$RUNNER_TEMP/route-grant-public.pem" \
             -text_pub -noout \
             | grep -q '^ED25519 Public-Key:'
-          openssl pkey \
-            -pubin \
-            -in "$RUNNER_TEMP/route-grant-public.pem" \
-            -outform DER \
-            | sha256sum \
-            | awk '{print $1}' \
-            > "$RUNNER_TEMP/route-grant-public.sha256"
-
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
@@ -297,10 +299,12 @@ jobs:
             --arg storage_postgres_session_setup "$storage_postgres_session_setup" \
             --rawfile route_grant_private_key_pem "$RUNNER_TEMP/route-grant-private.pem" \
             --rawfile route_grant_public_key_pem "$RUNNER_TEMP/route-grant-public.pem" \
+            --rawfile runtime_provisioner_trust_bundle_json "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
             '{
               runtime_secret_data: $runtime_secret_data[0],
               route_grant_private_key_pem: $route_grant_private_key_pem,
               route_grant_public_key_pem: $route_grant_public_key_pem,
+              runtime_provisioner_trust_bundle_json: $runtime_provisioner_trust_bundle_json,
               storage_postgres_url: $rotated[0].CATS_POSTGRES_URL,
               storage_postgres_session_setup: $storage_postgres_session_setup,
               usage_postgres_url: $rotated[0].CATS_USAGE_POSTGRES_URL,
@@ -315,7 +319,7 @@ jobs:
             "$RUNNER_TEMP/rds-ca.pem" \
             "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/route-grant-public.pem" \
-            "$RUNNER_TEMP/route-grant-public.sha256" \
+            "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility
@@ -324,20 +328,11 @@ jobs:
           set -euo pipefail
           required_schema="$(
             sed -nE \
-              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
-              control-plane/src/store/schema.rs
-          )"
-          oldest_migratable="$(
-            sed -nE \
-              's/^(pub\(super\)[[:space:]]+)?const[[:space:]]+OLDEST_MIGRATABLE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p' \
-              control-plane/src/store/schema.rs
+              's/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p' \
+              storage/src/authority.rs
           )"
           if [[ ! "$required_schema" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not read control-plane SCHEMA_VERSION"
-            exit 1
-          fi
-          if [[ ! "$oldest_migratable" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not read control-plane OLDEST_MIGRATABLE_SCHEMA_VERSION"
+            echo "::error::Could not read AUTHORITY_RELEASE_SCHEMA_VERSION"
             exit 1
           fi
 
@@ -361,8 +356,8 @@ jobs:
 
           if (( query_status == 0 )) && [[ "$query_output" =~ ^[0-9]+$ ]]; then
             actual_schema="$query_output"
-            if (( actual_schema < oldest_migratable || actual_schema > required_schema )); then
-              echo "::error::Control database schema $actual_schema is incompatible with build schema $required_schema (migratable from $oldest_migratable). cats-controld only migrates stamped versions inside that range; recreate the database with the reviewed runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
+            if (( actual_schema != required_schema )); then
+              echo "::error::Control database schema $actual_schema does not exactly match build schema $required_schema. Recreate the database with the reviewed clean-slate cutover runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
           elif (( query_status != 0 )) && [[ "$query_output" == *'relation "control_schema_version" does not exist'* ]]; then
@@ -371,60 +366,6 @@ jobs:
             echo "::error::Could not read the control database schema version (probe exit $query_status): $query_output"
             exit 1
           fi
-
-      - name: Check Route Grant verifier compatibility
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_fingerprint="$(tr -d '\r\n' < "$RUNNER_TEMP/route-grant-public.sha256")"
-          [[ "$expected_fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          admin_token="$(jq -er '.CATS_ADMIN_TOKEN' "$RUNNER_TEMP/live-secret.json")"
-          echo "::add-mask::$admin_token"
-
-          port_forward_log="$RUNNER_TEMP/route-grant-port-forward.log"
-          port_forward_pid=""
-          cleanup_port_forward() {
-            if [[ -n "$port_forward_pid" ]]; then
-              kill "$port_forward_pid" 2>/dev/null || true
-              wait "$port_forward_pid" 2>/dev/null || true
-            fi
-          }
-          trap cleanup_port_forward EXIT
-          kubectl \
-            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-            --namespace cats \
-            port-forward service/cats-controld 17300:7300 \
-            > "$port_forward_log" 2>&1 &
-          port_forward_pid=$!
-
-          ready=false
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:17300/healthz >/dev/null 2>&1; then
-              ready=true
-              break
-            fi
-            if ! kill -0 "$port_forward_pid" 2>/dev/null; then
-              echo "::error::Control-plane port-forward exited before the Route Grant preflight"
-              sed -n '1,120p' "$port_forward_log"
-              exit 1
-            fi
-            sleep 1
-          done
-          if [[ "$ready" != true ]]; then
-            echo "::error::Control plane did not become reachable for the Route Grant preflight"
-            sed -n '1,120p' "$port_forward_log"
-            exit 1
-          fi
-
-          curl -fsS \
-            --header "Authorization: Bearer $admin_token" \
-            http://127.0.0.1:17300/v1/admin/nodes \
-            > "$RUNNER_TEMP/route-grant-nodes.json"
-          jq -e '.items | type == "array"' \
-            "$RUNNER_TEMP/route-grant-nodes.json" >/dev/null
-          deploy/aws/check-route-grant-nodes.sh \
-            "$expected_fingerprint" \
-            "$RUNNER_TEMP/route-grant-nodes.json"
 
       - name: Initialize application state
         shell: bash
@@ -484,8 +425,7 @@ jobs:
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
             -var="control_plane_image=$IMAGE_REF" \
-            -var="gateway_image=$IMAGE_REF" \
-            -var="shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME" \
+            -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
             -var="credential_refresher_image=$REFRESHER_REF" \
             -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
 
@@ -506,7 +446,7 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: |
           set -euo pipefail
-          for deployment in cats-controld cats-gatewayd
+          for deployment in cats-controld
           do
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \

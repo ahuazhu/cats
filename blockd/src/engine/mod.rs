@@ -7,11 +7,11 @@
 //! state authoritative until the background publisher advances the remote
 //! watermark.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,26 +26,103 @@ use crate::crashpoint;
 use crate::format::{
     self, ChunkRef, LeafRef, PackByteRange, PackEntry, PackHeader, BITMAP_HEADER_LEN,
 };
-use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore};
+use cats_storage::authority::{
+    validate_authorized_serving_attachment, validate_authorized_serving_record, AsciiText,
+    AttachmentLineageIdentity, AuthorityError, AuthorizedServingAttachment, FenceEpoch, Generation,
+    Id, RemoteHead, RenewLeaseRequest, Sha256Digest, VolumeDataAuthority, VolumeDurability,
+    VolumeHeadCasRequest,
+};
+use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore, VolumeHead};
 
 mod gc;
 mod hydrate;
 mod lease;
 mod pack;
 mod plan;
+mod provision;
 mod publish;
 mod quota;
 mod recovery;
 mod status;
 
 pub use gc::GcStats;
+#[cfg(test)]
+use pack::StageWriteFailureGuard;
 use pack::{apply_local_entry, merge_dirty_range, DirtyByteRange, StagedPack, StagedQueue};
-use plan::{commit_workers, copy_planned_pages, plan_commit, ChunkPlan};
+use plan::{copy_planned_pages, plan_commit, ChunkPlan};
+pub use provision::ProvisionRootImageEffectError;
 #[cfg(test)]
 use publish::is_background_publisher_context;
 use publish::{CommitterSignal, EAGER_DRAIN_WATERMARK, MAX_UPLOAD_CONCURRENCY};
 use quota::{pack_reservation_upper, punch_hole};
 pub use status::DurabilityMode;
+
+/// Maximum transient encoded/decoded/materialized publisher working set for
+/// one CAS prefix. Pack boundaries use the provider-neutral formula documented
+/// beside `pack_working_set_bytes`; this is not an allocator-size estimate.
+const MAX_PUBLISHER_WORKING_SET_BYTES: usize = 256 << 20;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PUBLISHER_WORKING_SET_BYTES: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn publisher_working_set_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TEST_PUBLISHER_WORKING_SET_BYTES.get() {
+        return limit;
+    }
+    MAX_PUBLISHER_WORKING_SET_BYTES
+}
+
+fn materialized_entry_bytes(entry: &PackEntry) -> Option<usize> {
+    if entry.is_discard() {
+        return Some(0);
+    }
+    materialized_page_mask_bytes(entry.page_mask)
+}
+
+fn materialized_page_mask_bytes(page_mask: u64) -> Option<usize> {
+    (page_mask.count_ones() as usize).checked_mul(cats_api::chunk::DIRTY_PAGE_SIZE as usize)
+}
+
+fn materialized_pack_bytes(header: &PackHeader) -> Option<usize> {
+    header.entries.iter().try_fold(0usize, |total, entry| {
+        total.checked_add(materialized_entry_bytes(entry)?)
+    })
+}
+
+/// Cross-implementation publisher budget: twice the exact encoded pack bytes,
+/// plus its worst-case materialized output, plus one full-chunk scratch image.
+/// Every operation is checked before comparing with the fixed cap.
+fn pack_working_set_bytes(encoded_bytes: usize, materialized_bytes: usize) -> Option<usize> {
+    encoded_bytes
+        .checked_mul(2)?
+        .checked_add(materialized_bytes)?
+        .checked_add(CHUNK_SIZE as usize)
+}
+
+#[cfg(test)]
+struct PublisherWorkingSetLimitGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl PublisherWorkingSetLimitGuard {
+    fn set(limit: usize) -> Self {
+        let previous = TEST_PUBLISHER_WORKING_SET_BYTES.replace(Some(limit));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublisherWorkingSetLimitGuard {
+    fn drop(&mut self) {
+        TEST_PUBLISHER_WORKING_SET_BYTES.set(self.previous);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -53,6 +130,8 @@ pub enum EngineError {
     OutOfBounds { offset: u64, len: u64, size: u64 },
     #[error("attachment is fenced; refusing writes")]
     Fenced,
+    #[error("Guest block I/O is disabled for this control-only engine")]
+    GuestIoDisabled,
     #[error("volume corrupt: {0}")]
     Corrupt(String),
     #[error("invalid engine configuration: {0}")]
@@ -133,6 +212,10 @@ struct EngineState {
     map: Vec<ChunkRef>,
     /// Committed leaf references matching `map`.
     leaf_refs: Vec<LeafRef>,
+    /// Complete remote authority tuple matching `generation` and `map`.
+    /// Keeping the hashes here lets the control handshake prove the exact
+    /// checkpointed root without a second, weaker generation-only protocol.
+    remote_head: RemoteHead,
     generation: i64,
     /// Chunk cache holds the full authoritative-local content of the chunk.
     hydrated: Vec<bool>,
@@ -157,7 +240,7 @@ pub struct ChunkEngine {
     size: u64,
     chunk_count: u64,
     blob: Arc<dyn BlobStore>,
-    meta: Arc<dyn MetadataStore>,
+    authority: AuthorityBackend,
     cache: File,
     bitmap: Mutex<File>,
     state: Mutex<EngineState>,
@@ -181,6 +264,13 @@ pub struct ChunkEngine {
     local_space: Condvar,
     fenced: AtomicBool,
     epoch: i64,
+    /// A root-provision process adopts an existing grant with Guest I/O
+    /// disabled. It is intentionally unable to turn into a serving engine;
+    /// the reconciler must stop it and start the later frontend phase.
+    guest_io_enabled: bool,
+    /// Present only for the target-authority serving path. It is the exact
+    /// startup grant/lineage echoed by status and bound into every new pack.
+    authorized_attachment: Option<AuthorizedServingAttachment>,
     /// Signals the lease-renewal thread to stop, and wakes it so a detach does not
     /// have to wait out its sleep interval.
     stop_renew: Arc<(Mutex<bool>, Condvar)>,
@@ -201,7 +291,424 @@ pub struct ChunkEngine {
     backpressure_waiters: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+enum AttachmentMode {
+    Acquire,
+    AdoptControlOnly { expected_epoch: i64 },
+    AdoptAuthorizedControlOnly { expected_epoch: i64 },
+    AdoptAuthorizedServing { expected_epoch: i64 },
+}
+
+enum AuthorityBackend {
+    Legacy(Arc<dyn MetadataStore>),
+    Target(Arc<dyn VolumeDataAuthority>),
+}
+
+impl AuthorityBackend {
+    fn load_head(&self, volume_id: &str) -> cats_storage::metadata::Result<VolumeHead> {
+        match self {
+            Self::Legacy(metadata) => metadata.load_head(volume_id),
+            Self::Target(authority) => {
+                let volume_id = Id::new(volume_id.to_string()).ok_or_else(|| {
+                    MetaError::InvalidArgument("volume_id is not a target authority Id".into())
+                })?;
+                let record = authority
+                    .load_volume(&volume_id)
+                    .map_err(|error| map_target_error(error, volume_id.as_str(), 0))?;
+                if record.volume_id != volume_id {
+                    return Err(MetaError::Backend(
+                        "target authority returned a different volume".into(),
+                    ));
+                }
+                Ok(VolumeHead {
+                    volume_id: record.volume_id.to_string(),
+                    size_bytes: record.size_bytes,
+                    generation: i64::try_from(record.head.generation.get()).map_err(|_| {
+                        MetaError::Backend("target authority generation exceeds i64".into())
+                    })?,
+                    root_hash: record
+                        .head
+                        .root_hash
+                        .as_ref()
+                        .map(|digest| *digest.as_bytes()),
+                    root_object_id: record.head.root_object_id.as_ref().map(ToString::to_string),
+                    lease_owner: record.lease_owner.as_ref().map(ToString::to_string),
+                    lease_epoch: i64::try_from(record.lease_epoch.get()).map_err(|_| {
+                        MetaError::Backend("target authority epoch exceeds i64".into())
+                    })?,
+                })
+            }
+        }
+    }
+
+    fn renew_lease(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+        ttl_ms: i64,
+    ) -> cats_storage::metadata::Result<()> {
+        match self {
+            Self::Legacy(metadata) => metadata.renew_lease(volume_id, attachment_id, epoch, ttl_ms),
+            Self::Target(authority) => {
+                let volume_id = target_id(volume_id, "volume_id")?;
+                let attachment_id = target_id(attachment_id, "attachment_id")?;
+                let expected_epoch = target_epoch(epoch)?;
+                let lease_duration_ms = u64::try_from(ttl_ms)
+                    .ok()
+                    .filter(|duration| *duration > 0)
+                    .ok_or_else(|| {
+                        MetaError::InvalidArgument("lease duration must be positive".into())
+                    })?;
+                let result = authority
+                    .renew_lease(&RenewLeaseRequest {
+                        volume_id: volume_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_epoch,
+                        lease_duration_ms,
+                    })
+                    .map_err(|error| map_target_error(error, volume_id.as_str(), 0))?;
+                if result.volume_id != volume_id
+                    || result.attachment_id != attachment_id
+                    || result.epoch != expected_epoch
+                {
+                    return Err(MetaError::Backend(
+                        "target authority returned a mismatched renew result".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        volume_id: &str,
+        expected_size_bytes: u64,
+        expected_head: &RemoteHead,
+        new_head: &RemoteHead,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> cats_storage::metadata::Result<i64> {
+        match self {
+            Self::Legacy(metadata) => {
+                let root_hash = new_head
+                    .root_hash
+                    .as_ref()
+                    .ok_or_else(|| MetaError::InvalidArgument("new root hash is absent".into()))?;
+                let root_object_id = new_head.root_object_id.as_ref().ok_or_else(|| {
+                    MetaError::InvalidArgument("new root object id is absent".into())
+                })?;
+                metadata.cas_head(
+                    volume_id,
+                    i64::try_from(expected_head.generation.get()).map_err(|_| {
+                        MetaError::InvalidArgument("expected generation exceeds i64".into())
+                    })?,
+                    i64::try_from(new_head.generation.get()).map_err(|_| {
+                        MetaError::InvalidArgument("new generation exceeds i64".into())
+                    })?,
+                    *root_hash.as_bytes(),
+                    root_object_id.as_str(),
+                    attachment_id,
+                    epoch,
+                )
+            }
+            Self::Target(authority) => {
+                let volume_id = target_id(volume_id, "volume_id")?;
+                let attachment_id = target_id(attachment_id, "attachment_id")?;
+                let expected_epoch = target_epoch(epoch)?;
+                let result = authority
+                    .compare_and_swap_head(&VolumeHeadCasRequest {
+                        volume_id: volume_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_epoch,
+                        expected_size_bytes,
+                        expected_head: expected_head.clone(),
+                        new_head: new_head.clone(),
+                    })
+                    .map_err(|error| {
+                        map_target_error(
+                            error,
+                            volume_id.as_str(),
+                            i64::try_from(expected_head.generation.get()).unwrap_or(i64::MAX),
+                        )
+                    })?;
+                if result.volume_id != volume_id
+                    || result.attachment_id != attachment_id
+                    || result.epoch != expected_epoch
+                    || result.resulting_head != *new_head
+                {
+                    return Err(MetaError::Backend(
+                        "target authority returned a mismatched head CAS result".into(),
+                    ));
+                }
+                i64::try_from(result.resulting_head.generation.get()).map_err(|_| {
+                    MetaError::Backend("target authority generation exceeds i64".into())
+                })
+            }
+        }
+    }
+}
+
+fn target_id(value: &str, field: &str) -> cats_storage::metadata::Result<Id> {
+    Id::new(value.to_string())
+        .ok_or_else(|| MetaError::InvalidArgument(format!("{field} is not a target authority Id")))
+}
+
+fn target_epoch(value: i64) -> cats_storage::metadata::Result<FenceEpoch> {
+    u64::try_from(value)
+        .ok()
+        .and_then(FenceEpoch::new)
+        .filter(|epoch| epoch.get() > 0)
+        .ok_or_else(|| MetaError::InvalidArgument("attachment epoch must be positive".into()))
+}
+
+fn map_target_error(error: AuthorityError, volume_id: &str, expected: i64) -> MetaError {
+    match error {
+        AuthorityError::NotFound => MetaError::NotFound(volume_id.to_string()),
+        AuthorityError::OtherWriter | AuthorityError::Fenced | AuthorityError::AdminBusy => {
+            MetaError::Fenced
+        }
+        AuthorityError::HeadConflict => MetaError::CasConflict { expected },
+        AuthorityError::InvalidLeaseDuration => {
+            MetaError::InvalidArgument("lease duration is invalid".into())
+        }
+        AuthorityError::BackendUnknown => {
+            MetaError::Backend("target volume authority outcome is unknown".into())
+        }
+        AuthorityError::StaleTransition
+        | AuthorityError::EpochExhausted
+        | AuthorityError::SnapshotInUse
+        | AuthorityError::InvalidAuthorization => MetaError::Backend(
+            "target volume authority rejected an operation outside the data-plane port".into(),
+        ),
+    }
+}
+
+fn validate_authorized_serving_config(
+    cfg: &EngineConfig,
+    attachment: &AuthorizedServingAttachment,
+) -> Result<()> {
+    validate_authorized_serving_attachment(attachment).map_err(|_| {
+        EngineError::InvalidConfig("authorized serving attachment is not internally closed".into())
+    })?;
+    if cfg.volume_id != attachment.identity.volume_id.as_str()
+        || cfg.attachment_id != attachment.identity.attachment_id.as_str()
+    {
+        return Err(EngineError::InvalidConfig(
+            "engine IDs do not match the authorized serving attachment".into(),
+        ));
+    }
+    let lease_ttl_ms = u64::try_from(cfg.lease_ttl_ms).map_err(|_| {
+        EngineError::InvalidConfig("lease_ttl_ms must fit the target authority range".into())
+    })?;
+    if lease_ttl_ms != attachment.lease_duration_ms() {
+        return Err(EngineError::InvalidConfig(
+            "lease_ttl_ms does not match the exact acquire receipt".into(),
+        ));
+    }
+    let durability_matches = matches!(
+        (&cfg.durability, attachment.durability),
+        (DurabilityMode::Strict, VolumeDurability::Strict)
+            | (DurabilityMode::Relaxed { .. }, VolumeDurability::Relaxed)
+    );
+    if !durability_matches {
+        return Err(EngineError::InvalidConfig(
+            "durability mode does not match the immutable Volume".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_authorized_serving(
+    cfg: &EngineConfig,
+    attachment: &AuthorizedServingAttachment,
+    authority: &dyn VolumeDataAuthority,
+) -> Result<()> {
+    validate_attachment_identity_file(&cfg.data_dir, &attachment.identity)?;
+    let initial = authority
+        .load_volume(&attachment.identity.volume_id)
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    validate_authorized_serving_record(&initial, attachment, None).map_err(|_| {
+        EngineError::Meta(MetaError::Backend(
+            "target authority does not match the authorized serving grant".into(),
+        ))
+    })?;
+
+    let renewed = authority
+        .renew_lease(&RenewLeaseRequest {
+            volume_id: attachment.identity.volume_id.clone(),
+            attachment_id: attachment.identity.attachment_id.clone(),
+            expected_epoch: attachment.identity.attachment_epoch,
+            lease_duration_ms: attachment.lease_duration_ms(),
+        })
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    if renewed.volume_id != attachment.identity.volume_id
+        || renewed.attachment_id != attachment.identity.attachment_id
+        || renewed.epoch != attachment.identity.attachment_epoch
+    {
+        return Err(EngineError::Meta(MetaError::Backend(
+            "target authority returned a mismatched startup renewal".into(),
+        )));
+    }
+    let after_renew = authority
+        .load_volume(&attachment.identity.volume_id)
+        .map_err(|error| {
+            EngineError::Meta(map_target_error(
+                error,
+                attachment.identity.volume_id.as_str(),
+                0,
+            ))
+        })?;
+    validate_authorized_serving_record(&after_renew, attachment, Some(renewed.lease_expires_at))
+        .map_err(|_| {
+            EngineError::Meta(MetaError::Backend(
+                "target authority changed outside the exact startup renewal".into(),
+            ))
+        })
+}
+
+fn validate_attachment_identity_file(
+    data_dir: &Path,
+    expected: &AttachmentLineageIdentity,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    const MAX_IDENTITY_BYTES: u64 = 4_096;
+    let path = CString::new(data_dir.as_os_str().as_bytes()).map_err(|_| {
+        EngineError::InvalidConfig("data directory contains an interior NUL".into())
+    })?;
+    // SAFETY: `path` is NUL-terminated and the returned descriptor, when
+    // nonnegative, is uniquely adopted by `File` below.
+    let directory_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if directory_fd < 0 {
+        return Err(EngineError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `directory_fd` is a newly opened, owned descriptor.
+    let directory = unsafe { File::from_raw_fd(directory_fd) };
+    let name = c"identity.json";
+    // SAFETY: `directory` remains live, `name` is NUL-terminated, and the
+    // returned descriptor is uniquely adopted below.
+    let identity_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if identity_fd < 0 {
+        return Err(EngineError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `identity_fd` is a newly opened, owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(identity_fd) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_IDENTITY_BYTES
+    {
+        return Err(EngineError::Corrupt(
+            "attachment identity is not one bounded regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_IDENTITY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(EngineError::Corrupt(
+            "attachment identity exceeds its byte limit".into(),
+        ));
+    }
+    let identity: AttachmentLineageIdentity = serde_json::from_slice(&bytes)
+        .map_err(|_| EngineError::Corrupt("attachment identity is malformed".into()))?;
+    let canonical = serde_json::to_vec(&identity)
+        .map_err(|_| EngineError::Corrupt("attachment identity cannot serialize".into()))?;
+    if canonical != bytes || identity != *expected {
+        return Err(EngineError::Corrupt(
+            "attachment identity is noncanonical or does not match the grant".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remote_head_from_legacy_projection(head: &VolumeHead) -> Result<RemoteHead> {
+    let generation = u64::try_from(head.generation)
+        .ok()
+        .and_then(Generation::new)
+        .ok_or_else(|| EngineError::Corrupt("authority generation is outside V1".into()))?;
+    let root_object_id = head
+        .root_object_id
+        .as_ref()
+        .map(|value| {
+            AsciiText::new(value.clone())
+                .ok_or_else(|| EngineError::Corrupt("authority root object ID is invalid".into()))
+        })
+        .transpose()?;
+    Ok(RemoteHead {
+        generation,
+        root_hash: head.root_hash.map(Sha256Digest::from_bytes),
+        root_object_id,
+    })
+}
+
 impl ChunkEngine {
+    fn validate_pack_lineage(&self, header: &PackHeader) -> Result<()> {
+        let epoch = header
+            .attachment_epoch_value()
+            .map_err(|error| EngineError::Corrupt(error.to_string()))?;
+        match &self.authorized_attachment {
+            Some(attachment)
+                if epoch == self.epoch
+                    && header.lease_epoch.is_none()
+                    && header.attachment_id.as_deref()
+                        == Some(attachment.identity.attachment_id.as_str())
+                    && header.attachment_epoch == Some(self.epoch)
+                    && header.acquire_origin.as_ref()
+                        == Some(&attachment.identity.acquire_origin) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(EngineError::Corrupt(
+                "pack lineage does not match identity.json and the current grant".into(),
+            )),
+            // Preserve the existing legacy restart semantics for the
+            // compatibility-only caller: it historically replays its v1
+            // journal after reacquiring a later epoch. The signed target path
+            // above has no such exception and binds every pack to the exact
+            // immutable grant.
+            None if header.lease_epoch.is_some()
+                && header.attachment_id.is_none()
+                && header.attachment_epoch.is_none()
+                && header.acquire_origin.is_none() =>
+            {
+                Ok(())
+            }
+            None => Err(EngineError::Corrupt(
+                "target-v2 pack cannot be adopted without a complete authorized lineage".into(),
+            )),
+        }
+    }
+
     /// Attach to a volume: acquire the lease (bumping the fencing epoch),
     /// start lease renewal, then load the committed map and recover pending
     /// packs under the live lease.
@@ -209,6 +716,101 @@ impl ChunkEngine {
         cfg: EngineConfig,
         blob: Arc<dyn BlobStore>,
         meta: Arc<dyn MetadataStore>,
+    ) -> Result<Arc<Self>> {
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Legacy(meta),
+            AttachmentMode::Acquire,
+            None,
+        )
+    }
+
+    /// Adopt an already-authorized attachment for the root-provision effect.
+    ///
+    /// Unlike [`Self::attach`], this does not acquire or bump the lease epoch,
+    /// replay pending packs, start a publisher, or enable any Guest I/O entry
+    /// point. The caller obtained the exact owner/epoch grant before spawning
+    /// blockd; every publication remains guarded by that same tuple.
+    pub fn attach_control_only(
+        cfg: EngineConfig,
+        expected_epoch: i64,
+        blob: Arc<dyn BlobStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Result<Arc<Self>> {
+        if expected_epoch <= 0 {
+            return Err(EngineError::InvalidConfig(
+                "an adopted attachment epoch must be positive".into(),
+            ));
+        }
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Target(authority),
+            AttachmentMode::AdoptControlOnly { expected_epoch },
+            None,
+        )
+    }
+
+    /// Adopt the complete Node-authorized grant for the root-provision effect.
+    ///
+    /// This is the signed Runtime form of [`Self::attach_control_only`]. It
+    /// performs the same strict read/renew/reread grant proof as authorized
+    /// serving, retains the complete lineage for status handshakes, and still
+    /// exposes no Guest data frontend or publisher.
+    pub fn attach_authorized_control_only(
+        cfg: EngineConfig,
+        attachment: AuthorizedServingAttachment,
+        blob: Arc<dyn BlobStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Result<Arc<Self>> {
+        validate_authorized_serving_config(&cfg, &attachment)?;
+        let expected_epoch =
+            i64::try_from(attachment.identity.attachment_epoch.get()).map_err(|_| {
+                EngineError::InvalidConfig("attachment epoch exceeds the engine range".into())
+            })?;
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Target(authority),
+            AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+            Some(attachment),
+        )
+    }
+
+    /// Adopt an exact target-authority grant as a serving block data plane.
+    ///
+    /// This path has no acquire capability and never increments an epoch. It
+    /// validates the complete Node-supplied grant against a strict authority
+    /// read, renews that same owner/epoch, and validates a second strict read
+    /// before creating or opening any local block state. Guest frontends are
+    /// usable only after recovery completes and this function returns.
+    pub fn attach_authorized_serving(
+        cfg: EngineConfig,
+        attachment: AuthorizedServingAttachment,
+        blob: Arc<dyn BlobStore>,
+        authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Result<Arc<Self>> {
+        validate_authorized_serving_config(&cfg, &attachment)?;
+        let expected_epoch =
+            i64::try_from(attachment.identity.attachment_epoch.get()).map_err(|_| {
+                EngineError::InvalidConfig("attachment epoch exceeds the engine range".into())
+            })?;
+        Self::open(
+            cfg,
+            blob,
+            AuthorityBackend::Target(authority),
+            AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+            Some(attachment),
+        )
+    }
+
+    fn open(
+        cfg: EngineConfig,
+        blob: Arc<dyn BlobStore>,
+        authority: AuthorityBackend,
+        mode: AttachmentMode,
+        authorized_attachment: Option<AuthorizedServingAttachment>,
     ) -> Result<Arc<Self>> {
         if cfg.volume_id.is_empty() || cfg.attachment_id.is_empty() {
             return Err(EngineError::InvalidConfig(
@@ -230,7 +832,31 @@ impl ChunkEngine {
                 "max_local_bytes must be at least one chunk ({CHUNK_SIZE} bytes)"
             )));
         }
-        let head = meta.load_head(&cfg.volume_id)?;
+        match (&mode, &authority, &authorized_attachment) {
+            (
+                AttachmentMode::AdoptAuthorizedServing { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
+                AuthorityBackend::Target(target),
+                Some(attachment),
+            ) => preflight_authorized_serving(&cfg, attachment, target.as_ref())?,
+            (
+                AttachmentMode::AdoptAuthorizedServing { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
+                _,
+                _,
+            ) => {
+                return Err(EngineError::InvalidConfig(
+                    "authorized target attach requires one complete authority grant".into(),
+                ));
+            }
+            (_, _, Some(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "an authorized attachment was supplied to another mode".into(),
+                ));
+            }
+            _ => {}
+        }
+        let head = authority.load_head(&cfg.volume_id)?;
         let size = head.size_bytes;
         if size == 0 || size % CHUNK_SIZE as u64 != 0 {
             return Err(EngineError::Corrupt(format!(
@@ -244,31 +870,95 @@ impl ChunkEngine {
         }
         let chunk_count = chunk::chunk_count(size);
 
-        let epoch = meta.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?;
+        let epoch = match (mode, &authority) {
+            (AttachmentMode::Acquire, AuthorityBackend::Legacy(metadata)) => {
+                metadata.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?
+            }
+            (AttachmentMode::AdoptControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
+                if head.lease_owner.is_some() && head.lease_epoch <= 0 {
+                    return Err(EngineError::Corrupt(
+                        "an owned volume cannot have lease epoch zero".into(),
+                    ));
+                }
+                if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
+                    || head.lease_epoch != expected_epoch
+                {
+                    return Err(EngineError::Meta(MetaError::Fenced));
+                }
+                expected_epoch
+            }
+            (
+                AttachmentMode::AdoptAuthorizedServing { expected_epoch }
+                | AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+                AuthorityBackend::Target(_),
+            ) => {
+                let attachment = authorized_attachment.as_ref().ok_or_else(|| {
+                    EngineError::InvalidConfig(
+                        "authorized serving attachment disappeared before open".into(),
+                    )
+                })?;
+                if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
+                    || head.lease_epoch != expected_epoch
+                    || head.size_bytes != attachment.size_bytes
+                    || remote_head_from_legacy_projection(&head)? != attachment.head
+                {
+                    return Err(EngineError::Meta(MetaError::Fenced));
+                }
+                expected_epoch
+            }
+            (AttachmentMode::Acquire, AuthorityBackend::Target(_))
+            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AdoptAuthorizedControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AdoptAuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "attachment mode and authority backend do not match".into(),
+                ));
+            }
+        };
+        let control_only = matches!(
+            mode,
+            AttachmentMode::AdoptControlOnly { .. }
+                | AttachmentMode::AdoptAuthorizedControlOnly { .. }
+        );
 
         fs::create_dir_all(cfg.data_dir.join(PENDING_PACK_DIR))?;
-        let cache = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(cfg.data_dir.join("cache.data"))?;
+        let cache_path = cfg.data_dir.join("cache.data");
+        let cache = if control_only {
+            Self::open_or_initialize_control_file(
+                &cfg.data_dir,
+                "cache.data",
+                ".cache.data.init",
+                |file| file.set_len(size),
+            )?
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&cache_path)?
+        };
         #[cfg(unix)]
         let cache_was_allocated = {
             use std::os::unix::fs::MetadataExt;
             cache.metadata()?.blocks() != 0
         };
+        if control_only && cache.metadata()?.len() != size {
+            return Err(EngineError::Corrupt(
+                "control-only cache length does not match the immutable volume size".into(),
+            ));
+        }
         if cache.metadata()?.len() != size {
             cache.set_len(size)?;
         }
 
-        let (bitmap_file, dirty) = Self::open_bitmap(&cfg.data_dir, chunk_count)?;
+        let (bitmap_file, dirty) = Self::open_bitmap(&cfg.data_dir, chunk_count, control_only)?;
 
         let engine = Arc::new(Self {
             size,
             chunk_count,
             blob,
-            meta,
+            authority,
             cache,
             bitmap: Mutex::new(bitmap_file),
             state: Mutex::new(EngineState {
@@ -276,6 +966,11 @@ impl ChunkEngine {
                 dirty_ranges: vec![Vec::new(); chunk_count as usize],
                 map: vec![ChunkRef::Hole; chunk_count as usize],
                 leaf_refs: vec![LeafRef::Empty; chunk::leaf_count(size) as usize],
+                remote_head: RemoteHead {
+                    generation: Generation::new(0).expect("zero is a valid generation"),
+                    root_hash: None,
+                    root_object_id: None,
+                },
                 generation: 0,
                 discarded: HashSet::new(),
                 hydrated: vec![false; chunk_count as usize],
@@ -303,6 +998,8 @@ impl ChunkEngine {
             }),
             fenced: AtomicBool::new(false),
             epoch,
+            guest_io_enabled: !control_only,
+            authorized_attachment,
             stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             committer_signal: Arc::new((
                 Mutex::new(CommitterSignal {
@@ -328,9 +1025,13 @@ impl ChunkEngine {
         // fenced every start of that Cat). Publishes issued by recovery are
         // still guarded by the epoch CAS.
         engine.start_renew_thread();
-        let recovered = engine
-            .load_committed_map()
-            .and_then(|()| engine.recover_pending_packs());
+        let recovered = engine.load_committed_map().and_then(|()| {
+            if control_only {
+                Ok(())
+            } else {
+                engine.recover_pending_packs()
+            }
+        });
         if let Err(error) = recovered {
             engine.stop_renewal();
             return Err(error);
@@ -351,15 +1052,40 @@ impl ChunkEngine {
             engine.stop_renewal();
             return Err(EngineError::Meta(MetaError::Fenced));
         }
-        engine.start_committer_thread();
-        if engine.staged.lock().unwrap().packs.len() > EAGER_DRAIN_WATERMARK {
-            engine.kick_committer();
+        if !control_only {
+            engine.start_committer_thread();
+            if engine.staged.lock().unwrap().packs.len() > EAGER_DRAIN_WATERMARK {
+                engine.kick_committer();
+            }
         }
         Ok(engine)
     }
 
-    fn open_bitmap(data_dir: &std::path::Path, chunk_count: u64) -> Result<(File, Vec<u64>)> {
+    fn open_bitmap(
+        data_dir: &std::path::Path,
+        chunk_count: u64,
+        preserve_existing: bool,
+    ) -> Result<(File, Vec<u64>)> {
         let path = data_dir.join("dirty.bitmap");
+        let expected_len = BITMAP_HEADER_LEN + chunk_count * 8;
+        if preserve_existing {
+            let file = Self::open_or_initialize_control_file(
+                data_dir,
+                "dirty.bitmap",
+                ".dirty.bitmap.init",
+                |file| {
+                    file.write_all_at(&format::encode_bitmap_header(chunk_count), 0)?;
+                    file.set_len(expected_len)
+                },
+            )?;
+            if file.metadata()?.len() != expected_len {
+                return Err(EngineError::Corrupt(
+                    "control-only dirty bitmap has an unexpected length".into(),
+                ));
+            }
+            return Self::read_bitmap(file, chunk_count);
+        }
+
         let existed = path.exists();
         let file = OpenOptions::new()
             .read(true)
@@ -367,34 +1093,106 @@ impl ChunkEngine {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        let expected_len = BITMAP_HEADER_LEN + chunk_count * 8;
-        let mut dirty = vec![0u64; chunk_count as usize];
         if existed && file.metadata()?.len() == expected_len {
-            let mut header = vec![0u8; BITMAP_HEADER_LEN as usize];
-            file.read_exact_at(&mut header, 0)?;
-            let stored = format::decode_bitmap_header(&header)
-                .map_err(|e| EngineError::Corrupt(e.to_string()))?;
-            if stored != chunk_count {
-                return Err(EngineError::Corrupt(
-                    "dirty bitmap chunk count mismatch".into(),
-                ));
-            }
-            let mut words = vec![0u8; (chunk_count * 8) as usize];
-            file.read_exact_at(&mut words, BITMAP_HEADER_LEN)?;
-            for (i, w) in dirty.iter_mut().enumerate() {
-                *w = u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().unwrap());
-            }
+            return Self::read_bitmap(file, chunk_count);
         } else {
             file.set_len(0)?;
             file.write_all_at(&format::encode_bitmap_header(chunk_count), 0)?;
             file.set_len(expected_len)?;
             file.sync_data()?;
         }
+        Ok((file, vec![0u64; chunk_count as usize]))
+    }
+
+    fn read_bitmap(file: File, chunk_count: u64) -> Result<(File, Vec<u64>)> {
+        let mut header = vec![0u8; BITMAP_HEADER_LEN as usize];
+        file.read_exact_at(&mut header, 0)?;
+        let stored = format::decode_bitmap_header(&header)
+            .map_err(|error| EngineError::Corrupt(error.to_string()))?;
+        if stored != chunk_count {
+            return Err(EngineError::Corrupt(
+                "dirty bitmap chunk count mismatch".into(),
+            ));
+        }
+        let mut words = vec![0u8; (chunk_count * 8) as usize];
+        file.read_exact_at(&mut words, BITMAP_HEADER_LEN)?;
+        let dirty = words
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+            .collect();
         Ok((file, dirty))
     }
 
+    /// Install one new control-only local file without ever exposing a
+    /// partially initialized final name. `hard_link` is the std-only atomic
+    /// no-replace primitive on the same filesystem; an existing final file is
+    /// opened and validated by the caller, never overwritten.
+    fn open_or_initialize_control_file(
+        data_dir: &Path,
+        final_name: &str,
+        temp_name: &str,
+        initialize: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<File> {
+        let path = data_dir.join(final_name);
+        let temp = data_dir.join(temp_name);
+
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(EngineError::Corrupt(format!(
+                        "control-only {final_name} is not a regular file"
+                    )));
+                }
+                Self::remove_control_init_temp(data_dir, &temp)?;
+                return Ok(OpenOptions::new().read(true).write(true).open(path)?);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        Self::remove_control_init_temp(data_dir, &temp)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let initialized = initialize(&file).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = initialized {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+
+        match fs::hard_link(&temp, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error.into());
+            }
+        }
+        fs::remove_file(&temp)?;
+        File::open(data_dir)?.sync_all()?;
+
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(EngineError::Corrupt(format!(
+                "control-only {final_name} is not a regular file"
+            )));
+        }
+        Ok(OpenOptions::new().read(true).write(true).open(path)?)
+    }
+
+    fn remove_control_init_temp(data_dir: &Path, temp: &Path) -> Result<()> {
+        match fs::remove_file(temp) {
+            Ok(()) => File::open(data_dir)?.sync_all().map_err(Into::into),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn load_committed_map(&self) -> Result<()> {
-        let head = self.meta.load_head(&self.cfg.volume_id)?;
+        let head = self.authority.load_head(&self.cfg.volume_id)?;
         let mut refs = vec![ChunkRef::Hole; self.chunk_count as usize];
         let mut leaf_refs = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
 
@@ -443,6 +1241,7 @@ impl ChunkEngine {
 
         let mut st = self.state.lock().unwrap();
         st.generation = head.generation;
+        st.remote_head = remote_head_from_legacy_projection(&head)?;
         st.map = refs;
         st.leaf_refs = leaf_refs;
         // Dirty chunks carry uncommitted local data: their cache content is
@@ -487,6 +1286,9 @@ impl ChunkEngine {
     /// and on a volume holding unflushed writes the cache would disagree with the
     /// map it just published.
     pub fn provision_from_image(&self, manifest: &format::ImageManifest) -> Result<i64> {
+        if !self.guest_io_enabled {
+            return Err(EngineError::GuestIoDisabled);
+        }
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
@@ -517,7 +1319,7 @@ impl ChunkEngine {
                     self.cfg.volume_id
                 )));
             }
-            manifest.base_map(self.size).map_err(|_| {
+            format::image_base_map(manifest, self.size).map_err(|_| {
                 EngineError::Corrupt(format!(
                     "image {} does not fit volume {} of {} bytes",
                     manifest.image_id, self.cfg.volume_id, self.size
@@ -526,15 +1328,24 @@ impl ChunkEngine {
         };
 
         let chunks: Vec<u64> = manifest.chunks.iter().map(|c| c.chunk_idx).collect();
-        let txn = format!("img-{}", &manifest.image_id[..16]);
+        let txn = format!("img-{}", &manifest.image_id.as_str()[..16]);
         let mut new_leaves = vec![LeafRef::Empty; chunk::leaf_count(self.size) as usize];
-        let new_gen =
-            self.publish_map(&txn, 0, 1, self.epoch, &new_map, &mut new_leaves, &chunks)?;
+        let (new_gen, remote_head) = self.publish_map(
+            &txn,
+            0,
+            1,
+            self.epoch,
+            &new_map,
+            &mut new_leaves,
+            &chunks,
+            &chunks,
+        )?;
 
         let mut st = self.state.lock().unwrap();
         st.map = new_map;
         st.leaf_refs = new_leaves;
         st.generation = new_gen;
+        st.remote_head = remote_head;
         // Provisioning published a generation without going through the staged
         // queue; the next staged pack chains onto it. (The queue is empty —
         // checked above — so next_base is exactly the committed generation.)
@@ -556,6 +1367,9 @@ impl ChunkEngine {
     }
 
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if !self.guest_io_enabled {
+            return Err(EngineError::GuestIoDisabled);
+        }
         self.check_bounds(offset, buf.len() as u64)?;
         if buf.is_empty() {
             return Ok(());
@@ -576,6 +1390,9 @@ impl ChunkEngine {
     }
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if !self.guest_io_enabled {
+            return Err(EngineError::GuestIoDisabled);
+        }
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
@@ -623,6 +1440,9 @@ impl ChunkEngine {
 
     /// TRIM / WRITE_ZEROES: V1 writes literal zeros (spec §7).
     pub fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        if !self.guest_io_enabled {
+            return Err(EngineError::GuestIoDisabled);
+        }
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
@@ -713,6 +1533,9 @@ impl ChunkEngine {
     /// Returns the generation the acknowledged state is (or, staged, will be)
     /// committed at.
     pub fn flush(&self) -> Result<i64> {
+        if !self.guest_io_enabled {
+            return Err(EngineError::GuestIoDisabled);
+        }
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }

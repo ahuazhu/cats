@@ -1,4 +1,4 @@
-//! The runtime ledger write path (ADR-0028 §1, stage 1).
+//! The V1 runtime-ledger write path.
 //!
 //! These tests drive real NodeJobs through `execute` with real `cats-blockd`
 //! and `cats-guest-agent` children, because the property under test is exactly
@@ -213,8 +213,8 @@ fn only_the_settled_state_of_each_job_is_recorded() {
     env.run(stop_job(CAT, 4));
 }
 
-/// ADR-0028 §2: the ledger is a local recovery aid, not authority. A node that
-/// cannot write it has lost the ability to re-adopt the Cat later; it has not
+/// The V1 ledger is a local recovery aid, not authority. A node that cannot
+/// write it has lost the ability to re-adopt the Cat later; it has not
 /// lost the Cat, and must not fail the job that started it.
 #[test]
 fn an_unwritable_ledger_does_not_fail_the_job() {

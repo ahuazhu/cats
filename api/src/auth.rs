@@ -11,6 +11,11 @@ pub struct CliAuthConfigResponse {
     pub workos_client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workos_api_base_url: Option<String>,
+    /// Deployment-scoped WorkOS Organization used only by the independent
+    /// fleet-administrator login. It is public routing input, never an
+    /// authorization assertion; every admin request is authorized online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workos_admin_organization_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

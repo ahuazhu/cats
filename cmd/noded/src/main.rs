@@ -1,33 +1,67 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
-use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
-use cats_node_agent::runtime::NodeConfig;
-use cats_node_agent::server::{spawn, ServerConfig};
-use cats_storage::{open_metadata_store, AdapterConfig, AdapterSelection, MetadataStoreFactory};
+use cats_node_agent::ch::{BlockPath, ChConfig};
+use cats_node_agent::route_v2_machine::RouteV2MachineConfig;
+use cats_node_agent::runtime::reconciliation::AuthorizedBlockdLaunchConfig;
+use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
+use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
+use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::{open_blob_store, AdapterConfig, AdapterSelection, BlobStoreFactory};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "cats-noded", about = "Cats node agent")]
 struct Args {
-    #[arg(long)]
-    node_id: String,
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
-    #[arg(long, env = "CATS_NODE_ADVERTISE_URL")]
-    advertise_url: Option<String>,
     #[arg(long)]
     control_plane_url: String,
-    #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
-    auth_token: String,
-    /// Ed25519 public key used to verify control-plane signed Route Grants.
-    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
-    route_grant_public_key_file: PathBuf,
-    #[arg(long, default_value = "")]
-    gateway_url: String,
-    #[arg(long)]
-    state_dir: PathBuf,
+    /// Retired single-key CLI retained only until the metal unit/install
+    /// transaction moves as one change. These bytes are never opened or used
+    /// as Route v2 authority.
+    #[arg(
+        long = "route-grant-public-key-file",
+        env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
+    )]
+    _retired_route_grant_public_key_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_ROUTE_V2_PUBLIC_KEY_RING_FILE",
+        default_value = cats_api::route_grant_v2::ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH
+    )]
+    route_v2_public_key_ring_file: PathBuf,
+    /// Independent TLS listener for authenticated Gateway Route v2 tunnels.
+    /// Absence keeps this ingress closed and does not read its fixed artifacts.
+    #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
+    route_v2_machine_listen: Option<String>,
+    #[arg(
+        long,
+        env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
+        default_value = cats_api::gateway_workload_identity::GATEWAY_CLIENT_CA_BUNDLE_PATH
+    )]
+    gateway_client_ca_bundle_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_NODE_ROUTE_V2_SERVER_CERTIFICATE_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CERTIFICATE_PATH
+    )]
+    node_route_v2_server_certificate_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_NODE_ROUTE_V2_SERVER_PRIVATE_KEY_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_PRIVATE_KEY_PATH
+    )]
+    node_route_v2_server_private_key_file: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
+        value_name = "PATH"
+    )]
+    guest_runtime_profile_receipt_file: Option<PathBuf>,
     #[arg(long)]
     blockd_bin: PathBuf,
     #[arg(long)]
@@ -40,18 +74,15 @@ struct Args {
     object_store_adapter: String,
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
-    /// Schedulable logical CPUs. Defaults to the detected host total.
-    #[arg(long, env = "CATS_NODE_CPUS")]
-    cpus: Option<u32>,
-    /// Schedulable memory in MiB. Defaults to the detected host total.
-    #[arg(long, env = "CATS_NODE_MEMORY_MIB")]
-    memory_mib: Option<u64>,
-    /// Keep a newly registered node out of placement until an administrator
-    /// explicitly uncordons it. Re-registration never overrides admin state.
-    #[arg(long, default_value_t = false)]
-    initially_cordoned: bool,
-    #[arg(long, default_value_t = 1000)]
-    heartbeat_ms: u64,
+    /// Initial A22 NormalAcquire lease. This must cover the checkpoint and
+    /// fresh-scan bridge to the root-provision process; serving blockd renews
+    /// the exact epoch independently afterwards.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_VOLUME_LEASE_DURATION_MS",
+        default_value_t = 60_000
+    )]
+    runtime_volume_lease_duration_ms: u64,
     #[arg(long, default_value_t = 1500)]
     blockd_lease_ttl_ms: i64,
     /// Per-volume remotely unpublished local journal limit.
@@ -69,6 +100,23 @@ struct Args {
     /// Delegated cgroup v2 subtree for authoritative billing counters.
     #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
     metering_cgroup_root: Option<PathBuf>,
+
+    /// Local budget for one complete signed Runtime inventory scan. This is an
+    /// operator safety limit, not a protocol or product latency SLA.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_INVENTORY_SCAN_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    runtime_inventory_scan_timeout_ms: u64,
+    /// Local budget for one durable signed Runtime physical step. It is
+    /// intentionally independent from the inventory scan budget.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_EFFECT_STEP_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    runtime_effect_step_timeout_ms: u64,
 
     /// Concurrent-wake commitment budget in bytes (ADR-0002 §8). Accounted in
     /// bytes because the 2026-07-21 run showed Guest memory page read-back is
@@ -90,29 +138,12 @@ struct Args {
     wake_queue_timeout_secs: u64,
 
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
-    #[arg(long, default_value = "fake")]
+    #[arg(long, default_value = "ch")]
     vmm: String,
+    #[arg(long, default_value = "/opt/cats/bin/cats-vmm-launcher")]
+    vmm_launcher_bin: PathBuf,
     #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
     ch_bin: PathBuf,
-    #[arg(long, default_value = "/opt/cats/guest/vmlinux")]
-    ch_kernel: PathBuf,
-    #[arg(long)]
-    ch_initramfs: Option<PathBuf>,
-    /// `clocksource=kvm-clock` is load-bearing, not cosmetic. On a host with an
-    /// invariant TSC the guest kernel demotes kvm-clock to rating 299 and picks
-    /// raw `tsc` instead (`arch/x86/kernel/kvmclock.c`), because reading `rdtsc`
-    /// is cheaper. But a Warm restore re-establishes the guest clock through
-    /// `KVM_SET_CLOCK`, which moves kvmclock -- a clock a `tsc` guest never
-    /// reads. Its TSC is restored to the snapshot value instead, so all three
-    /// guest clocks resume frozen at the moment of the snapshot and the lag
-    /// accumulates across every Warm cycle
-    /// (`experiments/suspend-clock-semantics-20260727`). Pinning kvm-clock puts
-    /// the guest back on the clock the restore path actually adjusts.
-    #[arg(
-        long,
-        default_value = "console=ttyS0 root=/dev/vda rw quiet clocksource=kvm-clock"
-    )]
-    ch_cmdline: String,
     /// Raw golden-root image written into fresh root volumes.
     #[arg(long)]
     ch_seed_image: Option<PathBuf>,
@@ -136,9 +167,6 @@ struct Args {
     ch_nbd_client: PathBuf,
     #[arg(long, default_value_t = 64)]
     ch_nbd_devices: u32,
-    /// Optional private /16 split into per-Cat /30 tap networks.
-    #[arg(long)]
-    ch_network_cidr: Option<String>,
     #[arg(long, default_value = "/usr/sbin/ip")]
     ch_ip_bin: PathBuf,
 }
@@ -151,133 +179,139 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let detected_cpus = std::thread::available_parallelism()
-        .map(|count| u32::try_from(count.get()))
-        .map_err(anyhow::Error::from)??;
-    let detected_memory_mib = detect_host_memory_mib()?;
-    let cpus = args.cpus.unwrap_or(detected_cpus);
-    let memory_mib = args.memory_mib.unwrap_or(detected_memory_mib);
-    anyhow::ensure!(cpus > 0, "--cpus must be greater than zero");
-    anyhow::ensure!(memory_mib > 0, "--memory-mib must be greater than zero");
-    tracing::info!(
-        schedulable_cpus = cpus,
-        schedulable_memory_mib = memory_mib,
-        detected_cpus,
-        detected_memory_mib,
-        "resolved node capacity"
+    let receipt_path = args
+        .guest_runtime_profile_receipt_file
+        .as_deref()
+        .context("--guest-runtime-profile-receipt-file or CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE is required")?;
+    let installed_receipt =
+        cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(receipt_path)?;
+    cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed_receipt)?;
+    let ch_config = installed_ch_config(&args, &installed_receipt)?;
+    anyhow::ensure!(
+        args.metadata_store_adapter == cats_metadata_store_postgres::ADAPTER_NAME,
+        "the signed production Runtime supports only --metadata-store-adapter {}",
+        cats_metadata_store_postgres::ADAPTER_NAME,
     );
-    let metadata_store = AdapterSelection::new(
-        args.metadata_store_adapter,
-        AdapterConfig::from_cli(args.metadata_store_options)?,
-    );
-    let object_store = AdapterSelection::new(
-        args.object_store_adapter,
-        AdapterConfig::from_cli(args.object_store_options)?,
-    );
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let storage_meta = open_metadata_store(
-        &metadata_store.name,
-        &metadata_store.config,
-        &metadata_factories,
-    )?;
-    let vmm = match args.vmm.as_str() {
-        "fake" => cats_node_agent::runtime::VmmMode::Fake,
-        "ch" => cats_node_agent::runtime::VmmMode::CloudHypervisor(cats_node_agent::ch::ChConfig {
-            ch_bin: args.ch_bin.clone(),
-            kernel: args.ch_kernel.clone(),
-            initramfs: args.ch_initramfs.clone(),
-            cmdline: args.ch_cmdline.clone(),
-            seed_image: args.ch_seed_image.clone(),
-            block_path: cats_node_agent::ch::BlockPath::parse(&args.ch_block_path)?,
-            block_direct: args.ch_block_direct,
-            vhost_user_queues: args.ch_vhost_user_queues,
-            vhost_user_queue_size: args.ch_vhost_user_queue_size,
-            nbd_client_bin: args.ch_nbd_client.clone(),
-            nbd_devices: args.ch_nbd_devices,
-            network_cidr: args.ch_network_cidr.clone(),
-            ip_bin: args.ch_ip_bin.clone(),
-        }),
-        other => anyhow::bail!("unknown --vmm {other} (expected fake|ch)"),
+    let metadata_config =
+        AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
+    let object_config =
+        AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
+    let authorized_blockd_launch = AuthorizedBlockdLaunchConfig {
+        blockd_binary: args.blockd_bin.clone(),
+        metadata_store: AdapterSelection::new(
+            args.metadata_store_adapter.clone(),
+            metadata_config.clone(),
+        ),
+        object_store: AdapterSelection::new(
+            args.object_store_adapter.clone(),
+            object_config.clone(),
+        ),
+        max_staged_bytes: args.blockd_max_staged_bytes,
+        max_staged_packs: args.blockd_max_staged_packs,
+        max_local_bytes: args.blockd_max_local_bytes,
     };
-    let route_grant_public_key =
-        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
-            format!(
-                "read route grant public key {}",
-                args.route_grant_public_key_file.display()
-            )
-        })?;
-    let route_grant_verifier = std::sync::Arc::new(
-        cats_node_agent::route_grant::RouteGrantVerifier::from_ed25519_pem(
-            &route_grant_public_key,
-        )?,
-    );
-    let handle = spawn(ServerConfig {
+    let object_factories: [&dyn BlobStoreFactory; 2] =
+        [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
+    let blob_store = open_blob_store(
+        &args.object_store_adapter,
+        &object_config,
+        &object_factories,
+    )
+    .context("open signed Runtime object store")?;
+    let volume_authority =
+        cats_metadata_store_postgres::PostgresVolumeDataAuthority::open_runtime(&metadata_config)
+            .context("open PostgreSQL Runtime Volume authorities")?;
+    let volume_data_authority: Arc<dyn cats_storage::authority::VolumeDataAuthority> =
+        volume_authority.clone();
+    let volume_inventory_authority: Arc<
+        dyn cats_storage::authority::RuntimeVolumeInventoryAuthority,
+    > = volume_authority;
+    let agent_registration =
+        cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
+            installed_receipt.receipt(),
+        )?;
+    let route_v2_machine = match args.route_v2_machine_listen {
+        Some(listen) => {
+            let artifacts =
+                cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
+                    &args.route_v2_public_key_ring_file,
+                    &args.gateway_client_ca_bundle_file,
+                    &args.node_route_v2_server_certificate_file,
+                    &args.node_route_v2_server_private_key_file,
+                )?;
+            Some(RouteV2MachineConfig::from_installed_artifacts(
+                listen,
+                agent_registration.identity().node_id.clone(),
+                &artifacts,
+            )?)
+        }
+        None => None,
+    };
+    let deadline_policy = RuntimeSpineDeadlinePolicy::new(
+        Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
+        Duration::from_millis(args.runtime_effect_step_timeout_ms),
+    )
+    .context("validate signed Runtime scan/effect deadline policy")?;
+    let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
-        advertise_url: args.advertise_url,
+        route_v2_machine,
         control_plane_url: args.control_plane_url,
-        auth_token: args.auth_token,
-        route_grant_verifier,
-        gateway_url: args.gateway_url,
-        cpus,
-        memory_mib,
-        initially_cordoned: args.initially_cordoned,
-        heartbeat_ms: args.heartbeat_ms,
-        node: NodeConfig {
-            node_id: args.node_id,
-            state_dir: args.state_dir,
-            blockd_bin: args.blockd_bin,
-            guest_agent_bin: args.guest_agent_bin,
-            metadata_store,
-            object_store,
-            blockd_lease_ttl_ms: args.blockd_lease_ttl_ms,
-            blockd_max_staged_bytes: args.blockd_max_staged_bytes,
-            blockd_max_staged_packs: args.blockd_max_staged_packs,
-            blockd_max_local_bytes: args.blockd_max_local_bytes,
-            metering_cgroup_root: args.metering_cgroup_root,
-            wake_budget: cats_node_agent::admission::WakeBudget {
-                commitment_bytes: args.wake_commitment_budget_bytes,
-                max_wakes: args.max_concurrent_wakes,
-                queue_timeout: std::time::Duration::from_secs(args.wake_queue_timeout_secs),
-            },
-            vmm,
-        },
-        storage_meta,
+        agent_registration,
+        ch_config,
+        authorized_blockd_launch,
+        guest_agent_binary: args.guest_agent_bin,
+        metering_cgroup_root: args.metering_cgroup_root,
+        volume_data_authority,
+        volume_inventory_authority,
+        blob_store,
+        volume_lease_duration_ms: args.runtime_volume_lease_duration_ms,
+        deadline_policy,
     })
     .await?;
-    println!("READY {}", handle.addr);
-    std::future::pending::<()>().await;
-    Ok(())
-}
-
-fn detect_host_memory_mib() -> anyhow::Result<u64> {
-    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(memory_mib) = parse_linux_memory_mib(&contents) {
-            return Ok(memory_mib);
-        }
+    match handle.route_v2_addr {
+        Some(route_v2_addr) => eprintln!(
+            "signed Runtime listener {} and authenticated Route v2 listener {} are bound; readiness stays closed until complete inventory is attested",
+            handle.addr, route_v2_addr
+        ),
+        None => eprintln!(
+            "signed Runtime listener {} is bound; Route v2 machine ingress is closed; readiness stays closed until complete inventory is attested",
+            handle.addr
+        ),
     }
-    // SAFETY: sysconf reads process-wide host configuration and does not
-    // dereference pointers. Negative results are checked before conversion.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    // SAFETY: same as above for the page-size selector.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    anyhow::ensure!(
-        pages > 0 && page_size > 0,
-        "could not detect host memory; pass --memory-mib explicitly"
-    );
-    u64::try_from(pages)
-        .and_then(|pages| u64::try_from(page_size).map(|size| pages.saturating_mul(size)))
-        .map(|bytes| bytes / 1024 / 1024)
-        .context("detected host memory does not fit in u64")
+    handle.run_until_signal().await
 }
 
-fn parse_linux_memory_mib(contents: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next()? != "MemTotal:" {
-            return None;
-        }
-        fields.next()?.parse::<u64>().ok().map(|kib| kib / 1024)
+fn installed_ch_config(
+    args: &Args,
+    installed: &cats_api::runtime_artifacts::InstalledGuestRuntimeProfileReceipt,
+) -> anyhow::Result<ChConfig> {
+    anyhow::ensure!(
+        args.vmm == "ch",
+        "the signed production Runtime supports only --vmm ch"
+    );
+    anyhow::ensure!(
+        args.vmm_launcher_bin.is_absolute(),
+        "--vmm-launcher-bin must be an absolute installed path"
+    );
+    let boot_contract = installed.boot_contract();
+    let initramfs = boot_contract
+        .initramfs()
+        .map(|_| cats_api::runtime_artifacts::GUEST_INITRAMFS_PATH.into());
+    Ok(ChConfig {
+        block_direct: args.ch_block_direct,
+        vmm_launcher_bin: args.vmm_launcher_bin.clone(),
+        ch_bin: args.ch_bin.clone(),
+        kernel: cats_api::runtime_artifacts::GUEST_KERNEL_PATH.into(),
+        initramfs,
+        boot_contract: Some(boot_contract),
+        cmdline: installed.receipt().kernel_cmdline.as_str().to_owned(),
+        seed_image: args.ch_seed_image.clone(),
+        block_path: BlockPath::parse(&args.ch_block_path)?,
+        vhost_user_queues: args.ch_vhost_user_queues,
+        vhost_user_queue_size: args.ch_vhost_user_queue_size,
+        nbd_client_bin: args.ch_nbd_client.clone(),
+        nbd_devices: args.ch_nbd_devices,
+        ip_bin: args.ch_ip_bin.clone(),
     })
 }
 
@@ -286,30 +320,39 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn parses_linux_host_memory() {
-        assert_eq!(
-            super::parse_linux_memory_mib("MemTotal:       197659444 kB\nMemFree: 1 kB\n"),
-            Some(193_026)
-        );
+    fn production_cli_has_no_identity_or_guest_byte_overrides() {
+        let command = super::Args::command();
+        let ids = command
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str())
+            .collect::<Vec<_>>();
+        for forbidden in [
+            "node_id",
+            "state_dir",
+            "ch_kernel",
+            "ch_initramfs",
+            "ch_cmdline",
+            "ch_network_cidr",
+        ] {
+            assert!(
+                !ids.contains(&forbidden),
+                "forbidden production override {forbidden}"
+            );
+        }
+        assert!(ids.contains(&"guest_runtime_profile_receipt_file"));
+        assert!(ids.contains(&"runtime_volume_lease_duration_ms"));
+        assert!(!ids.contains(&"auth_token"));
     }
 
     #[test]
-    fn default_guest_cmdline_pins_kvm_clock() {
-        let command = super::Args::command();
-        let arg = command
-            .get_arguments()
-            .find(|a| a.get_id() == "ch_cmdline")
-            .expect("--ch-cmdline argument");
-        let default = arg
-            .get_default_values()
-            .first()
-            .expect("--ch-cmdline has a default")
-            .to_string_lossy()
-            .into_owned();
-        assert!(
-            default.contains("clocksource=kvm-clock"),
-            "a guest left on the `tsc` clocksource resumes from a Warm restore with \
-             all three clocks frozen at the snapshot instant; got {default:?}"
-        );
+    fn production_entrypoint_cannot_start_the_legacy_node_runtime() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("spawn_signed_runtime_cutover"));
+        assert!(source.contains("PostgresVolumeDataAuthority::open_runtime"));
+        assert!(source.contains("open_blob_store"));
+        let legacy_spawn = ["server", "::{", "spawn"].concat();
+        let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
+        assert!(!source.contains(&legacy_spawn));
+        assert!(!source.contains(&legacy_runtime));
     }
 }

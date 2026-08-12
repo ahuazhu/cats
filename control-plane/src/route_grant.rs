@@ -1,4 +1,4 @@
-//! Control-plane-only signing for Endpoint Route Grants (ADR-0033).
+//! Control-plane-only signing for V1 Endpoint Route Grants.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -17,6 +17,10 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_reconciliation::{
+    AcquireOrigin, Epoch, FenceEpoch, Id, RandomId128, RemoteHead,
+};
+
 /// Directory under a blockd `--data-dir` holding locally durable, remotely
 /// unpublished packs.
 pub const PENDING_PACK_DIR: &str = "pending";
@@ -166,6 +170,53 @@ pub struct DurabilityStatus {
     /// same "identity unproven, do not adopt" meaning as [`Self::volume_id`].
     #[serde(default)]
     pub attachment_id: String,
+    /// Complete target-authority lineage is present only for a blockd that
+    /// adopted a Node-supplied exact grant. Missing means unproven legacy
+    /// status and must never be inferred from the process arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_epoch: Option<FenceEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_origin: Option<AcquireOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_epoch: Option<Epoch>,
+    /// Exact Guest-I/O gate state for the target path. Missing is legacy and
+    /// therefore not proof that a frontend is either open or closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_io_enabled: Option<bool>,
+    /// Immutable physical volume size reported by the running engine. Missing
+    /// is legacy and cannot satisfy a Runtime process handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Checkpointed transient-unit identity supplied by the signed Runtime.
+    /// The Node must also prove actual cgroup membership; this echo alone is
+    /// never systemd authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<Id>,
+    /// Fresh process-attempt token fsynced before spawn. Missing/corrupt values
+    /// are not adoptable and must never be reconstructed from a unit name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_identity_token: Option<RandomId128>,
+    /// Fresh Guest-device token fsynced with the serving launch. For
+    /// vhost-user this identifies the listener atomically created by the
+    /// serving process; missing is legacy/unproven and cannot be adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_ownership_token: Option<RandomId128>,
+    /// Exact GuestDeviceIdentity serial carried by every signed authorized
+    /// serving process. Missing is control-only or legacy/unproven and can
+    /// never satisfy a production serving handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_device_serial: Option<Id>,
+    /// Exact process mode. Missing means legacy; `guest_io_enabled=false`
+    /// alone is not proof that the process exposes only Host control I/O.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_only: Option<bool>,
+    /// Complete authoritative head loaded by a signed target-authority
+    /// process. Missing is legacy/unproven; a generation counter alone cannot
+    /// distinguish the checkpointed image root from an unrelated commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_head: Option<RemoteHead>,
     pub mode: String,
     pub local_durable_generation: i64,
     pub remote_durable_generation: i64,
@@ -218,6 +269,18 @@ mod tests {
         let status = DurabilityStatus {
             volume_id: "vol_x".to_string(),
             attachment_id: "att_x".to_string(),
+            attachment_epoch: None,
+            acquire_origin: None,
+            node_id: None,
+            placement_epoch: None,
+            guest_io_enabled: None,
+            size_bytes: None,
+            scope_id: None,
+            process_identity_token: None,
+            device_ownership_token: None,
+            guest_device_serial: Some(Id::new("cats-root").unwrap()),
+            control_only: None,
+            remote_head: None,
             mode: "relaxed".to_string(),
             local_durable_generation: 7,
             remote_durable_generation: 5,
@@ -236,7 +299,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
+            "{\"volume_id\":\"vol_x\",\"attachment_id\":\"att_x\",\"guest_device_serial\":\"cats-root\",\"mode\":\"relaxed\",\"local_durable_generation\":7,\"remote_durable_generation\":5,\"unpublished_generations\":2,\"unpublished_bytes\":65536,\"oldest_unpublished_age_ms\":250,\"max_unpublished_generations\":4096,\"max_unpublished_bytes\":8589934592,\"local_allocated_bytes\":131072,\"local_accounted_bytes\":196608,\"max_local_bytes\":17179869184,\"evicted_cache_chunks\":3,\"backpressured\":false,\"fenced\":false,\"last_publish_error\":\"timeout\"}"
         );
         assert_eq!(
             serde_json::from_str::<DurabilityStatus>(&serde_json::to_string(&status).unwrap())
@@ -253,6 +316,7 @@ mod tests {
         // what the node agent must read as "not adoptable".
         assert_eq!(status.volume_id, "");
         assert_eq!(status.attachment_id, "");
+        assert_eq!(status.guest_device_serial, None);
         // Every pre-existing field keeps its value and meaning.
         assert_eq!(status.mode, "relaxed");
         assert_eq!(status.local_durable_generation, 7);

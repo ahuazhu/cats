@@ -1,9 +1,8 @@
 <h2 id="operations">理解 Operation</h2>
-<p>Create、Lifecycle 与 Delete 请求是异步的。控制面记录包含 ID、类型、目标资源、阶段、时间戳和可选结构化错误的 Operation。</p>
-<pre><code>cats operation ls
-cats operation get OPERATION_ID
+<p>Cat Create 是异步的。控制面返回 canonical Operation 的 ID；该记录绑定 Cat、Desired Revision/Spec、Placement、Target、阶段、时间戳，以及可选的终态结果或错误。</p>
+<pre><code>cats operation get OPERATION_ID
 cats operation wait OPERATION_ID</code></pre>
-<p>阶段从 pending/running 进入 succeeded 或 failed。网络超时不代表原变更失败——重试前先查询已经接受的 Operation。</p>
+<p>Operation 从 <code>pending</code> 进入且只进入 <code>succeeded</code>、<code>failed</code> 或 <code>superseded</code> 之一。请使用接受该变更的同一 Workspace；其他 Workspace 与不存在的 ID 会有意返回相同结果。Operation List 当前不可用。网络超时不代表原变更失败——以相同持久 Create 意图重放并取回已接受的 ID，再精确查询该 Operation。</p>
 
 <h2 id="errors">常见错误类型</h2>
 <table><thead><tr><th>Code</th><th>含义</th><th>第一步处理</th></tr></thead><tbody>
@@ -20,7 +19,7 @@ cats operation wait OPERATION_ID</code></pre>
 <h2 id="cat-not-ready">Cat 无法 Ready</h2>
 <ol>
   <li>执行 <code>cats get NAME --json</code>，记录 desired/observed state 与 Node。</li>
-  <li>查看最近 Operation 及最终错误。</li>
+  <li>按已接受的 ID 查看 Operation 及其终态结果或错误。</li>
   <li>管理员检查 Node Heartbeat、blockd/Guest readiness、Console Output 与 Attachment Epoch。</li>
   <li>如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。</li>
 </ol>

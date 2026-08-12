@@ -1,50 +1,36 @@
-# ADR-0019：Cat 的绝对到期时间（自动删除）
+# ADR-0019：Cat绝对到期时间
 
 - 状态：Accepted
 - 日期：2026-07-28
+- Lifecycle authority：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)
 
-## 背景
+## 决策
 
-有些 Cat 在创建时就知道自己的生命周期是有界的，需要一个"到点自动回收"的
-边界。现有的 work-driven auto-suspend 和 auto-tier（ADR-0002）只做降级：
-Running → Suspended → Warm → Cold，从不删除。没有任何机制会自动把一个 Cat
-转到 Deleted，于是"到点回收"只能由控制面之外的 sweeper 记账并调用 DELETE，
-而外部 sweeper 正是这类编排里最容易静默失效的部分（凭据过期、cron 停摆、
-状态丢失）。
+Cat可配置绝对到期时间`expires_at_unix`（Unix秒）；缺省为永不过期。资源API提供读取、设置新
+绝对时间和清除操作。使用绝对时间使重试只重复写同一个值，不引入服务端TTL重置语义。
 
-## 决定
+设置或续期只更新到期属性，不立即创建lifecycle Operation。到期reaper发现
+`expires_at_unix <= now`后，在一个PostgreSQL事务中提交目标`Deleted`的新desired revision和
+kind=`cat.expire`的Operation。该mutation使用稳定idempotency identity；多个Controller副本
+重复扫描只得到一次有效删除意图。
 
-给 Cat 增加一个可选的**绝对到期时间** `expires_at_unix`（unix 秒）：
+删除按普通Cat Destroy合同收敛：先关闭route admission，处理Guest/VMM/blockd和卷屏障，
+RootDisk随Cat删除，PersistentDisk保持独立。到期时间本身不授予绕过drain、fencing或
+quarantine的权限。
 
-- `CreateCatRequest.expires_at_unix?: i64` — 创建时设定；缺省为永不过期。
-- `GET/PUT /v1/workspaces/{ws}/cats/{cat}/expiry` — 读取、续期（新的绝对时间）
-  或清除（`expires_at_unix: null`）。workspace token 可以调用，Cat 的使用方
-  自己就能续期。
-- 控制面 reconcile tick 里的 reaper：`expires_at_unix <= now` 且尚未在删除中的
-  Cat，走与 API delete 完全相同的收敛路径（`desired_state = Deleted`，操作
-  kind 为 `cat.expire`）。RootDisk 随 Cat 删除，PersistentDisk 存续，与
-  ADR-0002 的删除语义一致。
+## 失败语义
 
-语义选绝对时间而不是 TTL 时长：续期就是"写一个新的绝对时间"，没有服务端
-时钟重置语义，重放、重试、幂等都不需要额外规则。
+- PostgreSQL或Controller暂时不可用只延迟reaper；恢复后周期扫描继续，不依赖内存timer。
+- reaper与用户续期并发时以事务锁定后读取的当前值决定；已成功续期的Cat不能被旧扫描结果
+  删除。
+- 已提交的expire revision遵循普通Operation supersession；后续允许的用户mutation必须通过
+  同一资源状态机，不能直接撤销正在发生的物理清理。
+- `cats ls/get`持续显示到期时间，长期保留的Cat应清除该值。
 
-到期只是未来的记账，不是生命周期变更，所以 `PUT /expiry` 不 bump
-generation，也不生成 Operation；真正的删除到点时由 reaper 以自己的
-Operation 记录。
+## 验收
 
-## Schema 迁移立场的修正
-
-ADR 之前的立场是"schema 不迁移，重建数据库"（没有已发布部署的状态需要存活）。
-生产环境现在携带必须存活的控制面状态（workspace、token），这个前提不再成立。
-本 ADR 起：`SCHEMA_VERSION` 配对一个 `OLDEST_MIGRATABLE_SCHEMA_VERSION`，
-`Store::open` 对区间内的旧库原地升级（v1 → v2 为 `ALTER TABLE cats ADD COLUMN
-expires_at_unix INTEGER`），部署自动化用同样的区间判断放行。梯子只保留活跃
-部署仍需要的那几级，低于区间照旧拒绝。
-
-## 后果
-
-- 有界生命周期的回收内建于控制面，不再依赖外部 sweeper 的持续正确性。
-- 一个被遗忘的 `expires_at_unix` 会删掉还在用的 Cat；续期是使用方的责任。
-  要长期保留就清除到期时间。到期时间出现在每一行 `cats ls` 上，不需要专门
-  去查。
-- reaper 每 tick 扫一次到期集合（`cats` 上的单条 SELECT），代价可忽略。
+- 多Controller并发扫描、重复tick和进程重启只提交一个expire revision；
+- 到期与续期、手工Delete、Suspend/Warm/Cold并发具有确定性结果；
+- RootDisk/PersistentDisk、`R < L`和route guard合同与手工Destroy完全一致；
+- 数据库故障恢复后遗漏的到期项被重新发现；
+- 时间边界、负值/溢出、时钟回拨和远未来值有确定性测试。

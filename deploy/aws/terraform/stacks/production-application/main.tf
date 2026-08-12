@@ -1,29 +1,31 @@
 module "cats_kubernetes" {
   source = "../../modules/cats-kubernetes"
 
-  control_plane_image            = var.control_plane_image
-  control_plane_replicas         = var.control_plane_replicas
-  gateway_image                  = var.gateway_image
-  shared_route_cache_table       = var.shared_route_cache_table
-  runtime_secret_data            = var.runtime_secret_data
-  route_grant_private_key_pem    = var.route_grant_private_key_pem
-  route_grant_public_key_pem     = var.route_grant_public_key_pem
-  storage_postgres_url           = var.storage_postgres_url
-  storage_postgres_session_setup = var.storage_postgres_session_setup
-  usage_postgres_url             = var.usage_postgres_url
-  usage_postgres_schema          = var.usage_postgres_schema
-  usage_postgres_workers         = var.usage_postgres_workers
-  usage_delivery_adapter         = var.usage_delivery_adapter
-  usage_aws_region               = var.usage_aws_region
-  usage_kinesis_stream           = var.usage_kinesis_stream
-  usage_archive_bucket           = var.usage_archive_bucket
-  usage_checkpoint_table         = var.usage_checkpoint_table
-  stripe_enabled                 = var.stripe_enabled
-  stripe_secret_key              = var.stripe_secret_key
-  stripe_webhook_secret          = var.stripe_webhook_secret
-  stripe_topup_price_ids         = var.stripe_topup_price_ids
-  stripe_livemode                = var.stripe_livemode
-  rds_ca_pem                     = var.rds_ca_pem
+  control_plane_image                   = var.control_plane_image
+  control_plane_replicas                = var.control_plane_replicas
+  runtime_secret_data                   = var.runtime_secret_data
+  route_grant_private_key_pem           = var.route_grant_private_key_pem
+  route_grant_public_key_pem            = var.route_grant_public_key_pem
+  runtime_provisioner_trust_bundle_json = var.runtime_provisioner_trust_bundle_json
+  storage_postgres_url                  = var.storage_postgres_url
+  storage_postgres_session_setup        = var.storage_postgres_session_setup
+  chunkstore_bucket_name                = var.chunkstore_bucket_name
+  chunkstore_region                     = var.aws_region
+  chunkstore_prefix                     = var.chunkstore_prefix
+  usage_postgres_url                    = var.usage_postgres_url
+  usage_postgres_schema                 = var.usage_postgres_schema
+  usage_postgres_workers                = var.usage_postgres_workers
+  usage_delivery_adapter                = var.usage_delivery_adapter
+  usage_aws_region                      = var.usage_aws_region
+  usage_kinesis_stream                  = var.usage_kinesis_stream
+  usage_archive_bucket                  = var.usage_archive_bucket
+  usage_checkpoint_table                = var.usage_checkpoint_table
+  stripe_enabled                        = var.stripe_enabled
+  stripe_secret_key                     = var.stripe_secret_key
+  stripe_webhook_secret                 = var.stripe_webhook_secret
+  stripe_topup_price_ids                = var.stripe_topup_price_ids
+  stripe_livemode                       = var.stripe_livemode
+  rds_ca_pem                            = var.rds_ca_pem
 
   # In-cluster reconciliation of the database credential (ADR-0029, #77). The
   # Pod Identity association it needs lives in the infrastructure state.
@@ -35,7 +37,6 @@ module "cats_kubernetes" {
   acm_certificate_arn             = var.acm_certificate_arn
   public_subnet_ids               = var.public_subnet_ids
   control_plane_hosts             = var.control_plane_hosts
-  endpoint_wildcard_host          = var.endpoint_wildcard_host
 }
 
 # Public DNS.
@@ -49,10 +50,9 @@ module "cats_kubernetes" {
 locals {
   manage_dns = var.route53_zone_id != null
 
-  dns_hosts = toset(concat(
-    var.control_plane_hosts,
-    var.endpoint_wildcard_host == null ? [] : [var.endpoint_wildcard_host],
-  ))
+  # Endpoint wildcard DNS stays absent with the v2 Gateway deployment. A
+  # control-plane-only ALB must not advertise a dead or legacy data-plane path.
+  dns_hosts = toset(var.control_plane_hosts)
 }
 
 # Located by the tag EKS puts on the load balancer it provisions, because the

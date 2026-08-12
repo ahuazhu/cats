@@ -119,10 +119,11 @@ Disk Action Verb 为 `mount`、`unmount` 与 `resize`。Mount Body 指定 Cat �
 
 ## Operation
 
-    GET /v1/workspaces/{workspace_id}/operations
-    GET /v1/operations/{operation}
+    GET /v1/workspaces/{workspace_id}/operations/{operation}
 
-Operation 包含不可变 `workspace_id` Owner、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Workspace 分段，访问仍按 Workspace 限制。
+这个精确查询返回 canonical Runtime Reconciliation Operation：不可变的 Workspace/Cat/Revision/Spec/Placement 绑定、Target、时间戳，以及 `pending`、`succeeded`、`failed` 或 `superseded` 结算状态。成功响应使用 `application/json`，并携带 `Cache-Control: no-store`。
+
+服务端先完成 Workspace 鉴权，再查询 opaque Operation ID。属于其他 Workspace 的 ID 与不存在的 ID 返回完全相同的 `not_found`。旧的全局 `GET /v1/operations/{operation}` 和 Workspace Operation Collection/List 路由均已退役；当前不提供无界 List 合同。
 
 ## 错误
 

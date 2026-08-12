@@ -13,18 +13,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json \
-    -p cats-control-plane-daemon \
-    -p cats-network
+    -p cats-control-plane-daemon
 
 COPY . .
 RUN cargo build --locked --release \
       -p cats-control-plane-daemon \
-      -p cats-network \
-    && strip \
-      target/release/cats-controld \
-      target/release/cats-gatewayd \
-    && install -D -m 0755 target/release/cats-controld /out/cats-controld \
-    && install -D -m 0755 target/release/cats-gatewayd /out/cats-gatewayd
+    && strip target/release/cats-controld \
+    && install -D -m 0755 target/release/cats-controld /out/cats-controld
 
 FROM debian:bookworm-slim AS runtime
 
@@ -32,14 +27,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 cats \
-    && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats
+    && useradd --uid 10001 --gid cats --home-dir /var/lib/cats --create-home cats \
+    && install -d -o 0 -g 0 -m 0755 /etc/cats/identity
 
 COPY --from=builder /out/cats-controld /usr/local/bin/cats-controld
-COPY --from=builder /out/cats-gatewayd /usr/local/bin/cats-gatewayd
+# Produced once by the Guest release job and shared byte-for-byte with the
+# worker bundle. A missing payload is a build failure, never a runtime default.
+COPY --chown=0:0 --chmod=0644 guest-runtime-release.v1/guest-runtime-profile.v1.json /opt/cats/release/guest-runtime-profile.v1.json
+COPY --chown=0:0 --chmod=0644 guest-runtime-release.v1/manifest.v1.json /opt/cats/release/guest-runtime-release-manifest.v1.json
 
 USER 10001:10001
 WORKDIR /var/lib/cats
-EXPOSE 7300 7400
+EXPOSE 7300
 ENTRYPOINT ["/usr/local/bin/cats-controld"]
 
 # The in-cluster credential refresher (ADR-0029). A separate target rather than

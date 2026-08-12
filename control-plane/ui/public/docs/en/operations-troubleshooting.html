@@ -1,9 +1,8 @@
 <h2 id="operations">Understand Operations</h2>
-<p>Create, lifecycle, and delete requests are asynchronous. The control plane records an Operation with an ID, kind, target resource, phase, timestamps, and an optional structured error.</p>
-<pre><code>cats operation ls
-cats operation get OPERATION_ID
+<p>Cat create is asynchronous. The control plane returns an ID for the canonical Operation that binds the Cat, desired revision/spec, placement, target, phase, timestamps, and optional terminal result or error.</p>
+<pre><code>cats operation get OPERATION_ID
 cats operation wait OPERATION_ID</code></pre>
-<p>Phases move from pending/running to succeeded or failed. A network timeout does not prove that the original mutation failed—look up the accepted Operation before retrying.</p>
+<p>An Operation moves from <code>pending</code> to exactly one of <code>succeeded</code>, <code>failed</code>, or <code>superseded</code>. Select the same Workspace that accepted the mutation; another Workspace and an absent ID intentionally look identical. Operation list is unavailable. A network timeout does not prove that the original mutation failed—replay the same durable create intent to recover its accepted ID, then query that exact Operation.</p>
 
 <h2 id="errors">Common error classes</h2>
 <table><thead><tr><th>Code</th><th>Meaning</th><th>First response</th></tr></thead><tbody>
@@ -20,7 +19,7 @@ cats operation wait OPERATION_ID</code></pre>
 <h2 id="cat-not-ready">Cat does not become Ready</h2>
 <ol>
   <li>Run <code>cats get NAME --json</code> and note desired/observed state and node.</li>
-  <li>Inspect recent Operations and the final error.</li>
+  <li>Inspect the accepted Operation by ID and its terminal result or error.</li>
   <li>Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.</li>
   <li>If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.</li>
 </ol>

@@ -10,8 +10,10 @@ cats-storage = { workspace = true }
 native-tls = { workspace = true }
 postgres = { workspace = true }
 postgres-native-tls = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
+cats-control-plane = { workspace = true }
 cats-test-support = { workspace = true }
 tempfile = { workspace = true }
 

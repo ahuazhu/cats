@@ -2,76 +2,56 @@
 
 - 状态：Accepted
 - 日期：2026-07-22
-
-> CLI project token 部分已由 ADR-0008 取代；本 ADR 的浏览器 session、组织映射和
-> user/admin 隔离决定继续有效。无 Organization 的 Personal Project 及
-> Organization/Workspace 一一映射已由 ADR-0014 取代。文中全部 Project 资源边界已由
-> ADR-0018 的 Workspace 取代，映射键是 Account slug。
+- 相关：[ADR-0014](0014-account-workspace-identity-billing-and-switching.md)、
+  [ADR-0018](0018-remove-the-v1-project-compatibility-layer.md)
 
 ## 背景
 
-V1 开发控制面最初只接受静态 Bearer Token。它适合 node-agent、gateway、CLI 和
-自动化测试，但不适合作为生产 Web 登录：浏览器需要用户身份、组织成员关系、短期
-会话、登出、MFA/SSO 扩展点，以及 user/admin 两个站点之间明确的权限边界。
+浏览器入口需要用户身份、Organization membership、短期会话、登出、MFA/SSO 扩展点，
+并且必须把用户站、管理员站和机器身份隔离。Cats 的资源归属是 Account/Workspace；WorkOS
+负责用户认证和 Organization membership，Cats 负责把已验证身份映射为不可变的
+`account_id` / `workspace_id` 并执行资源授权。
 
-完整产品架构已经要求 Edge/API Gateway 校验 OIDC/session/API token 并生成 tenant
-context。本 ADR 确定当前 Rust 控制面中浏览器身份的具体实现，同时保留已有机器和
-CLI 调用契约。
+## 决策
 
-## 决定
+1. 嵌入式 user/admin Web 站点使用 **WorkOS AuthKit Hosted UI**。授权码流程使用 PKCE 和
+   随机 `state`；回调由服务端通过官方 SDK 交换 code，WorkOS API key 不进入浏览器。
+2. WorkOS Organization scope 解析为一个 Cats Account。Account 内的 Workspace 选择必须
+   再校验 Workspace ownership 与 active membership；slug、email、显示名和浏览器本地状态
+   都不是授权主键。
+3. Personal 与 Organization Account 都遵循 ADR-0014 的领域模型。Personal Account 只允许
+   owner，Organization Account 的可见性和权限来自 active WorkOS membership。部署预置的
+   Organization 使用显式 Account slug 到 WorkOS Organization ID 的映射；未映射身份
+   fail closed。
+4. user/admin 使用不同的 AES-GCM sealed、`HttpOnly`、`SameSite=Lax` Cookie。生产 HTTPS
+   Cookie 带 `Secure`。Cookie 保存当前 Organization scope、Account、Workspace 和旋转
+   refresh token；服务端忽略客户端提交的 Account identity，并从 session 与 membership
+   重新解析。
+5. 同一 Account 内切换 Workspace 只更新经过校验的 Workspace context。跨 Account 切换通过
+   旋转 refresh token 请求目标 Organization scope，验证返回的 user/organization identity
+   后原子替换 session。并发 refresh 按 session 串行，失败不覆盖仍有效的 session。
+6. Fleet 管理员使用独立 admin session，并且必须同时属于配置的管理员 Organization、持有
+   `cats:fleet:admin` permission。普通 user session 或普通 Organization member 不能访问
+   admin API。
+7. node-agent、Gateway、Controller 和 fleet 自动化使用独立机器凭据。WorkOS session 不获得
+   service 权限，Guest 不接收 WorkOS、Cookie、service 或 admin 凭据。
+8. WorkOS 未配置时浏览器入口 fail closed，不提供静态 token 登录表单。未过期且已 sealed 的
+   session 可以继续本地验证；新登录、membership refresh 和 token refresh 需要 WorkOS。
 
-1. 嵌入式 user/admin Web 站点使用 **WorkOS AuthKit Hosted UI** 登录。授权码流程
-   必须使用 PKCE 和随机 `state`；回调在服务端交换 code，WorkOS API Key 不进入
-   浏览器。
-2. WorkOS Organization 与 Cats Project 通过显式配置一一映射。用户 session 的
-   `org_id` 只允许访问对应 project；未映射 organization fail closed。没有
-   Organization membership 的 AuthKit 用户只在 user 站获得由 WorkOS `user_id`
-   确定的独立个人 Project（`personal-<user_id>`），不得回落到共享 Project。该例外
-   不适用于 admin 站。
-3. Fleet 管理员使用独立 admin session cookie，并且必须同时满足：
-   - session 属于配置的管理员 Organization；
-   - session permissions 包含 `cats:fleet:admin`（名称可配置）。
-   普通 organization member 或只拥有 user cookie 的请求不得访问 admin API。
-4. user/admin 使用不同的 AES-GCM sealed、`HttpOnly`、`SameSite=Lax` Cookie。生产
-   HTTPS 下 Cookie 必须带 `Secure`。短期 access token 过期后，控制面使用 sealed
-   refresh token 向 WorkOS 换取并轮换 session；认证响应不得缓存。
-5. 内部服务继续使用独立 Bearer Token：service token 只用于 node-agent、gateway 与
-   控制器，admin token 用于 fleet 自动化。普通用户 CLI 鉴权已由 ADR-0008 改为
-   WorkOS Device Login，不再使用 project token。WorkOS session 不得获得 service
-   权限，Guest 不接收任何上述凭据。
-6. user/admin Web 站点只使用 WorkOS 登录，不提供静态 Token 表单或开发回退。
-   WorkOS 未配置时浏览器站点 fail closed。Bearer API 本身仍保留给 CLI 和内部服务。
-7. 使用 WorkOS 官方 Rust SDK 提供的 AuthKit、PKCE 与 sealed-session helper，不自行
-   实现密码学协议。由此 workspace 最低 Rust 版本从 1.85 提升到 1.88。
-8. 公共 user 入口不预先枚举 Project。若 WorkOS Hosted UI 因现有登录上下文返回一个
-   未映射 Organization，但该用户的 active membership 与部署映射的交集恰好只有一个
-   Workspace，控制面使用 WorkOS refresh-token organization switching 将该 session
-   切换到唯一候选后再授权。候选为零个或多个时 fail closed；无 Organization session
-   的个人 Project 行为不变。该规则避免同时拥有平台管理员 Organization 和一个用户
-   Workspace 的账号被管理员登录上下文挡在 user 站之外。
+## 安全与验收
 
-## 安全边界
+- `WORKOS_API_KEY`、Cookie password、access/refresh token 不进入前端 JavaScript、公开配置、
+  数据库日志、错误响应或 Guest。
+- 登录 flow cookie 有界过期；回调必须匹配 site、sealed flow、`state` 和允许的 return path，
+  code/state 重放必须失败。
+- 每次资源请求最终按不可变 `account_id` / `workspace_id` 和 active membership 授权；跨
+  Workspace、跨 Account、inactive membership 和 scope 不匹配全部 fail closed。
+- user/admin Cookie、权限和路由彼此隔离；admin session 不能调用 service-only Node/Gateway
+  API。
+- refresh token 轮换、跨 Account 切换、多标签页并发及 WorkOS 暂时不可用均有回归测试，失败
+  不清空或降权绕过一个仍有效的 session。
 
-- `WORKOS_API_KEY`、Cookie password、refresh/access token 不写数据库日志、不返回
-  `/auth/config`、不进入前端 JavaScript 或 Guest。
-- 登录 flow cookie 最长 10 分钟；回调必须同时匹配 sealed flow、site、state 和
-  return path。组织 session 必须匹配请求的 organization；仅 user 站允许无组织
-  session 进入其确定性的个人 Project。自动 organization switching 前必须从 WorkOS
-  重新读取 active memberships；切换后的 user ID、organization ID 和显式 Project
-  映射必须全部匹配，否则拒绝登录。
-- user/admin session 相互独立；admin session 可以管理所有 Cats projects，但不能
-  调用 service-only node/gateway API。
-- Project 名称不通过公开认证配置接口枚举。公共用户入口先完成 WorkOS 认证，再从
-  已验证的 Organization membership 或 WorkOS user ID 确定工作区；受控邀请链接仍可
-  显式指定团队或个人 Project，并在回调时重新校验身份匹配。
+## 后果
 
-## 影响
-
-- WorkOS 不可用时，未过期且已 sealed 的浏览器 access token 仍可完成本地校验；新
-  登录和到期 refresh 会失败。CLI 的详细失败语义见 ADR-0008；service 路径不依赖
-  WorkOS。
-- 每个生产环境需要配置 WorkOS redirect URI、团队 Project/Organization 映射、
-  管理员 Organization 和权限；无组织用户的个人 Project 无需预配置。生产 Web
-  必须使用 HTTPS。
-- AuthKit 基础登录与企业 SSO/Directory Sync 的商业计费独立，启用企业连接前需要
-  将连接成本计入产品套餐。
+浏览器身份由 WorkOS 承担，资源授权仍由 Cats 的 Account/Workspace 模型承担。新登录和会话
+续期依赖 WorkOS；已经 Running 的数据面和机器服务路径不依赖浏览器身份服务。

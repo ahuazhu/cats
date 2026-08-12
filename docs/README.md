@@ -1,73 +1,170 @@
 # Cats 文档索引
 
-HTML 面向人类阅读和视觉演示；同名 Markdown 面向 Agent/实现者，包含可检索正文、Mermaid 图、明确状态和本地证据链接。实验总报告原生为 Markdown。
+这里是工程文档的唯一入口。架构和协议只维护 Markdown；不再维护一套容易漂移的静态
+HTML companion。公开产品文档仍由 `control-plane/ui/` 独立维护双语 HTML/Markdown。
 
-## 规格（实现的直接依据）
+## 先读什么
 
-| 文档 | 状态 | 对应实现 |
+1. [技术架构](architecture.md)：大目标、组件、唯一权威、故障边界和实施路线。
+2. [Runtime 生命周期](runtime-lifecycle.md)：Running/Suspended/Warm/Cold、route/data屏障。
+3. [存储架构](storage.md)：当前 Rust ChunkStore、Strict/Relaxed、fencing和恢复边界。
+4. 与任务相关的 accepted ADR 和 `docs/specs/` 合同。
+5. 需要引用数字时再读[实验总报告](experiments-2026-07-21-storage-lifecycle.md)及其原始证据。
+
+Agent注册的HTTP/proof/lease见
+[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)；Node本地identity
+artifact与单一Guest release payload见
+[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)。
+
+## 当前实现与目标
+
+决策状态和实现状态是两回事。2026-08-12 的 clean-slate cutover 边界：
+
+| 范围 | 当前 Rust/部署 | 已接受目标 |
 |---|---|---|
-| [blockd 协议规格](specs/blockd-protocol.md) | Frozen v1 | `blockd/`（常量出处 `api/src/chunk.rs`）；改动需新增 ADR |
-| [Guest Runtime API v1](specs/guest-runtime-api.md) | Frozen v1 | `guest/` 的 `/run/cats/runtime.sock` HTTP 工作租约；依据 ADR-0007 |
-| [Interactive Shell Protocol v1](specs/interactive-shell-protocol.md) | Implemented v1 | `cats shell` 的 WorkOS 鉴权 WebSocket、Node/Guest PTY 流；依据 ADR-0009 |
+| 存储 | ChunkStore、delta pack、golden root、NBD/vhost-user、S3/PostgreSQL adapters及ADR-0042 attachment/lease转换已实现并测试 | Snapshot/GC与外部Host-fence qualification仍是独立边界 |
+| 生命周期协调 | A19 session、A20 Desired/observation、A23 placement、完整物理inventory、checkpoint-first per-Cat reconciler与真实Cat-create v2已组成 | 完整lifecycle cutover与clean exact release仍开放，且须通过本页所列Linux/metal qualification；不提供legacy fallback |
+| Route | Route Grant v2、Node AdmissionCell/guard、Gateway-to-Node mTLS tunnel及退役/重启恢复已实现 | installer默认不安装ring/mTLS listener artifacts，未组成时machine ingress保持Closed；跨Node overlay仍deferred |
+| Agent restart | Host lock、per-Cat systemd scopes、union inventory、current-authority receipt/checkpoint恢复与旧boot清理已实现 | superseded pre-acquire publication不在已完成声明内；具体release仍须在systemd 255 + KVM/Cloud Hypervisor上保留exact-SHA证据 |
+| 控制面 HA | PostgreSQL A19/A20/A22/A23、bounded executor、Operation查询与多副本锁序已实现 | 真实RDS failover与外部Host fence仍需独立qualification，不从timeout推断隔离 |
+| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC和跨Host rejoin仍按各自合同/故障矩阵验收 |
+| placement/网络 | A23 provisioner policy、同snapshot planner、exact Desired `/30`与per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
+| privilege | 进程权限仍较集中 | privilege separation尚未实现 |
 
-实现状态一览见根 [README](../README.md#实现状态)。真实 microVM（Cloud Hypervisor + KVM）已实现为 node-agent 的 `--vmm ch` 模式（`node-agent/src/ch.rs`）；块路径有两种前端：内核 NBD（默认）与原生 vhost-user-blk（[ADR-0015](decisions/0015-vhost-user-blk-production-block-frontend.md)、协议规格 §7.1）——两者都通过同一套 i4i.metal 真机验收含 Warm 状态对齐，见 [2026-07-26 实验](../experiments/vhost-user-blk-frontend-20260726/README.md)；默认值按写吞吐权衡仍留 kernel-nbd，裸金属部署与验收见 [deploy/metal/](../deploy/metal/README.md)。共享 PostgreSQL root/lease 元数据 adapter、每 Cat `/30` tap 和 owning-node HTTP 入站已实现；并发唤醒准入与限流已实现（`node-agent/src/admission.rs`，ADR-0002 §8；按 resume commitment 字节数计量的节点预算 + 有界排队，并放开了 `ResumeCat` 的节点内并发）。delta pack（[ADR-0016](decisions/0016-delta-pack-page-granular-commits.md)：一次提交只发布脏的 64 KiB 页，而不是整 4 MiB chunk）、golden root（[ADR-0017](decisions/0017-golden-root-shared-base-images.md)：按引用从共享镜像开盘）和 digest-pinned OCI Bundle Deploy（[ADR-0024](decisions/0024-digest-pinned-oci-bundle-deploy.md)：Guest 校验、扁平化 layer 并生成 systemd 服务，不依赖 Docker/OverlayFS）已实现；节点内 cold create 也已不再全节点串行（`node-agent/src/runtime/supervisor.rs`：per-Cat 锁常驻，节点锁只在需要分配 NBD 设备/tap 等节点全局资源时叠加）。仍属后续里程碑：跨 Node Guest overlay、WebSocket 入站、控制面资源库 PostgreSQL/outbox 化、特权拆分、`RestoreCat` 并发化（需先让 `start_cat` 的块设备/tap 分配并发安全）。
+协调面按 [Operations and HA §8](operations-ha.md#8-首次终态部署)一次 clean-slate 切换：离线验证
+exact release，维护窗口内退出旧组件并清空产品状态，轮换 credentials，再启动唯一的空 authority
+schema 14和冻结协议。生产`cats-noded`只启动signed Runtime composition；legacy注册、heartbeat、
+work-status和work acquire/release不在生产route map，显式retired harness仅用于历史行为测试。
 
-Rust 工程质量现状、已修问题和后续优先项见 [Rust 工程实践审查](rust-engineering-review.md)。
+生产composition及current-Desired Running路径的attach、conditional takeover、checkpoint、ext4 readiness与
+AdmissionCell已有typed recovery和故障回归；这不宣称superseded pre-acquire publication或完整lifecycle已经
+闭合。PG/Linux production-public-spawn测试已组成真实PostgreSQL、installed scanner、systemd PID 1与
+production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、checkpoint、restart adoption与exact
+退役；它不执行S3数据面、device/TAP/VMM/Guest或稳定Running。精确证据边界见
+[当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)。任何具体部署仍必须以exact clean SHA
+通过Mac full、Linux full及适用的systemd/KVM资格测试；文档状态不是release准入。
 
-## 公开用户文档
+## Active architecture
 
-控制面会把无需登录的产品用户文档发布到 `/docs/`（英语）和 `/zh-CN/docs/`（简体中文）。
-可索引 HTML 片段位于 `control-plane/ui/public/docs/<locale>/*.html`；每个页面都有同名
-Markdown companion，便于 Agent 检索并满足 HTML/Markdown 同步维护约定。入口分别为：
+| 文档 | 状态 | 用途 |
+|---|---|---|
+| [architecture.md](architecture.md) | Target + current boundary | 系统总图、authority matrix、HA合同和路线 |
+| [runtime-lifecycle.md](runtime-lifecycle.md) | Product contract | 四态、work/admission、数据屏障、Host loss |
+| [storage.md](storage.md) | Implemented core + explicit gaps | ChunkStore格式、FLUSH、L/R、lease/fencing、GC |
+| [operations-ha.md](operations-ha.md) | Target operations contract | failure domain、有界DB、Host fence/rejoin、分层qualification |
+| [architecture-cross-review.md](architecture-cross-review.md) | Accepted review + current evidence boundary | 三边界交叉复核、阻断项关闭与可复现证据终点 |
+| [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 2026-07-21方法、样本、结果和失败尝试 |
 
-- [English usage docs](../control-plane/ui/public/docs/en/index.md)
-- [简体中文使用文档](../control-plane/ui/public/docs/zh-CN/index.md)
+## Active specs
 
-这些页面描述当前 Rust workspace 已实现的用户能力，并明确标注 vhost-user-blk 真机验收、
-跨 Node tap/overlay、控制面资源库 PostgreSQL 化与权限拆分等尚未完成项。跨组件事实仍以 ADR、
-原始实验数据和本文档索引中的架构 Markdown 为更高优先级来源。
+| 规格 | 状态 | 实现 |
+|---|---|---|
+| [blockd protocol](specs/blockd-protocol.md) | Implemented data plane + target Volume Authority | Chunk/Map/FLUSH已实现；pack v2/grant adoption未实现 |
+| [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | `/run/cats/runtime.sock`、work lease |
+| [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS鉴权 WebSocket PTY |
+| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Production spine + current-Desired Running path implemented | checkpoint/inventory/per-Cat effects及current-authority route/volume barriers；superseded publication、完整lifecycle和外部fence仍开放 |
+| [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Implemented frozen v1 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
+| [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Implemented frozen v1 | Desired read-position、inventory/observation接受与freshness |
+| [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Implemented frozen v1 | local NodeIdentity artifact与单一Guest release payload |
+| [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Implemented frozen v1 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
+| [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
+| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
+| [Route Grant v2](specs/route-grant-v2.md) | Core与machine tunnel implemented；public proxy closed | ADR-0041 AdmissionCell、Grant及machine tunnel；未安装ring/mTLS时不监听 |
+| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen target，部分实现 | 独立signer reference/public ring artifact；持久rotation/ACK composition未实现 |
+| [Volume Authority](specs/volume-authority.md) | Current-Desired Running attachment/ext4 path implemented | superseded publication及ADR-0042 Snapshot/GC/Host-fence边界仍按明确qualification矩阵推进 |
 
-Fleet 管理员指南不属于官网用户文档。其双语源文件位于
-`control-plane/ui/ops/docs/<locale>/index.{html,md}`，生产环境由 `ops.cats.run/docs/`
-与 `ops.cats.run/zh-CN/docs/` 提供，并通过 `noindex` 与官网 sitemap 隔离。
+协议状态必须明确写 `Implemented/Frozen` 或 `Target, not implemented`。不存在“文档写了就算
+代码存在”。
 
-如果同一设计的两种格式暂时不同，以 ADR 和实验数据为最高依据，随后以 Markdown 的实现约束为准，并尽快同步 HTML。
+## Active decisions
 
-## 当前基线
+### 基础与资源边界
 
-| 文档 | 人类版 | Agent 版 | 状态 | 用途 |
-|---|---|---|---|---|
-| 完整产品与技术架构 | [HTML](cats-complete-product-technical-architecture.html) | [Markdown](cats-complete-product-technical-architecture.md) | 产品/系统基线 | 资源模型、CLI/API、控制面、Node、VM、网络、存储、安全、可靠性和交付阶段 |
-| Direct-S3 ChunkStore（Direct-OS 实现）详细设计 | [HTML](direct-s3-chunkstore-architecture.html) | [Markdown](direct-s3-chunkstore-architecture.md) | 已选定存储基线（ADR-0003） | cats-blockd 的对象块存储：Chunk/Map、Pending Commit、FLUSH、lease/fencing、Snapshot、GC 与恢复 |
-| 睡眠、唤醒与资源回收 | [HTML](cats-sleep-wake-vmm-resource-reclamation.html) | [Markdown](cats-sleep-wake-vmm-resource-reclamation.md) | 生命周期基线（ADR-0002 四态） | Running、Suspended（pause/page-out）、Warm（snapshot/VMM exit）、Cold 的资源与失败处理 |
-| 工作驱动快速休眠 | — | [Markdown](cats-auto-tier-product-and-implementation-design.md) | V1 dev shape（ADR-0007 Guest ABI） | 显式工作租约、立即 Suspend、Guest Runtime HTTP、竞态栅栏与 fail-awake |
-| 让真实应用能睡 | [HTML](cats-sleepable-workload-design.html) | [Markdown](cats-sleepable-workload-design.md) | 设计提案，未实现 | 真实负载被休眠时的十一类症状与责任划分：Service 定义、`pin`/`drain` 两种保活语义、`slept_ms`、只叫醒的时刻表 + 错过清单、框架适配器 |
-| 实验总报告 | — | [Markdown](experiments-2026-07-21-storage-lifecycle.md) | 实验证据 | 方法、代码、正式数字、失败尝试、结论和未验证事项 |
+- [0001 Greenfield baseline](decisions/0001-greenfield-implementation-baseline.md)
+- [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
+- [0003 Direct-OS ChunkStore](decisions/0003-direct-s3-chunkstore-backend.md)
+- [0004 Rust 技术栈](decisions/0004-implementation-stack-and-dev-environment.md)
+- [0005 Storage Ports and Adapters](decisions/0005-provider-neutral-storage-ports-and-adapters.md)
+- [0018 Workspace 唯一 owner](decisions/0018-remove-the-v1-project-compatibility-layer.md)
 
-## 历史方案与外部参考
+### 身份、入口和产品 API
 
-| 文档 | 人类版 | Agent 版 | 状态 | 用途 |
-|---|---|---|---|---|
-| 存储架构设计（JuiceFS raw 方案） | [HTML](cats-storage-product-blueprint.html) | [Markdown](cats-storage-product-blueprint.md) | 历史参考，未采用（ADR-0003） | RootDisk/PersistentDisk 产品语义的最初出处；JuiceFS-backed disk.raw 备选设计 |
-| Sprite 小文件存储路径 | [HTML](sprite-storage-flow.html) | [Markdown](sprite-storage-flow.md) | 历史/竞品参考 | 解释小文件、ext4 逻辑块、Chunk 和对象存储之间的关系 |
-| 竞品与市场格局分析 | — | [Markdown](cats-competitive-landscape.md) | 外部调研快照（2026-07-25） | 按五个关键指标逐项横比（成本/持久性/环境保真度/隔离/并发）、逐产品档案、独立持久卷、计量基准与实际账单、自建 vs 买的成本边界、需求侧证据、Cats 的优势与差距、国内合规约束 |
+- [0006 WorkOS AuthKit](decisions/0006-workos-authkit-for-browser-identity.md)
+- [0007 Guest Runtime HTTP/Unix socket](decisions/0007-guest-runtime-http-over-unix-socket.md)
+- [0008 CLI Device Login](decisions/0008-workos-device-login-and-cli-workspaces.md)
+- [0009 Interactive Shell](decisions/0009-interactive-shell-over-authenticated-websocket.md)
+- [0010 默认 HTTP Endpoint](decisions/0010-default-http-endpoint-per-cat.md)
+- [0014 Account/Workspace/Billing](decisions/0014-account-workspace-identity-billing-and-switching.md)
+- [0019 Cat absolute expiry](decisions/0019-absolute-cat-expiry.md)
+- [0023 systemd Guest PID 1](decisions/0023-systemd-as-the-default-guest-init.md)
+- [0024 digest-pinned OCI bundle](decisions/0024-digest-pinned-oci-bundle-deploy.md)
+- [0026 OCI deploy outlives request](decisions/0026-oci-deploy-outlives-its-request.md)
 
-`Sprite` 文档用于理解和比较，不代表 Cats 必须复刻其未公开实现。
-[竞品与市场格局分析](cats-competitive-landscape.md)是外部调研快照，不是实现契约；
-其中已证实 Sprites 即 Fly.io 于 2026-01 发布的产品，且证实了 `sprite-storage-flow.md` 中标注的结构性推断。Direct-S3（Direct-OS 实现）已按 ADR-0003 选定为存储基线；当前 Python 原型只证明语义，不能代表生产性能。JuiceFS 蓝图不再实现，其中与后端无关的产品语义已并入完整架构文档。
+### 存储、数据与计费
 
-## Architecture Decision Records
+- [0011 累计 usage ledger](decisions/0011-cumulative-usage-metering-and-billing-ledger.md)
+- [0012 Terraform AWS](decisions/0012-terraform-managed-aws-resources-and-deployments.md)
+- [0013 prepaid credit/Stripe](decisions/0013-prepaid-credit-ledger-and-stripe-checkout.md)
+- [0015 vhost-user-blk](decisions/0015-vhost-user-blk-production-block-frontend.md)
+- [0016 delta packs](decisions/0016-delta-pack-page-granular-commits.md)
+- [0017 golden roots](decisions/0017-golden-root-shared-base-images.md)
+- [0021 Relaxed durability](decisions/0021-relaxed-durability-tier.md)
+- [0022 dual watermark](decisions/0022-relaxed-local-first-dual-watermark.md)
+- [0042 Volume Authority与磁盘生命周期](decisions/0042-volume-authority-and-disk-lifecycle.md)
+- [0025 disposable Root destroy](decisions/0025-destroy-disposable-root-without-remote-drain.md)
+- [0029 database password authority](decisions/0029-one-authority-for-the-database-password.md)
+- [0034 RDS Proxy](decisions/0034-bound-postgresql-connections-with-rds-proxy.md)
 
-- [ADR-0001：Greenfield implementation baseline](decisions/0001-greenfield-implementation-baseline.md)
-- [ADR-0002：生命周期四态 Running / Suspended / Warm / Cold](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
-- [ADR-0003：存储后端选定 Direct-OS ChunkStore（Direct-S3 实现）](decisions/0003-direct-s3-chunkstore-backend.md)
-- [ADR-0004：实现技术栈（全 Rust）与开发测试环境](decisions/0004-implementation-stack-and-dev-environment.md)
-- [ADR-0005：云无关存储边界采用 Ports and Adapters](decisions/0005-provider-neutral-storage-ports-and-adapters.md)
-- [ADR-0006：浏览器身份使用 WorkOS AuthKit](decisions/0006-workos-authkit-for-browser-identity.md)
-- [ADR-0007：Guest Runtime API 使用 Unix Socket 上的 HTTP](decisions/0007-guest-runtime-http-over-unix-socket.md)
-- [ADR-0008：CLI 使用 WorkOS Device Login 与多 Workspace 会话](decisions/0008-workos-device-login-and-cli-workspaces.md)
-- [ADR-0009：交互式 Shell 使用受鉴权的 WebSocket PTY 流](decisions/0009-interactive-shell-over-authenticated-websocket.md)
-- [ADR-0010：每个 Cat 默认获得稳定 HTTP Endpoint](decisions/0010-default-http-endpoint-per-cat.md)
-- [ADR-0024：按 digest 固定的 OCI Bundle Deploy，不引入 Docker/OverlayFS](decisions/0024-digest-pinned-oci-bundle-deploy.md)
+### 协调与高可用
 
-后续发生会改变数据格式、公开 API、故障语义或组件边界的决定时，应新增 ADR，而不是直接覆盖实验结论。
+- [0031 PostgreSQL control store](decisions/0031-control-store-on-postgresql.md)
+- [0032 control-plane multi-replica](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)
+- [0038 production cell qualification](decisions/0038-production-account-qualification-cell-boundary.md)
+- [0040 level-triggered runtime reconciliation](decisions/0040-level-triggered-runtime-reconciliation.md)
+- [0041 Node-verified route admission](decisions/0041-node-verified-route-admission.md)
+- [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
+- [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
+- [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)
+- [0046 Gateway到Node Route v2 machine tunnel](decisions/0046-gateway-node-route-v2-machine-tunnel.md)
+
+### Deferred
+
+- [0020 S3 Express One Zone hot commits](decisions/0020-s3-express-one-zone-hot-commits.md)：
+  不属于当前实现路线；需要新的成本/可用性证据才重新评估。
+
+## Evidence
+
+实验源码、正式 CSV、环境报告、原始日志和失败 crash evidence保留在 `experiments/`，入口见
+[`experiments/README.md`](../experiments/README.md)。主要已知证据包括：
+
+- Cloud Hypervisor + KVM bare-metal生命周期验收；
+- kernel-NBD/vhost-user-blk同场对照；
+- 双节点真实 S3 + RDS 的 Cold migration；
+- delta/golden root、Relaxed local-first、fencing和crash injection。
+
+这些证据证明各自记录的样本和 oracle，不自动证明控制面 HA、真实 RDS failover、自动
+Host fencing、Snapshot/GC安全或生产 SLA。引用数字时必须保留环境、样本量、测量边界和
+correctness oracle。
+
+## Source of truth
+
+冲突时按以下顺序：
+
+1. Accepted且未被 supersede的 ADR；
+2. Frozen/implemented spec；对尚未实现的切换则以 target spec为目标合同；
+3. 当前 Rust/SQL和可重复测试决定“现在实际做什么”；
+4. 原始实验数据决定测量事实；
+5. `architecture.md`/专题文档用于组合上述边界。
+
+文档不能覆盖代码事实，也不能把 prototype结果写成生产承诺。
+
+## 维护规则
+
+- 一个事实只在一个 authority文档展开；其他位置用链接，不复制滚动状态和 benchmark表。
+- 改公开 API、persisted format、Guest ABI、故障语义或组件 authority必须新增 ADR。
+- Superseded ADR留短 tombstone；未实现且被否决的 spec直接删除，Git就是 archive。
+- architecture Markdown不再生成/手工维护 static HTML。
+- 实验源码、CSV、环境报告、原始日志和失败 evidence不得因结论变化而删除。
+- 任何实现变更仍执行 `./scripts/quality.sh fast`，handoff前执行 `./scripts/quality.sh full`；
+  Linux-only block/Node代码以现有native x86_64 build host的exact-SHA `full`为最终门，本机无该
+  Host时用`./scripts/quality.sh linux`做Docker兼容检查。

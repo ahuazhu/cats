@@ -26,14 +26,17 @@ use serde::{Deserialize, Serialize};
 
 pub use cats_api::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
 use cats_api::guest::{
-    AcquireGuestWorkLeaseRequest, GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody,
-    GuestRuntimeApiError, GuestRuntimeApiErrorResponse, GuestShellFrame, GuestWorkLease,
-    GuestWorkStatus, RenewGuestWorkLeaseRequest, GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES,
-    MAX_WORK_LEASE_TTL_MS,
+    read_guest_request_frame, write_filesystem_control_response_frame,
+    write_runtime_ready_response_frame, AcquireGuestWorkLeaseRequest, GuestRequestBody,
+    GuestResponse, GuestResponseBody, GuestRuntimeApiError, GuestRuntimeApiErrorResponse,
+    GuestShellFrame, GuestWorkLease, GuestWorkStatus, RenewGuestWorkLeaseRequest,
+    GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
 use cats_block_client::NbdClient;
 
+mod filesystem_control;
 mod oci;
+mod runtime_ready;
 
 // ---------------------------------------------------------------------------
 // Guest runtime HTTP/1.1 over Unix socket.
@@ -289,6 +292,15 @@ pub enum GuestMode {
     /// oracle); syncfs is the real syscall; the kernel owns the disks, so
     /// block-level ops are not served here.
     Vm,
+}
+
+/// Local endpoint returned by `getsockname(2)` on the accepted AF_VSOCK
+/// stream.  This kernel fact, rather than a Guest-configured value, is echoed
+/// in RuntimeReady.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VsockLocalEndpoint {
+    cid: u32,
+    port: u32,
 }
 
 pub struct GuestAgent {
@@ -613,7 +625,16 @@ impl GuestAgent {
     }
 
     pub fn handle(&self, req: GuestRequestBody) -> GuestResponseBody {
-        match self.try_handle(req) {
+        self.handle_on_transport(req, None, None)
+    }
+
+    fn handle_on_transport(
+        &self,
+        req: GuestRequestBody,
+        vsock_endpoint: Option<VsockLocalEndpoint>,
+        peer_fd: Option<std::os::fd::RawFd>,
+    ) -> GuestResponseBody {
+        match self.try_handle(req, vsock_endpoint, peer_fd) {
             Ok(resp) => resp,
             Err(e) => GuestResponseBody::Error {
                 message: format!("{e:#}"),
@@ -630,7 +651,12 @@ impl GuestAgent {
         Ok(())
     }
 
-    fn try_handle(&self, req: GuestRequestBody) -> Result<GuestResponseBody> {
+    fn try_handle(
+        &self,
+        req: GuestRequestBody,
+        vsock_endpoint: Option<VsockLocalEndpoint>,
+        peer_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<GuestResponseBody> {
         match req {
             GuestRequestBody::Health => {
                 self.counter.fetch_add(1, Ordering::SeqCst);
@@ -643,6 +669,31 @@ impl GuestAgent {
                     uptime_ms: self.started.elapsed().as_millis() as u64,
                     disks,
                 })
+            }
+            GuestRequestBody::RuntimeReady { ready } => {
+                anyhow::ensure!(
+                    self.mode == GuestMode::Vm,
+                    "RuntimeReady is available only in a real Guest"
+                );
+                let endpoint =
+                    vsock_endpoint.context("RuntimeReady requires an accepted AF_VSOCK stream")?;
+                let ready = runtime_ready::RuntimeReadyCollector::system().collect(
+                    ready,
+                    endpoint,
+                    &self.boot_id,
+                )?;
+                Ok(GuestResponseBody::RuntimeReady { ready })
+            }
+            GuestRequestBody::FilesystemControl { filesystem } => {
+                anyhow::ensure!(
+                    self.mode == GuestMode::Vm,
+                    "filesystem control is available only in a real Guest"
+                );
+                vsock_endpoint
+                    .context("filesystem control requires an accepted AF_VSOCK stream")?;
+                let filesystem = filesystem_control::FilesystemController::system()
+                    .execute(filesystem, peer_fd)?;
+                Ok(GuestResponseBody::FilesystemControl { filesystem })
             }
             GuestRequestBody::WorkStatus {
                 after_sequence,
@@ -907,14 +958,18 @@ impl GuestAgent {
     pub fn serve_control(self: &std::sync::Arc<Self>, listener: UnixListener) {
         for conn in listener.incoming() {
             let Ok(stream) = conn else { return };
-            self.serve_control_stream(stream);
+            self.serve_control_stream(stream, None);
         }
     }
 
-    fn serve_control_stream(self: &std::sync::Arc<Self>, mut stream: UnixStream) {
+    fn serve_control_stream(
+        self: &std::sync::Arc<Self>,
+        mut stream: UnixStream,
+        vsock_endpoint: Option<VsockLocalEndpoint>,
+    ) {
         let agent = self.clone();
         std::thread::spawn(move || {
-            while let Ok(req) = read_frame::<_, GuestRequest>(&mut stream) {
+            while let Ok(req) = read_guest_request_frame(&mut stream) {
                 match req.body {
                     GuestRequestBody::Shell { rows, cols } => {
                         if let Err(error) = agent.serve_shell(&mut stream, req.id, rows, cols) {
@@ -931,11 +986,26 @@ impl GuestAgent {
                         break;
                     }
                     body => {
+                        let is_runtime_ready =
+                            matches!(&body, GuestRequestBody::RuntimeReady { .. });
+                        let is_filesystem_control =
+                            matches!(&body, GuestRequestBody::FilesystemControl { .. });
                         let resp = GuestResponse {
                             id: req.id,
-                            body: agent.handle(body),
+                            body: agent.handle_on_transport(
+                                body,
+                                vsock_endpoint,
+                                Some(std::os::fd::AsRawFd::as_raw_fd(&stream)),
+                            ),
                         };
-                        if write_frame(&mut stream, &resp).is_err() {
+                        let written = if is_runtime_ready {
+                            write_runtime_ready_response_frame(&mut stream, &resp)
+                        } else if is_filesystem_control {
+                            write_filesystem_control_response_frame(&mut stream, &resp)
+                        } else {
+                            write_frame(&mut stream, &resp)
+                        };
+                        if written.is_err() {
                             break;
                         }
                     }
@@ -1116,8 +1186,8 @@ impl GuestAgent {
     #[cfg(target_os = "linux")]
     pub fn serve_vsock_control(self: &std::sync::Arc<Self>, listener: VsockListener) -> Result<()> {
         loop {
-            let stream = listener.accept()?;
-            self.serve_control_stream(stream);
+            let (stream, endpoint) = listener.accept()?;
+            self.serve_control_stream(stream, Some(endpoint));
         }
     }
 
@@ -1232,7 +1302,7 @@ pub struct VsockListener(std::os::fd::OwnedFd);
 
 #[cfg(target_os = "linux")]
 impl VsockListener {
-    fn accept(&self) -> Result<std::os::unix::net::UnixStream> {
+    fn accept(&self) -> Result<(std::os::unix::net::UnixStream, VsockLocalEndpoint)> {
         use std::os::fd::{AsRawFd, FromRawFd};
         loop {
             // SAFETY: the listener owns a valid AF_VSOCK descriptor; null
@@ -1247,10 +1317,48 @@ impl VsockListener {
                 )
             };
             if fd >= 0 {
+                // Query the accepted stream itself. The listener was bound to
+                // VMADDR_CID_ANY, so its configured address is not evidence of
+                // the CID Cloud Hypervisor actually assigned to this Guest.
+                // SAFETY: zero initializes all padding; `getsockname` writes at
+                // most the supplied live sockaddr_vm and length.
+                let mut local: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+                let mut local_len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+                // SAFETY: `fd` is the new live socket and both pointers remain
+                // valid for the duration of this call.
+                let rc = unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut local as *mut libc::sockaddr_vm).cast(),
+                        &mut local_len,
+                    )
+                };
+                if rc != 0
+                    || usize::try_from(local_len).ok()
+                        != Some(std::mem::size_of::<libc::sockaddr_vm>())
+                    || i32::from(local.svm_family) != libc::AF_VSOCK
+                {
+                    // SAFETY: the accepted descriptor has not yet been
+                    // transferred to an owning Rust value.
+                    unsafe { libc::close(fd) };
+                    anyhow::bail!(
+                        "vsock getsockname: {}",
+                        if rc == 0 {
+                            "noncanonical AF_VSOCK address".to_owned()
+                        } else {
+                            std::io::Error::last_os_error().to_string()
+                        }
+                    );
+                }
+                let endpoint = VsockLocalEndpoint {
+                    cid: local.svm_cid,
+                    port: local.svm_port,
+                };
                 // SAFETY: a successful `accept4` returns a fresh owned stream
                 // descriptor, transferred exactly once to `UnixStream` as a
                 // generic owning stream-fd wrapper.
-                return Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+                let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                return Ok((stream, endpoint));
             }
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1309,6 +1417,7 @@ pub fn bind_vsock(_port: u32) -> Result<VsockListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::guest::GuestRequest;
 
     #[test]
     fn frame_roundtrip() {
@@ -1333,7 +1442,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        agent.serve_control_stream(server);
+        agent.serve_control_stream(server, None);
 
         write_frame(
             &mut client,
@@ -1386,6 +1495,55 @@ mod tests {
         std::fs::write(&map_path, b"{}").unwrap();
         let agent = GuestAgent::new(map_path.clone(), None);
         let boot_id = agent.boot_id().to_string();
+
+        assert!(matches!(
+            agent.handle(GuestRequestBody::RuntimeReady {
+                ready: cats_api::guest::RuntimeReadyRequestV1 {
+                    version: 1,
+                    challenge: cats_api::runtime_reconciliation::RandomId128::new(
+                        "11111111111111111111111111111111"
+                    )
+                    .unwrap(),
+                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                        "22222222222222222222222222222222"
+                    )
+                    .unwrap(),
+                    expected_guest_cid: 3,
+                    expected_guest_port: 5_000,
+                    expected_guest_agent_protocol_version: 1,
+                },
+            }),
+            GuestResponseBody::Error { .. }
+        ));
+
+        let vm_agent = GuestAgent::with_mode(GuestMode::Vm, map_path.clone(), None);
+        let rejected = vm_agent.handle_on_transport(
+            GuestRequestBody::RuntimeReady {
+                ready: cats_api::guest::RuntimeReadyRequestV1 {
+                    version: 1,
+                    challenge: cats_api::runtime_reconciliation::RandomId128::new(
+                        "11111111111111111111111111111111",
+                    )
+                    .unwrap(),
+                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                        "22222222222222222222222222222222",
+                    )
+                    .unwrap(),
+                    expected_guest_cid: 3,
+                    expected_guest_port: 5_000,
+                    expected_guest_agent_protocol_version: 1,
+                },
+            },
+            Some(VsockLocalEndpoint {
+                cid: 4,
+                port: 5_000,
+            }),
+            None,
+        );
+        let GuestResponseBody::Error { message } = rejected else {
+            panic!("mismatched accepted AF_VSOCK endpoint was accepted")
+        };
+        assert!(message.contains("accepted AF_VSOCK"), "{message}");
 
         match agent.handle(GuestRequestBody::Health) {
             GuestResponseBody::Health {

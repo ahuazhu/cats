@@ -20,6 +20,17 @@ variable "usage_archive_bucket_name" {
   type        = string
 }
 
+variable "chunkstore_bucket_name" {
+  description = "Platform stack chunkstore_bucket_name output."
+  type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix used by blockd and cats-controld."
+  type        = string
+  default     = "cats"
+}
+
 variable "usage_archive_object_lock_days" {
   description = "Default governance retention for archived raw usage objects."
   type        = number
@@ -121,7 +132,7 @@ variable "worker_managed_environment" {
 }
 
 variable "worker_runtime_secret_data" {
-  description = "Worker CATS_AUTH_TOKEN delivered through Secrets Manager. A legacy CATS_POSTGRES_URL is still accepted but no longer read."
+  description = "Optional legacy CATS_POSTGRES_URL compatibility map. Signed workers must not receive CATS_AUTH_TOKEN."
   type        = map(string)
   sensitive   = true
   default     = {}

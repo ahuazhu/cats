@@ -15,6 +15,8 @@ use crate::resources::{
     WorkLease,
 };
 
+/// Legacy product-authority request retained only for the explicit pre-cutover
+/// test composition. Production clients use [`crate::cat_create::CatCreateV2Request`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCatRequest {
     pub name: String,
@@ -153,7 +155,7 @@ pub struct ProxyHttpRequest {
     /// Public hostname whose active binding authorized this hop.
     #[serde(default)]
     pub hostname: String,
-    /// Opaque EdDSA JWS issued by the control plane (ADR-0033).
+    /// Opaque V1 EdDSA JWS issued by the control plane.
     #[serde(default)]
     pub route_grant: String,
 }

@@ -29,7 +29,7 @@ impl ChunkEngine {
                     if engine.is_fenced() {
                         return;
                     }
-                    match engine.meta.renew_lease(
+                    match engine.authority.renew_lease(
                         &engine.cfg.volume_id,
                         &engine.cfg.attachment_id,
                         engine.epoch,
@@ -65,13 +65,34 @@ impl ChunkEngine {
     /// local journal files alive so the caller can retry; silently releasing
     /// them would turn a transient remote outage into acknowledged data loss.
     pub fn detach(&self) -> Result<()> {
+        let AuthorityBackend::Legacy(metadata) = &self.authority else {
+            return Err(EngineError::GuestIoDisabled);
+        };
         if self.is_fenced() {
             return Err(EngineError::Fenced);
         }
         self.drain_staged()?;
         self.stop_renewal();
-        self.meta
-            .release_lease(&self.cfg.volume_id, &self.cfg.attachment_id, self.epoch)?;
+        metadata.release_lease(&self.cfg.volume_id, &self.cfg.attachment_id, self.epoch)?;
+        Ok(())
+    }
+
+    /// Stop a target-authority serving process without releasing or otherwise
+    /// mutating attachment ownership. The Runtime reconciler owns the later
+    /// exact release transition.
+    pub fn stop_authorized_serving(&self) -> Result<()> {
+        if !matches!(&self.authority, AuthorityBackend::Target(_))
+            || self.authorized_attachment.is_none()
+        {
+            return Err(EngineError::InvalidConfig(
+                "engine is not an authorized target serving attachment".into(),
+            ));
+        }
+        if self.is_fenced() {
+            return Err(EngineError::Fenced);
+        }
+        self.drain_staged()?;
+        self.stop_renewal();
         Ok(())
     }
 

@@ -71,7 +71,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat systemd-run; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -86,20 +86,48 @@ locals {
     seed_temp=""
     route_grant_key_temp=""
     route_grant_key_fingerprint=""
+    archive_entries=""
+    release_transaction_active=0
+    release_installer=""
     cleanup() {
+      status=$?
+      trap - EXIT INT TERM
+      if [ "$release_transaction_active" -eq 1 ]; then
+        systemctl mask --runtime cats-worker >/dev/null 2>&1 || true
+        cats_stop_node_service cats-worker >/dev/null 2>&1 || true
+        "$release_installer" rollback >/dev/null 2>&1 || true
+      fi
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp" "$archive_entries"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
       done
+      exit "$status"
     }
     trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     aws s3 cp --no-progress "s3://${aws_s3_bucket.artifacts.id}/${aws_s3_object.worker_bundle.key}" "$artifact_path"
     echo "${var.worker_bundle_sha256}  $artifact_path" | sha256sum --check --strict -
+    archive_entries="$(mktemp /var/tmp/cats-worker-entries.XXXXXX)"
+    tar --zstd -tf "$artifact_path" > "$archive_entries"
+    awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { exit 1 }
+      seen[$0]++ { exit 1 }
+    ' "$archive_entries"
+    tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
+    . "$stage_path/worker-deployment-transaction.sh"
+    "$stage_path/install-guest-runtime-release.sh" verify \
+      "$stage_path/guest-runtime-release.v1"
+    # The validator is itself part of the digest-checked, preflighted bundle.
+    # Do not execute anything from the empty mktemp stage before extraction.
+    # Identity validation still precedes the idle check, service stop, or any
+    # installed-file mutation.
+    "$stage_path/validate-node-identity-installation.sh"
 
     cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
 
@@ -144,27 +172,71 @@ locals {
     )"
     printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
 
+    # One Host-global open-file-description lock spans the entire mutation,
+    # candidate start/readiness proof, and commit/rollback boundary.
+    test "${var.install_root}" = /opt/cats
+    release_installer="${var.install_root}/bin/install-guest-runtime-release"
+    cats_acquire_worker_deployment_lock
+
+    # Before publishing an activation journal, close both ways the cached old
+    # unit could start: a runtime mask covers this boot, while the fsynced new
+    # unit/recovery helper covers a reboot. Only then may prepare expose a
+    # candidate release identity. The unlocked idle check above is only an
+    # early preflight: recompute the cgroup path after serialization and prove
+    # physical idle again immediately before the masked stop.
+    metering_root="$(cats_worker_metering_root cats-worker)"
+    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
+    cats_gate_node_service cats-worker
+    cats_worker_deployment_crash_probe after-mask-worker
+    install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
+    cats_worker_deployment_crash_probe after-install-release-installer
+    install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
+    cats_worker_deployment_crash_probe after-install-deployment-transaction
+    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
+    cats_worker_deployment_crash_probe after-install-worker-unit
+    sync -f "$release_installer"
+    sync -f "${var.install_root}/bin/worker-deployment-transaction"
+    sync -f "${var.install_root}/bin"
+    sync -f /etc/systemd/system/cats-worker.service
+    sync -f /etc/systemd/system
+    cats_worker_deployment_crash_probe after-fsync-worker-recovery-gate
+    systemctl daemon-reload
+    cats_worker_deployment_crash_probe after-recovery-gate-daemon-reload
+
+    release_transaction_active=1
+    "$release_installer" prepare "$stage_path/guest-runtime-release.v1"
+    cats_worker_deployment_crash_probe after-installer-return
+
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
+    cats_worker_deployment_crash_probe after-install-cats-noded
+    install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
+    cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
+    cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
+    cats_worker_deployment_crash_probe after-install-cats-guest-agent
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
+    cats_worker_deployment_crash_probe after-install-guest-seed-updater
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
+    cats_worker_deployment_crash_probe after-install-idle-guard
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
-    install -m 0644 "$stage_path/cats-worker.service" /etc/systemd/system/cats-worker.service
+    cats_worker_deployment_crash_probe after-install-postgres-renderer
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
+    cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
+    cats_worker_deployment_crash_probe after-install-postgres-timer
 
     install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
+    cats_worker_deployment_crash_probe after-install-route-key
     installed_route_grant_key_fingerprint="$(
       openssl pkey -pubin -in /etc/cats/route-grant-public.pem -outform DER \
         | sha256sum \
         | awk '{print $1}'
     )"
     test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
-
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
     aws secretsmanager get-secret-value \
@@ -177,12 +249,10 @@ locals {
     # A host still carrying the old key in worker.env is harmless once
     # cats-worker passes url-file.
     jq -er '
-      if (keys - ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]) != [] then
+      if (keys - ["CATS_POSTGRES_URL"]) != [] then
         error("unexpected worker runtime secret keys")
-      elif (has("CATS_AUTH_TOKEN") | not) then
-        error("worker runtime secret is missing CATS_AUTH_TOKEN")
       else
-        to_entries[] | "\(.key)=\(.value)"
+        [to_entries[] | "\(.key)=\(.value)"] | join("\n")
       end
     ' "$runtime_secret" > "$runtime_overlay"
 
@@ -199,31 +269,16 @@ CATS_MANAGED_ENVIRONMENT
     # production path ever created the non-secret half of the configuration.
     # Seed it once; an existing file is left alone so operator edits survive.
     if [ ! -f "${var.worker_environment_file}" ]; then
-      # Node identity is per worker, never fleet-shared configuration: a
-      # second host seeded from a shared map would register as a duplicate of
-      # the first. The name is this association's worker key; the advertise
-      # address is the host's own primary private IP from IMDSv2.
-      #
-      # The seed is assembled in a temporary file and only installed at the
-      # final path once every fallible step has succeeded. Writing the final
-      # path first would let an IMDS failure strand a worker.env without
-      # identity that no later run repairs, because seeding only happens when
-      # the file is absent.
-      imds_token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
-      private_ipv4="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/local-ipv4)"
-      test -n "$private_ipv4"
-
+      # Identity is never environment or IMDS data. The provisioner must have
+      # installed the closed /etc/cats/identity artifact before this release.
       seed_temp="$(mktemp /var/tmp/cats-worker-seed.XXXXXX)"
       cat > "$seed_temp" <<'CATS_BASE_ENVIRONMENT'
 ${local.worker_base_environment}
 CATS_BASE_ENVIRONMENT
-      {
-        echo "CATS_NODE_ID=__CATS_WORKER_NAME__"
-        echo "CATS_NODE_ADVERTISE_URL=http://$private_ipv4:7301"
-      } >> "$seed_temp"
 
       mkdir -p "$(dirname "${var.worker_environment_file}")"
       install -o root -g root -m 0600 "$seed_temp" "${var.worker_environment_file}"
+      cats_worker_deployment_crash_probe after-install-worker-environment-seed
     fi
 
     environment_temp="$(mktemp /var/tmp/cats-worker-env.XXXXXX)"
@@ -238,7 +293,11 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_METERING_CGROUP_ROOT") {
+        if (key == "CATS_AUTH_TOKEN") {
+          # Signed Agent registration is the only production Node credential.
+          # A rolling cutover must remove a bearer left by an older release.
+          next
+        } else if (key == "CATS_METERING_CGROUP_ROOT") {
           print "CATS_METERING_CGROUP_ROOT=" metering_root
           metering_found = 1
         } else if (key in replacement) {
@@ -261,27 +320,41 @@ CATS_BASE_ENVIRONMENT
       }
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
     install -o root -g root -m 0600 "$environment_temp" "${var.worker_environment_file}"
+    cats_worker_deployment_crash_probe after-install-worker-environment
 
-    # Replace the golden RootDisk immediately before stopping the idle node. This
-    # minimizes the window in which a create request could reuse the old
-    # in-memory golden-root ID after the on-disk seed has changed.
+    # Replace the golden RootDisk while the worker remains stopped. No create
+    # can observe a new seed under an in-memory ID computed from the old bytes.
     "${var.install_root}/bin/update-guest-seed" \
       "${var.install_root}/guest/rootfs.ext4" \
       "$stage_path/cats-guest-agent" \
       "$stage_path/guest-systemd"
+    cats_worker_deployment_crash_probe after-update-guest-seed
 
     systemctl daemon-reload
+    cats_worker_deployment_crash_probe after-daemon-reload
 
     # The timer covers a rotation that happens while the worker keeps running.
     # cats-worker renders the DSN itself before every start, so this is not on
     # the startup path; `--now` also proves the renderer works on this host
     # before the worker is stopped, rather than after it fails to come back.
     systemctl enable --now cats-postgres-url.timer
+    cats_worker_deployment_crash_probe after-enable-postgres-timer
     systemctl start cats-postgres-url.service
+    cats_worker_deployment_crash_probe after-start-postgres-renderer
 
-    systemctl stop cats-worker
+    cats_begin_candidate_lifetime cats-worker "$release_installer"
+    cats_worker_deployment_crash_probe after-authorize-worker-start
+    cats_ungate_node_service cats-worker
+    cats_worker_deployment_crash_probe after-unmask-worker
     systemctl start cats-worker
-    systemctl is-active --quiet cats-worker
+    cats_worker_deployment_crash_probe after-start-worker
+    cats_bind_candidate_main cats-worker "$release_installer"
+    cats_worker_deployment_crash_probe after-bind-worker-main
+    cats_wait_for_registered_node cats-worker
+    cats_worker_deployment_crash_probe after-registration-readiness
+    cats_commit_candidate "$release_installer"
+    release_transaction_active=0
+    cats_worker_deployment_crash_probe after-release-commit
     echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
@@ -385,7 +458,7 @@ resource "aws_s3_object" "worker_bundle" {
 
 resource "aws_secretsmanager_secret" "worker_runtime" {
   name                    = "${local.resource_name}-runtime"
-  description             = "Root-only runtime credentials fetched by the Cats metal worker during Terraform-managed deployment."
+  description             = "Root-only transitional worker compatibility values; signed workers receive no shared Control bearer."
   recovery_window_in_days = 30
 
   tags = local.tags
@@ -480,7 +553,7 @@ resource "aws_ssm_association" "worker_deploy" {
   parameters = {
     # The script is shared across the fleet except for the one line where a
     # fresh host learns who it is.
-    commands = replace(local.deployment_script, "__CATS_WORKER_NAME__", each.key)
+    commands = local.deployment_script
   }
 
   targets {

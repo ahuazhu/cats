@@ -15,6 +15,7 @@ const I18N_JS: &str = include_str!("../ui/i18n.js");
 const COMMON_JS: &str = include_str!("../ui/common.js");
 const USER_JS: &str = include_str!("../ui/user.js");
 const ADMIN_JS: &str = include_str!("../ui/admin.js");
+const CAT_CREATE_V2_JS: &str = include_str!("../ui/cat-create-v2.mjs");
 
 const PUBLIC_CSS: &str = include_str!("../ui/public/public.css");
 const LANDING_EN: &str = include_str!("../ui/public/landing-en.html");
@@ -900,6 +901,10 @@ pub async fn admin_script() -> Response {
     console_asset("text/javascript; charset=utf-8", ADMIN_JS)
 }
 
+pub async fn cat_create_v2_script() -> Response {
+    console_asset("text/javascript; charset=utf-8", CAT_CREATE_V2_JS)
+}
+
 pub async fn public_styles() -> Response {
     public_asset("text/css; charset=utf-8", PUBLIC_CSS)
 }
@@ -969,10 +974,52 @@ pub async fn sitemap() -> Response {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{
-        ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS, I18N_JS, LANDING_EN, LANDING_ZH,
-        USER_HTML, USER_JS,
+    use axum::body::to_bytes;
+    use axum::extract::OriginalUri;
+    use cats_api::runtime_reconciliation::{
+        RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+        RUNTIME_VOLUME_TRANSITION_PATH,
     };
+
+    use super::{
+        not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS, COMMON_JS, DOCS, I18N_JS,
+        LANDING_EN, LANDING_ZH, USER_HTML, USER_JS,
+    };
+
+    #[tokio::test]
+    async fn runtime_unmatched_route_fallback_has_the_shared_exact_shape() {
+        let response =
+            not_found(OriginalUri(RUNTIME_VOLUME_TRANSITION_PATH.parse().unwrap())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get("x-robots-tag").unwrap(),
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS
+        );
+        assert_eq!(
+            to_bytes(
+                response.into_body(),
+                RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY.len()
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+            RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY
+        );
+    }
 
     fn quoted_keys(source: &str, prefix: &str) -> BTreeSet<String> {
         let mut keys = BTreeSet::new();
@@ -1047,7 +1094,26 @@ mod tests {
     }
 
     #[test]
-    fn user_console_polls_for_background_lifecycle_changes() {
+    fn user_console_refreshes_without_probing_closed_resource_projections() {
+        let load_all = USER_JS
+            .split("async function loadAll")
+            .nth(1)
+            .and_then(|source| source.split("function render()").next())
+            .expect("loadAll is present");
+        for contract in [
+            "state.cats = []",
+            "state.disks = []",
+            "state.operations = []",
+        ] {
+            assert!(
+                load_all.contains(contract),
+                "missing local reset {contract:?}"
+            );
+        }
+        assert!(
+            !load_all.contains("authenticatedRequest("),
+            "background refresh must not probe a closed authority projection"
+        );
         for contract in [
             "window.setInterval(",
             "!document.hidden",
@@ -1059,6 +1125,86 @@ mod tests {
                 "missing polling contract: {contract}"
             );
         }
+    }
+
+    #[test]
+    fn shipped_consoles_expose_only_v2_create_across_the_closed_authority_boundary() {
+        for contract in [
+            "buildCatCreateV2Request",
+            "sendDurableCatCreateV2",
+            "resumePendingCatCreates",
+            "bootImageDigest: values.get(\"boot_image_digest\")",
+            "durability: values.get(\"durability\")",
+        ] {
+            assert!(
+                USER_JS.contains(contract),
+                "missing v2 create contract {contract:?}"
+            );
+        }
+        for contract in [
+            "parseCatCreateV2AcceptedResponseBody",
+            "status !== 202",
+            "globalThis.indexedDB",
+            "globalThis.navigator?.locks",
+            "{ durability: \"strict\" }",
+            "insertWithinWorkspaceLimit",
+            "PendingReplayToken",
+            "Idempotency-Key",
+            "request_body",
+        ] {
+            assert!(
+                CAT_CREATE_V2_JS.contains(contract),
+                "missing durable v2 create contract {contract:?}"
+            );
+        }
+        for contract in [
+            "name=\"boot_image_digest\"",
+            "name=\"vcpus\"",
+            "name=\"memory_mib\"",
+            "name=\"root_gib\"",
+            "name=\"durability\"",
+            "data-view=\"cats\" hidden",
+            "data-view=\"disks\" hidden",
+            "data-view=\"operations\" hidden",
+        ] {
+            assert!(
+                USER_HTML.contains(contract),
+                "missing cutover UI contract {contract:?}"
+            );
+        }
+        let create_handler = USER_JS
+            .split("document.querySelector(\"#create-cat-form\")")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("document.querySelector(\"#create-disk-form\")")
+                    .next()
+            })
+            .expect("create handler is present");
+        assert!(create_handler.contains("sendPendingCatCreate("));
+        assert!(USER_JS.contains("request.expectedPending"));
+        assert!(
+            USER_JS.matches("resumePendingCatCreates()").count() >= 4,
+            "pending create recovery must be wired into initialization, Workspace switching, and refresh"
+        );
+        for retired_create_field in [
+            "values.get(\"image\")",
+            "auto_suspend: true",
+            "disk: null",
+            "response.cat.name",
+            "waitForOperation(response.operation)",
+        ] {
+            assert!(
+                !create_handler.contains(retired_create_field),
+                "production create still uses {retired_create_field:?}"
+            );
+        }
+        assert!(ADMIN_HTML.contains("data-view=\"nodes\" hidden"));
+        assert!(ADMIN_HTML.contains("id=\"view-nodes\" hidden"));
+        assert!(USER_JS.contains("assertRuntimeCutoverClientRequestSupported(path"));
+        assert!(ADMIN_JS.contains("assertRuntimeCutoverClientRequestSupported(path"));
+        assert!(CAT_CREATE_V2_JS.contains("retiredWorkspaceSurface"));
+        assert!(CAT_CREATE_V2_JS.contains("retiredFleetSurface"));
     }
 
     #[test]

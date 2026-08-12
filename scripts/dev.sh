@@ -19,68 +19,11 @@ API=127.0.0.1:7300
 GW=127.0.0.1:7400
 
 up() {
-  mkdir -p "$STATE" "$LOGS" "$STATE/blob"
-  command -v openssl >/dev/null 2>&1 || {
-    echo "scripts/dev.sh needs openssl to create the local Route Grant key" >&2
-    exit 1
-  }
-  if [[ ! -f "$STATE/route-grant-private.pem" ]]; then
-    openssl genpkey -algorithm ED25519 -out "$STATE/route-grant-private.pem"
-    chmod 0600 "$STATE/route-grant-private.pem"
-  fi
-  openssl pkey \
-    -in "$STATE/route-grant-private.pem" \
-    -pubout \
-    -out "$STATE/route-grant-public.pem"
-  echo "building workspace..."
-  (cd "$ROOT" && cargo build --workspace -q)
-  BIN="$ROOT/target/debug"
-
-  echo "starting control plane on http://$API"
-  "$BIN/cats-controld" \
-    --listen "$API" \
-    --route-grant-private-key-file "$STATE/route-grant-private.pem" \
-    --route-grant-public-key-file "$STATE/route-grant-public.pem" \
-    --db-path "$STATE/control.db" \
-    --metadata-store-adapter sqlite \
-    --metadata-store-option "path=$STATE/storage-meta.db" \
-    >"$LOGS/controld.log" 2>&1 &
-  echo $! > "$STATE/controld.pid"
-
-  echo "starting gateway on http://$GW"
-  "$BIN/cats-gatewayd" \
-    --listen "$GW" \
-    --control-plane-url "http://$API" \
-    >"$LOGS/gatewayd.log" 2>&1 &
-  echo $! > "$STATE/gatewayd.pid"
-
-  sleep 0.5
-  echo "starting node agent n1"
-  "$BIN/cats-noded" \
-    --node-id n1 \
-    --control-plane-url "http://$API" \
-    --route-grant-public-key-file "$STATE/route-grant-public.pem" \
-    --gateway-url "http://$GW" \
-    --state-dir "$STATE/node-n1" \
-    --metadata-store-adapter sqlite \
-    --metadata-store-option "path=$STATE/storage-meta.db" \
-    --object-store-adapter file \
-    --object-store-option "root=$STATE/blob" \
-    --blockd-bin "$BIN/cats-blockd" \
-    --guest-agent-bin "$BIN/cats-guest-agent" \
-    >"$LOGS/noded.log" 2>&1 &
-  echo $! > "$STATE/noded.pid"
-
-  sleep 0.5
-  echo
-  echo "ready. try:"
-  echo "  cats create dev --root-size 64MiB"
-  echo "  cats exec dev -- echo hello"
-  echo "  cats suspend dev && cats resume dev"
-  echo "  cats expose dev 8080 --name web    # then:"
-  echo "  curl -H 'Host: web.dev.default.cats.local' http://$GW/"
-  echo
-  echo "logs: $LOGS  |  stop: scripts/dev.sh down"
+  echo "scripts/dev.sh up is unavailable after the signed Agent-registration cutover." >&2
+  echo "Use the process tests for loopback development; production cats-noded requires" >&2
+  echo "a provisioner-owned /etc/cats/identity set, the installed shared Guest release," >&2
+  echo "and an HTTPS Control origin. No hostname/CLI/shared-token fallback is provided." >&2
+  return 1
 }
 
 down() {

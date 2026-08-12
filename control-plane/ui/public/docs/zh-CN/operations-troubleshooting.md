@@ -1,12 +1,11 @@
 ## 理解 Operation
 
-Create、Lifecycle 与 Delete 请求是异步的。控制面记录包含 ID、类型、目标资源、阶段、时间戳和可选结构化错误的 Operation。
+Cat Create 是异步的。控制面返回 canonical Operation 的 ID；该记录绑定 Cat、Desired Revision/Spec、Placement、Target、阶段、时间戳，以及可选的终态结果或错误。
 
-    cats operation ls
     cats operation get OPERATION_ID
     cats operation wait OPERATION_ID
 
-阶段从 pending/running 进入 succeeded 或 failed。网络超时不代表原变更失败——重试前先查询已经接受的 Operation。
+Operation 从 `pending` 进入且只进入 `succeeded`、`failed` 或 `superseded` 之一。请使用接受该变更的同一 Workspace；其他 Workspace 与不存在的 ID 会有意返回相同结果。Operation List 当前不可用。网络超时不代表原变更失败——以相同持久 Create 意图重放并取回已接受的 ID，再精确查询该 Operation。
 
 ## 常见错误类型
 
@@ -24,7 +23,7 @@ Create、Lifecycle 与 Delete 请求是异步的。控制面记录包含 ID、�
 ## Cat 无法 Ready
 
 1.  执行 `cats get NAME --json`，记录 desired/observed state 与 Node。
-2.  查看最近 Operation 及最终错误。
+2.  按已接受的 ID 查看 Operation 及其终态结果或错误。
 3.  管理员检查 Node Heartbeat、blockd/Guest readiness、Console Output 与 Attachment Epoch。
 4.  如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。
 

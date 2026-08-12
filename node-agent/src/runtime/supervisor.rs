@@ -153,7 +153,7 @@ impl NodeRuntime {
         };
         // The final state is settled here — `run_action` returned and the
         // generation/metering step has run — so this is the one place the
-        // runtime ledger is written (ADR-0028 §1). Doing it here rather than at
+        // V1 runtime ledger is written. Doing it here rather than at
         // the individual `cats` mutation sites is what keeps intermediate states
         // (the Running -> Suspended -> Running bounce inside `suspend_cat`, for
         // example) out of the record. Failed jobs are recorded too: a failure
@@ -446,20 +446,25 @@ impl NodeRuntime {
                             .vhost_user_socket
                             .as_ref()
                             .context("blockd was started without a vhost-user socket")?;
-                        disks.push(ch::vhost_user_disk_arg(
+                        disks.push(ch::vhost_user_disk_arg_with_serial(
                             socket,
                             vhost_user_queues,
                             chc.vhost_user_queue_size,
+                            &grant.disk_id,
                         )?);
                     }
                 }
             }
             let block_attach_us = block_attach_started.elapsed().as_micros();
             rt.ch = Some(chrt.clone());
-            if !warm_restore {
-                chrt.network = ch::prepare_network(chc, cat_id)?;
-                rt.ch = Some(chrt.clone());
-            }
+            // The signed Desired runner is the only production owner allowed
+            // to install `chrt.network`. Legacy NodeJob carries no
+            // NetworkConfig, so it must never manufacture one from Cat ID or
+            // local configuration at this point.
+            anyhow::ensure!(
+                chrt.network.is_some(),
+                "Cloud Hypervisor launch has no exact Desired NetworkConfig binding"
+            );
             // 3. VMM. Store the child in `rt` immediately so a failure in
             //    readiness/health still lets `teardown` kill it (no orphan
             //    holding the api socket).
@@ -710,7 +715,9 @@ impl NodeRuntime {
                 ch::nbd_detach(chc, dev);
             }
             if let Some(network) = &chrt.network {
-                ch::remove_network(chc, network);
+                if let Err(error) = ch::remove_network(chc, network) {
+                    tracing::warn!(tap = %network.tap, %error, "refused to remove a non-owned Host tap");
+                }
             }
         }
         let cat_dir = rt.dir.clone();
@@ -883,9 +890,11 @@ mod teardown_tests {
             state_dir,
             VmmMode::CloudHypervisor(ChConfig {
                 block_direct: false,
+                vmm_launcher_bin: PathBuf::from("unused-vmm-launcher"),
                 ch_bin: PathBuf::from("unused-ch"),
                 kernel: PathBuf::from("unused-kernel"),
                 initramfs: None,
+                boot_contract: None,
                 cmdline: String::new(),
                 seed_image: None,
                 block_path: BlockPath::KernelNbd,
@@ -893,7 +902,6 @@ mod teardown_tests {
                 vhost_user_queue_size: 256,
                 nbd_client_bin: nbd_client,
                 nbd_devices: 8,
-                network_cidr: None,
                 ip_bin: PathBuf::from("unused-ip"),
             }),
         ))

@@ -10,6 +10,7 @@ import {
   toast,
 } from "/ui/common.js";
 import { initI18n, onLocaleChange, t } from "/ui/i18n.js";
+import { assertRuntimeCutoverClientRequestSupported } from "/ui/cat-create-v2.mjs";
 
 initI18n();
 
@@ -18,7 +19,7 @@ const state = {
   overview: null,
   nodes: [],
   metrics: "",
-  activeView: "overview",
+  activeView: "metrics",
   selectedNodeId: null,
   nodeCats: [],
   nodeDetailsLoading: false,
@@ -29,8 +30,6 @@ const appShell = document.querySelector("#app-shell");
 const loginError = document.querySelector("#login-error");
 
 const switchView = initNavigation({
-  overview: () => t("admin.nav.overview"),
-  nodes: () => t("admin.nav.nodes"),
   metrics: () => t("admin.nav.metrics"),
 }, (view) => {
   state.activeView = view;
@@ -38,6 +37,7 @@ const switchView = initNavigation({
 });
 
 async function authenticatedRequest(path, options) {
+  assertRuntimeCutoverClientRequestSupported(path, options?.method || "GET");
   try {
     return await request(path, options);
   } catch (error) {
@@ -50,7 +50,7 @@ async function authenticatedRequest(path, options) {
 function showApp() {
   loginScreen.classList.add("is-hidden");
   appShell.classList.remove("is-hidden");
-  startRefresh();
+  stopRefresh();
 }
 
 function showLogin(message = "") {
@@ -89,17 +89,9 @@ async function loadAll({ quiet = false } = {}) {
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
-    const [overview, nodes] = await Promise.all([
-      authenticatedRequest("/v1/admin/monitoring"),
-      authenticatedRequest("/v1/admin/nodes"),
-    ]);
-    state.overview = overview;
-    state.nodes = nodes.items || [];
-    render();
-    if (state.selectedNodeId && document.querySelector("#node-detail-dialog").open) {
-      await loadNodeCats(state.selectedNodeId, { quiet: true });
-    }
-    if (state.activeView === "metrics") await loadMetrics();
+    state.overview = null;
+    state.nodes = [];
+    await loadMetrics();
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
       showLogin(error.message);

@@ -3,9 +3,8 @@
 - Status: Accepted
 - Date: 2026-08-06
 - Relates to: ADR-0003 (Direct-S3), ADR-0005 (provider-neutral storage
-  adapters), ADR-0028 (runtime survival across noded restart), ADR-0029
-  (database-password authority), ADR-0032 (PostgreSQL singleton leadership);
-  issue #76
+  adapters), ADR-0040 (runtime reconciliation and Agent restart), ADR-0029
+  (database-password authority), ADR-0032 (PostgreSQL singleton leadership)
 
 ## Context
 
@@ -18,8 +17,8 @@ therefore stop fleet growth long before CPU or storage capacity is exhausted.
 
 A node-local connection broker would make every live blockd depend on another
 process on its Host. Restarting or replacing that broker would affect all Cats
-on the node and contradict ADR-0028's rule that a noded restart must not disturb
-surviving runtime processes. Raising `max_connections` or the RDS class only
+on the node and contradict ADR-0040's target that per-Cat runtimes remain
+independently adoptable across an Agent restart. Raising `max_connections` or the RDS class only
 moves the cliff and keeps client count coupled to database memory.
 
 RDS Proxy can multiplex many client sessions over a bounded backend pool and

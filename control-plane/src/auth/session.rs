@@ -142,8 +142,15 @@ pub async fn switch_workspace(
         .map(|user| user.id.clone())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::unauthenticated("WorkOS session has no user identity"))?;
-    let workspace = state.store.workspace_by_id(&request.workspace_id)?;
-    let account = state.store.account_by_id(&workspace.account_id)?;
+    let workspace_id = request.workspace_id;
+    let (workspace, account) = state
+        .store
+        .execute(move |store| {
+            let workspace = store.workspace_by_id(&workspace_id)?;
+            let account = store.account_by_id(&workspace.account_id)?;
+            Ok((workspace, account))
+        })
+        .await?;
     if account.status != "active"
         || !config
             .user_has_active_membership(&requested_user_id, &account.workos_organization_id)
@@ -243,7 +250,16 @@ async fn session_response(
     session: &SessionState,
     headers: &HeaderMap,
 ) -> Result<(SessionResponse, Option<String>), Failure> {
-    let identity = validate_session_identity(config, &state.store, site, session)?;
+    let session = session.clone();
+    let validation_session = session.clone();
+    let validation_config = config.clone();
+    let identity = state
+        .store
+        .execute(move |store| {
+            validate_session_identity(&validation_config, store, site, &validation_session)
+                .map_err(|failure| failure.0)
+        })
+        .await?;
     let user = session
         .user
         .clone()
@@ -479,12 +495,7 @@ fn validate_session_identity(
             })
         }
         Site::Admin => {
-            if session.organization_id != config.admin_organization_id
-                || !session
-                    .permissions
-                    .iter()
-                    .any(|permission| permission == &config.admin_permission)
-            {
+            if !session_is_admin(config, session) {
                 return Err(ApiError::new(
                     cats_api::error::ErrorCode::PermissionDenied,
                     "WorkOS session lacks fleet administrator permission",
@@ -503,15 +514,86 @@ fn validate_session_identity(
     }
 }
 
-fn identity_from_cookie(state: &AppState, headers: &HeaderMap, site: Site) -> Option<WebIdentity> {
-    let config = state.cfg.workos.as_ref()?;
-    let sealed = cookie_value(headers, site.session_cookie())?;
-    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
-    validate_session_identity(config, &state.store, site, &session).ok()
+fn session_is_admin(config: &WorkOsConfig, session: &SessionState) -> bool {
+    session.authenticated
+        && session.organization_id == config.admin_organization_id
+        && session
+            .permissions
+            .iter()
+            .any(|permission| permission == &config.admin_permission)
 }
 
-pub fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIdentity> {
-    identity_from_cookie(state, headers, Site::User)
+/// Cryptographically validate the dedicated sealed admin cookie and expose
+/// only its identity candidate. Stale permission claims are deliberately not
+/// consulted; A23 performs an online current-membership/role verification on
+/// every apply and replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FleetAdministratorIdentityCandidate {
+    pub(crate) subject: String,
+    pub(crate) organization_id: String,
+}
+
+pub(crate) fn sealed_admin_session_candidate(
+    config: &WorkOsConfig,
+    sealed: &str,
+) -> Result<FleetAdministratorIdentityCandidate, ApiError> {
+    let session =
+        SessionManager::new(None, sealed.to_owned(), &config.cookie_password).authenticate();
+    if !session.authenticated {
+        return Err(ApiError::unauthenticated(
+            "invalid or expired WorkOS administrator session",
+        ));
+    }
+    let subject = session
+        .user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthenticated("WorkOS administrator session has no subject"))?;
+    if session.organization_id.is_empty() {
+        return Err(ApiError::unauthenticated(
+            "WorkOS administrator session has no organization scope",
+        ));
+    }
+    Ok(FleetAdministratorIdentityCandidate {
+        subject,
+        organization_id: session.organization_id,
+    })
+}
+
+/// Validate the sealed administrator cookie without entering the control
+/// store. The normal admin identity path has the same predicate; its Store
+/// closure is only needed to share machinery with workspace-scoped sessions.
+pub fn web_session_is_admin_without_store(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(config) = state.cfg.workos.as_ref() else {
+        return false;
+    };
+    let Some(sealed) = cookie_value(headers, Site::Admin.session_cookie()) else {
+        return false;
+    };
+    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
+    session_is_admin(config, &session)
+}
+
+async fn identity_from_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    site: Site,
+) -> Option<WebIdentity> {
+    let config = state.cfg.workos.clone()?;
+    let sealed = cookie_value(headers, site.session_cookie())?;
+    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
+    state
+        .store
+        .execute(move |store| {
+            validate_session_identity(&config, store, site, &session).map_err(|failure| failure.0)
+        })
+        .await
+        .ok()
+}
+
+pub async fn web_user_identity(state: &AppState, headers: &HeaderMap) -> Option<WebIdentity> {
+    identity_from_cookie(state, headers, Site::User).await
 }
 
 pub async fn web_session_allows_workspace(
@@ -520,11 +602,12 @@ pub async fn web_session_allows_workspace(
     workspace_id: &str,
 ) -> Result<bool, ApiError> {
     if identity_from_cookie(state, headers, Site::Admin)
+        .await
         .is_some_and(|identity| identity.administrator)
     {
         return Ok(true);
     }
-    let Some(identity) = identity_from_cookie(state, headers, Site::User) else {
+    let Some(identity) = identity_from_cookie(state, headers, Site::User).await else {
         return Ok(false);
     };
     let (Some(user_id), Some(organization_id)) = (
@@ -533,9 +616,14 @@ pub async fn web_session_allows_workspace(
     ) else {
         return Ok(false);
     };
+    let workspace_id = workspace_id.to_string();
+    let organization_id_for_store = organization_id.to_string();
     if !state
         .store
-        .workspace_belongs_to_organization(workspace_id, organization_id)?
+        .execute(move |store| {
+            store.workspace_belongs_to_organization(&workspace_id, &organization_id_for_store)
+        })
+        .await?
     {
         return Ok(false);
     }
@@ -547,11 +635,17 @@ pub async fn web_session_allows_workspace(
         .await
 }
 
-pub fn web_session_is_admin(state: &AppState, headers: &HeaderMap) -> bool {
-    identity_from_cookie(state, headers, Site::Admin).is_some_and(|identity| identity.administrator)
+pub async fn web_session_is_admin(state: &AppState, headers: &HeaderMap) -> bool {
+    identity_from_cookie(state, headers, Site::Admin)
+        .await
+        .is_some_and(|identity| identity.administrator)
 }
 
-pub fn has_any_web_session(state: &AppState, headers: &HeaderMap) -> bool {
-    identity_from_cookie(state, headers, Site::User).is_some()
-        || identity_from_cookie(state, headers, Site::Admin).is_some()
+pub async fn has_any_web_session(state: &AppState, headers: &HeaderMap) -> bool {
+    identity_from_cookie(state, headers, Site::User)
+        .await
+        .is_some()
+        || identity_from_cookie(state, headers, Site::Admin)
+            .await
+            .is_some()
 }

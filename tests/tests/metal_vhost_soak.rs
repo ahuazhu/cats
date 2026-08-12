@@ -372,7 +372,7 @@ impl Soak {
         .context("open isolated S3 namespace")?;
         let runtime = Arc::new(NodeRuntime::new(NodeConfig {
             node_id: format!("soak-{}", cfg.run_id),
-            state_dir: cfg.state_dir.clone(),
+            state_dir: cfg.state_dir.clone().into(),
             blockd_bin: cfg.blockd_bin.clone(),
             guest_agent_bin: cfg.guest_agent_bin.clone(),
             metadata_store: metadata_selection,
@@ -389,9 +389,11 @@ impl Soak {
             },
             vmm: VmmMode::CloudHypervisor(ChConfig {
                 block_direct: false,
+                vmm_launcher_bin: PathBuf::from("/opt/cats/bin/cats-vmm-launcher"),
                 ch_bin: cfg.ch_bin.clone(),
                 kernel: cfg.kernel.clone(),
                 initramfs: Some(cfg.initramfs.clone()),
+                boot_contract: None,
                 cmdline: "console=ttyS0 root=/dev/vda rw clocksource=kvm-clock".into(),
                 seed_image: Some(cfg.seed_image.clone()),
                 block_path: cfg.block_path,
@@ -401,7 +403,6 @@ impl Soak {
                 nbd_devices: 64,
                 // No tap: storage/lifecycle control uses hybrid vsock. This
                 // prevents an experiment from sharing production NAT/routing.
-                network_cidr: None,
                 ip_bin: PathBuf::from("/usr/sbin/ip"),
             }),
         })?);

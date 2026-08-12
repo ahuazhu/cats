@@ -1,4 +1,4 @@
-//! Re-adopting a Cat after the agent restarts (ADR-0028 §3).
+//! V1 re-adoption of a Cat after the agent restarts.
 //!
 //! Every test here starts a real Cat — a real `cats-blockd` per disk and a real
 //! `cats-guest-agent` — with one `NodeRuntime`, then builds a *second*
@@ -201,7 +201,7 @@ fn a_running_cat_is_adopted_by_a_restarted_agent() {
     env.run(stop_job(CAT, 4));
 }
 
-/// Each of these breaks exactly one step of the ADR-0028 §3 proof. The expected
+/// Each case breaks exactly one step of the V1 adoption proof. The expected
 /// reason is asserted too: a later check firing first would make an earlier one
 /// look tested when it is not.
 #[test]
@@ -282,9 +282,9 @@ fn an_unprovable_identity_leaves_the_cat_as_residue() {
     env.run(stop_job(CAT, 2));
 }
 
-/// A `cats-blockd` older than ADR-0028 answers `status` without any volume
-/// identity. It may well be ours, but it cannot show that it is, so it is not
-/// adoptable — the empty payload must not read as "no mismatch, therefore fine".
+/// A legacy `cats-blockd` status payload has no volume identity. It may well be
+/// ours, but it cannot show that it is, so it is not adoptable — the empty
+/// payload must not read as "no mismatch, therefore fine".
 #[test]
 fn a_blockd_that_cannot_name_its_volume_is_not_adopted() {
     use std::io::{BufRead, BufReader, Write};
@@ -528,8 +528,8 @@ fn a_warm_cat_is_adopted_with_no_processes_at_all() {
     env.run(stop_job(CAT, 3));
 }
 
-/// The reboot exception (ADR-0028 §3). The boot-id gate exists to reject
-/// recorded pids, and Warm records none; its snapshot and journals are files,
+/// The V1 Warm reboot exception: the boot-id gate exists to reject recorded
+/// pids, and Warm records none; its snapshot and journals are files,
 /// which a reboot does not invalidate. Gating Warm on the boot id would turn
 /// every restorable Warm Cat on the host into residue the first time it came
 /// back up.
@@ -801,7 +801,7 @@ fn a_stopping_cat_whose_blockd_serves_another_volume_is_residue() {
 /// cannot prove it owns is *absent* from the heartbeat snapshot, not reported
 /// as `Cold`. Reporting Cold would tell the control plane the disk was released
 /// while a blockd may still hold its lease; omitting it only keeps the node
-/// Lost, which is the recoverable side (ADR-0028 §7).
+/// Lost, which is the recoverable side.
 #[test]
 fn an_unadopted_cat_is_absent_from_the_heartbeat_snapshot() {
     const CAT: &str = "cat_adopt_absent";

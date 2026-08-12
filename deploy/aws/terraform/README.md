@@ -12,7 +12,7 @@ No cloud resource is created merely by checking in this directory.
 |---|---|---|
 | `bootstrap/` | bootstrap state | Versioned, encrypted, private S3 state bucket |
 | `stacks/platform/` | platform state | VPC, EKS cluster, RDS PostgreSQL, Route 53 zone, ACM certificate, ECR repository, bare-metal worker capacity and security group, GitHub Actions release role |
-| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, shared signed-Route cache, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
+| `stacks/production-infrastructure/` | infrastructure state | Usage stream/archive/checkpoints, Pod Identity, alarms, worker artifacts/secrets/SSM deployment |
 | `stacks/production-payments/` | payments state | Stripe prepaid-credit Product, fixed one-time Prices and signed webhook endpoint |
 | `stacks/production-application/` | application state | Cats Namespace/ServiceAccount, Secret/ConfigMap, EBS PVC, Deployments, Services and public ingress |
 | `modules/` | none | Reusable implementation called by stacks |
@@ -95,10 +95,13 @@ stack creates a TLS-only RDS Proxy and exports `database_proxy_endpoint`, but
 the production workflow retains the direct storage URL until the optional
 `RDS_PROXY_ENDPOINT` repository variable is set. Wait for the proxy target to
 be `AVAILABLE` and verify its initialization timeouts before setting the
-variable. Usage clients remain direct. Metal workers switch separately, one
-drained node at a time, by setting `CATS_POSTGRES_HOST` to that output and
-`CATS_POSTGRES_SESSION_SETUP=server-verified`. See ADR-0034 for the complete
-cutover, rollback and metric acceptance contract.
+variable. Usage clients remain direct. Metal workers switch separately by
+setting `CATS_POSTGRES_HOST` to that output and
+`CATS_POSTGRES_SESSION_SETUP=server-verified`, but the old one-node-at-a-time
+drain is not current cutover authority: use the empty, cordoned, residue-free
+worker boundary below until a lifecycle migration procedure is separately
+qualified. See ADR-0034 for the database cutover, rollback and metric
+acceptance contract.
 
 **Production dependencies span availability zones by default.** The RDS
 instance keeps a synchronous Multi-AZ standby, and each private subnet routes
@@ -140,7 +143,6 @@ Defaults are deliberately cost-conscious:
 - one dedicated S3 bucket, batched-object lifecycle to Standard-IA after
   30 days and Deep Archive after 365 days;
 - one on-demand DynamoDB projector checkpoint table;
-- one on-demand DynamoDB table for short-lived, already-signed Route Grants;
 - AWS-managed Kinesis encryption and SSE-S3 for the archive;
 - seven-year S3 Object Lock in GOVERNANCE mode.
 
@@ -150,10 +152,9 @@ period before the first apply. `prevent_destroy` also blocks accidental bucket
 replacement. The archive must never be reused for ChunkStore blocks.
 
 The usage module attaches the producer and consumer policies to one EKS Pod
-Identity role, associated only with the `cats-controld` ServiceAccount. The
-gateway uses its own `cats-gatewayd` ServiceAccount and receives only
-`GetItem`/`PutItem` on the Route Grant table; it receives no usage AWS
-permissions. The replay policy remains unattached and is reserved for
+Identity role, associated only with the `cats-controld` ServiceAccount. No
+Gateway Pod Identity or shared Route table exists before the v2 route module is
+composed. The replay policy remains unattached and is reserved for
 controlled reconciliation jobs:
 
 - `usage_producer_policy_arn`: Kinesis publication;
@@ -204,6 +205,7 @@ example:
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
 export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
 export TF_VAR_route_grant_public_key_pem="$(openssl pkey -in /approved/secret/path/route-grant-private.pem -pubout)"
+export TF_VAR_runtime_provisioner_trust_bundle_json="$(cat /approved/provisioning/runtime-provisioner-trust.v1.json)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
@@ -222,68 +224,44 @@ Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
 control as production credentials.
 
-The Route Grant key is asymmetric (ADR-0033). Every control-plane replica gets
-the same private key from the application state and the application public half
-must be derived from that exact input; startup signs and verifies a proof before
-readiness. Metal workers get only the public half from the infrastructure state.
-Never add the private key to
-`runtime_secret_data`, `worker_runtime_secret_data`, Gateway configuration or a
-Guest image. Generate the pair with `openssl genpkey -algorithm ED25519` and
-`openssl pkey -pubout`, then rotate it only through a coordinated drained
-rollout until multi-key verification exists.
+### Route admission
 
-The infrastructure state also creates `route_cache_table_name` and the
-Gateway-only Pod Identity before the application rollout. Set the GitHub
-repository variable `ROUTE_CACHE_TABLE_NAME` to that output. Each successful
-active + Running resolve attempts to copy its signed response into this regional
-table under a 100-ms runtime I/O deadline; another Gateway Pod can then serve the
-signed grant if PostgreSQL or the control plane is unavailable. The table cannot
-mint authority, entries are bounded by the signed expiry, and conditional writes
-order them by PostgreSQL route epoch and then signed issue time. It is deliberately
-not a Gateway startup or readiness dependency; bounded runtime failures fall
-through to the healthy control plane.
+The retained V1 Terraform inputs use one Ed25519 key pair. They describe the
+pre-cutover deployment shape, not a current clean-slate ingress path. Every
+control-plane replica received the same private key from application state; CI
+derived the public key from that exact input and workers received only the
+public half. Because the module still accepts the private PEM as a Terraform
+variable, a saved plan and state containing it remain credentials even though
+the current application stack does not deploy public Endpoint ingress. Keep it
+out of workers, Gateway configuration, Guest images and logs. Generate it with
+`openssl genpkey -algorithm ED25519` and derive the public half with
+`openssl pkey -pubout` only when reproducing or retiring that historical shape.
 
-The first Route Grant release has a strict compatibility order:
+The clean-slate route design removes the private-key Terraform variable. Terraform manages
+only a secret reference, workload access policy and public verifier ring; a separate
+secret channel writes key bytes. The clean-slate deployment rotates the key so every
+private value retained in historical Terraform state is cryptographically obsolete. The
+versioned Terraform state remains restricted infrastructure evidence; it is not imported
+as product data and is not deleted by the cutover.
 
-1. configure the application private-key input and the matching infrastructure
-   public-key input, but do not deploy the new worker bundle yet. CI derives
-   the application public half from its exact private secret instead of
-   accepting a second independently editable key input;
-2. deploy the application first. Terraform waits for the complete control-plane
-   rollout before it starts the Gateway rollout. Old Gateways ignore the new
-   response fields, and old Nodes ignore the grant forwarded by a new Gateway;
-3. drain, deploy and uncordon one worker at a time using the worker procedure
-   below. The association verifies the installed public-key fingerprint; the
-   Node reports it at registration, and the control plane refuses uncordon
-   unless it matches the active signer. Never uncordon a Node that requires
-   Route Grants while the old Gateway is still live: the Node deliberately
-   rejects its unsigned requests;
-4. if the application must be rolled back after any worker has been upgraded,
-   first drain those workers and restore the compatible old worker bundle. An
-   old Gateway cannot serve a Node that requires a Route Grant.
+The old regional Route Grant cache and Gateway-only Pod Identity have been
+removed. The production stack does not deploy `cats-gatewayd`, publish Endpoint
+wildcard DNS or route wildcard ingress. ADR-0041, the Node admission core and
+Gateway-to-Node machine tunnel exist in code, but this Terraform stack still
+does not install their signing ring, Gateway/Node mTLS artifacts or public
+proxy; workers remain gate-closed until those artifacts and the qualification
+matrix land together.
 
-This additive first release is not the key-rotation procedure. With one accepted
-public key, rotation still needs the coordinated drained boundary described
-above; do not swap either half independently. The application workflow fails
-before Terraform plan if any schedulable or still-serving Node reports a
-different key. It permits an all-legacy serving cohort only for the additive
-first application rollout and rejects a mixed legacy/enforcing cohort as an
-interrupted worker rollout. The control database persists a one-way legacy
-admission phase: it closes after every schedulable or serving Node reports a
-verifier, never reopens, and a Node that downgrades from a reported key to no
-key is cordoned.
+The first qualified ADR-0040/0041 clean-slate deployment follows the single ordered runbook in
+[Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
+must already have removed the V1 route-cache/parser inputs and private-key value, retain only the
+new secret reference/public ring policy, and rotate the affected service and per-Node credentials.
+Historical Terraform state remains restricted evidence and is never imported as product data.
 
-The Route Grant Node column and rollout-phase table are an expand-only schema
-change and deliberately retain control schema stamp 1. The previous
-application ignores both additions, so a failed partial control-plane rollout
-can still start the old image. Do not bump the stamp for an additive nullable
-column/table; reserve a new stamp for the later contract phase after rollback
-compatibility is no longer required.
-
-`storage_postgres_url` and `usage_postgres_url` are intentionally independent.
-During the early shared-RDS phase they may point to the same instance/database,
-while usage uses the separate `cats_usage` schema and preferably a dedicated
-database role. Moving usage later only changes the usage DSN.
+`storage_postgres_url` and `usage_postgres_url` are independent. They may point
+to the same PostgreSQL instance and database, but usage keeps its own
+`cats_usage` schema and database role. Moving usage to another database changes
+only the usage DSN.
 
 Set `stripe_enabled=true` and copy the non-secret `topup_price_ids` output into
 `stripe_topup_price_ids`. Cats never credits a Checkout success redirect: only
@@ -309,6 +287,11 @@ creates a saved application plan, applies that exact plan and waits for both
 Deployments to report the same immutable image reference. A failed build,
 plan, apply or rollout records a failed GitHub deployment.
 
+That workflow updates the Terraform-managed control-plane application; its
+green result is not the missing production-public-spawn PostgreSQL/Linux
+runtime E2E and does not qualify a nonempty worker, public Route v2 ingress or
+the signed full lifecycle.
+
 Configure these non-secret repository variables:
 
 - `AWS_REGION`, `AWS_ROLE_ARN` and `ECR_REPOSITORY`;
@@ -332,84 +315,65 @@ HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
 a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
-fail closed. `cats-controld` only opens stamped versions inside the same range.
+fail closed. `cats-controld` opens only exact clean-slate authority schema 14;
+it does not migrate an earlier stamp or partial catalog in place.
 The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-Terraform will additionally create `cats-gateway-runtime`, which exposes only
-`CATS_AUTH_TOKEN` to the gateway, plus the non-secret Route cache table name and
-AWS region. The gateway must not receive PostgreSQL or WorkOS credentials.
+Terraform deliberately creates no Gateway Secret, ServiceAccount, Deployment,
+Service, Pod Identity or DynamoDB Route mirror in this release.
 
-## Metal worker deployment
+## Metal worker deployment boundary
 
 The infrastructure stack also owns the worker release path. CI builds one
 reviewed `linux/amd64` bundle, supplies its absolute path and SHA-256, and
 Terraform uploads it under a content-addressed S3 key. The EC2 role may read
 only worker artifacts and the dedicated Secrets Manager runtime secret.
-An SSM State Manager association downloads the bundle, verifies the digest,
-installs the host binaries/unit, atomically updates the Cloud Hypervisor guest
-seed with the matching Guest Agent and systemd units, creates the delegated
-metering cgroup root and restarts `cats-worker`. The previous guest seed stays
-at `rootfs.ext4.previous` for recovery.
+An SSM State Manager association can download the bundle, verify the digest,
+install the host binaries/unit, atomically update the Cloud Hypervisor guest
+seed with the matching Guest Agent and systemd units, create the delegated
+metering cgroup root and restart `cats-worker`. The previous guest seed stays
+at `rootfs.ext4.previous` for recovery. This machinery predates the current
+clean-slate exact-SHA qualification and is not authorization for a rolling
+upgrade of a nonempty worker.
 
-A worker release is a drain boundary. Before applying a new bundle:
-
-1. run `cats admin node drain <node-id>`;
-2. wait until `cats admin node get <node-id>` reports
-   `state=cordoned cats=0 orphans=0`;
-3. apply the reviewed infrastructure plan and wait for the SSM association to
-   succeed;
-4. run `cats admin node uncordon <node-id>`.
-
-A drain acts on both the control plane's assignments and the agent's own
-reported inventory: a Cat the agent runs that the control plane never assigned
-there (an *orphan runtime*, ADR-0030) gets a Cold stop by its reported
-identity, and the node does not reach `cordoned` while any orphan remains. So
-`state=cordoned` genuinely means the node runs nothing.
+The retired `cats admin node drain`/uncordon sequence and its orphan Cold-stop
+behavior are historical V1 paths, not a compatibility fallback. Before applying
+a current bundle, use a reviewed A23 policy revision to cordon the worker and
+prove both that its assigned Desired set is empty and that a complete physical
+inventory has no runtime or residue. The current Running-only completion claim
+does not provide an in-place lifecycle drain. If the worker is not already
+empty, the association must stay blocked pending a separately qualified
+migration or replacement procedure.
 
 The association independently refuses to change installed files while any Cat
 PID remains in the worker's metering cgroups **or** any `cats-blockd` /
 `cloud-hypervisor` process is alive on the host. The process-table check
 exists because a blockd is not metered: with the Guests gone the cgroup walk
-reads clean, yet the blockd may still hold an unpublished journal — on a
-relaxed volume that journal is the only authoritative copy. `cats-worker` uses
-`KillMode=process`, so stopping or restarting the agent deliberately leaves
-those runtimes alive for ledger-backed re-adoption; it does not make replacing
-the worker binaries or Guest seed underneath them safe. This fail-closed guard
-prevents bypassing the drain runbook; it does not cordon the node itself and
-therefore is not a substitute for step 1. Do not copy production binaries,
-patch the seed, or edit `worker.env` manually; update the bundle digest or
-secret input and apply Terraform.
+reads clean while a surviving blockd may still hold the only authoritative copy
+of an unpublished Relaxed journal. This process-table check remains a
+fail-closed empty-Host guard; it does not prove the signed scanner, per-Cat
+adoption or A23 cordon. Do not copy production binaries, patch the seed, or
+edit `worker.env` manually; update the bundle digest or secret input and apply
+Terraform only after the empty-Host precondition is independently closed.
 
-`systemctl stop cats-worker` now stops only the node agent. It does **not** stop
-the Cats on that worker. Use the drain flow above when the operational intent
-is to empty or decommission a node; stopping the service is not a drain.
+Do not stop or restart a worker that still has Cats. ADR-0040 Host lock,
+per-Cat units, bounded checkpoint and union inventory have landed for the
+current-Desired Running path, but no current exact SHA has passed the combined
+public-spawn PostgreSQL/Linux/systemd/KVM qualification. A controlled release
+therefore still requires an independently proven empty, residue-free Host.
 
-### When the drain cannot converge
+### When the empty-Host precondition cannot be proved
 
-An orphan whose Cold stop is refused by storage fencing
-(`root CAS conflict: expected generation N`) can never stop cleanly: its root
-was superseded elsewhere, its local journal is stale and must not be
-published. The drain deliberately does not escalate — whether to discard a
-journal is an operator decision, not the control plane's. After confirming
-the refusal is a CAS conflict (not a transient metadata-store error) in the
-controller logs, discard that Cat explicitly through the node agent's job
-API, which kills its processes and deletes its runtime directory **without
-publishing**:
-
-```sh
-# CATS_AUTH_TOKEN as installed in the worker's runtime secret (worker.env).
-curl -sS -X POST "http://<node-agent>/v1/jobs" \
-  -H "Authorization: Bearer $CATS_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"manual-cleanup-<cat-id>","cat_generation":<reported-generation>,
-       "action":"cleanup_cat","cat_id":"<cat-id>"}'
-```
-
-Use this only for Cats whose stop was refused by fencing. For any other
-failure (usage spool, transient storage errors) let the drain retry: those
-stops publish once the dependency recovers.
+An orphan or assigned runtime cannot be discarded through a Node HTTP fallback.
+Signed workers receive no `CATS_AUTH_TOKEN`, production does not expose
+`/v1/jobs`, and the deployment must remain fail closed with the Host untouched.
+Use a separately qualified lifecycle/fenced-cleanup procedure when it exists;
+do not recreate the retired shared-bearer request by hand or treat an empty
+legacy row as physical absence. For transient metadata-store failures, leave
+the Host cordoned and unchanged until a complete current-authority scan can
+close the precondition.
 
 ## PostgreSQL split runbook
 

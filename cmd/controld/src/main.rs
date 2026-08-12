@@ -6,7 +6,11 @@ use cats_control_plane::store::DsnSource as ControlStoreDsnSource;
 use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
 use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
-use cats_storage::{open_metadata_store, AdapterConfig, MetadataStoreFactory};
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
+use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::{
+    open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetadataStoreFactory,
+};
 use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
 use cats_usage_store_postgres::{DsnSource, PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
@@ -99,10 +103,36 @@ struct Args {
         default_value = "path=cats-storage-meta.db"
     )]
     metadata_store_options: Vec<String>,
+    /// Provider-neutral immutable-object adapter used only to read exact
+    /// golden-image manifest keys.
+    #[arg(long, env = "CATS_OBJECT_STORE_ADAPTER", default_value = "file")]
+    object_store_adapter: String,
+    /// Opaque object adapter option (`key=value`); may be repeated.
+    #[arg(
+        long = "object-store-option",
+        env = "CATS_OBJECT_STORE_OPTIONS",
+        value_delimiter = ',',
+        value_name = "KEY=VALUE",
+        default_value = "root=cats-storage-blob"
+    )]
+    object_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
+    /// Exact qualified Guest runtime release receipt. Production has one
+    /// immutable install path shared with Node registration and Cat placement.
+    #[arg(
+        long,
+        env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
+        value_name = "PATH"
+    )]
+    guest_runtime_profile_receipt_file: Option<std::path::PathBuf>,
+    /// Deployment-scoped A23 provisioner trust. Production accepts only the
+    /// frozen installed path; there is intentionally no environment or inline
+    /// alternate.
+    #[arg(long, value_name = "PATH")]
+    runtime_provisioner_trust_file: std::path::PathBuf,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
-    /// short-lived Endpoint Route Grants (ADR-0033).
+    /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
     route_grant_private_key_file: std::path::PathBuf,
     /// Matching Ed25519 public key. Startup signs and verifies a challenge so a
@@ -115,6 +145,17 @@ struct Args {
         default_value_t = cats_control_plane::route_grant::DEFAULT_ROUTE_GRANT_TTL_SECONDS
     )]
     route_grant_ttl_seconds: u64,
+    /// Optional independent mTLS listener for Gateway Route v2 resolve. When
+    /// set, every policy/CA/certificate/key/signer file is loaded only from
+    /// its frozen installed path; there are no path or inline-byte options.
+    #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
+    route_v2_machine_listen: Option<String>,
+    #[arg(
+        long,
+        env = "CATS_ROUTE_GRANT_V2_TTL_SECONDS",
+        default_value_t = cats_api::route_grant_v2::DEFAULT_ROUTE_GRANT_V2_TTL_SECONDS
+    )]
+    route_grant_v2_ttl_seconds: u64,
     #[arg(long, env = "CATS_ADMIN_TOKEN", default_value = "dev-admin-token")]
     admin_token: String,
     /// WorkOS AuthKit application client ID. Setting any WorkOS option
@@ -264,6 +305,14 @@ async fn main() -> anyhow::Result<()> {
         &args.metadata_store_adapter,
         &metadata_config,
         &metadata_factories,
+    )?;
+    let object_config = AdapterConfig::from_cli(args.object_store_options)?;
+    let object_factories: [&dyn BlobStoreFactory; 2] =
+        [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
+    let image_blob = open_blob_store(
+        &args.object_store_adapter,
+        &object_config,
+        &object_factories,
     )?;
     let (usage_projection, credit_store): (Arc<dyn UsageStore>, Arc<dyn CreditStore>) =
         match args.usage_store_adapter.as_str() {
@@ -494,14 +543,60 @@ async fn main() -> anyhow::Result<()> {
             args.route_grant_ttl_seconds,
         )?,
     );
-    let handle = cats_control_plane::server::spawn(cats_control_plane::server::Config {
+    let guest_runtime_profile_receipt_path = args
+        .guest_runtime_profile_receipt_file
+        .as_deref()
+        .context("--guest-runtime-profile-receipt-file or CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE is required")?;
+    let guest_runtime_profile_receipt =
+        cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
+            guest_runtime_profile_receipt_path,
+        )?;
+    let runtime_provisioner_trust =
+        cats_api::runtime_artifacts::load_installed_runtime_provisioner_trust_bundle(
+            &args.runtime_provisioner_trust_file,
+        )?;
+    let gateway_machine = if let Some(listen) = args.route_v2_machine_listen {
+        use cats_api::gateway_workload_identity::{
+            CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
+            GATEWAY_CLIENT_CA_BUNDLE_PATH, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
+        };
+        use cats_api::route_grant_v2::{
+            ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH, ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH,
+            ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH,
+        };
+
+        let gateway_artifacts =
+            cats_api::runtime_artifacts::load_installed_gateway_machine_artifacts(
+                std::path::Path::new(GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH),
+                std::path::Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+                std::path::Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH),
+                std::path::Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH),
+            )?;
+        let signer_artifacts = cats_api::runtime_artifacts::load_installed_route_grant_v2_signer(
+            std::path::Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH),
+            std::path::Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+            std::path::Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
+        )?;
+        Some(cats_control_plane::server::GatewayMachineConfig::new(
+            listen,
+            gateway_artifacts,
+            signer_artifacts,
+            args.route_grant_v2_ttl_seconds,
+        )?)
+    } else {
+        None
+    };
+    let server_config = cats_control_plane::server::Config {
         listen: args.listen,
         control_store_dsn,
         control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
         storage_meta,
+        image_blob,
         auth_token: args.auth_token,
+        guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
+        runtime_provisioner_trust_bundle: runtime_provisioner_trust.bundle().clone(),
         route_grant_signer,
         admin_token: args.admin_token,
         workos,
@@ -514,8 +609,13 @@ async fn main() -> anyhow::Result<()> {
             cold_after_ms: threshold_ms(args.auto_cold_after_seconds, "automatic Cold")?,
         },
         oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
-    })
-    .await?;
+    };
+    let handle = match gateway_machine {
+        Some(machine) => {
+            cats_control_plane::server::spawn_with_gateway_machine(server_config, machine).await?
+        }
+        None => cats_control_plane::server::spawn(server_config).await?,
+    };
     let usage_projector_task = usage_projector.map(|projector| {
         cats_control_plane::server::spawn_singleton_task(
             handle.state.store.clone(),
@@ -531,7 +631,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = usage_projector_task {
         task.abort();
     }
-    handle.shutdown();
+    handle.shutdown().await?;
     println!("SHUTDOWN");
     Ok(())
 }

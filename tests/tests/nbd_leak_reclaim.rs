@@ -48,9 +48,11 @@ fn nbd_client_bin() -> PathBuf {
 fn config() -> Result<ChConfig> {
     Ok(ChConfig {
         block_direct: false,
+        vmm_launcher_bin: PathBuf::from("/nonexistent"),
         ch_bin: PathBuf::from("/nonexistent"),
         kernel: PathBuf::from("/nonexistent"),
         initramfs: None,
+        boot_contract: None,
         cmdline: String::new(),
         seed_image: None,
         block_path: BlockPath::KernelNbd,
@@ -60,7 +62,6 @@ fn config() -> Result<ChConfig> {
         nbd_devices: std::env::var("CATS_NBD_TEST_DEVICES")
             .unwrap_or_else(|_| "8".to_string())
             .parse()?,
-        network_cidr: None,
         ip_bin: PathBuf::from("/usr/sbin/ip"),
     })
 }

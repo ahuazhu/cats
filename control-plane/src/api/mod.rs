@@ -41,23 +41,33 @@ use crate::server::AppState;
 use crate::store::OciDeploymentClaim;
 
 mod accounts;
+mod agent_registration;
 mod billing;
+mod cat_create_v2;
 mod cats;
 mod disks;
 mod endpoints;
 mod nodes;
 mod operations;
+mod persistent_disk_create_v1;
+pub(crate) mod route_resolve_v2;
 mod routes;
+pub(crate) mod runtime_node_authority;
+mod runtime_operations;
+mod runtime_spine;
+mod runtime_volume_transitions;
 mod sessions;
 mod usage;
 
 use accounts::*;
 use billing::*;
+use cat_create_v2::*;
 use cats::*;
 use disks::*;
 use endpoints::*;
 use nodes::*;
 use operations::*;
+use persistent_disk_create_v1::*;
 use routes::*;
 use sessions::*;
 use usage::*;
@@ -65,6 +75,7 @@ use usage::*;
 pub(crate) use billing::enforce_exhausted_billing_accounts;
 pub use cats::ensure_running;
 
+#[derive(Debug)]
 pub struct Failure(pub ApiError);
 
 impl IntoResponse for Failure {
@@ -91,6 +102,37 @@ impl From<ApiError> for Failure {
 }
 
 type ApiResult<T> = std::result::Result<T, Failure>;
+
+/// Reject an entry point whose implementation still owns legacy work leases
+/// or calls the retired Node HTTP runtime. This check must be the first handler
+/// action so production cannot authenticate, write an idempotency/work row, or
+/// emit an outbound call before failing closed.
+fn require_retired_product_authority_for_tests(state: &AppState) -> ApiResult<()> {
+    if state.retired_product_authority_for_tests {
+        Ok(())
+    } else {
+        Err(
+            ApiError::unavailable("operation is unavailable during the signed runtime cutover")
+                .into(),
+        )
+    }
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    if readiness_status(&state.readiness) == StatusCode::OK {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unready").into_response()
+    }
+}
+
+pub(crate) fn readiness_status(readiness: &crate::server::ReadinessLatch) -> StatusCode {
+    if readiness.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -121,9 +163,11 @@ async fn bearer_principal(state: &AppState, headers: &HeaderMap) -> ApiResult<Op
     if token == state.cfg.admin_token {
         return Ok(Some(Principal::Administrator));
     }
+    let token_hash = workspace_token_hash(token);
     if let Some(workspace_id) = state
         .store
-        .active_workspace_for_token_hash(&workspace_token_hash(token))?
+        .execute(move |store| store.active_workspace_for_token_hash(&token_hash))
+        .await?
     {
         return Ok(Some(Principal::WorkspaceAutomation { workspace_id }));
     }
@@ -154,7 +198,7 @@ fn auth_failure(authenticated: bool) -> Failure {
 
 async fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if bearer_principal(state, headers).await?.is_some()
-        || crate::auth::has_any_web_session(state, headers)
+        || crate::auth::has_any_web_session(state, headers).await
     {
         return Ok(());
     }
@@ -174,7 +218,11 @@ async fn check_workspace_auth(
             let Some(organization_id) = identity.organization_id.as_deref() else {
                 return Err(auth_failure(true));
             };
-            let scope = state.store.workspace_scope(workspace)?;
+            let workspace_id = workspace.to_string();
+            let scope = state
+                .store
+                .execute(move |store| store.workspace_scope(&workspace_id))
+                .await?;
             let allowed = scope.account.status == "active"
                 && scope.account.workos_organization_id == organization_id
                 && state
@@ -193,13 +241,18 @@ async fn check_workspace_auth(
     if bearer_allowed
         || crate::auth::web_session_allows_workspace(state, headers, workspace).await?
     {
-        return resolved_scope
-            .map(Ok)
-            .unwrap_or_else(|| state.store.workspace_scope(workspace))
+        if let Some(scope) = resolved_scope {
+            return Ok(scope);
+        }
+        let workspace = workspace.to_string();
+        return state
+            .store
+            .execute(move |store| store.workspace_scope(&workspace))
+            .await
             .map_err(Into::into);
     }
     Err(auth_failure(
-        principal.is_some() || crate::auth::has_any_web_session(state, headers),
+        principal.is_some() || crate::auth::has_any_web_session(state, headers).await,
     ))
 }
 
@@ -227,12 +280,39 @@ async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()
             .is_some_and(|workos| workos.is_fleet_administrator(identity)),
         Some(Principal::Service | Principal::WorkspaceAutomation { .. }) | None => false,
     };
-    if bearer_allowed || crate::auth::web_session_is_admin(state, headers) {
+    if bearer_allowed || crate::auth::web_session_is_admin(state, headers).await {
         return Ok(());
     }
     Err(auth_failure(
-        principal.is_some() || crate::auth::has_any_web_session(state, headers),
+        principal.is_some() || crate::auth::has_any_web_session(state, headers).await,
     ))
+}
+
+/// Authenticate the observability endpoint without consulting PostgreSQL.
+/// Static scrape credentials, WorkOS administrator JWTs, and the sealed admin
+/// browser session preserve the existing administrator surface while a stuck
+/// control-store lane remains diagnosable.
+async fn check_metrics_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if let Some(token) = bearer_token(headers) {
+        if token == state.cfg.admin_token {
+            return Ok(());
+        }
+        if token == state.cfg.auth_token {
+            return Err(auth_failure(true));
+        }
+        let Some(workos) = state.cfg.workos.as_ref() else {
+            return Err(auth_failure(false));
+        };
+        let identity = workos.verify_access_token(token).await?;
+        if workos.is_fleet_administrator(&identity) {
+            return Ok(());
+        }
+        return Err(auth_failure(true));
+    }
+    if crate::auth::web_session_is_admin_without_store(state, headers) {
+        return Ok(());
+    }
+    Err(auth_failure(false))
 }
 
 async fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -276,13 +356,17 @@ async fn require_account_manager(
             identity.organization_id,
             identity.permissions,
         )
-    } else if let Some(identity) = crate::auth::web_user_identity(state, headers) {
+    } else if let Some(identity) = crate::auth::web_user_identity(state, headers).await {
         let user_id = identity.user_id.ok_or_else(|| auth_failure(true))?;
         (user_id, identity.organization_id, identity.permissions)
     } else {
         return Err(auth_failure(false));
     };
-    let account = state.store.account_by_id(account_id)?;
+    let account_id = account_id.to_string();
+    let account = state
+        .store
+        .execute(move |store| store.account_by_id(&account_id))
+        .await?;
     if user_id.is_empty()
         || organization_id.as_deref() != Some(account.workos_organization_id.as_str())
         || !permissions
@@ -305,15 +389,20 @@ async fn require_account_manager(
     Ok((account, user_id))
 }
 
-fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
-    let node = state.store.get_node(id)?;
-    if node.state == NodeState::Draining && !state.store.cats_on_node(id)?.is_empty() {
-        return Err(ApiError::failed_precondition(
-            "node drain is still in progress; use uncordon to cancel it",
-        )
-        .into());
-    }
-    state.store.set_node_state(id, NodeState::Cordoned)?;
+async fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
+    let id = id.to_string();
+    state
+        .store
+        .execute(move |store| {
+            let node = store.get_node(&id)?;
+            if node.state == NodeState::Draining && !store.cats_on_node(&id)?.is_empty() {
+                return Err(ApiError::failed_precondition(
+                    "node drain is still in progress; use uncordon to cancel it",
+                ));
+            }
+            store.set_node_state(&id, NodeState::Cordoned)
+        })
+        .await?;
     Ok(())
 }
 
@@ -332,8 +421,15 @@ fn if_match(headers: &HeaderMap) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
-fn billing_account_id_for_workspace(state: &AppState, workspace: &str) -> Result<String, ApiError> {
-    state.store.billing_account_id_for_workspace(workspace)
+async fn billing_account_id_for_workspace(
+    state: &AppState,
+    workspace: &str,
+) -> Result<String, ApiError> {
+    let workspace = workspace.to_string();
+    state
+        .store
+        .execute(move |store| store.billing_account_id_for_workspace(&workspace))
+        .await
 }
 
 fn metering_failure(error: cats_metering::MeteringError) -> Failure {
@@ -344,76 +440,50 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
     }
 }
 
+async fn reject_retired_product_authority(
+    _request: axum::extract::Request,
+    _next: axum::middleware::Next,
+) -> Response {
+    Failure(ApiError::unavailable(
+        "legacy product authority is unavailable during the signed runtime cutover",
+    ))
+    .into_response()
+}
+
+async fn reject_retired_product_get() -> Response {
+    Failure(ApiError::unavailable(
+        "legacy product authority is unavailable during the signed runtime cutover",
+    ))
+    .into_response()
+}
+
+fn retired_product_support_router(enabled: bool) -> Router<AppState> {
+    if enabled {
+        Router::new()
+            .route("/v1/internal/work/acquire", post(acquire_work))
+            .route("/v1/internal/work/release", post(release_work))
+    } else {
+        Router::new()
+    }
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(crate::ui::portal))
-        .route("/zh-CN", get(crate::ui::zh_home_redirect))
-        .route("/zh-CN/", get(crate::ui::zh_home))
-        .route("/docs", get(crate::ui::docs_redirect))
-        .route("/docs/", get(crate::ui::docs_index))
-        .route("/docs/{slug}", get(crate::ui::docs_detail_redirect))
-        .route("/docs/{slug}/", get(crate::ui::docs_detail))
-        .route("/zh-CN/docs", get(crate::ui::zh_docs_redirect))
-        .route("/zh-CN/docs/", get(crate::ui::zh_docs_index))
-        .route(
-            "/zh-CN/docs/{slug}",
-            get(crate::ui::zh_docs_detail_redirect),
-        )
-        .route("/zh-CN/docs/{slug}/", get(crate::ui::zh_docs_detail))
-        .route("/robots.txt", get(crate::ui::robots))
-        .route("/sitemap.xml", get(crate::ui::sitemap))
-        .route("/site.webmanifest", get(crate::ui::web_manifest))
-        .route("/assets/public.css", get(crate::ui::public_styles))
-        .route("/assets/cats-mark.svg", get(crate::ui::cats_mark))
-        .route("/assets/cats-logo.svg", get(crate::ui::cats_logo))
-        .route("/assets/cats-og.svg", get(crate::ui::cats_og))
-        .route("/assets/cats-og.png", get(crate::ui::cats_og_png))
-        .route("/user", get(crate::ui::user_console))
-        .route("/user/", get(crate::ui::user_console))
-        .route("/user/{account}/{workspace}", get(crate::ui::user_console))
-        .route("/user/{account}/{workspace}/", get(crate::ui::user_console))
-        .route("/admin", get(crate::ui::admin_console))
-        .route("/admin/", get(crate::ui::admin_console))
-        .route("/ui/styles.css", get(crate::ui::styles))
-        .route("/ui/i18n.js", get(crate::ui::i18n_script))
-        .route("/ui/common.js", get(crate::ui::common_script))
-        .route("/ui/user.js", get(crate::ui::user_script))
-        .route("/ui/admin.js", get(crate::ui::admin_script))
-        .route("/auth/config", get(crate::auth::config))
-        .route("/auth/login", get(crate::auth::login))
-        .route("/auth/callback", get(crate::auth::callback))
-        .route("/auth/session", get(crate::auth::session))
-        .route("/auth/workspace", post(crate::auth::switch_workspace))
-        .route("/auth/logout", get(crate::auth::logout))
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/me", get(cli_me))
-        .route("/v1/workspaces", get(list_workspaces))
-        .route(
-            "/v1/accounts/{account}/workspaces",
-            post(create_account_workspace),
-        )
-        .route(
-            "/v1/workspaces/{workspace}",
-            axum::routing::patch(update_workspace),
-        )
-        .route("/v1/auth/logout", post(cli_logout))
-        .route(
-            "/v1/accounts/{account}/invitations",
-            post(create_account_invitation).get(list_account_invitations),
-        )
-        .route(
-            "/v1/accounts/{account}/invitations/{invitation}/actions/revoke",
-            post(revoke_account_invitation),
-        )
-        .route("/v1/accounts/{account}/members", get(list_account_members))
-        .route(
-            "/v1/accounts/{account}/members/{membership}",
-            axum::routing::patch(update_account_member).delete(deactivate_account_member),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats",
-            post(create_cat).get(list_cats),
-        )
+    let cat_create_route = if state.retired_product_authority_for_tests {
+        post(create_cat_legacy_for_tests)
+    } else {
+        post(create_cat_v2)
+    };
+    let disk_collection_route = if state.retired_product_authority_for_tests {
+        post(create_disk).get(list_disks)
+    } else {
+        post(create_persistent_disk_v1).get(reject_retired_product_get)
+    };
+    // These handlers read or mutate the retired Cat/Operation/Node authority.
+    // Keep them reachable only from the explicit pre-cutover test composition.
+    // The production middleware runs before authentication, body extraction,
+    // PostgreSQL access, idempotency writes, and outbound Node calls.
+    let retired_product_authority = Router::new()
+        .route("/v1/workspaces/{workspace}/cats", get(list_cats))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}",
             get(get_cat).delete(delete_cat),
@@ -448,18 +518,6 @@ pub fn router(state: AppState) -> Router {
             post(create_endpoint).get(list_endpoints),
         )
         .route(
-            "/v1/workspaces/{workspace}/tokens",
-            post(create_workspace_token).get(list_workspace_tokens),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/tokens/{token}",
-            axum::routing::delete(revoke_workspace_token),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks",
-            post(create_disk).get(list_disks),
-        )
-        .route(
             "/v1/workspaces/{workspace}/disks/{disk}",
             get(get_disk).delete(delete_disk),
         )
@@ -476,11 +534,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/operations",
             get(list_operations),
         )
-        .route("/v1/nodes/register", post(register_node))
-        .route("/v1/nodes/heartbeat", post(heartbeat))
-        .route("/v1/nodes/work-status", post(node_work_status))
-        .route("/v1/internal/work/acquire", post(acquire_work))
-        .route("/v1/internal/work/release", post(release_work))
         .route(
             "/v1/internal/usage/checkpoints",
             post(ingest_usage_checkpoints)
@@ -490,19 +543,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/billing/usage",
             get(workspace_usage),
         )
-        .route(
-            "/v1/workspaces/{workspace}/billing/balance",
-            get(workspace_billing_balance),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/billing/checkout",
-            post(create_billing_checkout),
-        )
-        .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/admin/nodes", get(admin_list_nodes))
-        .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .route(
             "/v1/admin/nodes/{id}",
             get(admin_get_node).delete(admin_delete_node),
@@ -513,9 +556,161 @@ pub fn router(state: AppState) -> Router {
             post(admin_node_action),
         )
         .route("/v1/admin/monitoring", get(admin_monitoring))
-        .route("/metrics", get(prometheus_metrics))
         .route("/v1/routes/resolve", get(resolve_route))
-        .route("/v1/routes/wake", post(wake_route_handler))
+        .route("/v1/routes/wake", post(wake_route_handler));
+    let retired_product_authority = if state.retired_product_authority_for_tests {
+        retired_product_authority
+    } else {
+        retired_product_authority
+            .route_layer(axum::middleware::from_fn(reject_retired_product_authority))
+    };
+    let retired_product_support =
+        retired_product_support_router(state.retired_product_authority_for_tests);
+    let runtime_volume_authority = if state.retired_product_authority_for_tests {
+        Router::new()
+    } else {
+        Router::new()
+            .route(
+                "/v1/internal/runtime/volume-transitions",
+                post(runtime_volume_transitions::mutation)
+                    .fallback(runtime_volume_transitions::mutation),
+            )
+            .route(
+                "/v1/internal/runtime/volume-transition-evidence",
+                post(runtime_volume_transitions::evidence)
+                    .fallback(runtime_volume_transitions::evidence),
+            )
+    };
+    let runtime_operation_read = if state.retired_product_authority_for_tests {
+        Router::new()
+    } else {
+        Router::new().route(
+            "/v1/workspaces/{workspace}/operations/{operation}",
+            get(runtime_operations::get_runtime_operation),
+        )
+    };
+    let route_resolve_v2 = Router::<AppState>::new()
+        .route(
+            "/v1/internal/routes/resolve",
+            post(route_resolve_v2::resolve).fallback(route_resolve_v2::resolve),
+        )
+        .layer(axum::Extension(std::sync::Arc::new(
+            route_resolve_v2::RouteResolveV2Service::from_app_state(&state),
+        )));
+
+    Router::new()
+        .route("/", get(crate::ui::portal))
+        .route("/zh-CN", get(crate::ui::zh_home_redirect))
+        .route("/zh-CN/", get(crate::ui::zh_home))
+        .route("/docs", get(crate::ui::docs_redirect))
+        .route("/docs/", get(crate::ui::docs_index))
+        .route("/docs/{slug}", get(crate::ui::docs_detail_redirect))
+        .route("/docs/{slug}/", get(crate::ui::docs_detail))
+        .route("/zh-CN/docs", get(crate::ui::zh_docs_redirect))
+        .route("/zh-CN/docs/", get(crate::ui::zh_docs_index))
+        .route(
+            "/zh-CN/docs/{slug}",
+            get(crate::ui::zh_docs_detail_redirect),
+        )
+        .route("/zh-CN/docs/{slug}/", get(crate::ui::zh_docs_detail))
+        .route("/robots.txt", get(crate::ui::robots))
+        .route("/sitemap.xml", get(crate::ui::sitemap))
+        .route("/site.webmanifest", get(crate::ui::web_manifest))
+        .route("/assets/public.css", get(crate::ui::public_styles))
+        .route("/assets/cats-mark.svg", get(crate::ui::cats_mark))
+        .route("/assets/cats-logo.svg", get(crate::ui::cats_logo))
+        .route("/assets/cats-og.svg", get(crate::ui::cats_og))
+        .route("/assets/cats-og.png", get(crate::ui::cats_og_png))
+        .route("/user", get(crate::ui::user_console))
+        .route("/user/", get(crate::ui::user_console))
+        .route("/user/{account}/{workspace}", get(crate::ui::user_console))
+        .route("/user/{account}/{workspace}/", get(crate::ui::user_console))
+        .route("/admin", get(crate::ui::admin_console))
+        .route("/admin/", get(crate::ui::admin_console))
+        .route("/ui/styles.css", get(crate::ui::styles))
+        .route("/ui/i18n.js", get(crate::ui::i18n_script))
+        .route("/ui/common.js", get(crate::ui::common_script))
+        .route("/ui/user.js", get(crate::ui::user_script))
+        .route("/ui/admin.js", get(crate::ui::admin_script))
+        .route(
+            "/ui/cat-create-v2.mjs",
+            get(crate::ui::cat_create_v2_script),
+        )
+        .route("/auth/config", get(crate::auth::config))
+        .route("/auth/login", get(crate::auth::login))
+        .route("/auth/callback", get(crate::auth::callback))
+        .route("/auth/session", get(crate::auth::session))
+        .route("/auth/workspace", post(crate::auth::switch_workspace))
+        .route("/auth/logout", get(crate::auth::logout))
+        .route("/healthz", get(readiness))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/v1/me", get(cli_me))
+        .route("/v1/workspaces", get(list_workspaces))
+        .route(
+            "/v1/accounts/{account}/workspaces",
+            post(create_account_workspace),
+        )
+        .route(
+            "/v1/workspaces/{workspace}",
+            axum::routing::patch(update_workspace),
+        )
+        .route("/v1/auth/logout", post(cli_logout))
+        .route(
+            "/v1/accounts/{account}/invitations",
+            post(create_account_invitation).get(list_account_invitations),
+        )
+        .route(
+            "/v1/accounts/{account}/invitations/{invitation}/actions/revoke",
+            post(revoke_account_invitation),
+        )
+        .route("/v1/accounts/{account}/members", get(list_account_members))
+        .route(
+            "/v1/accounts/{account}/members/{membership}",
+            axum::routing::patch(update_account_member).delete(deactivate_account_member),
+        )
+        .route("/v1/workspaces/{workspace}/cats", cat_create_route)
+        .route("/v1/workspaces/{workspace}/disks", disk_collection_route)
+        .route(
+            "/v1/workspaces/{workspace}/tokens",
+            post(create_workspace_token).get(list_workspace_tokens),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/tokens/{token}",
+            axum::routing::delete(revoke_workspace_token),
+        )
+        .route(
+            "/v1/internal/runtime/agent-sessions",
+            post(agent_registration::register_agent_session)
+                .fallback(agent_registration::register_agent_session),
+        )
+        .route(
+            "/v1/internal/runtime/desired-reads",
+            post(runtime_spine::desired_read).fallback(runtime_spine::desired_read),
+        )
+        .route(
+            "/v1/internal/runtime/observations",
+            post(runtime_spine::observation).fallback(runtime_spine::observation),
+        )
+        .route(
+            "/v1/admin/runtime/node-authority-applies",
+            post(runtime_node_authority::apply_runtime_node_authority)
+                .fallback(runtime_node_authority::apply_runtime_node_authority),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/billing/balance",
+            get(workspace_billing_balance),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/billing/checkout",
+            post(create_billing_checkout),
+        )
+        .route("/v1/billing/stripe/webhook", post(stripe_webhook))
+        .route("/v1/admin/workspaces", get(admin_list_workspaces))
+        .merge(runtime_operation_read)
+        .merge(runtime_volume_authority)
+        .merge(route_resolve_v2)
+        .merge(retired_product_support)
+        .merge(retired_product_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
 }
@@ -529,7 +724,7 @@ mod tests {
             .split_once("pub fn router")
             .expect("router declaration")
             .1
-            .split_once(".fallback")
+            .split_once(".fallback(crate::ui::not_found)")
             .expect("router fallback")
             .0;
         let mut routes = Vec::new();
@@ -588,6 +783,17 @@ mod tests {
             }
             cursor = end;
         }
+        assert!(
+            router.contains(".route(\"/v1/workspaces/{workspace}/cats\", cat_create_route)"),
+            "conditional Cat-create route is missing",
+        );
+        routes.push("POST /v1/workspaces/{workspace}/cats".to_string());
+        assert!(
+            router.contains(".route(\"/v1/workspaces/{workspace}/disks\", disk_collection_route)"),
+            "conditional PersistentDisk collection route is missing",
+        );
+        routes.push("GET /v1/workspaces/{workspace}/disks".to_string());
+        routes.push("POST /v1/workspaces/{workspace}/disks".to_string());
         routes.sort();
 
         let expected = r#"DELETE /v1/accounts/{account}/members/{membership}
@@ -618,6 +824,7 @@ GET /robots.txt
 GET /site.webmanifest
 GET /sitemap.xml
 GET /ui/admin.js
+GET /ui/cat-create-v2.mjs
 GET /ui/common.js
 GET /ui/i18n.js
 GET /ui/styles.css
@@ -652,6 +859,7 @@ GET /v1/workspaces/{workspace}/disks
 GET /v1/workspaces/{workspace}/disks/{disk}
 GET /v1/workspaces/{workspace}/disks/{disk}/snapshots
 GET /v1/workspaces/{workspace}/operations
+GET /v1/workspaces/{workspace}/operations/{operation}
 GET /v1/workspaces/{workspace}/tokens
 GET /zh-CN
 GET /zh-CN/
@@ -666,14 +874,16 @@ POST /v1/accounts/{account}/invitations
 POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 POST /v1/accounts/{account}/workspaces
 POST /v1/admin/nodes/{id}/actions/{verb}
+POST /v1/admin/runtime/node-authority-applies
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
+POST /v1/internal/routes/resolve
+POST /v1/internal/runtime/agent-sessions
+POST /v1/internal/runtime/desired-reads
+POST /v1/internal/runtime/observations
+POST /v1/internal/runtime/volume-transition-evidence
+POST /v1/internal/runtime/volume-transitions
 POST /v1/internal/usage/checkpoints
-POST /v1/internal/work/acquire
-POST /v1/internal/work/release
-POST /v1/nodes/heartbeat
-POST /v1/nodes/register
-POST /v1/nodes/work-status
 POST /v1/nodes/{id}/actions/cordon
 POST /v1/routes/wake
 POST /v1/workspaces/{workspace}/billing/checkout

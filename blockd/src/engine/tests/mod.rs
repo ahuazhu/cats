@@ -1,6 +1,11 @@
 use super::*;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::{
+    AcquireOrigin, AttachmentLineageIdentity, AuthorizedServingAttachment, LastVolumeTransition,
+    NormalAcquireRequest, RenewLeaseResult, UnixMillis, VolumeAdminState, VolumeDurability,
+    VolumeHeadCasResult, VolumeRecord,
+};
 use cats_test_support::blob_doubles::{
     ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
 };
@@ -28,6 +33,268 @@ fn env() -> Env {
         meta,
         data_dir,
     }
+}
+
+/// Keeps legacy-engine unit doubles useful while production control-only
+/// composition is constrained to the target authority port. Exact PostgreSQL
+/// row/transaction behavior is covered in the adapter integration tests.
+struct TestVolumeDataAuthority {
+    metadata: Arc<dyn MetadataStore>,
+}
+
+struct ExactServingAuthority {
+    record: Mutex<VolumeRecord>,
+    load_calls: AtomicU64,
+    renew_calls: AtomicU64,
+    fail_load_call: AtomicU64,
+}
+
+impl ExactServingAuthority {
+    fn new(record: VolumeRecord) -> Self {
+        Self {
+            record: Mutex::new(record),
+            load_calls: AtomicU64::new(0),
+            renew_calls: AtomicU64::new(0),
+            fail_load_call: AtomicU64::new(0),
+        }
+    }
+}
+
+impl VolumeDataAuthority for ExactServingAuthority {
+    fn load_volume(&self, volume_id: &Id) -> cats_storage::authority::Result<VolumeRecord> {
+        let call = self.load_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_load_call.load(Ordering::SeqCst) == call {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        let record = self.record.lock().unwrap();
+        if record.volume_id != *volume_id {
+            return Err(AuthorityError::NotFound);
+        }
+        Ok(record.clone())
+    }
+
+    fn renew_lease(
+        &self,
+        request: &RenewLeaseRequest,
+    ) -> cats_storage::authority::Result<RenewLeaseResult> {
+        let call = self.renew_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = UnixMillis::new(100_000 + call).unwrap();
+        let (updated, result) =
+            cats_storage::authority::renew_lease(&self.record.lock().unwrap(), request, now)?;
+        *self.record.lock().unwrap() = updated;
+        Ok(result)
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        request: &VolumeHeadCasRequest,
+    ) -> cats_storage::authority::Result<VolumeHeadCasResult> {
+        let (updated, result) =
+            cats_storage::authority::compare_and_swap_head(&self.record.lock().unwrap(), request)?;
+        *self.record.lock().unwrap() = updated;
+        Ok(result)
+    }
+}
+
+fn target_authority(metadata: Arc<dyn MetadataStore>) -> Arc<dyn VolumeDataAuthority> {
+    Arc::new(TestVolumeDataAuthority { metadata })
+}
+
+impl VolumeDataAuthority for TestVolumeDataAuthority {
+    fn load_volume(&self, volume_id: &Id) -> cats_storage::authority::Result<VolumeRecord> {
+        let head = self
+            .metadata
+            .load_head(volume_id.as_str())
+            .map_err(test_authority_error)?;
+        let lease_owner = head.lease_owner.map(|owner| {
+            Id::new(owner).expect("legacy test attachment ids are valid target authority ids")
+        });
+        let lease_epoch = FenceEpoch::new(u64::try_from(head.lease_epoch).unwrap_or(0))
+            .expect("zero is a valid fence epoch");
+        Ok(VolumeRecord {
+            volume_id: Id::new(head.volume_id)
+                .expect("legacy test volume ids are valid target authority ids"),
+            size_bytes: head.size_bytes,
+            durability: VolumeDurability::Strict,
+            admin_state: VolumeAdminState::Active,
+            head: RemoteHead {
+                generation: Generation::new(u64::try_from(head.generation).unwrap_or(u64::MAX))
+                    .expect("legacy test generations fit the target wire range"),
+                root_hash: head.root_hash.map(Sha256Digest::from_bytes),
+                root_object_id: head.root_object_id.map(|object_id| {
+                    AsciiText::new(object_id)
+                        .expect("legacy test object ids are valid target ASCII text")
+                }),
+            },
+            lease_owner: lease_owner.clone(),
+            lease_epoch,
+            lease_expires_at: lease_owner
+                .as_ref()
+                .map(|_| UnixMillis::new(1).expect("one is a valid timestamp")),
+            last_transition: lease_owner.map(|_| LastVolumeTransition::Takeover {
+                authorization_id: Id::new("test-authority").expect("constant is a valid id"),
+            }),
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        request: &RenewLeaseRequest,
+    ) -> cats_storage::authority::Result<RenewLeaseResult> {
+        self.metadata
+            .renew_lease(
+                request.volume_id.as_str(),
+                request.attachment_id.as_str(),
+                i64::try_from(request.expected_epoch.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                i64::try_from(request.lease_duration_ms)
+                    .map_err(|_| AuthorityError::InvalidLeaseDuration)?,
+            )
+            .map_err(test_authority_error)?;
+        Ok(RenewLeaseResult {
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            epoch: request.expected_epoch,
+            lease_expires_at: UnixMillis::new(1).expect("one is a valid timestamp"),
+        })
+    }
+
+    fn compare_and_swap_head(
+        &self,
+        request: &VolumeHeadCasRequest,
+    ) -> cats_storage::authority::Result<VolumeHeadCasResult> {
+        let hash = request
+            .new_head
+            .root_hash
+            .as_ref()
+            .ok_or(AuthorityError::HeadConflict)?;
+        let object_id = request
+            .new_head
+            .root_object_id
+            .as_ref()
+            .ok_or(AuthorityError::HeadConflict)?;
+        self.metadata
+            .cas_head(
+                request.volume_id.as_str(),
+                i64::try_from(request.expected_head.generation.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                i64::try_from(request.new_head.generation.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+                *hash.as_bytes(),
+                object_id.as_str(),
+                request.attachment_id.as_str(),
+                i64::try_from(request.expected_epoch.get())
+                    .map_err(|_| AuthorityError::BackendUnknown)?,
+            )
+            .map_err(test_authority_error)?;
+        Ok(VolumeHeadCasResult {
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            epoch: request.expected_epoch,
+            resulting_head: request.new_head.clone(),
+        })
+    }
+}
+
+fn test_authority_error(error: MetaError) -> AuthorityError {
+    match error {
+        MetaError::NotFound(_) => AuthorityError::NotFound,
+        MetaError::LeaseHeld => AuthorityError::OtherWriter,
+        MetaError::Fenced => AuthorityError::Fenced,
+        MetaError::CasConflict { .. } => AuthorityError::HeadConflict,
+        MetaError::InvalidArgument(_) => AuthorityError::InvalidLeaseDuration,
+        MetaError::AlreadyExists(_) | MetaError::Backend(_) => AuthorityError::BackendUnknown,
+    }
+}
+
+struct ServingFixture {
+    _dir: tempfile::TempDir,
+    blob: Arc<FileBlobStore>,
+    authority: Arc<ExactServingAuthority>,
+    attachment: AuthorizedServingAttachment,
+    config: EngineConfig,
+    data_dir: PathBuf,
+}
+
+fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let request = NormalAcquireRequest {
+        volume_id: Id::new(VOL).unwrap(),
+        transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+            "1234567890abcdef1234567890abcdef",
+        )
+        .unwrap(),
+        attachment_id: Id::new("attA").unwrap(),
+        expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+        desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
+        placement_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+        lease_duration_ms: 60_000,
+    };
+    let unowned = VolumeRecord {
+        volume_id: request.volume_id.clone(),
+        size_bytes: SIZE,
+        durability,
+        admin_state: VolumeAdminState::Active,
+        head: RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        lease_owner: None,
+        lease_epoch: request.expected_unowned_epoch,
+        lease_expires_at: None,
+        last_transition: None,
+    };
+    let (record, result) = cats_storage::authority::normal_acquire(
+        &unowned,
+        &request,
+        UnixMillis::new(10_000).unwrap(),
+    )
+    .unwrap();
+    let identity = AttachmentLineageIdentity {
+        volume_id: request.volume_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        attachment_epoch: result.resulting_epoch,
+        acquire_origin: AcquireOrigin::Normal {
+            transition_id: request.transition_id.clone(),
+        },
+        node_id: Id::new("node_a").unwrap(),
+        placement_epoch: request.placement_epoch,
+    };
+    let attachment = AuthorizedServingAttachment {
+        identity,
+        size_bytes: record.size_bytes,
+        durability: record.durability,
+        head: record.head.clone(),
+        lease_expires_at: result.lease_expires_at,
+        acquire: cats_storage::authority::AuthorizedServingAcquire::Normal { request, result },
+    };
+    let data_dir = dir.path().join("serving-data");
+    let mut config = EngineConfig::new(VOL, &data_dir, "attA");
+    config.lease_ttl_ms = 60_000;
+    config.durability = match durability {
+        VolumeDurability::Strict => DurabilityMode::Strict,
+        VolumeDurability::Relaxed => DurabilityMode::Relaxed {
+            drain_interval_ms: 0,
+        },
+    };
+    ServingFixture {
+        _dir: dir,
+        blob,
+        authority: Arc::new(ExactServingAuthority::new(record)),
+        attachment,
+        config,
+        data_dir,
+    }
+}
+
+fn write_serving_identity(fixture: &ServingFixture) {
+    fs::create_dir_all(&fixture.data_dir).unwrap();
+    let file = File::create(fixture.data_dir.join("identity.json")).unwrap();
+    serde_json::to_writer(&file, &fixture.attachment.identity).unwrap();
+    file.sync_all().unwrap();
+    File::open(&fixture.data_dir).unwrap().sync_all().unwrap();
 }
 
 fn attach(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
@@ -74,10 +341,10 @@ fn write_read_roundtrip_and_holes() {
     e.detach().unwrap();
 }
 
-/// ADR-0028 §3: a restarted node agent may only re-adopt a live `cats-blockd`
-/// if the process self-reports, over the control protocol, the volume and
-/// attachment the agent started it for. `status` serializes exactly this
-/// payload, so the identity has to survive the wire encoding.
+/// V1 runtime adoption may only re-adopt a live `cats-blockd` if the process
+/// self-reports, over the control protocol, the volume and attachment the
+/// agent started it for. `status` serializes exactly this payload, so the
+/// identity has to survive the wire encoding.
 #[test]
 fn status_reports_the_configured_volume_and_attachment() {
     let env = env();
@@ -86,6 +353,7 @@ fn status_reports_the_configured_volume_and_attachment() {
     let status: cats_api::blockd::DurabilityStatus = serde_json::from_str(&wire).unwrap();
     assert_eq!(status.volume_id, VOL);
     assert_eq!(status.attachment_id, "attA");
+    assert_eq!(status.guest_device_serial, None);
     e.detach().unwrap();
 
     // A later attachment of the same volume reports its own attachment id, so
@@ -95,6 +363,212 @@ fn status_reports_the_configured_volume_and_attachment() {
     assert_eq!(status.volume_id, VOL);
     assert_eq!(status.attachment_id, "attB");
     next.detach().unwrap();
+}
+
+#[test]
+fn authorized_serving_requires_identity_before_authority_or_local_state() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Io(_))));
+    assert_eq!(fixture.authority.load_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 0);
+    assert!(!fixture.data_dir.join(PENDING_PACK_DIR).exists());
+}
+
+#[test]
+fn authorized_control_only_renews_exact_grant_and_keeps_guest_io_closed() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&fixture);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_control_only(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.load_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+    let status = engine.durability_status();
+    assert_eq!(
+        status.attachment_epoch,
+        Some(fixture.attachment.identity.attachment_epoch)
+    );
+    assert_eq!(
+        status.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+    assert_eq!(status.guest_io_enabled, Some(false));
+    assert_eq!(status.remote_head, Some(fixture.attachment.head.clone()));
+    assert!(matches!(
+        engine.write(0, b"must stay closed"),
+        Err(EngineError::GuestIoDisabled)
+    ));
+}
+
+#[test]
+fn authorized_serving_renews_before_guest_io_and_writes_target_v2_lineage() {
+    let fixture = serving_fixture(VolumeDurability::Relaxed);
+    write_serving_identity(&fixture);
+    let authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+
+    let status = engine.durability_status();
+    assert_eq!(
+        status.attachment_epoch,
+        Some(fixture.attachment.identity.attachment_epoch)
+    );
+    assert_eq!(
+        status.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+    assert_eq!(
+        status.node_id.as_ref(),
+        Some(&fixture.attachment.identity.node_id)
+    );
+    assert_eq!(
+        status.placement_epoch,
+        Some(fixture.attachment.identity.placement_epoch)
+    );
+    assert_eq!(status.guest_io_enabled, Some(true));
+
+    engine.write(0, b"authorized target bytes").unwrap();
+    assert_eq!(engine.flush().unwrap(), 1);
+    let packs = fs::read_dir(fixture.data_dir.join(PENDING_PACK_DIR))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(packs.len(), 1);
+    let bytes = fs::read(&packs[0]).unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 2);
+    let (header, _) = format::decode_pack(&bytes).unwrap();
+    assert_eq!(header.lease_epoch, None);
+    assert_eq!(
+        header.attachment_id.as_deref(),
+        Some(fixture.attachment.identity.attachment_id.as_str())
+    );
+    assert_eq!(
+        header.attachment_epoch,
+        Some(i64::try_from(fixture.attachment.identity.attachment_epoch.get()).unwrap())
+    );
+    assert_eq!(
+        header.acquire_origin.as_ref(),
+        Some(&fixture.attachment.identity.acquire_origin)
+    );
+
+    engine.stop_authorized_serving().unwrap();
+    assert_eq!(
+        fixture.authority.record.lock().unwrap().head.generation,
+        Generation::new(1).unwrap()
+    );
+    assert!(fixture
+        .authority
+        .record
+        .lock()
+        .unwrap()
+        .lease_owner
+        .is_some());
+}
+
+#[test]
+fn authorized_serving_retry_after_lost_startup_result_reuses_the_exact_grant() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&fixture);
+    fixture.authority.fail_load_call.store(3, Ordering::SeqCst);
+    let first_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let first = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        first_authority,
+    );
+    assert!(first.is_err());
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 1);
+    assert!(!fixture.data_dir.join(PENDING_PACK_DIR).exists());
+
+    fixture.authority.fail_load_call.store(0, Ordering::SeqCst);
+    let retry_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        retry_authority,
+    )
+    .unwrap();
+    assert_eq!(fixture.authority.renew_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.epoch(), 1);
+    engine.stop_authorized_serving().unwrap();
+}
+
+#[test]
+fn authorized_serving_never_adopts_or_discards_legacy_and_malformed_packs() {
+    let legacy = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&legacy);
+    let pending = legacy.data_dir.join(PENDING_PACK_DIR);
+    fs::create_dir_all(&pending).unwrap();
+    let legacy_path = pending.join("00000000000000000000-legacy.pack");
+    fs::write(
+        &legacy_path,
+        format::encode_pack(
+            &PackHeader {
+                txn: "legacy".into(),
+                volume_id: VOL.into(),
+                base_generation: 0,
+                lease_epoch: Some(1),
+                attachment_id: None,
+                attachment_epoch: None,
+                acquire_origin: None,
+                entries: Vec::new(),
+            },
+            &[],
+        ),
+    )
+    .unwrap();
+    let authority: Arc<dyn VolumeDataAuthority> = legacy.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        legacy.config.clone(),
+        legacy.attachment.clone(),
+        legacy.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(legacy_path.exists(), "legacy evidence must remain intact");
+    assert_eq!(
+        legacy.authority.record.lock().unwrap().head.generation,
+        Generation::new(0).unwrap()
+    );
+
+    let malformed = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&malformed);
+    let pending = malformed.data_dir.join(PENDING_PACK_DIR);
+    fs::create_dir_all(&pending).unwrap();
+    let malformed_path = pending.join("00000000000000000000-malformed.pack");
+    fs::write(&malformed_path, b"not a pack").unwrap();
+    let authority: Arc<dyn VolumeDataAuthority> = malformed.authority.clone();
+    let result = ChunkEngine::attach_authorized_serving(
+        malformed.config.clone(),
+        malformed.attachment.clone(),
+        malformed.blob.clone(),
+        authority,
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(
+        malformed_path.exists(),
+        "malformed target evidence must remain intact"
+    );
 }
 
 #[test]
@@ -179,6 +653,311 @@ fn relaxed_flush_acks_locally_and_the_drain_publishes() {
     assert!(counting.data_put_count() > 0);
     assert_eq!(e.generation(), 1);
     e.detach().unwrap();
+}
+
+#[test]
+fn one_large_barrier_is_split_into_bounded_contiguous_packs() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let first = pattern(DENSE_BYTES, 61);
+    let second = pattern(DENSE_BYTES, 62);
+    e.write(0, &first).unwrap();
+    e.write(CHUNK_SIZE as u64, &second).unwrap();
+
+    assert_eq!(
+        e.flush().unwrap(),
+        2,
+        "one logical barrier must advance once per bounded pack"
+    );
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    assert_eq!(paths.len(), 2);
+    for (index, path) in paths.iter().enumerate() {
+        let encoded = fs::read(path).unwrap();
+        let (header, _) = format::decode_pack(&encoded).unwrap();
+        assert_eq!(header.base_generation, index as i64);
+        let materialized = materialized_pack_bytes(&header).unwrap();
+        assert!(
+            pack_working_set_bytes(encoded.len(), materialized).unwrap() <= TEST_LIMIT,
+            "pack {index} exceeded its exact publisher budget"
+        );
+    }
+
+    assert_eq!(e.drain_staged().unwrap(), 2);
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        2,
+        "the same budget also bounds each publisher CAS prefix"
+    );
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    let mut back = vec![0u8; DENSE_BYTES];
+    restored.read(0, &mut back).unwrap();
+    assert_eq!(back, first);
+    restored.read(CHUNK_SIZE as u64, &mut back).unwrap();
+    assert_eq!(back, second);
+    restored.detach().unwrap();
+}
+
+#[test]
+fn strict_flush_waits_for_every_bounded_pack_in_one_barrier() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    e.write(0, &pattern(DENSE_BYTES, 63)).unwrap();
+    e.write(CHUNK_SIZE as u64, &pattern(DENSE_BYTES, 64))
+        .unwrap();
+
+    assert_eq!(e.flush().unwrap(), 2);
+    assert!(e.staged.lock().unwrap().packs.is_empty());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        2,
+        "Strict must publish every bounded pack before acknowledging the barrier"
+    );
+    e.detach().unwrap();
+}
+
+#[test]
+fn failed_multi_pack_stage_queues_its_durable_prefix_and_restores_the_tail() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let first = pattern(DENSE_BYTES, 71);
+    let second = pattern(DENSE_BYTES, 72);
+    let third = pattern(DENSE_BYTES, 73);
+    e.write(0, &first).unwrap();
+    e.write(CHUNK_SIZE as u64, &second).unwrap();
+
+    let error = {
+        let _failure = StageWriteFailureGuard::set(1);
+        e.flush().unwrap_err()
+    };
+    assert!(matches!(error, EngineError::Io(_)));
+    let status = e.durability_status();
+    assert_eq!(status.local_durable_generation, 1);
+    assert_eq!(status.remote_durable_generation, 0);
+    assert_eq!(status.unpublished_generations, 1);
+    assert_eq!(e.staged.lock().unwrap().packs.len(), 1);
+
+    // The failed barrier was not ACKed, but its durable first pack remains a
+    // live prefix. The restored tail can join later writes in a new barrier
+    // without a restart or a generation gap.
+    e.write(2 * CHUNK_SIZE as u64, &third).unwrap();
+    assert_eq!(e.flush().unwrap(), 3);
+    assert_eq!(e.staged.lock().unwrap().packs.len(), 3);
+    assert_eq!(e.drain_staged().unwrap(), 3);
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    for (chunk_index, expected) in [first, second, third].iter().enumerate() {
+        let mut back = vec![0u8; DENSE_BYTES];
+        restored
+            .read(chunk_index as u64 * CHUNK_SIZE as u64, &mut back)
+            .unwrap();
+        assert_eq!(&back, expected, "chunk {chunk_index} lost staged bytes");
+    }
+    restored.detach().unwrap();
+}
+
+#[test]
+fn restart_scans_a_durable_split_prefix_without_breaking_the_watermark() {
+    const TEST_LIMIT: usize = 18 << 20;
+    const DENSE_BYTES: usize = 3 << 20;
+
+    let _limit = PublisherWorkingSetLimitGuard::set(TEST_LIMIT);
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let first = pattern(DENSE_BYTES, 74);
+    let second = pattern(DENSE_BYTES, 75);
+    {
+        let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+        e.write(0, &first).unwrap();
+        e.write(CHUNK_SIZE as u64, &second).unwrap();
+        let error = {
+            let _failure = StageWriteFailureGuard::set(1);
+            e.flush().unwrap_err()
+        };
+        assert!(matches!(error, EngineError::Io(_)));
+        assert_eq!(e.staged.lock().unwrap().packs.len(), 1);
+        // Drop models a crash: the in-memory queue disappears, leaving only
+        // the renamed pack prefix and persistent dirty bitmap/cache.
+    }
+    meta.revoke_lease(VOL).unwrap();
+
+    let recovered =
+        ChunkEngine::attach(EngineConfig::new(VOL, &data_dir, "attB"), blob, meta).unwrap();
+    assert_eq!(
+        recovered.generation(),
+        1,
+        "startup must replay the durable contiguous prefix"
+    );
+    let mut back = vec![0u8; DENSE_BYTES];
+    recovered.read(0, &mut back).unwrap();
+    assert_eq!(back, first);
+    // The tail was never ACKed, so a crash may discard it. The recovered
+    // prefix must nevertheless leave an appendable watermark.
+    let replacement = pattern(4096, 76);
+    recovered
+        .write(2 * CHUNK_SIZE as u64, &replacement)
+        .unwrap();
+    assert_eq!(recovered.flush().unwrap(), 2);
+    let mut replacement_back = vec![0u8; replacement.len()];
+    recovered
+        .read(2 * CHUNK_SIZE as u64, &mut replacement_back)
+        .unwrap();
+    assert_eq!(replacement_back, replacement);
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
+    const RANGE_STORM_LIMIT: usize = (8 << 20) + (16 << 10);
+
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    let mut expected = vec![0u8; CHUNK_SIZE as usize];
+
+    for generation in 0..3usize {
+        let offset = generation * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let bytes = pattern(4096, 81 + generation as u8);
+        e.write(offset as u64, &bytes).unwrap();
+        expected[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        e.flush().unwrap();
+        e.drain_staged().unwrap();
+    }
+    assert_eq!(e.state.lock().unwrap().map[0].layer_count(), 3);
+
+    let _limit = PublisherWorkingSetLimitGuard::set(RANGE_STORM_LIMIT);
+    let mut range_count = 0usize;
+    for page in 0..33usize {
+        let page_start = page * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        for range in 0..16usize {
+            let offset = page_start + range * 2;
+            let byte = [(page as u8).wrapping_add(range as u8).wrapping_add(1)];
+            e.write(offset as u64, &byte).unwrap();
+            expected[offset] = byte[0];
+            range_count += 1;
+        }
+    }
+    let local_generation = e.flush().unwrap();
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    assert!(paths.len() > 1, "the range storm did not cross the budget");
+    let mut persisted_ranges = 0usize;
+    for path in &paths {
+        let encoded = fs::read(path).unwrap();
+        let (header, _) = format::decode_pack(&encoded).unwrap();
+        assert_eq!(header.entries.len(), 1);
+        assert_eq!(header.entries[0].page_mask, format::full_page_mask());
+        persisted_ranges += header.entries[0].byte_ranges.len();
+        assert!(
+            pack_working_set_bytes(encoded.len(), materialized_pack_bytes(&header).unwrap())
+                .unwrap()
+                <= RANGE_STORM_LIMIT
+        );
+    }
+    assert_eq!(persisted_ranges, range_count);
+    assert_eq!(local_generation, 3 + paths.len() as i64);
+
+    e.drain_staged().unwrap();
+    assert_eq!(
+        e.state.lock().unwrap().map[0].layer_count(),
+        0,
+        "budget-split overlays must end at a fresh base"
+    );
+    e.detach().unwrap();
+
+    let restored = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        blob,
+        meta,
+    )
+    .unwrap();
+    let mut back = vec![0u8; CHUNK_SIZE as usize];
+    restored.read(0, &mut back).unwrap();
+    assert_eq!(format::sha256(&back), format::sha256(&expected));
+    assert_eq!(back, expected);
+    restored.detach().unwrap();
 }
 
 #[test]
@@ -592,16 +1371,19 @@ fn failed_detach_keeps_the_journal_and_lease_for_retry() {
 struct CountingMeta {
     inner: Arc<dyn MetadataStore>,
     cas_calls: AtomicU64,
+    forced_head_epoch: Option<i64>,
 }
 
 /// Commits the first CAS but drops its response, reproducing a database
 /// timeout after PostgreSQL made the new root authoritative.
 #[derive(Clone, Copy)]
 enum CasFault {
+    BackendBeforeCas,
     ResponseLost,
     ResponseLostAndFirstReconciliationFails,
     ResponseLostThenLeaseRevoked,
     ResponseLostThenGenerationAdvanced,
+    ResponseLostThenSizeChanged,
     UnrelatedRootPublished,
     ExplicitFenced,
 }
@@ -610,6 +1392,8 @@ struct LostCasResponseMeta {
     inner: Arc<dyn MetadataStore>,
     fault: Mutex<Option<CasFault>>,
     fail_next_load: AtomicBool,
+    forced_head_size: AtomicU64,
+    cas_calls: AtomicU64,
 }
 
 impl MetadataStore for LostCasResponseMeta {
@@ -625,7 +1409,12 @@ impl MetadataStore for LostCasResponseMeta {
                 "injected authoritative-head read failure".into(),
             ));
         }
-        self.inner.load_head(v)
+        let mut head = self.inner.load_head(v)?;
+        let forced_size = self.forced_head_size.load(Ordering::SeqCst);
+        if forced_size != 0 {
+            head.size_bytes = forced_size;
+        }
+        Ok(head)
     }
     fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.delete_volume(v)
@@ -662,8 +1451,14 @@ impl MetadataStore for LostCasResponseMeta {
         a: &str,
         epoch: i64,
     ) -> cats_storage::metadata::Result<i64> {
+        self.cas_calls.fetch_add(1, Ordering::SeqCst);
         let fault = self.fault.lock().unwrap().take();
         match fault {
+            Some(CasFault::BackendBeforeCas) => {
+                return Err(MetaError::Backend(
+                    "injected failure before root CAS".into(),
+                ));
+            }
             Some(CasFault::ExplicitFenced) => return Err(MetaError::Fenced),
             Some(CasFault::UnrelatedRootPublished) => {
                 self.inner.cas_head(
@@ -702,7 +1497,18 @@ impl MetadataStore for LostCasResponseMeta {
                         epoch,
                     )?;
                 }
-                CasFault::UnrelatedRootPublished | CasFault::ExplicitFenced => unreachable!(),
+                CasFault::ResponseLostThenSizeChanged => {
+                    let changed_size = self
+                        .inner
+                        .load_head(v)?
+                        .size_bytes
+                        .checked_add(1)
+                        .expect("test volume size has room to grow");
+                    self.forced_head_size.store(changed_size, Ordering::SeqCst);
+                }
+                CasFault::BackendBeforeCas
+                | CasFault::UnrelatedRootPublished
+                | CasFault::ExplicitFenced => unreachable!(),
             }
             return Err(MetaError::Backend(
                 "injected timeout after root CAS committed".into(),
@@ -733,7 +1539,11 @@ impl MetadataStore for CountingMeta {
         &self,
         v: &str,
     ) -> cats_storage::metadata::Result<cats_storage::metadata::VolumeHead> {
-        self.inner.load_head(v)
+        let mut head = self.inner.load_head(v)?;
+        if let Some(epoch) = self.forced_head_epoch {
+            head.lease_epoch = epoch;
+        }
+        Ok(head)
     }
     fn delete_volume(&self, v: &str) -> cats_storage::metadata::Result<()> {
         self.inner.delete_volume(v)
@@ -796,6 +1606,7 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
     let meta = Arc::new(CountingMeta {
         inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
         cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
@@ -834,6 +1645,454 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
 }
 
 #[test]
+fn final_batch_record_is_byte_stable_when_recovery_uses_smaller_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::BackendBeforeCas);
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    e.write(0, &pattern(4096, 31)).unwrap();
+    assert_eq!(e.flush().unwrap(), 1);
+    e.write(CHUNK_SIZE as u64, &pattern(4096, 32)).unwrap();
+    assert_eq!(e.flush().unwrap(), 2);
+    let final_txn = e.staged.lock().unwrap().packs.back().unwrap().txn.clone();
+    let final_record_key = chunk::keys::commit_record(VOL, 2, &final_txn);
+
+    assert!(matches!(
+        e.drain_staged(),
+        Err(EngineError::Meta(MetaError::Backend(_)))
+    ));
+    assert_eq!(meta.load_head(VOL).unwrap().generation, 0);
+    let record_before_restart = blob.get(&final_record_key).unwrap();
+    assert!(
+        !blob
+            .exists(&chunk::keys::commit_record(
+                VOL,
+                1,
+                &e.staged.lock().unwrap().packs.front().unwrap().txn,
+            ))
+            .unwrap(),
+        "the failed batch writes only its final commit record"
+    );
+
+    // This is the durable state of a crash after the final record PUT and
+    // before CAS. A Strict restart replays A and B separately, changing the
+    // batch prefix but not the identity or bytes of B's final record.
+    drop(e);
+    meta.revoke_lease(VOL).unwrap();
+    let recovered = ChunkEngine::attach(
+        EngineConfig::new(VOL, &data_dir, "attB"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    assert_eq!(recovered.generation(), 2);
+    assert_eq!(blob.get(&final_record_key).unwrap(), record_before_restart);
+    assert!(fs::read_dir(data_dir.join("pending"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        3,
+        "one failed batch CAS plus two single-pack recovery CAS operations"
+    );
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn strict_recovery_cleans_every_pack_covered_by_a_final_record_only_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
+    cfg.durability = DurabilityMode::Relaxed {
+        drain_interval_ms: NO_TIMER,
+    };
+    let e = ChunkEngine::attach(cfg, blob.clone(), meta.clone()).unwrap();
+    e.write(0, &pattern(4096, 41)).unwrap();
+    e.flush().unwrap();
+    e.write(CHUNK_SIZE as u64, &pattern(4096, 42)).unwrap();
+    e.flush().unwrap();
+
+    let paths: Vec<PathBuf> = e
+        .staged
+        .lock()
+        .unwrap()
+        .packs
+        .iter()
+        .map(|pack| pack.path.clone())
+        .collect();
+    let decoded: Vec<(PackHeader, Vec<u8>)> = paths
+        .iter()
+        .map(|path| format::decode_pack(&fs::read(path).unwrap()).unwrap())
+        .collect();
+    let packs: Vec<(&PackHeader, &[u8])> = decoded
+        .iter()
+        .map(|(header, payload)| (header, payload.as_slice()))
+        .collect();
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    assert_eq!(
+        e.commit_pack_batch(&packs, base_map, base_leaves).unwrap(),
+        2
+    );
+    assert_eq!(meta.cas_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !blob
+            .exists(&chunk::keys::commit_record(VOL, 1, &decoded[0].0.txn))
+            .unwrap(),
+        "a successful batch intentionally has no intermediate record"
+    );
+
+    // Simulate a crash after CAS and before local queue cleanup. Recovery must
+    // use the exact authoritative generation as the oracle, not require an
+    // intermediate record that the batching model never writes.
+    drop(e);
+    meta.revoke_lease(VOL).unwrap();
+    let recovered = ChunkEngine::attach(
+        EngineConfig::new(VOL, &data_dir, "attB"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    assert_eq!(recovered.generation(), 2);
+    assert!(fs::read_dir(data_dir.join("pending"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "cleanup of a covered prefix must not issue another CAS"
+    );
+    recovered.detach().unwrap();
+}
+
+#[test]
+fn generation_exhaustion_rejects_a_batch_before_any_remote_write() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+
+    let first = PackHeader {
+        txn: "generation-exhaustion-a".into(),
+        volume_id: VOL.into(),
+        base_generation: i64::MAX - 1,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
+        entries: Vec::new(),
+    };
+    let second = PackHeader {
+        txn: "generation-exhaustion-b".into(),
+        volume_id: VOL.into(),
+        base_generation: i64::MAX,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
+        entries: Vec::new(),
+    };
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+
+    // Any object-store PUT would consume this fault. The unchanged counter and
+    // CAS count jointly prove the overflow is rejected before remote mutation.
+    blob.fail_puts.store(1, Ordering::SeqCst);
+    let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+    let error = e
+        .commit_pack_batch(&[(&first, &[]), (&second, &[])], base_map, base_leaves)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, EngineError::Corrupt(ref message) if message == "commit generation overflow"),
+        "unexpected generation exhaustion error: {error}"
+    );
+    assert_eq!(
+        blob.fail_puts.load(Ordering::SeqCst),
+        1,
+        "generation exhaustion must precede every immutable PUT"
+    );
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        cas_before,
+        "generation exhaustion must precede the authority CAS"
+    );
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
+fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let first = PackHeader {
+        txn: "lineage-a".into(),
+        volume_id: VOL.into(),
+        base_generation: 0,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
+        entries: Vec::new(),
+    };
+    let second = PackHeader {
+        txn: "lineage-b".into(),
+        volume_id: VOL.into(),
+        base_generation: 1,
+        lease_epoch: Some(e.epoch),
+        attachment_id: None,
+        attachment_epoch: None,
+        acquire_origin: None,
+        entries: Vec::new(),
+    };
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    let malformed = [
+        {
+            let mut value = second.clone();
+            value.base_generation = 2;
+            (first.clone(), value)
+        },
+        (second.clone(), first.clone()),
+        {
+            let mut value = second.clone();
+            value.volume_id = "other-volume".into();
+            (first.clone(), value)
+        },
+        {
+            let mut value = second.clone();
+            value.lease_epoch = value.lease_epoch.map(|epoch| epoch + 1);
+            (first.clone(), value)
+        },
+        {
+            let mut value = second.clone();
+            value.txn = first.txn.clone();
+            (first.clone(), value)
+        },
+    ];
+
+    for (first, second) in malformed {
+        blob.fail_puts.store(1, Ordering::SeqCst);
+        let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            e.commit_pack_batch(
+                &[(&first, &[]), (&second, &[])],
+                base_map.clone(),
+                base_leaves.clone(),
+            ),
+            Err(EngineError::Corrupt(_))
+        ));
+        assert_eq!(blob.fail_puts.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.cas_calls.load(Ordering::SeqCst), cas_before);
+    }
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
+fn malformed_pack_entries_fail_before_any_remote_write_or_indexing() {
+    use cats_storage::blob::FaultyBlobStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let healthy: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let blob = Arc::new(FaultyBlobStore::new(healthy));
+    let meta = Arc::new(CountingMeta {
+        inner: Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap()),
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob.clone(),
+        meta.clone(),
+    )
+    .unwrap();
+    let page = vec![0x5a; cats_api::chunk::DIRTY_PAGE_SIZE as usize];
+    let valid_entry = PackEntry {
+        chunk_idx: 0,
+        payload_offset: 0,
+        len: page.len() as u32,
+        sha256_hex: hex::encode(format::sha256(&page)),
+        page_mask: 1,
+        byte_ranges: Vec::new(),
+    };
+
+    let mut cases: Vec<(&str, PackEntry, Vec<u8>)> = vec![
+        (
+            "payload offset overflow",
+            PackEntry {
+                payload_offset: u64::MAX,
+                len: 1,
+                ..valid_entry.clone()
+            },
+            vec![0x5a],
+        ),
+        (
+            "payload length out of bounds",
+            PackEntry {
+                len: valid_entry.len + 1,
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "chunk out of bounds",
+            PackEntry {
+                chunk_idx: e.chunk_count,
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "payload hash mismatch",
+            PackEntry {
+                sha256_hex: "00".repeat(32),
+                ..valid_entry.clone()
+            },
+            page.clone(),
+        ),
+        (
+            "page mask length mismatch",
+            PackEntry {
+                page_mask: 0b11,
+                ..valid_entry
+            },
+            page,
+        ),
+    ];
+    let overlay = vec![0x7b; 16];
+    cases.push((
+        "byte range exceeds chunk",
+        PackEntry {
+            chunk_idx: 0,
+            payload_offset: 0,
+            len: overlay.len() as u32,
+            sha256_hex: hex::encode(format::sha256(&overlay)),
+            page_mask: 1,
+            byte_ranges: vec![PackByteRange {
+                chunk_offset: CHUNK_SIZE - 8,
+                payload_offset: 0,
+                len: overlay.len() as u32,
+            }],
+        },
+        overlay.clone(),
+    ));
+    cases.push((
+        "byte range payload overflow",
+        PackEntry {
+            chunk_idx: 0,
+            payload_offset: 0,
+            len: overlay.len() as u32,
+            sha256_hex: hex::encode(format::sha256(&overlay)),
+            page_mask: 1,
+            byte_ranges: vec![PackByteRange {
+                chunk_offset: 0,
+                payload_offset: u64::MAX,
+                len: overlay.len() as u32,
+            }],
+        },
+        overlay,
+    ));
+
+    let (base_map, base_leaves) = {
+        let state = e.state.lock().unwrap();
+        (state.map.clone(), state.leaf_refs.clone())
+    };
+    for (case, entry, payload) in cases {
+        let header = PackHeader {
+            txn: format!("malformed-{}", case.replace(' ', "-")),
+            volume_id: VOL.into(),
+            base_generation: 0,
+            lease_epoch: Some(e.epoch),
+            attachment_id: None,
+            attachment_epoch: None,
+            acquire_origin: None,
+            entries: vec![entry],
+        };
+        blob.fail_puts.store(1, Ordering::SeqCst);
+        let cas_before = meta.cas_calls.load(Ordering::SeqCst);
+        let error = e
+            .commit_pack_batch(
+                &[(&header, payload.as_slice())],
+                base_map.clone(),
+                base_leaves.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, EngineError::Corrupt(_)),
+            "{case} returned {error}"
+        );
+        assert_eq!(
+            blob.fail_puts.load(Ordering::SeqCst),
+            1,
+            "{case} reached an immutable PUT"
+        );
+        assert_eq!(
+            meta.cas_calls.load(Ordering::SeqCst),
+            cas_before,
+            "{case} reached the authority CAS"
+        );
+    }
+
+    blob.fail_puts.store(0, Ordering::SeqCst);
+    e.detach().unwrap();
+}
+
+#[test]
 fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
     let dir = tempfile::tempdir().unwrap();
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
@@ -844,6 +2103,8 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
         inner,
         fault: Mutex::new(Some(CasFault::ResponseLost)),
         fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
     });
     let data_dir = dir.path().join("data-a");
     let e = ChunkEngine::attach(
@@ -903,6 +2164,8 @@ fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMe
         inner,
         fault: Mutex::new(Some(fault)),
         fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
     })
 }
 
@@ -947,6 +2210,38 @@ fn an_authoritative_generation_beyond_the_target_fences() {
         Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
     ));
     assert!(e.is_fenced());
+}
+
+#[test]
+fn a_target_head_with_a_different_size_cannot_reconcile_a_lost_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let meta = fault_meta(&dir, CasFault::ResponseLostThenSizeChanged);
+    let e = ChunkEngine::attach(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        blob,
+        meta.clone(),
+    )
+    .unwrap();
+    e.write(0, &pattern(4096, 77)).unwrap();
+
+    assert!(matches!(
+        e.flush(),
+        Err(EngineError::Meta(MetaError::CasConflict { expected: 0 }))
+    ));
+    assert!(
+        e.is_fenced(),
+        "a changed authority binding must fail closed"
+    );
+    assert_eq!(e.generation(), 0, "the target head must not be adopted");
+    assert_eq!(
+        meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "ambiguous reconciliation must read, never guess with a second CAS"
+    );
+    let observed = meta.load_head(VOL).unwrap();
+    assert_eq!(observed.generation, 1, "the injected CAS did commit");
+    assert_ne!(observed.size_bytes, SIZE, "the authority size drifted");
 }
 
 #[test]
@@ -1357,7 +2652,10 @@ fn provisioning_refuses_staged_commits() {
     e.flush().unwrap();
     let manifest = format::ImageManifest {
         version: 1,
-        image_id: "0123456789abcdef0123456789abcdef".into(),
+        image_id: format::LowerHexSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
         size_bytes: SIZE,
         chunks: vec![],
     };
@@ -2194,4 +3492,855 @@ fn snapshot_captures_generation() {
     let snap = env.meta.create_snapshot("snap_1", VOL).unwrap();
     assert_eq!(snap.generation, 1);
     e.detach().unwrap();
+}
+
+struct RootProvisionFixture {
+    engine: Arc<ChunkEngine>,
+    blob: Arc<FileBlobStore>,
+    meta: Arc<CountingMeta>,
+    manifest: format::ImageManifest,
+    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+    data_dir: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn root_provision_request(
+    engine: &ChunkEngine,
+    manifest: &format::ImageManifest,
+    epoch: i64,
+    transition: &str,
+) -> cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+    let map = format::image_base_map(manifest, SIZE).unwrap();
+    let chunks: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let leaves = vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize];
+    let prepared = engine.prepare_map_publication(0, &map, &leaves, &chunks);
+    cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(transition)
+            .unwrap(),
+        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
+        size_bytes: SIZE,
+        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+            "sha256:{}",
+            manifest.image_id
+        ))
+        .unwrap(),
+        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                prepared.root_hash,
+            )),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+            ),
+        },
+    }
+}
+
+fn root_provision_fixture() -> RootProvisionFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    let meta = Arc::new(CountingMeta {
+        inner,
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: None,
+    });
+    meta.create_volume(VOL, SIZE).unwrap();
+
+    let image_path = dir.path().join("root.img");
+    let mut image_file = File::create(&image_path).unwrap();
+    image_file
+        .write_all(&pattern(CHUNK_SIZE as usize, 211))
+        .unwrap();
+    image_file.sync_all().unwrap();
+    let manifest = crate::image::publish(blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+
+    let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+    let data_dir = dir.path().join("control-data");
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        epoch,
+        blob.clone(),
+        target_authority(meta.clone()),
+    )
+    .unwrap();
+    let request = root_provision_request(
+        &engine,
+        &manifest,
+        epoch,
+        "13579bdf2468ace013579bdf2468ace0",
+    );
+    RootProvisionFixture {
+        engine,
+        blob,
+        meta,
+        manifest,
+        request,
+        data_dir,
+        _dir: dir,
+    }
+}
+
+fn assert_definite_problem(
+    error: ProvisionRootImageEffectError,
+    expected: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem,
+) {
+    assert!(
+        matches!(
+            &error,
+            ProvisionRootImageEffectError::Closed(
+                cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                    problem,
+                    ..
+                }
+            ) if *problem == expected
+        ),
+        "expected definite conflict {expected:?}, got {error:?}"
+    );
+}
+
+fn assert_retryable_problem(
+    error: ProvisionRootImageEffectError,
+    expected: cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem,
+) {
+    assert!(
+        matches!(
+            &error,
+            ProvisionRootImageEffectError::Closed(
+                cats_api::runtime_reconciliation::ProvisionRootImageError::Retryable {
+                    problem,
+                    ..
+                }
+            ) if *problem == expected
+        ),
+        "expected retryable {expected:?}, got {error:?}"
+    );
+}
+
+fn volume_objects(blob: &dyn BlobStore) -> Vec<String> {
+    blob.list(&format!("volumes/{VOL}/")).unwrap()
+}
+
+struct LostPutResponseBlob {
+    inner: Arc<dyn BlobStore>,
+    fail_key: Mutex<Option<String>>,
+    lost_responses: AtomicU64,
+}
+
+impl BlobStore for LostPutResponseBlob {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        self.inner.put_immutable(key, data)?;
+        let mut fail_key = self.fail_key.lock().unwrap();
+        if fail_key.as_deref() == Some(key) {
+            fail_key.take();
+            self.lost_responses.fetch_add(1, Ordering::SeqCst);
+            return Err(BlobError::Backend {
+                key: key.into(),
+                message: "injected lost immutable PUT response".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+#[test]
+fn typed_root_provision_is_exact_idempotent_and_never_enables_guest_io() {
+    let fixture = root_provision_fixture();
+    assert!(matches!(
+        fixture.engine.read(0, &mut [0_u8; 1]),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.write(0, &[1]),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.flush(),
+        Err(EngineError::GuestIoDisabled)
+    ));
+    assert!(matches!(
+        fixture.engine.provision_from_image(&fixture.manifest),
+        Err(EngineError::GuestIoDisabled)
+    ));
+
+    let result = fixture
+        .engine
+        .provision_root_image(&fixture.request)
+        .unwrap();
+    assert_eq!(
+        result.resulting_head,
+        fixture.request.expected_provisioned_head
+    );
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.engine.state.lock().unwrap().remote_head.clone(),
+        fixture.request.expected_provisioned_head,
+        "engine state must retain the complete target rather than generation alone"
+    );
+    let head = fixture.meta.load_head(VOL).unwrap();
+    assert_eq!(head.generation, 1);
+    assert_eq!(
+        head.root_hash,
+        fixture
+            .request
+            .expected_provisioned_head
+            .root_hash
+            .as_ref()
+            .map(|digest| *digest.as_bytes())
+    );
+
+    let record_key =
+        chunk::keys::commit_record(VOL, 1, fixture.request.provision_transition_id.as_str());
+    let record = fixture.blob.get(&record_key).unwrap();
+    let expected_record = super::publish::encode_commit_record(
+        fixture.request.provision_transition_id.as_str(),
+        1,
+        fixture.engine.epoch(),
+        &hex::encode(head.root_hash.unwrap()),
+        &[0],
+    );
+    assert_eq!(record, expected_record);
+
+    let replay = fixture
+        .engine
+        .provision_root_image(&fixture.request)
+        .unwrap();
+    assert_eq!(replay, result);
+    assert_eq!(
+        fixture.meta.cas_calls.load(Ordering::SeqCst),
+        1,
+        "an exact target replay must not issue a second CAS"
+    );
+}
+
+#[test]
+fn request_binding_and_target_conflicts_have_zero_remote_side_effects() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+
+    let mut cases = Vec::new();
+    let mut wrong = fixture.request.clone();
+    wrong.volume_id = cats_api::runtime_reconciliation::Id::new("other-volume").unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.attachment_id = cats_api::runtime_reconciliation::Id::new("other-owner").unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.attachment_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(
+        fixture.request.attachment_epoch.get() + 1,
+    )
+    .unwrap();
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.size_bytes += CHUNK_SIZE as u64;
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.expected_blank_head.generation =
+        cats_api::runtime_reconciliation::Generation::new(1).unwrap();
+    wrong.expected_blank_head.root_hash = Some(
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([3; 32]),
+    );
+    wrong.expected_blank_head.root_object_id =
+        Some(cats_api::runtime_reconciliation::AsciiText::new("bad.node").unwrap());
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+    ));
+    let mut wrong = fixture.request.clone();
+    wrong.expected_provisioned_head.root_hash = Some(
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([4; 32]),
+    );
+    cases.push((
+        wrong,
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+    ));
+
+    for (request, expected) in cases {
+        assert_definite_problem(
+            fixture.engine.provision_root_image(&request).unwrap_err(),
+            expected,
+        );
+    }
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+
+    fixture.engine.state.lock().unwrap().dirty[0] = 1;
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture.engine.state.lock().unwrap().dirty[0] = 0;
+
+    fs::write(
+        fixture.data_dir.join(PENDING_PACK_DIR).join("residue.pack"),
+        b"x",
+    )
+    .unwrap();
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fs::remove_file(fixture.data_dir.join(PENDING_PACK_DIR).join("residue.pack")).unwrap();
+
+    fixture.engine.staged.lock().unwrap().bytes = 1;
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture.engine.staged.lock().unwrap().bytes = 0;
+    fixture
+        .engine
+        .inflight_staging_bytes
+        .store(1, Ordering::SeqCst);
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    fixture
+        .engine
+        .inflight_staging_bytes
+        .store(0, Ordering::SeqCst);
+
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn control_only_attach_preserves_and_refuses_legacy_pending_state() {
+    let env = env();
+    let image_path = env.data_dir.parent().unwrap().join("pending-root.img");
+    fs::write(&image_path, pattern(CHUNK_SIZE as usize, 81)).unwrap();
+    let manifest = crate::image::publish(env.blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+    let epoch;
+    {
+        let legacy = attach_relaxed(&env, "attA");
+        epoch = legacy.epoch();
+        legacy.write(0, b"legacy unpublished bytes").unwrap();
+        assert_eq!(legacy.flush().unwrap(), 1);
+        assert_eq!(legacy.generation(), 0);
+    }
+    assert_eq!(
+        fs::read_dir(env.data_dir.join(PENDING_PACK_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let control = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &env.data_dir, "attA"),
+        epoch,
+        env.blob.clone(),
+        target_authority(env.meta.clone()),
+    )
+    .unwrap();
+    assert!(
+        control.staged.lock().unwrap().packs.is_empty(),
+        "control-only attach must not recover the legacy journal into a publisher queue"
+    );
+    let request = root_provision_request(
+        &control,
+        &manifest,
+        epoch,
+        "fedcba9876543210fedcba9876543210",
+    );
+    assert_definite_problem(
+        control.provision_root_image(&request).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+    );
+    assert_eq!(env.meta.load_head(VOL).unwrap().generation, 0);
+    assert!(volume_objects(env.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn control_only_attach_rejects_an_owned_zero_epoch_authority_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    let granted_epoch = inner.acquire_lease(VOL, "attA", 60_000).unwrap();
+    assert!(granted_epoch > 0);
+    let corrupt: Arc<dyn MetadataStore> = Arc::new(CountingMeta {
+        inner,
+        cas_calls: AtomicU64::new(0),
+        forced_head_epoch: Some(0),
+    });
+    let data_dir = dir.path().join("control-data");
+
+    let result = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        granted_epoch,
+        blob.clone(),
+        target_authority(corrupt.clone()),
+    );
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+    assert!(
+        !data_dir.exists(),
+        "a corrupt authority row must fail before local state is created"
+    );
+
+    let result = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, &data_dir, "attA"),
+        0,
+        blob,
+        target_authority(corrupt),
+    );
+    assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
+    assert!(!data_dir.exists());
+}
+
+#[test]
+fn control_only_local_initialization_replays_every_crash_window_without_overwrite() {
+    for crash_window in [
+        "cache_before_sync",
+        "cache_after_sync",
+        "bitmap_before_sync",
+        "bitmap_after_link",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+        let data_dir = dir.path().join("control-data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        match crash_window {
+            "cache_before_sync" => {
+                // Crash after creating the initialization file but before the
+                // sparse cache reached its immutable volume length.
+                fs::write(data_dir.join(".cache.data.init"), b"partial").unwrap();
+            }
+            "cache_after_sync" => {
+                let cache = File::create(data_dir.join(".cache.data.init")).unwrap();
+                cache.set_len(SIZE).unwrap();
+                cache.sync_all().unwrap();
+            }
+            "bitmap_before_sync" | "bitmap_after_link" => {
+                // The cache was fully installed, then bitmap initialization
+                // started. Its marker proves replay never replaces a valid
+                // final file while repairing the other item.
+                let cache = File::create(data_dir.join("cache.data")).unwrap();
+                cache.set_len(SIZE).unwrap();
+                cache.write_all_at(b"keep", 0).unwrap();
+                cache.sync_all().unwrap();
+                let bitmap_temp = data_dir.join(".dirty.bitmap.init");
+                if crash_window == "bitmap_before_sync" {
+                    fs::write(bitmap_temp, b"partial").unwrap();
+                } else {
+                    let bitmap = File::create(&bitmap_temp).unwrap();
+                    bitmap
+                        .write_all_at(&format::encode_bitmap_header(chunk::chunk_count(SIZE)), 0)
+                        .unwrap();
+                    bitmap
+                        .set_len(BITMAP_HEADER_LEN + chunk::chunk_count(SIZE) * 8)
+                        .unwrap();
+                    bitmap
+                        .write_all_at(&0x55aa_u64.to_le_bytes(), BITMAP_HEADER_LEN)
+                        .unwrap();
+                    bitmap.sync_all().unwrap();
+                    fs::hard_link(bitmap_temp, data_dir.join("dirty.bitmap")).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let engine = ChunkEngine::attach_control_only(
+            EngineConfig::new(VOL, &data_dir, "attA"),
+            epoch,
+            blob,
+            target_authority(meta),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(data_dir.join("cache.data")).unwrap().len(),
+            SIZE
+        );
+        assert_eq!(
+            fs::metadata(data_dir.join("dirty.bitmap")).unwrap().len(),
+            BITMAP_HEADER_LEN + chunk::chunk_count(SIZE) * 8
+        );
+        assert!(!data_dir.join(".cache.data.init").exists());
+        assert!(!data_dir.join(".dirty.bitmap.init").exists());
+        if crash_window.starts_with("bitmap_") {
+            let cache = File::open(data_dir.join("cache.data")).unwrap();
+            let mut marker = [0_u8; 4];
+            cache.read_exact_at(&mut marker, 0).unwrap();
+            assert_eq!(&marker, b"keep", "a valid final cache was overwritten");
+        }
+        if crash_window == "bitmap_after_link" {
+            assert_eq!(engine.state.lock().unwrap().dirty[0], 0x55aa);
+            let bitmap = File::open(data_dir.join("dirty.bitmap")).unwrap();
+            let mut word = [0_u8; 8];
+            bitmap.read_exact_at(&mut word, BITMAP_HEADER_LEN).unwrap();
+            assert_eq!(u64::from_le_bytes(word), 0x55aa);
+        }
+        drop(engine);
+    }
+}
+
+#[test]
+fn invalid_manifest_corpus_is_rejected_before_any_volume_object_or_cas() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    let valid_object = fixture.manifest.chunks[0].object_id.as_str();
+    let invalid_manifests = vec![
+        serde_json::json!({"version":2,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":0,"chunks":[]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE},
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":2*CHUNK_SIZE as u64,"chunks":[
+            {"chunk_idx":1,"object_id":valid_object,"len":CHUNK_SIZE},
+            {"chunk_idx":0,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":1,"object_id":valid_object,"len":CHUNK_SIZE}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":valid_object,"len":1}
+        ]}),
+        serde_json::json!({"version":1,"image_id":"","size_bytes":CHUNK_SIZE,"chunks":[
+            {"chunk_idx":0,"object_id":"ABCDEF","len":CHUNK_SIZE}
+        ]}),
+    ];
+
+    for (index, mut manifest) in invalid_manifests.into_iter().enumerate() {
+        let image_id = format!("{index:064x}");
+        manifest["image_id"] = serde_json::Value::String(image_id.clone());
+        fixture
+            .blob
+            .put_immutable(
+                &chunk::keys::image_manifest(&image_id),
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        let mut request = fixture.request.clone();
+        request.boot_image_digest =
+            cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{image_id}"))
+                .unwrap();
+        let error = fixture.engine.provision_root_image(&request).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProvisionRootImageEffectError::Closed(
+                    cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                        problem: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+                        ..
+                    }
+                )
+            ),
+            "invalid manifest case {index} produced {error:?}"
+        );
+    }
+
+    let mismatch_id = format!("{:064x}", 99);
+    let mismatch_object = "1111111111111111111111111111111111111111111111111111111111111111";
+    fixture
+        .blob
+        .put_immutable(
+            &chunk::keys::image_data(&mismatch_id, mismatch_object),
+            &vec![7; CHUNK_SIZE as usize],
+        )
+        .unwrap();
+    let mismatch = serde_json::json!({
+        "version":1,"image_id":mismatch_id,"size_bytes":CHUNK_SIZE,
+        "chunks":[{"chunk_idx":0,"object_id":mismatch_object,"len":CHUNK_SIZE}]
+    });
+    fixture
+        .blob
+        .put_immutable(
+            &chunk::keys::image_manifest(&mismatch_id),
+            &serde_json::to_vec(&mismatch).unwrap(),
+        )
+        .unwrap();
+    let mut request = fixture.request.clone();
+    request.boot_image_digest =
+        cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{mismatch_id}"))
+            .unwrap();
+    assert_definite_problem(
+        fixture.engine.provision_root_image(&request).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+    );
+
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn missing_image_and_changed_owner_never_publish_volume_objects() {
+    let fixture = root_provision_fixture();
+    let before_objects = volume_objects(fixture.blob.as_ref());
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    let mut missing = fixture.request.clone();
+    missing.boot_image_digest =
+        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0xee; 32]);
+    assert_retryable_problem(
+        fixture.engine.provision_root_image(&missing).unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+    );
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+
+    fixture.meta.revoke_lease(VOL).unwrap();
+    assert!(matches!(
+        fixture.engine.provision_root_image(&fixture.request),
+        Err(ProvisionRootImageEffectError::ResultUnknown(_))
+    ));
+    assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+}
+
+#[test]
+fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let inner: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    inner.create_volume(VOL, SIZE).unwrap();
+    let image_path = dir.path().join("root.img");
+    fs::write(&image_path, pattern(CHUNK_SIZE as usize, 57)).unwrap();
+    let manifest = crate::image::publish(blob.as_ref(), &image_path)
+        .unwrap()
+        .manifest;
+    let epoch = inner.acquire_lease(VOL, "attA", 60_000).unwrap();
+    let meta = Arc::new(LostCasResponseMeta {
+        inner,
+        fault: Mutex::new(Some(CasFault::ResponseLost)),
+        fail_next_load: AtomicBool::new(false),
+        forced_head_size: AtomicU64::new(0),
+        cas_calls: AtomicU64::new(0),
+    });
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
+        blob,
+        target_authority(meta.clone()),
+    )
+    .unwrap();
+    let map = format::image_base_map(&manifest, SIZE).unwrap();
+    let chunks: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let prepared = engine.prepare_map_publication(
+        0,
+        &map,
+        &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+        &chunks,
+    );
+    let request = cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+            "2468ace013579bdf2468ace013579bdf",
+        )
+        .unwrap(),
+        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
+        size_bytes: SIZE,
+        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+            "sha256:{}",
+            manifest.image_id
+        ))
+        .unwrap(),
+        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        },
+        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
+            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                prepared.root_hash,
+            )),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+            ),
+        },
+    };
+    let result = engine.provision_root_image(&request).unwrap();
+    assert_eq!(result.resulting_head, request.expected_provisioned_head);
+    assert_eq!(meta.load_head(VOL).unwrap().generation, 1);
+}
+
+#[test]
+fn lost_leaf_root_and_commit_put_responses_reconcile_by_exact_bytes() {
+    for stage in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let inner_blob: Arc<dyn BlobStore> =
+            Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+        let image_path = dir.path().join("root.img");
+        fs::write(&image_path, pattern(CHUNK_SIZE as usize, stage + 31)).unwrap();
+        let manifest = crate::image::publish(inner_blob.as_ref(), &image_path)
+            .unwrap()
+            .manifest;
+        let blob = Arc::new(LostPutResponseBlob {
+            inner: inner_blob,
+            fail_key: Mutex::new(None),
+            lost_responses: AtomicU64::new(0),
+        });
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+        meta.create_volume(VOL, SIZE).unwrap();
+        let epoch = meta.acquire_lease(VOL, "attA", 60_000).unwrap();
+        let engine = ChunkEngine::attach_control_only(
+            EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+            epoch,
+            blob.clone(),
+            target_authority(meta.clone()),
+        )
+        .unwrap();
+        let request = root_provision_request(
+            &engine,
+            &manifest,
+            epoch,
+            "abcdef0123456789abcdef0123456789",
+        );
+        let map = format::image_base_map(&manifest, SIZE).unwrap();
+        let chunks: Vec<u64> = manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_idx)
+            .collect();
+        let prepared = engine.prepare_map_publication(
+            0,
+            &map,
+            &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+            &chunks,
+        );
+        let fail_key = match stage {
+            0 => chunk::keys::map_node(VOL, &hex::encode(prepared.leaf_nodes[0].0)),
+            1 => chunk::keys::map_node(VOL, &hex::encode(prepared.root_hash)),
+            _ => chunk::keys::commit_record(VOL, 1, request.provision_transition_id.as_str()),
+        };
+        *blob.fail_key.lock().unwrap() = Some(fail_key);
+
+        let result = engine.provision_root_image(&request).unwrap();
+        assert_eq!(result.resulting_head, request.expected_provisioned_head);
+        assert_eq!(blob.lost_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.load_head(VOL).unwrap().generation, 1);
+    }
+}
+
+#[test]
+fn immutable_key_conflict_and_unrelated_head_fail_closed_without_cas() {
+    let fixture = root_provision_fixture();
+    let map = format::image_base_map(&fixture.manifest, SIZE).unwrap();
+    let chunks: Vec<u64> = fixture
+        .manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.chunk_idx)
+        .collect();
+    let prepared = fixture.engine.prepare_map_publication(
+        0,
+        &map,
+        &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
+        &chunks,
+    );
+    let leaf_key = chunk::keys::map_node(VOL, &hex::encode(prepared.leaf_nodes[0].0));
+    fixture
+        .blob
+        .put_immutable(&leaf_key, b"wrong bytes")
+        .unwrap();
+    let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
+    assert_definite_problem(
+        fixture
+            .engine
+            .provision_root_image(&fixture.request)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImmutableObject,
+    );
+    assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
+
+    let other = root_provision_fixture();
+    other
+        .meta
+        .cas_head(
+            VOL,
+            0,
+            1,
+            [0xa5; 32],
+            "unrelated.node",
+            "attA",
+            other.engine.epoch(),
+        )
+        .unwrap();
+    let before_objects = volume_objects(other.blob.as_ref());
+    let before_cas = other.meta.cas_calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        other.engine.provision_root_image(&other.request),
+        Err(ProvisionRootImageEffectError::ResultUnknown(_))
+    ));
+    assert_eq!(volume_objects(other.blob.as_ref()), before_objects);
+    assert_eq!(other.meta.cas_calls.load(Ordering::SeqCst), before_cas);
 }

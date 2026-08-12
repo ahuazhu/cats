@@ -28,10 +28,23 @@ pub fn blob_store_contract(make_store: impl FnOnce() -> Arc<dyn BlobStore>) {
 
     store.put_immutable(&data_key, b"hello").unwrap();
     assert_eq!(store.get(&data_key).unwrap(), b"hello");
+    assert_eq!(store.get_bounded(&data_key, 5).unwrap(), b"hello");
+    assert!(matches!(
+        store.get_bounded(&data_key, 4),
+        Err(BlobError::TooLarge {
+            maximum: 4,
+            observed_at_least: 5,
+            ..
+        })
+    ));
     assert!(store.exists(&data_key).unwrap());
     assert!(!store.exists(&missing_key).unwrap());
     assert!(matches!(
         store.get(&missing_key),
+        Err(BlobError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.get_bounded(&missing_key, 5),
         Err(BlobError::NotFound(_))
     ));
 

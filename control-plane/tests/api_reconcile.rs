@@ -12,6 +12,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
+use cats_api::agent_registration::{
+    Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER,
+    NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
+};
 use cats_api::billing::BillingBalance;
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
@@ -20,9 +24,18 @@ use cats_api::metering::{
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition};
 use cats_api::requests::*;
 use cats_api::resources::*;
+use cats_api::runtime_reconciliation::{
+    decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
+    encode_agent_registration_attempt, encode_desired_read_request, encode_node_observation,
+    guest_config_digest, inventory_digest, AgentRegistrationAttempt, ContractVersion,
+    CredentialBinding, DesiredReadRequest, Epoch, Id, NodeBootId, NodeIdentity, NodeIdentityState,
+    NodeObservation, RandomId128, Sequence, SessionBinding, UnixMillis,
+};
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
-use cats_control_plane::store::{DsnSource, Store};
+use cats_control_plane::server::{
+    spawn as spawn_production, spawn_for_retired_product_tests as spawn, Config, Handle,
+};
+use cats_control_plane::store::{DsnSource, OciDeploymentClaim, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
@@ -30,6 +43,13 @@ use cats_metering::{
 use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
+
+async fn reject_unexpected_production_node_call(
+    State(calls): State<Arc<AtomicUsize>>,
+) -> StatusCode {
+    calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
 
 // ---------------------------------------------------------------------------
 // Stub node agent: accepts every job, tracks "running" cats, heartbeats.
@@ -110,6 +130,69 @@ impl StubNode {
             self.job_response_release.notified().await;
         }
     }
+}
+
+/// Feed the retired Controller's private test model without recreating a Node
+/// HTTP authority. The signed spine is exercised separately below; this helper
+/// exists only until the old NodeJob product tests are deleted.
+async fn record_retired_controller_inventory(
+    store: Arc<Store>,
+    notify: Arc<tokio::sync::Notify>,
+    req: HeartbeatRequest,
+) {
+    store
+        .execute(move |store| {
+            let inventory_changed =
+                store.heartbeat_node(&req.node_id, req.telemetry.as_ref(), &req.cats)?;
+            if inventory_changed {
+                let orphans = store.orphan_reported_cats(&req.node_id)?;
+                if !orphans.is_empty() {
+                    tracing::warn!(
+                        node = %req.node_id,
+                        orphans = orphans.len(),
+                        reported = req.cats.len(),
+                        "retired Controller fixture reports unassigned Cats"
+                    );
+                }
+            }
+            for reported in &req.cats {
+                if let Ok(cat) = store.must_get_cat_by_id(&reported.cat_id) {
+                    if cat.generation == reported.generation
+                        && cat.node_id.as_deref() == Some(req.node_id.as_str())
+                        && cat.observed_state != reported.state
+                        && matches!(
+                            cat.observed_state,
+                            ObservedState::Running
+                                | ObservedState::Suspended
+                                | ObservedState::Warm
+                                | ObservedState::Unknown
+                        )
+                    {
+                        store.set_observed(&cat.id, reported.state)?;
+                        notify.notify_one();
+                    }
+                }
+            }
+            let node = store.get_node(&req.node_id)?;
+            if node.state == NodeState::Lost {
+                let claims = store.cats_on_node(&req.node_id)?;
+                let required: Vec<&Cat> = claims
+                    .iter()
+                    .filter(|cat| cat.desired_state != DesiredState::Deleted)
+                    .collect();
+                let missing = required.iter().any(|cat| {
+                    !req.cats.iter().any(|reported| {
+                        reported.cat_id == cat.id && reported.generation == cat.generation
+                    })
+                });
+                if !missing && store.recover_lost_node(&req.node_id)? {
+                    notify.notify_one();
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Response {
@@ -333,31 +416,22 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         axum::serve(listener, app).await.ok();
     });
 
-    let client = reqwest::Client::new();
-    let base = cp.base_url();
-    client
-        .post(format!("{base}/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&RegisterNodeRequest {
-            node_id: id.to_string(),
-            agent_url: format!("http://{addr}"),
-            gateway_url: format!("http://{addr}"),
-            cpus: 16,
-            memory_mib: 32_768,
-            route_grant_public_key_sha256: Some(
-                cp.state
-                    .cfg
-                    .route_grant_signer
-                    .public_key_sha256()
-                    .to_string(),
-            ),
-            initially_cordoned: false,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &cp.state.store,
+        id.to_string(),
+        format!("http://{addr}"),
+        format!("http://{addr}"),
+        16,
+        32_768,
+        cp.state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+    let heartbeat_store = Arc::clone(&cp.state.store);
+    let heartbeat_notify = Arc::clone(&cp.state.notify);
 
     // Heartbeat loop.
     let hb = node.clone();
@@ -392,10 +466,10 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                     disk_durability: Vec::new(),
                 })
                 .collect();
-            let _ = client
-                .post(format!("{base}/v1/nodes/heartbeat"))
-                .bearer_auth(SERVICE_TOKEN)
-                .json(&HeartbeatRequest {
+            record_retired_controller_inventory(
+                Arc::clone(&heartbeat_store),
+                Arc::clone(&heartbeat_notify),
+                HeartbeatRequest {
                     node_id: hb.id.clone(),
                     cats,
                     telemetry: Some(NodeTelemetry {
@@ -419,9 +493,9 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
                         unsupervised_runtime_dirs: Some(0),
                         unsupervised_runtime_bytes: Some(0),
                     }),
-                })
-                .send()
-                .await;
+                },
+            )
+            .await;
         }
     });
     node
@@ -442,6 +516,50 @@ fn default_workspace_id(cp: &Handle) -> String {
         .find(|workspace| workspace.is_default)
         .expect("the bootstrap account has a default workspace")
         .id
+}
+
+/// Lifecycle/controller tests still exercise the pre-A23 product model. The
+/// public POST route now has the strict Desired-runtime contract, so those
+/// fixtures create their legacy resource directly instead of weakening the
+/// production ingress with a compatibility parser.
+fn create_legacy_cat(
+    cp: &Handle,
+    name: &str,
+    idempotency_key: Option<&str>,
+) -> Result<CatOperationResponse, cats_api::error::ApiError> {
+    let workspace_id = default_workspace_id(cp);
+    let workspace = cp.state.store.workspace_scope(&workspace_id)?.workspace;
+    let route = format!("test legacy create {workspace_id}/{name}");
+    let (cat, _disks, operation) = match idempotency_key {
+        Some(key) => cp.state.store.create_cat_idempotent(
+            &workspace,
+            name,
+            "ubuntu-24.04",
+            2,
+            1024,
+            8 << 20,
+            true,
+            None,
+            None,
+            Default::default(),
+            key,
+            &route,
+        ),
+        None => cp.state.store.create_cat(
+            &workspace,
+            name,
+            "ubuntu-24.04",
+            2,
+            1024,
+            8 << 20,
+            true,
+            None,
+            None,
+            Default::default(),
+        ),
+    }?;
+    cp.state.notify.notify_one();
+    Ok(CatOperationResponse { operation, cat })
 }
 
 struct Ctx {
@@ -488,7 +606,12 @@ impl Ctx {
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
+            image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
+            guest_runtime_profile_receipt:
+                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+            runtime_provisioner_trust_bundle:
+                cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "dev-admin-token".into(),
             workos: None,
@@ -560,17 +683,34 @@ impl Ctx {
             .unwrap()
     }
 
-    /// `POST` a JSON body as the node-agent service identity, asserting success.
-    async fn post_service<B: serde::Serialize>(&self, url: String, body: &B) {
-        self.http
-            .post(url)
-            .bearer_auth(SERVICE_TOKEN)
-            .json(body)
-            .send()
+    async fn record_retired_inventory(&self, request: HeartbeatRequest) {
+        record_retired_controller_inventory(
+            Arc::clone(&self.cp.state.store),
+            Arc::clone(&self.cp.state.notify),
+            request,
+        )
+        .await;
+    }
+
+    async fn record_retired_work(&self, request: NodeWorkStatusRequest) {
+        let cat_id = request.cat_id.clone();
+        let should_wake = self
+            .cp
+            .state
+            .store
+            .execute(move |store| store.ingest_guest_work(&request))
             .await
-            .unwrap()
-            .error_for_status()
             .unwrap();
+        if should_wake {
+            self.cp.state.notify.notify_one();
+        } else {
+            self.cp
+                .state
+                .controller
+                .maybe_auto_suspend(&cat_id)
+                .await
+                .unwrap();
+        }
     }
 
     /// [`Self::post_service`] for the endpoints whose response body is asserted.
@@ -642,24 +782,7 @@ impl Ctx {
     }
 
     async fn create_cat(&self, name: &str, idem: Option<&str>) -> CatOperationResponse {
-        let mut req = self
-            .http
-            .post(self.ws_url("/cats"))
-            .bearer_auth("dev-admin-token")
-            .json(&serde_json::json!({
-                "name": name,
-                "image": "ubuntu-24.04",
-                "cpus": 2,
-                "memory_mib": 1024,
-                "root_size_bytes": 8 << 20,
-                "disk": null
-            }));
-        if let Some(k) = idem {
-            req = req.header("Idempotency-Key", k);
-        }
-        let resp = req.send().await.unwrap();
-        assert_eq!(resp.status(), 202);
-        resp.json().await.unwrap()
+        create_legacy_cat(&self.cp, name, idem).unwrap()
     }
 
     async fn action(&self, name: &str, verb: &str) -> CatOperationResponse {
@@ -933,26 +1056,9 @@ async fn create_converges_and_idempotency_replays() {
     // Same idempotency key: same operation, no duplicate cat.
     let replay = ctx.create_cat("dev", Some("key-1")).await;
     assert_eq!(replay.operation.id, created.operation.id);
-    // A different key with the same name conflicts.
-    let resp = ctx
-        .http
-        .post(ctx.ws_url("/cats"))
-        .bearer_auth("dev-admin-token")
-        .json(&CreateCatRequest {
-            name: "dev".into(),
-            image: "x".into(),
-            cpus: 1,
-            memory_mib: 256,
-            root_size_bytes: 4 << 20,
-            auto_suspend: true,
-            disk: None,
-            expires_at_unix: None,
-            durability: Default::default(),
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409);
+    // A different key with the same name conflicts in the legacy fixture too.
+    let error = create_legacy_cat(&ctx.cp, "dev", Some("different-key")).unwrap_err();
+    assert_eq!(error.code, cats_api::error::ErrorCode::AlreadyExists);
 
     // Unauthenticated requests are rejected.
     let resp = ctx.http.get(ctx.ws_url("/cats")).send().await.unwrap();
@@ -974,7 +1080,12 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         usage_store: usage.clone(),
         credit_store: usage,
         storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -991,34 +1102,16 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     let workspace_id = default_workspace_id(&first);
     let http = reqwest::Client::new();
     let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
-    let request = serde_json::json!({
-        "name": "replicated",
-        "image": "ubuntu-24.04",
-        "cpus": 2,
-        "memory_mib": 1024,
-        "root_size_bytes": 8 << 20,
-        "disk": null
+    let (created_first, created_second) = std::thread::scope(|scope| {
+        let first_create =
+            scope.spawn(|| create_legacy_cat(&first, "replicated", Some("replica-create")));
+        let second_create =
+            scope.spawn(|| create_legacy_cat(&second, "replicated", Some("replica-create")));
+        (
+            first_create.join().unwrap().unwrap(),
+            second_create.join().unwrap().unwrap(),
+        )
     });
-
-    let create_first = http
-        .post(format!("{}{cats_path}", first.base_url()))
-        .bearer_auth("dev-admin-token")
-        .header("Idempotency-Key", "replica-create")
-        .json(&request)
-        .send();
-    let create_second = http
-        .post(format!("{}{cats_path}", second.base_url()))
-        .bearer_auth("dev-admin-token")
-        .header("Idempotency-Key", "replica-create")
-        .json(&request)
-        .send();
-    let (created_first, created_second) = tokio::join!(create_first, create_second);
-    let created_first = created_first.unwrap();
-    let created_second = created_second.unwrap();
-    assert_eq!(created_first.status(), StatusCode::ACCEPTED);
-    assert_eq!(created_second.status(), StatusCode::ACCEPTED);
-    let created_first: CatOperationResponse = created_first.json().await.unwrap();
-    let created_second: CatOperationResponse = created_second.json().await.unwrap();
     assert_eq!(created_first.cat.id, created_second.cat.id);
     assert_eq!(created_first.operation.id, created_second.operation.id);
     assert_eq!(first.state.store.list_cats(&workspace_id).unwrap().len(), 1);
@@ -1124,7 +1217,12 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         usage_store: usage.clone(),
         credit_store: usage,
         storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -1140,25 +1238,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     let workspace_id = default_workspace_id(&first);
     let http = reqwest::Client::new();
     let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
-    let created: CatOperationResponse = http
-        .post(format!("{}{cats_path}", first.base_url()))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({
-            "name": "handoff-suspend",
-            "image": "ubuntu-24.04",
-            "cpus": 2,
-            "memory_mib": 1024,
-            "root_size_bytes": 8 << 20,
-            "disk": null
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let created = create_legacy_cat(&first, "handoff-suspend", None).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let cat = first
@@ -1220,7 +1300,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     // aborted. The node has already journaled success, so replaying the same
     // deterministic job returns without applying SuspendCat twice.
     let second = spawn(config).await.unwrap();
-    first.shutdown();
+    first.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let cat = second
@@ -1350,7 +1430,7 @@ async fn reconciler_handoff_replays_persisted_warming_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await.unwrap();
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1403,7 +1483,7 @@ async fn reconciler_handoff_replays_persisted_stopping_success_once() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await.unwrap();
     let converged = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1455,7 +1535,7 @@ async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await.unwrap();
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1515,7 +1595,7 @@ async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
     );
 
     let second = spawn(ctx.config.clone()).await.unwrap();
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await.unwrap();
     let retained = wait_for_persisted_transition(
         &second,
         &created.cat.id,
@@ -1561,7 +1641,7 @@ async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_nod
     // before the matching operation did. Also seed an older operation, a
     // future-generation operation, and an operation whose Cat row is gone so
     // the recovery scan's generation and deletion boundaries are explicit.
-    ctx.cp.shutdown();
+    ctx.cp.shutdown().await.unwrap();
     let dsn = match &ctx.config.control_store_dsn {
         DsnSource::Literal(dsn) => dsn.clone(),
         DsnSource::File(_) => panic!("the PostgreSQL test harness must use a literal DSN"),
@@ -1774,17 +1854,14 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
         guest_lease_sequence: sequence,
         leases,
     };
-    ctx.post_service(
-        ctx.url("/v1/nodes/work-status"),
-        &report(
-            1,
-            vec![cats_api::guest::GuestWorkLease {
-                id: "job-1".into(),
-                label: "user-training".into(),
-                remaining_ttl_ms: 30_000,
-            }],
-        ),
-    )
+    ctx.record_retired_work(report(
+        1,
+        vec![cats_api::guest::GuestWorkLease {
+            id: "job-1".into(),
+            label: "user-training".into(),
+            remaining_ttl_ms: 30_000,
+        }],
+    ))
     .await;
 
     let enabled: AutoSuspendResponse = ctx.get_json(ctx.ws_url("/cats/worker/auto-suspend")).await;
@@ -1802,8 +1879,7 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
         ObservedState::Running
     );
 
-    ctx.post_service(ctx.url("/v1/nodes/work-status"), &report(2, vec![]))
-        .await;
+    ctx.record_retired_work(report(2, vec![])).await;
     let suspended = ctx.wait_observed("worker", ObservedState::Suspended).await;
     assert_eq!(suspended.desired_state, DesiredState::Suspended);
 
@@ -1827,17 +1903,14 @@ async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
     ctx.create_cat("tiered", None).await;
     let cat = ctx.wait_observed("tiered", ObservedState::Running).await;
 
-    ctx.post_service(
-        ctx.url("/v1/nodes/work-status"),
-        &NodeWorkStatusRequest {
-            node_id: "node_a".into(),
-            cat_id: cat.id.clone(),
-            generation: cat.generation,
-            guest_source_epoch: "guest-boot-1".into(),
-            guest_lease_sequence: 0,
-            leases: vec![],
-        },
-    )
+    ctx.record_retired_work(NodeWorkStatusRequest {
+        node_id: "node_a".into(),
+        cat_id: cat.id.clone(),
+        generation: cat.generation,
+        guest_source_epoch: "guest-boot-1".into(),
+        guest_lease_sequence: 0,
+        leases: vec![],
+    })
     .await;
 
     let cold = ctx.wait_observed("tiered", ObservedState::Cold).await;
@@ -2133,27 +2206,21 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     // explicitly fence the Host; silently making it Ready would strand these
     // Unknown Cats outside both recovery paths.
     let registered = ctx.cp.state.store.get_node("node_a").unwrap();
-    ctx.post_service(
-        ctx.url("/v1/nodes/register"),
-        &RegisterNodeRequest {
-            node_id: registered.id.clone(),
-            agent_url: registered.agent_url.clone(),
-            gateway_url: registered.gateway_url.clone(),
-            cpus: registered.capacity.cpus,
-            memory_mib: registered.capacity.memory_mib,
-            route_grant_public_key_sha256: registered.route_grant_public_key_sha256.clone(),
-            initially_cordoned: false,
-        },
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &ctx.cp.state.store,
+        registered.id.clone(),
+        registered.agent_url.clone(),
+        registered.gateway_url.clone(),
+        registered.capacity.cpus,
+        registered.capacity.memory_mib,
+        registered.route_grant_public_key_sha256.clone().unwrap(),
     )
     .await;
-    ctx.post_service(
-        ctx.url("/v1/nodes/heartbeat"),
-        &HeartbeatRequest {
-            node_id: "node_a".into(),
-            cats: Vec::new(),
-            telemetry: None,
-        },
-    )
+    ctx.record_retired_inventory(HeartbeatRequest {
+        node_id: "node_a".into(),
+        cats: Vec::new(),
+        telemetry: None,
+    })
     .await;
     assert_eq!(
         ctx.cp.state.store.get_node("node_a").unwrap().state,
@@ -2174,25 +2241,22 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     // in place only after its complete, same-generation inventory proves every
     // preserved claim instead of cold-starting another Guest.
     node_a.alive.store(true, Ordering::SeqCst);
-    ctx.post_service(
-        ctx.url("/v1/nodes/heartbeat"),
-        &HeartbeatRequest {
-            node_id: "node_a".into(),
-            cats: vec![
-                HeartbeatCat {
-                    cat_id: cat.id.clone(),
-                    generation: cat.generation,
-                    state: ObservedState::Running,
-                },
-                HeartbeatCat {
-                    cat_id: doomed.id.clone(),
-                    generation: doomed.generation,
-                    state: ObservedState::Running,
-                },
-            ],
-            telemetry: None,
-        },
-    )
+    ctx.record_retired_inventory(HeartbeatRequest {
+        node_id: "node_a".into(),
+        cats: vec![
+            HeartbeatCat {
+                cat_id: cat.id.clone(),
+                generation: cat.generation,
+                state: ObservedState::Running,
+            },
+            HeartbeatCat {
+                cat_id: doomed.id.clone(),
+                generation: doomed.generation,
+                state: ObservedState::Running,
+            },
+        ],
+        telemetry: None,
+    })
     .await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -2363,7 +2427,12 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
         control_store_ca_file: None,
         storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2690,7 +2759,12 @@ async fn static_user_tokens_are_not_accepted() {
         usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "token-admin".into(),
         workos: None,
@@ -3095,140 +3169,683 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
 }
 
 #[tokio::test]
-async fn route_grant_verifier_admission_is_rollout_compatible_and_fails_closed() {
+async fn every_composition_closes_old_node_ingress_and_accepts_the_signed_spine() {
     let ctx = Ctx::new().await;
-    let register = |fingerprint: String| RegisterNodeRequest {
-        node_id: "node-key-mismatch".into(),
-        agent_url: "http://127.0.0.1:7301".into(),
-        gateway_url: "http://127.0.0.1:7301".into(),
-        cpus: 4,
-        memory_mib: 4096,
-        route_grant_public_key_sha256: Some(fingerprint),
-        initially_cordoned: false,
+    for path in [
+        "/v1/nodes/register",
+        "/v1/nodes/heartbeat",
+        "/v1/nodes/inventory",
+        "/v1/nodes/work-status",
+    ] {
+        let response = ctx
+            .http
+            .post(ctx.url(path))
+            .bearer_auth(SERVICE_TOKEN)
+            .json(&serde_json::json!({"node_id": "legacy"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let signer = Ed25519RequestSigner::from_pkcs8_pem(
+        Id::new("credential_fixture_node").unwrap(),
+        include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+    )
+    .unwrap();
+    let identity = NodeIdentity {
+        version: ContractVersion::V1,
+        node_id: Id::new("fixture-node").unwrap(),
+        immutable_host_id: Id::new("fixture-host").unwrap(),
+        credential_id: signer.credential_id().clone(),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: signer.public_key_spki_sha256(),
+        },
+        state_path_id: Id::new("fixture-state").unwrap(),
+        state: NodeIdentityState::Provisioned,
+    };
+    cats_control_plane::testsupport::provision_node_identity(&ctx.cp.state.store, identity.clone())
+        .await;
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: identity.node_id,
+        immutable_host_id: identity.immutable_host_id,
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+        registration_attempt_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+        guest_config_digest: guest_config_digest(
+            &cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        )
+        .unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let registration_body = encode_agent_registration_attempt(&attempt).unwrap();
+    let registration_proof = signer.sign("POST", REGISTRATION_PATH, &registration_body);
+    let response = ctx
+        .http
+        .post(ctx.url(REGISTRATION_PATH))
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(NODE_CREDENTIAL_ID_HEADER, registration_proof.credential_id)
+        .header(
+            NODE_PUBLIC_KEY_SPKI_HEADER,
+            registration_proof.public_key_spki,
+        )
+        .header(NODE_SIGNATURE_HEADER, registration_proof.signature)
+        .body(registration_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = decode_agent_session(&response.bytes().await.unwrap()).unwrap();
+    let binding = SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
     };
 
-    let legacy = RegisterNodeRequest {
-        node_id: "node-legacy-new".into(),
-        agent_url: "http://127.0.0.1:7302".into(),
-        gateway_url: "http://127.0.0.1:7302".into(),
-        cpus: 4,
-        memory_mib: 4096,
-        route_grant_public_key_sha256: None,
-        initially_cordoned: false,
+    const DESIRED_PATH: &str = "/v1/internal/runtime/desired-reads";
+    let desired_body = encode_desired_read_request(&DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding.clone(),
+        request_sequence: Sequence::new(1).unwrap(),
+    })
+    .unwrap();
+    let desired_proof = signer.sign("POST", DESIRED_PATH, &desired_body);
+    let response = ctx
+        .http
+        .post(ctx.url(DESIRED_PATH))
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+        .header(NODE_CREDENTIAL_ID_HEADER, desired_proof.credential_id)
+        .header(NODE_PUBLIC_KEY_SPKI_HEADER, desired_proof.public_key_spki)
+        .header(NODE_SIGNATURE_HEADER, desired_proof.signature)
+        .body(desired_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let desired = decode_desired_read_snapshot(&response.bytes().await.unwrap()).unwrap();
+    assert!(desired.desired_specs.is_empty());
+
+    const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
+    let mut observation = NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+        node_id: binding.node_id.clone(),
+        node_boot_id: binding.node_boot_id.clone(),
+        agent_instance_id: binding.agent_instance_id.clone(),
+        agent_session_epoch: binding.agent_session_epoch,
+        heartbeat_sequence: Sequence::new(1).unwrap(),
+        observed_at_unix_ms: UnixMillis::new(1).unwrap(),
+        complete_inventory: true,
+        inventory_epoch: Epoch::new(1).unwrap(),
+        inventory_digest: None,
+        inventory_read_position: Some(desired.read_position),
+        key_ring_version: None,
+        key_ring_digest: None,
+        loaded_kids: Vec::new(),
+        runtimes: Vec::new(),
+        residue: Vec::new(),
     };
-    ctx.cp
+    observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    let observation_body = encode_node_observation(&observation).unwrap();
+    let observation_proof = signer.sign("POST", OBSERVATION_PATH, &observation_body);
+    let response = ctx
+        .http
+        .post(ctx.url(OBSERVATION_PATH))
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+        .header(NODE_CREDENTIAL_ID_HEADER, observation_proof.credential_id)
+        .header(
+            NODE_PUBLIC_KEY_SPKI_HEADER,
+            observation_proof.public_key_spki,
+        )
+        .header(NODE_SIGNATURE_HEADER, observation_proof.signature)
+        .body(observation_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted = decode_observation_acceptance(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(accepted.session, binding);
+}
+
+#[tokio::test]
+async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
+    let storage_meta: Arc<dyn MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        ),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        storage_meta,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+        auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 10,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: AutoTierPolicy::default(),
+    };
+    let mut legacy_billing = config.clone();
+    legacy_billing.billing_enforcement_enabled = true;
+    let billing_error = match spawn_production(legacy_billing).await {
+        Ok(handle) => {
+            handle.shutdown().await.unwrap();
+            panic!("production started the legacy Cat billing enforcer")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        billing_error
+            .to_string()
+            .contains("legacy Cat billing enforcement is unavailable"),
+        "unexpected startup error: {billing_error:#}",
+    );
+    let production = spawn_production(config.clone()).await.unwrap();
+    let workspace_id = default_workspace_id(&production);
+
+    let outbound_calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = listener.local_addr().unwrap();
+    let counter = outbound_calls.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(reject_unexpected_production_node_call)
+                .with_state(counter),
+        )
+        .await
+        .ok();
+    });
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &production.state.store,
+        "node_cutover_old".into(),
+        format!("http://{node_addr}"),
+        format!("http://{node_addr}"),
+        4,
+        4096,
+        production
+            .state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+
+    // Seed a pre-cutover row directly. Production HTTP must not create or
+    // inspect this authority; the explicit legacy test composition retains
+    // those handlers for the older lifecycle suites.
+    let workspace = production
         .state
         .store
-        .register_node(
-            "node-legacy-existing",
-            "http://127.0.0.1:7303",
-            "http://127.0.0.1:7303",
-            4,
-            4096,
+        .workspace_by_id(&workspace_id)
+        .unwrap();
+    let (legacy_cat, legacy_disks, legacy_operation) = production
+        .state
+        .store
+        .create_cat(
+            &workspace,
+            "signed-cutover",
+            "ubuntu-24.04",
+            1,
+            512,
+            8 << 20,
             false,
+            None,
+            None,
+            DiskDurability::Strict,
         )
         .unwrap();
-    let existing_legacy = RegisterNodeRequest {
-        node_id: "node-legacy-existing".into(),
-        agent_url: "http://127.0.0.1:7303".into(),
-        gateway_url: "http://127.0.0.1:7303".into(),
-        ..legacy.clone()
-    };
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&existing_legacy)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-legacy-existing"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Ready);
+    let legacy_disk_id = legacy_disks[0].id.clone();
+    let client = reqwest::Client::new();
 
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&legacy)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-legacy-new"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Cordoned);
-    let refused = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-legacy-new/actions/uncordon"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
-
-    let mismatch = "0".repeat(64);
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&register(mismatch.clone()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let summary: NodeSummary = ctx
-        .get_json(ctx.url("/v1/admin/nodes/node-key-mismatch"))
-        .await;
-    assert_eq!(summary.node.state, NodeState::Cordoned);
-    assert_eq!(
-        summary.node.route_grant_public_key_sha256.as_deref(),
-        Some(mismatch.as_str())
-    );
-
-    let refused = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
-    let body: cats_api::error::ErrorBody = refused.json().await.unwrap();
-    assert_eq!(body.code, cats_api::error::ErrorCode::FailedPrecondition);
-
-    let expected = ctx
-        .cp
+    // A 10 ms legacy reconcile interval would place and dispatch this row
+    // almost immediately. Production owns no such background role.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    let cat_before = production
         .state
-        .cfg
-        .route_grant_signer
-        .public_key_sha256()
-        .to_string();
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&register(expected))
+        .store
+        .must_get_cat_by_id(&legacy_cat.id)
+        .unwrap();
+    assert_eq!(cat_before.node_id, None);
+    assert_eq!(cat_before.observed_state, ObservedState::Creating);
+    let cat_before_json = serde_json::to_value(&cat_before).unwrap();
+    let operations_before = serde_json::to_value(
+        production
+            .state
+            .store
+            .list_operations(&workspace_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let work_before = production
+        .state
+        .store
+        .work_status(&cat_before.id, 30_000)
+        .unwrap();
+    let nodes_before = serde_json::to_value(production.state.store.list_nodes().unwrap()).unwrap();
+
+    let workspace_base = format!("{}/v1/workspaces/{workspace_id}", production.base_url());
+    let closed = vec![
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{workspace_base}/cats/signed-cutover"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/actions/stop"),
+            Some(serde_json::json!({})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/exec"),
+            Some(serde_json::json!({"command": ["true"]})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
+            Some(serde_json::json!({
+                "app": "server",
+                "image": format!("registry.test/app@sha256:{}", "a".repeat(64))
+            })),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/actions/sync"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/auto-suspend"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{workspace_base}/cats/signed-cutover/auto-suspend"),
+            Some(serde_json::json!({"enabled": true})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/expiry"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{workspace_base}/cats/signed-cutover/expiry"),
+            Some(serde_json::json!({"expires_at_unix": 4_102_444_800_i64})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/work"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/cats/signed-cutover/endpoints"),
+            Some(serde_json::json!({"name": "web"})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/cats/signed-cutover/endpoints"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks/{legacy_disk_id}"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{workspace_base}/disks/{legacy_disk_id}"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
+            Some(serde_json::json!({"size_bytes": 16 << 20})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/actions/mount"),
+            Some(serde_json::json!({
+                "cat_id": "signed-cutover",
+                "mount_at": "/data"
+            })),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/actions/unmount"),
+            Some(serde_json::json!({})),
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{workspace_base}/disks/old/snapshots"),
+            None,
+            "dev-admin-token",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/disks/{legacy_disk_id}/snapshots"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/operations/{}",
+                production.base_url(),
+                legacy_operation.id
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/operations"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{}/v1/internal/usage/checkpoints", production.base_url()),
+            Some(serde_json::json!({"checkpoints": []})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{workspace_base}/billing/usage"),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/nodes/node_cutover_old/actions/cordon",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/nodes", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/nodes", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/nodes/node_cutover_old", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{}/v1/admin/nodes/node_cutover_old", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/admin/nodes/node_cutover_old/cats",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/admin/nodes/node_cutover_old/actions/fence",
+                production.base_url()
+            ),
+            Some(serde_json::json!({"confirm_host_stopped_or_isolated": true})),
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!("{}/v1/admin/monitoring", production.base_url()),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::GET,
+            format!(
+                "{}/v1/routes/resolve?hostname=cutover.test",
+                production.base_url()
+            ),
+            None,
+            "invalid-before-cutover-gate",
+        ),
+        (
+            reqwest::Method::POST,
+            format!(
+                "{}/v1/routes/wake?hostname=cutover.test",
+                production.base_url()
+            ),
+            None,
+            SERVICE_TOKEN,
+        ),
+    ];
+    for (method, url, body, token) in closed {
+        let mut request = client.request(method, &url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "legacy runtime entry point stayed reachable: {url}",
+        );
+    }
+
+    let strict_disk_create = client
+        .post(format!("{workspace_base}/disks"))
+        .bearer_auth("dev-admin-token")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", "reject-legacy-disk-create-shape")
+        .json(&serde_json::json!({"name": "must-not-create"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let admitted = ctx
-        .http
-        .post(ctx.url("/v1/admin/nodes/node-key-mismatch/actions/uncordon"))
+    assert_eq!(
+        strict_disk_create.status(),
+        StatusCode::BAD_REQUEST,
+        "the covered PersistentDisk route accepted the retired create shape",
+    );
+
+    let metrics = client
+        .get(format!("{}/metrics", production.base_url()))
         .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(admitted.status(), StatusCode::OK);
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = metrics.text().await.unwrap();
+    assert!(metrics.contains("cats_control_store_blocking_jobs_active"));
+    assert!(metrics.contains("cats_control_observation_store_active"));
+    assert!(metrics.contains("cats_control_plane_metrics_database_snapshot_available 0"));
+    assert!(!metrics.contains("cats_control_plane_cats_total"));
+    assert!(!metrics.contains("cats_node_load_average_1m"));
+
+    // Exercise the WebSocket extractor so this proves the handler itself is
+    // closed, rather than merely observing a missing Upgrade header.
+    let shell = client
+        .get(format!(
+            "{workspace_base}/cats/signed-cutover/shell?rows=24&cols=80"
+        ))
+        .bearer_auth("dev-admin-token")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shell.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // The retired shared-bearer routes are absent rather than authenticated
+    // fallbacks. Try both credentials and prove the same old rows stayed exact.
+    for path in [
+        "/v1/nodes/register",
+        "/v1/nodes/heartbeat",
+        "/v1/nodes/inventory",
+        "/v1/nodes/work-status",
+        "/v1/internal/work/acquire",
+        "/v1/internal/work/release",
+    ] {
+        for token in [SERVICE_TOKEN, "dev-admin-token"] {
+            let response = client
+                .post(format!("{}{path}", production.base_url()))
+                .bearer_auth(token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        admitted.json::<NodeSummary>().await.unwrap().node.state,
-        NodeState::Ready
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .must_get_cat_by_id(&legacy_cat.id)
+                .unwrap()
+        )
+        .unwrap(),
+        cat_before_json
     );
+    assert_eq!(
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .list_operations(&workspace_id)
+                .unwrap()
+        )
+        .unwrap(),
+        operations_before
+    );
+    let work_after = production
+        .state
+        .store
+        .work_status(&legacy_cat.id, 30_000)
+        .unwrap();
+    assert_eq!(work_after.work_version, work_before.work_version);
+    assert_eq!(work_after.active_work_count, work_before.active_work_count);
+    assert_eq!(
+        serde_json::to_value(production.state.store.list_nodes().unwrap()).unwrap(),
+        nodes_before
+    );
+
+    // A stranded legacy OCI row is another old runtime owner. Restarting a
+    // production replica must leave it untouched rather than running the old
+    // in-memory-task reaper.
+    let claim_cat = cat_before.clone();
+    let (operation_id, lease) = production
+        .state
+        .store
+        .execute(move |store| {
+            match store.claim_oci_deployment(
+                &claim_cat,
+                "legacy-app",
+                &format!("sha256:{}", "b".repeat(64)),
+            )? {
+                OciDeploymentClaim::Claimed {
+                    operation, lease, ..
+                } => Ok((operation.id, lease)),
+                _ => unreachable!("fresh legacy deployment identity"),
+            }
+        })
+        .await
+        .unwrap();
+    drop(lease);
+    let operation_before =
+        serde_json::to_value(production.state.store.get_operation(&operation_id).unwrap()).unwrap();
+    production.shutdown().await.unwrap();
+
+    let successor = spawn_production(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        serde_json::to_value(successor.state.store.get_operation(&operation_id).unwrap()).unwrap(),
+        operation_before,
+        "production startup converged a legacy OCI row",
+    );
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    successor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -3400,43 +4017,27 @@ async fn admin_can_monitor_and_drain_nodes() {
         cordon.json::<NodeSummary>().await.unwrap().node.state,
         NodeState::Lost
     );
-    let register = ctx
-        .http
-        .post(ctx.url("/v1/nodes/register"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&RegisterNodeRequest {
-            node_id: "node_a".into(),
-            agent_url: "http://127.0.0.1:1".into(),
-            gateway_url: "http://gateway.invalid".into(),
-            cpus: 8,
-            memory_mib: 16_384,
-            route_grant_public_key_sha256: Some(
-                ctx.cp
-                    .state
-                    .cfg
-                    .route_grant_signer
-                    .public_key_sha256()
-                    .to_string(),
-            ),
-            initially_cordoned: false,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(register.status(), StatusCode::NO_CONTENT);
-    let heartbeat = ctx
-        .http
-        .post(ctx.url("/v1/nodes/heartbeat"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&HeartbeatRequest {
-            node_id: "node_a".into(),
-            cats: Vec::new(),
-            telemetry: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+    cats_control_plane::testsupport::register_legacy_test_node(
+        &ctx.cp.state.store,
+        "node_a".into(),
+        "http://127.0.0.1:1".into(),
+        "http://gateway.invalid".into(),
+        8,
+        16_384,
+        ctx.cp
+            .state
+            .cfg
+            .route_grant_signer
+            .public_key_sha256()
+            .to_string(),
+    )
+    .await;
+    ctx.record_retired_inventory(HeartbeatRequest {
+        node_id: "node_a".into(),
+        cats: Vec::new(),
+        telemetry: None,
+    })
+    .await;
     let node: NodeSummary = ctx
         .http
         .get(ctx.url("/v1/admin/nodes/node_a"))
@@ -3949,18 +4550,15 @@ async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
     // include it again -- absence is the delete succeeding, not an anomaly.
     node_a.cats.lock().unwrap().remove(&going.id);
     node_a.alive.store(true, Ordering::SeqCst);
-    ctx.post_service(
-        ctx.url("/v1/nodes/heartbeat"),
-        &HeartbeatRequest {
-            node_id: "node_a".into(),
-            cats: vec![HeartbeatCat {
-                cat_id: keeper.id.clone(),
-                generation: keeper.generation,
-                state: ObservedState::Running,
-            }],
-            telemetry: None,
-        },
-    )
+    ctx.record_retired_inventory(HeartbeatRequest {
+        node_id: "node_a".into(),
+        cats: vec![HeartbeatCat {
+            cat_id: keeper.id.clone(),
+            generation: keeper.generation,
+            state: ObservedState::Running,
+        }],
+        telemetry: None,
+    })
     .await;
 
     assert_eq!(
@@ -4020,18 +4618,15 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    ctx.post_service(
-        ctx.url("/v1/nodes/heartbeat"),
-        &HeartbeatRequest {
-            node_id: "node_a".into(),
-            cats: vec![HeartbeatCat {
-                cat_id: reported.id.clone(),
-                generation: reported.generation,
-                state: ObservedState::Running,
-            }],
-            telemetry: None,
-        },
-    )
+    ctx.record_retired_inventory(HeartbeatRequest {
+        node_id: "node_a".into(),
+        cats: vec![HeartbeatCat {
+            cat_id: reported.id.clone(),
+            generation: reported.generation,
+            state: ObservedState::Running,
+        }],
+        telemetry: None,
+    })
     .await;
 
     assert_eq!(
@@ -4216,7 +4811,7 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse reconciliation of agent-reported runtimes (issue #98, ADR-0030)
+// V1 reverse reconciliation of agent-reported runtimes
 // ---------------------------------------------------------------------------
 
 async fn admin_node_summary(ctx: &Ctx, node_id: &str) -> NodeSummary {
@@ -4357,8 +4952,8 @@ async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
 /// (`root CAS conflict`) and can never stop cleanly. The drain must stay
 /// visibly open rather than cordon a node that still runs them, and must back
 /// off instead of re-dispatching the doomed stop every reconcile tick.
-/// Discarding the stale journal is an explicit operator action (ADR-0030);
-/// the injected recovery below stands in for it.
+/// Discarding the stale journal is an explicit operator action; the injected
+/// recovery below stands in for it.
 #[tokio::test]
 async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
     let ctx = Ctx::new_with_stable_node_lease().await;

@@ -1,0 +1,91 @@
+#cloud-config
+write_files:
+  - path: /etc/cats-build/identity.json
+    owner: root:root
+    permissions: '0444'
+    content: |
+      ${identity_json}
+  - path: /opt/cats-build/toolchain-lock-v1.json
+    owner: root:root
+    permissions: '0444'
+    content: |
+      ${indent(6, toolchain_lock)}
+  - path: /usr/local/sbin/cats-build-bootstrap
+    owner: root:root
+    permissions: '0755'
+    content: |
+      ${indent(6, bootstrap_script)}
+  - path: /usr/local/sbin/cats-build-imds-guard
+    owner: root:root
+    permissions: '0755'
+    content: |
+      ${indent(6, imds_guard_script)}
+  - path: /usr/local/bin/cats-checkout-exact-sha
+    owner: root:root
+    permissions: '0755'
+    content: |
+      ${indent(6, checkout_script)}
+  - path: /usr/local/lib/cats-build/immutable-receipt.sh
+    owner: root:root
+    permissions: '0444'
+    content: |
+      ${indent(6, immutable_receipt)}
+  - path: /usr/local/bin/cats-publish-content-addressed
+    owner: root:root
+    permissions: '0700'
+    content: |
+      ${indent(6, publish_script)}
+  - path: /usr/local/sbin/cats-run-build
+    owner: root:root
+    permissions: '0700'
+    content: |
+      ${indent(6, run_build_script)}
+  - path: /usr/local/libexec/cats-build/stage-build-output
+    owner: root:root
+    permissions: '0700'
+    content: |
+      ${indent(6, stage_output_script)}
+  - path: /usr/local/bin/cats-verify-build-host-readiness
+    owner: root:root
+    permissions: '0755'
+    content: |
+      ${indent(6, readiness_script)}
+  - path: /etc/systemd/system/cats-build-bootstrap.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Cats qualification build-host bootstrap
+      Wants=network-online.target
+      After=network-online.target
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/cats-build-bootstrap
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=15
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/cats-build-imds-guard.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Block untrusted build identities and containers from IMDS
+      Before=docker.service buildkit.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/cats-build-imds-guard
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, --no-block, cats-build-bootstrap.service]

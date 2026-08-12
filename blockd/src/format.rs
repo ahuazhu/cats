@@ -5,13 +5,16 @@
 
 use sha2::{Digest, Sha256};
 
-use cats_api::chunk::{CHUNK_SIZE, PAGES_PER_CHUNK};
+use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE, PAGES_PER_CHUNK};
+use cats_api::runtime_reconciliation::AcquireOrigin;
 
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
 pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
 pub const PACK_MAGIC: &[u8; 8] = b"CATSPACK";
+pub(crate) const ENCODED_PACK_PREFIX_LEN: usize = 8 + 2 + 4;
 pub const BITMAP_MAGIC: &[u8; 8] = b"CATSDRTY";
 pub const FORMAT_VERSION: u16 = 1;
+pub const TARGET_PACK_FORMAT_VERSION: u16 = 2;
 /// Leaf encoding version that can carry layered (base + delta) chunk refs.
 ///
 /// A leaf is encoded at version 1 unless it actually contains a layered ref, so
@@ -407,12 +410,49 @@ pub fn decode_root(mut buf: &[u8]) -> Result<(u64, Vec<LeafRef>), FormatError> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackHeader {
     pub txn: String,
     pub volume_id: String,
     pub base_generation: i64,
-    pub lease_epoch: i64,
+    /// Legacy-only epoch spelling. Target-v2 packs omit it and carry the
+    /// complete closed lineage below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_origin: Option<AcquireOrigin>,
     pub entries: Vec<PackEntry>,
+}
+
+impl PackHeader {
+    pub fn attachment_epoch_value(&self) -> Result<i64, FormatError> {
+        match (
+            self.lease_epoch,
+            &self.attachment_id,
+            self.attachment_epoch,
+            &self.acquire_origin,
+        ) {
+            (Some(epoch), None, None, None) | (None, Some(_), Some(epoch), Some(_)) => Ok(epoch),
+            _ => Err(FormatError::Malformed("pack lineage")),
+        }
+    }
+
+    fn wire_version(&self) -> Result<u16, FormatError> {
+        match (
+            self.lease_epoch,
+            &self.attachment_id,
+            self.attachment_epoch,
+            &self.acquire_origin,
+        ) {
+            (Some(_), None, None, None) => Ok(FORMAT_VERSION),
+            (None, Some(_), Some(_), Some(_)) => Ok(TARGET_PACK_FORMAT_VERSION),
+            _ => Err(FormatError::Malformed("pack lineage")),
+        }
+    }
 }
 
 /// `page_mask` of a full-chunk base image. Deltas always carry fewer pages, so
@@ -435,7 +475,10 @@ pub struct PackEntry {
     /// by the Guest. The background publisher materializes those ranges into
     /// the complete 64 KiB pages named by `page_mask` before uploading. Empty
     /// means the payload is already a publishable base/delta (the V1 format).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Target-v2 makes this field explicit even when the payload is already a
+    // publishable base/delta. Legacy readers already accept the empty array;
+    // `default` keeps old v1 packs without the field readable.
+    #[serde(default)]
     pub byte_ranges: Vec<PackByteRange>,
 }
 
@@ -467,89 +510,245 @@ impl PackEntry {
 }
 
 pub fn encode_pack(header: &PackHeader, payload: &[u8]) -> Vec<u8> {
+    let version = header
+        .wire_version()
+        .expect("pack header has one complete lineage shape");
     let hdr = serde_json::to_vec(header).expect("pack header serializes");
     let mut out = Vec::with_capacity(16 + hdr.len() + payload.len());
     out.extend_from_slice(PACK_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
     out.extend_from_slice(&hdr);
     out.extend_from_slice(payload);
     out
 }
 
-pub fn decode_pack(mut buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError> {
-    let b = &mut buf;
-    if take(b, 8, "pack")? != PACK_MAGIC {
+pub fn encoded_pack_len(header: &PackHeader, payload_len: usize) -> Option<usize> {
+    let header_len = serde_json::to_vec(header)
+        .expect("pack header serializes")
+        .len();
+    8usize
+        .checked_add(2)?
+        .checked_add(4)?
+        .checked_add(header_len)?
+        .checked_add(payload_len)
+}
+
+pub(crate) fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatError> {
+    let mut remaining = prefix;
+    if take(&mut remaining, 8, "pack")? != PACK_MAGIC {
         return Err(FormatError::Malformed("pack"));
     }
-    let ver = take_u16(b, "pack")?;
-    if ver != FORMAT_VERSION {
+    let ver = take_u16(&mut remaining, "pack")?;
+    if ver != FORMAT_VERSION && ver != TARGET_PACK_FORMAT_VERSION {
         return Err(FormatError::Version("pack", ver));
     }
-    let hdr_len = take_u32(b, "pack")? as usize;
-    let hdr = take(b, hdr_len, "pack")?;
+    let header_len = take_u32(&mut remaining, "pack")? as usize;
+    ENCODED_PACK_PREFIX_LEN
+        .checked_add(header_len)
+        .ok_or(FormatError::Malformed("pack"))
+}
+
+pub(crate) fn decode_pack_header(buf: &[u8]) -> Result<(PackHeader, usize), FormatError> {
+    let mut remaining = buf;
+    let encoded_header_len = encoded_pack_header_len(buf)?;
+    let _prefix = take(&mut remaining, ENCODED_PACK_PREFIX_LEN, "pack")?;
+    let hdr_len = encoded_header_len - ENCODED_PACK_PREFIX_LEN;
+    let hdr = take(&mut remaining, hdr_len, "pack")?;
     let header: PackHeader =
         serde_json::from_slice(hdr).map_err(|_| FormatError::Malformed("pack"))?;
-    Ok((header, b.to_vec()))
+    let encoded_version = u16::from_le_bytes(
+        buf.get(8..10)
+            .ok_or(FormatError::Malformed("pack"))?
+            .try_into()
+            .map_err(|_| FormatError::Malformed("pack"))?,
+    );
+    if encoded_version == TARGET_PACK_FORMAT_VERSION {
+        validate_target_pack_json_shape(hdr)?;
+    }
+    if header.wire_version()? != encoded_version {
+        return Err(FormatError::Malformed("pack lineage"));
+    }
+    let payload_offset = buf
+        .len()
+        .checked_sub(remaining.len())
+        .ok_or(FormatError::Malformed("pack"))?;
+    Ok((header, payload_offset))
+}
+
+fn validate_target_pack_json_shape(bytes: &[u8]) -> Result<(), FormatError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| FormatError::Malformed("pack"))?;
+    let object = value.as_object().ok_or(FormatError::Malformed("pack"))?;
+    const HEADER_FIELDS: [&str; 7] = [
+        "txn",
+        "volume_id",
+        "base_generation",
+        "attachment_id",
+        "attachment_epoch",
+        "acquire_origin",
+        "entries",
+    ];
+    if object.len() != HEADER_FIELDS.len()
+        || HEADER_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(FormatError::Malformed("pack"));
+    }
+    let entries = object
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(FormatError::Malformed("pack"))?;
+    const ENTRY_FIELDS: [&str; 6] = [
+        "chunk_idx",
+        "payload_offset",
+        "len",
+        "sha256_hex",
+        "page_mask",
+        "byte_ranges",
+    ];
+    const RANGE_FIELDS: [&str; 3] = ["chunk_offset", "payload_offset", "len"];
+    for entry in entries {
+        let entry = entry.as_object().ok_or(FormatError::Malformed("pack"))?;
+        if entry.len() != ENTRY_FIELDS.len()
+            || ENTRY_FIELDS.iter().any(|field| !entry.contains_key(*field))
+        {
+            return Err(FormatError::Malformed("pack"));
+        }
+        let ranges = entry
+            .get("byte_ranges")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(FormatError::Malformed("pack"))?;
+        for range in ranges {
+            let range = range.as_object().ok_or(FormatError::Malformed("pack"))?;
+            if range.len() != RANGE_FIELDS.len()
+                || RANGE_FIELDS.iter().any(|field| !range.contains_key(*field))
+            {
+                return Err(FormatError::Malformed("pack"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn decode_pack(buf: &[u8]) -> Result<(PackHeader, Vec<u8>), FormatError> {
+    let (header, payload_offset) = decode_pack_header(buf)?;
+    Ok((header, buf[payload_offset..].to_vec()))
+}
+
+/// Decode an owned pack without cloning its payload. The prefix is removed
+/// in-place, so publisher memory stays bounded by the encoded buffer it
+/// admitted before reading the file.
+pub fn decode_pack_owned(mut buf: Vec<u8>) -> Result<(PackHeader, Vec<u8>), FormatError> {
+    let (header, payload_offset) = decode_pack_header(&buf)?;
+    buf.drain(..payload_offset);
+    Ok((header, buf))
 }
 
 // ---------------------------------------------------------------------------
 // Shared base image manifest (spec §6.3, ADR-0017)
 // ---------------------------------------------------------------------------
 
-/// What a volume needs to reference an image's chunks without reading them.
+pub use cats_storage::{
+    ImageManifestChunkV1 as ImageChunk, ImageManifestV1 as ImageManifest, LowerHexSha256,
+};
+
+/// The deterministic generation-one map identity for a shared image.
 ///
-/// JSON, like the commit record: an image is published once and read once per
-/// provisioning, so the encoding costs nothing and stays inspectable.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ImageManifest {
-    pub version: u16,
-    /// sha256 of the raw image file. Also the namespace it was published under,
-    /// which is what makes publishing idempotent across nodes.
-    pub image_id: String,
-    /// Logical length of the image. A volume may be larger — the chunks past the
-    /// image are holes — but never smaller.
-    pub size_bytes: u64,
-    /// Non-hole chunks only, ascending by `chunk_idx`. An all-zero chunk is left
-    /// out rather than stored, so a sparse image publishes only what it uses.
-    pub chunks: Vec<ImageChunk>,
+/// This is the same typed value that root provisioning validates and publishes;
+/// callers can therefore checkpoint the exact target before starting blockd
+/// without reimplementing the frozen map encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRootIdentity {
+    pub root_hash: [u8; 32],
+    pub root_object_id: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ImageChunk {
-    pub chunk_idx: u64,
-    /// Content-addressed: the sha256 of the chunk's bytes. Identical chunks
-    /// within an image therefore share one object.
-    pub object_id: String,
-    pub len: u32,
+pub(crate) struct PreparedImageRoot {
+    pub(crate) map: Vec<ChunkRef>,
+    pub(crate) leaf_nodes: Vec<([u8; 32], Vec<u8>)>,
+    pub(crate) root_bytes: Vec<u8>,
+    pub(crate) identity: ImageRootIdentity,
+    pub(crate) leaves: Vec<LeafRef>,
 }
 
-impl ImageManifest {
-    /// The map a freshly provisioned volume of `volume_bytes` starts from.
-    ///
-    /// Every entry is a base ref into the image namespace, so building this
-    /// uploads nothing: provisioning becomes a metadata operation.
-    pub fn base_map(&self, volume_bytes: u64) -> Result<Vec<ChunkRef>, FormatError> {
-        if volume_bytes < self.size_bytes {
-            return Err(FormatError::Malformed("image manifest"));
-        }
-        let count = volume_bytes.div_ceil(CHUNK_SIZE as u64) as usize;
-        let mut map = vec![ChunkRef::Hole; count];
-        for chunk in &self.chunks {
-            let slot = map
-                .get_mut(chunk.chunk_idx as usize)
-                .ok_or(FormatError::Malformed("image manifest"))?;
-            let sha256 = decode_sha256_hex(&chunk.object_id)
-                .ok_or(FormatError::Malformed("image manifest"))?;
-            *slot = ChunkRef::Base(BaseRef {
-                object_id: chunk.object_id.clone(),
-                len: chunk.len,
-                sha256,
-                image: Some(self.image_id.clone()),
-            });
-        }
-        Ok(map)
+/// Build the block-map view of an already validated shared manifest DTO.
+pub fn image_base_map(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<Vec<ChunkRef>, FormatError> {
+    if volume_bytes < manifest.size_bytes {
+        return Err(FormatError::Malformed("image manifest"));
     }
+    let count = volume_bytes.div_ceil(CHUNK_SIZE as u64) as usize;
+    let mut map = vec![ChunkRef::Hole; count];
+    for chunk in &manifest.chunks {
+        let slot = map
+            .get_mut(chunk.chunk_idx as usize)
+            .ok_or(FormatError::Malformed("image manifest"))?;
+        let sha256 = decode_sha256_hex(chunk.object_id.as_str())
+            .ok_or(FormatError::Malformed("image manifest"))?;
+        *slot = ChunkRef::Base(BaseRef {
+            object_id: chunk.object_id.as_str().to_string(),
+            len: chunk.len,
+            sha256,
+            image: Some(manifest.image_id.as_str().to_string()),
+        });
+    }
+    Ok(map)
+}
+
+/// Compute the exact root-map identity that provisioning a validated image
+/// manifest into a blank volume will publish.
+pub fn image_root_identity(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<ImageRootIdentity, FormatError> {
+    Ok(prepare_image_root(manifest, volume_bytes)?.identity)
+}
+
+pub(crate) fn prepare_image_root(
+    manifest: &ImageManifest,
+    volume_bytes: u64,
+) -> Result<PreparedImageRoot, FormatError> {
+    let map = image_base_map(manifest, volume_bytes)?;
+    let mut leaves = vec![LeafRef::Empty; chunk::leaf_count(volume_bytes) as usize];
+    let mut touched: Vec<u64> = manifest
+        .chunks
+        .iter()
+        .map(|entry| entry.chunk_idx / u64::from(CHUNKS_PER_LEAF))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+
+    let mut leaf_nodes = Vec::with_capacity(touched.len());
+    for leaf_idx in touched {
+        let first = leaf_idx * u64::from(CHUNKS_PER_LEAF);
+        let end = (first + u64::from(CHUNKS_PER_LEAF)).min(map.len() as u64);
+        let encoded = encode_leaf(first, &map[first as usize..end as usize]);
+        let hash = sha256(&encoded);
+        let object_id = format!("{}.node", hex::encode(hash));
+        leaves[leaf_idx as usize] = LeafRef::Present {
+            hash,
+            object_id: object_id.clone(),
+        };
+        leaf_nodes.push((hash, encoded));
+    }
+
+    let root_bytes = encode_root(volume_bytes, &leaves);
+    let root_hash = sha256(&root_bytes);
+    let identity = ImageRootIdentity {
+        root_hash,
+        root_object_id: format!("{}.node", hex::encode(root_hash)),
+    };
+    Ok(PreparedImageRoot {
+        map,
+        leaf_nodes,
+        root_bytes,
+        identity,
+        leaves,
+    })
 }
 
 /// Image object ids are their own sha256, so a reference into an image carries no
@@ -648,7 +847,10 @@ mod tests {
             txn: "t1".into(),
             volume_id: "vol_x".into(),
             base_generation: 3,
-            lease_epoch: 5,
+            lease_epoch: Some(5),
+            attachment_id: None,
+            attachment_epoch: None,
+            acquire_origin: None,
             entries: vec![PackEntry {
                 chunk_idx: 2,
                 payload_offset: 0,
@@ -659,9 +861,80 @@ mod tests {
             }],
         };
         let enc = encode_pack(&header, b"data");
+        assert_eq!(encoded_pack_len(&header, 4), Some(enc.len()));
+        let encoded_header_len = encoded_pack_header_len(&enc[..ENCODED_PACK_PREFIX_LEN]).unwrap();
+        let (prefix_header, payload_offset) =
+            decode_pack_header(&enc[..encoded_header_len]).unwrap();
+        assert_eq!(prefix_header.txn, "t1");
+        assert_eq!(payload_offset, encoded_header_len);
         let (h, payload) = decode_pack(&enc).unwrap();
         assert_eq!(h.txn, "t1");
         assert_eq!(payload, b"data");
+        let (owned_header, owned_payload) = decode_pack_owned(enc).unwrap();
+        assert_eq!(owned_header.txn, "t1");
+        assert_eq!(owned_payload, b"data");
+    }
+
+    #[test]
+    fn target_pack_requires_version_two_and_complete_closed_lineage() {
+        let header = PackHeader {
+            txn: "target-txn".into(),
+            volume_id: "vol_x".into(),
+            base_generation: 4,
+            lease_epoch: None,
+            attachment_id: Some("att_x".into()),
+            attachment_epoch: Some(7),
+            acquire_origin: Some(AcquireOrigin::Normal {
+                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                    "1234567890abcdef1234567890abcdef",
+                )
+                .unwrap(),
+            }),
+            entries: vec![PackEntry {
+                chunk_idx: 0,
+                payload_offset: 0,
+                len: 0,
+                sha256_hex: hex::encode(sha256(&[])),
+                page_mask: 0,
+                byte_ranges: Vec::new(),
+            }],
+        };
+        let encoded = encode_pack(&header, &[]);
+        assert_eq!(
+            u16::from_le_bytes(encoded[8..10].try_into().unwrap()),
+            TARGET_PACK_FORMAT_VERSION
+        );
+        let (decoded, payload) = decode_pack(&encoded).unwrap();
+        assert_eq!(decoded.attachment_epoch_value().unwrap(), 7);
+        assert_eq!(decoded.acquire_origin, header.acquire_origin);
+        assert!(decoded.entries[0].byte_ranges.is_empty());
+        assert!(payload.is_empty());
+
+        let mut falsely_legacy = encoded.clone();
+        falsely_legacy[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        assert!(matches!(
+            decode_pack(&falsely_legacy),
+            Err(FormatError::Malformed("pack lineage"))
+        ));
+
+        let header_length = u32::from_le_bytes(encoded[10..14].try_into().unwrap()) as usize;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encoded[14..14 + header_length]).unwrap();
+        value["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("byte_ranges");
+        let malformed_header = serde_json::to_vec(&value).unwrap();
+        let mut missing_required_entry_field = Vec::new();
+        missing_required_entry_field.extend_from_slice(PACK_MAGIC);
+        missing_required_entry_field.extend_from_slice(&TARGET_PACK_FORMAT_VERSION.to_le_bytes());
+        missing_required_entry_field
+            .extend_from_slice(&(malformed_header.len() as u32).to_le_bytes());
+        missing_required_entry_field.extend_from_slice(&malformed_header);
+        assert!(matches!(
+            decode_pack(&missing_required_entry_field),
+            Err(FormatError::Malformed("pack"))
+        ));
     }
 
     #[test]
@@ -842,18 +1115,18 @@ mod tests {
         let object = "c".repeat(64);
         let manifest = ImageManifest {
             version: FORMAT_VERSION,
-            image_id: "d".repeat(64),
+            image_id: LowerHexSha256::new("d".repeat(64)).unwrap(),
             size_bytes: 2 * CHUNK_SIZE as u64,
             // Chunk 1 is all zeros, so the image never stored it.
             chunks: vec![ImageChunk {
                 chunk_idx: 0,
-                object_id: object.clone(),
+                object_id: LowerHexSha256::new(object.clone()).unwrap(),
                 len: CHUNK_SIZE,
             }],
         };
 
         // A volume bigger than the image: the tail is holes, not an error.
-        let map = manifest.base_map(4 * CHUNK_SIZE as u64).unwrap();
+        let map = image_base_map(&manifest, 4 * CHUNK_SIZE as u64).unwrap();
         assert_eq!(map.len(), 4);
         assert_eq!(map[0].image(), Some(manifest.image_id.as_str()));
         assert_eq!(map[0].base().unwrap().object_id, object);
@@ -865,17 +1138,12 @@ mod tests {
         assert!(matches!(map[3], ChunkRef::Hole));
 
         // A volume smaller than the image would silently truncate the rootfs.
-        assert!(manifest.base_map(CHUNK_SIZE as u64).is_err());
+        assert!(image_base_map(&manifest, CHUNK_SIZE as u64).is_err());
 
         // A chunk index past the volume is a corrupt manifest, not a hole.
         let mut bad = manifest.clone();
         bad.chunks[0].chunk_idx = 99;
-        assert!(bad.base_map(2 * CHUNK_SIZE as u64).is_err());
-
-        // Object ids are content hashes; anything else cannot be verified on read.
-        let mut unhashed = manifest.clone();
-        unhashed.chunks[0].object_id = "not-a-digest".into();
-        assert!(unhashed.base_map(2 * CHUNK_SIZE as u64).is_err());
+        assert!(image_base_map(&bad, 2 * CHUNK_SIZE as u64).is_err());
     }
 
     #[test]

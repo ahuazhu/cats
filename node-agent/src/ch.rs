@@ -23,24 +23,38 @@
 //! per-Cat, file-backed memory zone and process_madvise(MADV_PAGEOUT), so it
 //! reclaims Guest RAM without depending on host swap.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd as _;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use cats_api::runtime_reconciliation::{
+    IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
+    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
+};
 
 use crate::proc::ProcHandle;
+use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
 /// Named, per-Cat RAM backing kept under the Cat's host-local runtime.
 pub const GUEST_MEMORY_FILE: &str = "guest-memory.bin";
 const MIB: u64 = 1024 * 1024;
+const IP_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const IP_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const STANDALONE_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which frontend of `cats-blockd` the Guest's virtio-blk devices are served by.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,9 +90,18 @@ pub struct ChConfig {
     /// cache. Only meaningful on [`BlockPath::KernelNbd`]; the vhost-user path
     /// never had a host-side cache to bypass.
     pub block_direct: bool,
+    /// Fixed launcher selected by the installed Node configuration. The
+    /// StartRuntime checkpoint records and hashes this exact executable; it is
+    /// never inferred from the Agent executable or from PATH.
+    pub vmm_launcher_bin: PathBuf,
     pub ch_bin: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
+    /// Production carries the release manifest projection and reopens/hashes
+    /// the exact boot bytes for every fresh launch. `None` exists only for
+    /// test and historical experiment constructors that do not use the
+    /// production installed release paths.
+    pub boot_contract: Option<cats_api::runtime_artifacts::GuestRuntimeBootContract>,
     /// Kernel command line; `root=/dev/vda` etc.
     pub cmdline: String,
     /// Golden root: the raw image a generation-0 root volume is provisioned from.
@@ -96,18 +119,17 @@ pub struct ChConfig {
     pub nbd_client_bin: PathBuf,
     /// How many /dev/nbdN devices exist (modprobe nbd nbds_max=...).
     pub nbd_devices: u32,
-    /// Optional private /16 used for per-Cat tap networks (for example
-    /// `10.240.0.0/16`). Host NAT is installed by the deployment scripts.
-    pub network_cidr: Option<String>,
     pub ip_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChNetwork {
     pub tap: String,
-    pub mac: String,
-    pub host_ip: String,
-    pub guest_ip: String,
+    /// Host-physical fencing token. It is fresh and deliberately has no input
+    /// relationship to Cat or Network identity.
+    pub ownership_token: RandomId128,
+    /// Exact Desired authority consumed by this tap and VMM launch.
+    pub config: NetworkConfig,
 }
 
 /// Per-cat runtime state that only exists in CH mode.
@@ -125,56 +147,859 @@ pub struct ChRuntime {
     pub network: Option<ChNetwork>,
 }
 
-fn stable_hash(value: &str) -> u64 {
-    // FNV-1a: deterministic across processes and Rust releases, unlike
-    // DefaultHasher. The slot only controls local addressing, never identity.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn validate_desired_network(desired: &NetworkConfig) -> Result<()> {
+    anyhow::ensure!(
+        desired.kind == IsolatedIpv4Kind::IsolatedIpv4,
+        "Desired network kind is not isolated_ipv4"
+    );
+    anyhow::ensure!(
+        desired.prefix_length == 30,
+        "Desired isolated IPv4 prefix must be /30"
+    );
+    let guest: std::net::Ipv4Addr = desired
+        .guest_ipv4
+        .as_str()
+        .parse()
+        .context("Desired guest IPv4 is invalid")?;
+    let gateway: std::net::Ipv4Addr = desired
+        .gateway_ipv4
+        .as_str()
+        .parse()
+        .context("Desired gateway IPv4 is invalid")?;
+    let guest_bits = u32::from(guest);
+    let gateway_bits = u32::from(gateway);
+    anyhow::ensure!(
+        guest_bits & !3 == gateway_bits & !3 && guest_bits & 3 == 2 && gateway_bits & 3 == 1,
+        "Desired guest and gateway IPv4 do not name the host/guest pair of one /30"
+    );
+    let octets = guest.octets();
+    let expected_mac = format!(
+        "02:ca:{:02x}:{:02x}:{:02x}:{:02x}",
+        octets[0], octets[1], octets[2], octets[3]
+    );
+    anyhow::ensure!(
+        desired.guest_mac.as_str() == expected_mac,
+        "Desired guest MAC does not encode its exact guest IPv4"
+    );
+    Ok(())
 }
 
-fn network_for(cidr: &str, cat_id: &str) -> Result<ChNetwork> {
-    let (base, prefix) = cidr
-        .split_once('/')
-        .context("--ch-network-cidr must include /16")?;
-    anyhow::ensure!(prefix == "16", "--ch-network-cidr must be a /16");
-    let base: std::net::Ipv4Addr = base.parse().context("invalid --ch-network-cidr")?;
-    let octets = base.octets();
+fn bind_desired_network(
+    desired: &NetworkConfig,
+    tap: String,
+    ownership_token: RandomId128,
+) -> Result<ChNetwork> {
+    validate_desired_network(desired)?;
     anyhow::ensure!(
-        octets[2] == 0 && octets[3] == 0,
-        "--ch-network-cidr must be aligned to a /16"
+        (4..=15).contains(&tap.len())
+            && tap.starts_with("cat")
+            && tap
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+        "Host tap name must be cat-prefixed lowercase ASCII within 15 bytes"
     );
-
-    let hash = stable_hash(cat_id);
-    // 16,383 non-overlapping /30s. Slot zero is intentionally unused.
-    let offset = ((hash % 16_383) + 1) as u16 * 4;
-    let third = (offset >> 8) as u8;
-    let fourth = (offset & 0xff) as u8;
-    let host_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 1);
-    let guest_ip = format!("{}.{}.{}.{}/30", octets[0], octets[1], third, fourth + 2);
     Ok(ChNetwork {
-        tap: format!("cat{:011x}", hash & 0x7ff_ffff_ffff),
-        // The Guest's early cats-network service derives its address from
-        // these final two octets before Guest Agent readiness.
-        mac: format!(
-            "02:ca:{:02x}:{:02x}:{third:02x}:{:02x}",
-            octets[0],
-            octets[1],
-            fourth + 2
-        ),
-        host_ip,
-        guest_ip,
+        tap,
+        ownership_token,
+        config: desired.clone(),
     })
 }
 
-fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new(ip_bin)
+/// Revalidates a checkpointed Host-physical tuple without touching Host
+/// state. The signed Desired adapter calls this immediately after every
+/// descriptor-relative checkpoint read, before the tuple can reach `ip` or a
+/// VMM launch.
+pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
+    let checked = bind_desired_network(
+        &network.config,
+        network.tap.clone(),
+        network.ownership_token.clone(),
+    )?;
+    anyhow::ensure!(
+        checked == *network,
+        "checkpointed Host network tuple is invalid"
+    );
+    Ok(())
+}
+
+/// A newly-created TAP that is still tied to its clone descriptor.
+///
+/// Until `publish` succeeds, dropping this value is the only cleanup action:
+/// Linux removes the non-persistent interface when the descriptor closes, so
+/// an error path never has to guess ownership from a reusable name or ifindex.
+pub(crate) trait PendingTap: Send {
+    /// Configure the exact unpublished interface retained by this object.
+    ///
+    /// Production binds every mutation to the TUN descriptor's stable
+    /// network-namespace and ifindex identity. Test doubles implement the
+    /// same lifecycle seam without claiming that a reusable interface name
+    /// is an authority handle.
+    fn configure(
+        &mut self,
+        ip_bin: &Path,
+        network: &ChNetwork,
+        effect_context: &RuntimeDesiredEffectContext,
+    ) -> Result<()>;
+
+    fn publish(self: Box<Self>) -> Result<()>;
+}
+
+/// The narrow physical TAP creation seam used by the network state machine.
+/// Tests inject a descriptor-lifetime fake; production has no command-line
+/// fallback for this security-sensitive create/publish transition.
+pub(crate) trait TapCreatePort: Send + Sync + 'static {
+    fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>>;
+}
+
+pub(crate) struct PlatformTapCreatePort;
+
+#[cfg(target_os = "linux")]
+struct LinuxPendingTap {
+    descriptor: File,
+    network_namespace: File,
+    network_namespace_identity: LinuxNetworkNamespaceIdentity,
+    route_socket: File,
+    tap_name: String,
+    ifindex: u32,
+    next_sequence: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxNetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxTapConfigurationBoundary {
+    Alias,
+    Address,
+    LinkUp,
+    Publish,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingTap for LinuxPendingTap {
+    fn configure(
+        &mut self,
+        _ip_bin: &Path,
+        network: &ChNetwork,
+        effect_context: &RuntimeDesiredEffectContext,
+    ) -> Result<()> {
+        let context = IpCommandContext::Desired(effect_context);
+        self.configure_with_boundary_hook(network, &context, |_| Ok(()))
+    }
+
+    fn publish(self: Box<Self>) -> Result<()> {
+        self.assert_stable_identity()
+            .context("revalidate unpublished Linux TAP before publication")?;
+        // TUNSETPERSIST consumes an integer value, despite its `_IOW<int>`
+        // encoding. On failure `self` still drops and closes the clone fd, so
+        // the unpublished TAP is removed by the kernel.
+        // SAFETY: `descriptor` is a live `/dev/net/tun` clone descriptor and
+        // this ioctl retains neither the fd nor any Rust memory.
+        let result = unsafe {
+            libc::ioctl(
+                self.descriptor.as_raw_fd(),
+                libc::TUNSETPERSIST,
+                1 as libc::c_int,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error()).context("publish Linux TAP with TUNSETPERSIST")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_NETLINK_HEADER_LEN: usize = 16;
+#[cfg(target_os = "linux")]
+const LINUX_NETLINK_ALIGNMENT: usize = 4;
+
+#[cfg(target_os = "linux")]
+fn linux_netlink_align(length: usize) -> usize {
+    (length + LINUX_NETLINK_ALIGNMENT - 1) & !(LINUX_NETLINK_ALIGNMENT - 1)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_network_namespace_identity(file: &File) -> Result<LinuxNetworkNamespaceIdentity> {
+    let metadata = file
+        .metadata()
+        .context("inspect Linux network namespace descriptor")?;
+    Ok(LinuxNetworkNamespaceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_network_namespace(descriptor: &File) -> Result<File> {
+    // SAFETY: `descriptor` is a live TUN clone descriptor. TUNGETDEVNETNS
+    // returns a new owned fd and retains no Rust memory.
+    let namespace_fd = unsafe {
+        libc::ioctl(
+            descriptor.as_raw_fd(),
+            libc::TUNGETDEVNETNS,
+            0 as libc::c_int,
+        )
+    };
+    if namespace_fd < 0 {
+        return Err(io::Error::last_os_error()).context("read Linux TAP network namespace");
+    }
+    // SAFETY: a successful TUNGETDEVNETNS returns one newly-owned descriptor.
+    let namespace = unsafe { File::from_raw_fd(namespace_fd) };
+    // TUNGETDEVNETNS predates an atomic CLOEXEC variant. Set it before this fd
+    // can outlive the create call and accidentally cross a later exec.
+    // SAFETY: `namespace` owns a live descriptor and fcntl retains no memory.
+    let result = unsafe { libc::fcntl(namespace.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if result < 0 {
+        return Err(io::Error::last_os_error())
+            .context("set CLOEXEC on Linux TAP network namespace descriptor");
+    }
+    Ok(namespace)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_socket(expected_namespace: LinuxNetworkNamespaceIdentity) -> Result<File> {
+    // Network namespaces are a per-thread property. `/proc/self/ns/net`
+    // follows the thread-group leader and can therefore name a different
+    // namespace after this worker thread has called `setns` or `unshare`.
+    // `/proc/thread-self` is the race-free handle for the calling thread.
+    let current_namespace = File::open("/proc/thread-self/ns/net")
+        .context("open current Linux thread network namespace")?;
+    anyhow::ensure!(
+        linux_network_namespace_identity(&current_namespace)? == expected_namespace,
+        "new Linux TAP moved out of the creating network namespace"
+    );
+
+    // SAFETY: socket returns a new descriptor and retains no Rust memory.
+    let socket_fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if socket_fd < 0 {
+        return Err(io::Error::last_os_error()).context("open Linux routing netlink socket");
+    }
+    // SAFETY: a successful socket call returns one newly-owned descriptor.
+    let socket = unsafe { File::from_raw_fd(socket_fd) };
+    // SAFETY: zero is the required initial representation for sockaddr_nl;
+    // the public family field is set before the value reaches the kernel.
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: `address` has the exact sockaddr_nl layout and is live for the
+    // duration of bind. The socket retains neither its pointer nor Rust data.
+    let result = unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("bind Linux routing netlink socket");
+    }
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_interface_index(name: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(name).context("Linux TAP name contains NUL")?;
+    // SAFETY: `name` is NUL-terminated and live for this lookup.
+    let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if ifindex == 0 {
+        Err(io::Error::last_os_error()).context("resolve Linux TAP ifindex")
+    } else {
+        Ok(ifindex)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_identity(descriptor: &File) -> Result<(String, libc::c_short)> {
+    // SAFETY: an all-zero ifreq is the required writable request for
+    // TUNGETIFF. The kernel initializes the name and flag union.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: `descriptor` is a TUN clone descriptor and `request` is a live,
+    // correctly-sized writable ifreq retained only for this call.
+    let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNGETIFF, &mut request) };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("read Linux TAP identity");
+    }
+    let name_end = request
+        .ifr_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("Linux TUNGETIFF returned a non-terminated interface name")?;
+    let name = request.ifr_name[..name_end]
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    let name = String::from_utf8(name).context("Linux TUNGETIFF returned a non-UTF-8 name")?;
+    // SAFETY: TUNGETIFF initialized the flag member of the ifreq union.
+    let flags = unsafe { request.ifr_ifru.ifru_flags };
+    Ok((name, flags))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_append_route_attribute(message: &mut Vec<u8>, kind: u16, value: &[u8]) -> Result<()> {
+    let attribute_length = 4usize
+        .checked_add(value.len())
+        .context("Linux routing attribute length overflow")?;
+    let encoded_length =
+        u16::try_from(attribute_length).context("Linux routing attribute exceeds u16 length")?;
+    message.extend_from_slice(&encoded_length.to_ne_bytes());
+    message.extend_from_slice(&kind.to_ne_bytes());
+    message.extend_from_slice(value);
+    message.resize(linux_netlink_align(message.len()), 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_message(
+    message_type: u16,
+    flags: u16,
+    sequence: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let length = LINUX_NETLINK_HEADER_LEN
+        .checked_add(payload.len())
+        .context("Linux routing message length overflow")?;
+    let length = u32::try_from(length).context("Linux routing message exceeds u32 length")?;
+    let mut message = Vec::with_capacity(length as usize);
+    message.extend_from_slice(&length.to_ne_bytes());
+    message.extend_from_slice(&message_type.to_ne_bytes());
+    message.extend_from_slice(&flags.to_ne_bytes());
+    message.extend_from_slice(&sequence.to_ne_bytes());
+    message.extend_from_slice(&0u32.to_ne_bytes());
+    message.extend_from_slice(payload);
+    Ok(message)
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPendingTap {
+    fn configure_with_boundary_hook(
+        &mut self,
+        network: &ChNetwork,
+        context: &IpCommandContext<'_>,
+        mut boundary: impl FnMut(LinuxTapConfigurationBoundary) -> Result<()>,
+    ) -> Result<()> {
+        validate_network_plan(network)?;
+        anyhow::ensure!(
+            network.tap == self.tap_name,
+            "pending Linux TAP does not match the checkpointed name"
+        );
+        let gateway = network
+            .config
+            .gateway_ipv4
+            .as_str()
+            .parse::<Ipv4Addr>()
+            .context("parse checkpointed Host gateway IPv4")?;
+
+        boundary(LinuxTapConfigurationBoundary::Alias)?;
+        self.change_link_alias(&network_alias(network), context)?;
+        boundary(LinuxTapConfigurationBoundary::Address)?;
+        self.add_ipv4_address(gateway, network.config.prefix_length, context)?;
+        boundary(LinuxTapConfigurationBoundary::LinkUp)?;
+        self.change_link_up(context)?;
+        boundary(LinuxTapConfigurationBoundary::Publish)?;
+        self.assert_stable_identity()
+            .context("revalidate configured unpublished Linux TAP")
+    }
+
+    fn assert_stable_identity(&self) -> Result<()> {
+        let current_namespace = linux_tap_network_namespace(&self.descriptor)?;
+        anyhow::ensure!(
+            linux_network_namespace_identity(&current_namespace)?
+                == self.network_namespace_identity,
+            "unpublished Linux TAP moved to a different network namespace"
+        );
+        anyhow::ensure!(
+            linux_network_namespace_identity(&self.network_namespace)?
+                == self.network_namespace_identity,
+            "retained Linux TAP network namespace identity changed"
+        );
+        let (name, flags) = linux_tap_identity(&self.descriptor)?;
+        anyhow::ensure!(
+            name == self.tap_name,
+            "unpublished Linux TAP was renamed from its checkpointed name"
+        );
+        let required_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        anyhow::ensure!(
+            flags & required_flags == required_flags,
+            "unpublished Linux TAP flags changed"
+        );
+        anyhow::ensure!(
+            linux_interface_index(&self.tap_name)? == self.ifindex,
+            "checkpointed Linux TAP name resolves to a replacement ifindex"
+        );
+        Ok(())
+    }
+
+    fn next_sequence(&mut self) -> u32 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        sequence
+    }
+
+    fn send_route_message(
+        &mut self,
+        message_type: u16,
+        flags: u16,
+        payload: &[u8],
+        context: &IpCommandContext<'_>,
+        operation: &str,
+    ) -> Result<()> {
+        context.check_active()?;
+        self.assert_stable_identity()
+            .with_context(|| format!("revalidate Linux TAP before {operation}"))?;
+        let sequence = self.next_sequence();
+        let message = linux_route_message(message_type, flags, sequence, payload)?;
+        // SAFETY: zero is the required initial sockaddr_nl representation;
+        // setting only the family addresses the kernel routing endpoint.
+        let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: all buffers and the sockaddr are live for this call, and the
+        // kernel retains no pointers after sendto returns.
+        let sent = unsafe {
+            libc::sendto(
+                self.route_socket.as_raw_fd(),
+                message.as_ptr().cast::<libc::c_void>(),
+                message.len(),
+                0,
+                (&raw const kernel).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("send Linux routing request to {operation}"));
+        }
+        anyhow::ensure!(
+            sent as usize == message.len(),
+            "short Linux routing request while attempting to {operation}"
+        );
+        self.await_route_ack(sequence, context, operation)?;
+        self.assert_stable_identity()
+            .with_context(|| format!("revalidate Linux TAP after {operation}"))
+    }
+
+    fn await_route_ack(
+        &self,
+        sequence: u32,
+        context: &IpCommandContext<'_>,
+        operation: &str,
+    ) -> Result<()> {
+        let mut response = [0u8; 8192];
+        loop {
+            context.check_active()?;
+            // SAFETY: `response` is a live writable byte buffer. recv retains
+            // no pointer after returning.
+            let received = unsafe {
+                libc::recv(
+                    self.route_socket.as_raw_fd(),
+                    response.as_mut_ptr().cast::<libc::c_void>(),
+                    response.len(),
+                    0,
+                )
+            };
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    let remaining = context.deadline().saturating_duration_since(Instant::now());
+                    std::thread::sleep(IP_COMMAND_POLL_INTERVAL.min(remaining));
+                    continue;
+                }
+                return Err(error)
+                    .with_context(|| format!("receive Linux routing {operation} ack"));
+            }
+            anyhow::ensure!(
+                received != 0,
+                "Linux routing socket closed while awaiting {operation}"
+            );
+            let received = received as usize;
+            let mut offset = 0usize;
+            while offset < received {
+                anyhow::ensure!(
+                    received - offset >= LINUX_NETLINK_HEADER_LEN,
+                    "truncated Linux routing response while awaiting {operation}"
+                );
+                let message_length = u32::from_ne_bytes(
+                    response[offset..offset + 4]
+                        .try_into()
+                        .expect("fixed-width netlink length slice"),
+                ) as usize;
+                anyhow::ensure!(
+                    message_length >= LINUX_NETLINK_HEADER_LEN
+                        && message_length <= received - offset,
+                    "invalid Linux routing response length while awaiting {operation}"
+                );
+                let message_type = u16::from_ne_bytes(
+                    response[offset + 4..offset + 6]
+                        .try_into()
+                        .expect("fixed-width netlink type slice"),
+                );
+                let message_sequence = u32::from_ne_bytes(
+                    response[offset + 8..offset + 12]
+                        .try_into()
+                        .expect("fixed-width netlink sequence slice"),
+                );
+                if message_sequence == sequence && message_type == libc::NLMSG_ERROR as u16 {
+                    anyhow::ensure!(
+                        message_length >= LINUX_NETLINK_HEADER_LEN + 4,
+                        "truncated Linux routing error while awaiting {operation}"
+                    );
+                    let code = i32::from_ne_bytes(
+                        response[offset + LINUX_NETLINK_HEADER_LEN
+                            ..offset + LINUX_NETLINK_HEADER_LEN + 4]
+                            .try_into()
+                            .expect("fixed-width netlink error slice"),
+                    );
+                    if code == 0 {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(code.saturating_neg()))
+                        .with_context(|| format!("Linux routing request to {operation}"));
+                }
+                offset = offset
+                    .checked_add(linux_netlink_align(message_length))
+                    .context("Linux routing response offset overflow")?;
+            }
+        }
+    }
+
+    fn change_link_alias(&mut self, alias: &str, context: &IpCommandContext<'_>) -> Result<()> {
+        anyhow::ensure!(
+            !alias.as_bytes().contains(&0),
+            "Linux TAP alias contains NUL"
+        );
+        let mut payload = Vec::with_capacity(16 + 4 + alias.len() + 1);
+        let ifindex = i32::try_from(self.ifindex).context("Linux TAP ifindex exceeds i32")?;
+        payload.push(libc::AF_UNSPEC as u8);
+        payload.push(0);
+        payload.extend_from_slice(&0u16.to_ne_bytes());
+        payload.extend_from_slice(&ifindex.to_ne_bytes());
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        let mut encoded_alias = alias.as_bytes().to_vec();
+        encoded_alias.push(0);
+        linux_append_route_attribute(&mut payload, libc::IFLA_IFALIAS, &encoded_alias)?;
+        self.send_route_message(
+            libc::RTM_NEWLINK,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            &payload,
+            context,
+            "set the unpublished TAP alias",
+        )
+    }
+
+    fn add_ipv4_address(
+        &mut self,
+        address: Ipv4Addr,
+        prefix_length: u8,
+        context: &IpCommandContext<'_>,
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(8 + 16);
+        payload.push(libc::AF_INET as u8);
+        payload.push(prefix_length);
+        payload.push(0);
+        payload.push(libc::RT_SCOPE_UNIVERSE);
+        payload.extend_from_slice(&self.ifindex.to_ne_bytes());
+        linux_append_route_attribute(&mut payload, libc::IFA_LOCAL, &address.octets())?;
+        linux_append_route_attribute(&mut payload, libc::IFA_ADDRESS, &address.octets())?;
+        self.send_route_message(
+            libc::RTM_NEWADDR,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16,
+            &payload,
+            context,
+            "add the unpublished TAP IPv4 address",
+        )
+    }
+
+    fn change_link_up(&mut self, context: &IpCommandContext<'_>) -> Result<()> {
+        let mut payload = Vec::with_capacity(16);
+        let ifindex = i32::try_from(self.ifindex).context("Linux TAP ifindex exceeds i32")?;
+        payload.push(libc::AF_UNSPEC as u8);
+        payload.push(0);
+        payload.extend_from_slice(&0u16.to_ne_bytes());
+        payload.extend_from_slice(&ifindex.to_ne_bytes());
+        payload.extend_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        payload.extend_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        self.send_route_message(
+            libc::RTM_NEWLINK,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            &payload,
+            context,
+            "bring the unpublished TAP up",
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tap_request(tap_name: &str) -> Result<libc::ifreq> {
+    let name = tap_name.as_bytes();
+    anyhow::ensure!(
+        name.len() < libc::IFNAMSIZ,
+        "Linux TAP name exceeds IFNAMSIZ"
+    );
+    // SAFETY: `ifreq` is a C plain-data request whose all-zero representation
+    // is the required starting state before setting its name and flag union.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (target, source) in request.ifr_name.iter_mut().zip(name.iter().copied()) {
+        *target = source as libc::c_char;
+    }
+    request.ifr_ifru.ifru_flags =
+        (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
+    Ok(request)
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_pending_tap(tap_name: &str) -> Result<LinuxPendingTap> {
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/dev/net/tun")
+        .context("open Linux /dev/net/tun clone device")?;
+    let mut request = linux_tap_request(tap_name)?;
+    // SAFETY: the fd is a live TUN clone descriptor and `request` is a
+    // correctly-sized writable ifreq that remains live for this call.
+    let result = unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TUNSETIFF, &mut request) };
+    if result < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("create exclusive non-persistent Linux TAP {tap_name}"));
+    }
+    let actual_name_end = request
+        .ifr_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("Linux TUNSETIFF returned a non-terminated interface name")?;
+    let actual_name = request.ifr_name[..actual_name_end]
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        actual_name == tap_name.as_bytes(),
+        "Linux TUNSETIFF returned a different TAP name"
+    );
+    let network_namespace = linux_tap_network_namespace(&descriptor)?;
+    let network_namespace_identity = linux_network_namespace_identity(&network_namespace)?;
+    let route_socket = linux_route_socket(network_namespace_identity)?;
+    let ifindex = linux_interface_index(tap_name)?;
+    let pending = LinuxPendingTap {
+        descriptor,
+        network_namespace,
+        network_namespace_identity,
+        route_socket,
+        tap_name: tap_name.to_owned(),
+        ifindex,
+        next_sequence: 1,
+    };
+    pending
+        .assert_stable_identity()
+        .context("bind new Linux TAP to its stable namespace and ifindex")?;
+    Ok(pending)
+}
+
+#[cfg(target_os = "linux")]
+impl TapCreatePort for PlatformTapCreatePort {
+    fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>> {
+        Ok(Box::new(create_linux_pending_tap(tap_name)?))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl TapCreatePort for PlatformTapCreatePort {
+    fn create_nonpersistent(&self, _tap_name: &str) -> Result<Box<dyn PendingTap>> {
+        anyhow::bail!("exclusive non-persistent TAP creation requires Linux /dev/net/tun")
+    }
+}
+
+enum IpCommandContext<'a> {
+    Desired(&'a RuntimeDesiredEffectContext),
+    Physical(&'a dyn RuntimePhysicalReadContext),
+    Standalone { deadline: Instant },
+}
+
+impl IpCommandContext<'_> {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Desired(context) => context.deadline(),
+            Self::Physical(context) => context.deadline(),
+            Self::Standalone { deadline } => *deadline,
+        }
+    }
+
+    fn check_active(&self) -> Result<()> {
+        match self {
+            Self::Desired(context) => context.check_active(),
+            Self::Physical(context) => context.check_active(),
+            Self::Standalone { deadline } => {
+                anyhow::ensure!(
+                    Instant::now() < *deadline,
+                    "Host ip command deadline expired"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+struct IpCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    // SAFETY: `fd` is owned by a live Child pipe for the duration of both
+    // fcntl calls. F_GETFL does not modify memory and F_SETFL receives the
+    // flags returned for that same descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: see above; adding O_NONBLOCK preserves every existing flag.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_ip_stream(
+    stream: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    eof: &mut bool,
+    stream_name: &str,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                *eof = true;
+                return Ok(());
+            }
+            Ok(read) => {
+                anyhow::ensure!(
+                    bytes.len().saturating_add(read) <= IP_COMMAND_OUTPUT_MAX_BYTES,
+                    "Host ip {stream_name} exceeded {IP_COMMAND_OUTPUT_MAX_BYTES} bytes"
+                );
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context(format!("read Host ip {stream_name}")),
+        }
+    }
+}
+
+fn kill_and_reap_ip(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("poll Host ip before termination")?
+        .is_none()
+    {
+        child
+            .kill()
+            .context("kill Host ip after cancellation or deadline")?;
+    }
+    child
+        .wait()
+        .context("reap Host ip after cancellation or deadline")?;
+    Ok(())
+}
+
+fn run_ip_command(
+    context: &IpCommandContext<'_>,
+    ip_bin: &Path,
+    args: &[&str],
+) -> Result<IpCommandOutput> {
+    context.check_active()?;
+    let command = format!("{} {}", ip_bin.display(), args.join(" "));
+    let mut child = Command::new(ip_bin)
         .args(args)
-        .output()
-        .with_context(|| format!("run {} {}", ip_bin.display(), args.join(" ")))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {command}"))?;
+    let pipes = (|| {
+        let stdout = child
+            .stdout
+            .take()
+            .context("Host ip stdout pipe was not created")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Host ip stderr pipe was not created")?;
+        set_nonblocking(stdout.as_raw_fd()).context("make Host ip stdout nonblocking")?;
+        set_nonblocking(stderr.as_raw_fd()).context("make Host ip stderr nonblocking")?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    })();
+    let (mut stdout, mut stderr) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            return match kill_and_reap_ip(&mut child) {
+                Ok(()) => Err(error).with_context(|| format!("set up {command}")),
+                Err(cleanup) => Err(error).with_context(|| {
+                    format!("set up {command}; additionally failed to terminate child: {cleanup:#}")
+                }),
+            };
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let result = (|| -> Result<IpCommandOutput> {
+        let mut status = None;
+        loop {
+            drain_ip_stream(&mut stdout, &mut stdout_bytes, &mut stdout_eof, "stdout")?;
+            drain_ip_stream(&mut stderr, &mut stderr_bytes, &mut stderr_eof, "stderr")?;
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .with_context(|| format!("poll {command}"))?;
+            }
+            if let Some(status) = status {
+                if stdout_eof && stderr_eof {
+                    context.check_active()?;
+                    return Ok(IpCommandOutput {
+                        status,
+                        stdout: stdout_bytes,
+                        stderr: stderr_bytes,
+                    });
+                }
+            }
+
+            context.check_active()?;
+            let remaining = context.deadline().saturating_duration_since(Instant::now());
+            std::thread::sleep(IP_COMMAND_POLL_INTERVAL.min(remaining));
+        }
+    })();
+
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => match kill_and_reap_ip(&mut child) {
+            Ok(()) => Err(error).with_context(|| format!("run {command}")),
+            Err(cleanup) => Err(error).with_context(|| {
+                format!("run {command}; additionally failed to terminate child: {cleanup:#}")
+            }),
+        },
+    }
+}
+
+fn ip_status(context: &IpCommandContext<'_>, ip_bin: &Path, args: &[&str]) -> Result<()> {
+    let output = run_ip_command(context, ip_bin, args)?;
     anyhow::ensure!(
         output.status.success(),
         "{} {} failed: {}",
@@ -185,51 +1010,812 @@ fn ip_status(ip_bin: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_network(cfg: &ChConfig, cat_id: &str) -> Result<Option<ChNetwork>> {
-    let Some(cidr) = cfg.network_cidr.as_deref() else {
-        return Ok(None);
-    };
-    let network = network_for(cidr, cat_id)?;
-    let _ = Command::new(&cfg.ip_bin)
-        .args(["link", "delete", "dev", &network.tap])
-        .output();
-    let addresses = Command::new(&cfg.ip_bin)
-        .args(["-o", "-4", "addr", "show"])
-        .output()
-        .with_context(|| format!("run {} -o -4 addr show", cfg.ip_bin.display()))?;
+/// Produce the complete Host-physical tuple without touching Host state.
+/// The caller must durably checkpoint the return value before calling
+/// [`prepare_network`]. A checkpoint replay must reuse this exact value.
+pub fn plan_network(desired: &NetworkConfig) -> Result<ChNetwork> {
+    plan_network_with_random(desired, || {
+        RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
+            .context("generate Host network identity entropy")
+    })
+}
+
+fn plan_network_with_random(
+    desired: &NetworkConfig,
+    mut random: impl FnMut() -> Result<RandomId128>,
+) -> Result<ChNetwork> {
+    validate_desired_network(desired)?;
+    // The Linux-visible name is not an authority token.  Mint it from a
+    // separate CSPRNG sample so publishing the name does not disclose any
+    // prefix of the provider-private ownership capability.
+    let tap_entropy = random()?;
+    let ownership_token = random()?;
+    anyhow::ensure!(
+        tap_entropy != ownership_token,
+        "Host TAP name entropy collided with its ownership token"
+    );
+    bind_desired_network(
+        desired,
+        format!("cat{}", &tap_entropy.as_str()[..11]),
+        ownership_token,
+    )
+}
+
+fn network_alias(network: &ChNetwork) -> String {
+    format!(
+        "cats-network:{}:{}",
+        network.config.network_id, network.ownership_token
+    )
+}
+
+fn host_cidr(network: &ChNetwork) -> String {
+    format!(
+        "{}/{}",
+        network.config.gateway_ipv4.as_str(),
+        network.config.prefix_length
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ipv4Cidr {
+    address: Ipv4Addr,
+    prefix_length: u8,
+}
+
+impl Ipv4Cidr {
+    fn parse(value: &str) -> Result<Self> {
+        let (address, prefix) = value
+            .split_once('/')
+            .context("IPv4 address is missing its prefix length")?;
+        anyhow::ensure!(!prefix.contains('/'), "IPv4 address has multiple prefixes");
+        let address = address.parse().context("IPv4 address is invalid")?;
+        let prefix_length: u8 = prefix.parse().context("IPv4 prefix length is invalid")?;
+        anyhow::ensure!(prefix_length <= 32, "IPv4 prefix length exceeds 32");
+        Ok(Self {
+            address,
+            prefix_length,
+        })
+    }
+
+    fn display(self) -> String {
+        format!("{}/{}", self.address, self.prefix_length)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        let (self_start, self_end) = self.range();
+        let (other_start, other_end) = other.range();
+        self_start <= other_end && other_start <= self_end
+    }
+
+    fn range(self) -> (u32, u32) {
+        let mask = if self.prefix_length == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(self.prefix_length))
+        };
+        let start = u32::from(self.address) & mask;
+        (start, start | !mask)
+    }
+}
+
+pub(crate) fn network_configs_overlap(left: &NetworkConfig, right: &NetworkConfig) -> Result<bool> {
+    validate_desired_network(left)?;
+    validate_desired_network(right)?;
+    let left = Ipv4Cidr::parse(&format!(
+        "{}/{}",
+        left.gateway_ipv4.as_str(),
+        left.prefix_length
+    ))?;
+    let right = Ipv4Cidr::parse(&format!(
+        "{}/{}",
+        right.gateway_ipv4.as_str(),
+        right.prefix_length
+    ))?;
+    Ok(left.overlaps(right))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostIpv4Address {
+    interface: String,
+    cidr: Ipv4Cidr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostNetworkLinkSnapshot {
+    ifindex: u32,
+    is_tap: bool,
+    is_up: bool,
+    alias: Option<String>,
+    ipv4: Vec<Ipv4Cidr>,
+}
+
+/// One bounded, stable view of every Host link and IPv4 address relevant to
+/// a checkpoint-first TAP reservation. The fields stay private so a caller
+/// cannot turn a link name or an alias string into provider evidence without
+/// applying the validation methods below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostNetworkSnapshot {
+    links: BTreeMap<String, HostNetworkLinkSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedHostNetworkState {
+    Absent,
+    Exact,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonLink {
+    ifindex: u32,
+    ifname: String,
+    flags: Vec<String>,
+    #[serde(default)]
+    ifalias: Option<String>,
+    #[serde(default)]
+    linkinfo: Option<IpJsonLinkInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonLinkInfo {
+    info_kind: String,
+    #[serde(default)]
+    info_data: Option<IpJsonTunInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonTunInfo {
+    #[serde(rename = "type")]
+    interface_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonAddressLink {
+    ifindex: u32,
+    ifname: String,
+    #[serde(default)]
+    addr_info: Vec<IpJsonAddress>,
+}
+
+#[derive(serde::Deserialize)]
+struct IpJsonAddress {
+    family: String,
+    local: String,
+    prefixlen: u8,
+}
+
+impl HostNetworkSnapshot {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            links: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_for_test(identity: &RuntimeNetworkIdentity) -> Result<Self> {
+        let expected = ChNetwork {
+            tap: identity.tap_name.as_str().to_owned(),
+            ownership_token: identity.ownership_token.clone(),
+            config: identity.network_config.clone(),
+        };
+        validate_network_plan(&expected)?;
+        Ok(Self {
+            links: BTreeMap::from([(
+                expected.tap.clone(),
+                HostNetworkLinkSnapshot {
+                    ifindex: 17,
+                    is_tap: true,
+                    is_up: true,
+                    alias: Some(network_alias(&expected)),
+                    ipv4: vec![Ipv4Cidr::parse(&host_cidr(&expected))?],
+                },
+            )]),
+        })
+    }
+
+    fn managed_networks(
+        &self,
+    ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>
+    {
+        let mut managed = BTreeMap::new();
+        let mut network_ids = BTreeSet::new();
+        let mut ownership_tokens = BTreeSet::new();
+        for (name, link) in &self.links {
+            let managed_name = is_managed_tap_name(name);
+            let alias = link.alias.as_deref();
+            let cats_alias = alias.is_some_and(|alias| alias.starts_with("cats-network"));
+            anyhow::ensure!(
+                managed_name == cats_alias,
+                "Host link {name} has an incomplete Cats network identity"
+            );
+            if !cats_alias {
+                continue;
+            }
+            let (network_id, ownership_token) =
+                parse_network_alias(alias.expect("cats_alias proves an alias is present"))?;
+            anyhow::ensure!(
+                link.is_tap && link.is_up && link.ipv4.len() == 1,
+                "managed Host network {name} is not one exact up TAP with one IPv4 address"
+            );
+            anyhow::ensure!(
+                network_ids.insert(network_id.clone()),
+                "Host network identity {network_id} is present more than once"
+            );
+            anyhow::ensure!(
+                ownership_tokens.insert(ownership_token.clone()),
+                "Host network ownership token is present more than once"
+            );
+            managed.insert(name.clone(), (network_id, ownership_token, link.ipv4[0]));
+        }
+        Ok(managed)
+    }
+
+    /// Require every physical Cats TAP to be the exact projection of one
+    /// durable network reservation. A reservation may legitimately be absent
+    /// before its later create effect, but a physical managed TAP without a
+    /// checkpoint must never be treated as harmless Host background state.
+    pub(crate) fn ensure_managed_networks_are_reserved<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<()> {
+        let mut durable = BTreeMap::new();
+        for identity in reserved {
+            let network = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&network)?;
+            anyhow::ensure!(
+                durable.insert(network.tap.clone(), network).is_none(),
+                "durable Host network reservations repeat one TAP name"
+            );
+        }
+        for (tap_name, (network_id, ownership_token, address)) in self.managed_networks()? {
+            let expected = durable
+                .get(&tap_name)
+                .context("physical Cats TAP lacks a durable reservation")?;
+            anyhow::ensure!(
+                expected.config.network_id.as_str() == network_id.as_str()
+                    && expected.ownership_token.as_str() == ownership_token.as_str()
+                    && Ipv4Cidr::parse(&host_cidr(expected))? == address,
+                "physical Cats TAP differs from its durable reservation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Close every durable reservation against the complete Host IPv4 set.
+    /// Its own exact TAP/address is the sole allowed overlap; an absent
+    /// reservation therefore conflicts with any physical owner of its range.
+    pub(crate) fn ensure_reserved_network_ranges<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<()> {
+        let reserved = reserved.into_iter().collect::<Vec<_>>();
+        for identity in &reserved {
+            let expected = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&expected)?;
+            let desired = Ipv4Cidr::parse(&host_cidr(&expected))?;
+            for (name, link) in &self.links {
+                for address in &link.ipv4 {
+                    if name == &expected.tap && address == &desired {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !address.overlaps(desired),
+                        "durable Host network range {} overlaps {} on {name}",
+                        desired.display(),
+                        address.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Prove that a fresh random reservation does not reuse a Host link,
+    /// network identity, ownership token, or overlapping IPv4 range. Existing
+    /// managed links must themselves be well-formed TAPs so a foreign alias
+    /// cannot be ignored merely because the candidate chose another name.
+    pub(crate) fn ensure_candidate_available(&self, network: &ChNetwork) -> Result<()> {
+        validate_network_plan(network)?;
+        let desired = Ipv4Cidr::parse(&host_cidr(network))?;
+        let managed = self.managed_networks()?;
+        for (name, link) in &self.links {
+            if name == &network.tap {
+                anyhow::bail!("checkpointed Host tap name {name} already exists")
+            }
+            if let Some((network_id, ownership_token, _)) = managed.get(name) {
+                anyhow::ensure!(
+                    network_id != &network.config.network_id,
+                    "Host network identity {} is already present on {name}",
+                    network.config.network_id
+                );
+                anyhow::ensure!(
+                    ownership_token != &network.ownership_token,
+                    "Host network ownership token is already present on {name}"
+                );
+            }
+            for address in &link.ipv4 {
+                anyhow::ensure!(
+                    !address.overlaps(desired),
+                    "checkpointed Host network range {} overlaps {} on {name}",
+                    desired.display(),
+                    address.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify one durable reservation from this complete snapshot.  A
+    /// present name is exact only when TAP kind, link state, alias authority,
+    /// ifindex/address join and IPv4 tuple all match.  Partial or foreign
+    /// state is an error, never an adoptable absence.
+    pub(crate) fn reserved_network_state(
+        &self,
+        identity: &RuntimeNetworkIdentity,
+    ) -> Result<ReservedHostNetworkState> {
+        let expected = ChNetwork {
+            tap: identity.tap_name.as_str().to_owned(),
+            ownership_token: identity.ownership_token.clone(),
+            config: identity.network_config.clone(),
+        };
+        validate_network_plan(&expected)?;
+        let Some(link) = self.links.get(&expected.tap) else {
+            return Ok(ReservedHostNetworkState::Absent);
+        };
+        anyhow::ensure!(
+            link.is_tap
+                && link.is_up
+                && link.alias.as_deref() == Some(network_alias(&expected).as_str())
+                && link.ipv4 == [Ipv4Cidr::parse(&host_cidr(&expected))?],
+            "durable Host network reservation is present with partial or foreign state"
+        );
+        Ok(ReservedHostNetworkState::Exact)
+    }
+
+    pub(crate) fn unchanged_except_reserved_tap(
+        &self,
+        after: &Self,
+        identity: &RuntimeNetworkIdentity,
+    ) -> bool {
+        self.links
+            .iter()
+            .filter(|(name, _)| name.as_str() != identity.tap_name.as_str())
+            .eq(after
+                .links
+                .iter()
+                .filter(|(name, _)| name.as_str() != identity.tap_name.as_str()))
+    }
+}
+
+fn is_managed_tap_name(name: &str) -> bool {
+    (4..=15).contains(&name.len())
+        && name.starts_with("cat")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn parse_network_alias(alias: &str) -> Result<(cats_api::runtime_reconciliation::Id, RandomId128)> {
+    let fields = alias
+        .strip_prefix("cats-network:")
+        .context("Host network alias is outside the Cats namespace")?;
+    let (network_id, ownership_token) = fields
+        .rsplit_once(':')
+        .context("Cats Host network alias lacks ownership token")?;
+    anyhow::ensure!(
+        !network_id.is_empty(),
+        "Cats Host network alias lacks network ID"
+    );
+    Ok((
+        cats_api::runtime_reconciliation::Id::new(network_id.to_owned())
+            .context("Cats Host network alias has invalid network ID")?,
+        RandomId128::new(ownership_token.to_owned())
+            .context("Cats Host network alias has invalid ownership token")?,
+    ))
+}
+
+fn parse_ip_link_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, HostNetworkLinkSnapshot>> {
+    let records: Vec<IpJsonLink> =
+        serde_json::from_slice(bytes).context("decode Host ip JSON link inventory")?;
+    anyhow::ensure!(
+        records.len() <= 131_072,
+        "Host link inventory exceeds the closed entry bound"
+    );
+    let mut links = BTreeMap::new();
+    let mut indexes = BTreeSet::new();
+    for record in records {
+        anyhow::ensure!(record.ifindex > 0, "Host link has zero ifindex");
+        anyhow::ensure!(
+            !record.ifname.is_empty()
+                && record.ifname.len() < libc::IFNAMSIZ
+                && !record.ifname.contains('@'),
+            "Host link inventory has an invalid interface name"
+        );
+        anyhow::ensure!(
+            indexes.insert(record.ifindex),
+            "Host link inventory repeats ifindex {}",
+            record.ifindex
+        );
+        if let Some(alias) = &record.ifalias {
+            anyhow::ensure!(
+                !alias.is_empty() && alias.len() <= 256,
+                "Host link alias is empty or exceeds 256 bytes"
+            );
+        }
+        let is_tap = record.linkinfo.as_ref().is_some_and(|linkinfo| {
+            linkinfo.info_kind == "tun"
+                && linkinfo
+                    .info_data
+                    .as_ref()
+                    .and_then(|data| data.interface_type.as_deref())
+                    == Some("tap")
+        });
+        let is_up = record.flags.iter().any(|flag| flag == "UP");
+        anyhow::ensure!(
+            links
+                .insert(
+                    record.ifname,
+                    HostNetworkLinkSnapshot {
+                        ifindex: record.ifindex,
+                        is_tap,
+                        is_up,
+                        alias: record.ifalias,
+                        ipv4: Vec::new(),
+                    },
+                )
+                .is_none(),
+            "Host link inventory repeats an interface name"
+        );
+    }
+    Ok(links)
+}
+
+fn add_ip_address_snapshot(
+    links: &mut BTreeMap<String, HostNetworkLinkSnapshot>,
+    bytes: &[u8],
+) -> Result<()> {
+    let records: Vec<IpJsonAddressLink> =
+        serde_json::from_slice(bytes).context("decode Host ip JSON IPv4 inventory")?;
+    anyhow::ensure!(
+        records.len() <= 131_072,
+        "Host IPv4 inventory exceeds the closed entry bound"
+    );
+    let mut address_records = BTreeSet::new();
+    for record in records {
+        anyhow::ensure!(
+            address_records.insert((record.ifindex, record.ifname.clone())),
+            "Host IPv4 inventory repeats one interface"
+        );
+        let link = links
+            .get_mut(&record.ifname)
+            .context("Host IPv4 inventory names an absent link")?;
+        anyhow::ensure!(
+            link.ifindex == record.ifindex,
+            "Host IPv4 inventory changed interface identity"
+        );
+        let mut addresses = Vec::new();
+        for address in record.addr_info {
+            anyhow::ensure!(
+                address.family == "inet",
+                "Host IPv4 inventory contains a non-IPv4 address"
+            );
+            addresses.push(Ipv4Cidr::parse(&format!(
+                "{}/{}",
+                address.local, address.prefixlen
+            ))?);
+        }
+        addresses.sort_by_key(|address| (u32::from(address.address), address.prefix_length));
+        anyhow::ensure!(
+            addresses.windows(2).all(|pair| pair[0] != pair[1]),
+            "Host IPv4 inventory repeats one address"
+        );
+        link.ipv4 = addresses;
+    }
+    Ok(())
+}
+
+fn host_network_snapshot_once(
+    ip_bin: &Path,
+    context: &IpCommandContext<'_>,
+) -> Result<HostNetworkSnapshot> {
+    let links = run_ip_command(context, ip_bin, &["-j", "-d", "link", "show"])?;
+    anyhow::ensure!(
+        links.status.success(),
+        "{} JSON link inventory failed: {}",
+        ip_bin.display(),
+        String::from_utf8_lossy(&links.stderr).trim()
+    );
+    let addresses = run_ip_command(context, ip_bin, &["-j", "-4", "address", "show"])?;
+    anyhow::ensure!(
+        addresses.status.success(),
+        "{} JSON IPv4 inventory failed: {}",
+        ip_bin.display(),
+        String::from_utf8_lossy(&addresses.stderr).trim()
+    );
+    let mut links = parse_ip_link_snapshot(&links.stdout)?;
+    add_ip_address_snapshot(&mut links, &addresses.stdout)?;
+    Ok(HostNetworkSnapshot { links })
+}
+
+/// Read the complete Host link/address set twice and accept it only when the
+/// two independent command snapshots are byte-semantically equal. This does
+/// not claim atomicity against arbitrary root mutation; it detects the
+/// ordinary rename/recreate/address windows and is always bracketed by the
+/// Node-global network allocation lock for checkpoint/effect use.
+pub(crate) fn inspect_host_network_snapshot(
+    ip_bin: &Path,
+    context: &dyn RuntimePhysicalReadContext,
+) -> Result<HostNetworkSnapshot> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    let context = IpCommandContext::Physical(context);
+    let before = host_network_snapshot_once(ip_bin, &context)?;
+    let after = host_network_snapshot_once(ip_bin, &context)?;
+    anyhow::ensure!(
+        before == after,
+        "Host network inventory changed during the bounded physical scan"
+    );
+    Ok(after)
+}
+
+fn ipv4_addresses(output: &[u8]) -> Result<Vec<HostIpv4Address>> {
+    let text = std::str::from_utf8(output).context("Host ip address output is not UTF-8")?;
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        anyhow::ensure!(!line.trim().is_empty(), "Host ip output has an empty line");
+        let mut fields = line.split_ascii_whitespace();
+        let ordinal = fields
+            .next()
+            .and_then(|field| field.strip_suffix(':'))
+            .with_context(|| format!("Host ip line {} has no interface index", index + 1))?;
+        ordinal.parse::<u32>().with_context(|| {
+            format!("Host ip line {} has an invalid interface index", index + 1)
+        })?;
+        let interface = fields
+            .next()
+            .with_context(|| format!("Host ip line {} has no interface name", index + 1))?;
+        anyhow::ensure!(
+            !interface.is_empty(),
+            "Host ip line {} has an empty interface name",
+            index + 1
+        );
+        anyhow::ensure!(
+            fields.next() == Some("inet"),
+            "Host ip line {} has no IPv4 address marker",
+            index + 1
+        );
+        let cidr_text = fields
+            .next()
+            .with_context(|| format!("Host ip line {} has no IPv4 CIDR", index + 1))?;
+        anyhow::ensure!(
+            !fields.any(|field| field == "inet"),
+            "Host ip line {} has multiple IPv4 address markers",
+            index + 1
+        );
+        let cidr = Ipv4Cidr::parse(cidr_text)
+            .with_context(|| format!("parse Host ip line {} IPv4 CIDR", index + 1))?;
+        anyhow::ensure!(
+            seen.insert(cidr.address),
+            "Host ip output repeats IPv4 address {}",
+            cidr.address
+        );
+        addresses.push(HostIpv4Address {
+            interface: interface.to_owned(),
+            cidr,
+        });
+    }
+    Ok(addresses)
+}
+
+/// Return false only when the exact tap name is absent. A present tap with a
+/// different/missing token is foreign residue and must fail closed.
+fn exact_network_exists(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    context: &IpCommandContext<'_>,
+) -> Result<bool> {
+    let output = run_ip_command(
+        context,
+        &cfg.ip_bin,
+        &["-d", "link", "show", "dev", &network.tap],
+    )
+    .with_context(|| format!("inspect Host tap {}", network.tap))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let expected = network_alias(network);
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stdout)
+            .split_ascii_whitespace()
+            .any(|field| field == expected),
+        "Host tap {} exists with a different or missing ownership token",
+        network.tap
+    );
+    Ok(true)
+}
+
+fn ensure_host_cidr_available(
+    ip_bin: &Path,
+    desired: Ipv4Cidr,
+    adopted_tap: Option<&str>,
+    context: &IpCommandContext<'_>,
+) -> Result<()> {
+    let addresses = run_ip_command(context, ip_bin, &["-o", "-4", "addr", "show"])
+        .with_context(|| format!("run {} -o -4 addr show", ip_bin.display()))?;
     anyhow::ensure!(
         addresses.status.success(),
         "{} -o -4 addr show failed: {}",
-        cfg.ip_bin.display(),
+        ip_bin.display(),
         String::from_utf8_lossy(&addresses.stderr).trim()
     );
-    let assigned = String::from_utf8_lossy(&addresses.stdout);
-    anyhow::ensure!(
-        !assigned.contains(&format!("inet {}", network.host_ip)),
-        "Cat network address collision for {}",
-        network.host_ip
-    );
-    ip_status(
-        &cfg.ip_bin,
-        &["tuntap", "add", "dev", &network.tap, "mode", "tap"],
-    )?;
-    if let Err(error) = (|| {
-        ip_status(
-            &cfg.ip_bin,
-            &["addr", "add", &network.host_ip, "dev", &network.tap],
-        )?;
-        ip_status(&cfg.ip_bin, &["link", "set", "dev", &network.tap, "up"])
-    })() {
-        remove_network(cfg, &network);
-        return Err(error);
+    let addresses = ipv4_addresses(&addresses.stdout)?;
+    let mut adopted_seen = false;
+    for address in addresses {
+        if !address.cidr.overlaps(desired) {
+            continue;
+        }
+        if adopted_tap == Some(address.interface.as_str()) && address.cidr == desired {
+            anyhow::ensure!(
+                !adopted_seen,
+                "Host ip output repeats adopted tap {0}",
+                address.interface
+            );
+            adopted_seen = true;
+            continue;
+        }
+        anyhow::bail!(
+            "Cat network address collision: desired {} overlaps {} on {}",
+            desired.display(),
+            address.cidr.display(),
+            address.interface
+        );
     }
-    Ok(Some(network))
+    if let Some(tap) = adopted_tap {
+        anyhow::ensure!(
+            adopted_seen,
+            "adopted Host tap {tap} disappeared from the global IPv4 inventory"
+        );
+    }
+    Ok(())
 }
 
-pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) {
-    let _ = Command::new(&cfg.ip_bin)
-        .args(["link", "delete", "dev", &network.tap])
-        .output();
+/// Create or adopt only the exact tuple that the caller already checkpointed.
+/// An existing same-token tap is completed idempotently; a same-name tap with
+/// any other token or address is rejected without mutation.
+pub fn prepare_network(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+) -> Result<()> {
+    prepare_network_with_tap_port(cfg, network, effect_context, &PlatformTapCreatePort)
+}
+
+pub(crate) fn prepare_network_with_tap_port(
+    cfg: &ChConfig,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+    tap_create: &dyn TapCreatePort,
+) -> Result<()> {
+    validate_network_plan(network)?;
+    let host_cidr = host_cidr(network);
+    let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
+    let context = IpCommandContext::Desired(effect_context);
+
+    if exact_network_exists(cfg, network, &context)? {
+        let addresses = run_ip_command(
+            &context,
+            &cfg.ip_bin,
+            &["-o", "-4", "addr", "show", "dev", &network.tap],
+        )
+        .with_context(|| format!("inspect IPv4 addresses on Host tap {}", network.tap))?;
+        anyhow::ensure!(
+            addresses.status.success(),
+            "inspect IPv4 addresses on Host tap {}: {}",
+            network.tap,
+            String::from_utf8_lossy(&addresses.stderr).trim()
+        );
+        let assigned = ipv4_addresses(&addresses.stdout)?;
+        if assigned.is_empty() {
+            ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, None, &context)?;
+            ip_status(
+                &context,
+                &cfg.ip_bin,
+                &["addr", "add", &host_cidr, "dev", &network.tap],
+            )?;
+        } else {
+            anyhow::ensure!(
+                assigned.len() == 1 && assigned[0].cidr == desired_cidr,
+                "Host tap {} has an address other than exact checkpointed {host_cidr}",
+                network.tap
+            );
+            ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, Some(&network.tap), &context)?;
+        }
+        return ip_status(
+            &context,
+            &cfg.ip_bin,
+            &["link", "set", "dev", &network.tap, "up"],
+        );
+    }
+
+    ensure_host_cidr_available(&cfg.ip_bin, desired_cidr, None, &context)?;
+    let mut pending_tap = tap_create
+        .create_nonpersistent(&network.tap)
+        .with_context(|| format!("create unpublished Host tap {}", network.tap))?;
+    (|| {
+        pending_tap.configure(&cfg.ip_bin, network, effect_context)?;
+        // This is the publication boundary. Every earlier failure,
+        // cancellation or process exit closes `pending_tap`, so Linux removes
+        // the exact unpublished interface without a name-based delete.
+        context.check_active()?;
+        pending_tap
+            .publish()
+            .with_context(|| format!("publish configured Host tap {}", network.tap))
+    })()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkCreateAttempt {
+    Published,
+    DefinitelyNotPublished,
+    PublicationOutcomeUnknown,
+}
+
+/// Create only from a caller-retained complete absence proof. This primitive
+/// never adopts or completes an existing interface: `TUNSETIFF|TUN_EXCL` is
+/// the sole name claim, and every pre-publication path drops the clone fd.
+/// Once creation is attempted, the closed outcome deliberately contains no
+/// retry instruction; the reconciler must Refresh and obtain a new scan.
+pub(crate) fn create_network_from_sealed_absence_with_tap_port(
+    ip_bin: &Path,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+    tap_create: &dyn TapCreatePort,
+) -> Result<NetworkCreateAttempt> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    validate_network_plan(network)?;
+    let host_cidr = host_cidr(network);
+    let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
+    let context = IpCommandContext::Desired(effect_context);
+    ensure_host_cidr_available(ip_bin, desired_cidr, None, &context)?;
+    context.check_active()?;
+
+    let mut pending_tap = match tap_create.create_nonpersistent(&network.tap) {
+        Ok(pending) => pending,
+        Err(_) => return Ok(NetworkCreateAttempt::DefinitelyNotPublished),
+    };
+    let configured = pending_tap
+        .configure(ip_bin, network, effect_context)
+        .and_then(|()| context.check_active());
+    if configured.is_err() {
+        drop(pending_tap);
+        return Ok(NetworkCreateAttempt::DefinitelyNotPublished);
+    }
+    match pending_tap.publish() {
+        Ok(()) => Ok(NetworkCreateAttempt::Published),
+        Err(_) => Ok(NetworkCreateAttempt::PublicationOutcomeUnknown),
+    }
+}
+
+pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
+    let context = IpCommandContext::Standalone {
+        deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+    };
+    if exact_network_exists(cfg, network, &context)? {
+        ip_status(
+            &context,
+            &cfg.ip_bin,
+            &["link", "delete", "dev", &network.tap],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +2320,15 @@ pub fn file_disk_arg(path: &str, direct: bool) -> String {
     format!("path={path},image_type=raw,direct={direct}")
 }
 
+/// Checkpoint-bound variant used by Runtime Reconciliation V1. Cloud
+/// Hypervisor v53 exposes this value through virtio-blk and `vm.info`; omitting
+/// it would leave the Guest-reported serial unbound to the launch authority.
+pub(crate) fn file_disk_arg_with_serial(path: &str, direct: bool, serial: &str) -> Result<String> {
+    validate_virtio_blk_serial(serial)?;
+    anyhow::ensure!(!path.contains(','), "disk path cannot contain a comma");
+    Ok(format!("{},serial={serial}", file_disk_arg(path, direct)))
+}
+
 /// Effective virtio-blk queue count for one Cat.
 ///
 /// Cloud Hypervisor validates `num_queues <= boot vCPUs` and refuses to start
@@ -741,7 +2336,13 @@ pub fn file_disk_arg(path: &str, direct: bool) -> String {
 /// Cat. The Guest driver maps queues to vCPUs anyway, so more queues than vCPUs
 /// would buy nothing.
 pub fn vhost_user_queues_for(cfg: &ChConfig, cpus: u32) -> usize {
-    cfg.vhost_user_queues.clamp(1, cpus.max(1) as usize)
+    effective_vhost_user_queues(cfg.vhost_user_queues, cpus)
+}
+
+/// Shared projection used when the signed Runtime composer freezes only the
+/// vhost fields it needs instead of retaining the wider VMM configuration.
+pub(crate) fn effective_vhost_user_queues(maximum_queues: usize, cpus: u32) -> usize {
+    maximum_queues.clamp(1, cpus.max(1) as usize)
 }
 
 /// `--disk` argument for a `cats-blockd` vhost-user-blk backend.
@@ -760,6 +2361,31 @@ pub fn vhost_user_disk_arg(socket: &Path, num_queues: usize, queue_size: u16) ->
     Ok(format!(
         "vhost_user=on,socket={socket},num_queues={num_queues},queue_size={queue_size}"
     ))
+}
+
+pub(crate) fn vhost_user_disk_arg_with_serial(
+    socket: &Path,
+    num_queues: usize,
+    queue_size: u16,
+    serial: &str,
+) -> Result<String> {
+    validate_virtio_blk_serial(serial)?;
+    Ok(format!(
+        "{},serial={serial}",
+        vhost_user_disk_arg(socket, num_queues, queue_size)?
+    ))
+}
+
+fn validate_virtio_blk_serial(serial: &str) -> Result<()> {
+    // Restrict the unescaped CLI value to the shared Id alphabet as well.
+    anyhow::ensure!(
+        (1..=GUEST_DEVICE_SERIAL_MAX_BYTES_V1).contains(&serial.len())
+            && serial.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            }),
+        "virtio-blk serial is not a 1..=20 byte canonical Id"
+    );
+    Ok(())
 }
 
 pub struct ChSpawn<'a> {
@@ -786,15 +2412,45 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
     let _ = std::fs::remove_file(s.vsock_sock);
     let mut cmd = Command::new(&s.cfg.ch_bin);
     cmd.arg("--api-socket").arg(s.api_sock);
+    let verified_boot = if s.restore_from.is_none() {
+        s.cfg
+            .boot_contract
+            .as_ref()
+            .map(|contract| {
+                cats_api::runtime_artifacts::open_verified_guest_runtime_launch(
+                    contract,
+                    &s.cfg.kernel,
+                    s.cfg.initramfs.as_deref(),
+                )
+                .context("revalidate installed Guest boot bytes for VMM launch")
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(verified) = &verified_boot {
+        make_inheritable(verified.kernel())?;
+        if let Some(initramfs) = verified.initramfs() {
+            make_inheritable(initramfs)?;
+        }
+    }
     match s.restore_from {
         Some(dir) => {
             cmd.arg("--restore")
                 .arg(format!("source_url=file://{}", dir.display()));
         }
         None => {
-            cmd.arg("--kernel").arg(&s.cfg.kernel);
-            if let Some(initrd) = &s.cfg.initramfs {
-                cmd.arg("--initramfs").arg(initrd);
+            if let Some(verified) = &verified_boot {
+                cmd.arg("--kernel")
+                    .arg(inherited_fd_path(verified.kernel()));
+                if let Some(initramfs) = verified.initramfs() {
+                    cmd.arg("--initramfs").arg(inherited_fd_path(initramfs));
+                }
+            } else {
+                cmd.arg("--kernel").arg(&s.cfg.kernel);
+                if let Some(initrd) = &s.cfg.initramfs {
+                    cmd.arg("--initramfs").arg(initrd);
+                }
             }
             cmd.arg("--cmdline").arg(&s.cfg.cmdline);
             cmd.arg("--cpus").arg(format!("boot={}", s.cpus.max(1)));
@@ -818,8 +2474,11 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
             cmd.arg("--vsock")
                 .arg(format!("cid=3,socket={}", s.vsock_sock.display()));
             if let Some(network) = s.network {
-                cmd.arg("--net")
-                    .arg(format!("tap={},mac={}", network.tap, network.mac));
+                cmd.arg("--net").arg(format!(
+                    "tap={},mac={}",
+                    network.tap,
+                    network.config.guest_mac.as_str()
+                ));
             }
             cmd.arg("--disk").args(s.disks);
             cmd.arg("--serial")
@@ -831,6 +2490,23 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
         std::fs::File::create(s.serial_log.with_file_name("vmm.log")).context("create vmm log")?;
     cmd.stdout(Stdio::null()).stderr(log);
     cmd.spawn().context("spawn cloud-hypervisor")
+}
+
+fn inherited_fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+fn make_inheritable(file: &File) -> Result<()> {
+    // SAFETY: `file` owns a live descriptor. F_GETFD/F_SETFD operate only on
+    // that descriptor and do not access Rust memory. Clearing CLOEXEC is
+    // deliberate: Cloud Hypervisor opens `/proc/self/fd/<n>` after exec.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    anyhow::ensure!(flags >= 0, "read Guest boot descriptor flags");
+    // SAFETY: the same live descriptor invariant applies to this F_SETFD
+    // operation; no pointer or Rust memory is passed to libc.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    anyhow::ensure!(result == 0, "make Guest boot descriptor inheritable");
+    Ok(())
 }
 
 /// Create a zero-filled sparse RAM backing. Sparse allocation avoids charging
@@ -1076,7 +2752,117 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[derive(Debug, Clone, Copy)]
+    enum FakePublishBehavior {
+        Succeed,
+        ReturnError,
+        PanicBeforePublish,
+    }
+
+    #[derive(Default)]
+    struct FakeTapEvents {
+        creates: usize,
+        publishes: usize,
+        unpublished_drops: usize,
+    }
+
+    struct MarkerTapCreatePort {
+        link: PathBuf,
+        behavior: FakePublishBehavior,
+        cancel_after_create: Option<RuntimeDesiredEffectContext>,
+        events: Arc<Mutex<FakeTapEvents>>,
+    }
+
+    impl MarkerTapCreatePort {
+        fn new(link: PathBuf) -> Self {
+            Self {
+                link,
+                behavior: FakePublishBehavior::Succeed,
+                cancel_after_create: None,
+                events: Arc::new(Mutex::new(FakeTapEvents::default())),
+            }
+        }
+    }
+
+    struct MarkerPendingTap {
+        link: PathBuf,
+        behavior: FakePublishBehavior,
+        events: Arc<Mutex<FakeTapEvents>>,
+        published: bool,
+    }
+
+    impl PendingTap for MarkerPendingTap {
+        fn configure(
+            &mut self,
+            ip_bin: &Path,
+            network: &ChNetwork,
+            effect_context: &RuntimeDesiredEffectContext,
+        ) -> Result<()> {
+            let context = IpCommandContext::Desired(effect_context);
+            ip_status(
+                &context,
+                ip_bin,
+                &[
+                    "link",
+                    "set",
+                    "dev",
+                    &network.tap,
+                    "alias",
+                    &network_alias(network),
+                ],
+            )?;
+            ip_status(
+                &context,
+                ip_bin,
+                &["addr", "add", &host_cidr(network), "dev", &network.tap],
+            )?;
+            ip_status(
+                &context,
+                ip_bin,
+                &["link", "set", "dev", &network.tap, "up"],
+            )
+        }
+
+        fn publish(mut self: Box<Self>) -> Result<()> {
+            if matches!(self.behavior, FakePublishBehavior::PanicBeforePublish) {
+                panic!("injected process crash before TAP publish");
+            }
+            if matches!(self.behavior, FakePublishBehavior::ReturnError) {
+                anyhow::bail!("injected TAP publication response loss")
+            }
+            self.events.lock().unwrap().publishes += 1;
+            self.published = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for MarkerPendingTap {
+        fn drop(&mut self) {
+            if !self.published {
+                let _ = std::fs::remove_file(&self.link);
+                self.events.lock().unwrap().unpublished_drops += 1;
+            }
+        }
+    }
+
+    impl TapCreatePort for MarkerTapCreatePort {
+        fn create_nonpersistent(&self, _tap_name: &str) -> Result<Box<dyn PendingTap>> {
+            anyhow::ensure!(!self.link.exists(), "fake exclusive TAP already exists");
+            std::fs::write(&self.link, [])?;
+            self.events.lock().unwrap().creates += 1;
+            if let Some(context) = &self.cancel_after_create {
+                context.cancel_for_test();
+            }
+            Ok(Box::new(MarkerPendingTap {
+                link: self.link.clone(),
+                behavior: self.behavior,
+                events: Arc::clone(&self.events),
+                published: false,
+            }))
+        }
+    }
 
     #[test]
     fn block_path_round_trips_and_rejects_unknown_values() {
@@ -1138,9 +2924,11 @@ mod tests {
     fn probe_config(nbd_client_bin: PathBuf, nbd_devices: u32) -> ChConfig {
         ChConfig {
             block_direct: false,
+            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
+            boot_contract: None,
             cmdline: String::new(),
             seed_image: None,
             block_path: BlockPath::KernelNbd,
@@ -1148,7 +2936,6 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin,
             nbd_devices,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         }
     }
@@ -1309,9 +3096,11 @@ mod tests {
     fn queue_count_never_exceeds_the_cats_vcpus() {
         let mut cfg = ChConfig {
             block_direct: false,
+            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
+            boot_contract: None,
             cmdline: String::new(),
             seed_image: None,
             block_path: BlockPath::VhostUser,
@@ -1319,7 +3108,6 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin: PathBuf::from("nbd-client"),
             nbd_devices: 8,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         };
         // Cloud Hypervisor rejects num_queues > boot vCPUs, so a 1-vCPU Cat on a
@@ -1353,26 +3141,737 @@ mod tests {
         );
         // A comma would silently split into another CH disk option.
         assert!(vhost_user_disk_arg(Path::new("/tmp/a,b.sock"), 1, 256).is_err());
+        assert_eq!(
+            file_disk_arg_with_serial("/dev/nbd3", true, "cats-root").unwrap(),
+            "path=/dev/nbd3,image_type=raw,direct=on,serial=cats-root"
+        );
+        assert_eq!(
+            vhost_user_disk_arg_with_serial(
+                Path::new("/tmp/cats-sock/abc.sock"),
+                4,
+                256,
+                "cats-root"
+            )
+            .unwrap(),
+            "vhost_user=on,socket=/tmp/cats-sock/abc.sock,num_queues=4,queue_size=256,serial=cats-root"
+        );
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "").is_err());
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "12345678901234567890").is_ok());
+        assert!(file_disk_arg_with_serial("/dev/nbd3", true, "123456789012345678901").is_err());
+    }
+
+    fn desired_network() -> NetworkConfig {
+        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+
+        NetworkConfig {
+            kind: IsolatedIpv4Kind::IsolatedIpv4,
+            network_id: Id::new("net_77777777777777777777777777777777").unwrap(),
+            guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+            guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
+            prefix_length: 30,
+            gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
+        }
+    }
+
+    fn network_snapshot(
+        links: serde_json::Value,
+        addresses: serde_json::Value,
+    ) -> Result<HostNetworkSnapshot> {
+        let mut links = parse_ip_link_snapshot(&serde_json::to_vec(&links).unwrap())?;
+        add_ip_address_snapshot(&mut links, &serde_json::to_vec(&addresses).unwrap())?;
+        Ok(HostNetworkSnapshot { links })
+    }
+
+    fn incumbent_network() -> RuntimeNetworkIdentity {
+        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+
+        RuntimeNetworkIdentity {
+            network_config: NetworkConfig {
+                kind: IsolatedIpv4Kind::IsolatedIpv4,
+                network_id: Id::new("net_old").unwrap(),
+                guest_mac: MacAddress::new("02:ca:0a:f0:00:02").unwrap(),
+                guest_ipv4: Ipv4Address::new("10.240.0.2").unwrap(),
+                prefix_length: 30,
+                gateway_ipv4: Ipv4Address::new("10.240.0.1").unwrap(),
+            },
+            tap_name: Id::new("catold000001").unwrap(),
+            ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        }
+    }
+
+    fn incumbent_link_json(alias: &str, address: &str) -> (serde_json::Value, serde_json::Value) {
+        (
+            serde_json::json!([
+                {
+                    "ifindex": 1,
+                    "ifname": "lo",
+                    "flags": ["LOOPBACK", "UP"]
+                },
+                {
+                    "ifindex": 17,
+                    "ifname": "catold000001",
+                    "flags": ["BROADCAST", "UP"],
+                    "ifalias": alias,
+                    "linkinfo": {
+                        "info_kind": "tun",
+                        "info_data": { "type": "tap" }
+                    }
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "ifindex": 1,
+                    "ifname": "lo",
+                    "addr_info": [
+                        { "family": "inet", "local": "127.0.0.1", "prefixlen": 8 }
+                    ]
+                },
+                {
+                    "ifindex": 17,
+                    "ifname": "catold000001",
+                    "addr_info": [
+                        { "family": "inet", "local": address, "prefixlen": 30 }
+                    ]
+                }
+            ]),
+        )
     }
 
     #[test]
-    fn cat_network_is_stable_and_encodes_guest_address_in_mac() {
-        let first = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
-        let second = network_for("10.240.0.0/16", "cat_60e825c8c6cd").unwrap();
-        assert_eq!(first, second);
-        assert!(first.tap.len() <= 15);
-        let ip = first.guest_ip.trim_end_matches("/30");
-        let octets: Vec<u8> = ip.split('.').map(|part| part.parse().unwrap()).collect();
-        assert!(first.mac.ends_with(&format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}",
-            octets[0], octets[1], octets[2], octets[3]
-        )));
+    fn host_network_snapshot_closes_managed_aliases_and_candidate_collisions() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let snapshot = network_snapshot(links, addresses).unwrap();
+        snapshot
+            .ensure_managed_networks_are_reserved([&incumbent])
+            .unwrap();
+
+        let candidate = bind_desired_network(
+            &desired_network(),
+            "catnew000001".to_owned(),
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        )
+        .unwrap();
+        snapshot.ensure_candidate_available(&candidate).unwrap();
+
+        for conflicting in [
+            ChNetwork {
+                tap: incumbent.tap_name.as_str().to_owned(),
+                ..candidate.clone()
+            },
+            ChNetwork {
+                config: NetworkConfig {
+                    network_id: incumbent.network_config.network_id.clone(),
+                    ..candidate.config.clone()
+                },
+                ..candidate.clone()
+            },
+            ChNetwork {
+                ownership_token: incumbent.ownership_token.clone(),
+                ..candidate.clone()
+            },
+        ] {
+            assert!(snapshot.ensure_candidate_available(&conflicting).is_err());
+        }
+
+        let overlap = bind_desired_network(
+            &NetworkConfig {
+                network_id: cats_api::runtime_reconciliation::Id::new("net_overlap").unwrap(),
+                guest_mac: cats_api::runtime_reconciliation::MacAddress::new("02:ca:0a:f0:00:02")
+                    .unwrap(),
+                guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.2")
+                    .unwrap(),
+                gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.1")
+                    .unwrap(),
+                ..desired_network()
+            },
+            "catnew000002".to_owned(),
+            RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.ensure_candidate_available(&overlap).is_err());
     }
 
     #[test]
-    fn cat_network_rejects_non_16_or_unaligned_cidr() {
-        assert!(network_for("10.240.0.0/24", "cat").is_err());
-        assert!(network_for("10.240.1.0/16", "cat").is_err());
+    fn host_network_snapshot_rejects_missing_corrupt_or_unbound_managed_identity() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+
+        let (mut links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        links[1].as_object_mut().unwrap().remove("ifalias");
+        let missing = network_snapshot(links, addresses).unwrap();
+        assert!(missing
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
+
+        let (mut links, addresses) = incumbent_link_json("cats-network:broken", "10.240.0.1");
+        links[1]["ifname"] = serde_json::json!("catold000001");
+        let corrupt = network_snapshot(links, addresses).unwrap();
+        assert!(corrupt
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
+
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let unbound = network_snapshot(links, addresses).unwrap();
+        assert!(unbound.ensure_managed_networks_are_reserved([]).is_err());
+
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.5");
+        let wrong_address = network_snapshot(links, addresses).unwrap();
+        assert!(wrong_address
+            .ensure_managed_networks_are_reserved([&incumbent])
+            .is_err());
+    }
+
+    #[test]
+    fn host_network_snapshot_rejects_duplicate_managed_network_or_token() {
+        let incumbent = incumbent_network();
+        let alias = format!(
+            "cats-network:{}:{}",
+            incumbent.network_config.network_id, incumbent.ownership_token
+        );
+        let (mut links, mut addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        links.as_array_mut().unwrap().push(serde_json::json!({
+            "ifindex": 18,
+            "ifname": "catold000002",
+            "flags": ["UP"],
+            "ifalias": alias,
+            "linkinfo": {
+                "info_kind": "tun",
+                "info_data": { "type": "tap" }
+            }
+        }));
+        addresses.as_array_mut().unwrap().push(serde_json::json!({
+            "ifindex": 18,
+            "ifname": "catold000002",
+            "addr_info": [
+                { "family": "inet", "local": "10.240.0.9", "prefixlen": 30 }
+            ]
+        }));
+        let duplicate = network_snapshot(links, addresses).unwrap();
+        assert!(duplicate
+            .ensure_candidate_available(&plan_network(&desired_network()).unwrap())
+            .is_err());
+    }
+
+    fn desired_effect_context(path: &Path) -> RuntimeDesiredEffectContext {
+        RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(path.to_path_buf()),
+            Instant::now() + Duration::from_secs(10),
+        )
+    }
+
+    #[test]
+    fn exact_desired_network_is_retained_without_cat_or_cidr_derivation() {
+        use cats_api::runtime_reconciliation::{Ipv4Address, MacAddress};
+
+        let desired = desired_network();
+        let ownership = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let network =
+            bind_desired_network(&desired, "catphysical01".into(), ownership.clone()).unwrap();
+        assert_eq!(network.config, desired);
+        assert_eq!(network.ownership_token, ownership);
+        assert_eq!(network.tap, "catphysical01");
+
+        for changed in [
+            NetworkConfig {
+                prefix_length: 29,
+                ..desired.clone()
+            },
+            NetworkConfig {
+                gateway_ipv4: Ipv4Address::new("10.240.0.4").unwrap(),
+                ..desired.clone()
+            },
+            NetworkConfig {
+                guest_mac: MacAddress::new("02:ca:0a:f0:00:07").unwrap(),
+                ..desired.clone()
+            },
+        ] {
+            assert!(
+                bind_desired_network(&changed, "catphysical01".into(), ownership.clone()).is_err()
+            );
+        }
+
+        let first = plan_network(&desired).unwrap();
+        let second = plan_network(&desired).unwrap();
+        assert_eq!(first.config, desired);
+        assert_eq!(second.config, desired);
+        assert_ne!(first.ownership_token, second.ownership_token);
+        assert_ne!(first.tap, second.tap);
+    }
+
+    #[test]
+    fn network_plan_mints_independent_name_and_authority_samples() {
+        let samples = [
+            RandomId128::new("11111111111aaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            RandomId128::new("22222222222bbbbbbbbbbbbbbbbbbbbb").unwrap(),
+        ];
+        let mut samples = samples.into_iter();
+        let planned = plan_network_with_random(&desired_network(), || {
+            samples.next().context("test random sample exhausted")
+        })
+        .unwrap();
+
+        assert_eq!(planned.tap, "cat11111111111");
+        assert_eq!(
+            planned.ownership_token,
+            RandomId128::new("22222222222bbbbbbbbbbbbbbbbbbbbb").unwrap()
+        );
+        assert_ne!(
+            &planned.tap[3..],
+            &planned.ownership_token.as_str()[..11],
+            "published TAP name leaked the ownership-token prefix"
+        );
+        assert!(samples.next().is_none());
+    }
+
+    #[test]
+    fn network_alias_round_trips_colon_bearing_network_id() {
+        let config = NetworkConfig {
+            network_id: cats_api::runtime_reconciliation::Id::new("tenant:segment:42").unwrap(),
+            ..desired_network()
+        };
+        let network = bind_desired_network(
+            &config,
+            "catphysical01".into(),
+            RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+        )
+        .unwrap();
+
+        let parsed = parse_network_alias(&network_alias(&network)).unwrap();
+        assert_eq!(parsed.0, config.network_id);
+        assert_eq!(parsed.1, network.ownership_token);
+    }
+
+    #[test]
+    fn checkpointed_network_plan_precedes_effect_and_replays_exact_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ip.log");
+        let link = dir.path().join("link");
+        let alias = dir.path().join("alias");
+        let address = dir.path().join("address");
+        let fake_ip = dir.path().join("ip");
+        let planned = plan_network(&desired_network()).unwrap();
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\n\
+printf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then\n\
+  if [ -f '{link}' ]; then printf '1: tap0 alias %s\\n' \"$(cat '{alias}' 2>/dev/null)\"; exit 0; fi\n\
+  exit 1\n\
+fi\n\
+if [ \"$1\" = '-o' ] && [ \"$5\" = 'dev' ]; then\n\
+  if [ -f '{address}' ]; then printf '1: {tap} inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = '-o' ]; then\n\
+  if [ -f '{link}' ] && [ -f '{address}' ]; then printf '1: {tap} inet %s scope global\\n' \"$(cat '{address}')\"; fi\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = 'tuntap' ]; then : > '{link}'; exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'set' ] && [ \"$5\" = 'alias' ]; then printf '%s' \"$6\" > '{alias}'; exit 0; fi\n\
+if [ \"$1\" = 'addr' ]; then printf '%s' \"$3\" > '{address}'; exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'set' ]; then exit 0; fi\n\
+if [ \"$1\" = 'link' ] && [ \"$2\" = 'delete' ]; then rm -f '{link}' '{alias}' '{address}'; exit 0; fi\n\
+exit 97\n",
+                log = log.display(),
+                link = link.display(),
+                alias = alias.display(),
+                address = address.display(),
+                tap = planned.tap.as_str(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!log.exists(), "zero-effect plan unexpectedly executed ip");
+        let checkpoint = dir.path().join("network.json");
+        let mut file = File::create(&checkpoint).unwrap();
+        file.write_all(&serde_json::to_vec(&planned).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(!log.exists(), "durable checkpoint unexpectedly executed ip");
+        let replayed: ChNetwork =
+            serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
+
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        let context = desired_effect_context(dir.path());
+        let tap_create = MarkerTapCreatePort::new(link.clone());
+        let tap_events = Arc::clone(&tap_create.events);
+        prepare_network_with_tap_port(&cfg, &replayed, &context, &tap_create).unwrap();
+        assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            network_alias(&replayed)
+        );
+
+        // Crash after the token-bearing tap exists but before its address is
+        // complete: the durable tuple is adopted and completed, not replanned.
+        std::fs::remove_file(&address).unwrap();
+        prepare_network_with_tap_port(&cfg, &replayed, &context, &tap_create).unwrap();
+        assert_eq!(std::fs::read_to_string(&address).unwrap(), "10.240.0.5/30");
+
+        let foreign = ChNetwork {
+            ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            ..replayed.clone()
+        };
+        assert!(prepare_network_with_tap_port(&cfg, &foreign, &context, &tap_create).is_err());
+        assert!(remove_network(&cfg, &foreign).is_err());
+        assert!(link.exists(), "foreign-token cleanup deleted the owned tap");
+        let events = tap_events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 1);
+        assert_eq!(events.unpublished_drops, 0);
+        drop(events);
+        remove_network(&cfg, &replayed).unwrap();
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn cancellation_after_nonpersistent_tap_create_drops_it_without_name_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("tap-live");
+        let mutation = dir.path().join("mutation");
+        let log = dir.path().join("ip.log");
+        let fake_ip = dir.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then exit 1; fi\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+: > '{mutation}'\n\
+exit 0\n",
+                log = log.display(),
+                mutation = mutation.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        let network = plan_network(&desired_network()).unwrap();
+        let context = desired_effect_context(dir.path());
+        let mut tap_create = MarkerTapCreatePort::new(link.clone());
+        tap_create.cancel_after_create = Some(context.clone());
+        let events = Arc::clone(&tap_create.events);
+
+        let error = prepare_network_with_tap_port(&cfg, &network, &context, &tap_create)
+            .expect_err("cancelled unpublished TAP was accepted");
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(!link.exists(), "cancelled pending TAP remained visible");
+        assert!(
+            !mutation.exists(),
+            "cancelled state machine mutated the TAP"
+        );
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"),
+            "cancellation guessed cleanup from the TAP name"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 0);
+        assert_eq!(events.unpublished_drops, 1);
+    }
+
+    #[test]
+    fn sealed_absence_create_has_closed_publish_and_response_loss_outcomes() {
+        for (behavior, cancel, expected, remains) in [
+            (
+                FakePublishBehavior::Succeed,
+                false,
+                NetworkCreateAttempt::Published,
+                true,
+            ),
+            (
+                FakePublishBehavior::Succeed,
+                true,
+                NetworkCreateAttempt::DefinitelyNotPublished,
+                false,
+            ),
+            (
+                FakePublishBehavior::ReturnError,
+                false,
+                NetworkCreateAttempt::PublicationOutcomeUnknown,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("tap-live");
+            let log = dir.path().join("ip.log");
+            let fake_ip = dir.path().join("ip");
+            std::fs::write(
+                &fake_ip,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+exit 0\n",
+                    log = log.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let network = plan_network(&desired_network()).unwrap();
+            let context = desired_effect_context(dir.path());
+            let mut tap_create = MarkerTapCreatePort::new(link.clone());
+            tap_create.behavior = behavior;
+            if cancel {
+                tap_create.cancel_after_create = Some(context.clone());
+            }
+            let events = Arc::clone(&tap_create.events);
+
+            assert_eq!(
+                create_network_from_sealed_absence_with_tap_port(
+                    &fake_ip,
+                    &network,
+                    &context,
+                    &tap_create,
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(link.exists(), remains);
+            assert!(!std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"));
+            let events = events.lock().unwrap();
+            assert_eq!(events.creates, 1);
+            assert_eq!(
+                events.publishes,
+                usize::from(expected == NetworkCreateAttempt::Published)
+            );
+            assert_eq!(events.unpublished_drops, usize::from(!remains));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, and /dev/net/tun"]
+    fn real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace() {
+        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("install iproute2 for the scoped TAP test");
+        assert!(Path::new("/dev/net/tun").exists(), "/dev/net/tun is absent");
+        // SAFETY: unshare changes only this test thread's network namespace.
+        // The ignored test is run in a disposable privileged Linux process;
+        // the namespace (and its persistent TAP) is destroyed with the thread.
+        let result = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert_eq!(
+            result,
+            0,
+            "unshare(CLONE_NEWNET): {}",
+            io::Error::last_os_error()
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let context = desired_effect_context(state.path());
+        let network = plan_network(&desired_network()).unwrap();
+        assert_eq!(
+            create_network_from_sealed_absence_with_tap_port(
+                &ip,
+                &network,
+                &context,
+                &PlatformTapCreatePort,
+            )
+            .unwrap(),
+            NetworkCreateAttempt::Published
+        );
+        let identity = RuntimeNetworkIdentity {
+            network_config: network.config.clone(),
+            tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+            ownership_token: network.ownership_token.clone(),
+        };
+        assert_eq!(
+            inspect_host_network_snapshot(&ip, &context)
+                .unwrap()
+                .reserved_network_state(&identity)
+                .unwrap(),
+            ReservedHostNetworkState::Exact
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2, and /dev/net/tun"]
+    fn real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary() {
+        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("install iproute2 for the scoped TAP test");
+        assert!(Path::new("/dev/net/tun").exists(), "/dev/net/tun is absent");
+        // SAFETY: unshare changes only this test thread's network namespace.
+        // The ignored test runs in a disposable privileged Linux process.
+        let result = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert_eq!(
+            result,
+            0,
+            "unshare(CLONE_NEWNET): {}",
+            io::Error::last_os_error()
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let context = desired_effect_context(state.path());
+        for (index, injection) in [
+            LinuxTapConfigurationBoundary::Alias,
+            LinuxTapConfigurationBoundary::Address,
+            LinuxTapConfigurationBoundary::LinkUp,
+            LinuxTapConfigurationBoundary::Publish,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut network = plan_network(&desired_network()).unwrap();
+            network.tap = format!("cataba{index}");
+            validate_network_plan(&network).unwrap();
+            let detached_name = format!("catold{index}");
+            let mut pending = create_linux_pending_tap(&network.tap).unwrap();
+            let original_ifindex = pending.ifindex;
+            let mut replacement = None;
+            let ip_context = IpCommandContext::Standalone {
+                deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+            };
+
+            let error = pending
+                .configure_with_boundary_hook(
+                    &network,
+                    &IpCommandContext::Desired(&context),
+                    |at| {
+                        if at == injection {
+                            ip_status(
+                                &ip_context,
+                                &ip,
+                                &["link", "set", "dev", &network.tap, "name", &detached_name],
+                            )?;
+                            replacement = Some(create_linux_pending_tap(&network.tap)?);
+                        }
+                        Ok(())
+                    },
+                )
+                .expect_err("same-name replacement passed fd-bound configuration");
+            assert!(
+                format!("{error:#}").contains("renamed")
+                    || format!("{error:#}").contains("replacement ifindex"),
+                "unexpected identity failure: {error:#}"
+            );
+
+            let replacement_tap = replacement
+                .as_ref()
+                .expect("the configured boundary did not run");
+            assert_ne!(replacement_tap.ifindex, original_ifindex);
+            let snapshot = host_network_snapshot_once(
+                &ip,
+                &IpCommandContext::Standalone {
+                    deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
+                },
+            )
+            .unwrap();
+            let replacement_link = snapshot
+                .links
+                .get(&network.tap)
+                .expect("same-name replacement disappeared");
+            assert_eq!(replacement_link.ifindex, replacement_tap.ifindex);
+            assert_eq!(replacement_link.alias, None);
+            assert!(!replacement_link.is_up);
+            assert!(replacement_link.ipv4.is_empty());
+            let identity = RuntimeNetworkIdentity {
+                network_config: network.config.clone(),
+                tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+                ownership_token: network.ownership_token.clone(),
+            };
+            assert!(
+                snapshot.reserved_network_state(&identity).is_err(),
+                "same-name replacement became adoptable"
+            );
+
+            drop(pending);
+            assert!(
+                !Command::new(&ip)
+                    .args(["link", "show", "dev", &detached_name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "renamed original unpublished TAP leaked after descriptor close"
+            );
+            drop(replacement);
+        }
+    }
+
+    #[test]
+    fn crash_before_publish_drops_nonpersistent_tap_without_name_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("tap-live");
+        let log = dir.path().join("ip.log");
+        let fake_ip = dir.path().join("ip");
+        std::fs::write(
+            &fake_ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+if [ \"$1\" = '-d' ]; then exit 1; fi\n\
+if [ \"$1\" = '-o' ]; then exit 0; fi\n\
+exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
+        cfg.ip_bin = fake_ip;
+        let network = plan_network(&desired_network()).unwrap();
+        let context = desired_effect_context(dir.path());
+        let mut tap_create = MarkerTapCreatePort::new(link.clone());
+        tap_create.behavior = FakePublishBehavior::PanicBeforePublish;
+        let events = Arc::clone(&tap_create.events);
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_network_with_tap_port(&cfg, &network, &context, &tap_create)
+        }));
+        assert!(
+            crashed.is_err(),
+            "injected pre-publish crash did not unwind"
+        );
+        assert!(!link.exists(), "crashed pending TAP remained visible");
+        assert!(
+            !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("link delete"),
+            "crash recovery guessed cleanup from the TAP name"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.creates, 1);
+        assert_eq!(events.publishes, 0);
+        assert_eq!(events.unpublished_drops, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tun_request_is_exclusive_nonpersistent_tap_without_packet_info() {
+        let request = linux_tap_request("catphysical01").unwrap();
+        let name_end = request.ifr_name.iter().position(|byte| *byte == 0).unwrap();
+        let name = request.ifr_name[..name_end]
+            .iter()
+            .map(|byte| byte.to_ne_bytes()[0])
+            .collect::<Vec<_>>();
+        assert_eq!(name, b"catphysical01");
+        // SAFETY: linux_tap_request initialized this union variant and no
+        // other variant has been written since.
+        let flags = unsafe { request.ifr_ifru.ifru_flags } as libc::c_int & 0xffff;
+        assert_eq!(flags, libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL);
+        assert_eq!(flags & libc::IFF_PERSIST, 0);
     }
 
     #[test]
@@ -1418,9 +3917,11 @@ mod tests {
         prepare_memory_backing(&memory_file, 256).unwrap();
         let cfg = ChConfig {
             block_direct: false,
+            vmm_launcher_bin: dir.path().join("cats-vmm-launcher"),
             ch_bin: fake_ch,
             kernel,
             initramfs: None,
+            boot_contract: None,
             cmdline: "console=ttyS0".into(),
             seed_image: None,
             block_path: BlockPath::KernelNbd,
@@ -1428,10 +3929,10 @@ mod tests {
             vhost_user_queue_size: 256,
             nbd_client_bin: PathBuf::from("nbd-client"),
             nbd_devices: 8,
-            network_cidr: None,
             ip_bin: PathBuf::from("ip"),
         };
         let serial = dir.path().join("serial.log");
+        let network = plan_network(&desired_network()).unwrap();
         let mut child = spawn_vmm(&ChSpawn {
             cfg: &cfg,
             api_sock: &dir.path().join("api.sock"),
@@ -1442,7 +3943,7 @@ mod tests {
             memory_file: Some(&memory_file),
             disks: &[],
             restore_from: None,
-            network: None,
+            network: Some(&network),
         })
         .unwrap();
         assert!(child.wait().unwrap().success());
@@ -1451,6 +3952,11 @@ mod tests {
         assert!(args.contains(&format!(
             "--memory-zone\nid=cat-ram,size=256M,file={},shared=on\n",
             memory_file.display()
+        )));
+        assert!(args.contains(&format!(
+            "--net\ntap={},mac={}\n",
+            network.tap,
+            network.config.guest_mac.as_str()
         )));
     }
 

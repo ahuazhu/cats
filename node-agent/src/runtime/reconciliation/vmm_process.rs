@@ -1,0 +1,2081 @@
+//! Checkpointed systemd process boundary for one fresh Cloud Hypervisor.
+//!
+//! The durable `StartRuntime` checkpoint is the only launch request.  The
+//! Agent retains that exact checkpoint and every installed artifact
+//! descriptor, then asks PID 1 to pass those descriptors to the fixed
+//! `cats-vmm-launcher` with `OpenFile=`.  No second JSON request, caller-chosen
+//! argv, or pathname-only artifact is accepted at this boundary.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "linux"))]
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
+use anyhow::Context as _;
+use cats_api::runtime_reconciliation::{
+    encode_runtime_checkpoint, ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id,
+    ObservedVmShape, OwnershipTokenEvidence, PreparedDeviceInput, ProcessEvidence, ProcessRole,
+    ProcessState, RandomId128, RuntimeCheckpoint, RuntimeLaunchArtifact, RuntimeLaunchIdentity,
+    RuntimeNetworkIdentity, WireU64,
+};
+
+use crate::runtime_spine::RuntimeDesiredEffectContext;
+use crate::vmm_launcher::{
+    cloud_hypervisor_arguments_for_launch, RUNTIME_INCARNATION_ENVIRONMENT,
+    VMM_LAUNCHER_CONTRACT_ARGUMENT, VMM_PROCESS_TOKEN_ENVIRONMENT,
+};
+
+use super::authorized_blockd::validate_running_endpoint_only_desired_successor;
+use super::checkpoint::{FileCheckpointStore, RetainedCurrentCheckpoint, StoredCheckpoint};
+use super::retained_runtime_launch::RetainedRuntimeLaunchAuthority;
+#[cfg(any(test, target_os = "linux"))]
+use super::systemd_root_provision::{
+    exact_unset_environment, sanitized_systemd_command, LinuxProcessSample,
+    LinuxProcessSampleInspection, SystemdUnitProperties, SYSTEMD_RUN, UNSET_PROCESS_ENVIRONMENT,
+};
+#[cfg(target_os = "linux")]
+use super::systemd_root_provision::{
+    read_cgroup_processes, sample_linux_process, submit_fixed_systemd_command,
+    systemd_unit_properties, SystemdStartSubmission,
+};
+#[cfg(test)]
+use super::systemd_root_provision::{SystemdExecStart, SystemdExecTimestamp};
+#[cfg(target_os = "linux")]
+use super::vmm_api_inspection::{
+    inspect_vmm_api, ExactVmmApiProof, VmmApiExpectation, VmmApiInspection,
+};
+use super::vmm_launch_artifacts::{
+    RetainedVmmLaunchArtifacts, VmmLaunchArtifactDescriptors, VmmLaunchArtifactPaths,
+};
+#[cfg(target_os = "linux")]
+use super::vmm_runtime_paths::{
+    RetainedVmmRuntimePaths, VmmRuntimePathInspection, VmmRuntimePathRequirements,
+};
+#[cfg(target_os = "linux")]
+use super::vmm_socket_namespace::{
+    vmm_state_directory_from_checkpoint, RetainedManagedVmmSocketRoot, VmmSocketOwnershipReceiptV1,
+    VmmSocketReceiptStore,
+};
+
+const SYSTEM_SLICE: &str = "system.slice";
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const VMM_KILL_MODE: &str = "control-group";
+const VMM_RESTART: &str = "no";
+const VMM_UMASK: &str = "0077";
+const VMM_TIMEOUT_STOP: &str = "2s";
+const VMM_COLLECT_MODE: &str = "inactive-or-failed";
+
+const CHECKPOINT_FD_NAME: &str = "cats-checkpoint-v1";
+const VMM_FD_NAME: &str = "cats-vmm-v1";
+const KERNEL_FD_NAME: &str = "cats-kernel-v1";
+const INITRAMFS_FD_NAME: &str = "cats-initramfs-v1";
+
+pub(crate) mod sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) mod global_sealed {
+    pub(crate) trait Sealed {}
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) mod stale_boot_recovery_global_sealed {
+    pub(crate) trait Sealed {}
+}
+
+#[cfg(test)]
+pub(crate) use sealed::Sealed as VmmProcessPortSealedForTest;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VmmProcessStart {
+    Submitted,
+    OutcomeUnknown,
+    DefinitelyNotStarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VmmProcessConflict {
+    IdentityMismatch,
+    DuplicateIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VmmProcessInspection {
+    Absent,
+    Exact(Box<VmmProcessEvidence>),
+    Conflict(VmmProcessConflict),
+    Unavailable,
+}
+
+/// Exact provider-local systemd/process/API inspection.  This is not by
+/// itself an absence permit: a start effect must consume the same sealed
+/// Node-global admission used by the complete inventory sweep.
+pub(crate) trait VmmProcessPort: sealed::Sealed + Send + Sync {
+    fn inspect(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<VmmProcessInspection>;
+
+    fn start_checkpointed(
+        &self,
+        checkpointed: CheckpointedVmmProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessStart>;
+}
+
+/// The only provider boundary which may authorize a physical VMM start or
+/// launch-residue recovery. Implementations must bracket the same closed
+/// Node-global unit/cgroup/process/socket/file sweep as full inventory.
+pub(crate) trait VmmProcessGlobalPort:
+    global_sealed::Sealed + VmmProcessPort + Send + Sync
+{
+    fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection>;
+
+    /// Reinspect the accepted complete managed-process set while replacing
+    /// exactly one VMM's logical checkpoint expectation with a proven
+    /// gate-only successor. Platform implementations override this to run the
+    /// same first/sweep/second closed set with the successor pathname bytes;
+    /// the default keeps sealed test providers honest without widening the
+    /// ordinary exact-expectation API.
+    fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+        &self,
+        admitted_predecessor: &ExactVmmProcessProof,
+        successor: &VmmGateSuccessorProof,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessGlobalInspection>;
+}
+
+/// Restart-only absence boundary for retiring one previous-kernel-boot VMM
+/// receipt.  This is intentionally separate from [`VmmProcessGlobalPort`]: a
+/// pre-scan recovery has no accepted-full admission sidecar to consume.
+/// Implementations must instead revalidate the complete current checkpoint
+/// namespace supplied by the serialized recovery lane and perform a fresh,
+/// closed Node-global sweep while the caller holds the launch-root EX lock.
+#[cfg(target_os = "linux")]
+pub(crate) trait StaleBootVmmProcessGlobalPort:
+    stale_boot_recovery_global_sealed::Sealed + Send + Sync
+{
+    fn inspect_stale_boot_absence_after_node_global_sweep(
+        &self,
+        selected: &VmmProcessExpectation,
+        checkpoints: &super::clean_slate_probes::RuntimeCheckpointRecoverySet,
+        context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) enum StaleBootVmmProcessGlobalInspection {
+    Absent(Box<ExactVmmProcessAbsenceProof>),
+    Conflict(VmmProcessConflict),
+    Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VmmProcessGlobalInspection {
+    Absent(Box<ExactVmmProcessAbsenceProof>),
+    Exact(Box<ExactVmmProcessProof>),
+    Conflict(VmmProcessConflict),
+    Unavailable,
+}
+
+/// Closed launch identity shared by the physical start adapter and the future
+/// full-inventory VMM inspector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VmmProcessExpectation {
+    checkpoint: RuntimeCheckpoint,
+    launch: RuntimeLaunchIdentity,
+    unit_id: Id,
+    cgroup_path: HostPath,
+    launcher_command_line: Vec<OsString>,
+    vmm_command_line: Vec<OsString>,
+    /// Present only on an expectation minted by the descriptor-rooted full
+    /// scanner.  A naked checkpoint is sufficient to build one start command,
+    /// but it cannot authorize adoption because fixed fd 64 must be joined to
+    /// the exact current checkpoint pathname.
+    checkpoint_path: Option<HostPath>,
+}
+
+/// Opaque proof that one accepted VMM expectation has exactly one permitted
+/// logical gate successor.  The provider boundary accepts this type instead
+/// of a raw expectation so an Endpoint-only revision cannot be confused with
+/// an arbitrary checkpoint substitution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VmmGateSuccessorProof {
+    predecessor: VmmProcessExpectation,
+    successor: VmmProcessExpectation,
+    kind: VmmGateSuccessorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmmGateSuccessorKind {
+    SameRevision,
+    EndpointOnly {
+        predecessor_desired: Box<DesiredRuntimeSpec>,
+        successor_desired: Box<DesiredRuntimeSpec>,
+    },
+}
+
+impl VmmGateSuccessorProof {
+    pub(crate) fn same_revision(
+        admitted_predecessor: &ExactVmmProcessProof,
+        successor_checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let predecessor = admitted_predecessor.expectation().clone();
+        let successor = predecessor.gate_only_successor(successor_checkpoint)?;
+        Ok(Self {
+            predecessor,
+            successor,
+            kind: VmmGateSuccessorKind::SameRevision,
+        })
+    }
+
+    pub(crate) fn endpoint_only(
+        admitted_predecessor: &ExactVmmProcessProof,
+        predecessor_desired: &DesiredRuntimeSpec,
+        successor_desired: &DesiredRuntimeSpec,
+        successor_checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let predecessor = admitted_predecessor.expectation().clone();
+        let successor = predecessor.endpoint_only_gate_successor(
+            predecessor_desired,
+            successor_desired,
+            successor_checkpoint,
+        )?;
+        Ok(Self {
+            predecessor,
+            successor,
+            kind: VmmGateSuccessorKind::EndpointOnly {
+                predecessor_desired: Box::new(predecessor_desired.clone()),
+                successor_desired: Box::new(successor_desired.clone()),
+            },
+        })
+    }
+
+    /// Re-run the closed constructor against the exact proof passed to the
+    /// provider and return the successor only when the binding is unchanged.
+    pub(crate) fn validate_for<'a>(
+        &'a self,
+        admitted_predecessor: &ExactVmmProcessProof,
+    ) -> anyhow::Result<&'a VmmProcessExpectation> {
+        anyhow::ensure!(
+            admitted_predecessor.expectation() == &self.predecessor,
+            "VMM gate successor proof is bound to another admitted predecessor"
+        );
+        let reminted = match &self.kind {
+            VmmGateSuccessorKind::SameRevision => self
+                .predecessor
+                .gate_only_successor(self.successor.checkpoint())?,
+            VmmGateSuccessorKind::EndpointOnly {
+                predecessor_desired,
+                successor_desired,
+            } => self.predecessor.endpoint_only_gate_successor(
+                predecessor_desired,
+                successor_desired,
+                self.successor.checkpoint(),
+            )?,
+        };
+        anyhow::ensure!(
+            reminted == self.successor,
+            "VMM gate successor proof no longer matches its closed constructor"
+        );
+        Ok(&self.successor)
+    }
+
+    pub(crate) fn successor(&self) -> &VmmProcessExpectation {
+        &self.successor
+    }
+}
+
+impl VmmProcessExpectation {
+    pub(crate) fn from_checkpoint(checkpoint: RuntimeCheckpoint) -> anyhow::Result<Self> {
+        // Direct Rust construction must cross the same F0/cross validator as
+        // persisted input before it can become a process expectation.
+        encode_runtime_checkpoint(&checkpoint)
+            .context("validate VMM process retained-launch checkpoint")?;
+        let launch = RetainedRuntimeLaunchAuthority::from_checkpoint(&checkpoint)?
+            .identity()
+            .clone();
+        let expected_unit = Id::new(format!(
+            "cats-vmm-{}.service",
+            launch.runtime_incarnation.as_str()
+        ))
+        .context("retained VMM incarnation cannot form a systemd unit")?;
+        anyhow::ensure!(
+            launch.scope_id == expected_unit,
+            "retained VMM systemd unit is not the exact incarnation-derived identity"
+        );
+        let cgroup_path = HostPath::new(format!(
+            "{CGROUP_ROOT}/{SYSTEM_SLICE}/{}",
+            expected_unit.as_str()
+        ))
+        .context("StartRuntime cgroup path is not canonical")?;
+        let launcher_command_line = vec![
+            OsString::from(launch.launcher_executable.path.as_str()),
+            OsString::from(VMM_LAUNCHER_CONTRACT_ARGUMENT),
+        ];
+        let vmm_command_line =
+            std::iter::once(OsString::from(launch.boot.vmm_executable.path.as_str()))
+                .chain(cloud_hypervisor_arguments_for_launch(&launch)?)
+                .collect();
+        Ok(Self {
+            checkpoint,
+            launch,
+            unit_id: expected_unit,
+            cgroup_path,
+            launcher_command_line,
+            vmm_command_line,
+            checkpoint_path: None,
+        })
+    }
+
+    pub(crate) fn with_checkpoint_path(
+        mut self,
+        checkpoint_path: HostPath,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            Path::new(checkpoint_path.as_str()).is_absolute(),
+            "VMM process checkpoint path is not absolute"
+        );
+        self.checkpoint_path = Some(checkpoint_path);
+        Ok(self)
+    }
+
+    pub(crate) fn cat_id(&self) -> &Id {
+        &self.checkpoint.cat_id
+    }
+
+    pub(crate) fn checkpoint(&self) -> &RuntimeCheckpoint {
+        &self.checkpoint
+    }
+
+    pub(crate) fn unit_id(&self) -> &Id {
+        &self.unit_id
+    }
+
+    pub(crate) fn cgroup_path(&self) -> &HostPath {
+        &self.cgroup_path
+    }
+
+    pub(crate) fn launcher_command_line(&self) -> &[OsString] {
+        &self.launcher_command_line
+    }
+
+    pub(crate) fn vmm_command_line(&self) -> &[OsString] {
+        &self.vmm_command_line
+    }
+
+    pub(crate) fn vmm_executable(&self) -> &RuntimeLaunchArtifact {
+        &self.launch.boot.vmm_executable
+    }
+
+    pub(crate) fn runtime_incarnation(&self) -> &RandomId128 {
+        &self.launch.runtime_incarnation
+    }
+
+    pub(crate) fn process_identity_token(&self) -> &RandomId128 {
+        &self.launch.process_identity_token
+    }
+
+    pub(crate) fn launch_identity(&self) -> &RuntimeLaunchIdentity {
+        &self.launch
+    }
+
+    pub(crate) fn checkpoint_path(&self) -> Option<&HostPath> {
+        self.checkpoint_path.as_ref()
+    }
+
+    /// Produces the exact successor expectation only when every field outside
+    /// the admission/gate journal is byte-for-byte unchanged. The Running
+    /// gate planner separately proves the narrower legal route transition;
+    /// this VMM boundary independently prevents a gate CAS from reinterpreting
+    /// launch, device, network, Desired or placement authority.
+    pub(crate) fn gate_only_successor(
+        &self,
+        successor: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        let mut normalized = successor.clone();
+        normalized.stable_state = self.checkpoint.stable_state;
+        normalized.step = self.checkpoint.step.clone();
+        normalized.lifecycle_admission = self.checkpoint.lifecycle_admission;
+        normalized.route_gates = self.checkpoint.route_gates.clone();
+        normalized.require_idle = self.checkpoint.require_idle.clone();
+        normalized.updated_at_unix_ms = self.checkpoint.updated_at_unix_ms;
+        anyhow::ensure!(
+            normalized == self.checkpoint,
+            "VMM gate successor changed non-gate launch authority"
+        );
+        let mut expected = Self::from_checkpoint(successor.clone())?;
+        expected.checkpoint_path = self.checkpoint_path.clone();
+        anyhow::ensure!(
+            expected.launch == self.launch
+                && expected.unit_id == self.unit_id
+                && expected.cgroup_path == self.cgroup_path
+                && expected.launcher_command_line == self.launcher_command_line
+                && expected.vmm_command_line == self.vmm_command_line
+                && expected.checkpoint_path == self.checkpoint_path,
+            "VMM gate successor changed the retained physical launch identity"
+        );
+        Ok(expected)
+    }
+
+    /// Endpoint-only form of [`Self::gate_only_successor`]. The accepted VMM
+    /// remains the same physical launch, while the checkpoint top advances
+    /// from one sealed live-gate Desired to its closed Endpoint-only
+    /// successor. No caller may request a raw revision/digest substitution.
+    pub(crate) fn endpoint_only_gate_successor(
+        &self,
+        predecessor_desired: &DesiredRuntimeSpec,
+        successor_desired: &DesiredRuntimeSpec,
+        successor: &RuntimeCheckpoint,
+    ) -> anyhow::Result<Self> {
+        validate_running_endpoint_only_desired_successor(predecessor_desired, successor_desired)?;
+        anyhow::ensure!(
+            self.checkpoint.cat_id == predecessor_desired.cat_id
+                && self.checkpoint.node_id == predecessor_desired.placement.node_id
+                && self.checkpoint.placement_epoch == predecessor_desired.placement.placement_epoch
+                && self.checkpoint.desired_revision == predecessor_desired.desired_revision
+                && self.checkpoint.spec_digest == predecessor_desired.spec_digest
+                && successor.cat_id == successor_desired.cat_id
+                && successor.node_id == successor_desired.placement.node_id
+                && successor.placement_epoch == successor_desired.placement.placement_epoch
+                && successor.desired_revision == successor_desired.desired_revision
+                && successor.spec_digest == successor_desired.spec_digest,
+            "VMM Endpoint-only gate successor changed a Desired checkpoint coordinate"
+        );
+        let mut normalized = successor.clone();
+        normalized.desired_revision = self.checkpoint.desired_revision;
+        normalized.spec_digest = self.checkpoint.spec_digest.clone();
+        normalized.stable_state = self.checkpoint.stable_state;
+        normalized.step = self.checkpoint.step.clone();
+        normalized.lifecycle_admission = self.checkpoint.lifecycle_admission;
+        normalized.route_gates = self.checkpoint.route_gates.clone();
+        normalized.require_idle = self.checkpoint.require_idle.clone();
+        normalized.updated_at_unix_ms = self.checkpoint.updated_at_unix_ms;
+        anyhow::ensure!(
+            normalized == self.checkpoint,
+            "VMM Endpoint-only gate successor changed non-gate launch authority"
+        );
+        let mut expected = Self::from_checkpoint(successor.clone())?;
+        expected.checkpoint_path = self.checkpoint_path.clone();
+        anyhow::ensure!(
+            expected.launch == self.launch
+                && expected.unit_id == self.unit_id
+                && expected.cgroup_path == self.cgroup_path
+                && expected.launcher_command_line == self.launcher_command_line
+                && expected.vmm_command_line == self.vmm_command_line
+                && expected.checkpoint_path == self.checkpoint_path,
+            "VMM Endpoint-only gate successor changed the retained physical launch identity"
+        );
+        Ok(expected)
+    }
+
+    pub(crate) fn api_socket_path(&self) -> &HostPath {
+        &self.launch.api_socket_path
+    }
+
+    pub(crate) fn vsock_socket_path(&self) -> &HostPath {
+        &self.launch.vsock_socket_path
+    }
+
+    pub(crate) fn memory_file_path(&self) -> &HostPath {
+        &self.launch.memory_file_path
+    }
+
+    pub(crate) fn serial_log_path(&self) -> &HostPath {
+        &self.launch.serial_log_path
+    }
+
+    pub(crate) fn vmm_log_path(&self) -> &HostPath {
+        &self.launch.vmm_log_path
+    }
+
+    fn launch_artifact_paths(&self) -> VmmLaunchArtifactPaths {
+        VmmLaunchArtifactPaths {
+            launcher_executable: PathBuf::from(self.launch.launcher_executable.path.as_str()),
+            vmm_executable: PathBuf::from(self.launch.boot.vmm_executable.path.as_str()),
+            kernel: PathBuf::from(self.launch.boot.kernel.path.as_str()),
+            initramfs: self
+                .launch
+                .boot
+                .initramfs
+                .as_ref()
+                .map(|artifact| PathBuf::from(artifact.path.as_str())),
+            kernel_cmdline: self.launch.boot.kernel_cmdline.as_str().to_owned(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_path_requirements(
+        &self,
+        receipt: &VmmSocketOwnershipReceiptV1,
+    ) -> anyhow::Result<VmmRuntimePathRequirements> {
+        let checkpoint_path = self
+            .checkpoint_path
+            .clone()
+            .context("VMM inventory expectation lacks its checkpoint pathname")?;
+        Ok(VmmRuntimePathRequirements {
+            checkpoint_path,
+            checkpoint: self.checkpoint.clone(),
+            original_checkpoint_content_digest: receipt.checkpoint_content_digest().clone(),
+            original_desired_revision: receipt.original_desired_revision(),
+            original_spec_digest: receipt.original_spec_digest().clone(),
+            original_placement_epoch: receipt.original_placement_epoch(),
+            memory_file_path: self.memory_file_path().clone(),
+            memory_bytes: self.launch.memory_bytes,
+            serial_log_path: self.serial_log_path().clone(),
+            vmm_log_path: self.vmm_log_path().clone(),
+        })
+    }
+
+    fn exact_environment(&self) -> BTreeMap<OsString, OsString> {
+        BTreeMap::from([
+            (
+                OsString::from(RUNTIME_INCARNATION_ENVIRONMENT),
+                OsString::from(self.launch.runtime_incarnation.as_str()),
+            ),
+            (
+                OsString::from(VMM_PROCESS_TOKEN_ENVIRONMENT),
+                OsString::from(self.launch.process_identity_token.as_str()),
+            ),
+        ])
+    }
+
+    fn vm_info(&self) -> VmmVmInfoEvidence {
+        VmmVmInfoEvidence {
+            vcpus: self.launch.vcpus,
+            memory_bytes: self.launch.memory_bytes,
+            boot_image_digest: self.launch.boot_image_digest.clone(),
+            guest_config_digest: self.launch.guest_config_digest.clone(),
+            guest_cid: self.launch.guest_cid,
+            network: (*self.launch.network).clone(),
+            devices: self.launch.devices.clone(),
+        }
+    }
+
+    pub(crate) fn prove_exact_process(
+        self,
+        evidence: VmmProcessEvidence,
+    ) -> anyhow::Result<ExactVmmProcessProof> {
+        anyhow::ensure!(
+            evidence.exactly_matches(&self),
+            "VMM evidence does not exactly match its StartRuntime expectation"
+        );
+        Ok(ExactVmmProcessProof {
+            expectation: self,
+            evidence,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_evidence_for_test(&self, process_id: u32) -> VmmProcessEvidence {
+        VmmProcessEvidence {
+            process_id,
+            unit_main_process_id: process_id,
+            process_start_time_ticks: WireU64::new(u64::from(process_id) + 100).unwrap(),
+            executable_path: self.vmm_executable().path.clone(),
+            unit_id: self.unit_id.clone(),
+            cgroup_path: self.cgroup_path.clone(),
+            cgroup_process_ids: vec![process_id],
+            unit_launcher_command_line: self.launcher_command_line.clone(),
+            command_line: self.vmm_command_line.clone(),
+            environment: self.exact_environment(),
+            api_socket_path: self.api_socket_path().clone(),
+            vsock_socket_path: self.vsock_socket_path().clone(),
+            process_identity_token: self.launch.process_identity_token.clone(),
+            runtime_incarnation: self.launch.runtime_incarnation.clone(),
+            api_peer_process_id: process_id,
+            fixed_descriptors_exact: true,
+            api_socket_exact: true,
+            vmm_ping_verified: true,
+            vm_info: self.vm_info(),
+            authority: VmmPhysicalAuthority::Test,
+        }
+    }
+}
+
+/// Provider-private values returned by the fixed `vm.info` parser.  The
+/// digests are not claimed to be returned by Cloud Hypervisor; the inspector
+/// joins its exact launch descriptors/argv to the physical shape below before
+/// constructing this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VmmVmInfoEvidence {
+    vcpus: u32,
+    memory_bytes: u64,
+    boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest,
+    guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest,
+    guest_cid: u32,
+    network: RuntimeNetworkIdentity,
+    devices: Vec<PreparedDeviceInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmmPhysicalAuthority {
+    #[cfg(target_os = "linux")]
+    Platform {
+        descriptors: Box<VmmDescriptorAuthority>,
+        api: Box<ExactVmmApiProof>,
+    },
+    #[cfg(test)]
+    Test,
+}
+
+impl VmmPhysicalAuthority {
+    #[cfg(test)]
+    fn is_test(&self) -> bool {
+        matches!(self, Self::Test)
+    }
+
+    fn assert_current(
+        &self,
+        process_id: u32,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(any(test, target_os = "linux")))]
+        {
+            let _ = (self, process_id, context);
+            anyhow::bail!("VMM physical authority is unavailable on this platform")
+        }
+        #[cfg(any(test, target_os = "linux"))]
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Platform { descriptors, api } => {
+                descriptors.assert_current(process_id)?;
+                api.assert_current(context)
+            }
+            #[cfg(test)]
+            Self::Test => {
+                let _ = (process_id, context);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Complete provider-private VMM proof.  Booleans here are deliberately
+/// private: only the platform inspector in this module may assert that the
+/// fixed descriptor set, API socket and both CH handshakes were physically
+/// checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VmmProcessEvidence {
+    process_id: u32,
+    unit_main_process_id: u32,
+    process_start_time_ticks: WireU64,
+    executable_path: HostPath,
+    unit_id: Id,
+    cgroup_path: HostPath,
+    cgroup_process_ids: Vec<u32>,
+    unit_launcher_command_line: Vec<OsString>,
+    command_line: Vec<OsString>,
+    environment: BTreeMap<OsString, OsString>,
+    api_socket_path: HostPath,
+    vsock_socket_path: HostPath,
+    process_identity_token: RandomId128,
+    runtime_incarnation: RandomId128,
+    api_peer_process_id: u32,
+    fixed_descriptors_exact: bool,
+    api_socket_exact: bool,
+    vmm_ping_verified: bool,
+    vm_info: VmmVmInfoEvidence,
+    authority: VmmPhysicalAuthority,
+}
+
+impl VmmProcessEvidence {
+    fn exactly_matches(&self, expected: &VmmProcessExpectation) -> bool {
+        expected.checkpoint_path().is_some()
+            && self.process_id > 0
+            && self.unit_main_process_id == self.process_id
+            && self.process_start_time_ticks.get() > 0
+            && self.executable_path == expected.vmm_executable().path
+            && self.unit_id == *expected.unit_id()
+            && self.cgroup_path == *expected.cgroup_path()
+            && self.cgroup_process_ids == [self.process_id]
+            && self.unit_launcher_command_line == expected.launcher_command_line()
+            && self.command_line == expected.vmm_command_line()
+            && self.environment == expected.exact_environment()
+            && self.api_socket_path == *expected.api_socket_path()
+            && self.vsock_socket_path == *expected.vsock_socket_path()
+            && self.process_identity_token == *expected.process_identity_token()
+            && self.runtime_incarnation == *expected.runtime_incarnation()
+            && self.api_peer_process_id == self.process_id
+            && self.fixed_descriptors_exact
+            && self.api_socket_exact
+            && self.vmm_ping_verified
+            && self.vm_info == expected.vm_info()
+    }
+
+    pub(crate) fn unit_id(&self) -> &Id {
+        &self.unit_id
+    }
+
+    pub(crate) fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub(crate) fn api_socket_path(&self) -> &HostPath {
+        &self.api_socket_path
+    }
+
+    pub(crate) fn vsock_socket_path(&self) -> &HostPath {
+        &self.vsock_socket_path
+    }
+
+    pub(crate) fn assert_current(
+        &self,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        self.authority.assert_current(self.process_id, context)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn matches_manager_identity(&self, identity: &VmmManagerProcessIdentity) -> bool {
+        identity.properties.main_pid == self.process_id
+            && identity.process.start_time_ticks == self.process_start_time_ticks.get()
+            && identity.process.executable_path == Path::new(self.executable_path.as_str())
+            && identity.process.command_line == self.command_line
+            && identity.process.environment == self.environment
+            && identity.process.control_group == identity.properties.control_group
+            && identity.cgroup_process_ids == self.cgroup_process_ids
+    }
+
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
+        ProcessEvidence {
+            role: ProcessRole::Vmm {
+                runtime_incarnation: self.runtime_incarnation,
+            },
+            process_id: self.process_id,
+            process_start_time_ticks: self.process_start_time_ticks,
+            executable_path: self.executable_path,
+            scope_id: self.unit_id,
+            control_socket_path: self.api_socket_path,
+            state: ProcessState::Running,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: self.process_identity_token,
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: Some(ObservedVmShape {
+                vcpus: self.vm_info.vcpus,
+                memory_bytes: self.vm_info.memory_bytes,
+                boot_image_digest: self.vm_info.boot_image_digest,
+                guest_config_digest: self.vm_info.guest_config_digest,
+            }),
+        }
+    }
+}
+
+/// Unforgeable exact VMM proof retained in the accepted full-inventory
+/// admission.  Public `ProcessEvidence` alone cannot reconstruct it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactVmmProcessProof {
+    expectation: VmmProcessExpectation,
+    evidence: VmmProcessEvidence,
+}
+
+/// Ephemeral proof that the accepted exact `StartRuntime` attempt remained
+/// absent across a fresh closed Node-global sweep. Its private expectation
+/// prevents provider-local `systemctl show` absence from authorizing a
+/// namespace mutation or systemd submission.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExactVmmProcessAbsenceProof {
+    expectation: VmmProcessExpectation,
+}
+
+impl ExactVmmProcessAbsenceProof {
+    pub(super) fn for_expectation(expectation: VmmProcessExpectation) -> Self {
+        Self { expectation }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_expectation(expectation: VmmProcessExpectation) -> Self {
+        Self::for_expectation(expectation)
+    }
+
+    pub(crate) fn expectation(&self) -> &VmmProcessExpectation {
+        &self.expectation
+    }
+
+    pub(super) fn matches_checkpoint(&self, checkpoint: &RuntimeCheckpoint) -> bool {
+        self.expectation.checkpoint() == checkpoint
+    }
+}
+
+impl ExactVmmProcessProof {
+    pub(crate) fn expectation(&self) -> &VmmProcessExpectation {
+        &self.expectation
+    }
+
+    pub(crate) fn evidence(&self) -> &VmmProcessEvidence {
+        &self.evidence
+    }
+
+    /// The Node-global Guest CID identity proven by this exact physical VMM.
+    ///
+    /// Keeping this projection on the unforgeable proof prevents the CID
+    /// allocator from rebuilding a live owner from public `ProcessEvidence`
+    /// or from an independently reopened checkpoint.
+    pub(crate) fn guest_cid_identity(&self) -> (&Id, &RandomId128, u32) {
+        (
+            self.expectation.cat_id(),
+            self.expectation.runtime_incarnation(),
+            self.expectation.launch.guest_cid,
+        )
+    }
+
+    pub(crate) fn assert_current(
+        &self,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.evidence.authority.is_test() {
+            // Test providers mint this closed proof directly from the exact
+            // expectation. Keep that provider seam portable instead of
+            // accidentally consulting the test runner's real PID 1 on Linux.
+            return self.evidence.assert_current(context);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.evidence.assert_current(context)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            context.check_active()?;
+            let first = match inspect_vmm_manager_process(&self.expectation, context)? {
+                VmmManagerProcessInspection::Exact(identity)
+                    if self.evidence.matches_manager_identity(&identity) =>
+                {
+                    *identity
+                }
+                VmmManagerProcessInspection::Absent
+                | VmmManagerProcessInspection::Exact(_)
+                | VmmManagerProcessInspection::Conflict
+                | VmmManagerProcessInspection::Unavailable => {
+                    anyhow::bail!("retained VMM manager/process proof changed")
+                }
+            };
+            self.evidence.assert_current(context)?;
+            match inspect_vmm_manager_process(&self.expectation, context)? {
+                VmmManagerProcessInspection::Exact(identity) if *identity == first => {}
+                VmmManagerProcessInspection::Absent
+                | VmmManagerProcessInspection::Exact(_)
+                | VmmManagerProcessInspection::Conflict
+                | VmmManagerProcessInspection::Unavailable => {
+                    anyhow::bail!("VMM manager/process changed across retained proof revalidation")
+                }
+            }
+            context.check_active()
+        }
+    }
+
+    pub(crate) fn into_process_evidence(self) -> ProcessEvidence {
+        self.evidence.into_process_evidence()
+    }
+}
+
+/// Descriptor-retained authority held across the one `systemd-run` attempt.
+pub(crate) struct CheckpointedVmmProcess<'a> {
+    expected: &'a VmmProcessExpectation,
+    checkpoint: RetainedCurrentCheckpoint<'a>,
+    artifacts: &'a RetainedVmmLaunchArtifacts,
+}
+
+impl<'a> CheckpointedVmmProcess<'a> {
+    pub(crate) fn prepare(
+        expected: &'a VmmProcessExpectation,
+        store: &'a FileCheckpointStore,
+        stored: &'a StoredCheckpoint,
+        artifacts: &'a RetainedVmmLaunchArtifacts,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            stored.checkpoint() == expected.checkpoint(),
+            "VMM process expectation is not the retained current checkpoint"
+        );
+        anyhow::ensure!(
+            artifacts.launcher_executable() == expected.launch.launcher_executable.as_ref()
+                && artifacts.boot() == *expected.launch.boot,
+            "installed VMM artifacts do not match StartRuntime"
+        );
+        let checkpoint = store
+            .retain_current_checkpoint(stored)
+            .context("retain current StartRuntime checkpoint descriptor")?;
+        let checkpointed = Self {
+            expected,
+            checkpoint,
+            artifacts,
+        };
+        checkpointed.assert_current()?;
+        Ok(checkpointed)
+    }
+
+    fn expected(&self) -> &VmmProcessExpectation {
+        self.expected
+    }
+
+    fn checkpoint_descriptor(&self) -> &File {
+        self.checkpoint.descriptor()
+    }
+
+    fn artifact_descriptors(&self) -> VmmLaunchArtifactDescriptors<'_> {
+        self.artifacts.descriptors()
+    }
+
+    pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.checkpoint.checkpoint() == self.expected.checkpoint(),
+            "retained VMM checkpoint value changed"
+        );
+        self.checkpoint
+            .assert_current()
+            .context("revalidate current StartRuntime checkpoint")?;
+        self.artifacts
+            .assert_current()
+            .context("revalidate installed VMM launch artifacts")?;
+        anyhow::ensure!(
+            self.artifacts.launcher_executable()
+                == self.expected.launch.launcher_executable.as_ref()
+                && self.artifacts.boot() == *self.expected.launch.boot,
+            "installed VMM launch projection changed"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PlatformSystemdVmmProcessPort;
+
+impl sealed::Sealed for PlatformSystemdVmmProcessPort {}
+
+impl VmmProcessPort for PlatformSystemdVmmProcessPort {
+    fn inspect(
+        &self,
+        expected: &VmmProcessExpectation,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> anyhow::Result<VmmProcessInspection> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, context);
+            Ok(VmmProcessInspection::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match inspect_vmm_manager_process(expected, context)? {
+                VmmManagerProcessInspection::Absent => Ok(VmmProcessInspection::Absent),
+                VmmManagerProcessInspection::Conflict => Ok(VmmProcessInspection::Conflict(
+                    VmmProcessConflict::IdentityMismatch,
+                )),
+                VmmManagerProcessInspection::Unavailable => Ok(VmmProcessInspection::Unavailable),
+                VmmManagerProcessInspection::Exact(identity) => {
+                    let identity = *identity;
+                    let descriptor_authority =
+                        match inspect_vmm_descriptor_authority(expected, identity.process_id())? {
+                            VmmDescriptorInspection::Exact(authority) => authority,
+                            VmmDescriptorInspection::Conflict => {
+                                return Ok(VmmProcessInspection::Conflict(
+                                    VmmProcessConflict::IdentityMismatch,
+                                ))
+                            }
+                        };
+                    match inspect_vmm_manager_process(expected, context)? {
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
+                        VmmManagerProcessInspection::Unavailable => {
+                            return Ok(VmmProcessInspection::Unavailable)
+                        }
+                        VmmManagerProcessInspection::Absent
+                        | VmmManagerProcessInspection::Exact(_)
+                        | VmmManagerProcessInspection::Conflict => {
+                            return Ok(VmmProcessInspection::Conflict(
+                                VmmProcessConflict::IdentityMismatch,
+                            ))
+                        }
+                    }
+                    let api_expectation = VmmApiExpectation::from_launch_identity(
+                        expected.launch_identity(),
+                        identity.process_id(),
+                    )?;
+                    anyhow::ensure!(
+                        api_expectation.process_id() == identity.process_id(),
+                        "VMM API expectation changed its manager process ID"
+                    );
+                    let api_authority = match inspect_vmm_api(&api_expectation, context)? {
+                        VmmApiInspection::Exact(authority) => *authority,
+                        VmmApiInspection::Unavailable(_) => {
+                            return Ok(VmmProcessInspection::Unavailable)
+                        }
+                        VmmApiInspection::Conflict(_) => {
+                            return Ok(VmmProcessInspection::Conflict(
+                                VmmProcessConflict::IdentityMismatch,
+                            ))
+                        }
+                    };
+                    match inspect_vmm_manager_process(expected, context)? {
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
+                        VmmManagerProcessInspection::Unavailable => {
+                            return Ok(VmmProcessInspection::Unavailable)
+                        }
+                        VmmManagerProcessInspection::Absent
+                        | VmmManagerProcessInspection::Exact(_)
+                        | VmmManagerProcessInspection::Conflict => {
+                            return Ok(VmmProcessInspection::Conflict(
+                                VmmProcessConflict::IdentityMismatch,
+                            ))
+                        }
+                    }
+                    context.check_active()?;
+                    let physical_authority = VmmPhysicalAuthority::Platform {
+                        descriptors: descriptor_authority,
+                        api: Box::new(api_authority),
+                    };
+                    if physical_authority
+                        .assert_current(identity.process_id(), context)
+                        .is_err()
+                    {
+                        return Ok(VmmProcessInspection::Conflict(
+                            VmmProcessConflict::IdentityMismatch,
+                        ));
+                    }
+                    match inspect_vmm_manager_process(expected, context)? {
+                        VmmManagerProcessInspection::Exact(current) if *current == identity => {}
+                        VmmManagerProcessInspection::Unavailable => {
+                            return Ok(VmmProcessInspection::Unavailable)
+                        }
+                        VmmManagerProcessInspection::Absent
+                        | VmmManagerProcessInspection::Exact(_)
+                        | VmmManagerProcessInspection::Conflict => {
+                            return Ok(VmmProcessInspection::Conflict(
+                                VmmProcessConflict::IdentityMismatch,
+                            ))
+                        }
+                    }
+                    context.check_active()?;
+                    let evidence = VmmProcessEvidence {
+                        process_id: identity.process_id(),
+                        unit_main_process_id: identity.properties.main_pid,
+                        process_start_time_ticks: WireU64::new(identity.process.start_time_ticks)
+                            .context("VMM process has a zero start time")?,
+                        executable_path: expected.vmm_executable().path.clone(),
+                        unit_id: expected.unit_id().clone(),
+                        cgroup_path: expected.cgroup_path().clone(),
+                        cgroup_process_ids: identity.cgroup_process_ids.clone(),
+                        unit_launcher_command_line: expected.launcher_command_line().to_vec(),
+                        command_line: identity.process.command_line.clone(),
+                        environment: identity.process.environment.clone(),
+                        api_socket_path: expected.api_socket_path().clone(),
+                        vsock_socket_path: expected.vsock_socket_path().clone(),
+                        process_identity_token: expected.process_identity_token().clone(),
+                        runtime_incarnation: expected.runtime_incarnation().clone(),
+                        api_peer_process_id: identity.process_id(),
+                        fixed_descriptors_exact: true,
+                        api_socket_exact: true,
+                        vmm_ping_verified: true,
+                        vm_info: expected.vm_info(),
+                        authority: physical_authority,
+                    };
+                    anyhow::ensure!(
+                        evidence.exactly_matches(expected),
+                        "platform VMM evidence does not match its StartRuntime expectation"
+                    );
+                    Ok(VmmProcessInspection::Exact(Box::new(evidence)))
+                }
+            }
+        }
+    }
+
+    fn start_checkpointed(
+        &self,
+        checkpointed: CheckpointedVmmProcess<'_>,
+        context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<VmmProcessStart> {
+        context.check_active()?;
+        checkpointed.assert_current()?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = checkpointed;
+            Ok(VmmProcessStart::DefinitelyNotStarted)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let open_files = SystemdVmmOpenFiles::from_checkpointed(&checkpointed);
+            let command = systemd_vmm_command(checkpointed.expected(), open_files)?;
+            checkpointed.assert_current()?;
+            context.check_active()?;
+            let submitted = submit_fixed_systemd_command(command, context);
+            // After the helper may have contacted PID 1, every local drift or
+            // cancellation is an ambiguous external result, never a generic
+            // error which a caller could retry in the same admission.
+            if checkpointed.assert_current().is_err() || context.check_active().is_err() {
+                return Ok(VmmProcessStart::OutcomeUnknown);
+            }
+            Ok(match submitted {
+                SystemdStartSubmission::Submitted => VmmProcessStart::Submitted,
+                SystemdStartSubmission::OutcomeUnknown => VmmProcessStart::OutcomeUnknown,
+                SystemdStartSubmission::DefinitelyNotStarted => {
+                    VmmProcessStart::DefinitelyNotStarted
+                }
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VmmManagerProcessIdentity {
+    properties: SystemdUnitProperties,
+    process: LinuxProcessSample,
+    cgroup_process_ids: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl VmmManagerProcessIdentity {
+    fn process_id(&self) -> u32 {
+        self.properties.main_pid
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct VmmDescriptorAuthority {
+    launch: Arc<RetainedVmmLaunchArtifacts>,
+    runtime: Arc<RetainedVmmRuntimePaths>,
+    socket_root: Arc<RetainedManagedVmmSocketRoot>,
+    receipts: Arc<VmmSocketReceiptStore>,
+    receipt: VmmSocketOwnershipReceiptV1,
+    checkpoint: RuntimeCheckpoint,
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for VmmDescriptorAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.launch.launcher_executable() == other.launch.launcher_executable()
+            && self.launch.boot() == other.launch.boot()
+            && self.runtime == other.runtime
+            && self.socket_root.identity_coordinate() == other.socket_root.identity_coordinate()
+            && self.receipts.identity_coordinate() == other.receipts.identity_coordinate()
+            && self.receipt == other.receipt
+            && self.checkpoint == other.checkpoint
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for VmmDescriptorAuthority {}
+
+#[cfg(target_os = "linux")]
+impl VmmDescriptorAuthority {
+    fn assert_current(&self, process_id: u32) -> anyhow::Result<()> {
+        self.launch
+            .assert_current()
+            .context("revalidate retained VMM launch artifacts")?;
+        self.runtime
+            .assert_current()
+            .context("revalidate retained VMM runtime paths")?;
+        self.socket_root
+            .assert_current()
+            .context("revalidate retained VMM socket root")?;
+        self.receipts
+            .assert_current()
+            .context("revalidate retained VMM receipt namespace")?;
+        let current_receipt = self
+            .receipts
+            .load(self.receipt.runtime_incarnation())?
+            .context("retained VMM launch receipt disappeared")?;
+        anyhow::ensure!(
+            current_receipt == self.receipt,
+            "retained VMM launch receipt changed"
+        );
+        self.receipt.validate_against(
+            &self.checkpoint,
+            self.receipts.state_directory(),
+            &self.socket_root,
+        )?;
+        self.runtime
+            .assert_fixed_descriptors(process_id, self.launch.descriptors())
+            .context("revalidate VMM fixed descriptor set")
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum VmmDescriptorInspection {
+    Exact(Box<VmmDescriptorAuthority>),
+    Conflict,
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_vmm_descriptor_authority(
+    expected: &VmmProcessExpectation,
+    process_id: u32,
+) -> anyhow::Result<VmmDescriptorInspection> {
+    let launch = match RetainedVmmLaunchArtifacts::open(&expected.launch_artifact_paths()) {
+        Ok(launch) => Arc::new(launch),
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    if launch.launcher_executable() != expected.launch.launcher_executable.as_ref()
+        || launch.boot() != *expected.launch.boot
+    {
+        return Ok(VmmDescriptorInspection::Conflict);
+    }
+    let state_directory = match vmm_state_directory_from_checkpoint(expected.checkpoint()) {
+        Ok(directory) => directory,
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let socket_root = match RetainedManagedVmmSocketRoot::open_installed() {
+        Ok(root) => Arc::new(root),
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let receipts = match VmmSocketReceiptStore::open_existing(state_directory) {
+        Ok(receipts) => Arc::new(receipts),
+        Err(_) => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let receipt = match receipts.load(expected.runtime_incarnation())? {
+        Some(receipt) => receipt,
+        None => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    if receipt
+        .validate_against(
+            expected.checkpoint(),
+            receipts.state_directory(),
+            &socket_root,
+        )
+        .is_err()
+    {
+        return Ok(VmmDescriptorInspection::Conflict);
+    }
+    let requirements = expected.runtime_path_requirements(&receipt)?;
+    let runtime = match RetainedVmmRuntimePaths::open(&requirements, process_id)? {
+        VmmRuntimePathInspection::Exact(runtime) => runtime,
+        VmmRuntimePathInspection::Conflict => return Ok(VmmDescriptorInspection::Conflict),
+        // A live exact systemd process cannot legitimately lose any path it
+        // launched with. Missing RAM/log/checkpoint leaves are an identity
+        // conflict, not absence evidence and not a retryable empty state.
+        VmmRuntimePathInspection::Unavailable => return Ok(VmmDescriptorInspection::Conflict),
+    };
+    let authority = VmmDescriptorAuthority {
+        launch,
+        runtime,
+        socket_root,
+        receipts,
+        receipt,
+        checkpoint: expected.checkpoint().clone(),
+    };
+    if authority.assert_current(process_id).is_err() {
+        return Ok(VmmDescriptorInspection::Conflict);
+    }
+    Ok(VmmDescriptorInspection::Exact(Box::new(authority)))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmmManagerProcessInspection {
+    Absent,
+    Exact(Box<VmmManagerProcessIdentity>),
+    Conflict,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_vmm_manager_process(
+    expected: &VmmProcessExpectation,
+    context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+) -> anyhow::Result<VmmManagerProcessInspection> {
+    context.check_active()?;
+    let Some(first_properties) = systemd_unit_properties(expected.unit_id(), context)? else {
+        return Ok(VmmManagerProcessInspection::Unavailable);
+    };
+    if first_properties.proves_absent(expected.unit_id()) {
+        return Ok(VmmManagerProcessInspection::Absent);
+    }
+    if first_properties.is_starting(expected.unit_id()) {
+        return Ok(VmmManagerProcessInspection::Unavailable);
+    }
+    if !vmm_systemd_properties_are_exact(&first_properties, expected) {
+        return Ok(VmmManagerProcessInspection::Conflict);
+    }
+
+    let process_id = first_properties.main_pid;
+    let first_process = match exact_vmm_process_sample(
+        sample_linux_process(process_id),
+        expected,
+        &first_properties.control_group,
+    ) {
+        Ok(sample) => sample,
+        Err(VmmProcessSampleFailure::Unavailable) => {
+            return Ok(VmmManagerProcessInspection::Unavailable)
+        }
+        Err(VmmProcessSampleFailure::IdentityMismatch) => {
+            return Ok(VmmManagerProcessInspection::Conflict)
+        }
+    };
+    let physical_cgroup = Path::new(CGROUP_ROOT).join(
+        first_properties
+            .control_group
+            .strip_prefix('/')
+            .unwrap_or(first_properties.control_group.as_str()),
+    );
+    if physical_cgroup != Path::new(expected.cgroup_path().as_str()) {
+        return Ok(VmmManagerProcessInspection::Conflict);
+    }
+    let Some(cgroup_process_ids) = read_cgroup_processes(&physical_cgroup)? else {
+        return Ok(VmmManagerProcessInspection::Unavailable);
+    };
+    if cgroup_process_ids != [process_id] {
+        return Ok(VmmManagerProcessInspection::Conflict);
+    }
+
+    let second_process = match exact_vmm_process_sample(
+        sample_linux_process(process_id),
+        expected,
+        &first_properties.control_group,
+    ) {
+        Ok(sample) => sample,
+        Err(VmmProcessSampleFailure::Unavailable) => {
+            return Ok(VmmManagerProcessInspection::Unavailable)
+        }
+        Err(VmmProcessSampleFailure::IdentityMismatch) => {
+            return Ok(VmmManagerProcessInspection::Conflict)
+        }
+    };
+    if second_process != first_process {
+        return Ok(VmmManagerProcessInspection::Conflict);
+    }
+    let Some(second_properties) = systemd_unit_properties(expected.unit_id(), context)? else {
+        return Ok(VmmManagerProcessInspection::Unavailable);
+    };
+    if second_properties != first_properties {
+        return Ok(VmmManagerProcessInspection::Conflict);
+    }
+    context.check_active()?;
+    Ok(VmmManagerProcessInspection::Exact(Box::new(
+        VmmManagerProcessIdentity {
+            properties: second_properties,
+            process: second_process,
+            cgroup_process_ids,
+        },
+    )))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn vmm_systemd_properties_are_exact(
+    properties: &SystemdUnitProperties,
+    expected: &VmmProcessExpectation,
+) -> bool {
+    let expected_control_group = format!("/{SYSTEM_SLICE}/{}", expected.unit_id());
+    let expected_exec_start = expected_systemd_exec_start(expected);
+    properties.id == expected.unit_id().as_str()
+        && properties.load_state == "loaded"
+        && properties.active_state == "active"
+        && properties.sub_state == "running"
+        && properties.service_type == "exec"
+        && properties.transient == "yes"
+        && properties.main_pid > 0
+        && properties.control_group == expected_control_group
+        && expected_exec_start.as_ref().is_some_and(|(path, argv)| {
+            properties.exec_start.as_ref().is_some_and(|exec_start| {
+                exec_start.is_running(properties.main_pid)
+                    && &exec_start.path == path
+                    && &exec_start.argv == argv
+            })
+        })
+        && systemd_environment_is_exact(&properties.environment, expected)
+        && properties.environment_files.is_empty()
+        && properties.pass_environment.is_empty()
+        && exact_unset_environment(&properties.unset_environment)
+        && properties.kill_mode == VMM_KILL_MODE
+        && properties.restart == VMM_RESTART
+        && properties.umask == VMM_UMASK
+        && properties.timeout_stop_usec == VMM_TIMEOUT_STOP
+        && properties.collect_mode == VMM_COLLECT_MODE
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn expected_systemd_exec_start(expected: &VmmProcessExpectation) -> Option<(String, String)> {
+    let [launcher, argument] = expected.launcher_command_line() else {
+        return None;
+    };
+    let launcher = launcher.to_str()?;
+    let argument = argument.to_str()?;
+    if [launcher, argument].iter().any(|value| {
+        value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || b"{};\\\"".contains(&byte))
+    }) {
+        return None;
+    }
+    Some((launcher.to_owned(), format!("{launcher} {argument}")))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_environment_is_exact(value: &str, expected: &VmmProcessExpectation) -> bool {
+    let mut actual = value
+        .split_ascii_whitespace()
+        .map(|entry| entry.trim_matches('"'))
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected_values = expected
+        .exact_environment()
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+        .collect::<Vec<_>>();
+    expected_values.sort_unstable();
+    actual == expected_values
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn vmm_process_sample_is_exact(
+    sample: &LinuxProcessSample,
+    expected: &VmmProcessExpectation,
+    control_group: &str,
+) -> bool {
+    sample.start_time_ticks > 0
+        && sample.executable_path == Path::new(expected.vmm_executable().path.as_str())
+        && sample.command_line == expected.vmm_command_line()
+        && sample.control_group == control_group
+        && sample.environment == expected.exact_environment()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmmProcessSampleFailure {
+    IdentityMismatch,
+    Unavailable,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn exact_vmm_process_sample(
+    inspection: LinuxProcessSampleInspection,
+    expected: &VmmProcessExpectation,
+    control_group: &str,
+) -> Result<LinuxProcessSample, VmmProcessSampleFailure> {
+    match inspection {
+        LinuxProcessSampleInspection::Exact(sample)
+            if vmm_process_sample_is_exact(&sample, expected, control_group) =>
+        {
+            Ok(sample)
+        }
+        LinuxProcessSampleInspection::Exact(_) | LinuxProcessSampleInspection::Conflict => {
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        }
+        LinuxProcessSampleInspection::Unavailable => Err(VmmProcessSampleFailure::Unavailable),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystemdVmmOpenFiles {
+    checkpoint: i32,
+    vmm: i32,
+    kernel: i32,
+    initramfs: Option<i32>,
+}
+
+impl SystemdVmmOpenFiles {
+    #[cfg(target_os = "linux")]
+    fn from_checkpointed(checkpointed: &CheckpointedVmmProcess<'_>) -> Self {
+        let artifacts = checkpointed.artifact_descriptors();
+        Self {
+            checkpoint: checkpointed.checkpoint_descriptor().as_raw_fd(),
+            vmm: artifacts.vmm_executable().as_raw_fd(),
+            kernel: artifacts.kernel().as_raw_fd(),
+            initramfs: artifacts.initramfs().map(|file| file.as_raw_fd()),
+        }
+    }
+
+    fn named(self) -> [Option<(&'static str, i32)>; 4] {
+        [
+            Some((CHECKPOINT_FD_NAME, self.checkpoint)),
+            Some((VMM_FD_NAME, self.vmm)),
+            Some((KERNEL_FD_NAME, self.kernel)),
+            self.initramfs.map(|fd| (INITRAMFS_FD_NAME, fd)),
+        ]
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_vmm_command(
+    expected: &VmmProcessExpectation,
+    open_files: SystemdVmmOpenFiles,
+) -> anyhow::Result<Command> {
+    let mut descriptors = open_files.named().into_iter().flatten().collect::<Vec<_>>();
+    anyhow::ensure!(
+        descriptors.iter().all(|(_, fd)| *fd >= 3),
+        "VMM systemd transfer contains a reserved descriptor"
+    );
+    descriptors.sort_unstable_by_key(|(_, fd)| *fd);
+    anyhow::ensure!(
+        descriptors.windows(2).all(|pair| pair[0].1 != pair[1].1),
+        "VMM systemd transfer reuses one descriptor"
+    );
+
+    let mut command = Command::new(SYSTEMD_RUN);
+    sanitized_systemd_command(&mut command);
+    command
+        .arg("--system")
+        .arg("--quiet")
+        .arg("--no-ask-password")
+        .arg("--collect")
+        .arg(format!("--unit={}", expected.unit_id()))
+        .arg("--service-type=exec")
+        .arg(format!("--slice={SYSTEM_SLICE}"))
+        .arg(format!("--property=KillMode={VMM_KILL_MODE}"))
+        .arg(format!("--property=Restart={VMM_RESTART}"))
+        .arg(format!("--property=UMask={VMM_UMASK}"))
+        .arg(format!("--property=TimeoutStopSec={VMM_TIMEOUT_STOP}"))
+        .arg("--property=EnvironmentFile=")
+        .arg("--property=PassEnvironment=")
+        .arg(format!(
+            "--property=UnsetEnvironment={}",
+            UNSET_PROCESS_ENVIRONMENT.join(" ")
+        ))
+        .arg(format!(
+            "--setenv={RUNTIME_INCARNATION_ENVIRONMENT}={}",
+            expected.runtime_incarnation()
+        ))
+        .arg(format!(
+            "--setenv={VMM_PROCESS_TOKEN_ENVIRONMENT}={}",
+            expected.process_identity_token()
+        ));
+    let process_id = std::process::id();
+    for (name, descriptor) in descriptors {
+        command.arg(format!(
+            "--property=OpenFile=/proc/{process_id}/fd/{descriptor}:{name}:read-only"
+        ));
+    }
+    let [launcher, argument] = expected.launcher_command_line() else {
+        anyhow::bail!("VMM launcher command line is not the exact two arguments")
+    };
+    anyhow::ensure!(
+        Path::new(launcher).is_absolute() && argument == VMM_LAUNCHER_CONTRACT_ARGUMENT,
+        "VMM launcher command line is not canonical"
+    );
+    command.arg("--").arg(launcher).arg(argument);
+    Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use cats_api::runtime_reconciliation::{
+        decode_desired_runtime_spec, decode_runtime_checkpoint, encode_runtime_checkpoint,
+        spec_digest, Epoch, Id, ReconcileStep, Revision, StableState,
+    };
+
+    use super::*;
+
+    fn expectation() -> VmmProcessExpectation {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        VmmProcessExpectation::from_checkpoint(checkpoint).unwrap()
+    }
+
+    fn inventory_expectation() -> VmmProcessExpectation {
+        expectation()
+            .with_checkpoint_path(HostPath::new("/var/lib/cats/checkpoints/cat_01.json").unwrap())
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum RunningTail {
+        InstallGate,
+        Stable,
+    }
+
+    fn running_tail_checkpoint(
+        launch_checkpoint: &RuntimeCheckpoint,
+        tail: RunningTail,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.step = match tail {
+            RunningTail::InstallGate => ReconcileStep::InstallGate {
+                endpoint_id: Id::new("endpoint_01").unwrap(),
+                route_epoch: Epoch::new(1).unwrap(),
+            },
+            RunningTail::Stable => {
+                checkpoint.stable_state = Some(StableState::Running);
+                ReconcileStep::Stable {
+                    state: StableState::Running,
+                }
+            }
+        };
+        if !matches!(tail, RunningTail::Stable) {
+            checkpoint.stable_state = None;
+        }
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn running_tail_expectations_retain_the_original_vmm_identity() {
+        let launch_checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let launch = VmmProcessExpectation::from_checkpoint(launch_checkpoint.clone()).unwrap();
+        for tail in [RunningTail::InstallGate, RunningTail::Stable] {
+            let retained = VmmProcessExpectation::from_checkpoint(running_tail_checkpoint(
+                &launch_checkpoint,
+                tail,
+            ))
+            .unwrap();
+            assert_eq!(retained.launch_identity(), launch.launch_identity());
+            assert_eq!(retained.unit_id(), launch.unit_id());
+            assert_eq!(retained.cgroup_path(), launch.cgroup_path());
+            assert_eq!(
+                retained.launcher_command_line(),
+                launch.launcher_command_line()
+            );
+            assert_eq!(retained.vmm_command_line(), launch.vmm_command_line());
+        }
+    }
+
+    #[test]
+    fn endpoint_only_gate_successor_supports_two_revisions_without_reinterpreting_launch() {
+        let predecessor = decode_desired_runtime_spec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-desired.json"
+        )))
+        .unwrap();
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        assert_eq!(checkpoint.desired_revision, predecessor.desired_revision);
+        assert_eq!(checkpoint.spec_digest, predecessor.spec_digest);
+        let launch = VmmProcessExpectation::from_checkpoint(checkpoint.clone()).unwrap();
+
+        let mut first_desired = predecessor.clone();
+        first_desired.desired_revision =
+            Revision::new(predecessor.desired_revision.get() + 1).unwrap();
+        first_desired.endpoints[0].route_epoch =
+            Epoch::new(predecessor.endpoints[0].route_epoch.get() + 1).unwrap();
+        first_desired.spec_digest = spec_digest(&first_desired).unwrap();
+        let mut first_checkpoint = running_tail_checkpoint(&checkpoint, RunningTail::InstallGate);
+        first_checkpoint.desired_revision = first_desired.desired_revision;
+        first_checkpoint.spec_digest = first_desired.spec_digest.clone();
+        let first = launch
+            .endpoint_only_gate_successor(&predecessor, &first_desired, &first_checkpoint)
+            .unwrap();
+        assert_eq!(first.launch_identity(), launch.launch_identity());
+
+        let mut second_desired = first_desired.clone();
+        second_desired.desired_revision =
+            Revision::new(first_desired.desired_revision.get() + 1).unwrap();
+        second_desired.endpoints[0].route_epoch =
+            Epoch::new(first_desired.endpoints[0].route_epoch.get() + 1).unwrap();
+        second_desired.spec_digest = spec_digest(&second_desired).unwrap();
+        let mut second_checkpoint = first_checkpoint.clone();
+        second_checkpoint.desired_revision = second_desired.desired_revision;
+        second_checkpoint.spec_digest = second_desired.spec_digest.clone();
+        second_checkpoint.updated_at_unix_ms = cats_api::runtime_reconciliation::UnixMillis::new(
+            first_checkpoint.updated_at_unix_ms.get() + 1,
+        )
+        .unwrap();
+        let second = first
+            .endpoint_only_gate_successor(&first_desired, &second_desired, &second_checkpoint)
+            .unwrap();
+        assert_eq!(second.launch_identity(), launch.launch_identity());
+
+        let mut changed_runtime = second_desired.clone();
+        changed_runtime.desired_revision =
+            Revision::new(changed_runtime.desired_revision.get() + 1).unwrap();
+        changed_runtime.runtime.memory_bytes += 4096;
+        changed_runtime.spec_digest = spec_digest(&changed_runtime).unwrap();
+        let mut invalid_checkpoint = second_checkpoint;
+        invalid_checkpoint.desired_revision = changed_runtime.desired_revision;
+        invalid_checkpoint.spec_digest = changed_runtime.spec_digest.clone();
+        assert!(second
+            .endpoint_only_gate_successor(&second_desired, &changed_runtime, &invalid_checkpoint,)
+            .is_err());
+    }
+
+    fn exact_manager_properties(
+        expected: &VmmProcessExpectation,
+        process_id: u32,
+    ) -> SystemdUnitProperties {
+        SystemdUnitProperties {
+            id: expected.unit_id().as_str().to_owned(),
+            load_state: "loaded".to_owned(),
+            active_state: "active".to_owned(),
+            sub_state: "running".to_owned(),
+            service_type: "exec".to_owned(),
+            transient: "yes".to_owned(),
+            main_pid: process_id,
+            control_group: format!("/{SYSTEM_SLICE}/{}", expected.unit_id()),
+            exec_start: {
+                let (path, argv) = expected_systemd_exec_start(expected).unwrap();
+                Some(SystemdExecStart {
+                    path,
+                    argv,
+                    ignore_errors: false,
+                    start_time: SystemdExecTimestamp::Recorded(
+                        "Tue 2026-08-11 12:34:56 UTC".to_owned(),
+                    ),
+                    stop_time: SystemdExecTimestamp::NotAvailable,
+                    pid: process_id,
+                    code: "(null)".to_owned(),
+                    status: "0/0".to_owned(),
+                })
+            },
+            environment: expected
+                .exact_environment()
+                .into_iter()
+                .map(|(key, value)| {
+                    format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            environment_files: String::new(),
+            pass_environment: String::new(),
+            unset_environment: UNSET_PROCESS_ENVIRONMENT.join(" "),
+            kill_mode: VMM_KILL_MODE.to_owned(),
+            restart: VMM_RESTART.to_owned(),
+            umask: VMM_UMASK.to_owned(),
+            timeout_stop_usec: VMM_TIMEOUT_STOP.to_owned(),
+            collect_mode: VMM_COLLECT_MODE.to_owned(),
+        }
+    }
+
+    fn exact_process_sample(
+        expected: &VmmProcessExpectation,
+        properties: &SystemdUnitProperties,
+    ) -> LinuxProcessSample {
+        LinuxProcessSample {
+            start_time_ticks: 1234,
+            executable_path: Path::new(expected.vmm_executable().path.as_str()).to_path_buf(),
+            command_line: expected.vmm_command_line().to_vec(),
+            control_group: properties.control_group.clone(),
+            environment: expected.exact_environment(),
+        }
+    }
+
+    #[test]
+    fn start_runtime_freezes_manager_and_live_vmm_identities() {
+        let expected = expectation();
+        assert_eq!(
+            expected.unit_id().as_str(),
+            format!(
+                "cats-vmm-{}.service",
+                expected.runtime_incarnation().as_str()
+            )
+        );
+        assert_eq!(
+            expected.cgroup_path().as_str(),
+            format!(
+                "/sys/fs/cgroup/system.slice/{}",
+                expected.unit_id().as_str()
+            )
+        );
+        assert_eq!(
+            expected.launcher_command_line(),
+            [
+                OsString::from("/usr/libexec/cats-vmm-launcher"),
+                OsString::from("--contract-version=1")
+            ]
+        );
+        assert_eq!(
+            expected.vmm_command_line().first(),
+            Some(&OsString::from("/usr/bin/cloud-hypervisor"))
+        );
+    }
+
+    #[test]
+    fn manager_and_live_process_identity_are_exact_not_substring_proofs() {
+        let expected = inventory_expectation();
+        let properties = exact_manager_properties(&expected, 4242);
+        assert!(vmm_systemd_properties_are_exact(&properties, &expected));
+        let process = exact_process_sample(&expected, &properties);
+        assert!(vmm_process_sample_is_exact(
+            &process,
+            &expected,
+            &properties.control_group
+        ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Conflict,
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Unavailable,
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::Unavailable)
+        );
+
+        let mut extra_argument = properties.clone();
+        extra_argument
+            .exec_start
+            .as_mut()
+            .unwrap()
+            .argv
+            .push_str(" --foreign");
+        assert!(!vmm_systemd_properties_are_exact(
+            &extra_argument,
+            &expected
+        ));
+
+        let mut wrong_exec_pid = properties.clone();
+        wrong_exec_pid.exec_start.as_mut().unwrap().pid += 1;
+        assert!(!vmm_systemd_properties_are_exact(
+            &wrong_exec_pid,
+            &expected
+        ));
+
+        let mut permanent = properties.clone();
+        permanent.transient = "no".to_owned();
+        assert!(!vmm_systemd_properties_are_exact(&permanent, &expected));
+
+        let mut wrong_type = properties.clone();
+        wrong_type.service_type = "simple".to_owned();
+        assert!(!vmm_systemd_properties_are_exact(&wrong_type, &expected));
+
+        let mut extra_manager_environment = properties.clone();
+        extra_manager_environment
+            .environment
+            .push_str(" EXTRA=value");
+        assert!(!vmm_systemd_properties_are_exact(
+            &extra_manager_environment,
+            &expected
+        ));
+
+        let mut extra_live_environment = process.clone();
+        extra_live_environment
+            .environment
+            .insert(OsString::from("EXTRA"), OsString::from("value"));
+        assert!(!vmm_process_sample_is_exact(
+            &extra_live_environment,
+            &expected,
+            &properties.control_group
+        ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Exact(extra_live_environment),
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
+
+        let mut wrong_live_argv = process;
+        wrong_live_argv
+            .command_line
+            .push(OsString::from("--foreign"));
+        assert!(!vmm_process_sample_is_exact(
+            &wrong_live_argv,
+            &expected,
+            &properties.control_group
+        ));
+        assert_eq!(
+            exact_vmm_process_sample(
+                LinuxProcessSampleInspection::Exact(wrong_live_argv),
+                &expected,
+                &properties.control_group,
+            ),
+            Err(VmmProcessSampleFailure::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn systemd_submission_passes_only_the_exact_named_descriptors_and_identity() {
+        let expected = expectation();
+        let command = systemd_vmm_command(
+            &expected,
+            SystemdVmmOpenFiles {
+                checkpoint: 41,
+                vmm: 42,
+                kernel: 43,
+                initramfs: Some(44),
+            },
+        )
+        .unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let process_id = std::process::id();
+        for (name, descriptor) in [
+            (CHECKPOINT_FD_NAME, 41),
+            (VMM_FD_NAME, 42),
+            (KERNEL_FD_NAME, 43),
+            (INITRAMFS_FD_NAME, 44),
+        ] {
+            assert!(arguments.contains(
+                &format!("--property=OpenFile=/proc/{process_id}/fd/{descriptor}:{name}:read-only")
+                    .as_str()
+            ));
+        }
+        assert!(arguments.contains(
+            &format!(
+                "--setenv={RUNTIME_INCARNATION_ENVIRONMENT}={}",
+                expected.runtime_incarnation()
+            )
+            .as_str()
+        ));
+        assert!(arguments.contains(
+            &format!(
+                "--setenv={VMM_PROCESS_TOKEN_ENVIRONMENT}={}",
+                expected.process_identity_token()
+            )
+            .as_str()
+        ));
+        assert_eq!(
+            &arguments[arguments.len() - 3..],
+            [
+                "--",
+                "/usr/libexec/cats-vmm-launcher",
+                "--contract-version=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptor_alias_is_rejected_before_systemd_can_be_called() {
+        assert!(systemd_vmm_command(
+            &expectation(),
+            SystemdVmmOpenFiles {
+                checkpoint: 41,
+                vmm: 41,
+                kernel: 43,
+                initramfs: None,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exact_provider_proof_is_the_only_vmm_public_projection() {
+        let expected = inventory_expectation();
+        let proof = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(4242))
+            .unwrap();
+        let projected = proof.into_process_evidence();
+        assert_eq!(
+            projected.role,
+            ProcessRole::Vmm {
+                runtime_incarnation: expected.runtime_incarnation().clone(),
+            }
+        );
+        assert_eq!(projected.process_id, 4242);
+        assert_eq!(projected.executable_path, expected.vmm_executable().path);
+        assert_eq!(projected.scope_id, *expected.unit_id());
+        assert_eq!(projected.control_socket_path, *expected.api_socket_path());
+        assert_eq!(projected.state, ProcessState::Running);
+        assert_eq!(
+            projected.ownership_token,
+            OwnershipTokenEvidence::Valid {
+                ownership_token: expected.process_identity_token().clone(),
+            }
+        );
+        assert_eq!(
+            projected.control_handshake,
+            ControlHandshakeEvidence::Verified
+        );
+        assert_eq!(
+            projected.observed_vm_shape,
+            Some(ObservedVmShape {
+                vcpus: 2,
+                memory_bytes: 2_147_483_648,
+                boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                    [0; 32]
+                ),
+                guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest::new(
+                    "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2",
+                )
+                .unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn naked_checkpoint_cannot_mint_an_adoption_proof() {
+        let expected = expectation();
+        assert!(expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(4242))
+            .is_err());
+    }
+
+    #[test]
+    fn exact_vmm_proof_rejects_descriptor_environment_and_handshake_drift() {
+        let expected = inventory_expectation();
+        let mut descriptor = expected.exact_evidence_for_test(4242);
+        descriptor.fixed_descriptors_exact = false;
+        assert!(expected.clone().prove_exact_process(descriptor).is_err());
+
+        let mut environment = expected.exact_evidence_for_test(4242);
+        environment
+            .environment
+            .insert(OsString::from("EXTRA"), OsString::from("value"));
+        assert!(expected.clone().prove_exact_process(environment).is_err());
+
+        let mut handshake = expected.exact_evidence_for_test(4242);
+        handshake.api_peer_process_id = 4243;
+        assert!(expected.prove_exact_process(handshake).is_err());
+    }
+
+    #[test]
+    fn node_global_admission_retains_absent_or_exact_vmm_authority() {
+        let expected = inventory_expectation();
+        let cat_id = expected.cat_id().clone();
+        let exact = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(4242))
+            .unwrap();
+        let scan = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(
+            BTreeMap::from([(cat_id.clone(), expected.clone())]),
+            BTreeMap::from([(cat_id.clone(), exact)]),
+        )
+        .unwrap();
+        let projected = scan.process_projections().remove(&cat_id).unwrap();
+        let [projected] = projected.as_slice() else {
+            panic!("exact VMM must produce one public process")
+        };
+        assert!(matches!(projected.role, ProcessRole::Vmm { .. }));
+
+        let admission = scan.into_admission_for_test();
+        let (retained, inspection) = admission.vmm(&cat_id).unwrap();
+        assert_eq!(retained, &expected);
+        assert!(inspection.is_some());
+        assert!(matches!(
+            admission.vmm_state().1.get(&cat_id),
+            Some(VmmProcessInspection::Exact(_))
+        ));
+
+        let absent = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_vmms(
+            BTreeMap::from([(cat_id.clone(), expected)]),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .into_admission_for_test();
+        assert!(matches!(
+            absent.vmm_state().1.get(&cat_id),
+            Some(VmmProcessInspection::Absent)
+        ));
+    }
+}

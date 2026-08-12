@@ -86,11 +86,12 @@ Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签
 
 ## Operation 命令
 
-    cats operation ls
     cats operation get ID
     cats operation wait ID
 
-变更默认最多等待 120 秒。使用 `--no-wait` 时请保存返回 ID，再执行 `operation wait` 或 `operation get`。安全重试应保持同一资源意图；API 会为变更附带幂等键。
+Cat Create 返回已接受的 Operation ID。`operation get` 在当前 Workspace 精确读取该 Operation；`operation wait` 最多轮询 120 秒，并在 `failed` 或 `superseded` 时以失败退出。两个命令都使用严格的 Runtime Reconciliation Decoder。
+
+`operation ls` 仍不可用，且不会发出 HTTP：Runtime Authority 有意不提供无界 Operation List。旧的全局 Operation URL 已退役。
 
 ## 自动化建议
 

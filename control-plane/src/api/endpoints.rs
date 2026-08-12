@@ -26,27 +26,26 @@ pub(super) async fn create_endpoint(
     if req.protocol != "http" {
         return Err(ApiError::invalid("only http endpoints are currently supported").into());
     }
-    let cat = state.store.get_cat(&workspace, &cat)?;
-    let ep = state.store.create_endpoint(
-        &cat,
-        &req.name,
-        req.target_port,
-        &req.protocol,
-        req.wake_policy,
-    )?;
-    // If the cat is already running, bind the route immediately.
-    if let (ObservedState::Running, Some(node_id)) = (cat.observed_state, &cat.node_id) {
-        if let Some(node) = state
-            .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| &n.id == node_id)
-        {
-            state
-                .store
-                .publish_routes(&cat.id, &node.id, &node.gateway_url)?;
-        }
-    }
+    let ep = state
+        .store
+        .execute(move |store| {
+            let cat = store.get_cat(&workspace, &cat)?;
+            let ep = store.create_endpoint(
+                &cat,
+                &req.name,
+                req.target_port,
+                &req.protocol,
+                req.wake_policy,
+            )?;
+            // If the cat is already running, bind the route immediately.
+            if let (ObservedState::Running, Some(node_id)) = (cat.observed_state, &cat.node_id) {
+                if let Some(node) = store.list_nodes()?.into_iter().find(|n| &n.id == node_id) {
+                    store.publish_routes(&cat.id, &node.id, &node.gateway_url)?;
+                }
+            }
+            Ok(ep)
+        })
+        .await?;
     Ok(Json(EndpointResponse { endpoint: ep }))
 }
 
@@ -56,8 +55,12 @@ pub(super) async fn list_endpoints(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Endpoint>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let cat = state.store.get_cat(&workspace, &cat)?;
-    Ok(Json(ListResponse {
-        items: state.store.endpoints_for_cat(&cat.id)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| {
+            let cat = store.get_cat(&workspace, &cat)?;
+            store.endpoints_for_cat(&cat.id)
+        })
+        .await?;
+    Ok(Json(ListResponse { items }))
 }

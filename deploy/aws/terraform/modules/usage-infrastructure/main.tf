@@ -8,6 +8,8 @@ locals {
   })
 }
 
+data "aws_partition" "current" {}
+
 resource "aws_kinesis_stream" "usage" {
   name             = local.resource_name
   shard_count      = var.kinesis_shard_count
@@ -290,6 +292,26 @@ resource "aws_iam_role_policy_attachment" "pipeline_producer" {
 resource "aws_iam_role_policy_attachment" "pipeline_consumer" {
   role       = aws_iam_role.pipeline.name
   policy_arn = aws_iam_policy.consumer.arn
+}
+
+# The Control Plane resolves only the immutable manifest object addressed by a
+# request digest. It cannot list the bucket, read image data/volume objects, or
+# mutate any ChunkStore key.
+data "aws_iam_policy_document" "image_manifest_reader" {
+  statement {
+    sid     = "ReadExactImageManifestNamespace"
+    effect  = "Allow"
+    actions = ["s3:GetObject"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:s3:::${var.chunkstore_manifest_bucket_name}/${var.chunkstore_prefix}/images/*/manifest.json"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "image_manifest_reader" {
+  name   = "read-chunkstore-image-manifests"
+  role   = aws_iam_role.pipeline.name
+  policy = data.aws_iam_policy_document.image_manifest_reader.json
 }
 
 resource "aws_eks_pod_identity_association" "pipeline" {

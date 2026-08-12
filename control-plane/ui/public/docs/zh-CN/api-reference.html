@@ -94,9 +94,9 @@ Idempotency-Key: &lt;唯一键&gt;
 <p>可用额度耗尽时，付费计算 Admission 返回 HTTP <code>402</code> 和 <code>payment_required</code> Code；停止、休眠和删除资源仍然可用。</p>
 
 <h2 id="operations">Operation</h2>
-<pre><code>GET /v1/workspaces/{workspace_id}/operations
-GET /v1/operations/{operation}</code></pre>
-<p>Operation 包含不可变 <code>workspace_id</code> Owner、类型、目标 Resource ID/Generation、阶段、时间戳与可选结构化错误。即使单个 Operation URL 没有 Workspace 分段，访问仍按 Workspace 限制。</p>
+<pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation}</code></pre>
+<p>这个精确查询返回 canonical Runtime Reconciliation Operation：不可变的 Workspace/Cat/Revision/Spec/Placement 绑定、Target、时间戳，以及 <code>pending</code>、<code>succeeded</code>、<code>failed</code> 或 <code>superseded</code> 结算状态。成功响应使用 <code>application/json</code>，并携带 <code>Cache-Control: no-store</code>。</p>
+<p>服务端先完成 Workspace 鉴权，再查询 opaque Operation ID。属于其他 Workspace 的 ID 与不存在的 ID 返回完全相同的 <code>not_found</code>。旧的全局 <code>GET /v1/operations/{operation}</code> 和 Workspace Operation Collection/List 路由均已退役；当前不提供无界 List 合同。</p>
 
 <h2 id="errors">错误</h2>
 <pre><code>{

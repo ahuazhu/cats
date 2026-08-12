@@ -2,33 +2,15 @@
 
 - 状态：Accepted
 - 日期：2026-07-30
-- 修订：取代 ADR-0021 中“5 秒固定丢失窗口”“pack 满后前台/超时内联
-  publish”“detach 失败仍释放 lease”以及 Snapshot 不强制同步的部分；
-  strict 契约与按盘选择不变。
-- 后续修订：ADR-0025 仅允许 Cat Destroy 丢弃随后会 tombstone 的 RootDisk；
-  PersistentDisk 与其他生命周期边界仍必须强制 drain。
+- 细化：[ADR-0021](0021-relaxed-durability-tier.md)
+- RootDisk Destroy例外：[ADR-0025](0025-destroy-disposable-root-without-remote-drain.md)
+- Volume Authority：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md)
 
 ## 背景
 
-`pr3094-core` 在运行中随后无法写文件，CI 原地恢复明确得到
-`Read-only file system`；同时 Tunnel 健康、Platform API 返回 200，而
-Web/Cats origin 返回 502。这个组合说明控制面和网络入口仍活着，故障域在
-Cat 所在 Host/卷：文件系统可能被 fencing，或者承载运行时的根文件系统因
-底层 I/O 错误/容量耗尽被内核 remount 为只读。这不是 Paperboy 构建失败。
-
-旧 Relaxed 实现虽然先 fsync 本地 pack，但有三个结构性耦合：
-
-1. 队列到固定 pack 数或等待 10 秒后，Guest FLUSH 会自己进入 S3 PUT +
-   PostgreSQL CAS；远端故障因此重新进入 ext4 的 I/O 返回路径。
-2. “后台每 5 秒”被描述成“最多丢 5 秒”，但远端故障期间真实 RPO 是最老
-   未发布 generation 的年龄，可能远大于定时器。
-3. Stop/Warm/Detach 的 drain 错误被吞掉，甚至释放 lease、删除本地目录；
-   一个瞬时远端故障可以把已经本地 ACK 的数据变成永久丢失。
-
-这些不是某个 timeout 数值没调好的细节，而是 durability point、故障域和
-生命周期所有权放错位置的结构性风险。Relaxed 可以接受 Host 丢失时的非零
-RPO，但不能把 S3/DB 的瞬时故障直接翻译成运行中 ext4 的 EIO，也不能在未
-确认远端水位时销毁唯一的本地副本。
+Relaxed把Guest durability point放在本地NVMe，同时异步推进远端durability。正确性需要
+明确区分两个水位：定时器不能代表RPO，远端故障不能直接变成运行中ext4的EIO，生命周期
+也不能在远端水位落后时销毁唯一的本地副本。
 
 ## 决定
 
@@ -36,14 +18,17 @@ RPO，但不能把 S3/DB 的瞬时故障直接翻译成运行中 ext4 的 EIO，
 
 每个 blockd 同时维护：
 
-- `L = local_durable_generation`：Guest 已收到成功 FLUSH/FUA，且相应
-  immutable pending pack 已 fsync + rename + directory fsync 到本地 NVMe。
+- `L = local_durable_generation`：最高一个连续durable generation。`generation <= R`的内容已远端
+  durable；每个`R < generation <= L`都必须有完成file fsync、rename和directory fsync的
+  immutable pending pack。这个定义与Guest是否已经收到ACK无关。
 - `R = remote_durable_generation`：数据/Map/commit record 已写入对象存储，
   PostgreSQL head CAS 已成功。
 
-必须始终满足 `R <= L`。Strict 的 ACK 条件仍是 `R == L`；Relaxed 的 ACK
-条件是 `L` 前进。Host 永久丢失时可恢复到 `R`，所以 Relaxed 的真实风险
-不是“配置的 5 秒”，而是当时 `L-R` 的 generation 数、字节数和最老年龄。
+必须始终满足 `R <= L`。Strict 的 ACK 条件是目标barrier已推进`R`；Relaxed 的 ACK
+条件是目标barrier已推进`L`。发布后先推进`R`再删除相应pack，`L`保持不变。Host永久丢失时只能恢复
+到远端`R`。Node在线时以`L-R`的generation
+数、字节数和最老年龄暴露实时风险；Host丢失后最后一次observation只是最近样本，不是
+故障瞬间精确损失量。
 
 ### 2. Guest WRITE/FLUSH 只走本地路径
 
@@ -92,12 +77,18 @@ reserved/accounted bytes。否则普通 WRITE 可以先吃满 cache，下一次 
 
 ### 5. lease 与 fencing
 
-lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍是同一
-`owner + epoch`，原 holder 可以 renew，也可以在 generation CAS 中继续发布；
-单纯本地调度或 DB 抖动导致的 expiry lapse 不能把健康 Cat 自我 fencing。
+lease到期时间只用于健康判断，不授予竞争者acquire权限。只要数据库行仍是同一
+`owner + epoch`，原holder可以renew，也可以在generation CAS中继续发布；单纯本地调度或DB
+抖动导致的expiry lapse不能把健康Cat自我fencing。
 
-竞争 acquire 或显式 revoke 必须原子增加 epoch。旧 epoch 的 renew/CAS 随后
-失败并永久进入 fenced；即使旧 Host 从网络分区恢复，也不能发布。
+normal acquire只允许带`transition_id + attachment_id + expected_unowned_epoch`的精确
+`Unowned -> Owned`转换；相同transition重试返回原grant。release也必须幂等且精确匹配
+owner/epoch。其他owner即使过期也返回`OtherWriter`。非计划接管必须使用从Active
+`HostFenceEvent`派生的逐卷授权并原子提高epoch；旧epoch的renew/CAS随后永久失败。
+
+Node取得精确LeaseGrant后启动blockd；blockd只采用、renew和使用该grant，不自行acquire或换epoch。
+data-dir与pending pack必须绑定volume、attachment、epoch和acquire transition，新attachment不得
+采用旧lineage的`R < L`数据。完整接口见[Volume Authority规格](../specs/volume-authority.md)。
 
 ### 6. 恢复和生命周期
 
@@ -106,20 +97,24 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
 - `drain` 成功的定义是所有卷 `R == L`。`status` 控制命令返回两个水位、
   unpublished generations/bytes/oldest age、配额、eviction、backpressure、
   fencing 和最后发布错误。
-- Stop/Cold、Warm、hot detach、Snapshot、`cats sync`、计划内 Node drain/
-  冷迁移都必须先停止晚到的 Guest 写，再强制 drain。失败时保留 blockd、
+- Stop/Cold、Warm、`cats sync`和计划内 Node drain/冷迁移都必须先停止晚到的 Guest 写，再强制
+  drain。失败时保留 blockd、
   local journal 和 lease，控制器重试；不得标记 Cold、解绑/删除盘或清理源。
 - **Cat Destroy 的 RootDisk 例外**：RootDisk 与 Cat 同生命周期且本次操作会删除
   它的 metadata/对象，因此 Guest/VMM 停止后可以不发布其本地 tail，直接丢弃该
-  RootDisk 的 blockd、journal 与 cache。这个例外不能扩展到普通 Stop/Cold，也不能
+  RootDisk 的journal与cache；但必须先消费ADR-0042定义的精确disposable-root删除授权，
+  把当前Owned卷原子置为Deleting并提高epoch。这个例外不能扩展到普通Stop/Cold，也不能
   扩展到 PersistentDisk；同一次 Destroy 中需要返回 Available 的 PersistentDisk 仍
-  必须完成 final drain，任一失败就保留其 blockd/journal/lease 并重试。Node job 必须
-  携带控制面按 `DiskKind` 生成的显式 disposable/retained 清单，未知或冲突分类 fail
-  closed，不能由 mount path 猜测。
-- Snapshot 在 Running 时先 guest syncfs + drain；Suspended 已在 pause 前
-  syncfs，只需 drain frozen engines。Warm/Cold 已跨过强制 drain 边界。
-- 非计划 Host 丢失无法 drain，按 Relaxed 的实时 `L-R` 暴露 RPO，控制面提高
-  epoch 后从 `R` 冷恢复。这是产品选择，不是“自动恢复零丢失”。
+  必须完成 final drain，任一失败就保留其 blockd/journal/lease 并重试。删除授权CAS成功前不得
+  清本地tail；成功后旧epoch永久不能publish。生命周期期望必须在每个`VolumeIntent`上携带
+  `DeleteDisposableRoot {delete_id}`或`DetachRetained`；未知或冲突分类fail closed，不能由mount
+  path猜测。
+- 第一版不支持hot attach、hot detach、resize或Running DiskSnapshot。磁盘成员关系与
+  DiskSnapshot只在Cat稳定Cold且volume unowned时改变；volume容量创建后不可变。这里的
+  DiskSnapshot是远端Root pin，不是WarmRuntimeSnapshot。
+- 非计划 Host 丢失无法 drain；从最后远端`R`冷恢复并报告`DataLossPossible`，附带最后
+  observation的backlog作为诊断。外部隔离先建立HostFenceEvent，随后只有精确逐卷授权CAS才能
+  提高attachment epoch。这是产品选择，不是“自动恢复零丢失”。
 
 ## 可观测性
 
@@ -137,8 +132,7 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
 - `cats_disk_fenced`
 - `cats_disk_publish_error`
 
-告警应基于实际 age/bytes、水位是否持续不收敛和 Host free space；不得再以
-“后台定时器是 5 秒”推断 RPO。
+告警基于实际age/bytes、水位是否持续不收敛和Host free space。
 
 ## 验证
 
@@ -149,10 +143,12 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
    合并正确；
 3. blockd 崩溃后不做远端写即可重建本地水位，恢复发布保持 generation 顺序；
 4. 配额只淘汰 clean chunks，pin 数据不丢，背压期间远端调用只来自 publisher；
-5. drain 失败时普通 Stop/Warm/Snapshot/Detach/Node drain 不销毁源；Destroy 只允许
+5. drain 失败时普通 Stop/Cold、Warm/Node drain 不销毁源；Destroy 只允许
    销毁显式列出的 RootDisk，PersistentDisk 源必须保留，远端恢复后同一 job 可重试
    并从新 Host 校验 digest；
-6. expiry lapse 不自我 fence，而 revoke/竞争 acquire 后旧 epoch 必须失败。
+6. expiry lapse不自我fence，normal acquire不能抢占owner；逐卷授权takeover后旧epoch必须失败；
+7. 重复acquire/release transition返回同一结果，新attachment不能重放旧lineage pack；
+8. Running磁盘变更、resize与DiskSnapshot请求被拒绝，Cold Snapshot Root进入GC live set。
 
 测试数字只说明相应测试环境和边界，不是生产 SLA。生产 rollout 还必须观察
 真实 workload 的 local FLUSH P50/P99、publisher throughput、queue age、Host
@@ -165,10 +161,9 @@ lease 到期时间只决定竞争者何时可以 acquire。只要数据库行仍
 
 - Relaxed 的可用性显著提高：S3/DB 短故障与 Guest ext4 解耦，fsync 延迟由
   本地 pack 大小和 NVMe 决定。
-- 风险变得显式而不是消失：未发布数据仍只有一个 Host 副本，Host 永久丢失
-  会丢 `L-R`；冷读仍依赖对象存储。
+- 风险变得显式而不是消失：未发布数据仍只有一个 Host 副本，Host 永久丢失只能恢复到`R`；
+  故障前最后一次观测的`L-R`只是风险样本，不是故障瞬间精确损失量；冷读仍依赖对象存储。
 - 本地 NVMe 不再对所有状态都是“可删除 cache”。`R < L` 时 pending packs
   是唯一权威副本，生命周期和运维必须把它当数据而不是缓存。
-- Strict 仍是默认和 RPO 0 的唯一单 Host 方案；需要本地级 fsync 且承受 Host
-  丢失的工作负载，必须增加跨 Host replicated log，不能靠调小 drain interval
-  冒充。
+- Strict仍是默认的单Host RPO 0档位。本地级fsync同时要求Host-loss RPO 0时，需要独立
+  ADR定义跨Host replicated log。

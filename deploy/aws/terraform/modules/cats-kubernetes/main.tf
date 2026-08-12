@@ -4,7 +4,7 @@ locals {
   # Auto Mode ALB remove that target; otherwise the ALB can route to a process
   # that has already exited during the propagation window.
   public_target_pre_stop_delay_seconds           = 15
-  public_target_termination_grace_period_seconds = 30
+  public_target_termination_grace_period_seconds = 60
 
   labels = {
     "app.kubernetes.io/part-of"    = "cats"
@@ -38,32 +38,24 @@ locals {
     } : {}
   )
 
-  gateway_secret_data = {
-    CATS_AUTH_TOKEN = var.runtime_secret_data["CATS_AUTH_TOKEN"]
-  }
-
   rds_ca_pem = "${trimspace(var.rds_ca_pem)}\n"
 
-  ingress_routes = concat(
-    [
-      for host in var.control_plane_hosts : {
-        host         = host
-        service_name = "cats-controld"
-        service_port = 7300
-      }
-    ],
-    [{
-      host         = var.endpoint_wildcard_host
-      service_name = "cats-gatewayd"
-      service_port = 7400
-    }]
-  )
+  # Public Endpoint ingress stays absent until the Route Grant v2 signer,
+  # bounded per-replica cache and Node admission gate are composed. Exposing
+  # the old Gateway here would make a healthy ALB target serve V1 authority.
+  ingress_routes = [
+    for host in var.control_plane_hosts : {
+      host         = host
+      service_name = "cats-controld"
+      service_port = 7300
+    }
+  ]
 }
 
 check "public_target_drain_fits_termination_grace" {
   assert {
-    condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds
-    error_message = "public target termination grace must outlast its preStop target-drain delay."
+    condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds
+    error_message = "public target termination grace must leave at least 30 seconds after preStop for commit-resolution shutdown."
   }
 }
 
@@ -139,31 +131,8 @@ resource "kubernetes_secret_v1" "runtime" {
   data = local.runtime_secret_data
 }
 
-resource "kubernetes_secret_v1" "gateway_runtime" {
-  metadata {
-    name      = "cats-gateway-runtime"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels    = local.labels
-  }
-
-  type = "Opaque"
-  data = local.gateway_secret_data
-}
-
-resource "kubernetes_service_account_v1" "gateway" {
-  metadata {
-    name      = "cats-gatewayd"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels = merge(local.labels, {
-      "app.kubernetes.io/name" = "cats-gatewayd"
-    })
-  }
-
-  automount_service_account_token = false
-}
-
-# Separate from runtime and gateway credentials so the signing key is mounted
-# as a file only in cats-controld and can never be inherited by cats-gatewayd.
+# Separate from runtime credentials so the signing key is mounted as a file
+# only in cats-controld. The future v2 Gateway receives no private signing key.
 # The matching public half lets every replica prove the pair before Ready.
 resource "kubernetes_secret_v1" "route_grant_signing" {
   metadata {
@@ -176,6 +145,22 @@ resource "kubernetes_secret_v1" "route_grant_signing" {
   data = {
     "private.pem" = var.route_grant_private_key_pem
     "public.pem"  = var.route_grant_public_key_pem
+  }
+}
+
+# Public deployment-provisioner trust is a rollout-pinned artifact, not a
+# credential. A subPath bind mount gives the process one root-owned regular
+# 0644 file instead of Kubernetes' symlink-based projected-volume entry; the
+# A23 descriptor reader deliberately rejects symlinks and hot reload.
+resource "kubernetes_config_map_v1" "runtime_provisioner_trust" {
+  metadata {
+    name      = "cats-runtime-provisioner-trust"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  data = {
+    "runtime-provisioner-trust.v1.json" = var.runtime_provisioner_trust_bundle_json
   }
 }
 
@@ -224,9 +209,10 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256"  = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256" = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
-          "cats.run/rds-ca-sha256"          = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256"           = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
+          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
         }
       }
 
@@ -271,9 +257,9 @@ resource "kubernetes_deployment_v1" "control_plane" {
           image             = var.control_plane_image
           image_pull_policy = "IfNotPresent"
 
-          # Pin the binary rather than trusting the image ENTRYPOINT, exactly as
-          # the gatewayd container below does: a mis-targeted image build must
-          # not get to choose what runs as the control plane (issue #117).
+          # Pin the binary rather than trusting the image ENTRYPOINT: a
+          # mis-targeted image build must not get to choose what runs as the
+          # control plane (issue #117).
           command = ["/usr/local/bin/cats-controld"]
 
           args = [
@@ -281,6 +267,10 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "0.0.0.0:7300",
             "--control-store-url-file",
             "/etc/cats/runtime/CATS_POSTGRES_URL",
+            "--guest-runtime-profile-receipt-file",
+            "/opt/cats/release/guest-runtime-profile.v1.json",
+            "--runtime-provisioner-trust-file",
+            "/etc/cats/identity/runtime-provisioner-trust.v1.json",
             "--metadata-store-adapter",
             "postgres",
             "--metadata-store-option",
@@ -289,6 +279,14 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
             "--metadata-store-option",
             "session-setup=${var.storage_postgres_session_setup}",
+            "--object-store-adapter",
+            "aws-s3",
+            "--object-store-option",
+            "bucket=${var.chunkstore_bucket_name}",
+            "--object-store-option",
+            "region=${var.chunkstore_region}",
+            "--object-store-option",
+            "prefix=${var.chunkstore_prefix}",
           ]
 
           env {
@@ -409,6 +407,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
             mount_path = "/etc/cats/route-grant"
             read_only  = true
           }
+
+          volume_mount {
+            name       = "runtime-provisioner-trust"
+            mount_path = "/etc/cats/identity/runtime-provisioner-trust.v1.json"
+            sub_path   = "runtime-provisioner-trust.v1.json"
+            read_only  = true
+          }
         }
 
         volume {
@@ -432,6 +437,15 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "runtime-provisioner-trust"
+
+          config_map {
+            name         = kubernetes_config_map_v1.runtime_provisioner_trust.metadata[0].name
+            default_mode = "0644"
           }
         }
       }
@@ -474,220 +488,6 @@ resource "kubernetes_service_v1" "control_plane" {
     port {
       name        = "http"
       port        = 7300
-      target_port = "http"
-    }
-  }
-}
-
-resource "kubernetes_deployment_v1" "gateway" {
-  metadata {
-    name      = "cats-gatewayd"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels = merge(local.labels, {
-      "app.kubernetes.io/name" = "cats-gatewayd"
-    })
-  }
-
-  spec {
-    replicas = var.gateway_replicas
-
-    strategy {
-      type = "RollingUpdate"
-
-      rolling_update {
-        max_surge       = "1"
-        max_unavailable = "0"
-      }
-    }
-
-    selector {
-      match_labels = {
-        "app.kubernetes.io/name" = "cats-gatewayd"
-      }
-    }
-
-    template {
-      metadata {
-        labels = merge(local.labels, {
-          "app.kubernetes.io/name" = "cats-gatewayd"
-        })
-        annotations = {
-          "cats.run/runtime-secret-sha256" = sha256(jsonencode(local.gateway_secret_data))
-        }
-      }
-
-      spec {
-        automount_service_account_token  = false
-        enable_service_links             = false
-        service_account_name             = kubernetes_service_account_v1.gateway.metadata[0].name
-        termination_grace_period_seconds = local.public_target_termination_grace_period_seconds
-
-        node_selector = {
-          "kubernetes.io/arch" = "amd64"
-        }
-
-        affinity {
-          pod_anti_affinity {
-            required_during_scheduling_ignored_during_execution {
-              topology_key = "kubernetes.io/hostname"
-
-              label_selector {
-                match_labels = {
-                  "app.kubernetes.io/name" = "cats-gatewayd"
-                }
-              }
-            }
-          }
-        }
-
-        topology_spread_constraint {
-          max_skew           = 1
-          topology_key       = "kubernetes.io/hostname"
-          when_unsatisfiable = "DoNotSchedule"
-
-          label_selector {
-            match_labels = {
-              "app.kubernetes.io/name" = "cats-gatewayd"
-            }
-          }
-        }
-
-        container {
-          name              = "gatewayd"
-          image             = var.gateway_image
-          image_pull_policy = "IfNotPresent"
-          command           = ["/usr/local/bin/cats-gatewayd"]
-
-          args = [
-            "--listen",
-            "0.0.0.0:7400",
-            "--control-plane-url",
-            "http://cats-controld:7300",
-          ]
-
-          env_from {
-            secret_ref {
-              name = kubernetes_secret_v1.gateway_runtime.metadata[0].name
-            }
-          }
-
-          dynamic "env" {
-            for_each = var.shared_route_cache_table == null ? [] : [var.shared_route_cache_table]
-
-            content {
-              name  = "CATS_SHARED_ROUTE_CACHE_TABLE"
-              value = env.value
-            }
-          }
-
-          dynamic "env" {
-            for_each = var.shared_route_cache_table == null ? [] : [var.usage_aws_region]
-
-            content {
-              name  = "AWS_REGION"
-              value = env.value
-            }
-          }
-
-          port {
-            name           = "http"
-            container_port = 7400
-          }
-
-          resources {
-            requests = {
-              cpu    = "50m"
-              memory = "64Mi"
-            }
-            limits = {
-              cpu    = "500m"
-              memory = "256Mi"
-            }
-          }
-
-          lifecycle {
-            pre_stop {
-              exec {
-                command = ["/bin/sh", "-c", "sleep ${local.public_target_pre_stop_delay_seconds}"]
-              }
-            }
-          }
-
-          readiness_probe {
-            http_get {
-              path = "/healthz"
-              port = "http"
-            }
-            period_seconds = 5
-          }
-
-          liveness_probe {
-            http_get {
-              path = "/healthz"
-              port = "http"
-            }
-            period_seconds = 15
-          }
-
-          security_context {
-            allow_privilege_escalation = false
-            read_only_root_filesystem  = true
-            run_as_non_root            = true
-            run_as_user                = 10001
-
-            capabilities {
-              drop = ["ALL"]
-            }
-          }
-        }
-      }
-    }
-  }
-
-  wait_for_rollout = true
-
-  # Route Grants are additive in the control-plane response, so old Gateways
-  # tolerate a new control plane. The reverse is not true: a new Gateway fails
-  # closed when an old replica returns an active Running route without a grant.
-  # Terraform may otherwise update independent Deployments concurrently. Wait
-  # for every control-plane replica to finish its rollout before replacing the
-  # first Gateway Pod.
-  depends_on = [kubernetes_deployment_v1.control_plane]
-}
-
-resource "kubernetes_pod_disruption_budget_v1" "gateway" {
-  metadata {
-    name      = "cats-gatewayd"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels    = local.labels
-  }
-
-  spec {
-    min_available = "1"
-
-    selector {
-      match_labels = {
-        "app.kubernetes.io/name" = "cats-gatewayd"
-      }
-    }
-  }
-}
-
-resource "kubernetes_service_v1" "gateway" {
-  metadata {
-    name      = "cats-gatewayd"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels    = local.labels
-  }
-
-  spec {
-    selector = {
-      "app.kubernetes.io/name" = "cats-gatewayd"
-    }
-
-    port {
-      name        = "http"
-      port        = 7400
       target_port = "http"
     }
   }
@@ -797,10 +597,7 @@ resource "kubernetes_ingress_v1" "public" {
     }
   }
 
-  depends_on = [
-    kubernetes_deployment_v1.control_plane,
-    kubernetes_deployment_v1.gateway,
-  ]
+  depends_on = [kubernetes_deployment_v1.control_plane]
 }
 
 # In-cluster reconciliation of the database credential (ADR-0029, #77).

@@ -10,9 +10,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 CH_VERSION=${CH_VERSION:-v53.0}
 PREFIX=/opt/cats
+GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a *.metal instance" >&2; exit 1; }
+[[ -d $GUEST_RUNTIME_RELEASE_SOURCE ]] || {
+  echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
+  exit 1
+}
+"$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
+. "$REPO/deploy/aws/metal/worker-deployment-transaction.sh"
 
 echo "==> apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -20,7 +27,13 @@ apt-get update -q
 # libssl-dev is required by the PostgreSQL metadata adapter's native-tls stack.
 apt-get install -qy build-essential curl git nbd-client busybox-static \
   musl-tools e2fsprogs cpio zstd pkg-config libssl-dev debootstrap iptables \
-  util-linux openssl
+  util-linux openssl jq
+for required in flock stat curl jq openssl findmnt systemd-run systemd-tmpfiles; do
+  command -v "$required" >/dev/null 2>&1 || {
+    echo "worker deployment needs $required" >&2
+    exit 1
+  }
+done
 
 echo "==> rust toolchain"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -43,18 +56,77 @@ if [[ -n ${SUDO_USER:-} ]]; then
   done
 fi
 
+export CATS_NODE_SERVICE_NAME=cats-noded
+release_installer="$REPO/deploy/aws/metal/install-guest-runtime-release.sh"
+"$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
+metering_root=$(cats_worker_metering_root cats-noded)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
+release_transaction_active=0
+route_key_temp=""
+route_public_temp=""
+deployment_cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if [[ $release_transaction_active -eq 1 ]]; then
+    systemctl mask --runtime cats-noded >/dev/null 2>&1 || true
+    cats_stop_node_service cats-noded >/dev/null 2>&1 || true
+    "$release_installer" rollback >/dev/null 2>&1 || true
+  fi
+  [[ -z $route_key_temp ]] || rm -f -- "$route_key_temp"
+  [[ -z $route_public_temp ]] || rm -f -- "$route_public_temp"
+  exit "$status"
+}
+trap deployment_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cats_acquire_worker_deployment_lock
+# The unlocked check above is only an early, non-mutating preflight. Recompute
+# the cgroup path after serialization and prove physical idle again immediately
+# before masking/stopping the service, because another deployment may have
+# started runtime children while this process waited for the Host lock.
+metering_root=$(cats_worker_metering_root cats-noded)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
+cats_gate_node_service cats-noded
+cats_worker_deployment_crash_probe after-mask-worker
+
+install -D -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
+  "$PREFIX/bin/install-guest-runtime-release"
+cats_worker_deployment_crash_probe after-install-release-installer
+install -D -m 0755 "$REPO/deploy/aws/metal/worker-deployment-transaction.sh" \
+  "$PREFIX/bin/worker-deployment-transaction"
+cats_worker_deployment_crash_probe after-install-deployment-transaction
+install -m 0644 "$REPO/deploy/metal/systemd/cats-noded.service" \
+  /etc/systemd/system/cats-noded.service
+cats_worker_deployment_crash_probe after-install-worker-unit
+sync -f "$PREFIX/bin/install-guest-runtime-release"
+sync -f "$PREFIX/bin/worker-deployment-transaction"
+sync -f "$PREFIX/bin"
+sync -f /etc/systemd/system/cats-noded.service
+sync -f /etc/systemd/system
+cats_worker_deployment_crash_probe after-fsync-worker-recovery-gate
+systemctl daemon-reload
+cats_worker_deployment_crash_probe after-recovery-gate-daemon-reload
+release_installer="$PREFIX/bin/install-guest-runtime-release"
+release_transaction_active=1
+"$release_installer" prepare "$GUEST_RUNTIME_RELEASE_SOURCE"
+cats_worker_deployment_crash_probe after-installer-return
+
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
-for bin in cats cats-controld cats-noded cats-gatewayd cats-blockd cats-guest-agent; do
+cats_worker_deployment_crash_probe after-install-bin-directory
+for bin in cats cats-controld cats-noded cats-vmm-launcher cats-blockd cats-guest-agent; do
   install -m 0755 "$REPO/target/release/$bin" "$PREFIX/bin/$bin"
+  cats_worker_deployment_crash_probe "after-install-$bin"
 done
 ln -sf "$PREFIX/bin/cats" /usr/local/bin/cats
+cats_worker_deployment_crash_probe after-install-cli-link
 
 echo "==> cloud-hypervisor $CH_VERSION"
 if [[ ! -x /usr/local/bin/cloud-hypervisor ]]; then
   curl -fsSL -o /usr/local/bin/cloud-hypervisor \
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
   chmod +x /usr/local/bin/cloud-hypervisor
+  cats_worker_deployment_crash_probe after-install-cloud-hypervisor
 fi
 /usr/local/bin/cloud-hypervisor --version
 
@@ -62,18 +134,19 @@ echo "==> kernel NBD module (nbds_max=64)"
 modprobe nbd nbds_max=64 || true
 echo nbd > /etc/modules-load.d/cats.conf
 echo "options nbd nbds_max=64" > /etc/modprobe.d/cats-nbd.conf
+cats_worker_deployment_crash_probe after-install-nbd-configuration
 
 echo "==> guest outbound network"
 install -m 0755 "$REPO/deploy/metal/setup-guest-network.sh" \
   "$PREFIX/bin/setup-guest-network"
 printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=1\nnet.ipv4.conf.default.rp_filter=1\n' \
   > /etc/sysctl.d/90-cats-guest-network.conf
+cats_worker_deployment_crash_probe after-install-network-configuration
 CATS_GUEST_NETWORK_CIDR=${CATS_GUEST_NETWORK_CIDR:-10.240.0.0/16} \
   "$PREFIX/bin/setup-guest-network"
+cats_worker_deployment_crash_probe after-setup-guest-network
 
-echo "==> guest image"
-OUT="$PREFIX/guest" "$REPO/deploy/metal/build-guest-image.sh"
-
+echo "==> shared Guest runtime release"
 # --------------------------------------------------------------------------
 # Local NVMe for the ChunkStore cache and the file object store.
 #
@@ -130,6 +203,7 @@ if [[ $DATA_DEVICE != none ]]; then
     blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -q -F "$DATA_DEVICE"
     install -d /var/lib/cats
     mount "$DATA_DEVICE" /var/lib/cats
+    cats_worker_deployment_crash_probe after-mount-state-filesystem
     # Instance storage does not survive a stop/start, so this is deliberately not
     # written to /etc/fstab: a reboot should come up with an empty cache, not fail
     # to boot on a device that no longer has a filesystem.
@@ -141,8 +215,17 @@ fi
 
 echo "==> state dirs + config"
 install -d /var/lib/cats/{node,blob} /etc/cats
+cats_worker_deployment_crash_probe after-install-state-directories
+install -D -o root -g root -m 0644 "$REPO/deploy/metal/tmpfiles/cats-vmm.conf" \
+  /usr/lib/tmpfiles.d/cats-vmm.conf
+install -o root -g root -m 0755 \
+  "$REPO/deploy/aws/metal/provision-vmm-socket-namespaces.sh" \
+  "$PREFIX/bin/provision-vmm-socket-namespaces"
+"$PREFIX/bin/provision-vmm-socket-namespaces"
+cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
 if [[ ! -f /etc/cats/cats.env ]]; then
   install -m 0600 "$REPO/deploy/metal/cats.env.example" /etc/cats/cats.env
+  cats_worker_deployment_crash_probe after-install-cats-environment
   echo "    wrote /etc/cats/cats.env (edit for S3; defaults to local file blobstore)"
 fi
 
@@ -152,26 +235,54 @@ fi
 # separate control-plane and worker deployment states.
 if [[ ! -f /etc/cats/route-grant-private.pem ]]; then
   route_key_temp=$(mktemp /var/tmp/cats-route-grant-private.XXXXXX)
-  trap 'rm -f -- "$route_key_temp"' EXIT
   openssl genpkey -algorithm ED25519 -out "$route_key_temp"
   install -o root -g root -m 0600 "$route_key_temp" /etc/cats/route-grant-private.pem
+  cats_worker_deployment_crash_probe after-install-route-private-key
   rm -f -- "$route_key_temp"
-  trap - EXIT
+  route_key_temp=""
 fi
 route_public_temp=$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)
-trap 'rm -f -- "$route_public_temp"' EXIT
 openssl pkey -in /etc/cats/route-grant-private.pem -pubout -out "$route_public_temp"
 install -o root -g root -m 0644 "$route_public_temp" /etc/cats/route-grant-public.pem
+cats_worker_deployment_crash_probe after-install-route-public-key
 rm -f -- "$route_public_temp"
-trap - EXIT
+route_public_temp=""
 
 echo "==> systemd units"
-install -m 0644 "$REPO"/deploy/metal/systemd/*.service /etc/systemd/system/
+# A host upgraded from the V1 development shape may still have the old
+# Gateway enabled. Stop it before daemon-reload and remove its exact unit and
+# binary; leaving either behind would let a reboot revive legacy route
+# resolve/wake and Node proxy traffic.
+cats_retire_legacy_gateway \
+  /etc/systemd/system/cats-gatewayd.service \
+  /etc/systemd/system/multi-user.target.wants/cats-gatewayd.service \
+  "$PREFIX/bin/cats-gatewayd"
+cats_worker_deployment_crash_probe after-remove-legacy-gateway
+for unit in "$REPO"/deploy/metal/systemd/*.service; do
+  [[ ${unit##*/} == cats-noded.service ]] && continue
+  install -m 0644 "$unit" /etc/systemd/system/
+done
+cats_worker_deployment_crash_probe after-install-systemd-units
 systemctl daemon-reload
-systemctl enable --now cats-controld cats-gatewayd cats-noded
+cats_worker_deployment_crash_probe after-daemon-reload
+systemctl enable --now cats-controld
+cats_worker_deployment_crash_probe after-start-control-services
+cats_begin_candidate_lifetime cats-noded "$release_installer"
+cats_worker_deployment_crash_probe after-authorize-worker-start
+cats_ungate_node_service cats-noded
+cats_worker_deployment_crash_probe after-unmask-worker
+systemctl enable --now cats-noded
+cats_worker_deployment_crash_probe after-start-worker
+cats_bind_candidate_main cats-noded "$release_installer"
+cats_worker_deployment_crash_probe after-bind-worker-main
+cats_wait_for_registered_node cats-noded
+cats_worker_deployment_crash_probe after-registration-readiness
+cats_commit_candidate "$release_installer"
+release_transaction_active=0
+cats_worker_deployment_crash_probe after-release-commit
 
 sleep 1
-systemctl --no-pager --lines 0 status cats-controld cats-gatewayd cats-noded | grep -E "●|Active"
+systemctl --no-pager --lines 0 status cats-controld cats-noded | grep -E "●|Active"
 echo
 echo "install complete. Try:"
 echo "  cats create dev --root-size 1GiB && cats exec dev -- uname -a"

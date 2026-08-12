@@ -2,11 +2,11 @@
 //! supervises.
 //!
 //! A process this agent forked is a `std::process::Child`: it can be waited on
-//! and reaped. A process the agent *adopts* — recovered by pid after an agent
-//! restart (ADR-0028 §3) — is not a child of this process, so `waitpid` would
-//! fail with `ECHILD` and its exit has to be observed by probing the pid
-//! instead. Both kinds appear on the same supervision paths (guest/VMM and
-//! `cats-blockd`), so they share one type rather than splitting every call site.
+//! and reaped. A process the V1 agent *adopts* by pid after a restart is not a
+//! child of this process, so `waitpid` would fail with `ECHILD`; its exit has to
+//! be observed by probing the pid instead. Both kinds appear on the same
+//! supervision paths (guest/VMM and `cats-blockd`), so they share one type
+//! rather than splitting every call site.
 //!
 //! Identity lives here too, next to the handle it guards: a bare pid proves
 //! nothing, because the kernel reuses pids and an adopted process leaves the
@@ -18,6 +18,9 @@
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,9 +37,9 @@ pub(crate) enum ProcHandle {
     /// Recovered by pid after an agent restart. Signals still work; `waitpid`
     /// does not.
     ///
-    /// The start ticks recorded at adoption travel with the pid on purpose
-    /// (ADR-0028 §3). Adoption and teardown can be hours apart; an adopted
-    /// process is not this agent's child, so the moment it exits the kernel may
+    /// The start ticks recorded at adoption travel with the pid on purpose.
+    /// Adoption and teardown can be hours apart; an adopted process is not
+    /// this agent's child, so the moment it exits the kernel may
     /// hand its pid to something unrelated. Signalling on the pid alone would
     /// then kill a stranger's process, so every signal is re-proved against
     /// this value first. Owned children need no such guard: the kernel reserves
@@ -115,8 +118,19 @@ impl ProcHandle {
     }
 
     pub(crate) fn signal(&self, sig: i32) {
+        let _ = self.signal_if_same(sig);
+    }
+
+    /// Signal only if the recorded process incarnation still owns its PID.
+    /// The boolean lets an exact-effect caller distinguish a submitted signal
+    /// from a fail-closed PID/start mismatch without weakening the existing
+    /// best-effort `signal` API.
+    pub(crate) fn signal_if_same(&self, sig: i32) -> Result<bool> {
         match self {
-            Self::Owned(child) => signal_pid(child.id(), sig),
+            Self::Owned(child) => {
+                signal_pid_checked(child.id(), sig)?;
+                Ok(true)
+            }
             Self::Adopted { pid, start_ticks } => {
                 if !is_recorded_process(*pid, *start_ticks) {
                     tracing::warn!(
@@ -124,9 +138,10 @@ impl ProcHandle {
                         signal = sig,
                         "not signalling adopted pid: it no longer names the recorded process"
                     );
-                    return;
+                    return Ok(false);
                 }
-                signal_pid(*pid, sig);
+                signal_pid_checked(*pid, sig)?;
+                Ok(true)
             }
         }
     }
@@ -135,21 +150,33 @@ impl ProcHandle {
 /// Best-effort `kill(2)`. A process that has already exited answers `ESRCH`,
 /// which every caller here treats as success.
 fn signal_pid(pid: u32, sig: i32) {
+    let _ = signal_pid_checked(pid, sig);
+}
+
+fn signal_pid_checked(pid: u32, sig: i32) -> Result<()> {
     let Some(pid) = pid_t(pid) else {
-        return;
+        anyhow::bail!("process id is outside the platform pid domain");
     };
     // SAFETY: `kill` copies both scalar arguments and does not retain any
     // borrowed memory.
-    unsafe {
-        libc::kill(pid, sig);
+    let result = unsafe { libc::kill(pid, sig) };
+    if result == 0 {
+        return Ok(());
     }
+    let source = std::io::Error::last_os_error();
+    if source.raw_os_error() == Some(libc::ESRCH) {
+        // The exact incarnation exited between the identity sample and the
+        // signal. For a stop effect, absence is already the intended result.
+        return Ok(());
+    }
+    Err(source).with_context(|| format!("signal process {pid} with {sig}"))
 }
 
 /// Whether `pid` still names the process whose start ticks were recorded.
 ///
 /// Off Linux, and for a record written without start ticks, both sides are
-/// `None` and this is a no-op — the dev path has no `/proc` to sample
-/// (ADR-0028 §6). Anywhere the sample fails while a value was recorded, the
+/// `None` and this is a no-op because the development path has no `/proc` to
+/// sample. Anywhere the sample fails while a value was recorded, the
 /// answer is "not the same process", which is the fail-closed side: the caller
 /// then refuses to signal rather than risk a recycled pid.
 fn is_recorded_process(pid: u32, start_ticks: Option<u64>) -> bool {
@@ -211,13 +238,132 @@ impl ProcIdentity {
     }
 }
 
+/// Result of binding a Linux pidfd to an already-recorded process identity.
+/// A pidfd is the only signal handle used by exact retirement: a numeric PID
+/// can be recycled after the pre-effect inventory and must never be signalled
+/// directly.
+#[cfg(target_os = "linux")]
+pub(crate) enum ExactPidFdOpen {
+    Exact(ExactPidFd),
+    Absent,
+    IdentityMismatch,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ExactPidFd {
+    descriptor: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidFdSignal {
+    Submitted,
+    AlreadyExited,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactPidFd {
+    /// Open the kernel handle first, then re-sample the PID's start time and
+    /// executable. If the process exits and the numeric PID is recycled in
+    /// that window, the pidfd still names the old task while `/proc` names the
+    /// replacement; the mismatch therefore fails before any signal.
+    pub(crate) fn open_exact(expected: &ProcIdentity) -> Result<ExactPidFdOpen> {
+        Self::open_exact_with_sampler(expected, ProcIdentity::sample)
+    }
+
+    fn open_exact_with_sampler(
+        expected: &ProcIdentity,
+        sample: impl FnOnce(u32) -> ProcIdentity,
+    ) -> Result<ExactPidFdOpen> {
+        let Some(pid) = pid_t(expected.pid) else {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        };
+        if expected.start_ticks.is_none() || expected.exe.is_none() {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        }
+        // SAFETY: pidfd_open copies its scalar arguments and returns a fresh
+        // descriptor on success. Flags are frozen to zero by the syscall ABI.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+        if descriptor < 0 {
+            let source = std::io::Error::last_os_error();
+            return match source.raw_os_error() {
+                Some(libc::ESRCH) => Ok(ExactPidFdOpen::Absent),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(ExactPidFdOpen::Unsupported),
+                _ => Err(source).context("open exact process pidfd"),
+            };
+        }
+        let descriptor = i32::try_from(descriptor).context("pidfd exceeds descriptor range")?;
+        // SAFETY: successful pidfd_open returned one fresh descriptor, whose
+        // ownership moves exactly once into OwnedFd.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        if sample(expected.pid) != *expected {
+            return Ok(ExactPidFdOpen::IdentityMismatch);
+        }
+        Ok(ExactPidFdOpen::Exact(Self { descriptor }))
+    }
+
+    pub(crate) fn signal(&self, signal: i32) -> Result<PidFdSignal> {
+        // SAFETY: pidfd_send_signal copies scalar arguments. A null siginfo
+        // requests ordinary process-directed signal semantics and is not
+        // retained by the kernel.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.descriptor.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if result == 0 {
+            return Ok(PidFdSignal::Submitted);
+        }
+        let source = std::io::Error::last_os_error();
+        match source.raw_os_error() {
+            Some(libc::ESRCH) => Ok(PidFdSignal::AlreadyExited),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(PidFdSignal::Unsupported),
+            _ => Err(source).context("signal exact process through pidfd"),
+        }
+    }
+
+    /// pidfds become readable when their exact task exits. Polling this
+    /// descriptor never follows a later process which reuses the numeric PID.
+    pub(crate) fn exited(&self) -> Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: `descriptor` points to one initialized pollfd for this
+            // nonblocking call and poll retains no pointer.
+            let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+            if result >= 0 {
+                anyhow::ensure!(
+                    descriptor.revents & libc::POLLNVAL == 0,
+                    "exact process pidfd became invalid"
+                );
+                return Ok(result > 0
+                    && descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
+            }
+            let source = std::io::Error::last_os_error();
+            if source.kind() != std::io::ErrorKind::Interrupted {
+                return Err(source).context("poll exact process pidfd");
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn sample_start_ticks(pid: u32) -> Option<u64> {
     parse_start_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
-/// Dev and macOS hosts have no `/proc`, so process identity is weaker there.
-/// ADR-0028 §6 accepts that: those paths never carry production workload.
+/// Dev and macOS hosts have no `/proc`, so V1 process identity is weaker there;
+/// those paths never carry production workload.
 #[cfg(not(target_os = "linux"))]
 fn sample_start_ticks(_pid: u32) -> Option<u64> {
     None
@@ -249,8 +395,8 @@ fn parse_start_ticks(stat: &str) -> Option<u64> {
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Identity of the current host boot. Used to reject every recorded pid at once
-/// after a host reboot (ADR-0028 §3 step 1).
+/// Identity of the current host boot. V1 adoption uses it to reject every
+/// recorded pid at once after a host reboot.
 pub(crate) fn host_boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -277,8 +423,8 @@ mod tests {
             .expect("spawn test process")
     }
 
-    /// Adopt a live process the way the ADR-0028 §3 proof does: with the start
-    /// ticks sampled from the pid itself.
+    /// Adopt a live process with the start ticks sampled from the pid itself,
+    /// matching the V1 runtime-adoption proof.
     fn adopt(pid: u32) -> ProcHandle {
         ProcHandle::Adopted {
             pid,
@@ -360,8 +506,8 @@ mod tests {
         wait_until_exited(&mut adopted);
     }
 
-    /// ADR-0028 §3: an adopted process can exit long after adoption and the
-    /// kernel can hand its pid to something unrelated. Neither `signal` nor
+    /// An adopted process can exit long after V1 adoption and the kernel can
+    /// hand its pid to something unrelated. Neither `signal` nor
     /// `kill_and_reap` may touch a pid whose start ticks have moved.
     #[test]
     fn a_recycled_adopted_pid_is_never_signalled() {
@@ -432,6 +578,51 @@ mod tests {
         assert_eq!(identity.pid, 0);
         assert_eq!(identity.start_ticks, None);
         assert_eq!(identity.exe, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signals_and_waits_for_the_exact_kernel_task() {
+        let mut child = spawn_sleeper();
+        let expected = ProcIdentity::sample(child.id());
+        assert!(expected.start_ticks.is_some() && expected.exe.is_some());
+        let ExactPidFdOpen::Exact(pidfd) = ExactPidFd::open_exact(&expected).unwrap() else {
+            panic!("positive calibration: this Linux kernel must open an exact pidfd")
+        };
+        assert!(!pidfd.exited().unwrap());
+        assert_eq!(pidfd.signal(libc::SIGKILL).unwrap(), PidFdSignal::Submitted);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfd.exited().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "pidfd never reported process exit"
+            );
+            std::thread::sleep(ADOPTED_EXIT_POLL);
+        }
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_open_barrier_rejects_a_replacement_sample_without_signalling() {
+        let mut child = spawn_sleeper();
+        let expected = ProcIdentity::sample(child.id());
+        assert!(matches!(
+            ExactPidFd::open_exact(&expected).unwrap(),
+            ExactPidFdOpen::Exact(_)
+        ));
+        let mut replacement = expected.clone();
+        replacement.start_ticks = replacement.start_ticks.map(|ticks| ticks + 1);
+        assert!(matches!(
+            ExactPidFd::open_exact_with_sampler(&expected, |_| replacement).unwrap(),
+            ExactPidFdOpen::IdentityMismatch
+        ));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the replacement barrier must return before any signal reaches the PID"
+        );
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
     }
 
     #[test]

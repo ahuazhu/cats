@@ -5,15 +5,16 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
-# Stop or restart only the node agent. Its ledger-backed adoption path proves
-# and re-adopts the surviving VMM and blockd processes (ADR-0028); killing the
-# whole cgroup here would terminate every Cat on this worker at once.
-KillMode=process
+# The provisioner supplies `/etc/cats/identity/node-identity.v1.json` and its
+# closed key/credential set; no cloud metadata or environment value can
+# construct identity or its selected state path.
+# Controlled stop/restart is permitted only at state=cordoned cats=0/orphans=0.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # Direct RDS remains the compatible default. A managed worker environment can
 # override this after the proxy exists and has passed its connectivity check.
 Environment=CATS_POSTGRES_SESSION_SETUP=client
 EnvironmentFile=/etc/cats/worker.env
+ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
 # Every start renders the DSN afresh from its authority. A restart is the one
@@ -21,16 +22,13 @@ ExecStartPre=/opt/cats/bin/setup-guest-network
 # the old copy was reused.
 ExecStartPre=/opt/cats/bin/render-postgres-url
 ExecStart=/opt/cats/bin/cats-noded \
-  --node-id $CATS_NODE_ID \
   --listen 0.0.0.0:7301 \
-  --advertise-url $CATS_NODE_ADVERTISE_URL \
-  --initially-cordoned \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
   --route-grant-public-key-file /etc/cats/route-grant-public.pem \
-  --gateway-url $CATS_GATEWAY_URL \
-  --state-dir /var/lib/cats/node \
+  --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
@@ -41,10 +39,6 @@ ExecStart=/opt/cats/bin/cats-noded \
   --object-store-option prefix=cats \
   --vmm ch \
   --ch-bin /opt/cats/bin/cloud-hypervisor \
-  --ch-kernel /opt/cats/guest/vmlinuz \
-  --ch-initramfs /opt/cats/guest/initramfs.img \
-  --ch-cmdline "console=ttyS0 root=/dev/vda rw clocksource=kvm-clock" \
-  --ch-network-cidr $CATS_GUEST_NETWORK_CIDR \
   --ch-seed-image /opt/cats/guest/rootfs.ext4
 Restart=always
 RestartSec=2

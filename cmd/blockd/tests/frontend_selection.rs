@@ -127,6 +127,8 @@ fn vhost_user_is_rejected_off_linux() {
         .command("att-vhu-unsupported")
         .arg("--listen-vhost-user")
         .arg(env.path("vhu.sock"))
+        .arg("--guest-device-serial")
+        .arg("cats-root")
         .output()
         .expect("run cats-blockd");
     assert!(!output.status.success());
@@ -434,6 +436,8 @@ mod vhost_user {
             .arg(&nbd_socket)
             .arg("--listen-vhost-user")
             .arg(&vhost_user_socket)
+            .arg("--guest-device-serial")
+            .arg("cats-root")
             .arg("--vhost-user-queues")
             .arg("2")
             .stdout(Stdio::piped())

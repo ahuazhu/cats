@@ -794,11 +794,21 @@ impl WorkLeaseGuard {
 
 impl Drop for WorkLeaseGuard {
     fn drop(&mut self) {
-        if let Err(error) = self.store.release_work(&self.lease.id) {
+        let lease_id = self.lease.id.clone();
+        let cat_id = self.lease.cat_id.clone();
+        if let Err(error) = self.store.execute_detached(move |store| {
+            if let Err(error) = store.release_work(&lease_id) {
+                tracing::warn!(
+                    lease = %lease_id,
+                    cat = %cat_id,
+                    "releasing work lease failed; it expires with its TTL: {error}"
+                );
+            }
+        }) {
             tracing::warn!(
                 lease = %self.lease.id,
                 cat = %self.lease.cat_id,
-                "releasing work lease failed; it expires with its TTL: {error}"
+                "queueing work lease release failed; it expires with its TTL: {error}"
             );
         }
     }

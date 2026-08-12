@@ -9,7 +9,9 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cats_storage::blob::{validate_key, BlobError, BlobStore, Result};
@@ -21,6 +23,8 @@ pub const ADAPTER_NAME: &str = "aws-s3";
 const RETRY_ATTEMPTS: u32 = 5;
 const RETRY_INITIAL_DELAY_MS: u64 = 100;
 const RETRY_MAX_DELAY_MS: u64 = 3_000;
+const ERROR_RESPONSE_MAX_BYTES: usize = 8 * 1024;
+const CREDENTIAL_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -59,6 +63,28 @@ enum CredentialState {
         credentials: SigningCredentials,
         refreshed_at: Instant,
     },
+    Container {
+        endpoint: String,
+        token_file: PathBuf,
+        credentials: SigningCredentials,
+        refreshed_at: Instant,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct ReadBounds {
+    maximum: usize,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct RequestParts<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a [(String, String)],
+    body: &'a [u8],
+    extra_headers: &'a [(&'a str, &'a str)],
+    key_for_errors: &'a str,
 }
 
 #[derive(serde::Deserialize)]
@@ -96,6 +122,10 @@ impl AwsS3BlobStore {
         }
         cfg.endpoint = endpoint.origin().ascii_serialization();
         let client = reqwest::blocking::Client::builder()
+            // Signed requests and link-local credential requests must never
+            // be replayed to a Location that was not part of the signature or
+            // exact credential-endpoint validation.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| BlobError::Backend {
@@ -115,7 +145,7 @@ impl AwsS3BlobStore {
     }
 
     fn from_instance_role(mut cfg: AwsS3Config) -> Result<Self> {
-        let (role_name, credentials) = load_imds_credentials(None)?;
+        let (role_name, credentials) = load_imds_credentials(None, None)?;
         cfg.access_key = credentials.access_key.clone();
         cfg.secret_key = credentials.secret_key.clone();
         cfg.session_token = credentials.session_token.clone();
@@ -128,11 +158,32 @@ impl AwsS3BlobStore {
         Ok(store)
     }
 
-    fn signing_credentials(&self, key_for_errors: &str) -> Result<SigningCredentials> {
-        let mut state = self.credentials.lock().map_err(|_| BlobError::Backend {
-            key: key_for_errors.into(),
-            message: "AWS credential mutex was poisoned".into(),
-        })?;
+    fn from_container_role(
+        mut cfg: AwsS3Config,
+        endpoint: String,
+        token_file: PathBuf,
+    ) -> Result<Self> {
+        validate_container_credential_endpoint(&endpoint)?;
+        let credentials = load_container_credentials(&endpoint, &token_file, None)?;
+        cfg.access_key = credentials.access_key.clone();
+        cfg.secret_key = credentials.secret_key.clone();
+        cfg.session_token = credentials.session_token.clone();
+        let mut store = Self::new(cfg)?;
+        store.credentials = Mutex::new(CredentialState::Container {
+            endpoint,
+            token_file,
+            credentials,
+            refreshed_at: Instant::now(),
+        });
+        Ok(store)
+    }
+
+    fn signing_credentials(
+        &self,
+        key_for_errors: &str,
+        deadline: Option<Instant>,
+    ) -> Result<SigningCredentials> {
+        let mut state = self.lock_credentials(key_for_errors, deadline)?;
         match &mut *state {
             CredentialState::Static(credentials) => Ok(credentials.clone()),
             CredentialState::Imds {
@@ -144,17 +195,62 @@ impl AwsS3BlobStore {
                 // five minutes avoids depending on timestamp parsing while
                 // keeping a long-running blockd process current.
                 if refreshed_at.elapsed() >= Duration::from_secs(5 * 60) {
-                    let (_, replacement) =
-                        load_imds_credentials(Some(role_name)).map_err(|error| {
-                            BlobError::Backend {
-                                key: key_for_errors.into(),
-                                message: format!("refresh EC2 instance-role credentials: {error}"),
-                            }
+                    let (_, replacement) = load_imds_credentials(Some(role_name), deadline)
+                        .map_err(|error| BlobError::Backend {
+                            key: key_for_errors.into(),
+                            message: format!("refresh EC2 instance-role credentials: {error}"),
                         })?;
                     *credentials = replacement;
                     *refreshed_at = Instant::now();
                 }
                 Ok(credentials.clone())
+            }
+            CredentialState::Container {
+                endpoint,
+                token_file,
+                credentials,
+                refreshed_at,
+            } => {
+                if refreshed_at.elapsed() >= Duration::from_secs(5 * 60) {
+                    *credentials = load_container_credentials(endpoint, token_file, deadline)
+                        .map_err(|error| BlobError::Backend {
+                            key: key_for_errors.into(),
+                            message: format!("refresh EKS Pod Identity credentials: {error}"),
+                        })?;
+                    *refreshed_at = Instant::now();
+                }
+                Ok(credentials.clone())
+            }
+        }
+    }
+
+    fn lock_credentials(
+        &self,
+        key_for_errors: &str,
+        deadline: Option<Instant>,
+    ) -> Result<MutexGuard<'_, CredentialState>> {
+        let Some(deadline) = deadline else {
+            return self.credentials.lock().map_err(|_| BlobError::Backend {
+                key: key_for_errors.into(),
+                message: "AWS credential mutex was poisoned".into(),
+            });
+        };
+        loop {
+            match self.credentials.try_lock() {
+                Ok(state) => return Ok(state),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(BlobError::Backend {
+                        key: key_for_errors.into(),
+                        message: "AWS credential mutex was poisoned".into(),
+                    });
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| deadline_error(key_for_errors))?;
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
             }
         }
     }
@@ -202,11 +298,31 @@ impl AwsS3BlobStore {
         extra_headers: &[(&str, &str)],
         key_for_errors: &str,
     ) -> Result<(u16, Vec<u8>)> {
+        self.request_with_bounds(
+            RequestParts {
+                method,
+                path,
+                query,
+                body,
+                extra_headers,
+                key_for_errors,
+            },
+            None,
+        )
+    }
+
+    fn request_with_bounds(
+        &self,
+        request: RequestParts<'_>,
+        bounds: Option<ReadBounds>,
+    ) -> Result<(u16, Vec<u8>)> {
         let mut delay = Duration::from_millis(RETRY_INITIAL_DELAY_MS);
         let mut attempt = 1;
         loop {
-            let outcome =
-                self.request_once(method, path, query, body, extra_headers, key_for_errors);
+            if bounds.is_some_and(|bounds| Instant::now() >= bounds.deadline) {
+                return Err(deadline_error(request.key_for_errors));
+            }
+            let outcome = self.request_once(request, bounds);
             let retryable = match &outcome {
                 Err(BlobError::Backend { .. }) => true,
                 Ok((status, _)) => *status == 429 || (500..600).contains(status),
@@ -215,8 +331,8 @@ impl AwsS3BlobStore {
             if !retryable || attempt >= RETRY_ATTEMPTS {
                 if attempt > 1 {
                     tracing::warn!(
-                        key = key_for_errors,
-                        method,
+                        key = request.key_for_errors,
+                        method = request.method,
                         attempts = attempt,
                         "object-store request settled after retries"
                     );
@@ -225,16 +341,24 @@ impl AwsS3BlobStore {
             }
             match &outcome {
                 Err(error) => tracing::warn!(
-                    key = key_for_errors, method, attempt, %error,
+                    key = request.key_for_errors, method = request.method, attempt, %error,
                     "object-store request failed; retrying"
                 ),
                 Ok((status, _)) => tracing::warn!(
-                    key = key_for_errors,
-                    method,
+                    key = request.key_for_errors,
+                    method = request.method,
                     attempt,
                     status,
                     "object-store request returned a retryable status; retrying"
                 ),
+            }
+            if let Some(bounds) = bounds {
+                let Some(remaining) = bounds.deadline.checked_duration_since(Instant::now()) else {
+                    return Err(deadline_error(request.key_for_errors));
+                };
+                if remaining <= delay {
+                    return Err(deadline_error(request.key_for_errors));
+                }
             }
             std::thread::sleep(delay);
             delay = (delay * 4).min(Duration::from_millis(RETRY_MAX_DELAY_MS));
@@ -244,13 +368,17 @@ impl AwsS3BlobStore {
 
     fn request_once(
         &self,
-        method: &str,
-        path: &str,
-        query: &[(String, String)],
-        body: &[u8],
-        extra_headers: &[(&str, &str)],
-        key_for_errors: &str,
+        request: RequestParts<'_>,
+        bounds: Option<ReadBounds>,
     ) -> Result<(u16, Vec<u8>)> {
+        let RequestParts {
+            method,
+            path,
+            query,
+            body,
+            extra_headers,
+            key_for_errors,
+        } = request;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| BlobError::Backend {
@@ -265,7 +393,8 @@ impl AwsS3BlobStore {
         let (amz_date, date_stamp) = amz_timestamp(now);
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.host();
-        let credentials = self.signing_credentials(key_for_errors)?;
+        let credentials =
+            self.signing_credentials(key_for_errors, bounds.map(|bounds| bounds.deadline))?;
 
         let mut headers = vec![
             ("host".to_string(), host.clone()),
@@ -301,6 +430,13 @@ impl AwsS3BlobStore {
                 message: format!("invalid HTTP method: {error}"),
             })?;
         let mut req = self.client.request(method, &url).body(body.to_vec());
+        if let Some(bounds) = bounds {
+            let remaining = bounds
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| deadline_error(key_for_errors))?;
+            req = req.timeout(remaining);
+        }
         for (k, v) in &headers {
             if k != "host" {
                 req = req.header(k.as_str(), v.as_str());
@@ -312,13 +448,7 @@ impl AwsS3BlobStore {
             message: e.to_string(),
         })?;
         let status = resp.status().as_u16();
-        let bytes = resp
-            .bytes()
-            .map_err(|e| BlobError::Backend {
-                key: key_for_errors.into(),
-                message: e.to_string(),
-            })?
-            .to_vec();
+        let bytes = read_response_body(resp, status, bounds, key_for_errors)?;
         Ok((status, bytes))
     }
 
@@ -332,7 +462,77 @@ impl AwsS3BlobStore {
     }
 }
 
-fn load_imds_credentials(role_name: Option<&str>) -> Result<(String, SigningCredentials)> {
+fn deadline_error(key: &str) -> BlobError {
+    BlobError::Backend {
+        key: key.to_string(),
+        message: "bounded read deadline elapsed".into(),
+    }
+}
+
+fn read_response_body(
+    mut response: reqwest::blocking::Response,
+    status: u16,
+    bounds: Option<ReadBounds>,
+    key: &str,
+) -> Result<Vec<u8>> {
+    let success_limit = (200..300).contains(&status).then_some(bounds).flatten();
+    if let Some(bounds) = success_limit {
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(bounds.maximum).unwrap_or(u64::MAX))
+        {
+            return Err(BlobError::TooLarge {
+                key: key.to_string(),
+                maximum: bounds.maximum,
+                observed_at_least: bounds.maximum.saturating_add(1),
+            });
+        }
+    }
+
+    let maximum = success_limit
+        .map(|bounds| bounds.maximum)
+        .unwrap_or(ERROR_RESPONSE_MAX_BYTES);
+    if bounds.is_none() && (200..300).contains(&status) {
+        return response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| BlobError::Backend {
+                key: key.to_string(),
+                message: error.to_string(),
+            });
+    }
+
+    let read_limit = maximum.saturating_add(1);
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    response
+        .by_ref()
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BlobError::Backend {
+            key: key.to_string(),
+            message: error.to_string(),
+        })?;
+    if let Some(bounds) = success_limit {
+        if bytes.len() > bounds.maximum {
+            return Err(BlobError::TooLarge {
+                key: key.to_string(),
+                maximum: bounds.maximum,
+                observed_at_least: bytes.len(),
+            });
+        }
+        if Instant::now() > bounds.deadline {
+            return Err(deadline_error(key));
+        }
+    } else if bytes.len() > maximum {
+        bytes.truncate(maximum);
+    }
+    Ok(bytes)
+}
+
+fn load_imds_credentials(
+    role_name: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<(String, SigningCredentials)> {
     if std::env::var("AWS_EC2_METADATA_DISABLED").is_ok_and(|value| value == "true") {
         return Err(BlobError::Backend {
             key: "<credentials>".into(),
@@ -340,37 +540,34 @@ fn load_imds_credentials(role_name: Option<&str>) -> Result<(String, SigningCred
         });
     }
     const IMDS: &str = "http://169.254.169.254/latest";
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|error| BlobError::Backend {
-            key: "<credentials>".into(),
-            message: format!("build EC2 metadata client: {error}"),
-        })?;
-    let token = client
+    let initial_timeout = credential_timeout(deadline)?;
+    let client = credential_client(initial_timeout)?;
+    let token_response = client
         .put(format!("{IMDS}/api/token"))
+        .timeout(credential_timeout(deadline)?)
         .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::text)
         .map_err(|error| BlobError::Backend {
             key: "<credentials>".into(),
             message: format!("obtain EC2 metadata token: {error}"),
         })?;
+    let token = read_credential_text(token_response, "obtain EC2 metadata token")?;
     let role_name = match role_name {
         Some(role_name) => role_name.to_string(),
-        None => client
-            .get(format!("{IMDS}/meta-data/iam/security-credentials/"))
-            .header("x-aws-ec2-metadata-token", &token)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .and_then(reqwest::blocking::Response::text)
-            .map(|value| value.trim().to_string())
-            .map_err(|error| BlobError::Backend {
-                key: "<credentials>".into(),
-                message: format!("discover EC2 instance role: {error}"),
-            })?,
+        None => {
+            let response = client
+                .get(format!("{IMDS}/meta-data/iam/security-credentials/"))
+                .timeout(credential_timeout(deadline)?)
+                .header("x-aws-ec2-metadata-token", &token)
+                .send()
+                .map_err(|error| BlobError::Backend {
+                    key: "<credentials>".into(),
+                    message: format!("discover EC2 instance role: {error}"),
+                })?;
+            read_credential_text(response, "discover EC2 instance role")?
+                .trim()
+                .to_string()
+        }
     };
     if role_name.is_empty() || role_name.contains(['/', '\n', '\r']) {
         return Err(BlobError::Backend {
@@ -378,24 +575,19 @@ fn load_imds_credentials(role_name: Option<&str>) -> Result<(String, SigningCred
             message: "EC2 metadata returned an invalid role name".into(),
         });
     }
-    let document: ImdsCredentialDocument = client
+    let response = client
         .get(format!(
             "{IMDS}/meta-data/iam/security-credentials/{role_name}"
         ))
+        .timeout(credential_timeout(deadline)?)
         .header("x-aws-ec2-metadata-token", token)
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::text)
         .map_err(|error| BlobError::Backend {
             key: "<credentials>".into(),
             message: format!("read EC2 instance-role credentials: {error}"),
-        })
-        .and_then(|body| {
-            serde_json::from_str(&body).map_err(|error| BlobError::Backend {
-                key: "<credentials>".into(),
-                message: format!("decode EC2 instance-role credentials: {error}"),
-            })
         })?;
+    let document: ImdsCredentialDocument =
+        read_credential_json(response, "read EC2 instance-role credentials")?;
     if document.access_key_id.is_empty()
         || document.secret_access_key.is_empty()
         || document.token.is_empty()
@@ -413,6 +605,179 @@ fn load_imds_credentials(role_name: Option<&str>) -> Result<(String, SigningCred
             session_token: Some(document.token),
         },
     ))
+}
+
+fn validate_container_credential_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint_url = reqwest::Url::parse(endpoint).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("invalid EKS Pod Identity credential URI: {error}"),
+    })?;
+    if endpoint_url.scheme() != "http"
+        || endpoint_url.host_str() != Some("169.254.170.23")
+        || endpoint_url.port().is_some()
+        || endpoint_url.path() != "/v1/credentials"
+        || endpoint_url.query().is_some()
+        || endpoint_url.fragment().is_some()
+        || !endpoint_url.username().is_empty()
+        || endpoint_url.password().is_some()
+    {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message:
+                "EKS Pod Identity credential URI must be exact http://169.254.170.23/v1/credentials"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+fn load_container_credentials(
+    endpoint: &str,
+    token_file: &Path,
+    deadline: Option<Instant>,
+) -> Result<SigningCredentials> {
+    validate_container_credential_endpoint(endpoint)?;
+    let metadata = std::fs::metadata(token_file).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("read EKS Pod Identity token metadata: {error}"),
+    })?;
+    if metadata.len() > 16 * 1024 {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EKS Pod Identity authorization token exceeds 16384 bytes".into(),
+        });
+    }
+    let mut token_file = std::fs::File::open(token_file).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("open EKS Pod Identity authorization token: {error}"),
+    })?;
+    let mut token = String::with_capacity(usize::try_from(metadata.len()).unwrap_or(16 * 1024));
+    token_file
+        .by_ref()
+        .take(16 * 1024 + 1)
+        .read_to_string(&mut token)
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("read EKS Pod Identity authorization token: {error}"),
+        })?;
+    if token.len() > 16 * 1024 {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EKS Pod Identity authorization token exceeds 16384 bytes".into(),
+        });
+    }
+    let token = token.trim();
+    if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EKS Pod Identity authorization token is empty or malformed".into(),
+        });
+    }
+    let timeout = credential_timeout(deadline)?;
+    let client = credential_client(timeout)?;
+    let response = client
+        .get(endpoint)
+        .timeout(credential_timeout(deadline)?)
+        .header("authorization", token)
+        .send()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("read EKS Pod Identity credentials: {error}"),
+        })?;
+    let document: ImdsCredentialDocument =
+        read_credential_json(response, "read EKS Pod Identity credentials")?;
+    if document.access_key_id.is_empty()
+        || document.secret_access_key.is_empty()
+        || document.token.is_empty()
+    {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: "EKS Pod Identity returned incomplete credentials".into(),
+        });
+    }
+    Ok(SigningCredentials {
+        access_key: document.access_key_id,
+        secret_key: document.secret_access_key,
+        session_token: Some(document.token),
+    })
+}
+
+fn read_credential_text(response: reqwest::blocking::Response, operation: &str) -> Result<String> {
+    let bytes = read_credential_body(response, operation)?;
+    String::from_utf8(bytes).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("{operation}: response is not UTF-8: {error}"),
+    })
+}
+
+fn credential_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2).min(timeout))
+        .timeout(timeout)
+        .build()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("build AWS credential client: {error}"),
+        })
+}
+
+fn read_credential_json<T>(response: reqwest::blocking::Response, operation: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let bytes = read_credential_body(response, operation)?;
+    serde_json::from_slice(&bytes).map_err(|error| BlobError::Backend {
+        key: "<credentials>".into(),
+        message: format!("{operation}: invalid JSON: {error}"),
+    })
+}
+
+fn read_credential_body(
+    mut response: reqwest::blocking::Response,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    response = response
+        .error_for_status()
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: {error}"),
+        })?;
+    if response.content_length().is_some_and(|length| {
+        length > u64::try_from(CREDENTIAL_RESPONSE_MAX_BYTES).unwrap_or(u64::MAX)
+    }) {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: response exceeds {CREDENTIAL_RESPONSE_MAX_BYTES} bytes"),
+        });
+    }
+    let mut bytes = Vec::with_capacity(CREDENTIAL_RESPONSE_MAX_BYTES.min(4 * 1024));
+    response
+        .by_ref()
+        .take(u64::try_from(CREDENTIAL_RESPONSE_MAX_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: {error}"),
+        })?;
+    if bytes.len() > CREDENTIAL_RESPONSE_MAX_BYTES {
+        return Err(BlobError::Backend {
+            key: "<credentials>".into(),
+            message: format!("{operation}: response exceeds {CREDENTIAL_RESPONSE_MAX_BYTES} bytes"),
+        });
+    }
+    Ok(bytes)
+}
+
+fn credential_timeout(deadline: Option<Instant>) -> Result<Duration> {
+    match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| remaining.min(Duration::from_secs(3)))
+            .ok_or_else(|| deadline_error("<credentials>")),
+        None => Ok(Duration::from_secs(3)),
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -452,8 +817,19 @@ impl BlobStoreFactory for AwsS3BlobStoreFactory {
             session_token,
             prefix: config.optional("prefix").unwrap_or_default().to_string(),
         };
+        let container_uri = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok();
+        let container_token_file =
+            std::env::var_os("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE").map(PathBuf::from);
+        if container_uri.is_some() != container_token_file.is_some() {
+            return Err(AdapterError::InvalidConfig {
+                adapter: ADAPTER_NAME,
+                message: "AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE must be set together".into(),
+            });
+        }
         if access_key.is_some() {
             AwsS3BlobStore::new(config)
+        } else if let (Some(endpoint), Some(token_file)) = (container_uri, container_token_file) {
+            AwsS3BlobStore::from_container_role(config, endpoint, token_file)
         } else {
             AwsS3BlobStore::from_instance_role(config)
         }
@@ -495,6 +871,33 @@ impl BlobStore for AwsS3BlobStore {
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         let path = self.object_path(key)?;
         let (status, body) = self.request("GET", &path, &[], b"", &[], key)?;
+        match status {
+            200..=299 => Ok(body),
+            404 => Err(BlobError::NotFound(key.to_string())),
+            _ => Err(BlobError::Backend {
+                key: key.to_string(),
+                message: format!("GET status {status}: {}", snippet(&body)),
+            }),
+        }
+    }
+
+    fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        self.get_bounded_until(key, maximum, Instant::now() + Duration::from_secs(60))
+    }
+
+    fn get_bounded_until(&self, key: &str, maximum: usize, deadline: Instant) -> Result<Vec<u8>> {
+        let path = self.object_path(key)?;
+        let (status, body) = self.request_with_bounds(
+            RequestParts {
+                method: "GET",
+                path: &path,
+                query: &[],
+                body: b"",
+                extra_headers: &[],
+                key_for_errors: key,
+            },
+            Some(ReadBounds { maximum, deadline }),
+        )?;
         match status {
             200..=299 => Ok(body),
             404 => Err(BlobError::NotFound(key.to_string())),
@@ -721,7 +1124,61 @@ fn xml_unescape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
     use super::*;
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        request
+    }
+
+    fn local_store(
+        respond: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (AwsS3BlobStore, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            respond(stream);
+        });
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: None,
+            prefix: String::new(),
+        })
+        .unwrap();
+        (store, server)
+    }
+
+    fn assert_no_connection(listener: TcpListener, waited: Duration) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + waited;
+        loop {
+            match listener.accept() {
+                Ok(_) => panic!("redirect target received a credential-bearing request"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("redirect target accept failed: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn shared_blob_store_contract_when_s3_is_configured() {
@@ -799,6 +1256,234 @@ mod tests {
             store.exists("../escape"),
             Err(BlobError::InvalidKey { .. })
         ));
+    }
+
+    #[test]
+    fn pod_identity_credentials_accept_only_the_eks_link_local_endpoint() {
+        validate_container_credential_endpoint("http://169.254.170.23/v1/credentials").unwrap();
+        for endpoint in [
+            "https://169.254.170.23/v1/credentials",
+            "http://127.0.0.1/v1/credentials",
+            "http://169.254.170.23.evil.example/v1/credentials",
+            "http://169.254.170.23/v1/credentials?redirect=evil",
+            "http://169.254.170.23/latest/meta-data",
+        ] {
+            assert!(validate_container_credential_endpoint(endpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_s3_request_never_follows_a_cross_origin_redirect() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("http://{}/stolen", target.local_addr().unwrap());
+        let (store, redirect) = local_store(move |mut stream| {
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        *store.credentials.lock().unwrap() = CredentialState::Static(SigningCredentials {
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: Some("session-secret".into()),
+        });
+
+        assert!(matches!(
+            store.get("images/test/manifest.json"),
+            Err(BlobError::Backend { .. })
+        ));
+        redirect.join().unwrap();
+        assert_no_connection(target, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn signed_s3_request_treats_same_origin_redirect_as_a_terminal_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("{endpoint}/redirected");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx.send(read_request(&mut stream)).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            assert_no_connection(listener, Duration::from_millis(100));
+        });
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: Some("session-secret".into()),
+            prefix: String::new(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            store.get("images/test/manifest.json"),
+            Err(BlobError::Backend { .. })
+        ));
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(request.to_ascii_lowercase().contains("authorization:"));
+        assert!(request.contains("x-amz-security-token: session-secret"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn credential_client_rejects_redirects_and_caps_response_bodies() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!("http://{}/stolen", target.local_addr().unwrap());
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_url = format!("http://{}", redirect.local_addr().unwrap());
+        let redirect_server = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let client = credential_client(Duration::from_secs(1)).unwrap();
+        let response = client
+            .get(redirect_url)
+            .header("authorization", "credential-secret")
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        redirect_server.join().unwrap();
+        assert_no_connection(target, Duration::from_millis(100));
+
+        let oversized = TcpListener::bind("127.0.0.1:0").unwrap();
+        let oversized_url = format!("http://{}", oversized.local_addr().unwrap());
+        let oversized_server = std::thread::spawn(move || {
+            let (mut stream, _) = oversized.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = vec![b'x'; CREDENTIAL_RESPONSE_MAX_BYTES + 1];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let response = client.get(oversized_url).send().unwrap();
+        assert!(matches!(
+            read_credential_text(response, "test credential response"),
+            Err(BlobError::Backend { .. })
+        ));
+        oversized_server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_get_deadline_includes_waiting_for_a_credential_refresh() {
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "unused".into(),
+            secret_key: "unused".into(),
+            session_token: None,
+            prefix: String::new(),
+        })
+        .unwrap();
+        let _credential_refresh = store.credentials.lock().unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            store.get_bounded_until(
+                "images/test/manifest.json",
+                4,
+                Instant::now() + Duration::from_millis(30),
+            ),
+            Err(BlobError::Backend { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn bounded_get_rejects_declared_and_streamed_oversize_bodies() {
+        let (declared, server) = local_store(|mut stream| {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345",
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            declared.get_bounded("images/test/manifest.json", 4),
+            Err(BlobError::TooLarge {
+                maximum: 4,
+                observed_at_least: 5,
+                ..
+            })
+        ));
+        server.join().unwrap();
+
+        let (streamed, server) = local_store(|mut stream| {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n12345\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            streamed.get_bounded("images/test/manifest.json", 4),
+            Err(BlobError::TooLarge {
+                maximum: 4,
+                observed_at_least: 5,
+                ..
+            })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_get_keeps_oversized_error_bodies_out_of_too_large() {
+        let (store, server) = local_store(|mut stream| {
+            let body = vec![b'x'; ERROR_RESPONSE_MAX_BYTES + 1];
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        assert!(matches!(
+            store.get_bounded("images/test/manifest.json", 4),
+            Err(BlobError::NotFound(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_get_transport_obeys_the_absolute_deadline() {
+        let (store, server) = local_store(|mut stream| {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+        let started = Instant::now();
+        assert!(matches!(
+            store.get_bounded_until(
+                "images/test/manifest.json",
+                4,
+                Instant::now() + Duration::from_millis(50)
+            ),
+            Err(BlobError::Backend { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
     }
 
     /// AWS SigV4 test-suite vector `get-vanilla`.

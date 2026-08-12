@@ -174,10 +174,9 @@ impl NodeRuntime {
                 Some(chrt) => {
                     let network = chrt.network.as_ref().context("cat has no guest network")?;
                     let ip = network
-                        .guest_ip
-                        .split('/')
-                        .next()
-                        .context("invalid guest address")?
+                        .config
+                        .guest_ipv4
+                        .as_str()
                         .parse::<std::net::IpAddr>()
                         .context("invalid guest IP")?;
                     ProxyTarget::Tcp(std::net::SocketAddr::new(ip, request.target_port))
@@ -246,10 +245,9 @@ impl NodeRuntime {
                         .as_ref()
                         .context("cat has no guest network")?;
                     let ip = network
-                        .guest_ip
-                        .split('/')
-                        .next()
-                        .context("invalid guest address")?
+                        .config
+                        .guest_ipv4
+                        .as_str()
                         .parse::<std::net::IpAddr>()
                         .context("invalid guest IP")?;
                     ProxyTarget::Tcp(std::net::SocketAddr::new(ip, target_port))

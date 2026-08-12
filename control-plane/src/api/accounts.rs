@@ -51,12 +51,11 @@ pub(super) async fn cli_logout(
 }
 
 fn workspace_response(
-    state: &AppState,
+    store: &crate::store::Store,
     account: &crate::store::AccountRecord,
     workspace_id: &str,
 ) -> ApiResult<Workspace> {
-    let (_, workspaces) = state
-        .store
+    let (_, workspaces) = store
         .account_and_workspace_views(&account.workos_organization_id, None, &[])?
         .ok_or_else(|| ApiError::failed_precondition("account is not active"))?;
     workspaces
@@ -72,15 +71,15 @@ pub(super) async fn create_account_workspace(
     Json(request): Json<CreateWorkspaceRequest>,
 ) -> ApiResult<Response> {
     let (account, _) = require_account_manager(&state, &headers, &account_id).await?;
-    let workspace =
-        state
-            .store
-            .create_workspace(&account.id, &request.slug, &request.display_name)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(workspace_response(&state, &account, &workspace.id)?),
-    )
-        .into_response())
+    let workspace = state
+        .store
+        .execute(move |store| {
+            let workspace =
+                store.create_workspace(&account.id, &request.slug, &request.display_name)?;
+            workspace_response(store, &account, &workspace.id).map_err(|failure| failure.0)
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(workspace)).into_response())
 }
 
 pub(super) async fn create_workspace_token(
@@ -95,11 +94,11 @@ pub(super) async fn create_workspace_token(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let access_token = state.store.create_workspace_token(
-        &workspace,
-        &request.label,
-        &workspace_token_hash(&secret),
-    )?;
+    let token_hash = workspace_token_hash(&secret);
+    let access_token = state
+        .store
+        .execute(move |store| store.create_workspace_token(&workspace, &request.label, &token_hash))
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(CreatedWorkspaceToken {
@@ -116,9 +115,11 @@ pub(super) async fn list_workspace_tokens(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<WorkspaceToken>>> {
     check_workspace_token_admin(&state, &headers, &workspace).await?;
-    Ok(Json(ListResponse {
-        items: state.store.workspace_tokens(&workspace)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| store.workspace_tokens(&workspace))
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 pub(super) async fn revoke_workspace_token(
@@ -127,7 +128,10 @@ pub(super) async fn revoke_workspace_token(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     check_workspace_token_admin(&state, &headers, &workspace).await?;
-    state.store.revoke_workspace_token(&workspace, &token)?;
+    state
+        .store
+        .execute(move |store| store.revoke_workspace_token(&workspace, &token))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -137,14 +141,24 @@ pub(super) async fn update_workspace(
     headers: HeaderMap,
     Json(request): Json<UpdateWorkspaceRequest>,
 ) -> ApiResult<Json<Workspace>> {
-    let existing = state.store.workspace_by_id(&workspace_id)?;
+    let query_workspace_id = workspace_id.clone();
+    let existing = state
+        .store
+        .execute(move |store| store.workspace_by_id(&query_workspace_id))
+        .await?;
     let (account, _) = require_account_manager(&state, &headers, &existing.account_id).await?;
-    let workspace = state.store.update_workspace(
-        &workspace_id,
-        request.slug.as_deref(),
-        request.display_name.as_deref(),
-    )?;
-    Ok(Json(workspace_response(&state, &account, &workspace.id)?))
+    let workspace = state
+        .store
+        .execute(move |store| {
+            let workspace = store.update_workspace(
+                &workspace_id,
+                request.slug.as_deref(),
+                request.display_name.as_deref(),
+            )?;
+            workspace_response(store, &account, &workspace.id).map_err(|failure| failure.0)
+        })
+        .await?;
+    Ok(Json(workspace))
 }
 
 pub(super) async fn create_account_invitation(
@@ -190,9 +204,12 @@ pub(super) async fn create_account_invitation(
             &idempotency_key,
         )
         .await?;
+    let saved_invitation = invitation.clone();
+    let organization_id = account.workos_organization_id;
     state
         .store
-        .record_invitation(&invitation, &account.workos_organization_id)?;
+        .execute(move |store| store.record_invitation(&saved_invitation, &organization_id))
+        .await?;
     Ok((StatusCode::CREATED, Json(invitation)).into_response())
 }
 
@@ -208,11 +225,17 @@ pub(super) async fn list_account_invitations(
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     let items = workos.list_account_invitations(&account).await?;
-    for invitation in &items {
-        state
-            .store
-            .record_invitation(invitation, &account.workos_organization_id)?;
-    }
+    let saved_items = items.clone();
+    let organization_id = account.workos_organization_id;
+    state
+        .store
+        .execute(move |store| {
+            for invitation in &saved_items {
+                store.record_invitation(invitation, &organization_id)?;
+            }
+            Ok(())
+        })
+        .await?;
     Ok(Json(ListResponse { items }))
 }
 
@@ -230,9 +253,12 @@ pub(super) async fn revoke_account_invitation(
     let invitation = workos
         .revoke_account_invitation(&account, &invitation_id)
         .await?;
+    let saved_invitation = invitation.clone();
+    let organization_id = account.workos_organization_id;
     state
         .store
-        .record_invitation(&invitation, &account.workos_organization_id)?;
+        .execute(move |store| store.record_invitation(&saved_invitation, &organization_id))
+        .await?;
     Ok(Json(invitation))
 }
 
@@ -248,15 +274,23 @@ pub(super) async fn list_account_members(
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     let items = workos.list_account_members(&account).await?;
-    for member in &items {
-        state.store.upsert_membership_shadow(
-            &member.membership_id,
-            &account.id,
-            &member.user.id,
-            &member.role_slug,
-            &member.status,
-        )?;
-    }
+    let saved_items = items.clone();
+    let account_id = account.id;
+    state
+        .store
+        .execute(move |store| {
+            for member in &saved_items {
+                store.upsert_membership_shadow(
+                    &member.membership_id,
+                    &account_id,
+                    &member.user.id,
+                    &member.role_slug,
+                    &member.status,
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
     Ok(Json(ListResponse { items }))
 }
 
@@ -297,13 +331,20 @@ pub(super) async fn update_account_member(
     let member = workos
         .update_account_member(&account, &membership_id, &request.role_slug)
         .await?;
-    state.store.upsert_membership_shadow(
-        &member.membership_id,
-        &account.id,
-        &member.user.id,
-        &member.role_slug,
-        &member.status,
-    )?;
+    let saved_member = member.clone();
+    let account_id = account.id;
+    state
+        .store
+        .execute(move |store| {
+            store.upsert_membership_shadow(
+                &saved_member.membership_id,
+                &account_id,
+                &saved_member.user.id,
+                &saved_member.role_slug,
+                &saved_member.status,
+            )
+        })
+        .await?;
     Ok(Json(member))
 }
 
@@ -342,13 +383,22 @@ pub(super) async fn deactivate_account_member(
     workos
         .deactivate_account_member(&account, &membership_id)
         .await?;
-    state.store.upsert_membership_shadow(
-        &target.membership_id,
-        &account.id,
-        &target.user.id,
-        &target.role_slug,
-        "inactive",
-    )?;
+    let membership_id = target.membership_id.clone();
+    let account_id = account.id;
+    let user_id = target.user.id.clone();
+    let role_slug = target.role_slug.clone();
+    state
+        .store
+        .execute(move |store| {
+            store.upsert_membership_shadow(
+                &membership_id,
+                &account_id,
+                &user_id,
+                &role_slug,
+                "inactive",
+            )
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

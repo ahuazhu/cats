@@ -1,147 +1,254 @@
 # Cats agent instructions
 
-## Repository state
+## Repository reality
 
-The repository contains the full Rust workspace implementation (V1 dev shape) plus architecture documents and validated experiments. Implemented and tested: ChunkStore engine (`blockd/`, spec in `docs/specs/blockd-protocol.md`) with both frontends — NBD (portable) and native vhost-user-blk (Linux, ADR-0015) — provider-neutral storage ports and adapters, workspace-scoped control plane and fleet administration/monitoring, separate embedded user and administrator web consoles with optional WorkOS AuthKit sessions, node agent (FakeVmm plus a Cloud Hypervisor Phase-A path, `--ch-block-path kernel-nbd|vhost-user`), guest agent (Unix socket plus real-Guest vsock), systemd as the default Guest PID 1 with ordinary enabled Linux services (ADR-0023), CLI, endpoint gateway — automated workspace tests include adapter contracts, crash injection, fencing, cross-workspace authorization, AuthKit PKCE/session scopes and refresh, schema migration, node drain and cross-node cold restore, plus Linux-only vhost-user-blk acceptance tests driven by a userspace VMM stand-in (`blockd/tests/vhost_user_blk.rs`). The Cloud Hypervisor path has also passed the 17-check AWS bare-metal acceptance run recorded under `experiments/metal-e2e-20260721/`. Both block paths have now passed the same 22/23 acceptance run on AWS `i4i.metal` with real KVM and Cloud Hypervisor, including Warm `vm.snapshot`/`--restore` state alignment, and a two-node cluster over real S3 + RDS PostgreSQL did cross-node Cold migration 12/12 (`experiments/vhost-user-blk-frontend-20260726/`, `experiments/metal-cluster-20260726/`). Kernel NBD stays the default block path for a measured write-throughput trade-off, not for lack of validation; the flip criteria are in ADR-0015. Concurrent cold launches are no longer serialized node-wide (per-Cat lock always, node-wide lock only for the kernel-NBD device allocation, bounded by a separate launch ceiling) and the commit path parallelizes its copy and hashing (FLUSH 1.6x-1.8x). Delta packs (ADR-0016) and golden roots (ADR-0017) have since landed and are no longer future work: a commit publishes each dirty chunk's dirty 64 KiB pages as a delta object instead of the whole 4 MiB chunk, and the exclusive barrier copies exactly the page set the pack uploads (`copy_planned_pages`), so the "copy only dirty pages" form the earlier note ruled out is what the code now does; a chunk carries at most `MAX_DELTA_LAYERS` (4) deltas over its base, so a cold chunk read fetches at most five objects, and `plan_commit` publishes a fresh full 4 MiB base instead whenever the Guest dirtied more than half the chunk or the chain is full. Root disks are provisioned by referencing a shared, content-addressed image namespace (`images/<image-id>/`, `BaseRef::image`, `ChunkEngine::provision_from_image`) rather than every Cat uploading a byte-identical private copy. NOT yet implemented: tap/overlay Guest networking beyond per-Cat taps, and privilege separation. Do not infer other modules exist because a design document names them; check the workspace.
+This repository contains a complete Rust V1 development system plus experiments and deployment
+code. Implemented and tested areas include `cats-blockd`, kernel-NBD and native vhost-user-blk,
+delta packs, golden roots, provider-neutral storage ports, S3/PostgreSQL adapters, a
+PostgreSQL-backed Workspace control plane, user/admin consoles, optional WorkOS sessions, CLI,
+Gateway, FakeVmm and Cloud Hypervisor Node paths, vsock Guest Agent, systemd Guest PID 1, usage
+metering, crash injection, fencing, authorization, drain and cross-node Cold restore.
 
-Quality gates for any change: `./scripts/quality.sh full` green. This checks Rust formatting and shared agent-skill contracts; rejects known security advisories, unapproved licenses and dependency sources, new transitive version splits, wildcard or inconsistent workspace dependencies, and unused direct dependencies; builds the workspace before tests; runs Clippy with warnings denied; and runs all workspace tests and rustdoc. Use `./scripts/quality.sh fast` while iterating.
+Do not confuse that with completed production HA. The Rust control path is still V1:
+`desired_state/observed_state/generation -> NodeJob`, an in-memory job journal, a full local runtime
+ledger and heartbeat state overwrite. The accepted target is ADR-0040/0041/0042:
 
-The workspace tests need a disposable PostgreSQL for the control store
-(ADR-0031): `quality.sh` starts one through docker automatically, CI provides
-a service container, and setting `CATS_TEST_POSTGRES_URL` yourself skips the
-docker path. Tests fail loudly rather than skip when neither is available.
+```text
+PostgreSQL DesiredRuntimeSpec(revision)
+  -> Node per-Cat level-triggered reconcile
+  -> physical inventory + one bounded RuntimeCheckpoint
+  -> observation-only status and exact Operation settlement
+```
 
-The dependency gate uses pinned tool versions:
+Implement this target as one coherent clean-slate vertical cutover across schema, Controller, Node
+reconcile, disk binding, heartbeat, Operation settlement and Route admission, following
+[`docs/operations-ha.md` §8](docs/operations-ha.md#8-首次终态部署). The exact release contains one
+empty target schema and one protocol version; all old components, parser/write paths and credentials
+leave service before it starts. In that release,
+`DesiredRuntimeSpec` is the sole lifecycle intent, the per-Cat reconciler is the sole physical-effect
+executor, `RuntimeCheckpoint` is the sole restart record and status remains observation-only. These
+four facts are the complete coordination authority of that release.
+
+Known blockers that must have characterization tests before the cutover:
+
+- ambiguous AttachDisk completion can leave a physical mount after the control binding rolls back;
+- stale generation Jobs/observations can act on or settle a newer runtime;
+- current acquire has no expected-owner/takeover authority, so ordinary Start can replace an expired
+  owner that still holds unique Relaxed `R < L` data;
+- an Agent crash between a physical effect and ledger write can orphan a runtime or local journal;
+- same-node dual Agents have no Host-global lock or PostgreSQL AgentSession fence;
+- V1 Route Grants have no independent Node installed/closed admission gate;
+- PersistentDisk attach has no filesystem UUID, format authority or Guest mount-readiness result;
+- the control Store serializes synchronous PostgreSQL work and can block async request workers;
+- product DiskSnapshot roots are not yet protected by GC and have no finished same-disk restore path;
+  this is separate from the local WarmRuntimeSnapshot path.
+
+Not implemented: Runtime Reconciliation v1, Route Grant v2, Volume Authority, automatic cloud/BMC
+Host fencing, cross-Node Guest overlay and privilege separation. HTTP/WebSocket endpoint bridges
+and dev E2E exist; the real Cloud Hypervisor/production WebSocket qualification is still missing.
+Check the workspace before claiming any module or behavior exists.
+
+## Required reading
+
+Read in this order before a cross-component change:
+
+1. [`docs/architecture.md`](docs/architecture.md)
+2. [`docs/README.md`](docs/README.md) for current versus target status
+3. Accepted task-relevant ADRs, especially:
+   - lifecycle: ADR-0002 and ADR-0040
+   - route/admission: ADR-0041
+   - storage: ADR-0003, 0005, 0015, 0016, 0017, 0021, 0022, 0025 and 0042
+   - ownership/HA: ADR-0018, 0031, 0032, 0034 and 0038
+4. Task-specific contract:
+   - [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md)
+   - [`docs/storage.md`](docs/storage.md)
+   - [`docs/operations-ha.md`](docs/operations-ha.md)
+   - [`docs/specs/runtime-reconciliation-v1.md`](docs/specs/runtime-reconciliation-v1.md)
+   - [`docs/specs/route-grant-v2.md`](docs/specs/route-grant-v2.md)
+   - [`docs/specs/volume-authority.md`](docs/specs/volume-authority.md)
+   - [`docs/specs/blockd-protocol.md`](docs/specs/blockd-protocol.md)
+5. Experiment reports and raw evidence only when a measured claim matters.
+
+Superseded ADRs are tombstones, not implementation authority. Git history is the documentation
+archive.
+
+## Source-of-truth precedence
+
+When sources disagree:
+
+1. Accepted, non-superseded ADRs decide component boundaries and failure semantics.
+2. Frozen/implemented specs decide current protocols; target specs decide an explicitly scoped
+   cutover that is not yet implemented.
+3. Rust/SQL and calibrated tests decide what the repository does today.
+4. Raw experiment data decides measured facts.
+5. Architecture prose composes those facts but cannot manufacture implementation status.
+
+Never turn a prototype or one metal run into a production SLA. Preserve sample count, environment,
+measurement boundary and correctness oracle when citing a number.
+
+## Non-negotiable invariants
+
+- The Guest sees standard virtio block devices and unmodified ext4. It never receives object-store
+  or MetadataStore credentials.
+- A PersistentDisk is RWO in V1. Exactly one attachment epoch may publish writes; old epochs fail
+  closed even when an old Host returns.
+- Strict successful FLUSH is remotely durable and must survive permanent Host loss.
+- Relaxed successful FLUSH may advance local `L` while remote `R < L`. Pending packs in that window
+  are unique data, not deletable cache. Local NVMe is fully disposable only when every retained
+  volume has `R == L`.
+- Warm, Cold, Snapshot, detach and planned migration require retained volumes at `R == L`.
+- Do not upload an entire sparse virtual disk to commit a small dirty set. Current commits publish
+  dirty 64 KiB pages as deltas, bounded to four delta layers before a fresh base.
+- Lifecycle states are Running / Suspended / Warm / Cold. Suspended retains the VMM and may page out;
+  Warm retains a local snapshot and exits the VMM. Both are Host-bound and must not be merged.
+- Suspended resume or Warm restore failure protects unique local data first, then converges to a
+  provable Cold fallback.
+- A heartbeat timeout is suspicion, not fencing. Planned handoff requires exact release followed by
+  normal acquire; unplanned cross-Node recovery requires a trusted external HostFenceEvent and an
+  exact per-volume takeover authorization.
+- Ordinary reconcile never steals/revokes another writer. It reports
+  `Blocked(SupersededByAnotherNode)`.
+- A normal acquire only accepts the exact unowned epoch; retrying the same transition returns its
+  original grant. Volume capacity is immutable in the first terminal release.
+- Leaving Running closes local route admission and drains active guards before touching Guest, VMM,
+  blockd or attachments.
+- Route Grants bind runtime incarnation and one per-Endpoint serving epoch, not the global desired
+  revision. An actual gate close can reopen only after a fresh Desired raises that Endpoint epoch;
+  unchanged Endpoints do not churn when another Endpoint changes.
+- RootDisk follows the Cat. PersistentDisk is independent. Only explicitly disposable Root destroy
+  may discard a local tail, and only after an exact authorization CAS changes the current Owned
+  volume to Deleting and fences its epoch. Unknown disks and PersistentDisk discard fail closed.
+- Missing/corrupt checkpoints or incomplete inventory produce Blocked/Quarantined, never guessed
+  Cold and never blind directory deletion.
+- A full inventory establishes a session-bound admission attestation. Partial heartbeats may update
+  Cat observations but cannot replace that attestation or manufacture a complete scan.
+- Guest optional runtime capabilities use HTTP/1.1 on `/run/cats/runtime.sock`; they require no Cats
+  SDK/CLI or fixed TCP/UDP port. The VMM never opens this Guest-local socket.
+- Do not hard-code cloud account IDs, buckets, instances, credentials or Host paths.
+
+## Storage boundary
+
+Direct-OS ChunkStore is the selected backend. Core contracts live in `storage/`; provider code lives
+in `adapters/`. AWS S3 is an adapter, not a dependency of storage semantics. The current Rust engine
+is the implementation and `docs/storage.md`/`docs/specs/blockd-protocol.md` describe it. A backend
+change requires a new ADR and equivalent correctness evidence.
+
+MetadataStore owner/epoch/root CAS is the writer authority. Its epoch prevents stale remote publish,
+but does not prove an old VMM or Host stopped. Route TTL and heartbeat timeout cannot replace Host
+fencing.
+
+## Workspace isolation
+
+Every independent feature or bug fix gets its own branch and worktree under `.worktrees/`. Never
+develop in the primary checkout: tests spawn processes and rewrite state, and the primary checkout
+may contain the user's work.
+
+```bash
+git worktree add -b fix/<slug> .worktrees/<slug>
+```
+
+Never stash or reset the primary checkout to make room. Remove a worktree only after its branch has
+merged. Preserve unrelated dirty files in every checkout.
+
+## Quality gates
+
+Use:
+
+```bash
+./scripts/quality.sh fast
+./scripts/quality.sh full
+```
+
+`full` is required before handoff. It checks formatting and shared skill links; dependency security,
+licenses, sources, version splits and workspace inheritance; build-before-test; Clippy with warnings
+denied; workspace tests and rustdoc.
+
+The control-store tests require disposable PostgreSQL. `quality.sh` starts Docker PostgreSQL, CI has
+a service container, and `CATS_TEST_POSTGRES_URL` can provide one. Tests fail rather than skip when
+none exists.
+
+Pinned dependency tools:
 
 ```bash
 cargo install --locked cargo-deny --version 0.19.4
 cargo install --locked cargo-machete --version 0.9.2
 ```
 
-Shared audit, refactor, and PR-review workflows live canonically under `agent-skills/` and are linked into both `.agents/skills/` and `.claude/skills/`. Keep the audit and review workflows read-only unless the user explicitly asks for fixes.
-
-The vhost-user-blk frontend and the node agent's Linux-only code compile out on macOS, so a change touching either must also be gated on Linux. Without a Linux box, a container is enough (no KVM needed for the protocol tests):
+Changes touching Linux-only vhost-user-blk or Node code also require a Linux gate. The final gate is
+native `quality.sh full` on the configured x86_64 build host. When that host is unavailable during
+iteration, use the Docker compatibility gate:
 
 ```bash
 ./scripts/quality.sh linux
 ```
 
-The script keeps the target directory in a Docker volume, not in the bind-mounted repository: the shared macOS filesystem is slow and has produced spurious "can't find crate" failures mid-build. Override the defaults with `CATS_LINUX_PLATFORM`, `CATS_LINUX_TARGET_VOLUME`, or `CATS_LINUX_JOBS` when needed. The Linux gate defaults to two Cargo jobs to avoid parallel linker OOMs in constrained Docker runtimes, and child Cargo processes inherit the same limit. `cargo build` must come first because some integration tests shell out to `cargo build` for helper binaries and would otherwise deadlock on the build-directory lock.
+The Docker Linux gate deliberately builds first and uses a target volume with bounded Cargo jobs.
+Report exact commands and results, and separate pre-existing failures from regressions.
 
-## Working agreement
+Every `quality.sh` run prints the absolute repository root, HEAD, dirty flag and a fingerprint covering
+the tracked diff plus untracked files. A result without this provenance is not evidence for a worktree.
+Use the configured native x86_64 Linux test host for final Linux build/test and real integration work;
+deliver an exact clean commit through the existing content-addressed source bundle and retain its
+immutable build receipt. Do not rebuild an ad-hoc test environment when that host and the repository
+scripts already cover the gate.
 
-### Workspace isolation
+If the same environment or tool failure recurs, stop retrying the same manual steps. Fix or add the
+repository script first. Promote the workflow to a shared skill only when it recurs across tasks and
+requires agent judgment beyond a deterministic script.
 
-Every independent feature or bug fix gets its own git worktree at
-`.worktrees/<issue-id>`, on its own branch. Do not develop in the primary
-checkout: the quality gate and the storage/lifecycle tests spawn real processes
-and rewrite state directories, and the primary checkout is where the user's own
-uncommitted work and untracked notes live.
+## Change discipline
 
-```bash
-git worktree add -b fix/<short-slug> .worktrees/99
-```
-
-Without an issue, name the directory after the branch slug. Never `git stash` in
-the primary checkout to free it for another task — that is exactly what a second
-worktree is for. Remove the worktree once its branch has merged
-(`git worktree remove .worktrees/<issue-id>`).
-
-### Verification
-
-- Run `./scripts/quality.sh fast` while iterating and `./scripts/quality.sh full` before handoff.
-- Report the exact verification commands run and their results.
-- Clearly separate pre-existing failures from regressions introduced by the change.
-- Run `./scripts/quality.sh linux` when a change touches code that compiles out on macOS.
-
-### Change discipline
-
-- Preserve observable behavior unless the task explicitly changes it.
-- Before a non-trivial refactor, identify or add characterization tests.
-- Keep each patch focused on one coherent purpose; do not perform unrelated cleanup.
-- Do not add a production dependency without explaining why the standard library and existing dependencies are insufficient.
-- Inherit shared dependency versions from `[workspace.dependencies]`; keep any policy exception in `deny.toml` version-scoped and explain why it is needed.
-- Do not change public APIs, protocols, persisted formats or lifecycle semantics unless the task requires it.
-- Never silence a lint globally to make CI pass. Keep any new suppression as narrow as possible and document the invariant or reason.
+- Preserve observable behavior unless the task explicitly changes a contract.
+- Before a non-trivial refactor or protocol cutover, add characterization tests for confirmed failure
+  modes. A negative probe must be calibrated against a known positive.
+- Keep a patch focused. Do not bundle unrelated cleanup with behavior changes.
+- Do not add a production dependency without explaining why std/existing dependencies are
+  insufficient. Inherit versions from `[workspace.dependencies]`.
+- Do not change public APIs, Guest ABI, storage formats or lifecycle semantics implicitly.
+- Never globally silence a lint. Keep any suppression narrow and document the invariant.
 - Do not introduce an abstraction without a current boundary or multiple real uses.
+- Ambiguous external responses require postcondition discovery; do not blindly roll back or repeat a
+  destructive effect.
+- Audit logging is not a recovery protocol and may not become an authority.
 
-### Rust conventions
+## Rust conventions
 
-- Fallible input, request, persistence and background-worker paths must return errors rather than panic.
-- Use `unwrap` or `expect` only in tests or for a locally proven invariant that is obvious or documented.
-- Do not hold a mutex or rwlock guard across `.await`, and do not put blocking work directly on an async executor.
-- Prefer enums and domain-specific newtypes over new boolean-flag APIs or string protocols.
-- Default visibility to private or `pub(crate)`; expose only deliberate public API.
-- Avoid cloning data merely to satisfy the borrow checker; document intentionally expensive clones.
-- Keep unsafe code small and isolated. Every unsafe block must explain its safety invariant.
-- Do not leak framework-specific types across a domain or provider-neutral boundary without a concrete reason.
+- Fallible input, request, persistence and worker paths return errors rather than panic.
+- `unwrap`/`expect` belong in tests or obvious, documented local invariants.
+- Do not hold mutex/rwlock guards across `.await`; do not run blocking work on async executors.
+- Prefer enums/newtypes over boolean flags and string protocols.
+- Default visibility to private or `pub(crate)`; public API is deliberate.
+- Avoid clones merely to satisfy the borrow checker; document intentionally expensive clones.
+- Keep unsafe code isolated and explain every safety invariant.
+- Do not leak framework/provider types across domain or provider-neutral boundaries without cause.
 
-### Testing
+## Testing and review
 
-- Test externally observable behavior rather than private implementation details.
-- Bug fixes require a regression test that fails before the fix.
-- Refactors must not weaken existing assertions.
-- Parsers, decoders and other untrusted-input boundaries need malformed-input and boundary-value coverage.
-- Concurrency changes must cover cancellation, shutdown and resource cleanup when relevant.
+- Test observable behavior, not private implementation details.
+- Bug fixes require a regression that fails before the fix.
+- Refactors cannot weaken assertions.
+- Untrusted parsers need malformed and boundary coverage.
+- Concurrency changes cover cancellation, shutdown, restart and resource cleanup.
+- Lifecycle/storage changes cover crash points, ambiguous responses, stale identity and fencing.
 
-### Review priorities
-
-Review in this order:
+Review priority:
 
 1. Correctness and data loss.
 2. Memory safety and concurrency.
-3. Error handling and cancellation.
-4. Public API and architecture boundaries.
+3. Error handling, ambiguity and cancellation.
+4. Public API and authority boundaries.
 5. Missing tests.
 6. Maintainability.
 
-Do not report formatting issues already covered by Rustfmt or Clippy.
-
-## Read before implementation
-
-Read in this order:
-
-1. All ADRs in [`docs/decisions/`](docs/decisions/): [`0001` greenfield baseline](docs/decisions/0001-greenfield-implementation-baseline.md), [`0002` lifecycle states](docs/decisions/0002-lifecycle-states-running-suspended-warm-cold.md), [`0003` storage backend](docs/decisions/0003-direct-s3-chunkstore-backend.md), [`0004` stack and dev environment](docs/decisions/0004-implementation-stack-and-dev-environment.md), [`0005` provider-neutral storage ports and adapters](docs/decisions/0005-provider-neutral-storage-ports-and-adapters.md), [`0006` WorkOS AuthKit browser identity](docs/decisions/0006-workos-authkit-for-browser-identity.md), [`0007` Guest Runtime HTTP over Unix socket](docs/decisions/0007-guest-runtime-http-over-unix-socket.md), [`0015` vhost-user-blk production block frontend](docs/decisions/0015-vhost-user-blk-production-block-frontend.md), [`0018` Workspace is the only resource owner](docs/decisions/0018-remove-the-v1-project-compatibility-layer.md), [`0023` systemd Guest PID 1](docs/decisions/0023-systemd-as-the-default-guest-init.md)
-2. [`docs/cats-complete-product-technical-architecture.md`](docs/cats-complete-product-technical-architecture.md)
-3. The task-specific design:
-   - storage (selected backend, ADR-0003; Direct-OS 形态的 Direct-S3 实现): [`docs/direct-s3-chunkstore-architecture.md`](docs/direct-s3-chunkstore-architecture.md)
-   - lifecycle (Running/Suspended/Warm/Cold, ADR-0002): [`docs/cats-sleep-wake-vmm-resource-reclamation.md`](docs/cats-sleep-wake-vmm-resource-reclamation.md)
-   - historical JuiceFS alternative (not pursued): [`docs/cats-storage-product-blueprint.md`](docs/cats-storage-product-blueprint.md)
-4. [`docs/experiments-2026-07-21-storage-lifecycle.md`](docs/experiments-2026-07-21-storage-lifecycle.md) and the linked raw CSV/log evidence.
-
-## Source-of-truth precedence
-
-When documents disagree, use this order:
-
-1. Accepted ADRs for cross-component decisions.
-2. Raw experiment data for measured facts.
-3. Markdown architecture documents for implementation intent.
-4. HTML companions for visual presentation.
-5. External/Sprite reference material for background only.
-
-Never turn a prototype measurement into a production SLA. Preserve sample count, environment, measurement boundary and correctness oracle when citing a number.
-
-## Non-negotiable invariants
-
-- The Guest sees standard virtio block devices and unmodified ext4; it never receives object-store or metadata-store credentials.
-- Local NVMe is a deletable cache. A successful durable FLUSH must survive permanent Host loss.
-- Do not upload an entire sparse virtual disk to commit a small dirty working set.
-- A PersistentDisk is RWO in V1. Exactly one fencing epoch may publish writes.
-- Old attachment epochs must fail closed, even if an old Host returns after a partition.
-- Lifecycle states are Running / Suspended (pause + page-out) / Warm (snapshot + VMM exit) / Cold (ADR-0002). Suspended and Warm are host-bound; do not merge them into one "sleep" state.
-- Suspended resume or Warm restore failure must converge to a clean Cold fallback.
-- RootDisk lifecycle follows the Cat; PersistentDisk lifecycle is independent.
-- Guest user programs access optional runtime capabilities through HTTP/1.1 on `/run/cats/runtime.sock`; they must not require a Cats SDK/CLI or a fixed TCP/UDP port. The VMM never accesses this Guest-local socket.
-- Do not hard-code cloud account IDs, buckets, instance IDs, credentials or Host paths.
-
-## Backend status
-
-Direct-OS ChunkStore (Direct-S3 implementation: S3 immutable objects + PostgreSQL root/lease CAS) is the selected storage backend per ADR-0003. Do not implement the JuiceFS-backed sparse `disk.raw` design; `docs/cats-storage-product-blueprint.md` is historical reference only. The current Python/NBD prototype proves semantics and serves as a correctness oracle; the production target is the Rust `cats-blockd` described in the Direct-S3 document.
-
-Storage code follows Ports and Adapters per ADR-0005. Provider-neutral contracts live in `cats-storage`; concrete provider/product code lives in `adapters/`. AWS S3 is the first durable object-store adapter, not a dependency of core storage semantics.
+Do not report formatting already enforced by Rustfmt/Clippy. Shared audit/refactor/review workflows
+live canonically in `agent-skills/` and are symlinked into `.agents/skills/` and `.claude/skills/`.
 
 ## Documentation maintenance
 
-Every visual HTML design has a same-name Markdown companion for agents. When a decision or invariant changes, update both formats or make the Markdown/ADR change explicit. Mermaid diagrams in Markdown are manually maintained; rerunning `tools/html_to_agent_md.lua` leaves diagram markers that must be replaced before commit.
-
-Keep experiment source, formal result CSVs and failed crash evidence. Generated caches such as `__pycache__` must not be committed.
+- Architecture is Markdown-only. Do not recreate static HTML companions.
+- Keep one canonical explanation per fact and link to it; do not copy rolling status or benchmark
+  tables across README/ADRs.
+- A decision changing a protocol, persisted format, failure semantic or authority gets a new ADR.
+- Leave superseded ADRs as short tombstones. Delete rejected/unimplemented specs; Git is the archive.
+- Preserve experiment source, CSVs, environment reports, raw logs and failed crash evidence.
+- Generated caches such as `__pycache__` must not be committed.

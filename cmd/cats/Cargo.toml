@@ -25,6 +25,9 @@ futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 crossterm = { workspace = true }
 fs2 = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { workspace = true }

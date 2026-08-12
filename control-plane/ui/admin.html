@@ -44,9 +44,9 @@
       <a class="brand" href="/"><img class="brand-mark" src="/assets/cats-mark.svg" alt=""><span><strong>Cats</strong><small data-i18n="brand.adminConsole">Admin Console</small></span></a>
       <div class="context-card admin-context"><small data-i18n="admin.context.label">PLATFORM</small><strong>Fleet</strong><span data-i18n="admin.context.description">Global administration boundary</span></div>
       <nav class="nav-list" data-i18n-aria-label="admin.nav.aria" aria-label="Administrator console navigation">
-        <button class="nav-item is-active" data-view="overview"><span>⌁</span><b data-i18n="admin.nav.overview">Fleet overview</b></button>
-        <button class="nav-item" data-view="nodes"><span>▦</span><b data-i18n="admin.nav.nodes">Worker nodes</b></button>
-        <button class="nav-item" data-view="metrics"><span>⌇</span><b data-i18n="admin.nav.metrics">Metrics</b></button>
+        <button class="nav-item" data-view="overview" hidden><span>⌁</span><b data-i18n="admin.nav.overview">Fleet overview</b></button>
+        <button class="nav-item" data-view="nodes" hidden><span>▦</span><b data-i18n="admin.nav.nodes">Worker nodes</b></button>
+        <button class="nav-item is-active" data-view="metrics"><span>⌇</span><b data-i18n="admin.nav.metrics">Metrics</b></button>
       </nav>
       <div class="sidebar-footer">
         <label class="language-picker language-picker-sidebar">
@@ -66,11 +66,11 @@
     <main class="workspace">
       <header class="topbar">
         <button class="mobile-menu" id="mobile-menu" data-i18n-aria-label="user.mobileMenu" aria-label="Open navigation">☰</button>
-        <div><span class="breadcrumb"><span data-i18n="admin.breadcrumb">Platform /</span> <b>Fleet</b></span><h1 id="view-title" data-i18n="admin.nav.overview">Fleet overview</h1></div>
-        <div class="topbar-actions"><span class="live-indicator admin-live"><i></i><span data-i18n="admin.autoRefresh">Auto refresh</span></span><button class="button button-quiet" id="refresh-button" data-i18n="common.refresh">Refresh</button></div>
+        <div><span class="breadcrumb"><span data-i18n="admin.breadcrumb">Platform /</span> <b>Fleet</b></span><h1 id="view-title" data-i18n="admin.nav.metrics">Metrics</h1></div>
+        <div class="topbar-actions"><button class="button button-quiet" id="refresh-button" data-i18n="common.refresh">Refresh</button></div>
       </header>
       <div class="content">
-        <section class="view is-active" id="view-overview">
+        <section class="view" id="view-overview" hidden>
           <div class="metric-grid" id="admin-metrics"></div>
           <div class="dashboard-grid">
             <section class="panel panel-span-2"><header class="panel-header"><div><small data-i18n="section.capacity">CAPACITY</small><h2 data-i18n="admin.capacity.title">Schedulable resource allocation</h2></div><span class="timestamp" id="generated-at"></span></header><div class="capacity-grid" id="capacity-grid"></div></section>
@@ -79,7 +79,7 @@
           </div>
         </section>
 
-        <section class="view" id="view-nodes">
+        <section class="view" id="view-nodes" hidden>
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="admin.nodes.eyebrow">FLEET MANAGEMENT</small><h2 data-i18n="admin.nodes.title">Worker nodes</h2><p data-i18n="admin.nodes.description">Heartbeat loss preserves claims. Fence only after the old Host is externally stopped or isolated.</p></div></header>
             <div class="table-wrap"><table><thead><tr><th data-i18n="common.node">Node</th><th data-i18n="common.status">Status</th><th data-i18n="admin.nodes.assignments">Assignments</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="admin.nodes.heartbeat">Heartbeat</th><th data-i18n="admin.nodes.telemetry">Host telemetry</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="nodes-table"></tbody></table></div>
@@ -87,14 +87,14 @@
           </section>
         </section>
 
-        <section class="view" id="view-metrics">
+        <section class="view is-active" id="view-metrics">
           <section class="panel"><header class="panel-header"><div><small data-i18n="section.prometheus">PROMETHEUS</small><h2 data-i18n="admin.metrics.title">Live metrics</h2><p data-i18n="admin.metrics.description">Read from the same control plane using administrator credentials.</p></div><button class="button button-quiet" id="copy-metrics" data-i18n="common.copy">Copy</button></header><pre class="metrics-output" id="metrics-output" data-i18n="common.loading">Loading…</pre></section>
         </section>
       </div>
     </main>
   </div>
 
-  <dialog class="modal modal-node" id="node-detail-dialog">
+  <dialog class="modal modal-node" id="node-detail-dialog" hidden>
     <form method="dialog">
       <header>
         <div><small data-i18n="admin.nodeDetail.eyebrow">WORKER DETAIL</small><h2 id="node-detail-title" data-i18n="admin.nodeDetail.title">Node Cats</h2></div>

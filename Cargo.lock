@@ -978,9 +978,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hex",
+ "libc",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 
@@ -1027,6 +1030,7 @@ dependencies = [
  "cats-api",
  "cats-block-client",
  "cats-blockd",
+ "cats-control-plane",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
@@ -1034,6 +1038,8 @@ dependencies = [
  "cats-storage",
  "cats-test-support",
  "clap",
+ "libc",
+ "postgres",
  "serde_json",
  "tempfile",
  "tracing",
@@ -1054,13 +1060,16 @@ dependencies = [
  "fs2",
  "futures-util",
  "keyring",
+ "libc",
  "open",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "uuid",
  "workos",
 ]
 
@@ -1072,22 +1081,30 @@ dependencies = [
  "axum",
  "base64",
  "cats-api",
+ "cats-blockd",
  "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-storage",
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
+ "loom",
  "native-tls",
  "postgres",
  "postgres-native-tls",
  "reqwest",
+ "ring",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "uuid",
@@ -1099,10 +1116,13 @@ name = "cats-control-plane-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cats-api",
  "cats-control-plane",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
+ "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "cats-usage-store-aws-stream",
  "cats-usage-store-postgres",
@@ -1127,15 +1147,14 @@ dependencies = [
  "cats-network",
  "cats-node-agent",
  "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
- "futures-util",
  "hex",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
@@ -1168,11 +1187,13 @@ dependencies = [
 name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [
+ "cats-control-plane",
  "cats-storage",
  "cats-test-support",
  "native-tls",
  "postgres",
  "postgres-native-tls",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1205,20 +1226,24 @@ name = "cats-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-config",
- "aws-sdk-dynamodb",
  "axum",
  "base64",
+ "bytes",
  "cats-api",
- "clap",
  "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1228,26 +1253,39 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bytes",
  "cats-api",
  "cats-block-client",
+ "cats-blockd",
+ "cats-control-plane",
+ "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
+ "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
  "futures-util",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "libc",
  "reqwest",
+ "ring",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "vhost",
 ]
 
 [[package]]
@@ -1257,14 +1295,13 @@ dependencies = [
  "anyhow",
  "cats-api",
  "cats-metadata-store-postgres",
- "cats-metadata-store-sqlite",
  "cats-node-agent",
+ "cats-object-store-aws-s3",
+ "cats-object-store-file",
  "cats-storage",
  "clap",
- "libc",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -1296,6 +1333,10 @@ dependencies = [
 name = "cats-storage"
 version = "0.1.0"
 dependencies = [
+ "cats-api",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
 ]
 
@@ -2048,6 +2089,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "generator"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2633,6 +2689,19 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lru"
@@ -3603,6 +3672,12 @@ checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"
@@ -4800,6 +4875,15 @@ dependencies = [
  "regex",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

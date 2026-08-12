@@ -2,14 +2,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
 use std::io::Write;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
-const SCHEMA_PATH: &str = "control-plane/src/store/schema.rs";
-const SCHEMA_VERSION_PATTERN: &str = r"s/^(pub\(super\)[[:space:]]+)?const[[:space:]]+SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p";
-const OLDEST_MIGRATABLE_PATTERN: &str = r"s/^(pub\(super\)[[:space:]]+)?const[[:space:]]+OLDEST_MIGRATABLE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\2/p";
+const SCHEMA_PATH: &str = "storage/src/authority.rs";
+const SCHEMA_VERSION_PATTERN: &str = r"s/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -82,10 +86,10 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
         .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
         .map(|(section, _)| section)
         .expect("control-plane Deployment section");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .map(|(_, section)| section)
-        .expect("Gateway Deployment section");
+    assert!(
+        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
+        "the V1 Gateway must remain undeployed during the v2 cutover"
+    );
     for fragment in [
         "kubernetes_secret_v1.route_grant_signing",
         "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
@@ -94,10 +98,6 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
         assert!(
             control.contains(fragment) || kubernetes.contains(fragment),
             "control-plane Route Grant delivery lost {fragment:?}"
-        );
-        assert!(
-            !gateway.contains(fragment),
-            "Gateway must never receive Route Grant signing material: {fragment:?}"
         );
     }
     for fragment in [
@@ -136,8 +136,7 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(workflow.contains("openssl pkey"));
     assert!(workflow.contains("^ED25519 Private-Key:"));
     assert!(workflow.contains("-pubout"));
-    assert!(workflow.contains("route-grant-public.sha256"));
-    assert!(workflow.contains("-outform DER"));
+    assert!(!workflow.contains("route-grant-public.sha256"));
     assert!(workflow.contains(
         "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
     ));
@@ -147,80 +146,292 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(workflow.contains("route_grant_public_key_pem: $route_grant_public_key_pem"));
 
     let dev = read_workspace_file("scripts/dev.sh");
-    assert!(dev.contains("--route-grant-private-key-file"));
-    assert!(dev.contains("--route-grant-public-key-file"));
+    assert!(dev.contains("signed Agent-registration cutover"));
+    assert!(dev.contains("provisioner-owned /etc/cats/identity"));
+    assert!(!dev.contains("--node-id"));
+    assert!(!dev.contains("--state-dir"));
 }
 
 #[test]
-fn gateway_replicas_share_only_already_signed_route_grants_outside_postgres() {
-    let infrastructure =
-        read_workspace_file("deploy/aws/terraform/modules/route-cache-infrastructure/main.tf");
-    for expected in [
-        "resource \"aws_dynamodb_table\" \"route_grants\"",
-        "billing_mode = \"PAY_PER_REQUEST\"",
-        "hash_key     = \"hostname\"",
-        "attribute_name = \"expires_at_unix\"",
-        "point_in_time_recovery",
-        "server_side_encryption",
-        "\"dynamodb:GetItem\"",
-        "\"dynamodb:PutItem\"",
-        "resource \"aws_eks_pod_identity_association\" \"gateway\"",
-        "service_account = var.gateway_service_account_name",
+fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
+    for removed in [
+        "deploy/aws/terraform/modules/route-cache-infrastructure/main.tf",
+        "deploy/aws/terraform/modules/route-cache-infrastructure/variables.tf",
+        "deploy/aws/terraform/modules/route-cache-infrastructure/outputs.tf",
+        "deploy/aws/check-route-grant-nodes.sh",
+        "deploy/metal/systemd/cats-gatewayd.service",
     ] {
         assert!(
-            infrastructure.contains(expected),
-            "shared Route cache infrastructure lost {expected:?}"
+            !workspace_root().join(removed).exists(),
+            "legacy production artifact still exists: {removed}"
         );
     }
+
+    for path in [
+        "deploy/aws/terraform/modules/cats-kubernetes/main.tf",
+        "deploy/aws/terraform/modules/cats-kubernetes/variables.tf",
+        "deploy/aws/terraform/modules/cats-kubernetes/outputs.tf",
+        "deploy/aws/terraform/stacks/production-application/main.tf",
+        "deploy/aws/terraform/stacks/production-application/variables.tf",
+        "deploy/aws/terraform/stacks/production-application/outputs.tf",
+        "deploy/aws/terraform/stacks/production-infrastructure/main.tf",
+        "deploy/aws/terraform/stacks/production-infrastructure/outputs.tf",
+        ".github/workflows/deploy-production.yml",
+        "deploy/aws/Dockerfile.control-plane",
+    ] {
+        let source = read_workspace_file(path);
+        for forbidden in [
+            "CATS_SHARED_ROUTE_CACHE_TABLE",
+            "shared_route_cache_table",
+            "ROUTE_CACHE_TABLE_NAME",
+            "route_cache_infrastructure",
+            "cats-gatewayd",
+            "kubernetes_deployment_v1.gateway",
+            "kubernetes_service_v1.gateway",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} still ships or deploys legacy Gateway surface {forbidden:?}"
+            );
+        }
+    }
+
+    let manifest = read_workspace_file("network/Cargo.toml");
+    assert!(manifest.contains("legacy-test-harness"));
+    assert!(!manifest.contains("aws-sdk-dynamodb"));
+    assert!(!manifest.contains("aws-config"));
+
+    let binary = read_workspace_file("network/src/main.rs");
+    assert!(binary.contains("Route Grant v2 is not composed"));
+    assert!(binary.contains("ExitCode::FAILURE"));
     for forbidden in [
-        "dynamodb:Scan",
-        "dynamodb:Query",
-        "dynamodb:DeleteTable",
-        "dynamodb:CreateTable",
+        "cats_network::spawn",
+        "/v1/routes/resolve",
+        "/v1/routes/wake",
+        "/v1/cats/",
+        "CATS_SHARED_ROUTE_CACHE_TABLE",
+        "READY ",
     ] {
         assert!(
-            !infrastructure.contains(forbidden),
-            "Gateway Route cache identity gained unnecessary permission {forbidden:?}"
+            !binary.contains(forbidden),
+            "default Gateway binary retained legacy behavior {forbidden:?}"
+        );
+    }
+
+    let metal = read_workspace_file("deploy/metal/install.sh");
+    assert!(metal.contains("cats_retire_legacy_gateway \\"));
+    assert!(metal.contains("/etc/systemd/system/cats-gatewayd.service \\"));
+    assert!(metal.contains("/etc/systemd/system/multi-user.target.wants/cats-gatewayd.service \\"));
+    assert!(metal.contains("\"$PREFIX/bin/cats-gatewayd\""));
+    assert!(!metal.contains("systemctl disable --now cats-gatewayd.service"));
+    assert!(!metal.contains("cats cats-controld cats-noded cats-gatewayd"));
+    assert!(!metal.contains("enable --now cats-controld cats-gatewayd"));
+    assert!(!metal.contains("status cats-controld cats-gatewayd cats-noded"));
+
+    let deployment = read_workspace_file("deploy/aws/metal/worker-deployment-transaction.sh");
+    for expected in [
+        "cats_retire_legacy_gateway()",
+        "systemctl disable \"$service\"",
+        "[ \"$load_state\" = not-found ]",
+        "cats_stop_node_service \"$service\" || return 1",
+        "cats_require_node_service_stopped \"$service\" || return 1",
+        "rm -f -- \"$unit_file\" \"$wants_link\" \"$binary_file\"",
+    ] {
+        assert!(
+            deployment.contains(expected),
+            "legacy Gateway retirement lost {expected:?}"
+        );
+    }
+    assert!(!deployment.contains("disable --now cats-gatewayd.service 2>/dev/null || true"));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_gateway_retirement_fails_closed_before_removing_files() {
+    let fixture = tempfile::tempdir().expect("legacy Gateway retirement fixture");
+    let fake_bin = fixture.path().join("bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake systemctl directory");
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CATS_FAKE_SYSTEMCTL_TRACE"
+case "$1" in
+  disable)
+    case "$CATS_FAKE_SYSTEMCTL_MODE" in
+      absent|disable-fails-loaded) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  stop)
+    case "$CATS_FAKE_SYSTEMCTL_MODE" in
+      absent|active-stop-fails) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  show)
+    property=""
+    for argument in "$@"; do
+      case "$argument" in
+        --property=*) property=${argument#--property=} ;;
+      esac
+    done
+    case "$property:$CATS_FAKE_SYSTEMCTL_MODE" in
+      LoadState:absent) printf 'not-found\n' ;;
+      LoadState:*) printf 'loaded\n' ;;
+      ActiveState:active-after-stop) printf 'active\n' ;;
+      ActiveState:*) printf 'inactive\n' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .expect("write fake systemctl");
+    let mut permissions = std::fs::metadata(&systemctl)
+        .expect("fake systemctl metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&systemctl, permissions).expect("make fake systemctl executable");
+
+    let helper = workspace_root().join("deploy/aws/metal/worker-deployment-transaction.sh");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    for (mode, succeeds, removes_files) in [
+        ("stopped", true, true),
+        ("absent", true, true),
+        ("disable-fails-loaded", false, false),
+        ("active-stop-fails", false, false),
+        ("active-after-stop", false, false),
+    ] {
+        let case_dir = fixture.path().join(mode);
+        let systemd_dir = case_dir.join("etc/systemd/system");
+        let unit_file = systemd_dir.join("cats-gatewayd.service");
+        let wants_link = systemd_dir.join("multi-user.target.wants/cats-gatewayd.service");
+        let binary_file = case_dir.join("opt/cats/bin/cats-gatewayd");
+        for path in [&unit_file, &wants_link, &binary_file] {
+            std::fs::create_dir_all(path.parent().expect("artifact parent"))
+                .expect("create legacy artifact parent");
+            std::fs::write(path, b"legacy").expect("write legacy artifact");
+        }
+        let trace_file = case_dir.join("systemctl.trace");
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                ". \"$1\"; cats_retire_legacy_gateway \"$2\" \"$3\" \"$4\"",
+                "legacy-gateway-retirement-test",
+            ])
+            .arg(&helper)
+            .arg(&unit_file)
+            .arg(&wants_link)
+            .arg(&binary_file)
+            .env("CATS_FAKE_SYSTEMCTL_MODE", mode)
+            .env("CATS_FAKE_SYSTEMCTL_TRACE", &trace_file)
+            .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
+            .output()
+            .expect("run legacy Gateway retirement helper");
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "unexpected {mode} result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in [&unit_file, &wants_link, &binary_file] {
+            assert_eq!(
+                path.exists(),
+                !removes_files,
+                "{mode} left the wrong artifact state at {}",
+                path.display()
+            );
+        }
+
+        let trace = std::fs::read_to_string(&trace_file).expect("read systemctl trace");
+        assert!(trace.contains("disable cats-gatewayd.service"));
+        if mode == "disable-fails-loaded" {
+            assert!(!trace.contains("stop cats-gatewayd.service"));
+        } else {
+            assert!(trace.contains("stop cats-gatewayd.service"));
+        }
+        if mode == "active-after-stop" {
+            assert!(trace.contains("show cats-gatewayd.service --property=ActiveState --value"));
+        }
+    }
+}
+
+#[test]
+fn control_plane_image_manifest_access_is_exact_and_read_only() {
+    let identity = read_workspace_file("deploy/aws/terraform/modules/usage-infrastructure/main.tf");
+    let manifest_policy = identity
+        .split_once("data \"aws_iam_policy_document\" \"image_manifest_reader\"")
+        .and_then(|(_, rest)| {
+            rest.split_once("resource \"aws_iam_role_policy\" \"image_manifest_reader\"")
+        })
+        .map(|(section, _)| section)
+        .expect("image manifest IAM policy");
+    assert!(manifest_policy.contains("actions = [\"s3:GetObject\"]"));
+    assert!(manifest_policy.contains("${var.chunkstore_prefix}/images/*/manifest.json"));
+    for forbidden in [
+        "s3:ListBucket",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "/data/",
+        "/volumes/",
+    ] {
+        assert!(
+            !manifest_policy.contains(forbidden),
+            "manifest reader gained forbidden scope {forbidden}"
         );
     }
 
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .map(|(_, section)| section)
-        .expect("Gateway Deployment section");
+    let control = kubernetes
+        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
+        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
+        .map(|(section, _)| section)
+        .expect("control-plane Deployment section");
     for expected in [
-        "resource \"kubernetes_service_account_v1\" \"gateway\"",
-        "service_account_name",
-        "kubernetes_service_account_v1.gateway.metadata[0].name",
-        "CATS_SHARED_ROUTE_CACHE_TABLE",
-        "AWS_REGION",
+        "\"--object-store-adapter\"",
+        "\"aws-s3\"",
+        "bucket=${var.chunkstore_bucket_name}",
+        "region=${var.chunkstore_region}",
+        "prefix=${var.chunkstore_prefix}",
     ] {
         assert!(
-            kubernetes.contains(expected) || gateway.contains(expected),
-            "Gateway deployment lost shared Route cache wiring {expected:?}"
+            control.contains(expected),
+            "control-plane manifest adapter lost {expected:?}"
         );
     }
 
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    for expected in [
-        "ROUTE_CACHE_TABLE_NAME: ${{ vars.ROUTE_CACHE_TABLE_NAME }}",
-        "-var=\"shared_route_cache_table=$ROUTE_CACHE_TABLE_NAME\"",
-    ] {
-        assert!(
-            workflow.contains(expected),
-            "production deployment lost shared Route cache input {expected:?}"
-        );
-    }
+    assert!(workflow.contains("CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}"));
+    assert!(workflow.contains("-var=\"chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME\""));
 }
 
 #[test]
-fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() {
+fn production_deploy_has_no_legacy_route_grant_admin_preflight() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let verifier = read_workspace_file("deploy/aws/check-route-grant-nodes.sh");
-    let preflight = workflow
-        .find("- name: Check Route Grant verifier compatibility")
-        .expect("Route Grant compatibility preflight");
+    for forbidden in [
+        "Check Route Grant verifier compatibility",
+        "/v1/admin/nodes",
+        "route-grant-public.sha256",
+        "check-route-grant-nodes.sh",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "production deploy retained legacy Route Grant preflight {forbidden:?}"
+        );
+    }
+    assert!(
+        !workspace_root()
+            .join("deploy/aws/check-route-grant-nodes.sh")
+            .exists(),
+        "the unreachable V1 Node verifier must be removed with its workflow hook"
+    );
+
+    let initialize = workflow
+        .find("- name: Initialize application state")
+        .expect("application initialization step");
     let plan = workflow
         .find("- name: Plan production deployment")
         .expect("production plan step");
@@ -228,134 +439,50 @@ fn route_grant_rotation_checks_schedulable_and_serving_nodes_before_a_rollout() 
         .find("- name: Apply reviewed plan")
         .expect("production apply step");
     assert!(
-        preflight < plan && plan < apply,
-        "a verifier mismatch must fail before Terraform can mutate the application"
+        initialize < plan && plan < apply,
+        "removing the legacy preflight must preserve plan/apply ordering"
     );
-
-    let gate = &workflow[preflight..plan];
-    for fragment in [
-        "port-forward service/cats-controld 17300:7300",
-        "/v1/admin/nodes",
-        "route-grant-public.sha256",
-        "deploy/aws/check-route-grant-nodes.sh",
-    ] {
-        assert!(
-            gate.contains(fragment),
-            "Route Grant preflight lost {fragment:?}"
-        );
-    }
-    for fragment in [
-        ".node.state == \"ready\"",
-        "(.assigned_cats // 0) > 0",
-        "(.orphan_cats // 0) > 0",
-        ".node.route_grant_public_key_sha256",
-        "Interrupted Route Grant worker rollout",
-        "Schedulable or serving Nodes verify a different Route Grant key",
-    ] {
-        assert!(
-            verifier.contains(fragment),
-            "Route Grant Node verifier lost {fragment:?}"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn route_grant_node_preflight_exercises_safe_and_interrupted_rollout_cohorts() {
-    let fixture = tempfile::tempdir().expect("Route Grant preflight fixture");
-    let expected = "a".repeat(64);
-    let run = |name: &str, items: serde_json::Value| {
-        let path = fixture.path().join(format!("{name}.json"));
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap(),
-        )
-        .unwrap();
-        Command::new("bash")
-            .arg(workspace_root().join("deploy/aws/check-route-grant-nodes.sh"))
-            .arg(&expected)
-            .arg(path)
-            .output()
-            .unwrap()
-    };
-    let node =
-        |id: &str, state: &str, fingerprint: Option<&str>, assigned_cats: u64, orphan_cats: u64| {
-            serde_json::json!({
-                "node": {
-                    "id": id,
-                    "state": state,
-                    "route_grant_public_key_sha256": fingerprint,
-                },
-                "assigned_cats": assigned_cats,
-                "orphan_cats": orphan_cats,
-            })
-        };
-
-    let all_legacy = run(
-        "all-legacy",
-        serde_json::json!([
-            node("legacy-ready", "ready", None, 0, 0),
-            node("legacy-serving", "cordoned", None, 1, 0),
-        ]),
-    );
-    assert!(all_legacy.status.success());
-    assert!(String::from_utf8_lossy(&all_legacy.stdout).contains("Additive first rollout"));
-
-    let all_enforcing = run(
-        "all-enforcing",
-        serde_json::json!([
-            node("ready", "ready", Some(&expected), 0, 0),
-            node("empty-legacy", "cordoned", None, 0, 0),
-        ]),
-    );
-    assert!(all_enforcing.status.success());
-
-    let interrupted = run(
-        "interrupted",
-        serde_json::json!([
-            node("ready", "ready", Some(&expected), 0, 0),
-            node("legacy-serving", "draining", None, 2, 0),
-        ]),
-    );
-    assert!(!interrupted.status.success());
-    assert!(String::from_utf8_lossy(&interrupted.stderr)
-        .contains("Interrupted Route Grant worker rollout"));
-
-    let mismatch = "b".repeat(64);
-    let wrong_orphan = run(
-        "wrong-orphan",
-        serde_json::json!([node("wrong-orphan", "cordoned", Some(&mismatch), 0, 1,)]),
-    );
-    assert!(!wrong_orphan.status.success());
-    assert!(String::from_utf8_lossy(&wrong_orphan.stderr)
-        .contains("verify a different Route Grant key"));
 }
 
 #[test]
-fn route_grant_application_rolls_control_plane_before_gateway() {
+fn release_build_publishes_the_control_plane_runtime_target() {
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+    let build = workflow
+        .split_once("- name: Build and push")
+        .and_then(|(_, rest)| rest.split_once("- name: Report image reference"))
+        .map(|(step, _)| step)
+        .expect("control-plane Buildx step");
+    assert!(build.contains("file: deploy/aws/Dockerfile.control-plane"));
+    assert!(build.contains("target: runtime"));
+
+    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    let runtime = dockerfile
+        .split_once("FROM debian:bookworm-slim AS runtime")
+        .and_then(|(_, rest)| rest.split_once("FROM runtime AS credential-refresher"))
+        .map(|(stage, _)| stage)
+        .expect("dedicated control-plane runtime stage");
+    assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/cats-controld\"]"));
+}
+
+#[test]
+fn route_grant_application_keeps_gateway_undeployed_until_v2() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
         .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
         .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
         .map(|(section, _)| section)
         .expect("control-plane Deployment section");
-    let gateway = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_service_v1\" \"gateway\""))
-        .map(|(section, _)| section)
-        .expect("Gateway Deployment section");
-
     assert!(
         control.contains("wait_for_rollout = true"),
-        "the Gateway dependency is safe only if Terraform waits for the complete control-plane rollout"
+        "Terraform must wait for the complete control-plane rollout"
     );
     assert!(
-        gateway.contains("wait_for_rollout = true"),
-        "Terraform must wait for the Gateway rollout too"
+        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
+        "production must not deploy the legacy Gateway while v2 is incomplete"
     );
     assert!(
-        gateway.contains("depends_on = [kubernetes_deployment_v1.control_plane]"),
-        "a new Gateway must not start until every control-plane replica issues Route Grants"
+        !kubernetes.contains("endpoint_wildcard_host"),
+        "production must not publish an Endpoint ingress route without the v2 Gateway"
     );
 }
 
@@ -373,37 +500,34 @@ fn production_deploy_extracts_versions_from_the_current_store_schema() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     assert_eq!(
         workflow.matches(SCHEMA_PATH).count(),
-        2,
-        "production deployment must read both schema bounds from {SCHEMA_PATH}"
+        1,
+        "production deployment must read the exact schema version from {SCHEMA_PATH}"
     );
     assert!(
         !workflow.contains("control-plane/src/store.rs"),
         "production deployment still refers to the pre-refactor Store module"
     );
 
-    for (name, pattern) in [
-        ("SCHEMA_VERSION", SCHEMA_VERSION_PATTERN),
-        (
-            "OLDEST_MIGRATABLE_SCHEMA_VERSION",
-            OLDEST_MIGRATABLE_PATTERN,
-        ),
-    ] {
-        assert!(
-            workflow.contains(pattern),
-            "production deployment does not use the tested {name} extraction pattern"
-        );
-        let output = Command::new("sed")
-            .args(["-nE", pattern])
-            .arg(workspace_root().join(SCHEMA_PATH))
-            .output()
-            .unwrap_or_else(|error| panic!("run sed for {name}: {error}"));
-        assert!(output.status.success(), "sed failed for {name}");
-        let value = String::from_utf8(output.stdout).expect("schema version is UTF-8");
-        assert!(
-            value.trim().parse::<i64>().is_ok(),
-            "{name} did not yield one numeric value: {value:?}"
-        );
-    }
+    assert!(
+        workflow.contains(SCHEMA_VERSION_PATTERN),
+        "production deployment does not use the tested SCHEMA_VERSION extraction pattern"
+    );
+    assert!(!workflow.contains("OLDEST_MIGRATABLE_SCHEMA_VERSION"));
+    assert!(workflow.contains("if (( actual_schema != required_schema )); then"));
+    assert!(workflow.contains("does not exactly match build schema"));
+    assert!(!workflow.contains("actual_schema <"));
+    assert!(!workflow.contains("actual_schema >"));
+    let output = Command::new("sed")
+        .args(["-nE", SCHEMA_VERSION_PATTERN])
+        .arg(workspace_root().join(SCHEMA_PATH))
+        .output()
+        .unwrap_or_else(|error| panic!("run sed for SCHEMA_VERSION: {error}"));
+    assert!(output.status.success(), "sed failed for SCHEMA_VERSION");
+    let value = String::from_utf8(output.stdout).expect("schema version is UTF-8");
+    assert!(
+        value.trim().parse::<i64>().is_ok(),
+        "AUTHORITY_RELEASE_SCHEMA_VERSION did not yield one numeric value: {value:?}"
+    );
 }
 
 #[test]
@@ -413,10 +537,7 @@ fn production_schema_probe_fails_closed() {
     let probe = workflow
         .split("# The control store lives in PostgreSQL.")
         .nth(1)
-        .and_then(|rest| {
-            rest.split("- name: Check Route Grant verifier compatibility")
-                .next()
-        })
+        .and_then(|rest| rest.split("- name: Initialize application state").next())
         .expect("control schema probe block");
 
     assert!(probe.contains("query_status=$?"));
@@ -446,16 +567,1373 @@ fn production_schema_probe_fails_closed() {
 #[test]
 fn linux_quality_gate_installs_the_postgres_probe_runtime() {
     let quality = read_workspace_file("scripts/quality.sh");
-    let linux_gate = quality
-        .split("run_linux() {")
-        .nth(1)
-        .and_then(|rest| rest.split("case \"${1:-full}\"").next())
-        .expect("Linux quality-gate function");
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
 
+    assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
     assert!(
         linux_gate.contains("apt-get install -qy --no-install-recommends e2fsprogs jq"),
         "the Linux gate must install jq before deployment probe fixtures execute"
     );
+    for field in ["ROOT", "HEAD", "DIRTY", "FINGERPRINT"] {
+        assert!(
+            quality.contains(&format!(
+                "export CATS_SOURCE_PROVENANCE_{field}=\"$SOURCE_PROVENANCE_{field}\""
+            )),
+            "the Linux gate must export the host's complete source provenance"
+        );
+    }
+    assert!(linux_gate.contains("--ulimit nofile=65536:65536"));
+    assert!(linux_gate.contains("env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR"));
+    assert!(linux_gate.contains("GIT_CEILING_DIRECTORIES=\"$(dirname \"$LINUX_CAPTURE_DIR\")\""));
+    assert!(linux_gate.contains("git -C \"$LINUX_CAPTURE_DIR\" hash-object --stdin --no-filters"));
+    assert!(linux_gate.contains("[[ \"$LINUX_TARGET_NAMESPACE\" =~ ^[0-9a-f]{40}$"));
+    assert!(
+        !linux_gate.contains("git -C \"$REPO_ROOT\" hash-object --stdin"),
+        "target isolation must not reopen host-only worktree Git metadata inside Linux"
+    );
+    assert!(
+        linux_gate.contains("LINUX_TARGET_DIRECTORY=\"/target/worktrees/$LINUX_TARGET_NAMESPACE\"")
+    );
+    assert!(
+        linux_gate.contains("-e CATS_LINUX_TARGET_DIRECTORY=\"$LINUX_TARGET_DIRECTORY\""),
+        "the Linux gate must pass its worktree-isolated target root into the container"
+    );
+    assert_eq!(
+        linux_gate
+            .matches("--target-dir \"$CATS_LINUX_TARGET_DIRECTORY\"")
+            .count(),
+        5,
+        "check, build, Clippy, tests and rustdoc must share the isolated target root"
+    );
+    assert!(!linux_gate.contains("--target-dir /target"));
+}
+
+#[test]
+fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
+    let quality = read_workspace_file("scripts/quality.sh");
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let (workspace_gate, _) = linux_gate
+        .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
+        .expect("focused systemd gate boundary");
+
+    assert!(quality.contains("run_linux() {"));
+    assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
+    assert!(!quality.contains("run_linux() ("));
+    assert!(
+        !workspace_gate.lines().any(|line| {
+            let line = line.trim_start();
+            !line.starts_with('#') && line.contains("--privileged")
+        }),
+        "the workspace-wide Linux gate must stay unprivileged"
+    );
+    assert!(linux_gate.contains("create --name \"$LINUX_WORKSPACE_GATE\""));
+    assert!(linux_gate.contains("start --attach \"$LINUX_WORKSPACE_GATE\""));
+    for (intent, command) in [
+        (
+            "LINUX_NETWORK_INTENDED=true",
+            "network create --label \"$LINUX_OWNER_LABEL\" \"$LINUX_NETWORK\"",
+        ),
+        ("LINUX_PG_INTENDED=true", "create --name \"$LINUX_PG\""),
+        (
+            "LINUX_WORKSPACE_INTENDED=true",
+            "create --name \"$LINUX_WORKSPACE_GATE\"",
+        ),
+        (
+            "LINUX_SYSTEMD_INTENDED=true",
+            "create --name \"$LINUX_SYSTEMD_GATE\"",
+        ),
+    ] {
+        let intent_position = linux_gate
+            .find(intent)
+            .unwrap_or_else(|| panic!("Linux cleanup lost intent {intent:?}"));
+        let command_position = linux_gate
+            .find(command)
+            .unwrap_or_else(|| panic!("Linux gate lost Docker call {command:?}"));
+        assert!(
+            intent_position < command_position,
+            "cleanup intent {intent:?} must precede response-loss-prone Docker call {command:?}"
+        );
+    }
+    for required in [
+        "LINUX_RUN_TOKEN=\"$(LC_ALL=C od -An -N16 -tx1 /dev/urandom",
+        "LINUX_OWNER_KEY=\"io.cats.quality.linux.owner\"",
+        "--label \"$LINUX_OWNER_LABEL\"",
+        "LINUX_ACTIVE_DOCKER_PID=$!",
+        "LINUX_ACTIVE_DOCKER_KIND=\"$kind\"",
+        "docker_create_cli",
+        "settle_active_create",
+        "reconcile_pending_create",
+        "LINUX_CREATE_PENDING=true",
+        "LINUX_CREATE_ARGUMENTS=(\"$@\")",
+        "trap '' INT TERM",
+        "set -m",
+        "LINUX_CREATE_SETTLEMENT_UNKNOWN=true",
+        "Container create\n  # and start are separate",
+        "probe_owned_container",
+        "probe_owned_network",
+        "rm --force --volumes \"$id\"",
+        "remove_owned_container \"$LINUX_SYSTEMD_INTENDED\" \"$LINUX_SYSTEMD_GATE\" true",
+        "remove_owned_container \"$LINUX_WORKSPACE_INTENDED\" \"$LINUX_WORKSPACE_GATE\" false",
+        "remove_owned_container \"$LINUX_PG_INTENDED\" \"$LINUX_PG\" false",
+        "remove_owned_network \"$LINUX_NETWORK_INTENDED\" \"$LINUX_NETWORK\"",
+        "all_intended_resources_absent",
+        "LINUX_CLEANUP_DEADLINE=$((SECONDS + LINUX_CLEANUP_BUDGET_SECONDS))",
+        "trap linux_gate_on_exit EXIT",
+        "trap 'linux_gate_signal 130' INT",
+        "trap 'linux_gate_signal 143' TERM",
+    ] {
+        assert!(
+            linux_gate.contains(required),
+            "the capability-owned cancellation-safe Linux cleanup lost {required:?}"
+        );
+    }
+    assert!(
+        !linux_gate.contains("absent_rounds"),
+        "elapsed absence is not proof that an interrupted create request settled"
+    );
+}
+
+#[test]
+fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let (_, systemd_gate) = linux_gate
+        .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
+        .expect("focused systemd gate boundary");
+
+    for required in [
+        "LINUX_SYSTEMD_IIDFILE=\"$LINUX_CAPTURE_DIR/systemd-image.iid\"",
+        "--iidfile \"$LINUX_SYSTEMD_IIDFILE\"",
+        "cmp -s \"$LINUX_SYSTEMD_IIDFILE\" \"$iidfile_expected\"",
+        "cmp -s \"$LINUX_SYSTEMD_IIDFILE\" \"$iidfile_expected_lf\"",
+        "CATS_SOURCE_PROVENANCE_FINGERPRINT=$CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "^sha256:[0-9a-f]{64}$",
+        "image inspect",
+        "LINUX_SYSTEMD_IMAGE_ID|$CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "\"$LINUX_SYSTEMD_IMAGE_ID\" /lib/systemd/systemd",
+        "--privileged",
+        "--cgroupns=private",
+        "--cgroup-parent system.slice",
+        "--tmpfs /run",
+        "--tmpfs /run/lock",
+        "-e container=docker",
+        "target=/work,readonly",
+        "cat /proc/1/comm",
+        "cat /proc/1/cgroup",
+        "0::/init.scope",
+        "systemctl is-system-running --quiet",
+        "-- --ignored --exact --list",
+        "listed_test_count=$((listed_test_count + 1))",
+        "listed_test_count\" -ne 1",
+        "listed_test_mismatch\" == true",
+        "focused Linux Runtime E2E test inventory was not the exact known positive",
+        "timeout --signal=TERM --kill-after=30s 20m",
+        "install -D -m 0755 \"$source_binary\" \"$target_binary\"",
+        "cmp -s \"$source_binary\" \"$target_binary\"",
+    ] {
+        assert!(
+            systemd_gate.contains(required) || linux_gate.contains(required),
+            "the focused real-systemd E2E lost boundary {required:?}"
+        );
+    }
+    assert!(
+        !systemd_gate.contains("--tag"),
+        "the focused systemd container must not be created through a mutable tag"
+    );
+    assert!(
+        !systemd_gate.contains("wc -l <\"$LINUX_SYSTEMD_IIDFILE\""),
+        "BuildKit may write its exact iidfile receipt without a terminal newline"
+    );
+    assert!(
+        !linux_gate.contains("image rm"),
+        "run cleanup must not delete content-addressed image cache shared by concurrent gates"
+    );
+    assert_eq!(
+        linux_gate.matches("--privileged").count(),
+        1,
+        "privilege must be confined to the one focused systemd container"
+    );
+    for forbidden in ["--cgroupns=host", "source=/sys/fs/cgroup", "--network host"] {
+        assert!(
+            !systemd_gate.contains(forbidden),
+            "the focused systemd E2E escaped its private boundary {forbidden:?}"
+        );
+    }
+    let focused_command = systemd_gate
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        focused_command.contains(
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --list"
+        ),
+        "the focused test inventory must bound both Docker and its in-container Cargo process"
+    );
+    assert!(
+        focused_command.contains(
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
+        ),
+        "the privileged gate must run only the exact ignored Node E2E"
+    );
+    assert!(
+        !systemd_gate.contains("--workspace"),
+        "the privileged focused block must never run workspace-wide Cargo"
+    );
+
+    let image = read_workspace_file("scripts/linux-systemd.Dockerfile");
+    for required in [
+        "FROM rust:1.97.1-bookworm",
+        "ARG CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "LABEL io.cats.quality.source-fingerprint=",
+        "e2fsprogs",
+        "iproute2",
+        "jq",
+        "systemd",
+        "rm -rf /var/lib/apt/lists/*",
+        "STOPSIGNAL SIGRTMIN+3",
+        "CMD [\"/lib/systemd/systemd\"]",
+    ] {
+        assert!(
+            image.contains(required),
+            "the focused systemd image lost {required:?}"
+        );
+    }
+    assert!(
+        !image.lines().any(|line| {
+            let instruction = line.trim_start().to_ascii_uppercase();
+            instruction.starts_with("COPY ") || instruction.starts_with("ADD ")
+        }),
+        "the focused PID-1 image must not embed a mutable source snapshot"
+    );
+}
+
+#[cfg(unix)]
+const LINUX_GATE_TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[cfg(unix)]
+fn write_executable(path: &Path, source: &str) {
+    std::fs::write(path, source)
+        .unwrap_or_else(|error| panic!("write executable {}: {error}", path.display()));
+    let mut permissions = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("read executable metadata {}: {error}", path.display()))
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+}
+
+#[cfg(unix)]
+fn install_linux_gate_fake_cli(bin: &Path) {
+    std::fs::create_dir_all(bin).expect("create Linux gate fake bin");
+    write_executable(
+        &bin.join("od"),
+        &format!("#!/bin/sh\nprintf ' {LINUX_GATE_TEST_TOKEN}\\n'\n"),
+    );
+    write_executable(
+        &bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+state=${CATS_FAKE_DOCKER_STATE:?}
+mode=${CATS_FAKE_DOCKER_MODE:?}
+trace="$state/trace"
+mkdir -p "$state"
+printf '%s\n' "$*" >>"$trace"
+
+object_path() {
+  printf '%s/%s.%s\n' "$state" "$1" "$2"
+}
+
+object_by_id() {
+  local kind="$1"
+  local wanted="$2"
+  local candidate
+  local id
+  shopt -s nullglob
+  for candidate in "$state/$kind."*; do
+    IFS='|' read -r id _ <"$candidate"
+    if [[ "$id" == "$wanted" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+label_value() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "$previous" == --label ]]; then
+      printf '%s\n' "${argument#*=}"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+named_value() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "$previous" == --name ]]; then
+      printf '%s\n' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+argument_after() {
+  local wanted="$1"
+  local previous=""
+  local argument
+  shift
+  for argument in "$@"; do
+    if [[ "$previous" == "$wanted" ]]; then
+      printf '%s\n' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+case "${1:-} ${2:-}" in
+  "build "*)
+    iidfile="$(argument_after --iidfile "$@")"
+    provenance="$(argument_after --build-arg "$@")"
+    provenance="${provenance#CATS_SOURCE_PROVENANCE_FINGERPRINT=}"
+    image_id="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    case "$mode" in
+      iidfile-one-lf) printf '%s\n' "$image_id" >"$iidfile" ;;
+      iidfile-two-lf) printf '%s\n\n' "$image_id" >"$iidfile" ;;
+      iidfile-nul) printf '%s\0' "$image_id" >"$iidfile" ;;
+      iidfile-second-line) printf '%s\n%s\n' "$image_id" "$image_id" >"$iidfile" ;;
+      iidfile-garbage) printf '%s!' "$image_id" >"$iidfile" ;;
+      *) printf '%s' "$image_id" >"$iidfile" ;;
+    esac
+    printf '%s|%s\n' "$image_id" "$provenance" >"$state/systemd-image"
+    ;;
+  "image inspect")
+    id="${!#}"
+    IFS='|' read -r stored_id provenance <"$state/systemd-image"
+    [[ "$id" == "$stored_id" ]] || exit 64
+    printf '%s|%s\n' "$stored_id" "$provenance"
+    ;;
+  "network create")
+    name="${!#}"
+    owner="$(label_value "$@")"
+    path="$(object_path network "$name")"
+    [[ ! -e "$path" ]] || exit 125
+    printf 'owned-network-id|%s\n' "$owner" >"$path"
+    printf 'owned-network-id\n'
+    ;;
+  "network ls")
+    name=""
+    for argument in "$@"; do
+      if [[ "$argument" == name=^*'$' ]]; then
+        name="${argument#name=^}"
+        name="${name%\$}"
+      fi
+    done
+    path="$(object_path network "$name")"
+    if [[ -e "$path" ]]; then
+      IFS='|' read -r id _ <"$path"
+      printf '%s\n' "$id"
+    fi
+    ;;
+  "network inspect")
+    id="${!#}"
+    path="$(object_by_id network "$id")"
+    name="${path#"$state/network."}"
+    IFS='|' read -r stored_id owner <"$path"
+    printf '%s|%s|%s\n' "$stored_id" "$name" "$owner"
+    ;;
+  "network rm")
+    id="${!#}"
+    if [[ -e "$state/workspace-network-active" && ! -e "$state/late-workspace-removed" ]]; then
+      printf 'network has active endpoints\n' >&2
+      exit 1
+    fi
+    path="$(object_by_id network "$id")"
+    rm -f -- "$path"
+    ;;
+  "container ls")
+    if [[ "$mode" == cleanup-hang && -e "$state/workspace-network-active" ]]; then
+      : >"$state/cleanup-hang-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    name=""
+    for argument in "$@"; do
+      if [[ "$argument" == name=^/*'$' ]]; then
+        name="${argument#name=^/}"
+        name="${name%\$}"
+      fi
+    done
+    path="$(object_path container "$name")"
+    if [[ -e "$path" ]]; then
+      IFS='|' read -r id _ <"$path"
+      printf '%s\n' "$id"
+    fi
+    ;;
+  "container inspect")
+    id="${!#}"
+    path="$(object_by_id container "$id")"
+    name="${path#"$state/container."}"
+    IFS='|' read -r stored_id owner <"$path"
+    printf '%s|/%s|%s\n' "$stored_id" "$name" "$owner"
+    ;;
+  "stop "*)
+    ;;
+  "rm --force")
+    [[ "${3:-}" == --volumes ]] || exit 64
+    id="${!#}"
+    path="$(object_by_id container "$id")"
+    name="${path#"$state/container."}"
+    rm -f -- "$path"
+    rm -f -- "$state/anonymous-volume.$name"
+    if [[ "$id" == late-workspace-id \
+      || "$id" == response-loss-workspace-id \
+      || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
+      : >"$state/late-workspace-removed"
+    fi
+    if [[ "$id" == owned-cats-linux-systemd-gate-*-id ]]; then
+      : >"$state/systemd-removed"
+    fi
+    ;;
+  "create "*)
+    name="$(named_value "$@")"
+    owner="$(label_value "$@")"
+    path="$(object_path container "$name")"
+    [[ ! -e "$path" ]] || exit 125
+    if [[ "$mode" == cleanup-hang && "$name" == cats-linux-workspace-gate-* ]]; then
+      printf 'owned-workspace-id|%s\n' "$owner" >"$path"
+      : >"$state/workspace-network-active"
+      : >"$state/create-settlement-hang-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    if [[ "$mode" == term-delayed-create && "$name" == cats-linux-workspace-gate-* ]]; then
+      : >"$state/workspace-network-active"
+      nohup /bin/bash -c '
+        sleep 5.2
+        state=$1
+        name=$2
+        owner=$3
+        temporary="$state/container.$name.pending"
+        printf "late-workspace-id|%s\\n" "$owner" >"$temporary"
+        mv -- "$temporary" "$state/container.$name"
+        : >"$state/late-marker"
+        : >"$state/create-response"
+        printf "LATE_CREATE late-workspace-id\\n" >>"$state/trace"
+      ' fake-daemon "$state" "$name" "$owner" >/dev/null 2>&1 &
+      while [[ ! -e "$state/create-response" ]]; do sleep 0.1; done
+      printf 'late-workspace-id\n'
+      exit 0
+    fi
+    if [[ "$mode" == response-loss-late-create && "$name" == cats-linux-workspace-gate-* ]]; then
+      count_path="$state/response-loss-create-count"
+      count=0
+      [[ ! -e "$count_path" ]] || IFS= read -r count <"$count_path"
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$count_path"
+      if [[ "$count" -eq 1 ]]; then
+        : >"$state/workspace-network-active"
+        nohup /bin/bash -c '
+          trap "" INT TERM
+          sleep 5.2
+          state=$1
+          name=$2
+          owner=$3
+          temporary="$state/container.$name.pending"
+          printf "response-loss-workspace-id|%s\\n" "$owner" >"$temporary"
+          mv -- "$temporary" "$state/container.$name"
+          : >"$state/response-loss-late-marker"
+          printf "RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id\\n" >>"$state/trace"
+        ' fake-daemon "$state" "$name" "$owner" >/dev/null 2>&1 &
+        : >"$state/first-response-lost"
+        exit 125
+      fi
+      : >"$state/idempotent-retry-entered"
+      while [[ ! -e "$path" ]]; do sleep 0.1; done
+      : >"$state/idempotent-name-reserved"
+      exit 125
+    fi
+    if [[ "$name" == cats-linux-pg-* ]]; then
+      : >"$state/anonymous-volume.$name"
+      : >"$state/anonymous-volume-created.$name"
+    fi
+    printf 'owned-%s-id|%s\n' "$name" "$owner" >"$path"
+    printf 'owned-%s-id\n' "$name"
+    ;;
+  "start "*)
+    name="${!#}"
+    if [[ "$mode" == term-start && "$name" == cats-linux-workspace-gate-* ]]; then
+      : >"$state/workspace-network-active"
+      : >"$state/start-entered"
+      trap '' TERM
+      while :; do sleep 0.2; done
+    fi
+    ;;
+  "exec "*)
+    case "$*" in
+      *" cat /proc/1/comm") printf 'systemd\n' ;;
+      *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
+      *" systemctl is-system-running --quiet") ;;
+      *" sh -ceu "*) : >"$state/blockd-installed" ;;
+      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --exact --list")
+        : >"$state/focused-systemd-test-list-ran"
+        if [[ "$mode" == timeout-systemd-test-list ]]; then
+          exit 124
+        fi
+        if [[ "$mode" != zero-systemd-test ]]; then
+          printf '%s\n' \
+            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test'
+        fi
+        ;;
+      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*)
+        : >"$state/focused-systemd-test-ran"
+        ;;
+      *)
+        printf 'unexpected fake Docker exec: %s\n' "$*" >&2
+        exit 64
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected fake Docker command: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    );
+}
+
+#[cfg(unix)]
+fn linux_gate_command(fake_bin: &Path, state: &Path, mode: &str) -> Command {
+    let linked_worktree = state
+        .parent()
+        .expect("Linux gate fixture parent")
+        .join("linked-worktree");
+    let scripts = linked_worktree.join("scripts");
+    std::fs::create_dir_all(&scripts).expect("create linked-worktree scripts fixture");
+    for name in ["quality.sh", "linux-gate.sh"] {
+        let destination = scripts.join(name);
+        std::fs::copy(workspace_root().join("scripts").join(name), &destination)
+            .unwrap_or_else(|error| panic!("copy {name} into linked-worktree fixture: {error}"));
+        let mut permissions = std::fs::metadata(&destination)
+            .unwrap_or_else(|error| panic!("read {name} fixture metadata: {error}"))
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&destination, permissions)
+            .unwrap_or_else(|error| panic!("make {name} fixture executable: {error}"));
+    }
+    std::fs::write(
+        linked_worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            linked_worktree.join("unmounted-host-gitdir").display()
+        ),
+    )
+    .expect("write broken linked-worktree Git indirection");
+
+    let mut command = Command::new(scripts.join("quality.sh"));
+    command
+        .arg("linux")
+        // Exercise the macOS-supported system Bash (3.2) instead of allowing
+        // a Homebrew Bash earlier in the developer's inherited PATH to mask
+        // an incompatible gate construct.
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake_bin.display()),
+        )
+        .env("CATS_FAKE_DOCKER_STATE", state)
+        .env("CATS_FAKE_DOCKER_MODE", mode)
+        .env("CATS_SOURCE_PROVENANCE_ROOT", &linked_worktree)
+        .env("CATS_SOURCE_PROVENANCE_HEAD", "a".repeat(40))
+        .env("CATS_SOURCE_PROVENANCE_DIRTY", "false")
+        .env("CATS_SOURCE_PROVENANCE_FINGERPRINT", "b".repeat(40));
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collision() {
+    for (kind, name, id) in [
+        (
+            "network",
+            format!("cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-network-id",
+        ),
+        (
+            "container",
+            format!("cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-container-id",
+        ),
+        (
+            "container",
+            format!("cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-systemd-id",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().expect("Linux gate collision fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+        let foreign = state.join(format!("{kind}.{name}"));
+        let original = format!("{id}|foreign-owner\n");
+        std::fs::write(&foreign, &original).expect("preseed foreign Docker resource");
+
+        let output = linux_gate_command(&fake_bin, &state, "collision")
+            .output()
+            .expect("run Linux gate collision regression");
+        assert!(!output.status.success(), "foreign {kind} collision passed");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign resource survived"),
+            original,
+            "the Linux gate mutated a same-name foreign {kind}"
+        );
+        let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+        assert!(
+            !trace.lines().any(|line| {
+                line == format!("stop --time 20 {id}")
+                    || line == format!("rm --force --volumes {id}")
+                    || line == format!("network rm {id}")
+            }),
+            "the Linux gate attempted to remove foreign immutable ID {id}:\n{trace}"
+        );
+        for owned_resource in [
+            format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        ] {
+            if state.join(&owned_resource) != foreign {
+                assert!(
+                    !state.join(&owned_resource).exists(),
+                    "foreign {kind} collision blocked exact cleanup of {owned_resource}:\n{trace}"
+                );
+            }
+        }
+        if id == "foreign-systemd-id" {
+            for exact_cleanup in [
+                format!(
+                    "rm --force --volumes owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
+                ),
+                format!(
+                    "rm --force --volumes owned-cats-linux-pg-{LINUX_GATE_TEST_TOKEN}-id"
+                ),
+                "network rm owned-network-id".to_owned(),
+            ] {
+                assert!(
+                    trace.contains(&exact_cleanup),
+                    "foreign systemd collision skipped cleanup {exact_cleanup:?}:\n{trace}"
+                );
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing to remove foreign Linux gate"),
+            "foreign owner mismatch was not diagnosed:\n{stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_cleanup() {
+    let fixture = tempfile::tempdir().expect("Linux gate TERM fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let stdout_path = fixture.path().join("stdout");
+    let stderr_path = fixture.path().join("stderr");
+    let stdout = std::fs::File::create(&stdout_path).expect("create stdout capture");
+    let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
+    let mut command = linux_gate_command(&fake_bin, &state, "term-delayed-create");
+    command
+        .process_group(0)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command
+        .spawn()
+        .expect("start isolated Linux quality-gate process group");
+
+    let workspace_started = Instant::now();
+    while !state.join("workspace-network-active").exists() {
+        assert!(
+            workspace_started.elapsed() < Duration::from_secs(8),
+            "fake Docker never entered the foreground workspace run"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    let signal = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", child.id())])
+        .status()
+        .expect("signal Linux quality-gate process group");
+    assert!(
+        signal.success(),
+        "could not TERM Linux quality-gate process group"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut removed_at = None;
+    let status = loop {
+        if removed_at.is_none() && state.join("late-workspace-removed").exists() {
+            removed_at = Some(Instant::now());
+        }
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("TERM cleanup exceeded its 15-second bound");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    let removed_at = removed_at.expect("late workspace immutable-ID removal marker");
+    assert!(
+        removed_at.duration_since(signal_at) >= Duration::from_millis(4_800),
+        "cleanup acted before the daemon returned the deliberately delayed create receipt"
+    );
+    assert!(
+        state.join("late-marker").exists(),
+        "test never observed the daemon-side create after the signal"
+    );
+
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after TERM cleanup: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let late_create = trace
+        .find("LATE_CREATE late-workspace-id")
+        .expect("late daemon-side create trace");
+    let immutable_remove = trace
+        .find("rm --force --volumes late-workspace-id")
+        .expect("immutable-ID cleanup trace");
+    assert!(
+        late_create < immutable_remove,
+        "settled late resource was not removed by immutable ID:\n{trace}"
+    );
+    assert!(
+        trace.contains("network rm owned-network-id"),
+        "the previously active network did not converge to removal:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observable() {
+    let fixture = tempfile::tempdir().expect("Linux gate response-loss fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let started_at = Instant::now();
+    let output = linux_gate_command(&fake_bin, &state, "response-loss-late-create")
+        .output()
+        .expect("run Linux quality gate response-loss regression");
+    assert!(
+        output.status.success(),
+        "response-loss reconciliation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(4_800),
+        "response loss was blessed before the delayed daemon create became observable"
+    );
+    for marker in [
+        "first-response-lost",
+        "idempotent-retry-entered",
+        "idempotent-name-reserved",
+        "response-loss-late-marker",
+        "late-workspace-removed",
+        "blockd-installed",
+        "focused-systemd-test-ran",
+        "systemd-removed",
+    ] {
+        assert!(
+            state.join(marker).exists(),
+            "response-loss regression did not exercise {marker}"
+        );
+    }
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("anonymous-volume.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after response-loss settlement: {resource}"
+        );
+    }
+    assert!(
+        state
+            .join(format!(
+                "anonymous-volume-created.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"
+            ))
+            .exists(),
+        "the response-loss regression did not model postgres:16's anonymous data volume"
+    );
+
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let create_call = format!("create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}");
+    assert_eq!(
+        trace.matches(&create_call).count(),
+        2,
+        "the ambiguous first response was not closed by one same-name retry:\n{trace}"
+    );
+    let late_create = trace
+        .find("RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id")
+        .expect("late daemon create trace");
+    let immutable_remove = trace
+        .find("rm --force --volumes response-loss-workspace-id")
+        .expect("response-loss immutable-ID removal trace");
+    assert!(
+        late_create < immutable_remove,
+        "cleanup raced the response-loss daemon create:\n{trace}"
+    );
+    let immutable_image = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let systemd_create = trace
+        .lines()
+        .find(|line| {
+            line.starts_with(&format!(
+                "create --name cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} "
+            ))
+        })
+        .expect("focused systemd immutable-image create trace");
+    assert!(
+        systemd_create.ends_with(&format!("{immutable_image} /lib/systemd/systemd")),
+        "focused systemd create did not consume the iidfile image ID:\n{trace}"
+    );
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
+        "focused systemd container was not gracefully and exactly cleaned:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
+    let fixture = tempfile::tempdir().expect("Linux gate empty focused-test fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "zero-systemd-test")
+        .output()
+        .expect("run Linux gate empty focused-test regression");
+    assert!(
+        !output.status.success(),
+        "an empty exact Rust test filter incorrectly passed the Linux gate"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the real focused command ran after its known-positive probe returned zero tests"
+    );
+    assert!(
+        state.join("focused-systemd-test-list-ran").exists(),
+        "the zero-test regression did not exercise the bounded inventory probe"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("focused Linux Runtime E2E test inventory was not the exact known positive"),
+        "the empty exact test filter was not diagnosed:\n{stderr}"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after empty test-inventory failure: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
+        "empty test-inventory failure did not clean the focused container exactly:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_cleans_exact_resources_when_focused_test_inventory_times_out() {
+    let fixture = tempfile::tempdir().expect("Linux gate focused-test timeout fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "timeout-systemd-test-list")
+        .output()
+        .expect("run Linux gate focused-test timeout regression");
+    assert!(
+        !output.status.success(),
+        "a timed-out exact Rust test inventory incorrectly passed the Linux gate"
+    );
+    assert!(
+        state.join("focused-systemd-test-list-ran").exists(),
+        "the timeout regression did not exercise the bounded inventory probe"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the real focused command ran after its inventory probe timed out"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after focused test-inventory timeout: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let bounded_list = format!(
+        "exec cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked"
+    );
+    assert!(
+        trace.contains(&bounded_list) && trace.contains("-- --ignored --exact --list"),
+        "the timeout regression did not preserve the in-container Cargo deadline:\n{trace}"
+    );
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
+        "test-inventory timeout did not clean the focused container exactly:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_accepts_exact_iidfile_frames_and_rejects_trailing_data() {
+    for mode in ["iidfile-no-lf", "iidfile-one-lf"] {
+        let fixture = tempfile::tempdir().expect("Linux gate valid iidfile fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+
+        let output = linux_gate_command(&fake_bin, &state, mode)
+            .output()
+            .unwrap_or_else(|error| panic!("run Linux gate {mode} regression: {error}"));
+        assert!(
+            output.status.success(),
+            "valid iidfile mode {mode} was not accepted:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            state.join("focused-systemd-test-ran").exists(),
+            "valid iidfile mode {mode} did not reach the exact focused systemd test"
+        );
+        assert!(
+            state.join("systemd-removed").exists(),
+            "valid iidfile mode {mode} did not converge through exact systemd cleanup"
+        );
+    }
+
+    for mode in [
+        "iidfile-two-lf",
+        "iidfile-nul",
+        "iidfile-second-line",
+        "iidfile-garbage",
+    ] {
+        let fixture = tempfile::tempdir().expect("Linux gate malformed iidfile fixture");
+        let fake_bin = fixture.path().join("bin");
+        let state = fixture.path().join("state");
+        std::fs::create_dir_all(&state).expect("create fake Docker state");
+        install_linux_gate_fake_cli(&fake_bin);
+
+        let output = linux_gate_command(&fake_bin, &state, mode)
+            .output()
+            .unwrap_or_else(|error| panic!("run Linux gate {mode} regression: {error}"));
+        assert!(
+            !output.status.success(),
+            "malformed iidfile mode {mode} incorrectly passed"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("focused Linux Runtime E2E received an invalid Docker image receipt"),
+            "malformed iidfile mode {mode} was not diagnosed:\n{stderr}"
+        );
+        let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+        assert!(
+            trace
+                .lines()
+                .any(|line| line.starts_with("build --platform ")),
+            "malformed iidfile mode {mode} did not reach the image receipt boundary:\n{trace}"
+        );
+        assert!(
+            !trace.lines().any(|line| line.starts_with("image inspect ")),
+            "malformed iidfile mode {mode} reached image inspection:\n{trace}"
+        );
+        assert!(
+            !trace.lines().any(|line| {
+                line.starts_with(&format!(
+                    "create --name cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} "
+                ))
+            }),
+            "malformed iidfile mode {mode} created the privileged systemd container:\n{trace}"
+        );
+        for resource in [
+            format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        ] {
+            assert!(
+                !state.join(&resource).exists(),
+                "malformed iidfile mode {mode} left owned resource {resource}:\n{trace}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_term_interrupts_start_after_create_receipt_and_cleans_exact_id() {
+    let fixture = tempfile::tempdir().expect("Linux gate start TERM fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let mut child = linux_gate_command(&fake_bin, &state, "term-start")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start top-level Linux quality gate");
+
+    let start_deadline = Instant::now() + Duration::from_secs(8);
+    while !state.join("start-entered").exists() {
+        if Instant::now() >= start_deadline {
+            child.kill().expect("kill Linux gate missing start marker");
+            child.wait().expect("reap Linux gate missing start marker");
+            panic!("fake Docker never entered workspace start --attach");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("signal top-level quality gate")
+            .success(),
+        "could not TERM top-level quality gate"
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if signal_at.elapsed() >= Duration::from_secs(8) {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("start cancellation and exact cleanup exceeded eight seconds");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        signal_at.elapsed() < Duration::from_secs(6),
+        "settled create incorrectly made start wait for create-style settlement"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after start cancellation: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let create = trace
+        .find(&format!(
+            "create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"
+        ))
+        .expect("workspace create trace");
+    let start = trace
+        .find(&format!(
+            "start --attach cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"
+        ))
+        .expect("workspace start trace");
+    let remove = trace
+        .find(&format!(
+            "rm --force --volumes owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
+        ))
+        .expect("workspace immutable-ID removal trace");
+    assert!(
+        create < start && start < remove,
+        "workspace create/start/immutable-ID cleanup order was not causal:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_cleanup_has_one_hard_deadline_when_docker_cli_hangs() {
+    let fixture = tempfile::tempdir().expect("Linux gate cleanup deadline fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+    let stdout_path = fixture.path().join("stdout");
+    let stderr_path = fixture.path().join("stderr");
+    let stdout = std::fs::File::create(&stdout_path).expect("create stdout capture");
+    let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
+    let mut child = linux_gate_command(&fake_bin, &state, "cleanup-hang")
+        .env("CATS_LINUX_CLEANUP_BUDGET_SECONDS", "5")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("start top-level Linux quality gate");
+
+    let workspace_started = Instant::now();
+    while !state.join("workspace-network-active").exists() {
+        assert!(
+            workspace_started.elapsed() < Duration::from_secs(8),
+            "fake Docker never entered the foreground workspace run"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let signal_at = Instant::now();
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("signal top-level quality gate");
+    assert!(signal.success(), "could not TERM top-level quality gate");
+
+    let deadline = signal_at + Duration::from_secs(9);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out Linux quality gate");
+            child.wait().expect("reap timed-out Linux quality gate");
+            panic!("hung cleanup exceeded its nine-second test deadline");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let elapsed = signal_at.elapsed();
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "five-second shared cleanup budget took {elapsed:?} after TERM"
+    );
+    assert!(
+        state.join("create-settlement-hang-entered").exists(),
+        "test never exercised a create receipt that remained unknown at the shared deadline"
+    );
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read cleanup stderr");
+    assert!(
+        stderr.contains("Docker create request did not settle before the Linux cleanup deadline"),
+        "hung daemon create did not hit the shared settlement deadline:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Linux gate has an unsettled Docker create result"),
+        "an unknown daemon create result was incorrectly treated as absence:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Linux gate resources did not converge to exact absence"),
+        "cleanup timeout was not reported as non-convergence:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_declares_native_linux_test_resources() {
+    let root = workspace_root();
+    let fixture = tempfile::tempdir().expect("quality process-limit fixture");
+    let fake_cargo = fixture.path().join("cargo");
+    let capture = fixture.path().join("capture");
+    std::fs::write(
+        &fake_cargo,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'soft=%s\n' "$(ulimit -Sn)" > "$CATS_QUALITY_CAPTURE"
+printf 'hard=%s\n' "$(ulimit -Hn)" >> "$CATS_QUALITY_CAPTURE"
+printf 'path=%s\n' "$PATH" >> "$CATS_QUALITY_CAPTURE"
+printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
+"#,
+    )
+    .expect("write fake cargo");
+    let mut permissions = std::fs::metadata(&fake_cargo)
+        .expect("fake cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_cargo, permissions).expect("make fake cargo executable");
+    for (name, body) in [
+        ("uname", "#!/bin/sh\nprintf 'Linux\\n'\n"),
+        ("mkfs.ext4", "#!/bin/sh\nexit 0\n"),
+        ("debugfs", "#!/bin/sh\nexit 0\n"),
+        ("e2fsck", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let path = fixture.path().join(name);
+        std::fs::write(&path, body).expect("write native-tool fixture");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("native-tool fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make native-tool fixture executable");
+    }
+
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg("ulimit -Sn 1024\nexec \"$QUALITY_SCRIPT\" test")
+        .env("QUALITY_SCRIPT", root.join("scripts/quality.sh"))
+        .env("CATS_QUALITY_CAPTURE", &capture)
+        .env("CATS_TEST_POSTGRES_URL", "postgres://unused")
+        .env(
+            "PATH",
+            format!("{}:{inherited_path}", fixture.path().display()),
+        )
+        .output()
+        .expect("run quality test process-limit probe");
+    assert!(
+        output.status.success(),
+        "quality probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured = std::fs::read_to_string(capture).expect("read process-limit capture");
+    let soft = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("soft="))
+        .expect("soft nofile capture");
+    let hard = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("hard="))
+        .expect("hard nofile capture");
+    assert_eq!(soft, hard);
+    assert_ne!(soft, "1024");
+    let path = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("path="))
+        .expect("PATH capture");
+    assert!(path.split(':').any(|entry| entry == "/usr/sbin"));
+    assert!(captured.contains("args=test --workspace --locked -- --test-threads=4\n"));
+}
+
+#[test]
+fn quality_gate_trusts_only_the_exact_source_root_for_git_provenance() {
+    let quality = read_workspace_file("scripts/quality.sh");
+
+    for boundary in [
+        "GIT_OPTIONAL_LOCKS=0 git",
+        r#"-c safe.directory="$REPO_ROOT""#,
+        r#"-c core.hooksPath=/dev/null"#,
+        r#"-c core.fsmonitor=false"#,
+        r#"-C "$REPO_ROOT""#,
+    ] {
+        assert!(quality.contains(boundary));
+    }
+    for command in [
+        "source_git rev-parse --show-toplevel",
+        "source_git rev-parse HEAD",
+        "source_git status --porcelain=v1 --untracked-files=all",
+        "source_git diff --binary HEAD --",
+        "source_git ls-files --others --exclude-standard -z",
+        "source_git hash-object --stdin",
+    ] {
+        assert!(
+            quality.contains(command),
+            "source provenance must execute {command} through the exact-root Git wrapper"
+        );
+    }
+    assert!(!quality.contains("safe.directory=*"));
+    assert!(!quality.contains("git config --global"));
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_accepts_complete_inherited_provenance_from_any_cwd() {
+    let root = workspace_root();
+    let fixture = tempfile::tempdir().expect("provenance caller directory");
+    let expected_head = "a".repeat(40);
+    let expected_fingerprint = "b".repeat(40);
+    let output = Command::new(root.join("scripts/quality.sh"))
+        .arg("provenance")
+        .current_dir(fixture.path())
+        .env("CATS_SOURCE_PROVENANCE_ROOT", "/host/exact-worktree")
+        .env("CATS_SOURCE_PROVENANCE_HEAD", &expected_head)
+        .env("CATS_SOURCE_PROVENANCE_DIRTY", "true")
+        .env("CATS_SOURCE_PROVENANCE_FINGERPRINT", &expected_fingerprint)
+        .output()
+        .expect("run provenance probe");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 provenance output");
+    assert!(stdout.contains("source.root=/host/exact-worktree\n"));
+    assert!(stdout.contains(&format!("source.head={expected_head}\n")));
+    assert!(stdout.contains("source.dirty=true\n"));
+    assert!(stdout.contains(&format!("source.fingerprint={expected_fingerprint}\n")));
+}
+
+#[cfg(unix)]
+#[test]
+fn quality_gate_rejects_partial_or_unresolvable_provenance() {
+    let root = workspace_root();
+    let partial = Command::new(root.join("scripts/quality.sh"))
+        .arg("provenance")
+        .env("CATS_SOURCE_PROVENANCE_ROOT", "/host/exact-worktree")
+        .env_remove("CATS_SOURCE_PROVENANCE_HEAD")
+        .env_remove("CATS_SOURCE_PROVENANCE_DIRTY")
+        .env_remove("CATS_SOURCE_PROVENANCE_FINGERPRINT")
+        .output()
+        .expect("run partial provenance probe");
+    assert!(!partial.status.success());
+    assert!(String::from_utf8_lossy(&partial.stderr)
+        .contains("overrides must set root, head, dirty and fingerprint together"));
+
+    let fixture = tempfile::tempdir().expect("non-Git provenance fixture");
+    let scripts = fixture.path().join("scripts");
+    std::fs::create_dir(&scripts).expect("create scripts fixture");
+    let copied = scripts.join("quality.sh");
+    std::fs::copy(root.join("scripts/quality.sh"), &copied).expect("copy quality script");
+    let unresolved = Command::new("bash")
+        .arg(copied)
+        .arg("provenance")
+        .env_remove("CATS_SOURCE_PROVENANCE_ROOT")
+        .env_remove("CATS_SOURCE_PROVENANCE_HEAD")
+        .env_remove("CATS_SOURCE_PROVENANCE_DIRTY")
+        .env_remove("CATS_SOURCE_PROVENANCE_FINGERPRINT")
+        .output()
+        .expect("run provenance outside Git");
+    assert!(!unresolved.status.success());
 }
 
 #[cfg(unix)]
@@ -984,8 +2462,8 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     }
     for expected in [
         "public_target_pre_stop_delay_seconds           = 15",
-        "public_target_termination_grace_period_seconds = 30",
-        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
+        "public_target_termination_grace_period_seconds = 60",
+        "condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
     ] {
         assert!(
             terraform.contains(expected),
@@ -1004,76 +2482,23 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 }
 
 #[test]
-fn production_gateway_survives_one_pod_or_node_disruption() {
+fn production_endpoint_ingress_stays_absent_until_route_grant_v2() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let variables =
         read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    let deployment = terraform
-        .split("resource \"kubernetes_deployment_v1\" \"gateway\"")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
-                .next()
-        })
-        .expect("Gateway Deployment block");
+    assert!(terraform.contains("Public Endpoint ingress stays absent"));
+    assert!(terraform.contains("for host in var.control_plane_hosts"));
+    assert!(!terraform.contains("endpoint_wildcard_host"));
+    assert!(!variables.contains("endpoint_wildcard_host"));
 
-    for expected in [
-        "replicas = var.gateway_replicas",
-        "type = \"RollingUpdate\"",
-        "max_surge       = \"1\"",
-        "max_unavailable = \"0\"",
-        "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
-        "pre_stop {",
-        "command = [\"/bin/sh\", \"-c\", \"sleep ${local.public_target_pre_stop_delay_seconds}\"]",
-        "pod_anti_affinity {",
-        "required_during_scheduling_ignored_during_execution {",
-        "topology_key       = \"kubernetes.io/hostname\"",
-        "when_unsatisfiable = \"DoNotSchedule\"",
-    ] {
-        assert!(
-            deployment.contains(expected),
-            "Gateway Deployment is missing {expected:?}"
-        );
-    }
-    let required_anti_affinity = deployment
-        .split("required_during_scheduling_ignored_during_execution {")
-        .nth(1)
-        .and_then(|rest| rest.split("topology_spread_constraint {").next())
-        .expect("required Gateway hostname anti-affinity block");
-    for expected in [
-        "topology_key = \"kubernetes.io/hostname\"",
-        "\"app.kubernetes.io/name\" = \"cats-gatewayd\"",
-    ] {
-        assert!(
-            required_anti_affinity.contains(expected),
-            "required Gateway anti-affinity is missing {expected:?}"
-        );
-    }
-    for expected in [
-        "public_target_pre_stop_delay_seconds           = 15",
-        "public_target_termination_grace_period_seconds = 30",
-        "condition     = local.public_target_pre_stop_delay_seconds < local.public_target_termination_grace_period_seconds",
-    ] {
-        assert!(
-            terraform.contains(expected),
-            "public target drain is missing {expected:?}"
-        );
-    }
-    assert!(variables.contains("var.gateway_replicas >= 2"));
-    let disruption_budget = terraform
-        .split("resource \"kubernetes_pod_disruption_budget_v1\" \"gateway\"")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("resource \"kubernetes_service_v1\" \"gateway\"")
-                .next()
-        })
-        .expect("Gateway PodDisruptionBudget block");
-    assert!(disruption_budget.contains("min_available = \"1\""));
-    assert!(disruption_budget.contains("\"app.kubernetes.io/name\" = \"cats-gatewayd\""));
-    assert!(
-        !deployment.contains("type = \"Recreate\""),
-        "Recreate deliberately creates a total Gateway outage"
-    );
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    assert!(application.contains("dns_hosts = toset(var.control_plane_hosts)"));
+    assert!(!application.contains("endpoint_wildcard_host"));
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains("for deployment in cats-controld"));
+    assert!(!workflow.contains("for deployment in cats-controld cats-gatewayd"));
 }
 
 #[test]
@@ -1425,6 +2850,83 @@ fn noninteractive_worker_bootstrap_defines_root_home_before_toolchain_use() {
     }
 }
 
+#[test]
+fn worker_installation_owns_all_runtime_socket_roots() {
+    let tmpfiles = read_workspace_file("deploy/metal/tmpfiles/cats-vmm.conf");
+    for declaration in [
+        "d /run/cats/vmm-v1 0700 root root -",
+        "d /run/cats/blockd-v1 0700 root root -",
+    ] {
+        assert!(
+            tmpfiles.lines().any(|line| line == declaration),
+            "runtime tmpfiles contract lost {declaration:?}"
+        );
+    }
+
+    let provisioned_state_namespaces = "vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1";
+
+    let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
+    assert!(
+        provisioner.contains(provisioned_state_namespaces),
+        "identity-selected state provisioning lost the durable blockd intent namespace"
+    );
+    let create = provisioner
+        .find("systemd-tmpfiles --create /usr/lib/tmpfiles.d/cats-vmm.conf")
+        .expect("runtime tmpfiles creation");
+    for preflight in [
+        "validate_or_absent_installed_runtime_socket_root /run/cats/vmm-v1 VMM",
+        "validate_or_absent_installed_runtime_socket_root /run/cats/blockd-v1 blockd",
+    ] {
+        let validate = provisioner
+            .find(preflight)
+            .unwrap_or_else(|| panic!("runtime provisioner lost {preflight:?}"));
+        assert!(
+            validate < create,
+            "tmpfiles may not repair a foreign runtime root"
+        );
+    }
+    for validation in [
+        "validate_installed_runtime_socket_root /run/cats/vmm-v1 VMM",
+        "validate_installed_runtime_socket_root /run/cats/blockd-v1 blockd",
+    ] {
+        let validate = provisioner
+            .find(validation)
+            .unwrap_or_else(|| panic!("runtime provisioner lost {validation:?}"));
+        assert!(
+            create < validate,
+            "runtime root was validated before creation"
+        );
+    }
+    for invariant in [
+        "[[ -d $directory && ! -L $directory ]]",
+        "stat -c '%u:%g:%a' \"$directory\"",
+        "== 0:0:700",
+    ] {
+        assert!(
+            provisioner.contains(invariant),
+            "runtime root validation lost {invariant:?}"
+        );
+    }
+
+    for bootstrap in [
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let source = read_workspace_file(bootstrap);
+        let install = source
+            .find("/usr/lib/tmpfiles.d/cats-vmm.conf")
+            .unwrap_or_else(|| panic!("{bootstrap} does not install runtime tmpfiles"));
+        let provision = source
+            .find("\"$PREFIX/bin/provision-vmm-socket-namespaces\"")
+            .or_else(|| source.find("\"$CATS_PREFIX/bin/provision-vmm-socket-namespaces\""))
+            .unwrap_or_else(|| panic!("{bootstrap} does not run the runtime provisioner"));
+        assert!(
+            install < provision,
+            "{bootstrap} must install tmpfiles before provisioning runtime roots"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation() {
@@ -1469,5 +2971,344 @@ fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation()
             .output()
             .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
         assert!(!output.status.success(), "accepted invalid key {invalid}");
+    }
+}
+
+#[test]
+fn agent_registration_deployments_share_one_canonical_release_receipt() {
+    let receipt_argument =
+        "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json";
+    for unit in [
+        "deploy/metal/systemd/cats-controld.service",
+        "deploy/metal/systemd/cats-noded.service",
+        "deploy/aws/metal/cats-worker.service",
+    ] {
+        let source = read_workspace_file(unit);
+        assert!(
+            source.contains(receipt_argument),
+            "{unit} lost the exact installed release receipt"
+        );
+        if unit.contains("noded") || unit.contains("worker") {
+            for forbidden in ["--node-id", "--state-dir", "--ch-kernel", "--ch-initramfs"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{unit} regained forbidden identity or Guest-byte override {forbidden}"
+                );
+            }
+        }
+    }
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(kubernetes.contains("\"--guest-runtime-profile-receipt-file\","));
+    assert!(kubernetes.contains("\"/opt/cats/release/guest-runtime-profile.v1.json\","));
+
+    let control_image = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    for copy in [
+        "guest-runtime-release.v1/guest-runtime-profile.v1.json /opt/cats/release/guest-runtime-profile.v1.json",
+        "guest-runtime-release.v1/manifest.v1.json /opt/cats/release/guest-runtime-release-manifest.v1.json",
+    ] {
+        assert!(control_image.contains(copy), "Control image lost {copy:?}");
+    }
+    let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
+    let noded = read_workspace_file("cmd/noded/src/main.rs");
+    assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
+    assert!(noded.contains("validate_installed_node_guest_runtime"));
+    assert!(noded.contains("spawn_signed_runtime_cutover"));
+
+    let workflow = read_workspace_file(".github/workflows/release.yml");
+    assert_eq!(
+        workflow.matches("guest-runtime-release:\n").count(),
+        1,
+        "the workflow must have one Guest release producer"
+    );
+    assert!(workflow.contains("RELEASE_OUT=\"$PWD/guest-runtime-release.v1\""));
+    assert_eq!(
+        workflow.matches("needs: guest-runtime-release").count(),
+        2,
+        "Control and Node artifacts must consume the same build job"
+    );
+    assert_eq!(
+        workflow.matches("name: guest-runtime-release-v1").count(),
+        3,
+        "one upload and exactly two consumers must name the same artifact"
+    );
+    assert!(
+        workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
+        "the worker archive must preserve the root-owned release member contract"
+    );
+    for guide in ["deploy/aws/README.md", "deploy/metal/README.md"] {
+        let guide = read_workspace_file(guide);
+        for composition_gate in [
+            "not a standalone deployable release",
+            "A20 signed Desired",
+            "/v1/nodes/heartbeat",
+            "shared-bearer heartbeat",
+            "eleven",
+            "readiness stays closed",
+            "zero runtime effect",
+        ] {
+            assert!(
+                guide.contains(composition_gate),
+                "runtime cutover guide lost composition blocker {composition_gate:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runtime_node_authority_deployments_pin_exact_trust_artifact_and_shutdown_window() {
+    let argument =
+        "--runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json";
+    let metal = read_workspace_file("deploy/metal/systemd/cats-controld.service");
+    assert!(metal.contains(argument));
+    assert!(metal.contains("TimeoutStopSec=35s"));
+
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    for expected in [
+        "\"--runtime-provisioner-trust-file\",",
+        "\"/etc/cats/identity/runtime-provisioner-trust.v1.json\",",
+        "resource \"kubernetes_config_map_v1\" \"runtime_provisioner_trust\"",
+        "mount_path = \"/etc/cats/identity/runtime-provisioner-trust.v1.json\"",
+        "sub_path   = \"runtime-provisioner-trust.v1.json\"",
+        "public_target_termination_grace_period_seconds = 60",
+        "public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds",
+    ] {
+        assert!(
+            kubernetes.contains(expected),
+            "production A23 composition lost {expected:?}"
+        );
+    }
+    let variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    assert!(variables.contains("variable \"runtime_provisioner_trust_bundle_json\""));
+    assert!(variables.contains("<= 16384"));
+    let image = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    assert!(image.contains("install -d -o 0 -g 0 -m 0755 /etc/cats/identity"));
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    for expected in [
+        "RUNTIME_PROVISIONER_TRUST_BUNDLE_B64",
+        "$RUNNER_TEMP/runtime-provisioner-trust.v1.json",
+        "runtime_provisioner_trust_bundle_json: $runtime_provisioner_trust_bundle_json",
+    ] {
+        assert!(workflow.contains(expected));
+    }
+}
+
+#[test]
+fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
+    let installer = read_workspace_file("deploy/aws/metal/install-guest-runtime-release.sh");
+    for invariant in [
+        "actual != expected",
+        "actual_directories != {\"guest\"}",
+        "metadata.st_nlink != 1",
+        "metadata.st_uid != required_uid",
+        "stat.S_IMODE(metadata.st_mode) != 0o644",
+        "sync_release_tree \"$destination\"",
+        "mv -T -- \"$incomplete\" \"$target_set\"",
+        "previous_id=$(persist_active_set)",
+        "write_activation \"$release_id\" \"$previous_id\"",
+        "recover_activation",
+        "write_start_authorization \"$activation_incoming\"",
+        "load_start_authorization \"$activation_incoming\"",
+        "require_service_stopped",
+        "require_service_active",
+        "activation-parent-fsync",
+        "activation-before-journal-replace",
+        "active-layout-parent-fsync:cats-root",
+        "trap prepare_rollback ERR",
+        "active-rename:$label",
+    ] {
+        assert!(
+            installer.contains(invariant),
+            "release installer lost {invariant:?}"
+        );
+    }
+    let kernel_activation = installer
+        .find("\"$set/guest/vmlinuz\" \"$active_guest_root/vmlinuz\" kernel")
+        .expect("kernel activation");
+    let manifest_activation = installer
+        .find("\"$set/manifest.v1.json\" \\")
+        .expect("manifest activation");
+    assert!(
+        kernel_activation < manifest_activation,
+        "the manifest is the active-set commit marker and must be renamed last"
+    );
+
+    for bootstrap in [
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let source = read_workspace_file(bootstrap);
+        let required = source
+            .find("CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload")
+            .expect("required shared release input");
+        let verify = source
+            .find("\"$release_installer\" verify")
+            .expect("release verification");
+        let prepare = source
+            .find("\"$release_installer\" prepare")
+            .expect("release preparation");
+        let readiness = source
+            .find("cats_wait_for_registered_node")
+            .expect("registration-backed readiness");
+        let authorize = source
+            .find("cats_begin_candidate_lifetime")
+            .expect("post-mutation start authorization and watchdog");
+        let commit = source
+            .find("cats_commit_candidate \"$release_installer\"")
+            .expect("release commit");
+        assert!(
+            required < verify
+                && verify < prepare
+                && prepare < authorize
+                && authorize < readiness
+                && readiness < commit
+        );
+        assert!(source.contains("cats_acquire_worker_deployment_lock"));
+        assert!(source.contains("validate-node-identity-installation.sh"));
+        for boundary in [
+            "after-installer-return",
+            "after-daemon-reload",
+            "after-authorize-worker-start",
+            "after-start-worker",
+            "after-registration-readiness",
+            "after-release-commit",
+        ] {
+            assert!(
+                source.contains(&format!("cats_worker_deployment_crash_probe {boundary}")),
+                "{bootstrap} lost outer transaction crash boundary {boundary}"
+            );
+        }
+        assert!(source.contains("cats_stop_node_service"));
+        assert!(source.contains("\"$release_installer\" rollback"));
+        for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "build-guest-image.sh"] {
+            assert!(
+                !source.contains(forbidden),
+                "{bootstrap} regained Host-local identity/release synthesis {forbidden:?}"
+            );
+        }
+    }
+
+    let identity_validator =
+        read_workspace_file("deploy/aws/metal/validate-node-identity-installation.sh");
+    for exact in [
+        "identity_dir=/etc/cats/identity",
+        "node-identity.v1.json",
+        "node-registration-key.pem",
+        "node-registration-credential-id",
+        "0:0:700",
+        "0:0:600:1",
+    ] {
+        assert!(identity_validator.contains(exact));
+    }
+
+    let terraform =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let archive_listing = terraform.find("tar --zstd -tf").expect("archive preflight");
+    let archive_extract = terraform.find("tar --zstd -xf").expect("archive extract");
+    let release_verify = terraform
+        .find("install-guest-runtime-release.sh\" verify")
+        .expect("staged release verification");
+    let identity_validate = terraform
+        .find("validate-node-identity-installation.sh\"")
+        .expect("staged identity validation");
+    let early_idle_guard = terraform
+        .find("require-idle-worker.sh\"")
+        .expect("drained worker guard");
+    let deployment_lock = terraform
+        .find("cats_acquire_worker_deployment_lock")
+        .expect("Host deployment lock");
+    let locked_metering = terraform[deployment_lock..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+        .map(|offset| deployment_lock + offset)
+        .expect("metering cgroup recomputation under the Host lock");
+    let locked_idle_guard = terraform[locked_metering..]
+        .find("require-idle-worker.sh\"")
+        .map(|offset| locked_metering + offset)
+        .expect("physical idle recheck under the Host lock");
+    let stop = terraform[locked_idle_guard..]
+        .find("cats_gate_node_service cats-worker")
+        .map(|offset| locked_idle_guard + offset)
+        .expect("masked worker stop");
+    let prepare = terraform[stop..]
+        .find("\"$release_installer\" prepare")
+        .map(|offset| stop + offset)
+        .expect("durable release prepare");
+    let first_install = terraform
+        .find("install -D -m 0755 \"$stage_path/cats-noded\"")
+        .expect("first installed byte");
+    assert!(
+        archive_listing < archive_extract
+            && archive_extract < release_verify
+            && release_verify < identity_validate,
+        "nothing from the empty stage may execute before verified extraction"
+    );
+    let authorize = terraform
+        .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
+        .expect("durable post-mutation start authorization and watchdog");
+    let start = terraform
+        .find("systemctl start cats-worker")
+        .expect("candidate worker start");
+    let readiness = terraform
+        .find("cats_wait_for_registered_node cats-worker")
+        .expect("registration-backed readiness");
+    let commit = terraform
+        .find("cats_commit_candidate \"$release_installer\"")
+        .expect("release commit");
+    assert!(
+        first_install < authorize && authorize < start && start < readiness && readiness < commit
+    );
+    assert!(
+        identity_validate < early_idle_guard
+            && early_idle_guard < deployment_lock
+            && deployment_lock < locked_metering
+            && locked_metering < locked_idle_guard
+            && locked_idle_guard < stop
+            && stop < prepare
+            && prepare < first_install
+    );
+    for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
+        assert!(
+            !terraform.contains(forbidden),
+            "Terraform regained derived Node identity {forbidden:?}"
+        );
+    }
+    for boundary in [
+        "after-installer-return",
+        "after-update-guest-seed",
+        "after-authorize-worker-start",
+        "after-start-worker",
+        "after-registration-readiness",
+        "after-release-commit",
+    ] {
+        assert!(
+            terraform.contains(&format!("cats_worker_deployment_crash_probe {boundary}")),
+            "Terraform lost outer transaction crash boundary {boundary}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn guest_release_shell_entrypoints_parse() {
+    for script in [
+        "deploy/aws/metal/install-guest-runtime-release.sh",
+        "deploy/aws/metal/install-worker.sh",
+        "deploy/aws/metal/worker-deployment-transaction.sh",
+        "deploy/aws/metal/validate-node-identity-installation.sh",
+        "deploy/metal/build-guest-image.sh",
+        "deploy/metal/install.sh",
+    ] {
+        let output = Command::new("bash")
+            .args(["-n", script])
+            .current_dir(workspace_root())
+            .output()
+            .unwrap_or_else(|error| panic!("parse {script}: {error}"));
+        assert!(
+            output.status.success(),
+            "{script} is not valid Bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

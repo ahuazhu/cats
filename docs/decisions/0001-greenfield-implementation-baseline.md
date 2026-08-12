@@ -1,45 +1,33 @@
 # ADR-0001：Greenfield implementation baseline
 
-- 状态：Accepted（第 7 条的状态命名由 [ADR-0002](0002-lifecycle-states-running-suspended-warm-cold.md) 细化；第 8 条“保留双候选后端”由 [ADR-0003](0003-direct-s3-chunkstore-backend.md) 取代）
+- 状态：Accepted
 - 日期：2026-07-21
-
-## 背景
-
-Cats 将脱离旧 `cat.dev` (~/work/cat.dev) / `dozyfs` 工程，从零实现。过去两天的架构讨论和实验提供了可复用的知识与证据，但旧代码同时包含不同产品形态、命名和技术债，不适合作为新项目代码基线。
 
 ## 决定
 
-1. 新项目只迁移设计文档、实验代码和实验结果，不迁移旧控制面、Node Agent、文件系统、UI 或部署代码。
-2. 对外产品名、CLI 和 API namespace 统一为 `Cats` / `cats`。
-3. Guest 存储接口固定为标准 virtio block；Guest 使用普通 ext4，不感知 JuiceFS、S3 或 Host Cache。
-4. Host 块服务暂命名为 `cats-blockd`，负责 vhost-user-blk、逻辑 Chunk、Cache、dirty tracking、FLUSH durability 和 attach fencing。
-5. 本地 NVMe 是可删除的 Cache，不是唯一真相源。删除一台 Host 后，已确认成功的 FLUSH 必须能从远端 durable store 恢复。
-6. RootDisk 生命周期与 Cat 一致；可选 PersistentDisk 独立持久化，并且 V1 只支持单写者 RWO。
-7. 生命周期实现保留三个层次：pause + page-out、snapshot + VMM exit、Cold。Warm 失败必须能回退到 Cold。
-8. JuiceFS-backed 与 Direct-OS（Direct-S3 实现）-backed 都保留为候选实现。在完成相同 crash/fencing/empty-cache/performance 测试前，不在 ADR-0001 中锁定最终后端。
+Cats 是一套独立实现的可休眠 Linux microVM 平台，当前基线固定为：
 
-## 明确不继承
+1. Guest 使用标准 virtio block 和普通 ext4，不感知对象存储、Host cache 或平台凭据。
+2. `cats-blockd` 使用唯一生产存储形态 **Direct-OS ChunkStore**；第一个生产适配器是
+   S3-compatible object store + PostgreSQL metadata，见 [ADR-0003](0003-direct-s3-chunkstore-backend.md)。
+3. 产品生命周期直接采用 **Running / Suspended / Warm / Cold** 四态，见
+   [ADR-0002](0002-lifecycle-states-running-suspended-warm-cold.md)。
+4. RootDisk 跟随 Cat 生命周期；PersistentDisk 独立存在。V1 volume 是 RWO，同一时刻只有
+   一个有效 attachment owner/epoch。
+5. Strict FLUSH 以远端 durable root 为成功边界；Relaxed FLUSH 可以先在本地达到 `L`。
+   只有 `R == L` 时本地 NVMe 才完全是可删除 cache；`R < L` 的 pending pack 是唯一数据。
+6. 控制面保存完整、单调版本的 desired runtime spec；Node 根据当前物理事实做电平触发
+   收敛，见 [ADR-0040](0040-level-triggered-runtime-reconciliation.md)。
+7. 云产品只出现在 composition root 和 adapter；存储、生命周期和 fencing 合同保持
+   provider-neutral。
 
-- 旧项目目录结构和内部包名。
-- Volume 与 Cat 一一绑定等旧资源耦合。
-- Guest 直接看到平台 JuiceFS/FUSE mount 的产品接口。
-- 特定 AWS Account、Bucket、Region、Host 路径或测试实例标识。
-- 旧项目已有测试通过就等同于新实现已验证的假设。
+## 不可妥协的基线
 
-## 实现顺序
-
-1. 固定协议和故障语义：block size、Chunk、Manifest、FLUSH/FUA、lease epoch。
-2. 实现单机 `cats-blockd` 最小闭环，并复用 Lazy ext4 digest/crash oracle。
-3. 接入 Cloud Hypervisor vhost-user-blk，完成 create/run/stop/wake/Cold。
-4. 实现 NVMe Cache 和一种 durable backend，再做空 Cache 恢复。
-5. 增加 RWO attach/fencing 和 Host 故障接管。
-6. 最后实现多节点控制面、CLI/API、网络 Endpoint、计费和管理功能。
-
-## 验收底线
-
-- 不能上传整个稀疏虚拟盘来提交少量写入。
-- Guest 收到成功 FLUSH 后，即使立即删除 Host，也必须能恢复该 generation。
-- 旧 attachment epoch 永远不能继续写。
-- 同一 RWO PersistentDisk 不能同时出现两个 writer。
-- Warm restore 错误不能阻止 Cold fallback。
-- 性能结论必须保留原始 CSV、样本数、测量边界和正确性判据。
+- 提交少量写入不能退化为上传整个稀疏虚拟盘。
+- Strict 已成功 FLUSH 的数据必须在永久丢失 Host 后从远端恢复；Relaxed 的较弱承诺必须
+  显式暴露，不能包装成 RPO 0。
+- 旧 attachment epoch 永远不能发布新 Root；同一 RWO volume 不得出现双 writer。
+- Suspended/Warm 的本地快路径失败必须先保护数据，再安全回退到 Cold。
+- checkpoint、心跳或缓存缺失不能单独证明 runtime 已停止或 volume 已释放。
+- 任何性能或可用性结论都必须保留环境、revision、样本数、测量边界和 correctness oracle；
+  实验数字不是生产 SLA。

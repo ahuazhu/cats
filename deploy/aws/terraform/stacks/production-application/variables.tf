@@ -24,21 +24,6 @@ variable "control_plane_replicas" {
   }
 }
 
-variable "gateway_image" {
-  description = "Immutable ECR cats-gatewayd image with sha256 digest."
-  type        = string
-}
-
-variable "shared_route_cache_table" {
-  description = "Production-infrastructure route_cache_table_name output. Required so any Gateway replica can reuse an already-signed Route Grant."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[A-Za-z0-9_.-]{3,255}$", var.shared_route_cache_table))
-    error_message = "shared_route_cache_table must be a valid DynamoDB table name."
-  }
-}
-
 variable "runtime_secret_data" {
   description = "WorkOS and Cats runtime secrets. Supply with TF_VAR_runtime_secret_data or an approved CI secret store."
   type        = map(string)
@@ -53,6 +38,11 @@ variable "route_grant_private_key_pem" {
 
 variable "route_grant_public_key_pem" {
   description = "Ed25519 public key derived by CI from route_grant_private_key_pem for startup key-pair verification."
+  type        = string
+}
+
+variable "runtime_provisioner_trust_bundle_json" {
+  description = "Canonical A23 deployment-provisioner public trust bundle. Supply from the central provisioning release."
   type        = string
 }
 
@@ -71,6 +61,17 @@ variable "storage_postgres_session_setup" {
     condition     = contains(["client", "server-verified"], var.storage_postgres_session_setup)
     error_message = "storage_postgres_session_setup must be client or server-verified."
   }
+}
+
+variable "chunkstore_bucket_name" {
+  description = "Platform stack chunkstore_bucket_name output."
+  type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact object-key prefix shared by blockd and cats-controld."
+  type        = string
+  default     = "cats"
 }
 
 variable "usage_postgres_url" {
@@ -174,12 +175,6 @@ variable "control_plane_hosts" {
   description = "Hosts routed to cats-controld."
   type        = list(string)
   default     = ["cats.run", "app.cats.run", "admin.cats.run", "ops.cats.run"]
-}
-
-variable "endpoint_wildcard_host" {
-  description = "Wildcard endpoint host routed to cats-gatewayd."
-  type        = string
-  default     = "*.cats.run"
 }
 
 variable "auto_warm_after_seconds" {

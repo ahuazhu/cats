@@ -55,7 +55,7 @@ impl Site {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct LoginFlow {
     pub(super) state: String,
     pub(super) code_verifier: String,
@@ -98,6 +98,11 @@ pub async fn config(State(state): State<AppState>) -> Response {
             .workos
             .as_ref()
             .map(|config| config.api_base_url().to_string()),
+        workos_admin_organization_id: state
+            .cfg
+            .workos
+            .as_ref()
+            .map(|config| config.admin_organization_id.clone()),
     })
     .into_response();
     set_no_store(&mut response);
@@ -117,7 +122,12 @@ pub async fn login(
     let (organization_id, workspace_id) = match site {
         Site::User => {
             if let Some(workspace_id) = query.workspace.as_deref() {
-                let scope = state.store.workspace_scope(workspace_id)?;
+                let workspace_id = workspace_id.to_string();
+                let lookup_workspace_id = workspace_id.clone();
+                let scope = state
+                    .store
+                    .execute(move |store| store.workspace_scope(&lookup_workspace_id))
+                    .await?;
                 (
                     Some(scope.account.workos_organization_id),
                     Some(workspace_id.to_string()),
@@ -280,12 +290,31 @@ pub async fn callback(
     } else {
         scope_unmapped_user_session(config, &state.store, &flow, sealed_session, session).await
     };
-    let identity = match validate_flow_identity(config, &state.store, &flow, &session) {
+    let validation_config = state
+        .cfg
+        .workos
+        .clone()
+        .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
+    let validation_flow = flow.clone();
+    let validation_session = session.clone();
+    let identity = match state
+        .store
+        .execute(move |store| {
+            validate_flow_identity(
+                &validation_config,
+                store,
+                &validation_flow,
+                &validation_session,
+            )
+            .map_err(|failure| failure.0)
+        })
+        .await
+    {
         Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(
                 site = ?flow.site,
-                error = %error.0,
+                error = %error,
                 "WorkOS session is not authorized for the requested site"
             );
             return auth_error_redirect(config, &flow, identity_error_code(flow.site));
@@ -302,16 +331,18 @@ pub async fn callback(
         config.cookie_domain.as_deref(),
     )?;
     if flow.site == Site::User {
-        let workspace = if let Some(workspace_id) = flow.workspace_id.as_deref() {
-            state.store.workspace_by_id(workspace_id)?
+        let workspace_id = if let Some(workspace_id) = flow.workspace_id.as_deref() {
+            workspace_id.to_string()
         } else {
-            state.store.workspace_by_id(
-                identity
-                    .default_workspace_id
-                    .as_deref()
-                    .ok_or_else(|| ApiError::internal("user login selected no workspace"))?,
-            )?
+            identity
+                .default_workspace_id
+                .clone()
+                .ok_or_else(|| ApiError::internal("user login selected no workspace"))?
         };
+        let workspace = state
+            .store
+            .execute(move |store| store.workspace_by_id(&workspace_id))
+            .await?;
         let user_id = identity
             .user_id
             .as_deref()
@@ -402,21 +433,22 @@ pub(super) async fn scope_session_to_organization(
 
 async fn scope_unmapped_user_session(
     config: &WorkOsConfig,
-    store: &crate::store::Store,
+    store: &std::sync::Arc<crate::store::Store>,
     flow: &LoginFlow,
     sealed_session: String,
     session: SessionState,
 ) -> (String, SessionState) {
+    let organization_id = session.organization_id.clone();
+    let account_is_unmapped = store
+        .execute(move |store| Ok(store.account_for_organization(&organization_id)?.is_none()))
+        .await
+        .unwrap_or(false);
     let should_rescope = flow.site == Site::User
         && flow.organization_id.is_none()
         && flow.workspace_id.is_none()
         && session.authenticated
         && !session.organization_id.is_empty()
-        && store
-            .account_for_organization(&session.organization_id)
-            .ok()
-            .flatten()
-            .is_none();
+        && account_is_unmapped;
     if !should_rescope {
         return (sealed_session, session);
     }
@@ -479,9 +511,17 @@ async fn scope_unmapped_user_session(
         || candidate.organization_id != organization_id
         || !same_user
         || !store
-            .workspace_by_id(&workspace_id)
-            .and_then(|workspace| store.account_by_id(&workspace.account_id))
-            .is_ok_and(|account| account.workos_organization_id == candidate.organization_id)
+            .execute({
+                let workspace_id = workspace_id.clone();
+                let organization_id = candidate.organization_id.clone();
+                move |store| {
+                    let workspace = store.workspace_by_id(&workspace_id)?;
+                    let account = store.account_by_id(&workspace.account_id)?;
+                    Ok(account.workos_organization_id == organization_id)
+                }
+            })
+            .await
+            .unwrap_or(false)
     {
         tracing::warn!(
             workspace_id,

@@ -580,10 +580,20 @@ fn singleton_roles_elect_independently_and_release_on_session_drop() {
     );
 
     drop(first_reconciler);
-    assert!(
-        second_reconciler.try_acquire().unwrap(),
-        "PostgreSQL must release leadership with the owner session"
-    );
+    // Client destruction closes the session, but PostgreSQL may observe the
+    // standby query before it processes that close. Poll the lock authority
+    // instead of treating Rust Drop completion as synchronous server state.
+    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if second_reconciler.try_acquire().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "PostgreSQL must release leadership within the session cleanup bound"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -801,7 +811,7 @@ fn refuses_a_database_stamped_with_another_schema_version() {
     assert!(
         error
             .to_string()
-            .contains(&format!("requires {SCHEMA_VERSION}")),
+            .contains(&format!("version {SCHEMA_VERSION}")),
         "the operator needs to see the required schema version, got: {error}"
     );
     // A schema this build wrote itself keeps opening.
@@ -823,7 +833,7 @@ fn refuses_a_database_stamped_with_another_schema_version() {
 }
 
 #[test]
-fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
+fn refuses_an_old_stamp_without_repairing_its_shape() {
     let url = crate::testsupport::isolated_control_store_url();
     drop(Store::connect(&url, None).unwrap());
     {
@@ -837,25 +847,716 @@ fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
             .unwrap();
     }
 
-    let store = Store::connect(&url, None).expect("upgrade the stamped v1 schema");
-    store
-        .register_node_with_admission(
-            "node-keyed",
-            "http://node",
-            "http://gateway",
-            4,
-            8192,
-            NodeAdmission::for_route_grant(false, Some("abc123"), "abc123"),
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("an old stamp must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let stamped: i64 = admin
+        .query_one(
+            "SELECT version FROM control_schema_version WHERE singleton",
+            &[],
         )
-        .unwrap();
-    assert_eq!(
-        store
-            .get_node("node-keyed")
-            .unwrap()
-            .route_grant_public_key_sha256
-            .as_deref(),
-        Some("abc123")
+        .unwrap()
+        .get(0);
+    let route_table: Option<String> = admin
+        .query_one("SELECT to_regclass('route_grant_rollout_state')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    let route_column: bool = admin
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name='nodes'
+                   AND column_name='route_grant_public_key_sha256'
+             )",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stamped, 1);
+    assert!(route_table.is_none());
+    assert!(!route_column);
+}
+
+#[test]
+fn refuses_current_stamp_without_node_transport_target_projection() {
+    assert_eq!(SCHEMA_VERSION, 14);
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "ALTER TABLE runtime_node_placement_policies
+                    DROP COLUMN node_transport_target;",
+            )
+            .unwrap();
+    }
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("a stamped schema missing the transport target projection must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error
+        .to_string()
+        .contains(&format!("version {SCHEMA_VERSION}")));
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let column_still_absent: bool = admin
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name='runtime_node_placement_policies'
+                   AND column_name='node_transport_target')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        column_still_absent,
+        "startup must not repair a stamped schema"
     );
+}
+
+#[test]
+fn refuses_unstamped_partial_control_schema_without_adding_tables() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE TABLE volume_records (volume_id TEXT PRIMARY KEY)")
+        .unwrap();
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("partial schema must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    let stamp: Option<String> = admin
+        .query_one("SELECT to_regclass('control_schema_version')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    let accounts: Option<String> = admin
+        .query_one("SELECT to_regclass('accounts')::TEXT", &[])
+        .unwrap()
+        .get(0);
+    assert!(stamp.is_none());
+    assert!(accounts.is_none());
+}
+
+#[test]
+fn refuses_current_stamp_with_a_partial_shape_without_repairing_it() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("DROP TABLE delete_completion_receipts")
+        .unwrap();
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("partial schema must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    let table: Option<String> = admin
+        .query_one(
+            "SELECT to_regclass('delete_completion_receipts')::TEXT",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(table.is_none(), "startup must not repair a stamped schema");
+}
+
+#[test]
+fn refuses_current_stamp_with_missing_authority_catalog_barriers() {
+    for ddl in [
+        "ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage",
+        "DROP INDEX runtime_node_one_active_credential",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records",
+        "ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage;
+         ALTER TABLE node_identities
+             ADD CONSTRAINT node_identity_current_public_key_lineage
+             FOREIGN KEY (
+                 credential_id, node_id, credential_public_key_spki_sha256,
+                 credential_lineage_state)
+             REFERENCES runtime_node_credential_lineage(
+                 node_id, credential_id, public_key_spki_sha256, state)
+             DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE runtime_node_credential_lineage
+             DROP CONSTRAINT runtime_node_credential_lineage_node_id_fkey;
+         ALTER TABLE runtime_node_credential_lineage
+             ADD CONSTRAINT runtime_node_credential_lineage_node_id_fkey
+             FOREIGN KEY (node_id) REFERENCES node_identities(node_id)
+             ON UPDATE CASCADE ON DELETE CASCADE
+             DEFERRABLE INITIALLY DEFERRED",
+        "CREATE SCHEMA shadow_authority;
+         CREATE TABLE shadow_authority.runtime_node_credential_lineage (
+             node_id TEXT NOT NULL,
+             credential_id TEXT NOT NULL,
+             public_key_spki_sha256 TEXT NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE (node_id, credential_id, public_key_spki_sha256, state)
+         );
+         INSERT INTO shadow_authority.runtime_node_credential_lineage
+             (node_id, credential_id, public_key_spki_sha256, state)
+         SELECT node_id, credential_id, public_key_spki_sha256, state
+           FROM runtime_node_credential_lineage;
+         ALTER TABLE node_identities
+             DROP CONSTRAINT node_identity_current_public_key_lineage;
+         ALTER TABLE node_identities
+             ADD CONSTRAINT node_identity_current_public_key_lineage
+             FOREIGN KEY (
+                 node_id, credential_id, credential_public_key_spki_sha256,
+                 credential_lineage_state)
+             REFERENCES shadow_authority.runtime_node_credential_lineage(
+                 node_id, credential_id, public_key_spki_sha256, state)
+             DEFERRABLE INITIALLY DEFERRED",
+        "CREATE OR REPLACE FUNCTION control_runtime_node_apply_is_immutable()
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN
+                 RETURN OLD;
+             END;
+             $$",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records;
+         CREATE TRIGGER runtime_node_apply_is_immutable
+             BEFORE UPDATE OR DELETE ON runtime_node_authority_apply_records
+             FOR EACH STATEMENT
+             EXECUTE FUNCTION control_runtime_node_apply_is_immutable()",
+        "DROP TRIGGER runtime_node_apply_is_immutable
+             ON runtime_node_authority_apply_records;
+         CREATE TRIGGER runtime_node_apply_is_immutable
+             BEFORE UPDATE OR DELETE ON runtime_node_authority_apply_records
+             FOR EACH ROW WHEN (false)
+             EXECUTE FUNCTION control_runtime_node_apply_is_immutable()",
+        "DROP TRIGGER runtime_node_policy_update
+             ON runtime_node_placement_policies;
+         CREATE TRIGGER runtime_node_policy_update
+             BEFORE UPDATE OF record ON runtime_node_placement_policies
+             FOR EACH ROW
+             EXECUTE FUNCTION control_runtime_node_policy_update()",
+        "ALTER TABLE runtime_node_placement_policies
+             DROP CONSTRAINT runtime_node_placement_policies_node_transport_target_check",
+        "ALTER TABLE runtime_node_placement_policies
+             DROP CONSTRAINT runtime_node_placement_policies_node_transport_target_check;
+         ALTER TABLE runtime_node_placement_policies
+             ADD CONSTRAINT runtime_node_placement_policies_node_transport_target_check
+             CHECK (node_transport_target LIKE 'https://%')",
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let current_schema: String = admin
+            .query_one("SELECT current_schema()", &[])
+            .unwrap()
+            .get(0);
+        let ddl = ddl.replace("shadow_authority", &format!("{current_schema}_shadow"));
+        admin.batch_execute(&ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema missing {ddl:?} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(
+            error.to_string().contains("authority catalog object"),
+            "operator must see the catalog mismatch, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
+        (
+            "volume_authorizations_record_authorization",
+            "DROP INDEX volume_authorizations_record_authorization",
+            None,
+        ),
+        (
+            "volume_authorizations_record_authorization",
+            "DROP INDEX volume_authorizations_record_authorization;
+             CREATE INDEX volume_authorizations_record_authorization
+                 ON volume_authorizations(volume_id)",
+            Some("USING btree (volume_id)"),
+        ),
+        (
+            "volume_authorizations_disposable_scope",
+            "DROP INDEX volume_authorizations_disposable_scope",
+            None,
+        ),
+        (
+            "volume_authorizations_disposable_scope",
+            "DROP INDEX volume_authorizations_disposable_scope;
+             CREATE INDEX volume_authorizations_disposable_scope
+                 ON volume_authorizations(
+                     volume_id, placement_epoch, desired_revision,
+                     authorization_id COLLATE \"C\"
+                 ) WHERE kind='disposable_root_delete'",
+            Some("volume_id, placement_epoch, desired_revision"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed authorization index must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(
+            error.to_string().contains(index),
+            "operator must see the changed index name, got: {error}"
+        );
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately wrong index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped index: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn refuses_missing_runtime_operation_lookup_indexes_without_repair() {
+    for index in [
+        "runtime_operations_lookup_scalar_scalar",
+        "runtime_operations_lookup_scalar_record",
+        "runtime_operations_lookup_record_scalar",
+        "runtime_operations_lookup_record_record",
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(&format!("DROP INDEX {index}")).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema missing {index} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        assert!(
+            definition.is_none(),
+            "startup recreated deliberately dropped {index}: {definition:?}"
+        );
+    }
+}
+
+#[test]
+fn refuses_missing_or_weakened_volume_owner_constraints_without_repair() {
+    for (constraint, ddl, expected_definition) in [
+        (
+            "volume_records_owner_present_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_present_check",
+            None,
+        ),
+        (
+            "volume_records_owner_node_present_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_node_present_check;
+             ALTER TABLE volume_records
+                 ADD CONSTRAINT volume_records_owner_node_present_check
+                 CHECK (owner_binding IS NULL OR owner_node_id IS NOT NULL)",
+            Some("owner_binding IS NULL"),
+        ),
+        (
+            "volume_records_owner_binding_check",
+            "ALTER TABLE volume_records
+                 DROP CONSTRAINT volume_records_owner_binding_check;
+             ALTER TABLE volume_records
+                 ADD CONSTRAINT volume_records_owner_binding_check
+                 CHECK (owner_binding IS NULL OR jsonb_typeof(owner_binding)='object')",
+            Some("jsonb_typeof(owner_binding)"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume owner constraint must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(constraint), "{error}");
+        let definition: Option<String> = admin
+            .query_opt(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname='volume_records'
+                    AND catalog_constraint.conname=$1",
+                &[&constraint],
+            )
+            .unwrap()
+            .map(|row| row.get(0));
+        match expected_definition {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately weak constraint: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped constraint: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn gateway_check_constraints_are_exact_and_current_stamp_rejects_drift() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let gateway_constraints = super::schema::REQUIRED_CHECK_CONSTRAINTS
+        .iter()
+        .filter(|(table, _, _)| table.starts_with("route_v2_gateway_"))
+        .collect::<Vec<_>>();
+    assert_eq!(gateway_constraints.len(), 22);
+    for (table, constraint, expected_definition) in gateway_constraints {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    for (constraint, ddl, expected_definition) in [
+        (
+            "route_v2_gateway_credential_first_revision_ck",
+            "ALTER TABLE route_v2_gateway_credential_lineage
+                 DROP CONSTRAINT route_v2_gateway_credential_first_revision_ck",
+            None,
+        ),
+        (
+            "route_v2_gateway_current_scope_ck",
+            "ALTER TABLE route_v2_gateway_current_credentials
+                 DROP CONSTRAINT route_v2_gateway_current_scope_ck;
+             ALTER TABLE route_v2_gateway_current_credentials
+                 ADD CONSTRAINT route_v2_gateway_current_scope_ck
+                 CHECK (scope IS NOT NULL)",
+            Some("scope IS NOT NULL"),
+        ),
+    ] {
+        let drift_url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&drift_url, None).unwrap());
+        let mut drift_admin = postgres::Client::connect(&drift_url, postgres::NoTls).unwrap();
+        drift_admin.batch_execute(ddl).unwrap();
+        let Err(error) = Store::connect(&drift_url, None) else {
+            panic!("a current stamp with changed {constraint} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(constraint), "{error}");
+        let definition: Option<String> = drift_admin
+            .query_opt(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND catalog_constraint.conname=$1",
+                &[&constraint],
+            )
+            .unwrap()
+            .map(|row| row.get(0));
+        match expected_definition {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired the weakened constraint: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated the dropped constraint: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn route_v2_signer_catalog_is_exact_and_current_stamp_rejects_drift() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let signer_constraints = super::schema::REQUIRED_CHECK_CONSTRAINTS
+        .iter()
+        .filter(|(table, _, _)| {
+            matches!(
+                *table,
+                "route_v2_signing_authority"
+                    | "route_v2_signer_revisions"
+                    | "route_v2_signer_key_lineage"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(signer_constraints.len(), 27);
+    for (table, constraint, expected_definition) in signer_constraints {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    for (catalog_object, ddl) in [
+        (
+            "route_v2_signing_authority_current_revision_fkey",
+            "ALTER TABLE route_v2_signing_authority
+                 DROP CONSTRAINT route_v2_signing_authority_current_revision_fkey",
+        ),
+        (
+            "route_v2_signer_revision_is_immutable",
+            "ALTER TABLE route_v2_signer_revisions
+                 DISABLE TRIGGER route_v2_signer_revision_is_immutable",
+        ),
+        (
+            "route_v2_signing_authority_selection_ck",
+            "ALTER TABLE route_v2_signing_authority
+                 DROP CONSTRAINT route_v2_signing_authority_selection_ck;
+             ALTER TABLE route_v2_signing_authority
+                 ADD CONSTRAINT route_v2_signing_authority_selection_ck
+                 CHECK (signer_state IN ('active', 'disabled'))",
+        ),
+    ] {
+        let drift_url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&drift_url, None).unwrap());
+        let mut drift_admin = postgres::Client::connect(&drift_url, postgres::NoTls).unwrap();
+        drift_admin.batch_execute(ddl).unwrap();
+        let Err(error) = Store::connect(&drift_url, None) else {
+            panic!("a current stamp with changed {catalog_object} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(catalog_object), "{error}");
+    }
+}
+
+#[test]
+fn refuses_missing_or_replaced_volume_primary_key_without_repair() {
+    for (ddl, expected_index_fragment) in [
+        (
+            "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE",
+            None,
+        ),
+        (
+            "ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE;
+             CREATE UNIQUE INDEX volume_records_pkey ON volume_records(volume_id)",
+            Some("CREATE UNIQUE INDEX"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume primary key must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains("volume_records_pkey"), "{error}");
+        let definition: Option<String> = admin
+            .query_one(
+                "SELECT pg_get_indexdef(to_regclass('volume_records_pkey'))",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        match expected_index_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired the deliberately non-primary unique index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated the deliberately dropped primary key: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn refuses_missing_or_replaced_persistent_disk_identity_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
+        (
+            "disk_records_initialization_token_unique",
+            "DROP INDEX disk_records_initialization_token_unique",
+            None,
+        ),
+        (
+            "disk_records_initialization_token_unique",
+            "DROP INDEX disk_records_initialization_token_unique;
+             CREATE INDEX disk_records_initialization_token_unique
+                 ON disk_records(initialization_token)
+                 WHERE role_kind='persistent'",
+            Some("CREATE INDEX"),
+        ),
+        (
+            "disk_records_filesystem_uuid_unique",
+            "DROP INDEX disk_records_filesystem_uuid_unique",
+            None,
+        ),
+        (
+            "disk_records_filesystem_uuid_unique",
+            "DROP INDEX disk_records_filesystem_uuid_unique;
+             CREATE UNIQUE INDEX disk_records_filesystem_uuid_unique
+                 ON disk_records(filesystem_uuid)
+                 WHERE role_kind='root'",
+            Some("role_kind = 'root'::text"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with changed {index} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired deliberately changed {index}: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated deliberately dropped {index}: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn refuses_missing_or_replaced_volume_owner_indexes_without_repair() {
+    for (index, ddl, expected_fragment) in [
+        (
+            "volume_records_owner_node",
+            "DROP INDEX volume_records_owner_node",
+            None,
+        ),
+        (
+            "volume_records_owner_node",
+            "DROP INDEX volume_records_owner_node;
+             CREATE INDEX volume_records_owner_node
+                 ON volume_records(volume_id, owner_node_id)
+                 WHERE owner_node_id IS NOT NULL",
+            Some("volume_id, owner_node_id"),
+        ),
+        (
+            "volume_records_owner_binding_node",
+            "DROP INDEX volume_records_owner_binding_node",
+            None,
+        ),
+        (
+            "volume_records_owner_binding_node",
+            "DROP INDEX volume_records_owner_binding_node;
+             CREATE INDEX volume_records_owner_binding_node
+                 ON volume_records(owner_node_id, volume_id)
+                 WHERE owner_node_id IS NOT NULL",
+            Some("owner_node_id, volume_id"),
+        ),
+    ] {
+        let url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&url, None).unwrap());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin.batch_execute(ddl).unwrap();
+
+        let Err(error) = Store::connect(&url, None) else {
+            panic!("a stamped schema with a changed Volume owner index must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(index), "{error}");
+        let definition: Option<String> = admin
+            .query_one("SELECT pg_get_indexdef(to_regclass($1))", &[&index])
+            .unwrap()
+            .get(0);
+        match expected_fragment {
+            Some(fragment) => assert!(
+                definition
+                    .as_deref()
+                    .is_some_and(|value| value.contains(fragment)),
+                "startup repaired or replaced the deliberately wrong index: {definition:?}"
+            ),
+            None => assert!(
+                definition.is_none(),
+                "startup recreated a deliberately dropped index: {definition:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn concurrent_first_connections_create_one_exact_schema() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let url = url.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            Store::connect(&url, None)
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        drop(worker.join().unwrap().unwrap());
+    }
+
+    let store = Store::connect(&url, None).unwrap();
     let stamped = store
         .with(|client| {
             client
@@ -867,10 +1568,6 @@ fn expands_v1_route_grant_metadata_without_breaking_the_rollback_stamp() {
         })
         .unwrap();
     assert_eq!(stamped, SCHEMA_VERSION);
-    assert_eq!(
-        stamped, 1,
-        "the expand-only Route Grant metadata must remain startable by the v1 application"
-    );
 }
 
 #[test]

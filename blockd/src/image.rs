@@ -28,7 +28,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use cats_api::chunk::{self, CHUNK_SIZE};
-use cats_storage::BlobStore;
+use cats_api::runtime_reconciliation::Sha256Digest;
+use cats_storage::{
+    encode_image_manifest, read_image_manifest, BlobError, BlobStore, ImageManifestReadError,
+    LowerHexSha256,
+};
 use sha2::Digest;
 
 use crate::format::{self, ImageChunk, ImageManifest, FORMAT_VERSION};
@@ -97,9 +101,13 @@ fn scan(path: &Path) -> Result<(String, ImageManifest, Vec<u64>)> {
         if buf.iter().all(|b| *b == 0) {
             continue;
         }
+        let object_id = hex::encode(format::sha256(&buf));
         chunks.push(ImageChunk {
             chunk_idx,
-            object_id: hex::encode(format::sha256(&buf)),
+            object_id: LowerHexSha256::new(object_id).ok_or_else(|| ImageError::Invalid {
+                path: path.display().to_string(),
+                message: "computed chunk digest was not lowercase SHA-256".into(),
+            })?,
             len: CHUNK_SIZE,
         });
         offsets.push(at);
@@ -107,7 +115,10 @@ fn scan(path: &Path) -> Result<(String, ImageManifest, Vec<u64>)> {
     let image_id = hex::encode(file_digest.finalize());
     let manifest = ImageManifest {
         version: FORMAT_VERSION,
-        image_id: image_id.clone(),
+        image_id: LowerHexSha256::new(image_id.clone()).ok_or_else(|| ImageError::Invalid {
+            path: path.display().to_string(),
+            message: "computed image digest was not lowercase SHA-256".into(),
+        })?,
         size_bytes,
         chunks,
     };
@@ -164,14 +175,14 @@ pub fn publish(blob: &dyn BlobStore, path: &Path) -> Result<Published> {
                         return;
                     };
                     let result = (|| -> Result<bool> {
-                        let key = chunk::keys::image_data(&image_id, &chunk.object_id);
+                        let key = chunk::keys::image_data(&image_id, chunk.object_id.as_str());
                         if blob.exists(&key)? {
                             return Ok(false);
                         }
                         let want = (file_len - at).min(CHUNK_SIZE as u64) as usize;
                         buf[want..].fill(0);
                         file.read_exact_at(&mut buf[..want], *at)?;
-                        if hex::encode(format::sha256(&buf)) != chunk.object_id {
+                        if hex::encode(format::sha256(&buf)) != chunk.object_id.as_str() {
                             // The file changed under us between the scan and the
                             // upload; the manifest would name the wrong bytes.
                             return Err(ImageError::Invalid {
@@ -209,7 +220,7 @@ pub fn publish(blob: &dyn BlobStore, path: &Path) -> Result<Published> {
     // Last: the manifest is what makes the image referenceable.
     blob.put_immutable(
         &chunk::keys::image_manifest(&image_id),
-        &serde_json::to_vec(&manifest).expect("image manifest serializes"),
+        &encode_image_manifest(&manifest).map_err(|_| ImageError::Corrupt(image_id.clone()))?,
     )?;
     Ok(Published {
         manifest,
@@ -220,13 +231,20 @@ pub fn publish(blob: &dyn BlobStore, path: &Path) -> Result<Published> {
 }
 
 pub fn load(blob: &dyn BlobStore, image_id: &str) -> Result<ImageManifest> {
-    let bytes = blob.get(&chunk::keys::image_manifest(image_id))?;
-    let manifest: ImageManifest =
-        serde_json::from_slice(&bytes).map_err(|_| ImageError::Corrupt(image_id.to_string()))?;
-    if manifest.image_id != image_id {
-        return Err(ImageError::Corrupt(image_id.to_string()));
-    }
-    Ok(manifest)
+    let digest = Sha256Digest::new(format!("sha256:{image_id}"))
+        .ok_or_else(|| ImageError::Corrupt(image_id.to_string()))?;
+    read_image_manifest(blob, &digest).map_err(|error| match error {
+        ImageManifestReadError::NotFound { key } => ImageError::Blob(BlobError::NotFound(key)),
+        ImageManifestReadError::BackendUnavailable { key } => {
+            ImageError::Blob(BlobError::Backend {
+                key,
+                message: "image manifest backend unavailable".into(),
+            })
+        }
+        ImageManifestReadError::TooLarge { .. } | ImageManifestReadError::Corrupt { .. } => {
+            ImageError::Corrupt(image_id.to_string())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -270,7 +288,7 @@ mod tests {
         // The id is the digest of the file, so an operator can verify it, and any
         // node publishing the same image lands on the same namespace.
         assert_eq!(
-            first.manifest.image_id,
+            first.manifest.image_id.as_str(),
             hex::encode(format::sha256(&std::fs::read(&path).unwrap()))
         );
     }
@@ -297,7 +315,7 @@ mod tests {
             1
         );
 
-        let map = published.manifest.base_map(3 * CHUNK_SIZE as u64).unwrap();
+        let map = format::image_base_map(&published.manifest, 3 * CHUNK_SIZE as u64).unwrap();
         assert!(matches!(map[1], crate::format::ChunkRef::Hole));
         assert_eq!(map[0].image(), Some(published.manifest.image_id.as_str()));
     }
@@ -320,12 +338,15 @@ mod tests {
             assert_eq!(chunk.len, CHUNK_SIZE);
             let bytes = blob
                 .get(&chunk::keys::image_data(
-                    &published.manifest.image_id,
-                    &chunk.object_id,
+                    published.manifest.image_id.as_str(),
+                    chunk.object_id.as_str(),
                 ))
                 .unwrap();
             assert_eq!(bytes.len(), CHUNK_SIZE as usize);
-            assert_eq!(hex::encode(format::sha256(&bytes)), chunk.object_id);
+            assert_eq!(
+                hex::encode(format::sha256(&bytes)),
+                chunk.object_id.as_str()
+            );
         }
     }
 
@@ -338,15 +359,17 @@ mod tests {
 
         // Simulate a publish that died before the manifest: the data object is
         // there, but nothing can reference it.
-        blob.delete(&chunk::keys::image_manifest(&published.manifest.image_id))
-            .unwrap();
-        assert!(load(blob.as_ref(), &published.manifest.image_id).is_err());
+        blob.delete(&chunk::keys::image_manifest(
+            published.manifest.image_id.as_str(),
+        ))
+        .unwrap();
+        assert!(load(blob.as_ref(), published.manifest.image_id.as_str()).is_err());
 
         // Re-publishing finishes the job without re-uploading the data.
         let again = publish(blob.as_ref(), &path).unwrap();
         assert!(!again.already_present);
         assert_eq!(again.objects_written, 0);
-        assert!(load(blob.as_ref(), &published.manifest.image_id).is_ok());
+        assert!(load(blob.as_ref(), published.manifest.image_id.as_str()).is_ok());
     }
 
     #[test]

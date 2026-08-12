@@ -24,7 +24,10 @@ pub enum DurabilityMode {
 
 impl ChunkEngine {
     pub fn durability_status(&self) -> DurabilityStatus {
-        let remote_durable_generation = self.generation();
+        let (remote_durable_generation, remote_head) = {
+            let state = self.state.lock().unwrap();
+            (state.generation, state.remote_head.clone())
+        };
         let unstaged_reservation = self.unstaged_pack_reservation_bytes();
         let staged = self.staged.lock().unwrap();
         let unpublished_generations = staged.packs.len();
@@ -41,9 +44,28 @@ impl ChunkEngine {
             .front()
             .map(|pack| unix_time_ms().saturating_sub(pack.staged_at_unix_ms))
             .unwrap_or(0);
+        let lineage = self
+            .authorized_attachment
+            .as_ref()
+            .map(|attachment| &attachment.identity);
         let status = DurabilityStatus {
             volume_id: self.cfg.volume_id.clone(),
             attachment_id: self.cfg.attachment_id.clone(),
+            attachment_epoch: lineage.map(|identity| identity.attachment_epoch),
+            acquire_origin: lineage.map(|identity| identity.acquire_origin.clone()),
+            node_id: lineage.map(|identity| identity.node_id.clone()),
+            placement_epoch: lineage.map(|identity| identity.placement_epoch),
+            guest_io_enabled: lineage.map(|_| self.guest_io_enabled),
+            // Process-attempt identity belongs to the composition root, not
+            // the storage engine. The target control server fills these only
+            // when exact signed CLI inputs are present.
+            size_bytes: None,
+            scope_id: None,
+            process_identity_token: None,
+            device_ownership_token: None,
+            guest_device_serial: None,
+            control_only: None,
+            remote_head: self.authorized_attachment.as_ref().map(|_| remote_head),
             mode: match self.cfg.durability {
                 DurabilityMode::Strict => "strict",
                 DurabilityMode::Relaxed { .. } => "relaxed",

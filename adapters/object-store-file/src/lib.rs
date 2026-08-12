@@ -4,7 +4,7 @@
 //! not a production durability substitute for a remote object store.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -124,6 +124,50 @@ impl BlobStore for FileBlobStore {
         }
     }
 
+    fn get_bounded(&self, key: &str, maximum: usize) -> Result<Vec<u8>> {
+        let path = self.path_for(key)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(BlobError::NotFound(key.to_string()));
+            }
+            Err(source) => return Err(Self::io_err(key, source)),
+        };
+        let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
+        let metadata_len = file
+            .metadata()
+            .map_err(|source| Self::io_err(key, source))?
+            .len();
+        if metadata_len > maximum_u64 {
+            return Err(BlobError::TooLarge {
+                key: key.to_string(),
+                maximum,
+                observed_at_least: maximum.saturating_add(1),
+            });
+        }
+
+        // Metadata is only an early reject: the file can grow between stat and
+        // read, so the actual stream remains capped at maximum + 1 bytes.
+        let read_limit = maximum.saturating_add(1);
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata_len)
+                .unwrap_or(maximum)
+                .min(maximum),
+        );
+        Read::by_ref(&mut file)
+            .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(|source| Self::io_err(key, source))?;
+        if bytes.len() > maximum {
+            return Err(BlobError::TooLarge {
+                key: key.to_string(),
+                maximum,
+                observed_at_least: bytes.len(),
+            });
+        }
+        Ok(bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.path_for(key)?.exists())
     }
@@ -233,5 +277,45 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let stored = store.get("volumes/v1/data/race").unwrap();
         assert!(stored == b"first" || stored == b"second");
+    }
+
+    #[test]
+    fn bounded_get_rejects_before_returning_an_oversized_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::open(directory.path()).unwrap();
+        store
+            .put_immutable("images/test/manifest.json", b"12345")
+            .unwrap();
+
+        assert_eq!(
+            store.get_bounded("images/test/manifest.json", 5).unwrap(),
+            b"12345"
+        );
+        assert!(matches!(
+            store.get_bounded("images/test/manifest.json", 4),
+            Err(BlobError::TooLarge {
+                maximum: 4,
+                observed_at_least: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn immutable_key_cannot_be_replaced_after_adapter_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = "images/test/manifest.json";
+        FileBlobStore::open(directory.path())
+            .unwrap()
+            .put_immutable(key, b"first")
+            .unwrap();
+
+        let reopened = FileBlobStore::open(directory.path()).unwrap();
+        reopened.put_immutable(key, b"first").unwrap();
+        assert!(matches!(
+            reopened.put_immutable(key, b"different"),
+            Err(BlobError::Backend { .. })
+        ));
+        assert_eq!(reopened.get(key).unwrap(), b"first");
     }
 }

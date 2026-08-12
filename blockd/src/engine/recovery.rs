@@ -28,6 +28,12 @@ impl ChunkEngine {
             let bytes = fs::read(&path)?;
             let (header, payload) = match format::decode_pack(&bytes) {
                 Ok(v) => v,
+                Err(error) if self.authorized_attachment.is_some() => {
+                    return Err(EngineError::Corrupt(format!(
+                        "authorized staged pack {}: {error}",
+                        path.display()
+                    )));
+                }
                 Err(e) => {
                     tracing::warn!("discarding undecodable pack {}: {e}", path.display());
                     let _ = fs::remove_file(&path);
@@ -37,29 +43,23 @@ impl ChunkEngine {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("pack volume id mismatch".into()));
             }
-            let head = self.meta.load_head(&self.cfg.volume_id)?;
-            let record_key = chunk::keys::commit_record(
-                &self.cfg.volume_id,
-                header.base_generation + 1,
-                &header.txn,
-            );
-            if self.blob.exists(&record_key)? && head.generation > header.base_generation {
-                // CAS happened before the crash; only clean up. The dirty
-                // bits stay set conservatively (we cannot tell post-barrier
-                // writes apart anymore), which at worst re-commits the chunk.
-                tracing::info!(txn = %header.txn, "pack already committed; cleaning up");
+            self.validate_pack_lineage(&header)?;
+            let head = self.authority.load_head(&self.cfg.volume_id)?;
+            if head.generation > header.base_generation {
+                // A sole serialized publisher can advance past this exact
+                // contiguous pack only by a successful batch CAS that included
+                // it. Intermediate packs intentionally have no commit record;
+                // the authoritative head is the cleanup oracle for both
+                // Strict and Relaxed recovery.
+                tracing::info!(txn = %header.txn, "pack covered by authoritative head; cleaning up");
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            if head.generation != header.base_generation {
-                tracing::warn!(
-                    txn = %header.txn,
-                    head_gen = head.generation,
-                    pack_base = header.base_generation,
-                    "discarding pack from a superseded lineage"
-                );
-                let _ = fs::remove_file(&path);
-                continue;
+            if head.generation < header.base_generation {
+                return Err(EngineError::Corrupt(format!(
+                    "pending pack chain is ahead of authority: head generation {}, pack base {}",
+                    head.generation, header.base_generation
+                )));
             }
             // Replay: object/record bytes keep the pack's original epoch so
             // the keys and contents stay byte-identical (idempotent);
@@ -102,6 +102,7 @@ impl ChunkEngine {
             if header.volume_id != self.cfg.volume_id {
                 return Err(EngineError::Corrupt("pack volume id mismatch".into()));
             }
+            self.validate_pack_lineage(&header)?;
             if header.base_generation < committed {
                 // A prior batch CAS included this generation. It is safe to
                 // remove the stale local file; the committed map is the truth.
@@ -133,7 +134,9 @@ impl ChunkEngine {
                 chunks,
             });
             recovered_bytes = recovered_bytes.saturating_add(encoded_bytes);
-            expected += 1;
+            expected = expected.checked_add(1).ok_or_else(|| {
+                EngineError::Corrupt("relaxed pack generation range overflows".into())
+            })?;
         }
 
         let mut staged = self.staged.lock().unwrap();

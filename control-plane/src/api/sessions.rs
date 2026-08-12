@@ -6,8 +6,12 @@ pub(super) async fn exec_cat(
     headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<ExecResponse>> {
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let cat = state.store.get_cat(&workspace, &cat)?;
+    let cat = state
+        .store
+        .execute(move |store| store.get_cat(&workspace, &cat))
+        .await?;
     if req.command.is_empty() {
         return Err(ApiError::invalid("command must be a non-empty argv array").into());
     }
@@ -21,10 +25,14 @@ pub(super) async fn exec_cat(
     // Guarded because an exec can outlive its caller too: an intermediary idle
     // timeout drops this future, and a release call placed after the awaited
     // work would never run, leaking the lease for its whole TTL.
-    let _lease =
-        state
-            .store
-            .acquire_work_guarded(&cat.id, WorkKind::Exec, &owner, "exec", ttl_ms)?;
+    let lease_cat_id = cat.id.clone();
+    let lease_owner = owner.clone();
+    let _lease = state
+        .store
+        .execute(move |store| {
+            store.acquire_work_guarded(&lease_cat_id, WorkKind::Exec, &lease_owner, "exec", ttl_ms)
+        })
+        .await?;
     let result: ApiResult<ExecResponse> = async {
         let mut cat = cat;
         let mut retried_suspend_conflict = false;
@@ -34,11 +42,16 @@ pub(super) async fn exec_cat(
             // 409 and cancels that suspend. Wait for the control plane to
             // observe Running again, then retry the exec once.
             cat = ensure_running(&state, cat).await?;
+            let node_id = cat.node_id.clone();
             let node = state
                 .store
-                .list_nodes()?
-                .into_iter()
-                .find(|n| Some(&n.id) == cat.node_id.as_ref())
+                .execute(move |store| {
+                    Ok(store
+                        .list_nodes()?
+                        .into_iter()
+                        .find(|node| Some(&node.id) == node_id.as_ref()))
+                })
+                .await?
                 .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
             let url = format!(
                 "{}/v1/cats/{}/exec",
@@ -84,7 +97,7 @@ pub(super) async fn exec_cat(
     }
     .await;
     drop(_lease);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    let _ = state.controller.maybe_auto_suspend(&cat_id).await;
     result.map(Json)
 }
 
@@ -104,10 +117,14 @@ pub(super) async fn list_oci_deployments(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<OciDeployment>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let cat = state.store.get_cat(&workspace, &cat)?;
-    Ok(Json(ListResponse {
-        items: state.store.list_oci_deployments(&cat.id)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| {
+            let cat = store.get_cat(&workspace, &cat)?;
+            store.list_oci_deployments(&cat.id)
+        })
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,8 +154,12 @@ pub(super) async fn deploy_oci(
     headers: HeaderMap,
     Json(request): Json<DeployOciRequest>,
 ) -> ApiResult<Response> {
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let cat = state.store.get_cat(&workspace, &cat)?;
+    let cat = state
+        .store
+        .execute(move |store| store.get_cat(&workspace, &cat))
+        .await?;
     // Reject a reference Cats cannot make an identity out of before claiming
     // anything: without a pinned digest there is nothing to be idempotent on.
     // The Guest reports the specific defect for anything subtler than this.
@@ -152,10 +173,14 @@ pub(super) async fn deploy_oci(
     let max_wait_ms = state.cfg.oci_deploy_sync_wait_ms;
     let wait = Duration::from_millis(query.wait_ms.unwrap_or(max_wait_ms).min(max_wait_ms));
 
-    let operation = match state
+    let claim_cat = cat.clone();
+    let claim_app = request.app.clone();
+    let claim_digest = image_digest.clone();
+    let claim = state
         .store
-        .claim_oci_deployment(&cat, &request.app, &image_digest)?
-    {
+        .execute(move |store| store.claim_oci_deployment(&claim_cat, &claim_app, &claim_digest))
+        .await?;
+    let operation = match claim {
         // Same cat, same app, same digest, already deployed. Answering from
         // the record is the point: re-running activation would restart a
         // service that is already running the requested image.
@@ -194,7 +219,8 @@ pub(super) async fn deploy_oci(
                 record_id,
                 operation.id.clone(),
                 lease,
-            )?;
+            )
+            .await?;
             operation
         }
     };
@@ -212,7 +238,7 @@ pub(super) async fn deploy_oci(
 /// The request -- which carries one-pull registry credentials -- is moved into
 /// the task and never persisted, which is also why an interrupted deploy is
 /// failed at startup rather than resumed.
-fn spawn_oci_deploy(
+async fn spawn_oci_deploy(
     state: &AppState,
     cat: &Cat,
     request: DeployOciRequest,
@@ -224,14 +250,22 @@ fn spawn_oci_deploy(
     // Registry transfer + layer extraction can legitimately take minutes.
     // Holding explicit work prevents auto-suspend from racing the deployment.
     let ttl_ms = 3_600_000;
-    let lease = state.store.acquire_work_guarded(
-        &cat.id,
-        WorkKind::Control,
-        &owner,
-        "oci-deploy",
-        ttl_ms,
-    )?;
-    state.store.start_operation(&operation_id)?;
+    let lease_cat_id = cat.id.clone();
+    let operation_to_start = operation_id.clone();
+    let lease = state
+        .store
+        .execute(move |store| {
+            let lease = store.acquire_work_guarded(
+                &lease_cat_id,
+                WorkKind::Control,
+                &owner,
+                "oci-deploy",
+                ttl_ms,
+            )?;
+            store.start_operation(&operation_to_start)?;
+            Ok(lease)
+        })
+        .await?;
     let state = state.clone();
     let cat = cat.clone();
     tokio::spawn(async move {
@@ -244,17 +278,31 @@ fn spawn_oci_deploy(
         let _owner_fence = owner_fence;
         let app = request.app.clone();
         let outcome = drive_oci_deploy(&state, cat.clone(), request, ttl_ms).await;
+        let result_record_id = record_id.clone();
+        let result_operation_id = operation_id.clone();
         let recorded = match &outcome {
             Ok(deployment) => {
+                let deployment = deployment.clone();
                 state
                     .store
-                    .succeed_oci_deployment(&record_id, &operation_id, deployment)
+                    .execute(move |store| {
+                        store.succeed_oci_deployment(
+                            &result_record_id,
+                            &result_operation_id,
+                            &deployment,
+                        )
+                    })
+                    .await
             }
-            Err(error) => state.store.fail_oci_deployment(
-                &record_id,
-                &operation_id,
-                &ErrorBody::new(error.code, &error.message),
-            ),
+            Err(error) => {
+                let error = ErrorBody::new(error.code, &error.message);
+                state
+                    .store
+                    .execute(move |store| {
+                        store.fail_oci_deployment(&result_record_id, &result_operation_id, &error)
+                    })
+                    .await
+            }
         };
         match (&outcome, recorded) {
             (Ok(_), Ok(true)) => {
@@ -276,7 +324,7 @@ fn spawn_oci_deploy(
                 "recording the OCI deployment outcome failed: {write_error}"
             ),
         }
-        let _ = state.controller.maybe_auto_suspend(&cat.id);
+        let _ = state.controller.maybe_auto_suspend(&cat.id).await;
     });
     Ok(())
 }
@@ -294,11 +342,16 @@ async fn drive_oci_deploy(
         cat = ensure_running(state, cat)
             .await
             .map_err(|failure| failure.0)?;
+        let node_id = cat.node_id.clone();
         let node = state
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|node| Some(&node.id) == cat.node_id.as_ref())
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| Some(&node.id) == node_id.as_ref()))
+            })
+            .await?
             .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
         let url = format!(
             "{}/v1/cats/{}/oci-deployments",
@@ -347,12 +400,18 @@ async fn await_oci_deployment(
 ) -> ApiResult<Response> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        let operation = state.store.get_operation(operation_id)?;
+        let query_operation_id = operation_id.to_string();
+        let operation = state
+            .store
+            .execute(move |store| store.get_operation(&query_operation_id))
+            .await?;
         match operation.phase {
             OperationPhase::Succeeded => {
+                let query_operation_id = operation_id.to_string();
                 let deployment = state
                     .store
-                    .oci_deployment_for_operation(operation_id)?
+                    .execute(move |store| store.oci_deployment_for_operation(&query_operation_id))
+                    .await?
                     .ok_or_else(|| {
                         ApiError::internal("succeeded OCI deployment is missing its result")
                     })?;
@@ -370,7 +429,11 @@ async fn await_oci_deployment(
             // Not an error: the deploy is still running and its outcome is
             // durable. The caller polls the operation instead of retrying,
             // which is what stops a retry from restarting the service.
-            let deployment = state.store.oci_deployment_for_operation(operation_id)?;
+            let query_operation_id = operation_id.to_string();
+            let deployment = state
+                .store
+                .execute(move |store| store.oci_deployment_for_operation(&query_operation_id))
+                .await?;
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(OciDeploymentOperationResponse {
@@ -407,15 +470,30 @@ pub(super) async fn shell_cat(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
     if !(1..=1_000).contains(&query.rows) || !(1..=1_000).contains(&query.cols) {
         return Err(ApiError::invalid("terminal dimensions must be in 1..=1000").into());
     }
-    let cat = state.store.get_cat(&workspace, &cat)?;
+    let cat = state
+        .store
+        .execute(move |store| store.get_cat(&workspace, &cat))
+        .await?;
     let owner = format!("shell_{}", uuid::Uuid::new_v4().simple());
+    let lease_cat_id = cat.id.clone();
+    let lease_owner = owner.clone();
     let lease = state
         .store
-        .acquire_work(&cat.id, WorkKind::Exec, &owner, "shell", 120_000)?;
+        .execute(move |store| {
+            store.acquire_work(
+                &lease_cat_id,
+                WorkKind::Exec,
+                &lease_owner,
+                "shell",
+                120_000,
+            )
+        })
+        .await?;
     state.notify.notify_one();
     let cat_id = cat.id.clone();
 
@@ -423,8 +501,12 @@ pub(super) async fn shell_cat(
     let node_socket = match prepared {
         Ok(socket) => socket,
         Err(error) => {
-            let _ = state.store.release_work(&lease.id);
-            let _ = state.controller.maybe_auto_suspend(&cat_id);
+            let lease_id = lease.id;
+            let _ = state
+                .store
+                .execute(move |store| store.release_work(&lease_id))
+                .await;
+            let _ = state.controller.maybe_auto_suspend(&cat_id).await;
             return Err(error);
         }
     };
@@ -441,8 +523,12 @@ pub(super) async fn shell_cat(
                 owner,
             )
             .await;
-            let _ = cleanup_state.store.release_work(&lease.id);
-            let _ = cleanup_state.controller.maybe_auto_suspend(&cat_id);
+            let lease_id = lease.id;
+            let _ = cleanup_state
+                .store
+                .execute(move |store| store.release_work(&lease_id))
+                .await;
+            let _ = cleanup_state.controller.maybe_auto_suspend(&cat_id).await;
         }))
 }
 
@@ -457,11 +543,16 @@ pub(super) async fn prepare_node_shell(
     let mut retried_suspend_conflict = false;
     loop {
         cat = ensure_running(state, cat).await?;
+        let node_id = cat.node_id.clone();
         let node = state
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|node| Some(&node.id) == cat.node_id.as_ref())
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| Some(&node.id) == node_id.as_ref()))
+            })
+            .await?
             .ok_or_else(|| ApiError::unavailable("cat has no live node"))?;
         let mut url = reqwest::Url::parse(node.agent_url.trim_end_matches('/'))
             .map_err(|error| ApiError::internal(format!("invalid node agent URL: {error}")))?;
@@ -565,13 +656,17 @@ pub(super) async fn proxy_shell(
                 }
             }
             _ = renewal.tick() => {
-                if let Err(error) = state.store.acquire_work(
-                    &cat_id,
-                    WorkKind::Exec,
-                    &owner,
-                    "shell",
-                    120_000,
-                ) {
+                let renewal_cat_id = cat_id.clone();
+                let renewal_owner = owner.clone();
+                if let Err(error) = state.store.execute(move |store| {
+                    store.acquire_work(
+                        &renewal_cat_id,
+                        WorkKind::Exec,
+                        &renewal_owner,
+                        "shell",
+                        120_000,
+                    )
+                }).await {
                     tracing::warn!(cat_id, error = %error, "shell work lease renewal failed");
                     break;
                 }

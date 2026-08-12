@@ -39,11 +39,10 @@ fi
 # The metering cgroups above hold only metered processes: the Guest and its
 # VMM. A cats-blockd is not metered, so a node whose Guests are gone but whose
 # blockd still holds an unpublished journal would pass that walk -- and the
-# release then runs `systemctl stop cats-worker`. KillMode=process deliberately
-# leaves that journal holder alive for re-adoption, but a release must not
-# replace the worker binaries or Guest seed underneath a live runtime. Walk the
-# process table for the installed runtime binaries as well. Match the full
-# argv[0] path, never the process comm: comm is truncated to 15 characters, so
+# release then runs `systemctl stop cats-worker`, whose default
+# KillMode=control-group kills the journal holder. Walk the process table for
+# the installed runtime binaries as well. Match the full argv[0]
+# path, never the process comm: comm is truncated to 15 characters, so
 # "cloud-hypervisor" (16) can never match itself there.
 runtime_pids=""
 process_table=$(ps -A -o pid= -o args=)
@@ -54,7 +53,7 @@ while IFS= read -r process_line; do
   set -- $process_line
   [ "$#" -ge 2 ] || continue
   case "$2" in
-    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cloud-hypervisor")
+    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cats-vmm-launcher"|"$runtime_bin_root/cloud-hypervisor")
       runtime_pids="$runtime_pids $1(${2##*/})"
       ;;
   esac
@@ -65,7 +64,7 @@ set +f
 
 if [ -n "$runtime_pids" ]; then
   echo "worker still has live Cat runtime processes:$runtime_pids" >&2
-  echo "a live cats-blockd may hold the only copy of unpublished writes; do not replace the worker underneath it" >&2
+  echo "a live cats-blockd may hold the only copy of unpublished writes; stopping cats-worker would kill it" >&2
   echo "drain the node and wait for state=cordoned cats=0 orphans=0 before applying the worker release" >&2
   echo "if the drain cannot converge, follow the worker release runbook in deploy/aws/terraform/README.md" >&2
   exit 1

@@ -94,9 +94,9 @@ Idempotency-Key: &lt;unique-key&gt;
 <p>When available credit is exhausted, paid compute admission returns HTTP <code>402</code> with code <code>payment_required</code>. Stopping, suspending, and deleting resources remain available.</p>
 
 <h2 id="operations">Operations</h2>
-<pre><code>GET /v1/workspaces/{workspace_id}/operations
-GET /v1/operations/{operation}</code></pre>
-<p>An Operation contains immutable <code>workspace_id</code> ownership, kind, target resource ID/generation, phase, timestamps, and an optional structured error. Access is still Workspace-scoped even though the single-Operation URL does not contain the workspace segment.</p>
+<pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation}</code></pre>
+<p>This exact lookup returns the canonical Runtime Reconciliation Operation: its immutable Workspace/Cat/revision/spec/placement binding, target, timestamps, and <code>pending</code>, <code>succeeded</code>, <code>failed</code>, or <code>superseded</code> settlement. A successful response is <code>application/json</code> with <code>Cache-Control: no-store</code>.</p>
+<p>Authorization is checked before the opaque Operation ID is looked up. An ID owned by another Workspace and an absent ID both return the same <code>not_found</code> response. The former global <code>GET /v1/operations/{operation}</code> and the Workspace Operation collection/list route are retired; no unbounded list contract is exposed.</p>
 
 <h2 id="errors">Errors</h2>
 <pre><code>{

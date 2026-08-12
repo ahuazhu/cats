@@ -15,8 +15,11 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use cats_api::runtime_node_authority::{
+    NODE_AUTHORITY_APPLY_ID_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
+};
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{spawn_for_retired_product_tests as spawn, Config, Handle};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::MetadataStore;
@@ -28,6 +31,7 @@ use workos::helpers::{seal_session, SessionData};
 
 const COOKIE_PASSWORD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const TEST_RSA_MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
+const NODE_AUTHORITY_UPDATE: &str = r#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MembershipFault {
@@ -46,6 +50,8 @@ struct WorkOsStub {
     personal_memberships: Arc<Mutex<HashMap<String, String>>>,
     invitations: Arc<Mutex<Vec<Value>>>,
     invitation_requests: Arc<Mutex<HashMap<String, Value>>>,
+    fleet_role_slug: Arc<Mutex<String>>,
+    fleet_permissions: Arc<Mutex<Vec<String>>>,
 }
 
 async fn authenticate(State(stub): State<WorkOsStub>, Json(body): Json<Value>) -> Json<Value> {
@@ -272,6 +278,15 @@ async fn list_memberships(
             "admin",
         ));
     }
+    if matches!(user_id, "user_cli" | "user_admin-code") {
+        data.push(membership(
+            "om_fleet_admin",
+            user_id,
+            "org_admin",
+            "Cats Fleet Administration",
+            &stub.fleet_role_slug.lock().unwrap(),
+        ));
+    }
     if let Some(expected_organization_id) = query.get("organization_id") {
         data.retain(|item| item["organization_id"] == *expected_organization_id);
     }
@@ -292,6 +307,25 @@ async fn list_memberships(
         "list_metadata": { "before": null, "after": null }
     }))
     .into_response()
+}
+
+async fn get_organization_role(
+    State(stub): State<WorkOsStub>,
+    Path((organization_id, slug)): Path<(String, String)>,
+) -> Json<Value> {
+    assert_eq!(organization_id, "org_admin");
+    Json(json!({
+        "object": "role",
+        "id": format!("role_{slug}"),
+        "name": "Fleet authorization test role",
+        "description": null,
+        "type": "EnvironmentRole",
+        "resource_type_slug": "organization",
+        "slug": slug,
+        "permissions": stub.fleet_permissions.lock().unwrap().clone(),
+        "created_at": "2026-07-22T00:00:00.000Z",
+        "updated_at": "2026-07-22T00:00:00.000Z"
+    }))
 }
 
 fn test_invitation(id: &str, email: &str, organization_id: &str, state: &str) -> Value {
@@ -485,6 +519,8 @@ struct Ctx {
     membership_fault: Arc<Mutex<MembershipFault>>,
     revoked_sessions: Arc<Mutex<Vec<String>>>,
     issuer: String,
+    fleet_role_slug: Arc<Mutex<String>>,
+    fleet_permissions: Arc<Mutex<Vec<String>>>,
 }
 
 impl Ctx {
@@ -497,6 +533,8 @@ impl Ctx {
         let personal_memberships = Arc::new(Mutex::new(HashMap::new()));
         let invitations = Arc::new(Mutex::new(Vec::new()));
         let invitation_requests = Arc::new(Mutex::new(HashMap::new()));
+        let fleet_role_slug = Arc::new(Mutex::new("member".to_owned()));
+        let fleet_permissions = Arc::new(Mutex::new(vec!["cats:fleet:admin".to_owned()]));
         let stub = WorkOsStub {
             exchanges: exchanges.clone(),
             membership_requests: membership_requests.clone(),
@@ -506,6 +544,8 @@ impl Ctx {
             personal_memberships,
             invitations,
             invitation_requests,
+            fleet_role_slug: fleet_role_slug.clone(),
+            fleet_permissions: fleet_permissions.clone(),
         };
         let app = Router::new()
             .route("/user_management/authenticate", post(authenticate))
@@ -537,6 +577,10 @@ impl Ctx {
                 get(get_organization_by_external_id),
             )
             .route("/user_management/users/{id}", get(get_user))
+            .route(
+                "/authorization/organizations/{organization_id}/roles/{slug}",
+                get(get_organization_role),
+            )
             .with_state(stub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let workos_base = format!("http://{}", listener.local_addr().unwrap());
@@ -576,7 +620,12 @@ impl Ctx {
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             storage_meta,
+            image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: "service-token".into(),
+            guest_runtime_profile_receipt:
+                cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+            runtime_provisioner_trust_bundle:
+                cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
             workos: Some(Arc::new(workos)),
@@ -615,6 +664,8 @@ impl Ctx {
             membership_fault,
             revoked_sessions,
             issuer,
+            fleet_role_slug,
+            fleet_permissions,
         }
     }
 
@@ -649,6 +700,14 @@ impl Ctx {
 
     fn membership_request_count(&self) -> usize {
         self.membership_requests.load(Ordering::SeqCst)
+    }
+
+    fn set_fleet_authority(&self, role_slug: &str, permissions: &[&str]) {
+        *self.fleet_role_slug.lock().unwrap() = role_slug.to_owned();
+        *self.fleet_permissions.lock().unwrap() = permissions
+            .iter()
+            .map(|permission| (*permission).to_owned())
+            .collect();
     }
 
     async fn begin_login(&self, site: &str) -> (String, String) {
@@ -760,6 +819,25 @@ impl Ctx {
     }
 }
 
+fn node_authority_update(apply_id: char) -> (String, String) {
+    let apply_id = std::iter::repeat_n(apply_id, 32).collect::<String>();
+    (
+        NODE_AUTHORITY_UPDATE.replace("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &apply_id),
+        apply_id,
+    )
+}
+
+async fn assert_node_authority_error(
+    response: reqwest::Response,
+    expected_status: StatusCode,
+    expected_body: &str,
+) {
+    assert_eq!(response.status(), expected_status);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    assert_eq!(response.text().await.unwrap(), expected_body);
+}
+
 fn cookie_pair(response: &reqwest::Response, name: &str) -> String {
     response
         .headers()
@@ -786,6 +864,169 @@ async fn assert_membership_unavailable(response: reqwest::Response) {
 }
 
 #[tokio::test]
+async fn node_authority_workos_contract_uses_only_current_admin_org_permission() {
+    let ctx = Ctx::new().await;
+    let token_without_permission = ctx.cli_token_with_permissions("org_admin", &[]);
+    let before = ctx.membership_request_count();
+    let (body, apply_id) = node_authority_update('a');
+    let authorized = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .bearer_auth(&token_without_permission)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        authorized.headers()[NODE_AUTHORITY_APPLY_ID_HEADER],
+        apply_id
+    );
+    assert_eq!(
+        authorized.text().await.unwrap(),
+        r#"{"code":"authority_precondition_failed","message":"runtime node authority precondition failed"}"#
+    );
+
+    // Exact replay still re-reads WorkOS before consulting the persisted A23
+    // result. Removing the current permission therefore denies the replay.
+    ctx.set_fleet_authority("member", &[]);
+    let replay_denied = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .bearer_auth(&token_without_permission)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(replay_denied
+        .headers()
+        .get(NODE_AUTHORITY_APPLY_ID_HEADER)
+        .is_none());
+    assert_node_authority_error(
+        replay_denied,
+        StatusCode::FORBIDDEN,
+        r#"{"code":"permission_denied","message":"runtime node authority permission denied"}"#,
+    )
+    .await;
+    assert_eq!(ctx.membership_request_count(), before + 2);
+
+    // A privileged-looking role slug and a stale JWT permission are both
+    // insufficient when the current role object lacks the exact permission.
+    ctx.set_fleet_authority("admin", &[]);
+    let token_with_stale_permission =
+        ctx.cli_token_with_permissions("org_admin", &["cats:fleet:admin"]);
+    let (body, _) = node_authority_update('b');
+    let role_slug_denied = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .bearer_auth(token_with_stale_permission)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_node_authority_error(
+        role_slug_denied,
+        StatusCode::FORBIDDEN,
+        r#"{"code":"permission_denied","message":"runtime node authority permission denied"}"#,
+    )
+    .await;
+
+    ctx.set_fleet_authority("member", &["cats:fleet:admin"]);
+    let admin_cookie = ctx.login("admin", "admin-code").await;
+    let (body, apply_id) = node_authority_update('c');
+    let authorized = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, &admin_cookie)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        authorized.headers()[NODE_AUTHORITY_APPLY_ID_HEADER],
+        apply_id
+    );
+
+    let user_cookie = ctx.login("user", "user-code").await;
+    let user_session = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, user_cookie)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_node_authority_error(
+        user_session,
+        StatusCode::UNAUTHORIZED,
+        r#"{"code":"authentication_failed","message":"runtime node authority authentication failed"}"#,
+    )
+    .await;
+
+    let mixed = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, admin_cookie)
+        .bearer_auth(ctx.cli_token("org_admin"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_node_authority_error(
+        mixed,
+        StatusCode::UNAUTHORIZED,
+        r#"{"code":"authentication_failed","message":"runtime node authority authentication failed"}"#,
+    )
+    .await;
+
+    let (body, _) = node_authority_update('d');
+    let wrong_org = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .bearer_auth(ctx.cli_token("org_default"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_node_authority_error(
+        wrong_org,
+        StatusCode::FORBIDDEN,
+        r#"{"code":"permission_denied","message":"runtime node authority permission denied"}"#,
+    )
+    .await;
+
+    ctx.set_membership_fault(MembershipFault::Status500);
+    let outage = ctx
+        .http
+        .post(ctx.url(RUNTIME_NODE_AUTHORITY_PATH))
+        .bearer_auth(ctx.cli_token("org_admin"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outage.headers()[header::RETRY_AFTER], "1");
+    assert!(outage
+        .headers()
+        .get(NODE_AUTHORITY_APPLY_ID_HEADER)
+        .is_none());
+    assert_node_authority_error(
+        outage,
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"code":"temporarily_unavailable","message":"runtime node authority is temporarily unavailable"}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn workos_user_and_admin_sessions_enforce_their_scopes() {
     let ctx = Ctx::new().await;
 
@@ -804,6 +1045,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .as_str()
         .unwrap()
         .starts_with("http://127.0.0.1:"));
+    assert_eq!(public_config["workos_admin_organization_id"], "org_admin");
     assert!(public_config.get("token_login_enabled").is_none());
     assert!(public_config.get("workspaces").is_none());
     assert!(!public_config.to_string().contains("sk_test_secret"));

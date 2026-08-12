@@ -86,11 +86,12 @@ Every Cat already has a `web` Endpoint for port 8080. `cats expose CAT PORT` rec
 
 ## Operation commands
 
-    cats operation ls
     cats operation get ID
     cats operation wait ID
 
-Mutations normally wait up to 120 seconds. With `--no-wait`, save the returned ID and use `operation wait` or `operation get`. Safe retries should use the same resource intent; the API attaches idempotency keys to mutations.
+Cat create returns an accepted Operation ID. `operation get` reads that exact Operation in the selected Workspace; `operation wait` polls it for up to 120 seconds and exits unsuccessfully for `failed` or `superseded`. Both commands use the strict Runtime Reconciliation decoder.
+
+`operation ls` remains unavailable and sends no HTTP request: the runtime authority deliberately exposes no unbounded Operation list. The old global Operation URL is retired.
 
 ## Automation guidance
 

@@ -5,24 +5,14 @@ module "usage_infrastructure" {
   environment                     = var.environment
   eks_cluster_name                = var.eks_cluster_name
   archive_bucket_name             = var.usage_archive_bucket_name
+  chunkstore_manifest_bucket_name = var.chunkstore_bucket_name
+  chunkstore_prefix               = var.chunkstore_prefix
   archive_object_lock_days        = var.usage_archive_object_lock_days
   kinesis_shard_count             = var.usage_kinesis_shard_count
   kinesis_retention_hours         = var.usage_kinesis_retention_hours
   consumer_lag_alarm_threshold_ms = var.usage_consumer_lag_alarm_threshold_ms
   alarm_action_arns               = var.alarm_sns_topic_arns
   tags                            = var.tags
-}
-
-# Independent from PostgreSQL and from any individual Gateway Pod. Apply this
-# before the application rollout so every Gateway replica has its Pod Identity
-# and regional shared cache when signed Route Grants become required.
-module "route_cache_infrastructure" {
-  source = "../../modules/route-cache-infrastructure"
-
-  name_prefix      = "cats"
-  environment      = var.environment
-  eks_cluster_name = var.eks_cluster_name
-  tags             = var.tags
 }
 
 locals {
@@ -45,10 +35,9 @@ resource "terraform_data" "metal_worker_inputs" {
         var.metal_worker_instance_role_name != "",
         var.worker_bundle_path != "",
         var.worker_bundle_sha256 != "",
-        length(var.worker_runtime_secret_data) > 0,
         length(trimspace(var.route_grant_public_key_pem)) > 0,
       ])
-      error_message = "The metal worker release path needs worker instances, instance role, bundle path, bundle sha256, runtime secret data and the Route Grant public key. Leave metal_worker_instances empty to skip it until the hardware exists."
+      error_message = "The metal worker release path needs worker instances, instance role, bundle path, bundle sha256 and the Route Grant public key. Leave metal_worker_instances empty to skip it until the hardware exists."
     }
   }
 }

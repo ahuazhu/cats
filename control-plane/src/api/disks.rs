@@ -10,12 +10,15 @@ pub(super) async fn create_disk(
     if req.size_bytes == 0 || req.size_bytes > cats_api::chunk::MAX_VOLUME_BYTES {
         return Err(ApiError::invalid("disk size out of range").into());
     }
-    let disk =
-        state
-            .store
-            .create_disk(&scope.workspace, &req.name, req.size_bytes, req.durability)?;
-    // Create the storage volume eagerly so snapshots/resize work pre-attach.
     let size = cats_api::chunk::round_up_to_chunk(req.size_bytes);
+    let workspace = scope.workspace;
+    let disk = state
+        .store
+        .execute(move |store| {
+            store.create_disk(&workspace, &req.name, req.size_bytes, req.durability)
+        })
+        .await?;
+    // Create the storage volume eagerly so snapshots/resize work pre-attach.
     match state.storage_meta.create_volume(&disk.volume_id, size) {
         Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(e) => return Err(ApiError::internal(e.to_string()).into()),
@@ -29,9 +32,11 @@ pub(super) async fn list_disks(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Disk>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    Ok(Json(ListResponse {
-        items: state.store.list_disks(&workspace)?,
-    }))
+    let items = state
+        .store
+        .execute(move |store| store.list_disks(&workspace))
+        .await?;
+    Ok(Json(ListResponse { items }))
 }
 
 pub(super) async fn get_disk(
@@ -40,7 +45,11 @@ pub(super) async fn get_disk(
     headers: HeaderMap,
 ) -> ApiResult<Json<Disk>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    Ok(Json(state.store.get_disk(&workspace, &disk)?))
+    let disk = state
+        .store
+        .execute(move |store| store.get_disk(&workspace, &disk))
+        .await?;
+    Ok(Json(disk))
 }
 
 pub(super) async fn delete_disk(
@@ -49,7 +58,10 @@ pub(super) async fn delete_disk(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let disk = state.store.get_disk(&workspace, &disk)?;
+    let disk = state
+        .store
+        .execute(move |store| store.get_disk(&workspace, &disk))
+        .await?;
     if disk.kind == DiskKind::Root {
         return Err(ApiError::failed_precondition("root disks are deleted with their cat").into());
     }
@@ -60,7 +72,11 @@ pub(super) async fn delete_disk(
         Ok(()) | Err(cats_storage::MetaError::NotFound(_)) => {}
         Err(e) => return Err(ApiError::internal(e.to_string()).into()),
     }
-    state.store.delete_disk_row(&disk.id)?;
+    let disk_id = disk.id;
+    state
+        .store
+        .execute(move |store| store.delete_disk_row(&disk_id))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -80,25 +96,43 @@ pub(super) async fn disk_action(
     headers: HeaderMap,
     Json(body): Json<DiskActionBody>,
 ) -> ApiResult<Response> {
+    if matches!(verb.as_str(), "mount" | "unmount") {
+        require_retired_product_authority_for_tests(&state)?;
+    }
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let disk = state.store.get_disk(&workspace, &disk)?;
+    let lookup_workspace = workspace.clone();
+    let disk = state
+        .store
+        .execute(move |store| store.get_disk(&lookup_workspace, &disk))
+        .await?;
     match verb.as_str() {
         "mount" => {
+            if disk.kind == DiskKind::Root {
+                return Err(ApiError::failed_precondition("cannot mount a root disk").into());
+            }
             let cat_ref = body
                 .cat_id
                 .ok_or_else(|| ApiError::invalid("cat_id required"))?;
             let mount_at = body
                 .mount_at
                 .ok_or_else(|| ApiError::invalid("mount_at required"))?;
-            let cat = state.store.get_cat(&workspace, &cat_ref)?;
-            if disk.kind == DiskKind::Root {
-                return Err(ApiError::failed_precondition("cannot mount a root disk").into());
-            }
-            let binding = state.store.bind_disk(&disk.id, &cat.id, &mount_at)?;
+            let query_disk = disk.clone();
+            let (cat, binding) = state
+                .store
+                .execute(move |store| {
+                    let cat = store.get_cat(&workspace, &cat_ref)?;
+                    let binding = store.bind_disk(&query_disk.id, &cat.id, &mount_at)?;
+                    Ok((cat, binding))
+                })
+                .await?;
             // Hot attach when running; cold cats pick the disk up at start.
             if cat.observed_state == ObservedState::Running {
                 if let Err(e) = hot_attach(&state, &cat, &disk, &binding.mount_path).await {
-                    state.store.unbind_disk(&disk.id)?;
+                    let disk_id = disk.id.clone();
+                    state
+                        .store
+                        .execute(move |store| store.unbind_disk(&disk_id))
+                        .await?;
                     return Err(e);
                 }
             }
@@ -108,7 +142,10 @@ pub(super) async fn disk_action(
             let Some(bound_cat) = disk.bound_cat_id.clone() else {
                 return Err(ApiError::failed_precondition("disk is not mounted").into());
             };
-            let cat = state.store.must_get_cat_by_id(&bound_cat)?;
+            let cat = state
+                .store
+                .execute(move |store| store.must_get_cat_by_id(&bound_cat))
+                .await?;
             if cat.observed_state == ObservedState::Running {
                 hot_detach(&state, &cat, &disk).await?;
             }
@@ -116,7 +153,11 @@ pub(super) async fn disk_action(
                 Ok(()) | Err(cats_storage::MetaError::NotFound(_)) => {}
                 Err(e) => return Err(ApiError::internal(e.to_string()).into()),
             }
-            state.store.unbind_disk(&disk.id)?;
+            let disk_id = disk.id;
+            state
+                .store
+                .execute(move |store| store.unbind_disk(&disk_id))
+                .await?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         "resize" => {
@@ -137,8 +178,15 @@ pub(super) async fn disk_action(
                 .storage_meta
                 .resize_volume(&disk.volume_id, rounded)
                 .map_err(|e| ApiError::failed_precondition(e.to_string()))?;
-            state.store.set_disk_size(&disk.id, new_size)?;
-            Ok(Json(state.store.get_disk(&workspace, &disk.id)?).into_response())
+            let disk_id = disk.id;
+            let disk = state
+                .store
+                .execute(move |store| {
+                    store.set_disk_size(&disk_id, new_size)?;
+                    store.get_disk(&workspace, &disk_id)
+                })
+                .await?;
+            Ok(Json(disk).into_response())
         }
         _ => Err(ApiError::invalid(format!("unknown disk action {verb}")).into()),
     }
@@ -151,18 +199,32 @@ pub(super) async fn hot_attach(
     mount_path: &str,
 ) -> ApiResult<()> {
     let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_attach", 120_000)?;
+    let lease_cat_id = cat.id.clone();
+    let lease = state
+        .store
+        .execute(move |store| {
+            store.acquire_work(
+                &lease_cat_id,
+                WorkKind::Control,
+                &owner,
+                "disk_attach",
+                120_000,
+            )
+        })
+        .await?;
     let cat_id = cat.id.clone();
     let result = async {
         let cat = ensure_running(state, cat.clone()).await?;
+        let node_id = cat.node_id.clone();
         let node = state
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| Some(&node.id) == node_id.as_ref()))
+            })
+            .await?
             .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
         let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
         match state.storage_meta.create_volume(&disk.volume_id, size) {
@@ -192,25 +254,43 @@ pub(super) async fn hot_attach(
         dispatch_or_unavailable(state, &node.agent_url, &job).await
     }
     .await;
-    let _ = state.store.release_work(&lease.id);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    let lease_id = lease.id;
+    let _ = state
+        .store
+        .execute(move |store| store.release_work(&lease_id))
+        .await;
+    let _ = state.controller.maybe_auto_suspend(&cat_id).await;
     result
 }
 
 pub(super) async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiResult<()> {
     let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "disk_detach", 120_000)?;
+    let lease_cat_id = cat.id.clone();
+    let lease = state
+        .store
+        .execute(move |store| {
+            store.acquire_work(
+                &lease_cat_id,
+                WorkKind::Control,
+                &owner,
+                "disk_detach",
+                120_000,
+            )
+        })
+        .await?;
     let cat_id = cat.id.clone();
     let result = async {
         let cat = ensure_running(state, cat.clone()).await?;
+        let node_id = cat.node_id.clone();
         let node = state
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| Some(&node.id) == node_id.as_ref()))
+            })
+            .await?
             .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
         let job = cats_api::nodejob::NodeJob {
             job_id: cats_api::nodejob::job_id(
@@ -227,8 +307,12 @@ pub(super) async fn hot_detach(state: &AppState, cat: &Cat, disk: &Disk) -> ApiR
         dispatch_or_unavailable(state, &node.agent_url, &job).await
     }
     .await;
-    let _ = state.store.release_work(&lease.id);
-    let _ = state.controller.maybe_auto_suspend(&cat_id);
+    let lease_id = lease.id;
+    let _ = state
+        .store
+        .execute(move |store| store.release_work(&lease_id))
+        .await;
+    let _ = state.controller.maybe_auto_suspend(&cat_id).await;
     result
 }
 
@@ -245,16 +329,30 @@ pub(super) async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response>
         return Ok((StatusCode::OK, Json(cat.clone())).into_response());
     }
     let owner = format!("control_{}", uuid::Uuid::new_v4().simple());
-    let lease =
-        state
-            .store
-            .acquire_work(&cat.id, WorkKind::Control, &owner, "cat_sync", 120_000)?;
+    let lease_cat_id = cat.id.clone();
+    let lease = state
+        .store
+        .execute(move |store| {
+            store.acquire_work(
+                &lease_cat_id,
+                WorkKind::Control,
+                &owner,
+                "cat_sync",
+                120_000,
+            )
+        })
+        .await?;
     let result = async {
+        let node_id = cat.node_id.clone();
         let node = state
             .store
-            .list_nodes()?
-            .into_iter()
-            .find(|n| Some(&n.id) == cat.node_id.as_ref())
+            .execute(move |store| {
+                Ok(store
+                    .list_nodes()?
+                    .into_iter()
+                    .find(|node| Some(&node.id) == node_id.as_ref()))
+            })
+            .await?
             .ok_or_else(|| ApiError::unavailable("cat node missing"))?;
         // The uuid keeps repeated syncs at one generation from replaying the
         // first run's journaled result: each call must actually drain.
@@ -272,13 +370,18 @@ pub(super) async fn sync_cat(state: &AppState, cat: &Cat) -> ApiResult<Response>
         dispatch_or_unavailable(state, &node.agent_url, &job).await
     }
     .await;
-    let _ = state.store.release_work(&lease.id);
+    let lease_id = lease.id;
+    let _ = state
+        .store
+        .execute(move |store| store.release_work(&lease_id))
+        .await;
     result?;
-    Ok((
-        StatusCode::OK,
-        Json(state.store.must_get_cat_by_id(&cat.id)?),
-    )
-        .into_response())
+    let cat_id = cat.id.clone();
+    let cat = state
+        .store
+        .execute(move |store| store.must_get_cat_by_id(&cat_id))
+        .await?;
+    Ok((StatusCode::OK, Json(cat)).into_response())
 }
 
 pub(super) async fn dispatch_or_unavailable(
@@ -319,10 +422,21 @@ pub(super) async fn create_snapshot(
     Path((workspace, disk)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Snapshot>> {
+    require_retired_product_authority_for_tests(&state)?;
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let disk = state.store.get_disk(&workspace, &disk)?;
-    if let Some(cat_id) = &disk.bound_cat_id {
-        let cat = state.store.must_get_cat_by_id(cat_id)?;
+    let (disk, bound_cat) = state
+        .store
+        .execute(move |store| {
+            let disk = store.get_disk(&workspace, &disk)?;
+            let cat = disk
+                .bound_cat_id
+                .as_deref()
+                .map(|cat_id| store.must_get_cat_by_id(cat_id))
+                .transpose()?;
+            Ok((disk, cat))
+        })
+        .await?;
+    if let Some(cat) = bound_cat {
         match cat.observed_state {
             ObservedState::Running | ObservedState::Suspended => {
                 // Snapshot metadata must name the remote watermark, never an
@@ -363,7 +477,10 @@ pub(super) async fn list_snapshots(
     headers: HeaderMap,
 ) -> ApiResult<Json<ListResponse<Snapshot>>> {
     check_workspace_auth(&state, &headers, &workspace).await?;
-    let disk = state.store.get_disk(&workspace, &disk)?;
+    let disk = state
+        .store
+        .execute(move |store| store.get_disk(&workspace, &disk))
+        .await?;
     let rows = state
         .storage_meta
         .list_snapshots(&disk.volume_id)

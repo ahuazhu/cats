@@ -1,3 +1,5 @@
+#[cfg(test)]
+use anyhow::Context as _;
 use anyhow::Result;
 
 #[cfg(target_os = "macos")]
@@ -250,13 +252,94 @@ mod platform {
 }
 
 pub(crate) fn get(service: &str, account: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path(service, account)? {
+        audit_test_operation("get")?;
+        return match std::fs::read_to_string(&path) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("read test credential store"),
+        };
+    }
     platform::get(service, account)
 }
 
 pub(crate) fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path(service, account)? {
+        audit_test_operation("set")?;
+        let parent = path
+            .parent()
+            .context("test credential path has no parent")?;
+        std::fs::create_dir_all(parent).context("create test credential store")?;
+        return std::fs::write(path, secret).context("write test credential store");
+    }
     platform::set(service, account, secret)
 }
 
 pub(crate) fn delete(service: &str, account: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(path) = test_credential_store_path(service, account)? {
+        audit_test_operation("delete")?;
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("delete test credential store"),
+        };
+    }
     platform::delete(service, account)
+}
+
+#[cfg(test)]
+fn test_credential_store_path(service: &str, account: &str) -> Result<Option<std::path::PathBuf>> {
+    let Some(root) = std::env::var_os("CATS_TEST_CREDENTIAL_STORE_DIR") else {
+        return Ok(None);
+    };
+    let root = std::path::PathBuf::from(root);
+    anyhow::ensure!(
+        root.is_absolute(),
+        "test credential-store directory must be absolute"
+    );
+    Ok(Some(test_path(&root, service, account)))
+}
+
+#[cfg(test)]
+pub(crate) fn test_path(
+    root: &std::path::Path,
+    service: &str,
+    account: &str,
+) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"cats.test-credential-store.v1\0");
+    hasher.update(service.as_bytes());
+    hasher.update([0]);
+    hasher.update(account.as_bytes());
+    let digest = hasher.finalize();
+    let name = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    root.join(name)
+}
+
+#[cfg(test)]
+fn audit_test_operation(operation: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("CATS_TEST_CREDENTIAL_STORE_AUDIT_FILE") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "test credential audit path must be absolute"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .context("open test credential audit")?;
+    writeln!(file, "{operation}").context("append test credential audit")
 }

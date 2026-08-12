@@ -142,6 +142,129 @@ impl WorkOsConfig {
         &self.account_organizations
     }
 
+    /// Re-read the candidate's current admin-organization membership and the
+    /// permissions of every currently assigned role. Role slugs are lookup
+    /// keys only; authorization is the exact permission in the current WorkOS
+    /// role objects, never a comparison against a privileged slug.
+    pub(crate) async fn current_fleet_administrator_principal(
+        &self,
+        candidate: &super::FleetAdministratorIdentityCandidate,
+    ) -> Result<Option<cats_api::runtime_reconciliation::FleetPolicyPrincipal>, ApiError> {
+        const FLEET_ADMIN_PERMISSION: &str = "cats:fleet:admin";
+
+        let page = self
+            .client
+            .organization_membership()
+            .list_organization_memberships(ListOrganizationMembershipsParams {
+                organization_id: Some(self.admin_organization_id.clone()),
+                user_id: Some(candidate.subject.clone()),
+                statuses: Some(vec![
+                    workos::enums::UserManagementOrganizationMembershipStatuses::Active,
+                ]),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    subject = candidate.subject,
+                    organization_id = self.admin_organization_id,
+                    "WorkOS fleet administrator membership lookup failed"
+                );
+                ApiError::unavailable("WorkOS fleet authorization is temporarily unavailable")
+            })?;
+        if page.list_metadata.after.is_some() {
+            tracing::warn!(
+                subject = candidate.subject,
+                organization_id = self.admin_organization_id,
+                "WorkOS returned more than one page for one subject/organization membership"
+            );
+            return Err(ApiError::unavailable(
+                "WorkOS fleet authorization is temporarily unavailable",
+            ));
+        }
+        let mut matching = page
+            .data
+            .into_iter()
+            .filter(|membership| {
+                membership.user_id == candidate.subject
+                    && membership.organization_id == self.admin_organization_id
+                    && membership.status == UserOrganizationMembershipStatus::Active
+            })
+            .collect::<Vec<_>>();
+        if candidate.organization_id != self.admin_organization_id || matching.len() != 1 {
+            return Ok(None);
+        }
+        let membership = matching.pop().expect("length was checked");
+        let mut role_slugs = membership
+            .roles
+            .into_iter()
+            .map(|role| role.slug)
+            .collect::<std::collections::BTreeSet<_>>();
+        role_slugs.insert(membership.role.slug);
+        if role_slugs.is_empty() {
+            return Ok(None);
+        }
+        for role_slug in role_slugs {
+            let role = match self
+                .client
+                .authorization()
+                .get_organization_role(&self.admin_organization_id, &role_slug)
+                .await
+            {
+                Ok(role) => role,
+                Err(error) if error.is_not_found() => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        subject = candidate.subject,
+                        organization_id = self.admin_organization_id,
+                        "WorkOS fleet administrator role lookup failed"
+                    );
+                    return Err(ApiError::unavailable(
+                        "WorkOS fleet authorization is temporarily unavailable",
+                    ));
+                }
+            };
+            if role.slug != role_slug {
+                tracing::warn!(
+                    requested_role = role_slug,
+                    returned_role = role.slug,
+                    "WorkOS fleet administrator role response was not self-consistent"
+                );
+                return Err(ApiError::unavailable(
+                    "WorkOS fleet authorization is temporarily unavailable",
+                ));
+            }
+            if role
+                .permissions
+                .iter()
+                .any(|permission| permission == FLEET_ADMIN_PERMISSION)
+            {
+                return Ok(Some(
+                    cats_api::runtime_reconciliation::FleetPolicyPrincipal::WorkosFleetAdministrator {
+                        subject: cats_api::runtime_reconciliation::Id::new(
+                            candidate.subject.clone(),
+                        )
+                        .ok_or_else(|| {
+                            ApiError::unauthenticated("WorkOS administrator subject is invalid")
+                        })?,
+                        organization_id: cats_api::runtime_reconciliation::Id::new(
+                            self.admin_organization_id.clone(),
+                        )
+                        .ok_or_else(|| {
+                            ApiError::unavailable(
+                                "WorkOS fleet authorization is temporarily unavailable",
+                            )
+                        })?,
+                    },
+                ));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn ensure_personal_organization(
         &self,
         user_id: &str,
@@ -473,7 +596,7 @@ impl WorkOsConfig {
 
     pub async fn me(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<MeResponse, ApiError> {
         let user = self
@@ -506,7 +629,7 @@ impl WorkOsConfig {
 
     pub async fn workspaces_for(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<Vec<Workspace>, ApiError> {
         self.accounts_and_workspaces_for(store, identity)
@@ -516,7 +639,7 @@ impl WorkOsConfig {
 
     pub async fn accounts_and_workspaces_for(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         identity: &AccessIdentity,
     ) -> Result<(Vec<Account>, Vec<Workspace>), ApiError> {
         let mut accounts = Vec::new();
@@ -539,43 +662,57 @@ impl WorkOsConfig {
                         "WorkOS workspace memberships are temporarily unavailable",
                     )
                 })?;
-            for membership in page.data {
-                if membership.status != UserOrganizationMembershipStatus::Active {
-                    continue;
-                }
-                if membership.user_id != identity.user_id {
-                    tracing::warn!(
-                        expected_user_id = identity.user_id,
-                        actual_user_id = membership.user_id,
-                        "WorkOS membership list returned another user"
-                    );
-                    continue;
-                }
-                let permissions = if identity.organization_id.as_deref()
-                    == Some(membership.organization_id.as_str())
-                {
-                    identity.permissions.as_slice()
-                } else {
-                    &[]
-                };
-                let Some((account, mut account_workspaces)) = store.account_and_workspace_views(
-                    &membership.organization_id,
-                    Some(&membership.role.slug),
-                    permissions,
-                )?
-                else {
-                    continue;
-                };
-                store.upsert_membership_shadow(
-                    &membership.id,
-                    &account.id,
-                    &membership.user_id,
-                    &membership.role.slug,
-                    "active",
-                )?;
-                accounts.push(account);
-                workspaces.append(&mut account_workspaces);
-            }
+            let memberships = page.data;
+            let expected_user_id = identity.user_id.clone();
+            let scoped_organization_id = identity.organization_id.clone();
+            let scoped_permissions = identity.permissions.clone();
+            let (mut page_accounts, mut page_workspaces) = store
+                .execute(move |store| {
+                    let mut accounts = Vec::new();
+                    let mut workspaces = Vec::new();
+                    for membership in memberships {
+                        if membership.status != UserOrganizationMembershipStatus::Active {
+                            continue;
+                        }
+                        if membership.user_id != expected_user_id {
+                            tracing::warn!(
+                                expected_user_id,
+                                actual_user_id = membership.user_id,
+                                "WorkOS membership list returned another user"
+                            );
+                            continue;
+                        }
+                        let permissions = if scoped_organization_id.as_deref()
+                            == Some(membership.organization_id.as_str())
+                        {
+                            scoped_permissions.as_slice()
+                        } else {
+                            &[]
+                        };
+                        let Some((account, mut account_workspaces)) = store
+                            .account_and_workspace_views(
+                                &membership.organization_id,
+                                Some(&membership.role.slug),
+                                permissions,
+                            )?
+                        else {
+                            continue;
+                        };
+                        store.upsert_membership_shadow(
+                            &membership.id,
+                            &account.id,
+                            &membership.user_id,
+                            &membership.role.slug,
+                            "active",
+                        )?;
+                        accounts.push(account);
+                        workspaces.append(&mut account_workspaces);
+                    }
+                    Ok((accounts, workspaces))
+                })
+                .await?;
+            accounts.append(&mut page_accounts);
+            workspaces.append(&mut page_workspaces);
             after = page.list_metadata.after;
             if after.is_none() {
                 break;
@@ -590,7 +727,7 @@ impl WorkOsConfig {
 
     pub(super) async fn single_mapped_workspace_for_user(
         &self,
-        store: &crate::store::Store,
+        store: &Arc<crate::store::Store>,
         user_id: &str,
     ) -> Result<Option<(String, String)>, ApiError> {
         let mut candidates = BTreeMap::new();
@@ -612,29 +749,38 @@ impl WorkOsConfig {
                         "WorkOS workspace memberships are temporarily unavailable",
                     )
                 })?;
-            for membership in page.data {
-                if membership.status != UserOrganizationMembershipStatus::Active {
-                    continue;
-                }
-                if membership.user_id != user_id {
-                    continue;
-                }
-                let Some(account) = store.account_for_organization(&membership.organization_id)?
-                else {
-                    continue;
-                };
-                if account.status != "active" {
-                    continue;
-                }
-                let Some(workspace) = store
-                    .workspaces_for_account(&account.id)?
-                    .into_iter()
-                    .find(|workspace| workspace.is_default)
-                else {
-                    continue;
-                };
-                candidates.insert(workspace.id, membership.organization_id);
-            }
+            let memberships = page.data;
+            let expected_user_id = user_id.to_string();
+            let page_candidates = store
+                .execute(move |store| {
+                    let mut candidates = Vec::new();
+                    for membership in memberships {
+                        if membership.status != UserOrganizationMembershipStatus::Active
+                            || membership.user_id != expected_user_id
+                        {
+                            continue;
+                        }
+                        let Some(account) =
+                            store.account_for_organization(&membership.organization_id)?
+                        else {
+                            continue;
+                        };
+                        if account.status != "active" {
+                            continue;
+                        }
+                        let Some(workspace) = store
+                            .workspaces_for_account(&account.id)?
+                            .into_iter()
+                            .find(|workspace| workspace.is_default)
+                        else {
+                            continue;
+                        };
+                        candidates.push((workspace.id, membership.organization_id));
+                    }
+                    Ok(candidates)
+                })
+                .await?;
+            candidates.extend(page_candidates);
             after = page.list_metadata.after;
             if after.is_none() {
                 break;
