@@ -607,12 +607,15 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
 fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
     let quality = read_workspace_file("scripts/quality.sh");
     let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let (workspace_gate, _) = linux_gate
+        .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
+        .expect("focused systemd gate boundary");
 
     assert!(quality.contains("run_linux() {"));
     assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
     assert!(!quality.contains("run_linux() ("));
     assert!(
-        !linux_gate.lines().any(|line| {
+        !workspace_gate.lines().any(|line| {
             let line = line.trim_start();
             !line.starts_with('#') && line.contains("--privileged")
         }),
@@ -629,6 +632,10 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         (
             "LINUX_WORKSPACE_INTENDED=true",
             "create --name \"$LINUX_WORKSPACE_GATE\"",
+        ),
+        (
+            "LINUX_SYSTEMD_INTENDED=true",
+            "create --name \"$LINUX_SYSTEMD_GATE\"",
         ),
     ] {
         let intent_position = linux_gate
@@ -659,6 +666,7 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         "Container create\n  # and start are separate",
         "probe_owned_container",
         "probe_owned_network",
+        "remove_owned_container \"$LINUX_SYSTEMD_INTENDED\" \"$LINUX_SYSTEMD_GATE\" true",
         "remove_owned_container \"$LINUX_WORKSPACE_INTENDED\" \"$LINUX_WORKSPACE_GATE\" false",
         "remove_owned_container \"$LINUX_PG_INTENDED\" \"$LINUX_PG\" false",
         "remove_owned_network \"$LINUX_NETWORK_INTENDED\" \"$LINUX_NETWORK\"",
@@ -676,6 +684,108 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
     assert!(
         !linux_gate.contains("absent_rounds"),
         "elapsed absence is not proof that an interrupted create request settled"
+    );
+}
+
+#[test]
+fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let (_, systemd_gate) = linux_gate
+        .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
+        .expect("focused systemd gate boundary");
+
+    for required in [
+        "LINUX_SYSTEMD_IIDFILE=\"$LINUX_CAPTURE_DIR/systemd-image.iid\"",
+        "--iidfile \"$LINUX_SYSTEMD_IIDFILE\"",
+        "CATS_SOURCE_PROVENANCE_FINGERPRINT=$CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "^sha256:[0-9a-f]{64}$",
+        "image inspect",
+        "LINUX_SYSTEMD_IMAGE_ID|$CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "\"$LINUX_SYSTEMD_IMAGE_ID\" /lib/systemd/systemd",
+        "--privileged",
+        "--cgroupns=private",
+        "--cgroup-parent system.slice",
+        "--tmpfs /run",
+        "--tmpfs /run/lock",
+        "-e container=docker",
+        "target=/work,readonly",
+        "cat /proc/1/comm",
+        "cat /proc/1/cgroup",
+        "0::/init.scope",
+        "systemctl is-system-running --quiet",
+        "-- --ignored --exact --list",
+        "listed_test_count=$((listed_test_count + 1))",
+        "listed_test_count\" -ne 1",
+        "listed_test_mismatch\" == true",
+        "focused Linux Runtime E2E test inventory was not the exact known positive",
+        "timeout --signal=TERM --kill-after=30s 20m",
+        "install -D -m 0755 \"$source_binary\" \"$target_binary\"",
+        "cmp -s \"$source_binary\" \"$target_binary\"",
+    ] {
+        assert!(
+            systemd_gate.contains(required) || linux_gate.contains(required),
+            "the focused real-systemd E2E lost boundary {required:?}"
+        );
+    }
+    assert!(
+        !systemd_gate.contains("--tag"),
+        "the focused systemd container must not be created through a mutable tag"
+    );
+    assert!(
+        !linux_gate.contains("image rm"),
+        "run cleanup must not delete content-addressed image cache shared by concurrent gates"
+    );
+    assert_eq!(
+        linux_gate.matches("--privileged").count(),
+        1,
+        "privilege must be confined to the one focused systemd container"
+    );
+    for forbidden in ["--cgroupns=host", "source=/sys/fs/cgroup", "--network host"] {
+        assert!(
+            !systemd_gate.contains(forbidden),
+            "the focused systemd E2E escaped its private boundary {forbidden:?}"
+        );
+    }
+    let focused_command = systemd_gate
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        focused_command.contains(
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
+        ),
+        "the privileged gate must run only the exact ignored Node E2E"
+    );
+    assert!(
+        !systemd_gate.contains("--workspace"),
+        "the privileged focused block must never run workspace-wide Cargo"
+    );
+
+    let image = read_workspace_file("scripts/linux-systemd.Dockerfile");
+    for required in [
+        "FROM rust:1.97.1-bookworm",
+        "ARG CATS_SOURCE_PROVENANCE_FINGERPRINT",
+        "LABEL io.cats.quality.source-fingerprint=",
+        "e2fsprogs",
+        "iproute2",
+        "jq",
+        "systemd",
+        "rm -rf /var/lib/apt/lists/*",
+        "STOPSIGNAL SIGRTMIN+3",
+        "CMD [\"/lib/systemd/systemd\"]",
+    ] {
+        assert!(
+            image.contains(required),
+            "the focused systemd image lost {required:?}"
+        );
+    }
+    assert!(
+        !image.lines().any(|line| {
+            let instruction = line.trim_start().to_ascii_uppercase();
+            instruction.starts_with("COPY ") || instruction.starts_with("ADD ")
+        }),
+        "the focused PID-1 image must not embed a mutable source snapshot"
     );
 }
 
@@ -758,7 +868,36 @@ named_value() {
   return 1
 }
 
+argument_after() {
+  local wanted="$1"
+  local previous=""
+  local argument
+  shift
+  for argument in "$@"; do
+    if [[ "$previous" == "$wanted" ]]; then
+      printf '%s\n' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
 case "${1:-} ${2:-}" in
+  "build "*)
+    iidfile="$(argument_after --iidfile "$@")"
+    provenance="$(argument_after --build-arg "$@")"
+    provenance="${provenance#CATS_SOURCE_PROVENANCE_FINGERPRINT=}"
+    image_id="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    printf '%s\n' "$image_id" >"$iidfile"
+    printf '%s|%s\n' "$image_id" "$provenance" >"$state/systemd-image"
+    ;;
+  "image inspect")
+    id="${!#}"
+    IFS='|' read -r stored_id provenance <"$state/systemd-image"
+    [[ "$id" == "$stored_id" ]] || exit 64
+    printf '%s|%s\n' "$stored_id" "$provenance"
+    ;;
   "network create")
     name="${!#}"
     owner="$(label_value "$@")"
@@ -834,6 +973,9 @@ case "${1:-} ${2:-}" in
       || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
       : >"$state/late-workspace-removed"
     fi
+    if [[ "$id" == owned-cats-linux-systemd-gate-*-id ]]; then
+      : >"$state/systemd-removed"
+    fi
     ;;
   "create "*)
     name="$(named_value "$@")"
@@ -905,6 +1047,27 @@ case "${1:-} ${2:-}" in
       while :; do sleep 0.2; done
     fi
     ;;
+  "exec "*)
+    case "$*" in
+      *" cat /proc/1/comm") printf 'systemd\n' ;;
+      *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
+      *" systemctl is-system-running --quiet") ;;
+      *" sh -ceu "*) : >"$state/blockd-installed" ;;
+      *" cargo test "*" -- --ignored --exact --list")
+        if [[ "$mode" != zero-systemd-test ]]; then
+          printf '%s\n' \
+            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test'
+        fi
+        ;;
+      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*)
+        : >"$state/focused-systemd-test-ran"
+        ;;
+      *)
+        printf 'unexpected fake Docker exec: %s\n' "$*" >&2
+        exit 64
+        ;;
+    esac
+    ;;
   *)
     printf 'unexpected fake Docker command: %s\n' "$*" >&2
     exit 64
@@ -949,6 +1112,11 @@ fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collisi
             format!("cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
             "foreign-container-id",
         ),
+        (
+            "container",
+            format!("cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+            "foreign-systemd-id",
+        ),
     ] {
         let fixture = tempfile::tempdir().expect("Linux gate collision fixture");
         let fake_bin = fixture.path().join("bin");
@@ -977,6 +1145,31 @@ fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collisi
             }),
             "the Linux gate attempted to remove foreign immutable ID {id}:\n{trace}"
         );
+        for owned_resource in [
+            format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+            format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        ] {
+            if state.join(&owned_resource) != foreign {
+                assert!(
+                    !state.join(&owned_resource).exists(),
+                    "foreign {kind} collision blocked exact cleanup of {owned_resource}:\n{trace}"
+                );
+            }
+        }
+        if id == "foreign-systemd-id" {
+            for exact_cleanup in [
+                format!("rm -f owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"),
+                format!("rm -f owned-cats-linux-pg-{LINUX_GATE_TEST_TOKEN}-id"),
+                "network rm owned-network-id".to_owned(),
+            ] {
+                assert!(
+                    trace.contains(&exact_cleanup),
+                    "foreign systemd collision skipped cleanup {exact_cleanup:?}:\n{trace}"
+                );
+            }
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("refusing to remove foreign Linux gate"),
@@ -1107,6 +1300,9 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         "idempotent-name-reserved",
         "response-loss-late-marker",
         "late-workspace-removed",
+        "blockd-installed",
+        "focused-systemd-test-ran",
+        "systemd-removed",
     ] {
         assert!(
             state.join(marker).exists(),
@@ -1117,6 +1313,7 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
     ] {
         assert!(
             !state.join(&resource).exists(),
@@ -1140,6 +1337,71 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
     assert!(
         late_create < immutable_remove,
         "cleanup raced the response-loss daemon create:\n{trace}"
+    );
+    let immutable_image = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let systemd_create = trace
+        .lines()
+        .find(|line| {
+            line.starts_with(&format!(
+                "create --name cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} "
+            ))
+        })
+        .expect("focused systemd immutable-image create trace");
+    assert!(
+        systemd_create.ends_with(&format!("{immutable_image} /lib/systemd/systemd")),
+        "focused systemd create did not consume the iidfile image ID:\n{trace}"
+    );
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm -f {systemd_id}")),
+        "focused systemd container was not gracefully and exactly cleaned:\n{trace}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
+    let fixture = tempfile::tempdir().expect("Linux gate empty focused-test fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "zero-systemd-test")
+        .output()
+        .expect("run Linux gate empty focused-test regression");
+    assert!(
+        !output.status.success(),
+        "an empty exact Rust test filter incorrectly passed the Linux gate"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the real focused command ran after its known-positive probe returned zero tests"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("focused Linux Runtime E2E test inventory was not the exact known positive"),
+        "the empty exact test filter was not diagnosed:\n{stderr}"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after empty test-inventory failure: {resource}"
+        );
+    }
+    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
+    let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
+    assert!(
+        trace.contains(&format!("stop --time 20 {systemd_id}"))
+            && trace.contains(&format!("rm -f {systemd_id}")),
+        "empty test-inventory failure did not clean the focused container exactly:\n{trace}"
     );
 }
 
