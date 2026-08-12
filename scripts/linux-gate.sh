@@ -29,9 +29,11 @@ LINUX_OWNER_LABEL="$LINUX_OWNER_KEY=$LINUX_RUN_TOKEN"
 LINUX_NETWORK="cats-linux-net-$LINUX_RUN_TOKEN"
 LINUX_PG="cats-linux-pg-$LINUX_RUN_TOKEN"
 LINUX_WORKSPACE_GATE="cats-linux-workspace-gate-$LINUX_RUN_TOKEN"
+LINUX_SYSTEMD_GATE="cats-linux-systemd-gate-$LINUX_RUN_TOKEN"
 LINUX_NETWORK_INTENDED=false
 LINUX_PG_INTENDED=false
 LINUX_WORKSPACE_INTENDED=false
+LINUX_SYSTEMD_INTENDED=false
 LINUX_OWNER_CONFLICT=false
 LINUX_ACTIVE_DOCKER_PID=""
 LINUX_ACTIVE_DOCKER_KIND=""
@@ -47,6 +49,9 @@ LINUX_CLEANUP_ACTIVE=false
 LINUX_CAPTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cats-linux-gate.XXXXXXXX")"
 LINUX_DOCKER_STDOUT="$LINUX_CAPTURE_DIR/docker.stdout"
 LINUX_DOCKER_STDERR="$LINUX_CAPTURE_DIR/docker.stderr"
+LINUX_SYSTEMD_IIDFILE="$LINUX_CAPTURE_DIR/systemd-image.iid"
+LINUX_SYSTEMD_IMAGE_ID=""
+LINUX_SOURCE_FINGERPRINT_KEY="io.cats.quality.source-fingerprint"
 LINUX_PROBE_PRESENT=false
 LINUX_PROBE_ID=""
 LINUX_CLEANUP_DEADLINE=0
@@ -203,6 +208,8 @@ abandon_foreign_intent() {
     LINUX_PG_INTENDED=false
   elif [[ "$resource_kind" == container && "$expected_name" == "$LINUX_WORKSPACE_GATE" ]]; then
     LINUX_WORKSPACE_INTENDED=false
+  elif [[ "$resource_kind" == container && "$expected_name" == "$LINUX_SYSTEMD_GATE" ]]; then
+    LINUX_SYSTEMD_INTENDED=false
   fi
 }
 
@@ -460,6 +467,10 @@ remove_owned_network() {
 
 all_intended_resources_absent() {
   local all_absent=true
+  if [[ "$LINUX_SYSTEMD_INTENDED" == true ]]; then
+    probe_owned_container "$LINUX_SYSTEMD_GATE" || all_absent=false
+    [[ "$LINUX_PROBE_PRESENT" == false ]] || all_absent=false
+  fi
   if [[ "$LINUX_WORKSPACE_INTENDED" == true ]]; then
     probe_owned_container "$LINUX_WORKSPACE_GATE" || all_absent=false
     [[ "$LINUX_PROBE_PRESENT" == false ]] || all_absent=false
@@ -491,6 +502,7 @@ cleanup_linux_gate() {
     fi
   fi
   while ((SECONDS < LINUX_CLEANUP_DEADLINE)); do
+    remove_owned_container "$LINUX_SYSTEMD_INTENDED" "$LINUX_SYSTEMD_GATE" true || true
     remove_owned_container "$LINUX_WORKSPACE_INTENDED" "$LINUX_WORKSPACE_GATE" false || true
     remove_owned_container "$LINUX_PG_INTENDED" "$LINUX_PG" false || true
     remove_owned_network "$LINUX_NETWORK_INTENDED" "$LINUX_NETWORK" || true
@@ -554,7 +566,16 @@ trap 'linux_gate_signal 130' INT
 trap 'linux_gate_signal 143' TERM
 
 main() {
+  local attempt
+  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test"
+  local image_inspection=""
+  local iidfile_lines=""
+  local listed_test=""
+  local listed_test_count=0
+  local listed_test_mismatch=false
+  local observed=""
   local status=0
+  local systemd_ready=false
 
   command -v docker >/dev/null 2>&1 || {
     echo "docker is required for the Linux quality gate" >&2
@@ -606,6 +627,153 @@ main() {
     :
   else
     status=$?
+  fi
+
+  # ProvisionRootImage restart inventory must query a real system manager.
+  # Build the small PID-1 image after the unprivileged workspace gate, bind it
+  # to this exact source fingerprint, and consume only Docker's immutable image
+  # receipt. A tag is deliberately not part of the create authority. The image
+  # is content-addressed build cache, not a run-owned resource: concurrent runs
+  # may share it, so cleanup must remove only the owner-labeled container and
+  # leave cache reclamation to Docker.
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 36000 build \
+      --platform "$LINUX_PLATFORM" \
+      --iidfile "$LINUX_SYSTEMD_IIDFILE" \
+      --build-arg \
+        "CATS_SOURCE_PROVENANCE_FINGERPRINT=$CATS_SOURCE_PROVENANCE_FINGERPRINT" \
+      --file "$REPO_ROOT/scripts/linux-systemd.Dockerfile" \
+      "$REPO_ROOT/scripts"; then
+      iidfile_lines="$(LC_ALL=C wc -l <"$LINUX_SYSTEMD_IIDFILE" | tr -d '[:space:]')"
+      IFS= read -r LINUX_SYSTEMD_IMAGE_ID <"$LINUX_SYSTEMD_IIDFILE" || true
+      if [[ "$iidfile_lines" != 1 \
+        || ! "$LINUX_SYSTEMD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "focused Linux Runtime E2E received an invalid Docker image receipt" >&2
+        status=1
+      fi
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli capture 50 image inspect \
+      --format \
+        "{{.Id}}|{{index .Config.Labels \"$LINUX_SOURCE_FINGERPRINT_KEY\"}}" \
+      "$LINUX_SYSTEMD_IMAGE_ID"; then
+      IFS= read -r image_inspection <"$LINUX_DOCKER_STDOUT" || true
+      if [[ "$image_inspection" \
+        != "$LINUX_SYSTEMD_IMAGE_ID|$CATS_SOURCE_PROVENANCE_FINGERPRINT" ]]; then
+        echo "focused Linux Runtime E2E image provenance does not match the source" >&2
+        status=1
+      fi
+    else
+      status=$?
+    fi
+  fi
+
+  # Privilege is confined to this owner-labeled container and one exact,
+  # ignored test. Its source bind is read-only, while the target volume reuses
+  # the workspace gate's already-built Linux artifacts. Create and start stay
+  # separate so an interrupted start has no late-create authority.
+  if [[ "$status" -eq 0 ]]; then
+    LINUX_SYSTEMD_INTENDED=true
+    if docker_create_cli container "$LINUX_SYSTEMD_GATE" capture 300 \
+      create --name "$LINUX_SYSTEMD_GATE" \
+      --label "$LINUX_OWNER_LABEL" --platform "$LINUX_PLATFORM" \
+      --privileged --cgroupns=private --cgroup-parent system.slice \
+      --tmpfs /run --tmpfs /run/lock -e container=docker \
+      -e CARGO_BUILD_JOBS="$LINUX_JOBS" \
+      -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${LINUX_PG}:5432/postgres" \
+      --network "$LINUX_NETWORK" \
+      --mount "type=bind,source=$REPO_ROOT,target=/work,readonly" -w /work \
+      -v cats-cargo-registry:/usr/local/cargo/registry \
+      -v "$LINUX_TARGET_VOLUME:/target" \
+      "$LINUX_SYSTEMD_IMAGE_ID" /lib/systemd/systemd \
+      && docker_cli capture 300 start "$LINUX_SYSTEMD_GATE"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    for ((attempt = 0; attempt < 120; attempt++)); do
+      observed=""
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" cat /proc/1/comm; then
+        IFS= read -r observed <"$LINUX_DOCKER_STDOUT" || true
+      fi
+      [[ "$observed" == systemd ]] || { sleep 0.25; continue; }
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" cat /proc/1/cgroup; then
+        IFS= read -r observed <"$LINUX_DOCKER_STDOUT" || true
+      fi
+      [[ "$observed" == "0::/init.scope" ]] || { sleep 0.25; continue; }
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" \
+        systemctl is-system-running --quiet; then
+        systemd_ready=true
+        break
+      fi
+      sleep 0.25
+    done
+    if [[ "$systemd_ready" != true ]]; then
+      echo "focused Linux Runtime E2E did not obtain a real systemd PID 1" >&2
+      docker_cli inherit 100 logs "$LINUX_SYSTEMD_GATE" || true
+      status=1
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 300 exec "$LINUX_SYSTEMD_GATE" \
+      sh -ceu 'source_binary="$1/debug/cats-blockd"
+        target_binary=/opt/cats/bin/cats-blockd
+        test -f "$source_binary"
+        test -x "$source_binary"
+        test ! -L "$source_binary"
+        install -D -m 0755 "$source_binary" "$target_binary"
+        test -f "$target_binary"
+        test -x "$target_binary"
+        test ! -L "$target_binary"
+        cmp -s "$source_binary" "$target_binary"' sh "$LINUX_TARGET_DIRECTORY"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    # Rust's exact test filter exits successfully even when it selects zero
+    # tests. Calibrate this probe before trusting the focused run: exactly one
+    # listed test entry must exist, and it must be the intended ignored E2E.
+    if docker_cli capture 300 exec "$LINUX_SYSTEMD_GATE" \
+      cargo test -p cats-node-agent --lib --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        -- --ignored --exact --list; then
+      while IFS= read -r listed_test; do
+        case "$listed_test" in
+          *": test")
+            listed_test_count=$((listed_test_count + 1))
+            if [[ "$listed_test" != "$expected_focused_test" ]]; then
+              listed_test_mismatch=true
+            fi
+            ;;
+        esac
+      done <"$LINUX_DOCKER_STDOUT"
+      if [[ "$listed_test_count" -ne 1 || "$listed_test_mismatch" == true ]]; then
+        echo "focused Linux Runtime E2E test inventory was not the exact known positive" >&2
+        status=1
+      fi
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-node-agent --lib --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        -- --ignored --exact --nocapture; then
+      :
+    else
+      status=$?
+    fi
   fi
 
   return "$status"
