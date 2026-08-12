@@ -127,6 +127,7 @@ fn read_only_blob_error(key: &str) -> BlobError {
 struct ControlContext {
     _directory: tempfile::TempDir,
     server: Handle,
+    control_store_url: String,
     http: reqwest::Client,
     release: cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt,
     image_blob: Arc<FixedImageBlob>,
@@ -135,6 +136,7 @@ struct ControlContext {
 impl ControlContext {
     async fn spawn() -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
         let usage = Arc::new(SqliteUsageStore::open(&directory.path().join("usage.db")).unwrap());
         let storage_meta: Arc<dyn MetadataStore> =
             Arc::new(SqliteMetadataStore::open(&directory.path().join("storage.db")).unwrap());
@@ -153,9 +155,7 @@ impl ControlContext {
         });
         let server = spawn(Config {
             listen: "127.0.0.1:0".into(),
-            control_store_dsn: DsnSource::Literal(
-                cats_control_plane::testsupport::isolated_control_store_url(),
-            ),
+            control_store_dsn: DsnSource::Literal(control_store_url.clone()),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
@@ -180,6 +180,7 @@ impl ControlContext {
         Self {
             _directory: directory,
             server,
+            control_store_url,
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -446,6 +447,28 @@ async fn next_step(runner: &mut RuntimeSpineRunner) -> RuntimeSpineRunStep {
     .await
     .expect("Runtime spine step exceeded its test deadline")
     .unwrap()
+}
+
+#[tokio::test]
+async fn postgres_runtime_schema_write_barrier_calibrates_retired_route_zero_write() {
+    let context = ControlContext::spawn().await;
+    let barrier = cats_control_plane::testsupport::RuntimeSchemaWriteBarrierForTest::acquire(
+        &context.control_store_url,
+    )
+    .await;
+    barrier.calibrate_dml_blocked().await;
+
+    let response = context
+        .http
+        .post(format!("{}/v1/nodes/inventory", context.server.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    barrier.finish_unchanged().await;
+    context.server.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
