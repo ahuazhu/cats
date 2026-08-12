@@ -29,19 +29,16 @@ LINUX_OWNER_LABEL="$LINUX_OWNER_KEY=$LINUX_RUN_TOKEN"
 LINUX_NETWORK="cats-linux-net-$LINUX_RUN_TOKEN"
 LINUX_PG="cats-linux-pg-$LINUX_RUN_TOKEN"
 LINUX_WORKSPACE_GATE="cats-linux-workspace-gate-$LINUX_RUN_TOKEN"
+LINUX_SYSTEMD_GATE="cats-linux-systemd-gate-$LINUX_RUN_TOKEN"
 LINUX_NETWORK_INTENDED=false
 LINUX_PG_INTENDED=false
 LINUX_WORKSPACE_INTENDED=false
+LINUX_SYSTEMD_INTENDED=false
 LINUX_OWNER_CONFLICT=false
 LINUX_ACTIVE_DOCKER_PID=""
 LINUX_ACTIVE_DOCKER_KIND=""
 LINUX_ACTIVE_DOCKER_STATUS=0
 LINUX_CREATE_SETTLEMENT_UNKNOWN=false
-LINUX_CREATE_PENDING=false
-LINUX_CREATE_RESOURCE_KIND=""
-LINUX_CREATE_EXPECTED_NAME=""
-LINUX_CREATE_MODE=""
-LINUX_CREATE_ARGUMENTS=()
 LINUX_DEFERRED_SIGNAL_STATUS=0
 LINUX_CLEANUP_ACTIVE=false
 LINUX_CAPTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cats-linux-gate.XXXXXXXX")"
@@ -64,6 +61,10 @@ LINUX_TARGET_NAMESPACE="$(
   printf '%s\0' "$CATS_SOURCE_PROVENANCE_ROOT" | source_git hash-object --stdin
 )"
 LINUX_TARGET_DIRECTORY="/target/worktrees/$LINUX_TARGET_NAMESPACE"
+LINUX_PLATFORM_NAMESPACE="$(
+  printf '%s\0' "$LINUX_PLATFORM" | source_git hash-object --stdin
+)"
+LINUX_SYSTEMD_IMAGE="cats-linux-systemd-gate:${LINUX_TARGET_NAMESPACE}-${LINUX_PLATFORM_NAMESPACE}"
 
 terminate_active_docker() {
   local attempt
@@ -120,7 +121,6 @@ start_docker_cli() {
   local mode="$1"
   local kind="$2"
   local defer_signals=true
-  local restore_job_control=false
   shift 2
   : >"$LINUX_DOCKER_STDOUT"
   : >"$LINUX_DOCKER_STDERR"
@@ -133,53 +133,25 @@ start_docker_cli() {
     trap 'defer_linux_gate_signal 130' INT
     trap 'defer_linux_gate_signal 143' TERM
   fi
-  if [[ "$kind" == create && "$-" != *m* ]]; then
-    # Put each create client in its own process group before restoring the
-    # parent's traps. This protects it when a supervisor signals the entire
-    # gate process group, including the fork-before-child-trap window.
-    set -m
-    restore_job_control=true
-  fi
-  if [[ "$kind" == create && "$mode" == capture ]]; then
-    # A terminal or CI supervisor may signal this shell's entire process
-    # group. Keep the create client alive until it receives the daemon result;
-    # the bounded settlement path can still terminate it with SIGKILL.
-    (
-      trap '' INT TERM
-      exec docker "$@"
-    ) >"$LINUX_DOCKER_STDOUT" 2>"$LINUX_DOCKER_STDERR" &
-  elif [[ "$kind" == create ]]; then
-    (
-      trap '' INT TERM
-      exec docker "$@"
-    ) &
-  elif [[ "$mode" == capture ]]; then
+  if [[ "$mode" == capture ]]; then
     docker "$@" >"$LINUX_DOCKER_STDOUT" 2>"$LINUX_DOCKER_STDERR" &
   else
     docker "$@" &
   fi
   LINUX_ACTIVE_DOCKER_PID=$!
-  if [[ "$restore_job_control" == true ]]; then
-    set +m
-  fi
   restore_linux_gate_signal_traps
   if [[ "$defer_signals" == true ]] && ((LINUX_DEFERRED_SIGNAL_STATUS != 0)); then
     linux_gate_signal "$LINUX_DEFERRED_SIGNAL_STATUS"
   fi
 }
 
-clear_pending_create() {
-  LINUX_CREATE_PENDING=false
-  LINUX_CREATE_RESOURCE_KIND=""
-  LINUX_CREATE_EXPECTED_NAME=""
-  LINUX_CREATE_MODE=""
-  LINUX_CREATE_ARGUMENTS=()
-}
-
-wait_active_create_result() {
+# A create request is causally settled only after its CLI receives the daemon
+# result. Killing that client first would make a later daemon-side create
+# indistinguishable from absence. The shared cleanup deadline is the only
+# bound; expiry records an explicit unknown state that cleanup cannot bless.
+settle_active_create() {
   local pid="$LINUX_ACTIVE_DOCKER_PID"
-  local status
-  [[ -n "$pid" && "$LINUX_ACTIVE_DOCKER_KIND" == create ]] || return 1
+  [[ -n "$pid" && "$LINUX_ACTIVE_DOCKER_KIND" == create ]] || return 0
   while kill -0 "$pid" 2>/dev/null; do
     if ((LINUX_CLEANUP_DEADLINE > 0 && SECONDS >= LINUX_CLEANUP_DEADLINE)); then
       echo "Docker create request did not settle before the Linux cleanup deadline" >&2
@@ -190,76 +162,6 @@ wait_active_create_result() {
     sleep 0.1
   done
   reap_active_docker
-  status="$LINUX_ACTIVE_DOCKER_STATUS"
-  return "$status"
-}
-
-abandon_foreign_intent() {
-  local resource_kind="$1"
-  local expected_name="$2"
-  if [[ "$resource_kind" == network && "$expected_name" == "$LINUX_NETWORK" ]]; then
-    LINUX_NETWORK_INTENDED=false
-  elif [[ "$resource_kind" == container && "$expected_name" == "$LINUX_PG" ]]; then
-    LINUX_PG_INTENDED=false
-  elif [[ "$resource_kind" == container && "$expected_name" == "$LINUX_WORKSPACE_GATE" ]]; then
-    LINUX_WORKSPACE_INTENDED=false
-  fi
-}
-
-reconcile_pending_create() {
-  while [[ "$LINUX_CREATE_PENDING" == true ]] \
-    && ((SECONDS < LINUX_CLEANUP_DEADLINE)); do
-    if [[ "$LINUX_CREATE_RESOURCE_KIND" == container ]]; then
-      if probe_owned_container "$LINUX_CREATE_EXPECTED_NAME"; then
-        if [[ "$LINUX_PROBE_PRESENT" == true ]]; then
-          clear_pending_create
-          return 0
-        fi
-      elif [[ "$LINUX_OWNER_CONFLICT" == true ]]; then
-        clear_pending_create
-        return 1
-      fi
-    elif [[ "$LINUX_CREATE_RESOURCE_KIND" == network ]]; then
-      if probe_owned_network "$LINUX_CREATE_EXPECTED_NAME"; then
-        if [[ "$LINUX_PROBE_PRESENT" == true ]]; then
-          clear_pending_create
-          return 0
-        fi
-      elif [[ "$LINUX_OWNER_CONFLICT" == true ]]; then
-        clear_pending_create
-        return 1
-      fi
-    else
-      echo "Linux gate lost the pending Docker create resource identity" >&2
-      LINUX_CREATE_SETTLEMENT_UNKNOWN=true
-      return 1
-    fi
-
-    start_docker_cli "$LINUX_CREATE_MODE" create "${LINUX_CREATE_ARGUMENTS[@]}"
-    wait_active_create_result || true
-    # Inspect even after success, because the exact name/owner object is the
-    # cleanup authority. A non-zero result can mean response loss, so retry the
-    # same request until that object or an exact foreign collision is visible.
-    sleep 0.1
-  done
-
-  echo "Docker create request did not settle before the Linux cleanup deadline" >&2
-  LINUX_CREATE_SETTLEMENT_UNKNOWN=true
-  if [[ "$LINUX_ACTIVE_DOCKER_KIND" == create ]]; then
-    terminate_active_docker
-  fi
-  return 1
-}
-
-# A create request is causally settled only after a successful daemon response
-# or an exact same-name ownership observation. Client exit alone is not a
-# receipt: transport failure may race a later daemon-side create.
-settle_active_create() {
-  if [[ "$LINUX_ACTIVE_DOCKER_KIND" == create ]]; then
-    wait_active_create_result || true
-  fi
-  [[ "$LINUX_CREATE_PENDING" == true ]] || return 0
-  reconcile_pending_create
 }
 
 # Every Docker CLI call is asynchronous from this shell. `steps` is a
@@ -292,20 +194,6 @@ docker_cli_operation() {
   fi
   reap_active_docker
   status="$LINUX_ACTIVE_DOCKER_STATUS"
-  if [[ "$kind" == create ]]; then
-    if ((LINUX_CLEANUP_DEADLINE == 0)); then
-      LINUX_CLEANUP_DEADLINE=$((SECONDS + LINUX_CLEANUP_BUDGET_SECONDS))
-    fi
-    if reconcile_pending_create; then
-      if [[ "$LINUX_CLEANUP_ACTIVE" == false ]]; then
-        LINUX_CLEANUP_DEADLINE=0
-      fi
-      return 0
-    fi
-    if [[ "$status" -eq 0 ]]; then
-      return 1
-    fi
-  fi
   return "$status"
 }
 
@@ -314,21 +202,7 @@ docker_cli() {
 }
 
 docker_create_cli() {
-  local resource_kind="$1"
-  local expected_name="$2"
-  local mode="$3"
-  local steps="$4"
-  shift 4
-  [[ "$LINUX_CREATE_PENDING" == false ]] || {
-    echo "Linux gate attempted overlapping Docker create requests" >&2
-    return 1
-  }
-  LINUX_CREATE_RESOURCE_KIND="$resource_kind"
-  LINUX_CREATE_EXPECTED_NAME="$expected_name"
-  LINUX_CREATE_MODE="$mode"
-  LINUX_CREATE_ARGUMENTS=("$@")
-  LINUX_CREATE_PENDING=true
-  docker_cli_operation create "$mode" "$steps" "$@"
+  docker_cli_operation create "$@"
 }
 
 # Cleanup is one bounded settlement operation, not a sequence of independent
@@ -388,7 +262,6 @@ probe_owned_container() {
   if [[ "$inspection" != "$id|/$expected_name|$LINUX_RUN_TOKEN" ]]; then
     echo "refusing to remove foreign Linux gate container $expected_name ($inspection)" >&2
     LINUX_OWNER_CONFLICT=true
-    abandon_foreign_intent container "$expected_name"
     return 1
   fi
   LINUX_PROBE_PRESENT=true
@@ -425,7 +298,6 @@ probe_owned_network() {
   if [[ "$inspection" != "$id|$expected_name|$LINUX_RUN_TOKEN" ]]; then
     echo "refusing to remove foreign Linux gate network $expected_name ($inspection)" >&2
     LINUX_OWNER_CONFLICT=true
-    abandon_foreign_intent network "$expected_name"
     return 1
   fi
   LINUX_PROBE_PRESENT=true
@@ -460,6 +332,10 @@ remove_owned_network() {
 
 all_intended_resources_absent() {
   local all_absent=true
+  if [[ "$LINUX_SYSTEMD_INTENDED" == true ]]; then
+    probe_owned_container "$LINUX_SYSTEMD_GATE" || all_absent=false
+    [[ "$LINUX_PROBE_PRESENT" == false ]] || all_absent=false
+  fi
   if [[ "$LINUX_WORKSPACE_INTENDED" == true ]]; then
     probe_owned_container "$LINUX_WORKSPACE_GATE" || all_absent=false
     [[ "$LINUX_PROBE_PRESENT" == false ]] || all_absent=false
@@ -486,11 +362,12 @@ cleanup_linux_gate() {
     settle_active_create || true
   else
     terminate_active_docker
-    if [[ "$LINUX_CREATE_PENDING" == true ]]; then
-      reconcile_pending_create || true
-    fi
   fi
   while ((SECONDS < LINUX_CLEANUP_DEADLINE)); do
+    if [[ "$LINUX_OWNER_CONFLICT" == true ]]; then
+      break
+    fi
+    remove_owned_container "$LINUX_SYSTEMD_INTENDED" "$LINUX_SYSTEMD_GATE" true || true
     remove_owned_container "$LINUX_WORKSPACE_INTENDED" "$LINUX_WORKSPACE_GATE" false || true
     remove_owned_container "$LINUX_PG_INTENDED" "$LINUX_PG" false || true
     remove_owned_network "$LINUX_NETWORK_INTENDED" "$LINUX_NETWORK" || true
@@ -508,9 +385,6 @@ cleanup_linux_gate() {
   fi
   if [[ "$LINUX_CREATE_SETTLEMENT_UNKNOWN" == true ]]; then
     echo "Linux gate has an unsettled Docker create result" >&2
-    cleanup_status=1
-  fi
-  if [[ "$LINUX_OWNER_CONFLICT" == true ]]; then
     cleanup_status=1
   fi
   if [[ "$cleanup_status" -ne 0 ]]; then
@@ -534,7 +408,6 @@ linux_gate_on_exit() {
 linux_gate_signal() {
   local status="$1"
   trap '' INT TERM
-  LINUX_CLEANUP_ACTIVE=true
   if ((LINUX_CLEANUP_DEADLINE == 0)); then
     LINUX_CLEANUP_DEADLINE=$((SECONDS + LINUX_CLEANUP_BUDGET_SECONDS))
   fi
@@ -542,9 +415,6 @@ linux_gate_signal() {
     settle_active_create || true
   else
     terminate_active_docker
-    if [[ "$LINUX_CREATE_PENDING" == true ]]; then
-      reconcile_pending_create || true
-    fi
   fi
   exit "$status"
 }
@@ -554,7 +424,10 @@ trap 'linux_gate_signal 130' INT
 trap 'linux_gate_signal 143' TERM
 
 main() {
+  local attempt
   local status=0
+  local systemd_ready=false
+  local observed
 
   command -v docker >/dev/null 2>&1 || {
     echo "docker is required for the Linux quality gate" >&2
@@ -565,19 +438,18 @@ main() {
   # CLI response is settled before cleanup observes absence. Container create
   # and start are separate so an interrupted start has no late-create power.
   LINUX_NETWORK_INTENDED=true
-  docker_create_cli network "$LINUX_NETWORK" capture 100 \
-    network create --label "$LINUX_OWNER_LABEL" "$LINUX_NETWORK" \
+  docker_create_cli capture 100 network create --label "$LINUX_OWNER_LABEL" "$LINUX_NETWORK" \
     || return $?
   LINUX_PG_INTENDED=true
-  docker_create_cli container "$LINUX_PG" capture 300 \
-    create --name "$LINUX_PG" --label "$LINUX_OWNER_LABEL" \
+  docker_create_cli capture 300 create --name "$LINUX_PG" --label "$LINUX_OWNER_LABEL" \
     --network "$LINUX_NETWORK" -e POSTGRES_PASSWORD=cats postgres:16 || return $?
   docker_cli capture 300 start "$LINUX_PG" || return $?
 
-  # The workspace-wide gate remains unprivileged.
+  # The workspace-wide gate remains unprivileged. It builds every workspace
+  # binary before tests so the focused systemd stage consumes the same exact
+  # Linux cats-blockd artifact without a second Cargo build lock.
   LINUX_WORKSPACE_INTENDED=true
-  if docker_create_cli container "$LINUX_WORKSPACE_GATE" capture 72000 \
-    create --name "$LINUX_WORKSPACE_GATE" \
+  if docker_create_cli capture 72000 create --name "$LINUX_WORKSPACE_GATE" \
     --label "$LINUX_OWNER_LABEL" --platform "$LINUX_PLATFORM" \
     --ulimit nofile=65536:65536 \
     -e CARGO_BUILD_JOBS="$LINUX_JOBS" \
@@ -608,6 +480,91 @@ main() {
     status=$?
   fi
 
+  # ProvisionRootImage restart inventory must query a real system manager.
+  # The privilege is confined to one private-cgroup container and one exact,
+  # ignored test. Source remains read-only.
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 36000 build \
+      --platform "$LINUX_PLATFORM" \
+      --file "$REPO_ROOT/scripts/linux-systemd.Dockerfile" \
+      --tag "$LINUX_SYSTEMD_IMAGE" "$REPO_ROOT/scripts"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    LINUX_SYSTEMD_INTENDED=true
+    if docker_create_cli capture 300 create --name "$LINUX_SYSTEMD_GATE" \
+      --label "$LINUX_OWNER_LABEL" --platform "$LINUX_PLATFORM" \
+      --privileged --cgroupns=private --cgroup-parent system.slice \
+      --tmpfs /run --tmpfs /run/lock -e container=docker \
+      -e CARGO_BUILD_JOBS="$LINUX_JOBS" \
+      -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${LINUX_PG}:5432/postgres" \
+      --network "$LINUX_NETWORK" \
+      --mount "type=bind,source=$REPO_ROOT,target=/work,readonly" -w /work \
+      -v cats-cargo-registry:/usr/local/cargo/registry \
+      -v "$LINUX_TARGET_VOLUME:/target" \
+      "$LINUX_SYSTEMD_IMAGE" /lib/systemd/systemd \
+      && docker_cli capture 300 start "$LINUX_SYSTEMD_GATE"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    for ((attempt = 0; attempt < 120; attempt++)); do
+      observed=""
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" cat /proc/1/comm; then
+        IFS= read -r observed <"$LINUX_DOCKER_STDOUT" || true
+      fi
+      [[ "$observed" == systemd ]] || { sleep 0.25; continue; }
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" cat /proc/1/cgroup; then
+        IFS= read -r observed <"$LINUX_DOCKER_STDOUT" || true
+      fi
+      [[ "$observed" == "0::/init.scope" ]] || { sleep 0.25; continue; }
+      if docker_cli capture 50 exec "$LINUX_SYSTEMD_GATE" \
+        systemctl is-system-running --quiet; then
+        systemd_ready=true
+        break
+      fi
+      sleep 0.25
+    done
+    if [[ "$systemd_ready" != true ]]; then
+      echo "focused Linux Runtime E2E did not obtain a real systemd PID 1" >&2
+      docker_cli inherit 100 logs "$LINUX_SYSTEMD_GATE" || true
+      status=1
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 300 exec "$LINUX_SYSTEMD_GATE" \
+      sh -ceu 'source_binary="$1/debug/cats-blockd"
+        target_binary=/opt/cats/bin/cats-blockd
+        test -f "$source_binary"
+        test -x "$source_binary"
+        test ! -L "$source_binary"
+        install -D -m 0755 "$source_binary" "$target_binary"
+        test -f "$target_binary"
+        test -x "$target_binary"
+        test ! -L "$target_binary"
+        cmp -s "$source_binary" "$target_binary"' sh "$LINUX_TARGET_DIRECTORY"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-node-agent --lib --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        -- --ignored --exact --nocapture; then
+      :
+    else
+      status=$?
+    fi
+  fi
   return "$status"
 }
 

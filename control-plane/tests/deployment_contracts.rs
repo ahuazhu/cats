@@ -9,8 +9,6 @@ use std::io::Write;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 
 const SCHEMA_PATH: &str = "storage/src/authority.rs";
 const SCHEMA_VERSION_PATTERN: &str = r"s/^pub[[:space:]]+const[[:space:]]+AUTHORITY_RELEASE_SCHEMA_VERSION:[[:space:]]+i64[[:space:]]+=[[:space:]]+([0-9]+);$/\1/p";
@@ -604,22 +602,25 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
 }
 
 #[test]
-fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
+fn linux_quality_gate_is_unprivileged_except_for_one_private_systemd_e2e() {
     let quality = read_workspace_file("scripts/quality.sh");
     let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let (workspace_gate, systemd_gate) = linux_gate
+        .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
+        .expect("focused systemd gate boundary");
 
     assert!(quality.contains("run_linux() {"));
     assert!(quality.contains("exec \"$REPO_ROOT/scripts/linux-gate.sh\""));
     assert!(!quality.contains("run_linux() ("));
     assert!(
-        !linux_gate.lines().any(|line| {
+        !workspace_gate.lines().any(|line| {
             let line = line.trim_start();
             !line.starts_with('#') && line.contains("--privileged")
         }),
         "the workspace-wide Linux gate must stay unprivileged"
     );
-    assert!(linux_gate.contains("create --name \"$LINUX_WORKSPACE_GATE\""));
-    assert!(linux_gate.contains("start --attach \"$LINUX_WORKSPACE_GATE\""));
+    assert!(workspace_gate.contains("create --name \"$LINUX_WORKSPACE_GATE\""));
+    assert!(workspace_gate.contains("start --attach \"$LINUX_WORKSPACE_GATE\""));
     for (intent, command) in [
         (
             "LINUX_NETWORK_INTENDED=true",
@@ -629,6 +630,10 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         (
             "LINUX_WORKSPACE_INTENDED=true",
             "create --name \"$LINUX_WORKSPACE_GATE\"",
+        ),
+        (
+            "LINUX_SYSTEMD_INTENDED=true",
+            "create --name \"$LINUX_SYSTEMD_GATE\"",
         ),
     ] {
         let intent_position = linux_gate
@@ -650,15 +655,11 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         "LINUX_ACTIVE_DOCKER_KIND=\"$kind\"",
         "docker_create_cli",
         "settle_active_create",
-        "reconcile_pending_create",
-        "LINUX_CREATE_PENDING=true",
-        "LINUX_CREATE_ARGUMENTS=(\"$@\")",
-        "trap '' INT TERM",
-        "set -m",
         "LINUX_CREATE_SETTLEMENT_UNKNOWN=true",
         "Container create\n  # and start are separate",
         "probe_owned_container",
         "probe_owned_network",
+        "remove_owned_container \"$LINUX_SYSTEMD_INTENDED\" \"$LINUX_SYSTEMD_GATE\" true",
         "remove_owned_container \"$LINUX_WORKSPACE_INTENDED\" \"$LINUX_WORKSPACE_GATE\" false",
         "remove_owned_container \"$LINUX_PG_INTENDED\" \"$LINUX_PG\" false",
         "remove_owned_network \"$LINUX_NETWORK_INTENDED\" \"$LINUX_NETWORK\"",
@@ -677,6 +678,69 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         !linux_gate.contains("absent_rounds"),
         "elapsed absence is not proof that an interrupted create request settled"
     );
+    for required in [
+        "--privileged",
+        "--cgroupns=private",
+        "--cgroup-parent system.slice",
+        "--tmpfs /run",
+        "--tmpfs /run/lock",
+        "-e container=docker",
+        "target=/work,readonly",
+        "/lib/systemd/systemd",
+        "cat /proc/1/comm",
+        "cat /proc/1/cgroup",
+        "0::/init.scope",
+        "systemctl is-system-running --quiet",
+        "timeout --signal=TERM --kill-after=30s 20m",
+        "install -D -m 0755 \"$source_binary\" \"$target_binary\"",
+        "cmp -s \"$source_binary\" \"$target_binary\"",
+    ] {
+        assert!(
+            systemd_gate.contains(required),
+            "the focused real-systemd E2E lost boundary {required:?}"
+        );
+    }
+    let focused_command = systemd_gate
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        focused_command.contains(
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
+        ),
+        "the privileged gate must run only the exact ignored Node E2E"
+    );
+    assert!(
+        !systemd_gate.contains("--workspace"),
+        "the privileged focused block must never run workspace-wide Cargo"
+    );
+    assert!(linux_gate.contains(
+        "LINUX_SYSTEMD_IMAGE=\"cats-linux-systemd-gate:${LINUX_TARGET_NAMESPACE}-${LINUX_PLATFORM_NAMESPACE}\""
+    ));
+    for forbidden in ["--cgroupns=host", "source=/sys/fs/cgroup", "--network host"] {
+        assert!(
+            !systemd_gate.contains(forbidden),
+            "the focused systemd E2E escaped its private boundary {forbidden:?}"
+        );
+    }
+
+    let image = read_workspace_file("scripts/linux-systemd.Dockerfile");
+    for required in [
+        "FROM rust:1.97.1-bookworm",
+        "e2fsprogs",
+        "iproute2",
+        "jq",
+        "systemd",
+        "rm -rf /var/lib/apt/lists/*",
+        "STOPSIGNAL SIGRTMIN+3",
+        "CMD [\"/lib/systemd/systemd\"]",
+    ] {
+        assert!(
+            image.contains(required),
+            "the focused systemd image lost {required:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -798,7 +862,7 @@ case "${1:-} ${2:-}" in
     rm -f -- "$path"
     ;;
   "container ls")
-    if [[ "$mode" == cleanup-hang && -e "$state/workspace-network-active" ]]; then
+    if [[ "$mode" == cleanup-hang ]]; then
       : >"$state/cleanup-hang-entered"
       trap '' TERM
       while :; do sleep 0.2; done
@@ -829,9 +893,7 @@ case "${1:-} ${2:-}" in
     id="${!#}"
     path="$(object_by_id container "$id")"
     rm -f -- "$path"
-    if [[ "$id" == late-workspace-id \
-      || "$id" == response-loss-workspace-id \
-      || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
+    if [[ "$id" == late-workspace-id || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
       : >"$state/late-workspace-removed"
     fi
     ;;
@@ -864,34 +926,6 @@ case "${1:-} ${2:-}" in
       while [[ ! -e "$state/create-response" ]]; do sleep 0.1; done
       printf 'late-workspace-id\n'
       exit 0
-    fi
-    if [[ "$mode" == response-loss-late-create && "$name" == cats-linux-workspace-gate-* ]]; then
-      count_path="$state/response-loss-create-count"
-      count=0
-      [[ ! -e "$count_path" ]] || IFS= read -r count <"$count_path"
-      count=$((count + 1))
-      printf '%s\n' "$count" >"$count_path"
-      if [[ "$count" -eq 1 ]]; then
-        : >"$state/workspace-network-active"
-        nohup /bin/bash -c '
-          trap "" INT TERM
-          sleep 5.2
-          state=$1
-          name=$2
-          owner=$3
-          temporary="$state/container.$name.pending"
-          printf "response-loss-workspace-id|%s\\n" "$owner" >"$temporary"
-          mv -- "$temporary" "$state/container.$name"
-          : >"$state/response-loss-late-marker"
-          printf "RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id\\n" >>"$state/trace"
-        ' fake-daemon "$state" "$name" "$owner" >/dev/null 2>&1 &
-        : >"$state/first-response-lost"
-        exit 125
-      fi
-      : >"$state/idempotent-retry-entered"
-      while [[ ! -e "$path" ]]; do sleep 0.1; done
-      : >"$state/idempotent-name-reserved"
-      exit 125
     fi
     printf 'owned-%s-id|%s\n' "$name" "$owner" >"$path"
     printf 'owned-%s-id\n' "$name"
@@ -987,7 +1021,7 @@ fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collisi
 
 #[cfg(unix)]
 #[test]
-fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_cleanup() {
+fn linux_quality_gate_term_settles_delayed_daemon_create_before_exact_cleanup() {
     let fixture = tempfile::tempdir().expect("Linux gate TERM fixture");
     let fake_bin = fixture.path().join("bin");
     let state = fixture.path().join("state");
@@ -997,14 +1031,11 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
     let stderr_path = fixture.path().join("stderr");
     let stdout = std::fs::File::create(&stdout_path).expect("create stdout capture");
     let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
-    let mut command = linux_gate_command(&fake_bin, &state, "term-delayed-create");
-    command
-        .process_group(0)
+    let mut child = linux_gate_command(&fake_bin, &state, "term-delayed-create")
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    let mut child = command
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("start isolated Linux quality-gate process group");
+        .expect("start top-level Linux quality gate");
 
     let workspace_started = Instant::now();
     while !state.join("workspace-network-active").exists() {
@@ -1016,13 +1047,10 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
     }
     let signal_at = Instant::now();
     let signal = Command::new("kill")
-        .args(["-TERM", "--", &format!("-{}", child.id())])
+        .args(["-TERM", &child.id().to_string()])
         .status()
-        .expect("signal Linux quality-gate process group");
-    assert!(
-        signal.success(),
-        "could not TERM Linux quality-gate process group"
-    );
+        .expect("signal top-level quality gate");
+    assert!(signal.success(), "could not TERM top-level quality gate");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut removed_at = None;
@@ -1055,6 +1083,7 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
         format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
     ] {
         assert!(
             !state.join(&resource).exists(),
@@ -1075,71 +1104,6 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
     assert!(
         trace.contains("network rm owned-network-id"),
         "the previously active network did not converge to removal:\n{trace}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observable() {
-    let fixture = tempfile::tempdir().expect("Linux gate response-loss fixture");
-    let fake_bin = fixture.path().join("bin");
-    let state = fixture.path().join("state");
-    std::fs::create_dir_all(&state).expect("create fake Docker state");
-    install_linux_gate_fake_cli(&fake_bin);
-
-    let started_at = Instant::now();
-    let output = linux_gate_command(&fake_bin, &state, "response-loss-late-create")
-        .output()
-        .expect("run Linux quality gate response-loss regression");
-    assert!(
-        output.status.success(),
-        "response-loss reconciliation failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        started_at.elapsed() >= Duration::from_millis(4_800),
-        "response loss was blessed before the delayed daemon create became observable"
-    );
-    for marker in [
-        "first-response-lost",
-        "idempotent-retry-entered",
-        "idempotent-name-reserved",
-        "response-loss-late-marker",
-        "late-workspace-removed",
-    ] {
-        assert!(
-            state.join(marker).exists(),
-            "response-loss regression did not exercise {marker}"
-        );
-    }
-    for resource in [
-        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
-        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
-        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
-    ] {
-        assert!(
-            !state.join(&resource).exists(),
-            "intended resource remained after response-loss settlement: {resource}"
-        );
-    }
-
-    let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
-    let create_call = format!("create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}");
-    assert_eq!(
-        trace.matches(&create_call).count(),
-        2,
-        "the ambiguous first response was not closed by one same-name retry:\n{trace}"
-    );
-    let late_create = trace
-        .find("RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id")
-        .expect("late daemon create trace");
-    let immutable_remove = trace
-        .find("rm -f response-loss-workspace-id")
-        .expect("response-loss immutable-ID removal trace");
-    assert!(
-        late_create < immutable_remove,
-        "cleanup raced the response-loss daemon create:\n{trace}"
     );
 }
 

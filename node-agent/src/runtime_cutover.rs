@@ -70,6 +70,48 @@ pub struct SignedRuntimeCutoverConfig {
     pub blob_store: Arc<dyn BlobStore>,
     pub volume_lease_duration_ms: u64,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
+    /// Test-only scheduler barrier after one accepted physical observation
+    /// and before the next Desired/effect iteration. It does not replace or
+    /// wrap the installed scanner/effect composition.
+    #[cfg(test)]
+    pub(crate) observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeObservationBarrierForTest {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+#[cfg(test)]
+impl RuntimeObservationBarrierForTest {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn channel() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                reached,
+                resume: resume_rx,
+            },
+            reached_rx,
+            resume,
+        )
+    }
+
+    async fn wait_after_observation(&mut self) -> anyhow::Result<()> {
+        self.reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("test observation-barrier receiver dropped"))?;
+        self.resume
+            .recv()
+            .await
+            .context("test observation-barrier resume sender dropped")
+    }
 }
 
 pub struct SignedRuntimeCutoverHandle {
@@ -174,6 +216,26 @@ fn join_result(
     context: &'static str,
 ) -> anyhow::Result<()> {
     result.context(context)?
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn provision_installed_vmm_socket_root_for_test() -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let installed = std::path::Path::new(crate::runtime::reconciliation::INSTALLED_VMM_SOCKET_ROOT);
+    std::fs::create_dir_all(
+        installed
+            .parent()
+            .context("installed VMM socket root has no parent")?,
+    )?;
+    let mut builder = std::fs::DirBuilder::new();
+    if let Err(error) = builder.mode(0o700).create(installed) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("create installed VMM socket root");
+        }
+    }
+    crate::runtime::reconciliation::RetainedManagedVmmSocketRoot::open_installed()?;
+    Ok(())
 }
 
 impl Drop for SignedRuntimeCutoverHandle {
@@ -493,10 +555,18 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     // can only request (not await) that shutdown sequence.
     let registration_lease = config.agent_registration;
     let deadline_policy = config.deadline_policy;
+    #[cfg(test)]
+    let observation_barrier_for_test = config.observation_barrier_for_test;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
         let run_result = tokio::select! {
-            result = run_signed_spine(&mut runner, &runner_readiness, deadline_policy) => result,
+            result = run_signed_spine(
+                &mut runner,
+                &runner_readiness,
+                deadline_policy,
+                #[cfg(test)]
+                observation_barrier_for_test,
+            ) => result,
             _ = &mut runner_shutdown => Ok(()),
         };
         runner_readiness.set(false);
@@ -532,6 +602,7 @@ async fn run_signed_spine(
     runner: &mut RuntimeSpineRunner,
     readiness: &Readiness,
     deadline_policy: RuntimeSpineDeadlinePolicy,
+    #[cfg(test)] mut observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
 ) -> anyhow::Result<()> {
     loop {
         // Both absolute deadlines start before dispatch into the runner. Time
@@ -539,8 +610,18 @@ async fn run_signed_spine(
         // a later blocking boundary.
         let deadlines = deadline_policy.deadlines_from(Instant::now())?;
         let step = runner.run_once_with_deadlines(deadlines).await?;
+        #[cfg(test)]
+        let observation_accepted = matches!(step, RuntimeSpineRunStep::ObservationAccepted { .. });
         match apply_readiness_policy(step, readiness)? {
-            RuntimeLoopAction::Continue => {}
+            RuntimeLoopAction::Continue =>
+            {
+                #[cfg(test)]
+                if observation_accepted {
+                    if let Some(barrier) = observation_barrier_for_test.as_mut() {
+                        barrier.wait_after_observation().await?;
+                    }
+                }
+            }
             RuntimeLoopAction::RetryAfterDelay => tokio::time::sleep(RETRY_DELAY).await,
             RuntimeLoopAction::WaitForIdentityRepair => {
                 // Credential/identity repair is external to the Agent session
@@ -686,8 +767,7 @@ mod tests {
         ExactVmmProcessAbsenceProof, InstalledStaleBootVmmRecoveryPorts, ManagedVmmLaunchFilePaths,
         RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RuntimeCheckpointRecoverySet,
         StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
-        VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, INSTALLED_VMM_SOCKET_ROOT,
-        VMM_LAUNCH_FILE_NAMESPACE,
+        VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, VMM_LAUNCH_FILE_NAMESPACE,
     };
     #[cfg(target_os = "linux")]
     use crate::runtime_spine::{
@@ -1288,13 +1368,7 @@ mod tests {
         if VmmSocketReceiptStore::open_existing(state.clone()).is_err() {
             VmmSocketReceiptStore::provision_for_test(state.clone())?;
         }
-        let installed = std::path::Path::new(INSTALLED_VMM_SOCKET_ROOT);
-        if !installed.exists() {
-            std::fs::create_dir_all(installed.parent().unwrap())?;
-            RetainedManagedVmmSocketRoot::provision_for_test(installed)?;
-        } else {
-            RetainedManagedVmmSocketRoot::open_installed()?;
-        }
+        provision_installed_vmm_socket_root_for_test()?;
         Ok(())
     }
 
@@ -1569,6 +1643,7 @@ mod tests {
                 Duration::from_secs(5),
             )
             .unwrap(),
+            observation_barrier_for_test: None,
         }
     }
 
@@ -1863,6 +1938,7 @@ mod tests {
         for path in [
             "/v1/jobs",
             "/v1/nodes/heartbeat",
+            "/v1/nodes/inventory",
             "/v1/nodes/register",
             "/v1/nodes/work-status",
             "/v1/internal/work/acquire",
@@ -1917,6 +1993,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .unwrap(),
+            observation_barrier_for_test: None,
         })
         .await
         .unwrap();
@@ -1998,6 +2075,7 @@ mod tests {
                     Duration::from_secs(30),
                 )
                 .unwrap(),
+                observation_barrier_for_test: None,
             },
             None,
             Some(owner_port),
@@ -2076,6 +2154,7 @@ mod tests {
             volume_lease_duration_ms: 60_000,
             deadline_policy: RuntimeSpineDeadlinePolicy::new(Duration::MAX, Duration::from_secs(1))
                 .unwrap(),
+            observation_barrier_for_test: None,
         })
         .await;
         let Err(error) = result else {
@@ -2126,6 +2205,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .unwrap(),
+            observation_barrier_for_test: None,
         })
         .await;
         let Err(error) = result else {

@@ -1257,6 +1257,7 @@ dependencies = [
  "cats-block-client",
  "cats-blockd",
  "cats-control-plane",
+ "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-object-store-file",
