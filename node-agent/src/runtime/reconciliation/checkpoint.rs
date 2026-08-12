@@ -98,7 +98,7 @@ pub enum CheckpointStoreError {
 /// boundary, but a change observed before publication is still rejected.
 pub struct FileCheckpointStore {
     directory: File,
-    _writer_lock: File,
+    _writer_lock: CheckpointWriterLock,
     directory_path: PathBuf,
     target_name: CString,
     target_path: PathBuf,
@@ -116,6 +116,57 @@ pub struct FileCheckpointStore {
     endpoint_effect_edges: Mutex<Vec<EndpointEffectEdge>>,
     #[cfg(test)]
     faults: Mutex<TestFaults>,
+}
+
+/// Sole owner of one acquired per-Cat checkpoint writer lock.
+///
+/// Closing the Agent's descriptor is not enough to release `flock` when a
+/// concurrent fork temporarily inherited the same open-file description.
+/// Explicitly unlocking when the store owner ends keeps that pre-exec window
+/// from delaying the next legitimate writer.
+struct CheckpointWriterLock {
+    file: File,
+}
+
+impl CheckpointWriterLock {
+    fn acquire(file: File, path: &Path) -> Result<Self, CheckpointStoreError> {
+        loop {
+            // SAFETY: `file` is a live file descriptor. `flock` neither takes
+            // ownership of it nor retains a pointer.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if source.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || source.raw_os_error() == Some(libc::EAGAIN)
+            {
+                return Err(CheckpointStoreError::WriterAlreadyActive {
+                    path: path.to_path_buf(),
+                });
+            }
+            return Err(io_error("lock checkpoint writer", path, source));
+        }
+    }
+}
+
+impl Drop for CheckpointWriterLock {
+    fn drop(&mut self) {
+        loop {
+            // SAFETY: `self.file` remains live throughout the call. `flock`
+            // retains neither the descriptor nor any Rust memory.
+            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            if result == 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+    }
 }
 
 /// In-process serialization proof that one previously loaded checkpoint is
@@ -262,25 +313,7 @@ impl FileCheckpointStore {
         )
         .map_err(|source| map_open_error("open checkpoint writer lock", &lock_path, source))?;
         verify_regular_single_link(&writer_lock, &lock_path)?;
-        loop {
-            // SAFETY: `writer_lock` is a live file descriptor. `flock`
-            // neither takes ownership of it nor retains a pointer.
-            let lock_result =
-                unsafe { libc::flock(writer_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if lock_result == 0 {
-                break;
-            }
-            let source = io::Error::last_os_error();
-            if source.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if source.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || source.raw_os_error() == Some(libc::EAGAIN)
-            {
-                return Err(CheckpointStoreError::WriterAlreadyActive { path: lock_path });
-            }
-            return Err(io_error("lock checkpoint writer", &lock_path, source));
-        }
+        let writer_lock = CheckpointWriterLock::acquire(writer_lock, &lock_path)?;
 
         if settle_checkpoint_temp {
             // The held per-Cat lock makes this exact deterministic basename
@@ -1886,6 +1919,48 @@ mod retained_checkpoint_tests {
             std::fs::metadata(namespace).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn writer_unlocks_before_an_inherited_descriptor_closes() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+        let inherited = store._writer_lock.file.try_clone().unwrap();
+
+        drop(store);
+        let successor = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+
+        drop(successor);
+        drop(inherited);
+    }
+
+    #[test]
+    fn preserving_temp_rejection_releases_the_writer_lock() {
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let temporary = root.path().join(format!(
+            ".cat-{}.checkpoint.tmp",
+            checkpoint.cat_id.as_str()
+        ));
+        std::fs::write(&temporary, b"classified checkpoint temp").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            FileCheckpointStore::open_preserving_checkpoint_temp(root.path(), &checkpoint.cat_id),
+            Err(CheckpointStoreError::UnsafeEntry { .. })
+        ));
+        let successor = FileCheckpointStore::open(root.path(), &checkpoint.cat_id).unwrap();
+
+        drop(successor);
     }
 
     #[test]

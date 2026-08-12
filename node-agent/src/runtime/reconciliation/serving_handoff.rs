@@ -4148,6 +4148,91 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(target_os = "linux")]
+        fn listener_accepts_connect(socket_path: &Path) -> anyhow::Result<bool> {
+            let encoded = CString::new(socket_path.as_os_str().as_bytes())?;
+            let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+            anyhow::ensure!(
+                encoded.as_bytes_with_nul().len() <= address.sun_path.len(),
+                "isolated managed Root socket path exceeds sockaddr_un"
+            );
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            // SAFETY: both buffers are valid for the checked byte count and
+            // do not overlap. `address` remains live through `connect` below.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    encoded.as_ptr(),
+                    address.sun_path.as_mut_ptr(),
+                    encoded.as_bytes_with_nul().len(),
+                );
+            }
+            // Use a nonblocking client so a listener inherited by a parallel
+            // raw-fork test cannot fill its unaccepted backlog and block this
+            // fixture's bounded convergence check.
+            let descriptor = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            // SAFETY: the fresh descriptor is transferred exactly once to
+            // this guard and closed when the probe returns.
+            let socket = unsafe { File::from_raw_fd(descriptor) };
+            let address_len = (std::mem::size_of::<libc::sa_family_t>()
+                + encoded.as_bytes_with_nul().len())
+                as libc::socklen_t;
+            let result = unsafe {
+                libc::connect(
+                    socket.as_raw_fd(),
+                    (&raw const address).cast::<libc::sockaddr>(),
+                    address_len,
+                )
+            };
+            if result == 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ECONNREFUSED) => Ok(false),
+                Some(libc::EAGAIN | libc::EINPROGRESS | libc::EALREADY) => Ok(true),
+                _ => Err(error.into()),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn listener_accepts_connect(socket_path: &Path) -> anyhow::Result<bool> {
+            match UnixStream::connect(socket_path) {
+                Ok(stream) => {
+                    drop(stream);
+                    Ok(true)
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+
+        fn await_listener_absent_preserving_path(&self, socket_path: &Path) -> anyhow::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                anyhow::ensure!(
+                    socket_path.exists(),
+                    "managed Root listener pathname disappeared while its process became absent"
+                );
+                if !Self::listener_accepts_connect(socket_path)? {
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "managed Root listener still accepted connects after its process became absent"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         fn drop_listener_preserving_path(
             &self,
             expected: &RootProvisionProcessExpectation,
@@ -4158,14 +4243,7 @@ mod tests {
             drop(listener);
             if had_listener {
                 let socket_path = Path::new(self.intent.control_socket_path().as_str());
-                anyhow::ensure!(
-                    socket_path.exists(),
-                    "managed Root listener pathname disappeared while its process became absent"
-                );
-                anyhow::ensure!(
-                    UnixStream::connect(socket_path).is_err(),
-                    "managed Root listener still accepted connects after its process became absent"
-                );
+                self.await_listener_absent_preserving_path(socket_path)?;
             }
             Ok(())
         }
@@ -7302,6 +7380,48 @@ mod tests {
         ));
         drop(successor);
         drop(inherited);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_root_absence_waits_for_an_inherited_listener_descriptor() {
+        let fixture = fixture();
+        let expectation = RootProvisionProcessExpectation::from_checkpoint(
+            fixture.stored_checkpoint.checkpoint(),
+            RootProvisionAuthoritySnapshot {
+                attachment: fixture.acquired.attachment.clone(),
+                volume: &fixture.authority.volume,
+            },
+            fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+        let socket_path = Path::new(fixture.managed_root.intent.control_socket_path().as_str());
+        assert!(IsolatedManagedRootOwner::listener_accepts_connect(socket_path).unwrap());
+        let inherited = fixture
+            .managed_root
+            .listener
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        let release_after = Duration::from_millis(50);
+        let started = Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(release_after);
+            drop(inherited);
+        });
+
+        fixture
+            .managed_root
+            .drop_listener_preserving_path(&expectation)
+            .unwrap();
+        release.join().unwrap();
+
+        assert!(started.elapsed() >= release_after);
+        assert!(socket_path.exists());
+        assert!(!IsolatedManagedRootOwner::listener_accepts_connect(socket_path).unwrap());
     }
 
     #[test]
