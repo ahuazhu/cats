@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     inventory_digest, AdmissionInventoryAttestation, AgentSession, ContractError,
     ContractErrorDetail, ContractVersion, DesiredReadRequest, DesiredReadSnapshot,
@@ -1005,6 +1007,28 @@ impl CompleteRuntimeInventory {
 
     pub(crate) fn take_running_tail_admission(&mut self) -> Option<RunningTailScanAdmission> {
         self.running_tail.take().map(|admission| *admission)
+    }
+
+    /// Binds one scanner-produced Node-global process admission through the
+    /// same full-observation builder used by the production runner. Linux
+    /// acceptance teardown needs a fresh physical scan after the runner has
+    /// joined; manufacturing fixed test coordinates here would sever the
+    /// process proof from the real boot, session, digest and public process
+    /// projection that authorized it.
+    #[cfg(test)]
+    pub(crate) fn bind_node_global_process_for_test(
+        mut self,
+        coordinates: RuntimeSpineFullScan,
+    ) -> anyhow::Result<(NodeObservation, NodeGlobalManagedProcessAdmission)> {
+        let private = self
+            .take_node_global_process_admission()
+            .context("complete inventory lacks its Node-global process admission")?;
+        let observation = build_full_observation(coordinates, self)
+            .context("build test full observation through the production projection")?;
+        let admission = private
+            .bind(&observation)
+            .context("bind test Node-global process proof to the full observation")?;
+        Ok((observation, admission))
     }
 
     #[cfg(test)]
@@ -3402,11 +3426,12 @@ mod tests {
         decode_node_observation, encode_desired_read_snapshot, encode_observation_acceptance,
         encode_runtime_spine_error, spec_digest, AdmissionInventoryAttestation,
         AppliedDesiredEvidence, AssignedKind, AssignedPlacement, CheckpointEvidence,
-        ContractVersion, GuestTransportEvidence, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, NetworkConfig, ObservationAcceptance,
-        ObservationInventoryAcceptance, ReconcileStep, Revision, RuntimeConfig,
+        ContractVersion, ControlHandshakeEvidence, FenceEpoch, GuestTransportEvidence, HostPath,
+        Id, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig,
+        ObservationAcceptance, ObservationInventoryAcceptance, OwnershipTokenEvidence,
+        ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, Revision, RuntimeConfig,
         RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
-        UnixMillis, WarmSnapshotEvidence, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+        UnixMillis, WarmSnapshotEvidence, WireU64, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
         NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -6245,6 +6270,105 @@ mod tests {
         assert_eq!(
             observation.inventory_digest,
             Some(inventory_digest(&observation).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_process_admission_binding_uses_real_full_coordinates_and_projection() {
+        let registered = decode_agent_session(SESSION).unwrap();
+        let mut desired = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        desired.desired_specs = vec![desired_with_network()];
+        let coordinates = RuntimeSpineFullScan {
+            session: SessionBinding {
+                node_id: registered.node_id.clone(),
+                node_boot_id: registered.node_boot_id.clone(),
+                agent_instance_id: registered.agent_instance_id.clone(),
+                agent_session_epoch: registered.agent_session_epoch,
+            },
+            heartbeat_sequence: Sequence::new(7).unwrap(),
+            inventory_epoch: Epoch::new(9).unwrap(),
+            desired,
+        };
+        let private = || {
+            NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+        };
+
+        let inventory = CompleteRuntimeInventory::for_test(
+            UnixMillis::new(1_720_000_004_000).unwrap(),
+            RuntimeInventoryKeyRing::Unavailable,
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_node_global_process_admission(Some(private()));
+        let (observation, admission) = inventory
+            .bind_node_global_process_for_test(coordinates.clone())
+            .unwrap();
+        assert_eq!(observation.node_boot_id, registered.node_boot_id);
+        assert_eq!(observation.heartbeat_sequence, Sequence::new(7).unwrap());
+        assert_eq!(observation.inventory_epoch, Epoch::new(9).unwrap());
+        assert!(admission.matches_observation(&observation));
+
+        let mut foreign_boot = observation.clone();
+        foreign_boot.node_boot_id =
+            cats_api::runtime_reconciliation::NodeBootId::new("ffffffffffffffffffffffffffffffff")
+                .unwrap();
+        assert!(!admission.matches_observation(&foreign_boot));
+
+        let mut foreign_runtime = ObservedRuntimeStatus {
+            cat_id: Id::new("cat_foreign").unwrap(),
+            applied_desired: None,
+            runtime_incarnation: None,
+            stable_state: None,
+            step: ReconcileStep::InspectInventory {
+                inventory_epoch: Epoch::new(9).unwrap(),
+            },
+            checkpoint: CheckpointEvidence::Missing {
+                checkpoint_path: HostPath::new("/var/lib/cats/cat_foreign.json").unwrap(),
+            },
+            processes: Vec::new(),
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        };
+        foreign_runtime.processes.push(ProcessEvidence {
+            role: ProcessRole::Blockd {
+                volume_id: Id::new("volume_foreign").unwrap(),
+                attachment_id: Id::new("attachment_foreign").unwrap(),
+                attachment_epoch: FenceEpoch::new(1).unwrap(),
+            },
+            process_id: 41,
+            process_start_time_ticks: WireU64::new(42).unwrap(),
+            executable_path: HostPath::new("/opt/cats/bin/cats-blockd").unwrap(),
+            scope_id: Id::new("scope_foreign").unwrap(),
+            control_socket_path: HostPath::new("/run/cats/blockd-v1/foreign.sock").unwrap(),
+            state: ProcessState::Running,
+            ownership_token: OwnershipTokenEvidence::Missing,
+            control_handshake: ControlHandshakeEvidence::Unavailable,
+            observed_vm_shape: None,
+        });
+        let foreign = CompleteRuntimeInventory::for_test(
+            UnixMillis::new(1_720_000_004_000).unwrap(),
+            RuntimeInventoryKeyRing::Unavailable,
+            vec![foreign_runtime],
+            Vec::new(),
+        )
+        .with_node_global_process_admission(Some(private()));
+        let error = foreign
+            .bind_node_global_process_for_test(coordinates)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("public process projection"),
+            "{error:#}"
         );
     }
 
