@@ -843,7 +843,7 @@ impl SignedRootProvisionEffect {
             prepared.checkpoint(),
             record,
             evidence.as_ref().clone(),
-            socket_owner,
+            *socket_owner,
             root_provision_retirement_admission(context)?,
         ) {
             Ok(receipt) => receipt,
@@ -1711,10 +1711,10 @@ mod tests {
             self.inspections.fetch_add(1, Ordering::SeqCst);
             Ok(RootProvisionManagedStopInspection::Exact {
                 process: Box::new(exact_process(expected)),
-                owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                owner: Box::new(super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
                     expected,
                     context.accepted_full()?.observation().node_boot_id.clone(),
-                )?,
+                )?),
             })
         }
 
@@ -1868,10 +1868,10 @@ mod tests {
                     let node_boot_id = context.accepted_full()?.observation().node_boot_id.clone();
                     RootProvisionManagedStopInspection::Exact {
                         process,
-                        owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                        owner: Box::new(super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
                             expected,
                             node_boot_id,
-                        )?,
+                        )?),
                     }
                 }
                 RootProvisionProcessInspection::Absent => {
@@ -1967,10 +1967,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(RootProvisionManagedStopInspection::Exact {
                 process: Box::new(exact_process(expected)),
-                owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                owner: Box::new(super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
                     expected,
                     context.accepted_full()?.observation().node_boot_id.clone(),
-                )?,
+                )?),
             })
         }
 
@@ -2932,7 +2932,7 @@ mod tests {
         // remove the journal.
         let empty = managed
             .root
-            .capture_closed_whole_root(&managed.intents, &[managed.intent.clone()])
+            .capture_closed_whole_root(&managed.intents, std::slice::from_ref(&managed.intent))
             .unwrap();
         assert!(empty
             .bind_root_stop_owner(receipt.socket_owner())
@@ -4975,7 +4975,7 @@ mod tests {
 
         let snapshot = managed
             .root
-            .capture_closed_whole_root(&managed.intents, &[managed.intent.clone()])
+            .capture_closed_whole_root(&managed.intents, std::slice::from_ref(&managed.intent))
             .unwrap();
         snapshot
             .bind_root_stop_owner(&receipted_owner)

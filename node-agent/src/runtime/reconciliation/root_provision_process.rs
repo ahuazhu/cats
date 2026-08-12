@@ -146,7 +146,7 @@ pub(crate) trait RootProvisionProcessRetirementPort:
 pub(crate) enum RootProvisionManagedStopInspection {
     Exact {
         process: Box<RootProvisionProcessEvidence>,
-        owner: ManagedBlockdRootStopOwnerEvidence,
+        owner: Box<ManagedBlockdRootStopOwnerEvidence>,
     },
     Absent,
     Conflict(RootProvisionProcessConflict),

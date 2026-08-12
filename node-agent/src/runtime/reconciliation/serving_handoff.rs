@@ -4139,10 +4139,7 @@ mod tests {
 
         fn marker_bytes_and_inode(&self) -> anyhow::Result<(Vec<u8>, u64)> {
             let marker = self.marker_path()?;
-            Ok((
-                std::fs::read(&marker)?,
-                std::fs::metadata(&marker)?.ino(),
-            ))
+            Ok((std::fs::read(&marker)?, std::fs::metadata(&marker)?.ino()))
         }
 
         fn assert_listener_live(&self, phase: &str) -> anyhow::Result<()> {
@@ -4311,9 +4308,9 @@ mod tests {
         ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
             let validated = self.validate_absence_context(expected, context)?;
             match inspect()? {
-                RootProvisionProcessInspection::Absent => self
-                    .seal_validated_absence(expected, validated)
-                    .map(Some),
+                RootProvisionProcessInspection::Absent => {
+                    self.seal_validated_absence(expected, validated).map(Some)
+                }
                 RootProvisionProcessInspection::Exact(_)
                 | RootProvisionProcessInspection::Unavailable => Ok(None),
                 RootProvisionProcessInspection::Conflict(problem) => anyhow::bail!(
@@ -4428,14 +4425,15 @@ mod tests {
         }
 
         fn marker_path(&self) -> anyhow::Result<PathBuf> {
-            let paths = self.root.planner().serving_paths(
-                match self.intent.owner() {
+            let paths = self
+                .root
+                .planner()
+                .serving_paths(match self.intent.owner() {
                     super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Serving {
                         device_ownership_token,
                     } => device_ownership_token,
                     _ => unreachable!("Serving shadow cannot hold a Root intent"),
-                },
-            )?;
+                })?;
             Ok(PathBuf::from(paths.owner_marker().as_str()))
         }
 
@@ -4611,12 +4609,10 @@ mod tests {
                 }
                 ServingBlockdProcessStart::Submitted
                 | ServingBlockdProcessStart::OutcomeUnknown => {
-                    let ctl = UnixListener::bind(Path::new(
-                        prepared.control_socket_path().as_str(),
-                    ))?;
-                    let io = UnixListener::bind(Path::new(
-                        prepared.io_socket_path().unwrap().as_str(),
-                    ))?;
+                    let ctl =
+                        UnixListener::bind(Path::new(prepared.control_socket_path().as_str()))?;
+                    let io =
+                        UnixListener::bind(Path::new(prepared.io_socket_path().unwrap().as_str()))?;
                     drop(
                         UnixStream::connect(Path::new(
                             prepared.control_socket_path().as_str(),
@@ -5347,16 +5343,13 @@ mod tests {
                         ready.attempt(),
                     )
                     .unwrap()
-            };
+                };
             if matches!(checkpoint.step, ReconcileStep::ProvisionRootImage { .. }) {
-                match fixture
-                    .store()
-                    .reopen_target_control_authorization(
-                        &fixture.stored_checkpoint,
-                        &fixture.acquired,
-                        &fixture.authority,
-                    )
-                {
+                match fixture.store().reopen_target_control_authorization(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                ) {
                     Ok(ReopenedTargetControlAuthorization::Absent) => {}
                     Ok(ReopenedTargetControlAuthorization::Exact(target)) => {
                         root_expectation = root_expectation
@@ -5632,8 +5625,8 @@ mod tests {
         let mut observation = accepted.observation().clone();
         let mut attestation = accepted.attestation().clone();
         mutate(&mut session, &mut observation, &mut attestation);
-        let node_global_process = node_global_process
-            .and_then(|admission| admission.rebind_for_test(&observation).ok());
+        let node_global_process =
+            node_global_process.and_then(|admission| admission.rebind_for_test(&observation).ok());
         let context = RuntimeDesiredEffectContext::for_test_with_admission(
             fixture.state_directory.clone(),
             Instant::now() + Duration::from_secs(10),
@@ -5879,10 +5872,7 @@ mod tests {
         ) -> anyhow::Result<&'a mut IsolatedManagedServingOwner> {
             let token = expected.device_ownership_token().clone();
             if !owners.contains_key(&token) {
-                owners.insert(
-                    token.clone(),
-                    IsolatedManagedServingOwner::new(expected)?,
-                );
+                owners.insert(token.clone(), IsolatedManagedServingOwner::new(expected)?);
             }
             let owner = owners
                 .get_mut(&token)
@@ -6015,12 +6005,9 @@ mod tests {
             expected: &ServingBlockdExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
-            Self::managed_owner(
-                &mut self.managed_owners.lock().unwrap(),
-                expected,
-            )?
-            .sealed_absence(expected, context)
-            .map(Some)
+            Self::managed_owner(&mut self.managed_owners.lock().unwrap(), expected)?
+                .sealed_absence(expected, context)
+                .map(Some)
         }
 
         fn inspect_serving_exact_or_absent_after_node_global_sweep(
@@ -7244,14 +7231,12 @@ mod tests {
             .managed_root
             .assert_listener_live("before the foreign-boot admission")
             .unwrap();
-        let foreign_root_context = mutate_absent_effect_context(
-            &root_fixture,
-            |session, observation, _attestation| {
+        let foreign_root_context =
+            mutate_absent_effect_context(&root_fixture, |session, observation, _attestation| {
                 let foreign = NodeBootId::new("99999999999999999999999999999999").unwrap();
                 session.node_boot_id = foreign.clone();
                 observation.node_boot_id = foreign;
-            },
-        );
+            });
         let root_error = match root_fixture
             .managed_root
             .sealed_absence(&root_expectation, &foreign_root_context)
@@ -7287,20 +7272,17 @@ mod tests {
             .assert_listeners_live("before the foreign-boot admission")
             .unwrap();
         let serving_marker = serving_owner.marker_bytes_and_inode().unwrap();
-        let foreign_serving_context = mutate_absent_effect_context(
-            &serving_fixture,
-            |session, observation, _attestation| {
+        let foreign_serving_context =
+            mutate_absent_effect_context(&serving_fixture, |session, observation, _attestation| {
                 let foreign = NodeBootId::new("99999999999999999999999999999999").unwrap();
                 session.node_boot_id = foreign.clone();
                 observation.node_boot_id = foreign;
-            },
-        );
-        let serving_error = match serving_owner
-            .sealed_absence(&serving_expectation, &foreign_serving_context)
-        {
-            Err(error) => error,
-            Ok(_) => panic!("foreign-boot Serving admission minted an absence capability"),
-        };
+            });
+        let serving_error =
+            match serving_owner.sealed_absence(&serving_expectation, &foreign_serving_context) {
+                Err(error) => error,
+                Ok(_) => panic!("foreign-boot Serving admission minted an absence capability"),
+            };
         assert!(serving_error.to_string().contains("exact accepted owner"));
         serving_owner
             .assert_listeners_live("after the rejected foreign-boot admission")
@@ -9481,8 +9463,8 @@ mod tests {
 
         assert_eq!(
             effect
-            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
-            .unwrap(),
+                .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+                .unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
         match effect

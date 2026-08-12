@@ -1397,12 +1397,11 @@ mod tests {
             unreachable!()
         };
         let first = devices.first_mut().unwrap();
-        let serving_paths =
-            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
-                .serving_paths(&first.ownership_token)
-                .unwrap();
         first.frontend = PrepareDeviceFrontend::KernelNbd {
-            listener_socket_path: serving_paths.io_socket().clone(),
+            listener_socket_path: cats_api::runtime_reconciliation::HostPath::new(
+                "/run/cats/cat_01/root-nbd.sock".to_owned(),
+            )
+            .unwrap(),
             device_path: cats_api::runtime_reconciliation::HostPath::new("/dev/nbd7".to_owned())
                 .unwrap(),
             direct: true,

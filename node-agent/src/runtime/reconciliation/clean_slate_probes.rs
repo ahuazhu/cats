@@ -5246,7 +5246,7 @@ impl RootProvisionProcessRetirementPort for PlatformRootProcessInventoryBridge {
                 }
                 Ok(RootProvisionManagedStopInspection::Exact {
                     process,
-                    owner: after,
+                    owner: Box::new(after),
                 })
             }
             RootProvisionProcessInspection::Absent => {
@@ -7656,9 +7656,9 @@ fn errno() -> libc::c_int {
 mod tests {
     use std::collections::VecDeque;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::{
-        DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
-    };
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::os::unix::io::AsRawFd as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -13082,6 +13082,7 @@ mod tests {
             &fixture.record,
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
         let retained_root_expected = RootProvisionProcessExpectation::from_retained_prepare_device(
             stored.checkpoint(),
             &fixture.acquired.desired,
@@ -13118,7 +13119,9 @@ mod tests {
         LivePreparedScannerFixture {
             stored,
             old_process,
+            #[cfg(target_os = "linux")]
             retained_root_expected,
+            #[cfg(target_os = "linux")]
             serving_expected,
             _listeners: vec![
                 old_socket,
@@ -13297,6 +13300,31 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn file_bytes_and_inode(path: &Path) -> (Vec<u8>, u64) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        (std::fs::read(path).unwrap(), metadata.ino())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn intent_receipt_path(
+        environment: &TestEnvironment,
+        intent: &BlockdSocketOwnershipIntentV1,
+    ) -> PathBuf {
+        let owner = match intent.owner() {
+            super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Root {
+                provision_transition_id,
+            } => format!("r-{provision_transition_id}.intent.v1.json"),
+            super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Serving {
+                device_ownership_token,
+            } => format!("d-{device_ownership_token}.intent.v1.json"),
+        };
+        environment
+            .state
+            .join(super::super::BLOCKD_SOCKET_INTENT_NAMESPACE)
+            .join(owner)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn normal_full_managed_root_composes_absent_then_exact_root_and_serving_owners() {
         let environment = TestEnvironment::new();
@@ -13414,6 +13442,105 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_rejects_live_listeners_for_processes_reported_absent() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+        }
+        let prepared_root = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.root_intent, &managed.boot)
+            .unwrap();
+        let root_listener =
+            std::os::unix::net::UnixListener::bind(prepared_root.control_socket_path().as_str())
+                .unwrap();
+        prepared_root
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_root);
+        let prepared_serving = managed
+            .root
+            .prepare_existing_intent(&managed.intents, &managed.serving_intent, &managed.boot)
+            .unwrap();
+        let serving_control_listener =
+            std::os::unix::net::UnixListener::bind(prepared_serving.control_socket_path().as_str())
+                .unwrap();
+        let serving_io_listener = std::os::unix::net::UnixListener::bind(
+            prepared_serving.io_socket_path().unwrap().as_str(),
+        )
+        .unwrap();
+        prepared_serving
+            .assert_post_submit_owner_current(
+                &managed.boot,
+                super::super::blockd_socket_namespace::BlockdSocketPostSubmitOutcome::HandshakeVerified,
+            )
+            .unwrap();
+        drop(prepared_serving);
+
+        for path in [
+            managed.root_intent.control_socket_path(),
+            managed.serving_intent.control_socket_path(),
+            managed.serving_intent.io_socket_path().unwrap(),
+        ] {
+            std::os::unix::net::UnixStream::connect(path.as_str())
+                .expect("known-positive managed listener must accept a connection");
+        }
+        let root_paths = managed
+            .root
+            .planner()
+            .root_paths(&managed.root_expected.provision_transition_id)
+            .unwrap();
+        let serving_paths = managed
+            .root
+            .planner()
+            .serving_paths(managed.serving_expected.device_ownership_token())
+            .unwrap();
+        let before = [
+            file_bytes_and_inode(Path::new(root_paths.owner_marker().as_str())),
+            file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+        ];
+        let bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            Arc::new(FakeRootProcessPort {
+                inspections: Mutex::new(VecDeque::from([
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ])),
+            }),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect_err("live managed listeners were projected as absent");
+        assert!(
+            format!("{error:#}").contains("retains a live Unix listener"),
+            "{error:#}"
+        );
+        assert_eq!(
+            before,
+            [
+                file_bytes_and_inode(Path::new(root_paths.owner_marker().as_str())),
+                file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+            ]
+        );
+        drop((root_listener, serving_control_listener, serving_io_listener));
+    }
+
+    #[cfg(target_os = "linux")]
     struct MutatingManagedRootProcessPort {
         mutation_path: PathBuf,
         calls: AtomicUsize,
@@ -13445,6 +13572,49 @@ mod tests {
         ) -> anyhow::Result<super::super::root_provision_process::RootProvisionProcessStart>
         {
             unreachable!("inventory mutation regression is read-only")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReplacingManagedMarkerPort {
+        marker_path: PathBuf,
+        replacement_path: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl super::super::root_provision_process::sealed::Sealed for ReplacingManagedMarkerPort {}
+
+    #[cfg(target_os = "linux")]
+    impl RootProvisionProcessPort for ReplacingManagedMarkerPort {
+        fn inspect(
+            &self,
+            _expected: &RootProvisionProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let bytes = std::fs::read(&self.marker_path).unwrap();
+                std::fs::write(&self.replacement_path, bytes).unwrap();
+                std::fs::set_permissions(
+                    &self.replacement_path,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                std::fs::rename(&self.replacement_path, &self.marker_path).unwrap();
+            }
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::root_provision_process::CheckpointedRootProvisionProcess<
+                '_,
+            >,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::root_provision_process::RootProvisionProcessStart>
+        {
+            unreachable!("inventory marker-ABA regression is read-only")
         }
     }
 
@@ -13486,8 +13656,96 @@ mod tests {
         );
         assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
         assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
-        assert!(Path::new(managed.root_intent.public_directory().as_str()).exists());
-        assert!(Path::new(managed.serving_intent.public_directory().as_str()).exists());
+        assert!(Path::new(
+            managed
+                .root
+                .planner()
+                .root_paths(&managed.root_expected.provision_transition_id)
+                .unwrap()
+                .public_directory()
+                .as_str()
+        )
+        .exists());
+        assert!(Path::new(
+            managed
+                .root
+                .planner()
+                .serving_paths(managed.serving_expected.device_ownership_token())
+                .unwrap()
+                .public_directory()
+                .as_str()
+        )
+        .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_full_managed_root_rejects_same_name_marker_inode_aba_without_cleanup() {
+        let environment = TestEnvironment::new();
+        let managed = managed_inspect_all_fixture(&environment);
+        for intent in [&managed.root_intent, &managed.serving_intent] {
+            managed
+                .intents
+                .publish(intent, &managed.root, &managed.boot)
+                .unwrap();
+            drop(
+                managed
+                    .root
+                    .prepare_existing_intent(&managed.intents, intent, &managed.boot)
+                    .unwrap(),
+            );
+        }
+        let root_paths = managed
+            .root
+            .planner()
+            .root_paths(&managed.root_expected.provision_transition_id)
+            .unwrap();
+        let serving_paths = managed
+            .root
+            .planner()
+            .serving_paths(managed.serving_expected.device_ownership_token())
+            .unwrap();
+        let marker = Path::new(root_paths.owner_marker().as_str()).to_path_buf();
+        let replacement = environment._root.path().join("replacement-owner-marker");
+        let marker_before = file_bytes_and_inode(&marker);
+        let stable_before = [
+            file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+            file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+        ];
+        let root_port = Arc::new(ReplacingManagedMarkerPort {
+            marker_path: marker.clone(),
+            replacement_path: replacement,
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = managed_inspect_all_bridge(
+            &environment,
+            &managed,
+            root_port.clone(),
+            Arc::new(FakeServingProcessPort {
+                process_ids: Mutex::new(VecDeque::from([None, None])),
+            }),
+        );
+        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect_err("same-name managed marker inode ABA entered a complete full inventory");
+        assert!(
+            format!("{error:#}").contains("changed across full Node-global inventory"),
+            "{error:#}"
+        );
+        assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
+        let marker_after = file_bytes_and_inode(&marker);
+        assert_eq!(marker_after.0, marker_before.0);
+        assert_ne!(marker_after.1, marker_before.1);
+        assert_eq!(
+            stable_before,
+            [
+                file_bytes_and_inode(Path::new(serving_paths.owner_marker().as_str())),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.root_intent)),
+                file_bytes_and_inode(&intent_receipt_path(&environment, &managed.serving_intent)),
+            ]
+        );
+        assert!(Path::new(root_paths.public_directory().as_str()).exists());
+        assert!(Path::new(serving_paths.public_directory().as_str()).exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -13541,11 +13799,13 @@ mod tests {
         .unwrap() else {
             panic!("stopped Root owner must retain its exact journaled socket")
         };
+        let first = first.into_admission_for_test();
         assert_eq!(
-            first.stop_receipt_socket(&managed.root_expected.cat_id),
-            Some(&StopReceiptSocketAdmission::from_managed(
-                stop_owner.clone()
-            ))
+            first
+                .stop_receipt_socket(&managed.root_expected.cat_id)
+                .unwrap()
+                .receipt_socket(),
+            stop_owner.control_socket_path()
         );
         assert_eq!(
             first.stop_receipt_physical_paths(),
@@ -13604,6 +13864,7 @@ mod tests {
                 process_ids: Mutex::new(VecDeque::from([None, None])),
             }),
         );
+        let expected_receipt_socket = stop_owner.control_socket_path().clone();
         let RootProcessInventoryBridgeOutcome::Complete(second) = managed_inspect_all(
             &second_bridge,
             &managed,
@@ -13615,9 +13876,26 @@ mod tests {
         .unwrap() else {
             panic!("retired owner with a surviving semantic journal must scan complete")
         };
+        let second = second.into_admission_for_test();
+        let retained_semantic_receipt = second
+            .stop_receipt_socket(&managed.root_expected.cat_id)
+            .expect("owner retirement must not erase the semantic stop receipt admission");
+        assert_eq!(
+            retained_semantic_receipt.receipt_socket(),
+            &expected_receipt_socket
+        );
         assert!(second.stop_receipt_physical_paths().is_empty());
         assert!(
-            !Path::new(managed.root_intent.public_directory().as_str()).exists()
+            !Path::new(
+                managed
+                    .root
+                    .planner()
+                    .root_paths(&managed.root_expected.provision_transition_id)
+                    .unwrap()
+                    .public_directory()
+                    .as_str()
+            )
+            .exists()
                 && managed
                     .intents
                     .load(managed.root_intent.owner())
@@ -13631,8 +13909,7 @@ mod tests {
         fixture: &FullRootScannerFixture,
         live: &mut LivePreparedScannerFixture,
     ) {
-        let old_listener = live._listeners.remove(0);
-        drop(old_listener);
+        let _ = live._listeners.remove(0);
         std::fs::remove_dir_all(
             environment
                 .proc_root
@@ -15349,7 +15626,7 @@ mod tests {
             RootProvisionProcessInspection::Exact(Box::new(second_process))
         );
 
-        drop(second_socket);
+        let _ = second_socket;
         std::fs::remove_dir_all(environment.systemd_root.join(second_root.scope_id.as_str()))
             .unwrap();
         std::fs::remove_dir_all(environment.proc_root.join("82")).unwrap();
@@ -15454,8 +15731,7 @@ mod tests {
         ));
         std::fs::remove_dir(foreign_unit).unwrap();
         std::fs::remove_dir_all(second_root.data_directory.as_str()).unwrap();
-        drop(_serving_control);
-        drop(_serving_frontend);
+        let _ = (_serving_control, _serving_frontend);
         std::fs::remove_dir_all(
             environment
                 .systemd_root

@@ -3585,11 +3585,6 @@ mod tests {
     }
 
     fn checkpoint(cat: &str, volume: &str, device: &str, token: char) -> RuntimeCheckpoint {
-        let ownership_token = random(token);
-        let serving_paths =
-            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
-                .serving_paths(&ownership_token)
-                .unwrap();
         RuntimeCheckpoint {
             version: ContractVersion::V1,
             cat_id: id(cat),
@@ -3634,7 +3629,7 @@ mod tests {
                         serial: id("cats-root"),
                         slot: 0,
                     },
-                    ownership_token,
+                    ownership_token: random(token),
                     serving_authority: Box::new(
                         ServingAuthorityProvenance::DirectAuthorizedAttachment {
                             authorization: cats_api::runtime_reconciliation::DirectAuthorizedAttachmentIdentity {
@@ -3652,13 +3647,13 @@ mod tests {
                     ),
                     serving_process: ServingBlockdIdentity {
                         scope_id: id("cats-serving.service"),
-                        control_socket_path: serving_paths.control_socket().clone(),
+                        control_socket_path: host("/run/cats/control.sock"),
                         data_directory: host("/var/lib/cats/data"),
                         executable_path: host("/usr/bin/cats-blockd"),
                         process_identity_token: random('5'),
                     },
                     frontend: PrepareDeviceFrontend::KernelNbd {
-                        listener_socket_path: serving_paths.io_socket().clone(),
+                        listener_socket_path: host("/run/cats/nbd.sock"),
                         device_path: host(device),
                         direct: false,
                     },
@@ -4144,12 +4139,8 @@ mod tests {
         let ReconcileStep::StartRuntime { devices, .. } = &mut launch.step else {
             unreachable!()
         };
-        let serving_paths =
-            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
-                .serving_paths(&devices[0].ownership_token)
-                .unwrap();
         devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
-            listener_socket_path: serving_paths.io_socket().clone(),
+            listener_socket_path: host("/run/cats/cat_01/root-nbd.sock"),
             device_path: host("/dev/nbd0"),
             direct: false,
         };
@@ -4210,11 +4201,7 @@ mod tests {
         authorization.path = host("/var/lib/cats/persistent-authorized-serving.json");
         *purpose = cats_api::runtime_reconciliation::DirectAuthorizedAttachmentPurpose::PersistentInitialized;
         device.serving_process.scope_id = id("cats-serving-persistent.service");
-        let serving_paths =
-            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
-                .serving_paths(&device.ownership_token)
-                .unwrap();
-        device.serving_process.control_socket_path = serving_paths.control_socket().clone();
+        device.serving_process.control_socket_path = host("/run/cats/persistent-control.sock");
         device.serving_process.data_directory = host("/var/lib/cats/persistent-data");
         device.serving_process.process_identity_token = random('8');
         let PrepareDeviceFrontend::KernelNbd {
@@ -4224,7 +4211,7 @@ mod tests {
         else {
             unreachable!()
         };
-        *listener_socket_path = serving_paths.io_socket().clone();
+        *listener_socket_path = host("/run/cats/persistent-nbd.sock");
 
         let root_device = super::super::network::prepared_device_input(&root).unwrap();
         let persistent_device = super::super::network::prepared_device_input(&persistent).unwrap();

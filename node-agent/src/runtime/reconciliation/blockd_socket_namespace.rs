@@ -113,7 +113,7 @@ fn canonical_json_bytes(value: &Value) -> Vec<u8> {
             }
             Value::Object(object) => {
                 let mut members = object.iter().collect::<Vec<_>>();
-                members.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                members.sort_unstable_by_key(|(key, _)| *key);
                 output.push(b'{');
                 for (index, (key, member)) in members.into_iter().enumerate() {
                     if index != 0 {
@@ -308,18 +308,16 @@ impl RetainedManagedBlockdSocketRoot {
         );
         absence.assert_current(current_boot)?;
         match absence.capture {
-            ManagedBlockdSocketOwnerStartCapture::Fresh {
-                receipt: Some(captured),
-                ..
-            } => {
-                intents.settle_captured_intent_for_start(
-                    &captured,
-                    self,
-                    current_boot,
-                    expected,
-                )?;
+            ManagedBlockdSocketOwnerStartCapture::Fresh(fresh) => {
+                if let Some(captured) = fresh.receipt {
+                    intents.settle_captured_intent_for_start(
+                        &captured,
+                        self,
+                        current_boot,
+                        expected,
+                    )?;
+                }
             }
-            ManagedBlockdSocketOwnerStartCapture::Fresh { receipt: None, .. } => {}
             ManagedBlockdSocketOwnerStartCapture::ExistingSameBoot(captured) => {
                 captured.settle_for_start_after_absence(current_boot)?;
             }
@@ -344,7 +342,7 @@ impl RetainedManagedBlockdSocketRoot {
         );
         absence.assert_current(current_boot)?;
         let captured_intent = match absence.capture {
-            ManagedBlockdSocketOwnerStartCapture::Fresh { receipt, .. } => receipt,
+            ManagedBlockdSocketOwnerStartCapture::Fresh(fresh) => fresh.receipt,
             ManagedBlockdSocketOwnerStartCapture::ExistingSameBoot(captured) => {
                 let intent_capture = captured.intent_capture.clone();
                 captured.settle_for_retirement_after_absence(current_boot)?;
@@ -457,7 +455,9 @@ impl RetainedManagedBlockdSocketRoot {
         };
         retained.assert_current_unlocked(current_boot)?;
         drop(namespace_lock);
-        Ok(ManagedBlockdSocketOwnerInspection::Current(retained))
+        Ok(ManagedBlockdSocketOwnerInspection::Current(Box::new(
+            retained,
+        )))
     }
 
     /// Capture one exact owner namespace before the Node-global process sweep.
@@ -478,12 +478,12 @@ impl RetainedManagedBlockdSocketRoot {
         match receipt {
             None => {
                 assert_all_owner_names_absent(self, &paths)?;
-                Ok(ManagedBlockdSocketOwnerStartCapture::Fresh {
-                    root: Arc::clone(self),
-                    intents: Arc::clone(intents),
-                    intent: expected.clone(),
-                    receipt: None,
-                })
+                Ok(ManagedBlockdSocketOwnerStartCapture::fresh(
+                    Arc::clone(self),
+                    Arc::clone(intents),
+                    expected.clone(),
+                    None,
+                ))
             }
             Some(captured) if captured.intent.node_boot_id() != current_boot.node_boot_id() => {
                 captured.intent.validate_stale_mapping(self)?;
@@ -494,12 +494,12 @@ impl RetainedManagedBlockdSocketRoot {
                     "old-boot blockd socket intent is another stable owner generation"
                 );
                 assert_all_owner_names_absent(self, &paths)?;
-                Ok(ManagedBlockdSocketOwnerStartCapture::Fresh {
-                    root: Arc::clone(self),
-                    intents: Arc::clone(intents),
-                    intent: expected.clone(),
-                    receipt: Some(captured),
-                })
+                Ok(ManagedBlockdSocketOwnerStartCapture::fresh(
+                    Arc::clone(self),
+                    Arc::clone(intents),
+                    expected.clone(),
+                    Some(captured),
+                ))
             }
             Some(captured) => {
                 anyhow::ensure!(
@@ -508,12 +508,12 @@ impl RetainedManagedBlockdSocketRoot {
                 );
                 if captured.phase != CapturedBlockdSocketIntentPhase::Public {
                     assert_all_owner_names_absent(self, &paths)?;
-                    return Ok(ManagedBlockdSocketOwnerStartCapture::Fresh {
-                        root: Arc::clone(self),
-                        intents: Arc::clone(intents),
-                        intent: expected.clone(),
-                        receipt: Some(captured),
-                    });
+                    return Ok(ManagedBlockdSocketOwnerStartCapture::fresh(
+                        Arc::clone(self),
+                        Arc::clone(intents),
+                        expected.clone(),
+                        Some(captured),
+                    ));
                 }
                 let candidates = [
                     (
@@ -544,12 +544,12 @@ impl RetainedManagedBlockdSocketRoot {
                 .flatten()
                 .collect::<Vec<_>>();
                 if candidates.is_empty() {
-                    return Ok(ManagedBlockdSocketOwnerStartCapture::Fresh {
-                        root: Arc::clone(self),
-                        intents: Arc::clone(intents),
-                        intent: expected.clone(),
-                        receipt: Some(captured),
-                    });
+                    return Ok(ManagedBlockdSocketOwnerStartCapture::fresh(
+                        Arc::clone(self),
+                        Arc::clone(intents),
+                        expected.clone(),
+                        Some(captured),
+                    ));
                 }
                 let [(phase, directory)] = candidates.as_slice() else {
                     anyhow::bail!(
@@ -560,7 +560,7 @@ impl RetainedManagedBlockdSocketRoot {
                 let snapshot =
                     owner_directory_snapshot(directory, expected, phase.snapshot_phase())?;
                 Ok(ManagedBlockdSocketOwnerStartCapture::ExistingSameBoot(
-                    ManagedBlockdSocketOwnerCleanupCapture {
+                    Box::new(ManagedBlockdSocketOwnerCleanupCapture {
                         root: Arc::clone(self),
                         intents: Arc::clone(intents),
                         receipt: captured.intent.clone(),
@@ -569,7 +569,7 @@ impl RetainedManagedBlockdSocketRoot {
                         directory: directory.try_clone()?,
                         directory_identity: identity,
                         snapshot,
-                    },
+                    }),
                 ))
             }
         }
@@ -1567,11 +1567,8 @@ impl BlockdSocketIntentStore {
                 return self.finish_stale_intent_retirement(
                     stale,
                     root,
-                    &paths,
                     current_boot,
-                    &quarantine_name,
                     quarantine_identity,
-                    &expected,
                 );
             }
             anyhow::ensure!(
@@ -1602,31 +1599,23 @@ impl BlockdSocketIntentStore {
         self.directory
             .sync_all()
             .context("fsync stale blockd socket intent claim")?;
-        self.finish_stale_intent_retirement(
-            stale,
-            root,
-            &paths,
-            current_boot,
-            &quarantine_name,
-            public_identity,
-            &expected,
-        )
+        self.finish_stale_intent_retirement(stale, root, current_boot, public_identity)
     }
 
     fn finish_stale_intent_retirement(
         &self,
         stale: &BlockdSocketOwnershipIntentV1,
         root: &RetainedManagedBlockdSocketRoot,
-        paths: &DerivedSocketPaths,
         current_boot: &CurrentBlockdSocketBoot,
-        quarantine_name: &CStr,
         claimed_identity: StableFileIdentity,
-        expected: &[u8],
     ) -> anyhow::Result<BlockdSocketStaleIntentRetirement> {
         anyhow::ensure!(
             stale.node_boot_id() != current_boot.node_boot_id(),
             "stale blockd intent became current during retirement"
         );
+        let paths = derive_paths(root.planner(), stale.owner())?;
+        let quarantine_name = intent_quarantine_file_name(stale.owner())?;
+        let expected = stale.encoded_bytes()?;
         root.assert_current()?;
         for name in [
             paths.public_name.as_str(),
@@ -1645,7 +1634,7 @@ impl BlockdSocketIntentStore {
             );
         }
         let (claimed, current_identity) =
-            read_optional_bounded_file_with_identity(&self.directory, quarantine_name)?
+            read_optional_bounded_file_with_identity(&self.directory, &quarantine_name)?
                 .context("claimed stale blockd socket intent disappeared")?;
         anyhow::ensure!(
             claimed == expected
@@ -1653,13 +1642,13 @@ impl BlockdSocketIntentStore {
                 && decode_intent(&claimed)? == *stale,
             "claimed stale blockd socket intent changed identity or bytes"
         );
-        unlink_at(&self.directory, quarantine_name)
+        unlink_at(&self.directory, &quarantine_name)
             .context("remove claimed stale blockd socket intent")?;
         self.directory
             .sync_all()
             .context("fsync stale blockd socket intent retirement")?;
         anyhow::ensure!(
-            read_optional_bounded_file(&self.directory, quarantine_name)?.is_none(),
+            read_optional_bounded_file(&self.directory, &quarantine_name)?.is_none(),
             "stale blockd socket intent quarantine reappeared"
         );
         root.assert_current()?;
@@ -1774,7 +1763,7 @@ pub(crate) enum ManagedBlockdSocketOwnerInspection<'a> {
     Absent,
     StaleBootAbsent,
     RecoverableAbsent,
-    Current(PreparedManagedBlockdSocketOwner<'a>),
+    Current(Box<PreparedManagedBlockdSocketOwner<'a>>),
 }
 
 /// Namespace state retained before a sealed Node-global process sweep.
@@ -1783,13 +1772,16 @@ pub(crate) enum ManagedBlockdSocketOwnerInspection<'a> {
 /// a later absence proof may consume for descriptor-relative cleanup.
 #[derive(Debug)]
 pub(crate) enum ManagedBlockdSocketOwnerStartCapture {
-    Fresh {
-        root: Arc<RetainedManagedBlockdSocketRoot>,
-        intents: Arc<BlockdSocketIntentStore>,
-        intent: BlockdSocketOwnershipIntentV1,
-        receipt: Option<CapturedBlockdSocketIntent>,
-    },
-    ExistingSameBoot(ManagedBlockdSocketOwnerCleanupCapture),
+    Fresh(Box<ManagedBlockdSocketFreshCapture>),
+    ExistingSameBoot(Box<ManagedBlockdSocketOwnerCleanupCapture>),
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedBlockdSocketFreshCapture {
+    root: Arc<RetainedManagedBlockdSocketRoot>,
+    intents: Arc<BlockdSocketIntentStore>,
+    intent: BlockdSocketOwnershipIntentV1,
+    receipt: Option<CapturedBlockdSocketIntent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1962,7 +1954,7 @@ enum CapturedOwnerDirectoryPhase {
 }
 
 impl CapturedOwnerDirectoryPhase {
-    fn name<'a>(self, paths: &'a DerivedSocketPaths) -> &'a str {
+    fn name(self, paths: &DerivedSocketPaths) -> &str {
         match self {
             Self::Public => &paths.public_name,
             Self::Staging => &paths.staging_name,
@@ -1980,16 +1972,30 @@ impl CapturedOwnerDirectoryPhase {
 }
 
 impl ManagedBlockdSocketOwnerStartCapture {
+    fn fresh(
+        root: Arc<RetainedManagedBlockdSocketRoot>,
+        intents: Arc<BlockdSocketIntentStore>,
+        intent: BlockdSocketOwnershipIntentV1,
+        receipt: Option<CapturedBlockdSocketIntent>,
+    ) -> Self {
+        Self::Fresh(Box::new(ManagedBlockdSocketFreshCapture {
+            root,
+            intents,
+            intent,
+            receipt,
+        }))
+    }
+
     pub(crate) fn intent(&self) -> &BlockdSocketOwnershipIntentV1 {
         match self {
-            Self::Fresh { intent, .. } => intent,
+            Self::Fresh(fresh) => &fresh.intent,
             Self::ExistingSameBoot(retained) => &retained.receipt,
         }
     }
 
     pub(crate) fn socket_paths(&self) -> BTreeSet<HostPath> {
         match self {
-            Self::Fresh { .. } => BTreeSet::new(),
+            Self::Fresh(_) => BTreeSet::new(),
             Self::ExistingSameBoot(retained) => {
                 let mut paths = BTreeSet::new();
                 if retained.snapshot.control_socket.is_some() {
@@ -2008,12 +2014,13 @@ impl ManagedBlockdSocketOwnerStartCapture {
         current_boot: &CurrentBlockdSocketBoot,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Fresh {
-                root,
-                intents,
-                intent,
-                receipt,
-            } => {
+            Self::Fresh(fresh) => {
+                let ManagedBlockdSocketFreshCapture {
+                    root,
+                    intents,
+                    intent,
+                    receipt,
+                } = fresh.as_ref();
                 root.assert_current()?;
                 intents.assert_current()?;
                 assert_all_owner_names_absent(root, &intent.derived_paths(root)?)?;
@@ -4388,7 +4395,7 @@ mod tests {
 
             let snapshot = fixture
                 .root
-                .capture_closed_whole_root(&fixture.intents, &[intent.clone()])
+                .capture_closed_whole_root(&fixture.intents, std::slice::from_ref(&intent))
                 .unwrap();
             if let Some(stop_owner) = stop_owner {
                 let physical = snapshot.bind_root_stop_owner(&stop_owner).unwrap();
