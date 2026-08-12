@@ -13,11 +13,11 @@ use cats_api::runtime_reconciliation::{
     FilesystemInitialization, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
     GuestTransportEvidence, HostPath, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
     LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDiskKind, ObservedMount,
-    ObservedRuntimeStatus, ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence,
-    PersistentFilesystemBinding, ProcessEvidence, ProcessRole, ProcessState, ReconcileStep,
-    RuntimeCheckpoint, RuntimeConfig, RuntimeTarget, RuntimeTransition,
-    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDevice,
+    ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
+    OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding, ProcessEvidence,
+    ProcessRole, ProcessState, ReconcileStep, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget,
+    RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
     SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
@@ -649,7 +649,77 @@ fn commit_initialized_checkpoint(
         "require_idle": {"kind": "not_applicable"},
         "updated_at_unix_ms": 1,
     });
-    decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap()
+    let checkpoint = decode_runtime_checkpoint(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let launch = checkpoint
+        .runtime_launch
+        .identity()
+        .expect("commit_initialized fixture retains one VMM launch");
+    for (device_token, volume_id, control_socket, io_socket) in [
+        (
+            &root_device_token,
+            &root.volume_id,
+            root_sockets.control_socket(),
+            root_sockets.io_socket(),
+        ),
+        (
+            &persistent_device_token,
+            &persistent.volume_id,
+            persistent_sockets.control_socket(),
+            persistent_sockets.io_socket(),
+        ),
+    ] {
+        let device = launch
+            .devices
+            .iter()
+            .find(|device| &device.ownership_token == device_token)
+            .expect("fixture launch retains the mapped device owner");
+        assert_eq!(device.serving_process.control_socket_path, *control_socket);
+        let cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            socket_path,
+            ..
+        } = &device.frontend
+        else {
+            panic!("commit_initialized fixture device must be vhost-user-blk")
+        };
+        assert_eq!(socket_path, io_socket);
+
+        let process = checkpoint
+            .processes
+            .iter()
+            .find(|process| {
+                matches!(
+                    &process.role,
+                    ProcessRole::Blockd {
+                        volume_id: observed,
+                        ..
+                    } if observed == volume_id
+                )
+            })
+            .expect("fixture observes the mapped serving process");
+        assert_eq!(process.control_socket_path, *control_socket);
+
+        let observed_device = checkpoint
+            .volumes
+            .iter()
+            .find(|volume| &volume.volume_id == volume_id)
+            .and_then(|volume| {
+                volume.devices.iter().find(|device| {
+                    matches!(
+                        device,
+                        ObservedDevice::VhostUserBlk {
+                            ownership_token: OwnershipTokenEvidence::Valid { ownership_token },
+                            ..
+                        } if ownership_token == device_token
+                    )
+                })
+            })
+            .expect("fixture observes the mapped vhost-user device");
+        let ObservedDevice::VhostUserBlk { socket_path, .. } = observed_device else {
+            unreachable!()
+        };
+        assert_eq!(socket_path, io_socket);
+    }
+    checkpoint
 }
 
 fn commit_initialized_runtime_status(checkpoint: &RuntimeCheckpoint) -> ObservedRuntimeStatus {

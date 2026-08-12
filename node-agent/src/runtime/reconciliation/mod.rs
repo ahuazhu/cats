@@ -26,6 +26,10 @@ mod authorized_blockd;
     reason = "managed blockd socket ownership awaits process-port composition"
 )]
 mod blockd_socket_namespace;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use blockd_socket_namespace::{
+    BlockdSocketIntentStore, RetainedManagedBlockdSocketRoot, BLOCKD_SOCKET_INTENT_NAMESPACE,
+};
 mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;

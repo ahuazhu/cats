@@ -682,12 +682,13 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use crate::runtime::reconciliation::{
-        current_kernel_node_boot_id, stale_boot_recovery_global_sealed,
+        current_kernel_node_boot_id, stale_boot_recovery_global_sealed, BlockdSocketIntentStore,
         ExactVmmProcessAbsenceProof, InstalledStaleBootVmmRecoveryPorts, ManagedVmmLaunchFilePaths,
-        RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RuntimeCheckpointRecoverySet,
+        RetainedManagedBlockdSocketRoot, RetainedManagedVmmLaunchRoot,
+        RetainedManagedVmmSocketRoot, RuntimeCheckpointRecoverySet,
         StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
-        VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, INSTALLED_VMM_SOCKET_ROOT,
-        VMM_LAUNCH_FILE_NAMESPACE,
+        VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, BLOCKD_SOCKET_INTENT_NAMESPACE,
+        INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
     };
     #[cfg(target_os = "linux")]
     use crate::runtime_spine::{
@@ -1287,6 +1288,24 @@ mod tests {
         RetainedManagedVmmLaunchRoot::open_existing(state.clone())?;
         if VmmSocketReceiptStore::open_existing(state.clone()).is_err() {
             VmmSocketReceiptStore::provision_for_test(state.clone())?;
+        }
+        if state
+            .path()
+            .join(BLOCKD_SOCKET_INTENT_NAMESPACE)
+            .try_exists()?
+        {
+            BlockdSocketIntentStore::open_existing(state.clone())?;
+        } else {
+            BlockdSocketIntentStore::provision_for_test(state.clone())?;
+        }
+        let blockd_socket_root =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed();
+        let blockd_installed = std::path::Path::new(blockd_socket_root.path().as_str());
+        if !blockd_installed.exists() {
+            std::fs::create_dir_all(blockd_installed.parent().unwrap())?;
+            RetainedManagedBlockdSocketRoot::provision_for_test(blockd_installed)?;
+        } else {
+            RetainedManagedBlockdSocketRoot::open_installed()?;
         }
         let installed = std::path::Path::new(INSTALLED_VMM_SOCKET_ROOT);
         if !installed.exists() {

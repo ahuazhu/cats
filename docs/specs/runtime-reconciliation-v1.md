@@ -934,8 +934,12 @@ data-directory child path、任意`/run`前缀、staging/quarantine path和ctl/i
 普通effect失败。
 
 首次bind前，Node必须先持有current durable checkpoint和installed root descriptor，再在Node state下
-fsync一份provider-private namespace-intent receipt；receipt绑定当前boot、完整checkpoint digest、role和上述
-owner。随后只可创建对应`.s-r-*`/`.s-d-*` staging directory，写入与receipt canonical bytes完全相同的
+fsync一份provider-private namespace-intent receipt；receipt绑定当前boot、role、owner和稳定的
+owner-authority digest。Root digest取完整provision authorization context，刻意排除合法重启只会轮换的process
+token/timestamp；Serving digest取canonical完整`PreparedDeviceInput`，所以owner、frontend、attachment、process或
+handoff任一变化都会烧掉旧generation，而PrepareNetwork/StartRuntime后继保持同一值。不得直接绑定整个当前
+checkpoint digest，否则同一Root transition的合法process-token rotation会与既有receipt冲突。随后只可创建对应
+`.s-r-*`/`.s-d-*` staging directory，写入与receipt canonical bytes完全相同的
 `.owner.v1.json`并fsync file/directory，再以no-replace rename发布public owner directory并fsync root；
 最后才可提交systemd。checkpoint提供长期语义authority，但不授权markerless或identity已变的inode cleanup。
 unknown root entry、foreign marker、public+staging/quarantine重复代、symlink或socket inode ABA必须fail closed；

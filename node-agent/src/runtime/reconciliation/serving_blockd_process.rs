@@ -520,6 +520,130 @@ impl ServingBlockdExpectation {
         &self.prepared_device
     }
 
+    /// Project only the provider-owned socket mapping into an isolated test
+    /// namespace.  The input must first be an exact installed expectation;
+    /// reversing the projection must reproduce every byte of the original
+    /// process, attachment and device authority.
+    #[cfg(test)]
+    pub(crate) fn shadow_socket_root_for_test(
+        &self,
+        socket_root: &cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot,
+    ) -> anyhow::Result<Self> {
+        let installed = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(&self.device_ownership_token)?;
+        let projected = socket_root.serving_paths(&self.device_ownership_token)?;
+        anyhow::ensure!(
+            &self.control_socket_path == installed.control_socket()
+                && self.listener_path() == installed.io_socket()
+                && &self.prepared_device.serving_process.control_socket_path
+                    == installed.control_socket()
+                && match &self.prepared_device.frontend {
+                    PrepareDeviceFrontend::KernelNbd {
+                        listener_socket_path,
+                        ..
+                    } => listener_socket_path == installed.io_socket(),
+                    PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => {
+                        socket_path == installed.io_socket()
+                    }
+                },
+            "Serving test shadow source is outside the installed managed mapping"
+        );
+
+        fn replace_frontend_socket(
+            frontend: &mut PrepareDeviceFrontend,
+            expected: &HostPath,
+            replacement: &HostPath,
+        ) -> anyhow::Result<()> {
+            let socket = match frontend {
+                PrepareDeviceFrontend::KernelNbd {
+                    listener_socket_path,
+                    ..
+                } => listener_socket_path,
+                PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } => socket_path,
+            };
+            anyhow::ensure!(
+                socket == expected,
+                "Serving test shadow frontend changed before projection"
+            );
+            *socket = replacement.clone();
+            Ok(())
+        }
+
+        fn replace_command_socket(
+            command_line: &mut [OsString],
+            expected: &HostPath,
+            replacement: &HostPath,
+        ) -> anyhow::Result<()> {
+            let mut replacements = 0usize;
+            for argument in command_line {
+                if argument == expected.as_str() {
+                    *argument = OsString::from(replacement.as_str());
+                    replacements += 1;
+                }
+            }
+            anyhow::ensure!(
+                replacements == 1,
+                "Serving test shadow expected one exact socket argument, found {replacements}"
+            );
+            Ok(())
+        }
+
+        let mut shadow = self.clone();
+        replace_command_socket(
+            &mut shadow.command_line,
+            installed.control_socket(),
+            projected.control_socket(),
+        )?;
+        replace_command_socket(
+            &mut shadow.command_line,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+        shadow.control_socket_path = projected.control_socket().clone();
+        shadow.prepared_device.serving_process.control_socket_path =
+            projected.control_socket().clone();
+        replace_frontend_socket(
+            &mut shadow.frontend,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+        replace_frontend_socket(
+            &mut shadow.prepared_device.frontend,
+            installed.io_socket(),
+            projected.io_socket(),
+        )?;
+
+        let mut restored = shadow.clone();
+        replace_command_socket(
+            &mut restored.command_line,
+            projected.control_socket(),
+            installed.control_socket(),
+        )?;
+        replace_command_socket(
+            &mut restored.command_line,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        restored.control_socket_path = installed.control_socket().clone();
+        restored.prepared_device.serving_process.control_socket_path =
+            installed.control_socket().clone();
+        replace_frontend_socket(
+            &mut restored.frontend,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        replace_frontend_socket(
+            &mut restored.prepared_device.frontend,
+            projected.io_socket(),
+            installed.io_socket(),
+        )?;
+        anyhow::ensure!(
+            restored == *self,
+            "Serving test shadow changed non-socket process or device authority"
+        );
+        Ok(shadow)
+    }
+
     pub(super) fn listener_path(&self) -> &HostPath {
         match &self.frontend {
             PrepareDeviceFrontend::KernelNbd {

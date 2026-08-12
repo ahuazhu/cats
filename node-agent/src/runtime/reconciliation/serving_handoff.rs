@@ -3972,8 +3972,24 @@ mod tests {
     };
     use crate::runtime_spine::{
         RuntimeDesiredEffectAdmission, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
-        RuntimeDesiredEffectStopReason, RuntimePhysicalReadContext,
+        RuntimeDesiredEffectStopReason, RuntimeNodeGlobalEffectPermit, RuntimePhysicalReadContext,
     };
+
+    struct ValidatedRootSocketAbsence {
+        expected_intents: Vec<BlockdSocketOwnershipIntentV1>,
+        node_global_effect: RuntimeNodeGlobalEffectPermit,
+    }
+
+    fn current_test_node_boot_id() -> NodeBootId {
+        #[cfg(target_os = "linux")]
+        {
+            super::super::vmm_socket_namespace::current_kernel_node_boot_id().unwrap()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            NodeBootId::new("11111111111111111111111111111111").unwrap()
+        }
+    }
 
     /// One isolated, physically real analogue of the production managed Root
     /// socket namespace. Test process ports share this object so an `Absent`
@@ -4011,12 +4027,7 @@ mod tests {
                 ))
                 .unwrap(),
             );
-            #[cfg(target_os = "linux")]
-            let node_boot_id =
-                super::super::vmm_socket_namespace::current_kernel_node_boot_id().unwrap();
-            #[cfg(not(target_os = "linux"))]
-            let node_boot_id = NodeBootId::new("11111111111111111111111111111111").unwrap();
-            let boot = CurrentBlockdSocketBoot::for_test(node_boot_id);
+            let boot = CurrentBlockdSocketBoot::for_test(current_test_node_boot_id());
             let ReconcileStep::ProvisionRootImage {
                 provision_transition_id,
                 control_socket_path,
@@ -4115,12 +4126,48 @@ mod tests {
             Ok(())
         }
 
+        fn marker_path(&self) -> anyhow::Result<PathBuf> {
+            let super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Root {
+                provision_transition_id,
+            } = self.intent.owner()
+            else {
+                unreachable!("Root shadow cannot hold a Serving intent")
+            };
+            let paths = self.root.planner().root_paths(provision_transition_id)?;
+            Ok(PathBuf::from(paths.owner_marker().as_str()))
+        }
+
+        fn marker_bytes_and_inode(&self) -> anyhow::Result<(Vec<u8>, u64)> {
+            let marker = self.marker_path()?;
+            Ok((
+                std::fs::read(&marker)?,
+                std::fs::metadata(&marker)?.ino(),
+            ))
+        }
+
+        fn assert_listener_live(&self, phase: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.listener.lock().unwrap().is_some(),
+                "isolated managed Root owner retains no listener {phase}"
+            );
+            drop(
+                UnixStream::connect(Path::new(self.intent.control_socket_path().as_str()))
+                    .with_context(|| {
+                        format!("isolated managed Root listener is not live {phase}")
+                    })?,
+            );
+            Ok(())
+        }
+
         fn drop_listener_preserving_path(
             &self,
             expected: &RootProvisionProcessExpectation,
         ) -> anyhow::Result<()> {
             self.assert_same_owner(expected)?;
-            if self.listener.lock().unwrap().take().is_some() {
+            let listener = self.listener.lock().unwrap().take();
+            let had_listener = listener.is_some();
+            drop(listener);
+            if had_listener {
                 let socket_path = Path::new(self.intent.control_socket_path().as_str());
                 anyhow::ensure!(
                     socket_path.exists(),
@@ -4134,11 +4181,11 @@ mod tests {
             Ok(())
         }
 
-        fn sealed_absence(
+        fn validate_absence_context(
             &self,
             expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
-        ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
+        ) -> anyhow::Result<ValidatedRootSocketAbsence> {
             self.assert_same_owner(expected)?;
             let accepted = context.accepted_full()?;
             anyhow::ensure!(
@@ -4156,15 +4203,6 @@ mod tests {
                     .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
                 "isolated managed Root absence is not the exact accepted absent owner"
             );
-            let node_global_effect = context.lock_node_global_effect()?;
-            let control_socket = Path::new(self.intent.control_socket_path().as_str());
-            anyhow::ensure!(
-                UnixStream::connect(control_socket).is_err(),
-                "isolated managed Root listener is present before the absence sweep"
-            );
-            let capture =
-                self.root
-                    .capture_start_absence(&self.intents, &self.intent, &self.boot)?;
             let (root_expectations, _) = admission.root_control_state();
             let (serving_expectations, _) = admission.serving_blockd_state();
             let mut expected_intents = root_expectations
@@ -4208,16 +4246,41 @@ mod tests {
             if !expected_intents.iter().any(|intent| intent == &self.intent) {
                 expected_intents.push(self.intent.clone());
             }
+            let node_global_effect = context.lock_node_global_effect()?;
+            Ok(ValidatedRootSocketAbsence {
+                expected_intents,
+                node_global_effect,
+            })
+        }
+
+        fn seal_validated_absence(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            validated: ValidatedRootSocketAbsence,
+        ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
+            // The fake process scan reports logical absence first. Preserve
+            // the production ordering by touching the physical namespace
+            // only after the accepted full, exact admission, sibling set,
+            // and Node-global mutation permit have all been validated.
+            self.drop_listener_preserving_path(expected)?;
+            let control_socket = Path::new(self.intent.control_socket_path().as_str());
+            anyhow::ensure!(
+                UnixStream::connect(control_socket).is_err(),
+                "isolated managed Root listener is present before the absence sweep"
+            );
+            let capture =
+                self.root
+                    .capture_start_absence(&self.intents, &self.intent, &self.boot)?;
             let before = self
                 .root
-                .capture_closed_whole_root(&self.intents, &expected_intents)?;
+                .capture_closed_whole_root(&self.intents, &validated.expected_intents)?;
             anyhow::ensure!(
                 UnixStream::connect(control_socket).is_err(),
                 "isolated managed Root listener appeared during the absence sweep"
             );
             let after = self
                 .root
-                .capture_closed_whole_root(&self.intents, &expected_intents)?;
+                .capture_closed_whole_root(&self.intents, &validated.expected_intents)?;
             anyhow::ensure!(
                 UnixStream::connect(control_socket).is_err(),
                 "isolated managed Root listener appeared after the absence sweep"
@@ -4227,8 +4290,36 @@ mod tests {
                 before,
                 after,
                 &self.boot,
-                node_global_effect,
+                validated.node_global_effect,
             )
+        }
+
+        fn sealed_absence(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
+            let validated = self.validate_absence_context(expected, context)?;
+            self.seal_validated_absence(expected, validated)
+        }
+
+        fn retain_start_absence_after_fresh_inspection(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+            inspect: impl FnOnce() -> anyhow::Result<RootProvisionProcessInspection>,
+        ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+            let validated = self.validate_absence_context(expected, context)?;
+            match inspect()? {
+                RootProvisionProcessInspection::Absent => self
+                    .seal_validated_absence(expected, validated)
+                    .map(Some),
+                RootProvisionProcessInspection::Exact(_)
+                | RootProvisionProcessInspection::Unavailable => Ok(None),
+                RootProvisionProcessInspection::Conflict(problem) => anyhow::bail!(
+                    "fresh Root process inspection conflicts before target start ({problem:?})"
+                ),
+            }
         }
 
         fn retire_absent_owner(
@@ -4300,10 +4391,7 @@ mod tests {
     }
 
     impl IsolatedManagedServingOwner {
-        fn new(
-            expected: &ServingBlockdExpectation,
-            context: &RuntimeDesiredEffectContext,
-        ) -> anyhow::Result<Self> {
+        fn new(expected: &ServingBlockdExpectation) -> anyhow::Result<Self> {
             let temporary = tempfile::Builder::new()
                 .prefix("shs-")
                 .tempdir_in("/private/tmp")
@@ -4318,9 +4406,7 @@ mod tests {
             let intents = Arc::new(BlockdSocketIntentStore::provision_for_test(
                 StateDirectory::unanchored(intent_state),
             )?);
-            let boot = CurrentBlockdSocketBoot::for_test(
-                context.accepted_full()?.observation().node_boot_id.clone(),
-            );
+            let boot = CurrentBlockdSocketBoot::for_test(current_test_node_boot_id());
             let intent = BlockdSocketOwnershipIntentV1::serving(
                 &root,
                 &boot,
@@ -4339,6 +4425,25 @@ mod tests {
             };
             owner.assert_same_owner(expected)?;
             Ok(owner)
+        }
+
+        fn marker_path(&self) -> anyhow::Result<PathBuf> {
+            let paths = self.root.planner().serving_paths(
+                match self.intent.owner() {
+                    super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Serving {
+                        device_ownership_token,
+                    } => device_ownership_token,
+                    _ => unreachable!("Serving shadow cannot hold a Root intent"),
+                },
+            )?;
+            Ok(PathBuf::from(paths.owner_marker().as_str()))
+        }
+
+        fn marker_bytes_and_inode(&self) -> anyhow::Result<(Vec<u8>, u64)> {
+            let marker_path = self.marker_path()?;
+            let bytes = std::fs::read(&marker_path)?;
+            let inode = std::fs::metadata(&marker_path)?.ino();
+            Ok((bytes, inode))
         }
 
         fn assert_same_owner(&self, expected: &ServingBlockdExpectation) -> anyhow::Result<()> {
@@ -4376,6 +4481,19 @@ mod tests {
                     UnixStream::connect(socket).is_err(),
                     "isolated managed Serving listener is present {phase}"
                 );
+            }
+            Ok(())
+        }
+
+        fn assert_listeners_live(&self, phase: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.listeners.is_some(),
+                "isolated managed Serving owner retains no listeners {phase}"
+            );
+            for socket in self.socket_paths() {
+                drop(UnixStream::connect(socket).with_context(|| {
+                    format!("isolated managed Serving listener is not live {phase}")
+                })?);
             }
             Ok(())
         }
@@ -4434,8 +4552,6 @@ mod tests {
             context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
             self.assert_same_owner(expected)?;
-            self.listeners.take();
-            self.assert_listeners_absent("before the absence sweep")?;
             let accepted = context.accepted_full()?;
             let admission = context.node_global_process()?;
             anyhow::ensure!(
@@ -4446,11 +4562,14 @@ mod tests {
                         .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
                 "isolated managed Serving absence is not the exact accepted owner"
             );
+            let intents = self.expected_intents(admission)?;
             let node_global_effect = context.lock_node_global_effect()?;
+            let listeners = self.listeners.take();
+            drop(listeners);
+            self.assert_listeners_absent("before the absence sweep")?;
             let capture =
                 self.root
                     .capture_start_absence(&self.intents, &self.intent, &self.boot)?;
-            let intents = self.expected_intents(admission)?;
             let before = self
                 .root
                 .capture_closed_whole_root(&self.intents, &intents)?;
@@ -4498,6 +4617,22 @@ mod tests {
                     let io = UnixListener::bind(Path::new(
                         prepared.io_socket_path().unwrap().as_str(),
                     ))?;
+                    drop(
+                        UnixStream::connect(Path::new(
+                            prepared.control_socket_path().as_str(),
+                        ))
+                        .context(
+                            "known-positive isolated managed Serving control listener must accept connects",
+                        )?,
+                    );
+                    drop(
+                        UnixStream::connect(Path::new(
+                            prepared.io_socket_path().unwrap().as_str(),
+                        ))
+                        .context(
+                            "known-positive isolated managed Serving I/O listener must accept connects",
+                        )?,
+                    );
                     prepared.assert_post_submit_owner_current(
                         &self.boot,
                         BlockdSocketPostSubmitOutcome::MayHaveStarted,
@@ -4666,19 +4801,26 @@ mod tests {
     }
 
     impl EffectGlobalProcessPort {
+        fn take_inspection(
+            &self,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RootProvisionProcessInspection::Unavailable))
+        }
+
         fn inspect_one(
             &self,
             expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            context.check_active()?;
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let inspection = self
-                .inspections
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(RootProvisionProcessInspection::Unavailable);
+            let inspection = self.take_inspection(context)?;
             if matches!(inspection, RootProvisionProcessInspection::Absent) {
                 self.managed_root.drop_listener_preserving_path(expected)?;
             }
@@ -4711,10 +4853,10 @@ mod tests {
             expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
-            self.managed_root.drop_listener_preserving_path(expected)?;
             self.managed_root
-                .sealed_absence(expected, context)
-                .map(Some)
+                .retain_start_absence_after_fresh_inspection(expected, context, || {
+                    self.take_inspection(context)
+                })
         }
     }
 
@@ -4880,6 +5022,23 @@ mod tests {
         managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
+    impl AuthorityDriftingGlobalPort {
+        fn take_inspection(
+            &self,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<RootProvisionProcessInspection> {
+            context.check_active()?;
+            let mut record = self.authority.record.lock().unwrap();
+            match self.drift {
+                AuthorityDrift::BackToBlank => record.head = blank_head(),
+                AuthorityDrift::ForeignOwner => {
+                    record.lease_owner = Some(id("att_foreign"));
+                }
+            }
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+    }
+
     impl root_process_global_sealed::Sealed for AuthorityDriftingGlobalPort {}
     impl root_process_retirement_sealed::Sealed for AuthorityDriftingGlobalPort {}
 
@@ -4893,6 +5052,17 @@ mod tests {
             self.managed_root.drop_listener_preserving_path(expected)?;
             Ok(RootProvisionProcessInspection::Unavailable)
         }
+
+        fn retain_start_socket_absence(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+            self.managed_root
+                .retain_start_absence_after_fresh_inspection(expected, context, || {
+                    self.take_inspection(context)
+                })
+        }
     }
 
     impl RootProvisionProcessGlobalPort for AuthorityDriftingGlobalPort {
@@ -4901,16 +5071,9 @@ mod tests {
             expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            context.check_active()?;
-            let mut record = self.authority.record.lock().unwrap();
-            match self.drift {
-                AuthorityDrift::BackToBlank => record.head = blank_head(),
-                AuthorityDrift::ForeignOwner => {
-                    record.lease_owner = Some(id("att_foreign"));
-                }
-            }
+            let inspection = self.take_inspection(context)?;
             self.managed_root.drop_listener_preserving_path(expected)?;
-            Ok(RootProvisionProcessInspection::Absent)
+            Ok(inspection)
         }
     }
 
@@ -5059,6 +5222,11 @@ mod tests {
             content_sha256: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
             bytes,
         }
+    }
+
+    fn assert_file_bytes_and_inode(path: &Path, expected_bytes: &[u8], expected_inode: u64) {
+        assert_eq!(std::fs::read(path).unwrap(), expected_bytes);
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), expected_inode);
     }
 
     fn effect_context_with_processes(
@@ -5678,7 +5846,7 @@ mod tests {
         starts: AtomicUsize,
         start: ServingBlockdProcessStart,
         before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-        managed_owner: Mutex<Option<IsolatedManagedServingOwner>>,
+        managed_owners: Mutex<BTreeMap<RandomId128, IsolatedManagedServingOwner>>,
     }
 
     #[derive(Clone, Copy)]
@@ -5701,19 +5869,24 @@ mod tests {
                 starts: AtomicUsize::new(0),
                 start,
                 before_start: Mutex::new(None),
-                managed_owner: Mutex::new(None),
+                managed_owners: Mutex::new(BTreeMap::new()),
             }
         }
 
         fn managed_owner<'a>(
-            slot: &'a mut Option<IsolatedManagedServingOwner>,
+            owners: &'a mut BTreeMap<RandomId128, IsolatedManagedServingOwner>,
             expected: &ServingBlockdExpectation,
-            context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<&'a mut IsolatedManagedServingOwner> {
-            if slot.is_none() {
-                *slot = Some(IsolatedManagedServingOwner::new(expected, context)?);
+            let token = expected.device_ownership_token().clone();
+            if !owners.contains_key(&token) {
+                owners.insert(
+                    token.clone(),
+                    IsolatedManagedServingOwner::new(expected)?,
+                );
             }
-            let owner = slot.as_mut().unwrap();
+            let owner = owners
+                .get_mut(&token)
+                .expect("managed Serving owner was inserted for this exact token");
             owner.assert_same_owner(expected)?;
             Ok(owner)
         }
@@ -5827,9 +6000,8 @@ mod tests {
             context.check_active()?;
             self.starts.fetch_add(1, Ordering::SeqCst);
             Self::managed_owner(
-                &mut self.managed_owner.lock().unwrap(),
+                &mut self.managed_owners.lock().unwrap(),
                 checkpointed.expected(),
-                context,
             )?
             .submit(socket_absence, self.start)?;
             checkpointed.assert_current()?;
@@ -5844,9 +6016,8 @@ mod tests {
             context: &RuntimeDesiredEffectContext,
         ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
             Self::managed_owner(
-                &mut self.managed_owner.lock().unwrap(),
+                &mut self.managed_owners.lock().unwrap(),
                 expected,
-                context,
             )?
             .sealed_absence(expected, context)
             .map(Some)
@@ -7054,6 +7225,102 @@ mod tests {
                 &fixture.authority,
             )
             .is_err());
+    }
+
+    #[test]
+    fn managed_socket_shadows_reject_foreign_boot_before_listener_or_intent_mutation() {
+        let root_fixture = fixture();
+        let root_expectation = RootProvisionProcessExpectation::from_checkpoint(
+            root_fixture.stored_checkpoint.checkpoint(),
+            RootProvisionAuthoritySnapshot {
+                attachment: root_fixture.acquired.attachment.clone(),
+                volume: &root_fixture.authority.volume,
+            },
+            root_fixture.expected_executable_path.clone(),
+        )
+        .unwrap();
+        let root_marker = root_fixture.managed_root.marker_bytes_and_inode().unwrap();
+        root_fixture
+            .managed_root
+            .assert_listener_live("before the foreign-boot admission")
+            .unwrap();
+        let foreign_root_context = mutate_absent_effect_context(
+            &root_fixture,
+            |session, observation, _attestation| {
+                let foreign = NodeBootId::new("99999999999999999999999999999999").unwrap();
+                session.node_boot_id = foreign.clone();
+                observation.node_boot_id = foreign;
+            },
+        );
+        let root_error = match root_fixture
+            .managed_root
+            .sealed_absence(&root_expectation, &foreign_root_context)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("foreign-boot Root admission minted an absence capability"),
+        };
+        assert!(root_error.to_string().contains("another Node boot"));
+        root_fixture
+            .managed_root
+            .assert_listener_live("after the rejected foreign-boot admission")
+            .unwrap();
+        assert_eq!(
+            root_fixture.managed_root.marker_bytes_and_inode().unwrap(),
+            root_marker,
+            "a rejected Root admission changed the durable owner intent"
+        );
+
+        let mut serving_fixture = fixture();
+        advance_fixture_to_prepare_device(&mut serving_fixture);
+        let serving_expectation = serving_expectation(&serving_fixture);
+        let mut serving_owner = IsolatedManagedServingOwner::new(&serving_expectation).unwrap();
+        let absence = serving_owner
+            .sealed_absence(
+                &serving_expectation,
+                &absent_effect_context(&serving_fixture),
+            )
+            .unwrap();
+        serving_owner
+            .submit(absence, ServingBlockdProcessStart::Submitted)
+            .unwrap();
+        serving_owner
+            .assert_listeners_live("before the foreign-boot admission")
+            .unwrap();
+        let serving_marker = serving_owner.marker_bytes_and_inode().unwrap();
+        let foreign_serving_context = mutate_absent_effect_context(
+            &serving_fixture,
+            |session, observation, _attestation| {
+                let foreign = NodeBootId::new("99999999999999999999999999999999").unwrap();
+                session.node_boot_id = foreign.clone();
+                observation.node_boot_id = foreign;
+            },
+        );
+        let serving_error = match serving_owner
+            .sealed_absence(&serving_expectation, &foreign_serving_context)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("foreign-boot Serving admission minted an absence capability"),
+        };
+        assert!(serving_error.to_string().contains("exact accepted owner"));
+        serving_owner
+            .assert_listeners_live("after the rejected foreign-boot admission")
+            .unwrap();
+        assert_eq!(
+            serving_owner.marker_bytes_and_inode().unwrap(),
+            serving_marker,
+            "a rejected Serving admission changed the durable owner intent"
+        );
+        drop(
+            serving_owner
+                .sealed_absence(
+                    &serving_expectation,
+                    &successor_absent_effect_context(&serving_fixture),
+                )
+                .unwrap(),
+        );
+        serving_owner
+            .assert_listeners_absent("after a later valid admission")
+            .unwrap();
     }
 
     #[test]
@@ -9747,6 +10014,13 @@ mod tests {
     #[test]
     fn production_prepare_cas_freezes_complete_vhost_plan_and_is_the_only_effect() {
         let fixture = fixture();
+        let context = effect_context_with_processes(
+            &fixture,
+            vec![fixture
+                .exact_process_proof()
+                .unwrap()
+                .into_process_evidence()],
+        );
         let ready = fixture
             .store()
             .seal_serving_ready(
@@ -9756,13 +10030,6 @@ mod tests {
                 &fixture.exact_process_proof().unwrap(),
             )
             .unwrap();
-        let context = effect_context_with_processes(
-            &fixture,
-            vec![fixture
-                .exact_process_proof()
-                .unwrap()
-                .into_process_evidence()],
-        );
         let effect = ServingPrepareDeviceEffect::new(
             ServingPrepareFrontend::vhost_user_blk(8, 256).unwrap(),
             fixture.expected_executable_path.clone(),
@@ -9877,6 +10144,13 @@ mod tests {
     #[test]
     fn cancelled_or_aba_after_prepare_cas_never_authorizes_a_second_effect() {
         let cancelled = fixture();
+        let cancelled_context = effect_context_with_processes(
+            &cancelled,
+            vec![cancelled
+                .exact_process_proof()
+                .unwrap()
+                .into_process_evidence()],
+        );
         let cancelled_ready = cancelled
             .store()
             .seal_serving_ready(
@@ -9886,13 +10160,6 @@ mod tests {
                 &cancelled.exact_process_proof().unwrap(),
             )
             .unwrap();
-        let cancelled_context = effect_context_with_processes(
-            &cancelled,
-            vec![cancelled
-                .exact_process_proof()
-                .unwrap()
-                .into_process_evidence()],
-        );
         let canceller = cancelled_context.clone();
         let cancelled_effect = ServingPrepareDeviceEffect::new(
             ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
@@ -9922,6 +10189,10 @@ mod tests {
         ));
 
         let aba = fixture();
+        let aba_context = effect_context_with_processes(
+            &aba,
+            vec![aba.exact_process_proof().unwrap().into_process_evidence()],
+        );
         let aba_ready = aba
             .store()
             .seal_serving_ready(
@@ -9931,10 +10202,6 @@ mod tests {
                 &aba.exact_process_proof().unwrap(),
             )
             .unwrap();
-        let aba_context = effect_context_with_processes(
-            &aba,
-            vec![aba.exact_process_proof().unwrap().into_process_evidence()],
-        );
         let record_path = aba.record_path();
         let aba_effect = ServingPrepareDeviceEffect::new(
             ServingPrepareFrontend::vhost_user_blk(2, 256).unwrap(),
@@ -10017,6 +10284,21 @@ mod tests {
                 .unwrap(),
         );
         let old_checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        let ReconcileStep::ProvisionRootImage {
+            process_identity_token: old_process_identity_token,
+            ..
+        } = &old_checkpoint.step
+        else {
+            unreachable!()
+        };
+        let old_process_identity_token = old_process_identity_token.clone();
+        let old_checkpoint_digest = fixture.stored_checkpoint.content_digest().clone();
+        let old_record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let old_record_inode = std::fs::metadata(fixture.record_path()).unwrap().ino();
+        let target_bytes = std::fs::read(fixture.target_path()).unwrap();
+        let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
+        let root_marker_path = fixture.managed_root.marker_path().unwrap();
+        let root_marker = fixture.managed_root.marker_bytes_and_inode().unwrap();
         let old_process = fixture
             .exact_process_proof()
             .unwrap()
@@ -10057,6 +10339,29 @@ mod tests {
         ));
         assert!(fixture.retirement_path().exists());
         assert!(!fixture.record_path().exists());
+        assert_file_bytes_and_inode(&root_marker_path, &root_marker.0, root_marker.1);
+        let retirement_bytes = std::fs::read(fixture.retirement_path()).unwrap();
+        let retirement_inode = std::fs::metadata(fixture.retirement_path()).unwrap().ino();
+        let retirement = decode_serving_handoff_retirement_receipt(&retirement_bytes).unwrap();
+        assert_eq!(retirement.old_checkpoint, old_checkpoint);
+        assert_eq!(
+            retirement.old_checkpoint_content_digest,
+            old_checkpoint_digest
+        );
+        assert_eq!(
+            retirement.old_process_identity_token,
+            old_process_identity_token
+        );
+        assert_eq!(
+            encode_serving_handoff_record(&retirement.record).unwrap(),
+            old_record_bytes
+        );
+        assert_eq!(
+            retirement.record_identity.inode,
+            WireU64::new(old_record_inode).unwrap()
+        );
+        assert_file_bytes_and_inode(&fixture.target_path(), &target_bytes, target_inode);
+        assert_file_bytes_and_inode(&root_marker_path, &root_marker.0, root_marker.1);
 
         let same_admission = retirement_effect
             .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
@@ -10066,6 +10371,13 @@ mod tests {
             "same retirement admission was not rejected: {same_admission:#}"
         );
         assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
+        assert_file_bytes_and_inode(
+            &fixture.retirement_path(),
+            &retirement_bytes,
+            retirement_inode,
+        );
+        assert_file_bytes_and_inode(&fixture.target_path(), &target_bytes, target_inode);
+        assert_file_bytes_and_inode(&root_marker_path, &root_marker.0, root_marker.1);
         assert_eq!(
             FileCheckpointStore::open(
                 &fixture.checkpoint_directory,
@@ -10093,6 +10405,13 @@ mod tests {
         ));
         assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
         assert_eq!(retirement_global.calls.load(Ordering::SeqCst), 3);
+        assert_file_bytes_and_inode(
+            &fixture.retirement_path(),
+            &retirement_bytes,
+            retirement_inode,
+        );
+        assert_file_bytes_and_inode(&fixture.target_path(), &target_bytes, target_inode);
+        assert_file_bytes_and_inode(&root_marker_path, &root_marker.0, root_marker.1);
         let checkpoint_store = FileCheckpointStore::open(
             &fixture.checkpoint_directory,
             &fixture.acquired.desired.cat_id,
@@ -10125,12 +10444,19 @@ mod tests {
         // rebound to the successor checkpoint or trigger a start/reseal.
         assert!(retirement_effect
             .try_apply(
-                &effect_context_with_processes(&fixture, vec![old_process]),
+                &effect_context_without_node_global_process(&fixture, vec![old_process]),
                 &fixture.acquired.desired,
             )
             .is_err());
         assert_eq!(forbidden_start.starts.load(Ordering::SeqCst), 0);
         assert!(!fixture.record_path().exists());
+        assert_file_bytes_and_inode(
+            &fixture.retirement_path(),
+            &retirement_bytes,
+            retirement_inode,
+        );
+        assert_file_bytes_and_inode(&fixture.target_path(), &target_bytes, target_inode);
+        assert_file_bytes_and_inode(&root_marker_path, &root_marker.0, root_marker.1);
 
         fixture.process.ownership_token = new_token.clone();
         fixture.process.handshake.process_identity_token = new_token;
@@ -10199,6 +10525,12 @@ mod tests {
         ));
         assert_eq!(target_process.starts.load(Ordering::SeqCst), 1);
         assert_eq!(converge_global.calls.load(Ordering::SeqCst), 3);
+        assert_file_bytes_and_inode(
+            &fixture.retirement_path(),
+            &retirement_bytes,
+            retirement_inode,
+        );
+        assert_file_bytes_and_inode(&fixture.target_path(), &target_bytes, target_inode);
     }
 
     #[test]
@@ -10316,7 +10648,10 @@ mod tests {
         .unwrap();
 
         assert!(effect
-            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .try_apply(
+                &effect_context_without_node_global_process(&fixture, Vec::new()),
+                &fixture.acquired.desired,
+            )
             .is_err());
         assert!(fixture.target_temp_path().exists());
         assert!(!fixture.target_path().exists());
@@ -10355,7 +10690,10 @@ mod tests {
         .unwrap();
 
         assert!(effect
-            .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .try_apply(
+                &effect_context_without_node_global_process(&fixture, Vec::new()),
+                &fixture.acquired.desired,
+            )
             .is_err());
         assert!(checkpoint_temp.exists());
         assert!(!fixture.target_path().exists());
@@ -10859,6 +11197,7 @@ mod tests {
                     RootProvisionProcessInspection::Absent,
                 ],
             );
+            let context = absent_effect_context(&fixture);
             handoff_store.inject_crash_once(PublicationStage::new(
                 PublicationArtifact::HandoffRetirementReceipt,
                 point,
@@ -10871,7 +11210,7 @@ mod tests {
                     &fixture.authority,
                     fixture.expected_executable_path.clone(),
                     &port,
-                    &absent_effect_context(&fixture),
+                    &context,
                 )
                 .is_err());
             assert!(fixture.record_path().exists(), "{point:?}");
@@ -10885,7 +11224,7 @@ mod tests {
                         &fixture.authority,
                         fixture.expected_executable_path.clone(),
                         &port,
-                        &absent_effect_context(&fixture),
+                        &context,
                     )
                     .unwrap(),
                 ServingHandoffRetirement::Retired,
@@ -11166,6 +11505,7 @@ mod tests {
                     .unwrap(),
             );
             let exact_record = std::fs::read(fixture.record_path()).unwrap();
+            let context = absent_effect_context(&fixture);
             let residue_path = match residue {
                 "malformed_record" => {
                     std::fs::write(fixture.record_path(), b"{}").unwrap();
@@ -11206,7 +11546,7 @@ mod tests {
                     &fixture.authority,
                     fixture.expected_executable_path.clone(),
                     &port,
-                    &absent_effect_context(&fixture),
+                    &context,
                 )
                 .is_err());
             assert_eq!(std::fs::read(&residue_path).unwrap(), residue_bytes);
@@ -11413,12 +11753,14 @@ mod tests {
         let mut checkpoint = rebound.stored_checkpoint.checkpoint().clone();
         let ReconcileStep::ProvisionRootImage {
             provision_transition_id,
+            control_socket_path,
             ..
         } = &mut checkpoint.step
         else {
             unreachable!()
         };
         *provision_transition_id = new_transition.clone();
+        *control_socket_path = managed_root_control_socket(&new_transition);
         rebound.replace_checkpoint(checkpoint);
         rebound.authority.provision_transition_id = new_transition;
         std::fs::write(rebound.target_path(), &copied).unwrap();
@@ -11427,6 +11769,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        let copied_inode = std::fs::metadata(rebound.target_path()).unwrap().ino();
         assert!(rebound
             .store()
             .seal_target_control_authorization(
@@ -11438,6 +11781,11 @@ mod tests {
             .to_string()
             .contains("conflicts"));
         assert_eq!(std::fs::read(rebound.target_path()).unwrap(), copied);
+        assert_eq!(
+            std::fs::metadata(rebound.target_path()).unwrap().ino(),
+            copied_inode,
+            "an immutable-conflict check must not replace the copied target artifact"
+        );
 
         let wrong_head = fixture();
         let mut evidence = wrong_head.authority.clone();

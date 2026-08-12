@@ -3571,6 +3571,44 @@ mod tests {
         assert!(validate_process_mode(&conflicting).is_err());
     }
 
+    #[test]
+    fn signed_runtime_socket_paths_are_exactly_owner_mapped_before_any_effect() {
+        let transition = RandomId128::new(TARGET_TRANSITION).unwrap();
+        let other_transition = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab").unwrap();
+        let mut root = parse_target_control_mode(&[]);
+        assert!(validate_runtime_socket_paths(&root).is_ok());
+        root.listen_control = Some(managed_root_control_socket(&other_transition));
+        assert!(validate_runtime_socket_paths(&root).is_err());
+
+        let ownership = RandomId128::new("2468ace013579bdf2468ace013579bdf").unwrap();
+        let other_ownership = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac").unwrap();
+        let (control, frontend) = managed_serving_sockets(&ownership);
+        let (other_control, other_frontend) = managed_serving_sockets(&other_ownership);
+        let mut serving = parse_target(&["--listen-unix", "/runtime/placeholder.sock"]);
+        serving.listen_control = Some(control.clone());
+        serving.listen_unix = Some(frontend.clone());
+        assert!(validate_process_mode(&serving).is_ok());
+        assert!(validate_runtime_socket_paths(&serving).is_ok());
+
+        serving.listen_control = Some(other_control.clone());
+        assert!(validate_runtime_socket_paths(&serving).is_err());
+        serving.listen_control = Some(control.clone());
+        serving.listen_unix = Some(other_frontend);
+        assert!(validate_runtime_socket_paths(&serving).is_err());
+        serving.listen_unix = Some(frontend);
+        serving.device_ownership_token = Some(other_ownership.as_str().to_owned());
+        assert!(validate_runtime_socket_paths(&serving).is_err());
+
+        serving.device_ownership_token = Some(ownership.as_str().to_owned());
+        serving.listen_control = Some(other_control);
+        assert!(validate_runtime_socket_paths(&serving).is_err());
+
+        // The exact Root mapping is independently keyed by the provision
+        // transition and cannot be substituted for a Serving mapping.
+        serving.listen_control = Some(managed_root_control_socket(&transition));
+        assert!(validate_runtime_socket_paths(&serving).is_err());
+    }
+
     fn parse_target(extra: &[&str]) -> Args {
         let mut arguments = vec![
             "cats-blockd",
