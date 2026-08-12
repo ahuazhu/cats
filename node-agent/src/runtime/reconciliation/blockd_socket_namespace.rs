@@ -4678,7 +4678,7 @@ mod tests {
             BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT,
             BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT + 1
         );
-        assert!(OWNER_COUNT < BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT);
+        const { assert!(OWNER_COUNT < BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT) };
         validate_whole_root_expected_owner_count(BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT).unwrap();
         assert!(
             validate_whole_root_expected_owner_count(BLOCKD_SOCKET_EXPECTED_OWNER_LIMIT + 1)
