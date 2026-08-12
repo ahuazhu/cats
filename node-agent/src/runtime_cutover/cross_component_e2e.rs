@@ -1943,6 +1943,13 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     let first_assigned: DesiredReadSnapshot =
         serde_json::from_value(first_fingerprint["inventory"]["assigned_snapshot"].clone())
             .unwrap();
+    let [first_runtime] = first_full.runtimes.as_slice() else {
+        panic!("accepted production inventory must contain exactly the created Cat")
+    };
+    let [first_root_process] = first_runtime.processes.as_slice() else {
+        panic!("accepted production inventory must contain one root-provision process")
+    };
+    let first_root_process = first_root_process.clone();
     let [desired] = first_assigned.desired_specs.as_slice() else {
         panic!("accepted production inventory must bind exactly the created Cat")
     };
@@ -2282,6 +2289,10 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     let [root_process] = restarted_runtime.processes.as_slice() else {
         panic!("joined restart effect did not produce one root-provision process proof")
     };
+    assert_eq!(
+        root_process, &first_root_process,
+        "Agent restart replaced rather than adopted the retained root-provision process"
+    );
     assert!(root_process.process_id > 0);
     assert!(root_process.process_start_time_ticks.get() > 0);
     assert_eq!(
