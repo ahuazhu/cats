@@ -32,6 +32,7 @@ use super::authorized_blockd::{
     authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
     validate_running_physical_desired_successor, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
+use super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence;
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
@@ -84,6 +85,14 @@ pub(crate) trait ServingBlockdProcessPort: process_sealed::Sealed + Send + Sync 
 pub(crate) trait ServingBlockdProcessGlobalPort:
     global_sealed::Sealed + ServingBlockdProcessPort
 {
+    fn retain_start_socket_absence(
+        &self,
+        _expected: &ServingBlockdExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        anyhow::bail!("Serving start socket absence requires the production Node-global scanner")
+    }
+
     fn inspect_serving_exact_or_absent_after_node_global_sweep(
         &self,
         expected: &ServingBlockdExpectation,
@@ -505,6 +514,10 @@ impl ServingBlockdExpectation {
 
     pub(super) fn frontend(&self) -> &PrepareDeviceFrontend {
         &self.frontend
+    }
+
+    pub(super) fn prepared_device(&self) -> &PreparedDeviceInput {
+        &self.prepared_device
     }
 
     pub(super) fn listener_path(&self) -> &HostPath {
@@ -996,6 +1009,7 @@ pub(crate) struct CheckpointedServingBlockdProcess<'a> {
     authority: &'a VolumeRecord,
     store: &'a FileCheckpointStore,
     current_checkpoint: CurrentCheckpointGuard<'a>,
+    socket_absence: Option<ExactManagedBlockdSocketOwnerStartAbsence>,
 }
 
 impl CheckpointedServingBlockdProcess<'_> {
@@ -1012,6 +1026,14 @@ impl CheckpointedServingBlockdProcess<'_> {
             self.authority,
             self.expected,
         )
+    }
+}
+
+impl<'a> CheckpointedServingBlockdProcess<'a> {
+    pub(crate) fn take_socket_absence(
+        &mut self,
+    ) -> Option<ExactManagedBlockdSocketOwnerStartAbsence> {
+        self.socket_absence.take()
     }
 }
 
@@ -1486,6 +1508,13 @@ impl ServingBlockdStartEffect {
         let Some(selected) = selected_absent else {
             return Ok(None);
         };
+        let selected_entry = &serving[selected];
+        let Some(socket_absence) = self
+            .process
+            .retain_start_socket_absence(&selected_entry.expected, context)?
+        else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        };
 
         let observation_id = &accepted.observation().observation_id;
         let mut submitted = self
@@ -1497,7 +1526,6 @@ impl ServingBlockdStartEffect {
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
-        let selected_entry = &serving[selected];
         let checkpointed = CheckpointedServingBlockdProcess {
             expected: &selected_entry.expected,
             retained_authority: &selected_entry.retained,
@@ -1506,6 +1534,7 @@ impl ServingBlockdStartEffect {
             authority: &current_authorities[selected],
             store: &store,
             current_checkpoint: guard,
+            socket_absence: Some(socket_absence),
         };
         checkpointed.assert_current()?;
         let _submission = self.process.start_checkpointed(checkpointed, context)?;

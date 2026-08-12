@@ -8,6 +8,8 @@
 //! returned `Ready` only by the CAS-only `PrepareDevice` effect below; neither
 //! slice creates serving/device/VMM/network state in that round.
 
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,7 +44,7 @@ use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 #[cfg(target_os = "linux")]
 use super::kernel_nbd::{KernelNbdInventoryConfig, KernelNbdInventoryPort};
 use super::root_provision_process::{
-    retain_target_control_process_start, RootProvisionAuthoritySnapshot,
+    retain_target_control_process_start_with_socket_absence, RootProvisionAuthoritySnapshot,
     RootProvisionProcessConflict, RootProvisionProcessEvidence, RootProvisionProcessExpectation,
     RootProvisionProcessGlobalPort, RootProvisionProcessInspection, RootProvisionProcessStart,
     TargetControlProcessPort,
@@ -61,9 +63,82 @@ use super::{
 
 const SERVING_SCOPE_PREFIX: &str = "cats-serving-";
 const SERVING_SCOPE_SUFFIX: &str = ".service";
-pub(super) const SERVING_CONTROL_SOCKET_BASENAME: &str = "serving-control.sock";
-pub(super) const SERVING_NBD_SOCKET_BASENAME: &str = "serving-nbd.sock";
-pub(super) const SERVING_VHOST_SOCKET_BASENAME: &str = "serving-vhost.sock";
+
+/// Frontend facts which are fixed before the device ownership token is
+/// allocated. The managed socket path itself is deliberately absent: both
+/// control and I/O paths are derived only after the checkpoint's device token
+/// exists, so a caller cannot retain the old data-directory child layout.
+enum ReservedPrepareFrontends {
+    #[cfg(target_os = "linux")]
+    KernelNbd {
+        device_paths: VecDeque<HostPath>,
+        direct: bool,
+    },
+    VhostUserBlk {
+        remaining: usize,
+        queues: u16,
+        queue_size: u16,
+    },
+}
+
+impl ReservedPrepareFrontends {
+    #[cfg(target_os = "linux")]
+    fn kernel_nbd(device_paths: Vec<HostPath>, direct: bool) -> Self {
+        Self::KernelNbd {
+            device_paths: device_paths.into(),
+            direct,
+        }
+    }
+
+    fn vhost_user_blk(count: usize, queues: u16, queue_size: u16) -> Self {
+        Self::VhostUserBlk {
+            remaining: count,
+            queues,
+            queue_size,
+        }
+    }
+
+    fn next(&mut self, ownership_token: &RandomId128) -> anyhow::Result<PrepareDeviceFrontend> {
+        let sockets = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(ownership_token)
+            .context("derive managed serving blockd socket paths")?;
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::KernelNbd {
+                device_paths,
+                direct,
+            } => Ok(PrepareDeviceFrontend::KernelNbd {
+                listener_socket_path: sockets.io_socket().clone(),
+                device_path: device_paths
+                    .pop_front()
+                    .context("managed kernel-NBD plan omitted one reserved device")?,
+                direct: *direct,
+            }),
+            Self::VhostUserBlk {
+                remaining,
+                queues,
+                queue_size,
+            } => {
+                *remaining = remaining
+                    .checked_sub(1)
+                    .context("managed vhost-user plan omitted one frontend")?;
+                Ok(PrepareDeviceFrontend::VhostUserBlk {
+                    socket_path: sockets.io_socket().clone(),
+                    queues: *queues,
+                    queue_size: *queue_size,
+                })
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::KernelNbd { device_paths, .. } => device_paths.is_empty(),
+            Self::VhostUserBlk { remaining, .. } => *remaining == 0,
+        }
+    }
+}
 
 fn acquired_attachment_identity(
     desired: &DesiredRuntimeSpec,
@@ -366,10 +441,6 @@ impl ServingPrepareDeviceEffect {
         // Acquire every attachment lock in canonical slot order before the
         // checkpoint writer and optional Node-global NBD allocator.
         let prepared = self.retain_direct_authorizations(context, desired)?;
-        let data_directories = prepared
-            .iter()
-            .map(|prepared| host_path(prepared.data_directory(), "direct serving data directory"))
-            .collect::<anyhow::Result<Vec<_>>>()?;
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
         let state_root = context.state_directory().try_clone_directory()?;
         let store = FileCheckpointStore::open_preserving_checkpoint_temp(
@@ -408,25 +479,11 @@ impl ServingPrepareDeviceEffect {
                     &stored,
                     desired.volumes.len(),
                     |device_paths| {
-                        let frontends = data_directories
-                            .iter()
-                            .zip(device_paths)
-                            .map(|(data_directory, device_path)| {
-                                Ok(PrepareDeviceFrontend::KernelNbd {
-                                    listener_socket_path: serving_path(
-                                        data_directory,
-                                        SERVING_NBD_SOCKET_BASENAME,
-                                    )?,
-                                    device_path,
-                                    direct: *direct,
-                                })
-                            })
-                            .collect::<anyhow::Result<Vec<_>>>()?;
                         prepare_direct_device_successor(
                             desired,
                             &stored,
                             &prepared,
-                            frontends,
+                            ReservedPrepareFrontends::kernel_nbd(device_paths, *direct),
                             &self.executable_path,
                         )
                     },
@@ -455,24 +512,15 @@ impl ServingPrepareDeviceEffect {
                     usize::from(queues),
                     *queue_size,
                 )?;
-                let frontends = data_directories
-                    .iter()
-                    .map(|data_directory| {
-                        Ok(PrepareDeviceFrontend::VhostUserBlk {
-                            socket_path: serving_path(
-                                data_directory,
-                                SERVING_VHOST_SOCKET_BASENAME,
-                            )?,
-                            queues,
-                            queue_size: *queue_size,
-                        })
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let successor = prepare_direct_device_successor(
                     desired,
                     &stored,
                     &prepared,
-                    frontends,
+                    ReservedPrepareFrontends::vhost_user_blk(
+                        desired.volumes.len(),
+                        queues,
+                        *queue_size,
+                    ),
                     &self.executable_path,
                 )?;
                 context.check_active()?;
@@ -558,19 +606,6 @@ impl ServingPrepareDeviceEffect {
         validate_prepare_predecessor(desired, &stored, ready)?;
         context.check_active()?;
 
-        let data_directories =
-            std::iter::once(Ok(ready.old_control_process().data_directory.clone()))
-                .chain(persistent.iter().map(|prepared| {
-                    host_path(
-                        prepared.data_directory(),
-                        "Persistent serving data directory",
-                    )
-                }))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-        anyhow::ensure!(
-            data_directories.len() == desired.volumes.len(),
-            "retained authorization set is not the complete Desired set"
-        );
         ready.consume_for_prepare_device(&stored, |handoff| match &self.frontend {
             #[cfg(target_os = "linux")]
             ServingPrepareFrontend::KernelNbd { port, direct } => port
@@ -580,27 +615,13 @@ impl ServingPrepareDeviceEffect {
                     &stored,
                     desired.volumes.len(),
                     |device_paths| {
-                        let frontends = data_directories
-                            .iter()
-                            .zip(device_paths)
-                            .map(|(data_directory, device_path)| {
-                                Ok(PrepareDeviceFrontend::KernelNbd {
-                                    listener_socket_path: serving_path(
-                                        data_directory,
-                                        SERVING_NBD_SOCKET_BASENAME,
-                                    )?,
-                                    device_path,
-                                    direct: *direct,
-                                })
-                            })
-                            .collect::<anyhow::Result<Vec<_>>>()?;
                         prepare_device_successor(
                             desired,
                             &stored,
                             ready,
                             handoff,
                             &persistent,
-                            frontends,
+                            ReservedPrepareFrontends::kernel_nbd(device_paths, *direct),
                         )
                     },
                     || {
@@ -628,26 +649,17 @@ impl ServingPrepareDeviceEffect {
                     *queue_size,
                 )
                 .context("effective vhost-user shape is outside the authorized-serving contract")?;
-                let frontends = data_directories
-                    .iter()
-                    .map(|data_directory| {
-                        Ok(PrepareDeviceFrontend::VhostUserBlk {
-                            socket_path: serving_path(
-                                data_directory,
-                                SERVING_VHOST_SOCKET_BASENAME,
-                            )?,
-                            queues,
-                            queue_size: *queue_size,
-                        })
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let successor = prepare_device_successor(
                     desired,
                     &stored,
                     ready,
                     handoff,
                     &persistent,
-                    frontends,
+                    ReservedPrepareFrontends::vhost_user_blk(
+                        desired.volumes.len(),
+                        queues,
+                        *queue_size,
+                    ),
                 )?;
                 context.check_active()?;
                 #[cfg(test)]
@@ -784,15 +796,15 @@ fn prepare_device_successor(
     ready: &ServingHandoffReady,
     handoff: cats_api::runtime_reconciliation::RootServingHandoff,
     persistent: &[PreparedAuthorizedBlockd],
-    frontends: Vec<PrepareDeviceFrontend>,
+    mut frontends: ReservedPrepareFrontends,
 ) -> anyhow::Result<RuntimeCheckpoint> {
     validate_prepare_predecessor(desired, stored, ready)?;
     let Some(root_intent) = desired.volumes.first() else {
         unreachable!("predecessor validation requires one Root volume")
     };
     anyhow::ensure!(
-        persistent.len() + 1 == desired.volumes.len() && frontends.len() == desired.volumes.len(),
-        "PrepareDevice successor lacks the complete authorization or frontend set"
+        persistent.len() + 1 == desired.volumes.len(),
+        "PrepareDevice successor lacks the complete authorization set"
     );
     let root_attachment = &ready.target_control_authorization().artifact.attachment;
     let old_process = ready.old_control_process();
@@ -806,11 +818,11 @@ fn prepare_device_successor(
         excluded.push(device.clone());
         Ok((process, device))
     };
-    let mut frontends = frontends.into_iter();
     let (root_process_token, root_ownership_token) = next_tokens()?;
-    let root_frontend = frontends
-        .next()
-        .context("PrepareDevice successor omitted Root frontend")?;
+    let root_frontend = frontends.next(&root_ownership_token)?;
+    let root_sockets = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+        .serving_paths(&root_ownership_token)
+        .context("derive managed Root serving socket paths")?;
     let root_scope = Id::new(format!(
         "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
         root_process_token.as_str()
@@ -833,10 +845,7 @@ fn prepare_device_successor(
         serving_authority: Box::new(ServingAuthorityProvenance::AfterRootProvision { handoff }),
         serving_process: ServingBlockdIdentity {
             scope_id: root_scope,
-            control_socket_path: serving_path(
-                &old_process.data_directory,
-                SERVING_CONTROL_SOCKET_BASENAME,
-            )?,
+            control_socket_path: root_sockets.control_socket().clone(),
             data_directory: old_process.data_directory.clone(),
             executable_path: ready.record().expected_control_executable_path.clone(),
             process_identity_token: root_process_token,
@@ -844,13 +853,7 @@ fn prepare_device_successor(
         frontend: root_frontend,
     });
 
-    for ((intent, prepared), frontend) in desired
-        .volumes
-        .iter()
-        .skip(1)
-        .zip(persistent)
-        .zip(frontends)
-    {
+    for (intent, prepared) in desired.volumes.iter().skip(1).zip(persistent) {
         let attachment = &prepared.checkpoint().attachment;
         anyhow::ensure!(
             prepared.checkpoint().volume == *intent
@@ -921,6 +924,10 @@ fn prepare_device_successor(
             "Persistent serving data directory",
         )?;
         let (process_identity_token, ownership_token) = next_tokens()?;
+        let frontend = frontends.next(&ownership_token)?;
+        let sockets = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(&ownership_token)
+            .context("derive managed Persistent serving socket paths")?;
         let scope_id = Id::new(format!(
             "{SERVING_SCOPE_PREFIX}{}{SERVING_SCOPE_SUFFIX}",
             process_identity_token.as_str()
@@ -945,10 +952,7 @@ fn prepare_device_successor(
             }),
             serving_process: ServingBlockdIdentity {
                 scope_id,
-                control_socket_path: serving_path(
-                    &data_directory,
-                    SERVING_CONTROL_SOCKET_BASENAME,
-                )?,
+                control_socket_path: sockets.control_socket().clone(),
                 data_directory,
                 executable_path: ready.record().expected_control_executable_path.clone(),
                 process_identity_token,
@@ -957,7 +961,7 @@ fn prepare_device_successor(
         });
     }
     anyhow::ensure!(
-        devices.len() == desired.volumes.len(),
+        devices.len() == desired.volumes.len() && frontends.is_empty(),
         "PrepareDevice successor did not consume every Desired frontend"
     );
     let mut checkpoint = stored.checkpoint().clone();
@@ -1005,24 +1009,17 @@ fn prepare_direct_device_successor(
     desired: &DesiredRuntimeSpec,
     stored: &StoredCheckpoint,
     prepared: &[PreparedAuthorizedBlockd],
-    frontends: Vec<PrepareDeviceFrontend>,
+    mut frontends: ReservedPrepareFrontends,
     executable_path: &HostPath,
 ) -> anyhow::Result<RuntimeCheckpoint> {
     anyhow::ensure!(
         prepared.len() == desired.volumes.len()
-            && frontends.len() == desired.volumes.len()
             && stored.checkpoint().volumes.len() == desired.volumes.len(),
-        "direct PrepareDevice successor lacks its complete canonical input set"
+        "direct PrepareDevice successor lacks its complete canonical authorization set"
     );
     let mut excluded = Vec::<RandomId128>::new();
     let mut devices = Vec::with_capacity(desired.volumes.len());
-    for (((index, intent), retained), frontend) in desired
-        .volumes
-        .iter()
-        .enumerate()
-        .zip(prepared)
-        .zip(frontends)
-    {
+    for ((index, intent), retained) in desired.volumes.iter().enumerate().zip(prepared) {
         let attachment = &retained.checkpoint().attachment;
         let observed = &stored.checkpoint().volumes[index];
         let [lineage] = observed.local_lineages.as_slice() else {
@@ -1104,6 +1101,10 @@ fn prepare_direct_device_successor(
         let references = excluded.iter().collect::<Vec<_>>();
         let ownership_token = fresh_identity_token(&references)?;
         excluded.push(ownership_token.clone());
+        let frontend = frontends.next(&ownership_token)?;
+        let sockets = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(&ownership_token)
+            .context("derive managed direct serving socket paths")?;
         devices.push(PreparedDeviceInput {
             volume_intent_id: intent.volume_intent_id.clone(),
             disk_id: intent.disk_id.clone(),
@@ -1127,10 +1128,7 @@ fn prepare_direct_device_successor(
                     process_identity_token.as_str()
                 ))
                 .context("direct serving token does not form a canonical scope")?,
-                control_socket_path: serving_path(
-                    &data_directory,
-                    SERVING_CONTROL_SOCKET_BASENAME,
-                )?,
+                control_socket_path: sockets.control_socket().clone(),
                 data_directory,
                 executable_path: executable_path.clone(),
                 process_identity_token,
@@ -1138,6 +1136,10 @@ fn prepare_direct_device_successor(
             frontend,
         });
     }
+    anyhow::ensure!(
+        frontends.is_empty(),
+        "direct PrepareDevice successor did not consume every managed frontend"
+    );
     let mut checkpoint = stored.checkpoint().clone();
     checkpoint.step = ReconcileStep::PrepareDevice { devices };
     checkpoint.updated_at_unix_ms = monotonic_wall_clock(stored)?;
@@ -1154,15 +1156,6 @@ fn fresh_identity_token(excluded: &[&RandomId128]) -> anyhow::Result<RandomId128
         "fresh Runtime physical identity token collided with retained authority"
     );
     Ok(token)
-}
-
-fn serving_path(data_directory: &HostPath, basename: &str) -> anyhow::Result<HostPath> {
-    let path = Path::new(data_directory.as_str()).join(basename);
-    let path = path
-        .to_str()
-        .context("serving path is not UTF-8")?
-        .to_owned();
-    HostPath::new(path).context("serving path is not a canonical absolute HostPath")
 }
 
 fn host_path(path: &Path, label: &str) -> anyhow::Result<HostPath> {
@@ -1542,27 +1535,20 @@ impl ServingHandoffEffect {
         target_ready: &TargetControlAuthorizationReady,
         target: &cats_api::runtime_reconciliation::RemoteHead,
     ) -> anyhow::Result<()> {
-        let permit = retain_target_control_process_start(
+        let Some(socket_absence) = self
+            .global_process
+            .retain_start_socket_absence(expectation, context)?
+        else {
+            return Ok(());
+        };
+        self.reread_same_target(context, first_authority, target)?;
+        let permit = retain_target_control_process_start_with_socket_absence(
             checkpoint_store,
             stored,
             expectation,
             target_ready,
+            socket_absence,
         )?;
-        let _node_global_effect = context.lock_node_global_effect()?;
-        let inspection = self
-            .global_process
-            .inspect_exact_or_absent_after_node_global_sweep(expectation, context)?;
-        match inspection {
-            // A late exact process means the accepted empty vector is stale.
-            // It is never a reason to submit a second unit.
-            RootProvisionProcessInspection::Exact(_) => return Ok(()),
-            RootProvisionProcessInspection::Absent => {}
-            RootProvisionProcessInspection::Unavailable => return Ok(()),
-            RootProvisionProcessInspection::Conflict(problem) => {
-                return Err(process_conflict("before target-control start", problem))
-            }
-        }
-        self.reread_same_target(context, first_authority, target)?;
         permit.assert_current()?;
         match self
             .target_process
@@ -1981,6 +1967,14 @@ mod tests {
 
     fn random(value: char) -> RandomId128 {
         RandomId128::new(std::iter::repeat_n(value, 32).collect::<String>()).unwrap()
+    }
+
+    fn managed_root_control_socket(provision_transition_id: &RandomId128) -> HostPath {
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone()
     }
 
     fn epoch(value: u64) -> Epoch {
@@ -2419,17 +2413,14 @@ mod tests {
         let post_provision_data_directory = post_provision_runtime.volumes[0].local_lineages[0]
             .data_directory
             .clone();
+        let provision_transition_id = random('8');
         post_provision_runtime.step = ReconcileStep::ProvisionRootImage {
-            provision_transition_id: random('8'),
+            provision_transition_id: provision_transition_id.clone(),
             volume_id: desired.volumes[0].volume_id.clone(),
             attachment_id: root_attachment.identity.attachment_id.clone(),
             attachment_epoch: root_attachment.identity.attachment_epoch,
             scope_id: id("cats-root-test.service"),
-            control_socket_path: HostPath::new(format!(
-                "/var/lib/cats/{}/root-provision.sock",
-                root_attachment.identity.volume_id.as_str()
-            ))
-            .unwrap(),
+            control_socket_path: managed_root_control_socket(&provision_transition_id),
             data_directory: post_provision_data_directory.clone(),
             process_identity_token: random('9'),
             size_bytes: root_attachment.size_bytes,

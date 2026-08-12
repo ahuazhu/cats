@@ -31,6 +31,11 @@ use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadConte
 use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::AuthorizedBlockdLaunchConfig;
+use super::blockd_socket_namespace::{
+    serving_socket_owner_authority_digest, BlockdSocketIntentStore, BlockdSocketOwnershipIntentV1,
+    BlockdSocketPostSubmitOutcome, CurrentBlockdSocketBoot, ManagedBlockdSocketOwnerInspection,
+    RetainedManagedBlockdSocketRoot,
+};
 #[cfg(test)]
 use super::root_provision_process::RootProvisionProcessPhase;
 use super::root_provision_process::{
@@ -253,7 +258,9 @@ where
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessStart> {
         let expected = checkpointed.expected();
+        checkpointed.assert_current()?;
         let launch = self.launch(expected)?;
+        checkpointed.assert_current()?;
         match self.systemd.submit(&launch, context)? {
             SystemdStartSubmission::DefinitelyNotStarted => {
                 return Ok(RootProvisionProcessStart::Unavailable)
@@ -265,7 +272,8 @@ where
             context.check_active()?;
             match self.inspect_exact(expected, &launch, context)? {
                 RootProvisionProcessInspection::Exact(evidence) => {
-                    return Ok(RootProvisionProcessStart::Started(evidence))
+                    checkpointed.assert_current()?;
+                    return Ok(RootProvisionProcessStart::Started(evidence));
                 }
                 RootProvisionProcessInspection::Conflict(problem) => {
                     return Ok(RootProvisionProcessStart::Conflict(problem))
@@ -591,10 +599,18 @@ fn build_launch_with_authorization(
     authorization: ControlAuthorization<'_>,
 ) -> anyhow::Result<TransientServiceLaunch> {
     validate_credentialless_blockd_config(&config.blockd)?;
+    let managed_sockets =
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(&expected.provision_transition_id)
+            .context("derive managed root-provision socket namespace")?;
     anyhow::ensure!(
         config.blockd.blockd_binary.is_absolute()
             && config.blockd.blockd_binary == Path::new(expected.executable_path.as_str()),
         "root-provision blockd binary does not match checkpointed executable"
+    );
+    anyhow::ensure!(
+        &expected.control_socket_path == managed_sockets.control_socket(),
+        "root-provision systemd launch does not use the transition-owned managed socket"
     );
     anyhow::ensure!(
         config.blockd.metadata_store.name == "postgres",
@@ -630,8 +646,6 @@ fn build_launch_with_authorization(
         ControlAuthorization::Target(target) => {
             arguments.push(OsString::from("--authorized-target-control-spec"));
             arguments.push(OsString::from(target.authorization_path().as_str()));
-            arguments.push(OsString::from("--provision-transition-id"));
-            arguments.push(OsString::from(target.provision_transition_id().as_str()));
             arguments.push(OsString::from(
                 "--provision-root-authorization-context-digest",
             ));
@@ -639,6 +653,8 @@ fn build_launch_with_authorization(
         }
     }
     arguments.extend([
+        OsString::from("--provision-transition-id"),
+        OsString::from(expected.provision_transition_id.as_str()),
         OsString::from("--runtime-scope-id"),
         OsString::from(expected.scope_id.as_str()),
         OsString::from("--process-identity-token"),
@@ -759,6 +775,7 @@ struct UnixBlockdHandshake;
 
 pub(crate) struct PlatformSystemdRootProvisionProcessPort {
     inner: SystemdRootProvisionProcessPort<PlatformSystemdTransientService, UnixBlockdHandshake>,
+    state_directory: StateDirectory,
 }
 
 pub(crate) struct PlatformSystemdServingBlockdProcessPort {
@@ -902,20 +919,91 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<ServingBlockdProcessInspection> {
         let launch = self.launch(expected)?;
-        self.inspect_exact(expected, &launch, context)
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &current_boot,
+            expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(expected.prepared_device())?,
+        )?;
+        anyhow::ensure!(
+            intent.control_socket_path() == expected.control_socket_path()
+                && intent.io_socket_path() == Some(expected.listener_path()),
+            "Serving process expectation changed its managed socket mapping"
+        );
+        match root.retain_existing_intent(&intents, &intent, &current_boot)? {
+            ManagedBlockdSocketOwnerInspection::Current(retained) => {
+                retained.assert_current(&current_boot)?;
+                let inspection = self.inspect_exact(expected, &launch, context)?;
+                retained.assert_current(&current_boot)?;
+                Ok(inspection)
+            }
+            ManagedBlockdSocketOwnerInspection::Absent
+            | ManagedBlockdSocketOwnerInspection::StaleBootAbsent
+            | ManagedBlockdSocketOwnerInspection::RecoverableAbsent => {
+                Ok(match self.inspect_exact(expected, &launch, context)? {
+                    ServingBlockdProcessInspection::Absent => {
+                        ServingBlockdProcessInspection::Absent
+                    }
+                    ServingBlockdProcessInspection::Unavailable => {
+                        ServingBlockdProcessInspection::Unavailable
+                    }
+                    ServingBlockdProcessInspection::Exact(_)
+                    | ServingBlockdProcessInspection::Conflict(_) => {
+                        ServingBlockdProcessInspection::Conflict(
+                            ServingBlockdProcessConflict::IdentityMismatch,
+                        )
+                    }
+                })
+            }
+        }
     }
 
     fn start_checkpointed(
         &self,
-        checkpointed: CheckpointedServingBlockdProcess<'_>,
+        mut checkpointed: CheckpointedServingBlockdProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessStart> {
         context.check_active()?;
+        checkpointed.assert_current()?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let expected = checkpointed.expected();
+        let intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &current_boot,
+            expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(expected.prepared_device())?,
+        )?;
+        anyhow::ensure!(
+            intent.control_socket_path() == expected.control_socket_path()
+                && intent.io_socket_path() == Some(expected.listener_path()),
+            "Serving process start changed its managed socket mapping"
+        );
+        let absence = checkpointed
+            .take_socket_absence()
+            .context("Serving start lacks sealed Node-global socket absence")?;
+        let prepared =
+            root.prepare_absent_owner_for_start(&intents, &intent, &current_boot, absence)?;
         checkpointed.assert_current()?;
         let launch = self.launch(checkpointed.expected())?;
         checkpointed.assert_current()?;
         context.check_active()?;
         let submitted = self.systemd.submit(&launch, context)?;
+        prepared.assert_post_submit_owner_current(
+            &current_boot,
+            match submitted {
+                SystemdStartSubmission::DefinitelyNotStarted => {
+                    BlockdSocketPostSubmitOutcome::DefinitelyNotStarted
+                }
+                SystemdStartSubmission::Submitted | SystemdStartSubmission::OutcomeUnknown => {
+                    BlockdSocketPostSubmitOutcome::MayHaveStarted
+                }
+            },
+        )?;
         checkpointed.assert_current()?;
         Ok(match submitted {
             SystemdStartSubmission::Submitted => ServingBlockdProcessStart::Submitted,
@@ -928,13 +1016,17 @@ impl ServingBlockdProcessPort for PlatformSystemdServingBlockdProcessPort {
 }
 
 impl PlatformSystemdRootProvisionProcessPort {
-    pub(crate) fn platform(config: RootProvisionSystemdConfig) -> Self {
+    pub(crate) fn platform(
+        config: RootProvisionSystemdConfig,
+        state_directory: StateDirectory,
+    ) -> Self {
         Self {
             inner: SystemdRootProvisionProcessPort::new(
                 config,
                 PlatformSystemdTransientService,
                 UnixBlockdHandshake,
             ),
+            state_directory,
         }
     }
 }
@@ -948,15 +1040,79 @@ impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
         expected: &RootProvisionProcessExpectation,
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<RootProvisionProcessInspection> {
-        self.inner.inspect(expected, context)
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        anyhow::ensure!(
+            intent.control_socket_path() == &expected.control_socket_path,
+            "Root process expectation changed its managed socket mapping"
+        );
+        match root.retain_existing_intent(&intents, &intent, &current_boot)? {
+            ManagedBlockdSocketOwnerInspection::Current(retained) => {
+                retained.assert_current(&current_boot)?;
+                let inspection = self.inner.inspect(expected, context)?;
+                retained.assert_current(&current_boot)?;
+                Ok(inspection)
+            }
+            ManagedBlockdSocketOwnerInspection::Absent
+            | ManagedBlockdSocketOwnerInspection::StaleBootAbsent
+            | ManagedBlockdSocketOwnerInspection::RecoverableAbsent => {
+                Ok(match self.inner.inspect(expected, context)? {
+                    RootProvisionProcessInspection::Absent => {
+                        RootProvisionProcessInspection::Absent
+                    }
+                    RootProvisionProcessInspection::Unavailable => {
+                        RootProvisionProcessInspection::Unavailable
+                    }
+                    RootProvisionProcessInspection::Exact(_)
+                    | RootProvisionProcessInspection::Conflict(_) => {
+                        RootProvisionProcessInspection::Conflict(
+                            RootProvisionProcessConflict::IdentityMismatch,
+                        )
+                    }
+                })
+            }
+        }
     }
 
     fn start_checkpointed(
         &self,
-        checkpointed: CheckpointedRootProvisionProcess<'_>,
+        mut checkpointed: CheckpointedRootProvisionProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessStart> {
-        self.inner.start_checkpointed(checkpointed, context)
+        checkpointed.assert_current()?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let expected = checkpointed.expected();
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        anyhow::ensure!(
+            intent.control_socket_path() == &expected.control_socket_path,
+            "Root process start changed its managed socket mapping"
+        );
+        let absence = checkpointed
+            .take_socket_absence()
+            .context("Root start lacks sealed Node-global socket absence")?;
+        let prepared =
+            root.prepare_absent_owner_for_start(&intents, &intent, &current_boot, absence)?;
+        checkpointed.assert_current()?;
+        let result = self.inner.start_checkpointed(checkpointed, context)?;
+        prepared.assert_post_submit_owner_current(
+            &current_boot,
+            root_start_post_submit_outcome(&result),
+        )?;
+        Ok(result)
     }
 
     fn stop_exact(
@@ -971,10 +1127,52 @@ impl RootProvisionProcessPort for PlatformSystemdRootProvisionProcessPort {
 impl TargetControlProcessPort for PlatformSystemdRootProvisionProcessPort {
     fn start_target_checkpointed(
         &self,
-        checkpointed: CheckpointedTargetControlProcess<'_>,
+        mut checkpointed: CheckpointedTargetControlProcess<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessStart> {
-        self.inner.start_target_checkpointed(checkpointed, context)
+        checkpointed.assert_current()?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(self.state_directory.clone())?;
+        let expected = checkpointed.expected();
+        let intent = BlockdSocketOwnershipIntentV1::root(
+            &root,
+            &current_boot,
+            expected.provision_transition_id.clone(),
+            expected.socket_owner_authority_digest.clone(),
+        )?;
+        anyhow::ensure!(
+            intent.control_socket_path() == &expected.control_socket_path,
+            "target Root process start changed its managed socket mapping"
+        );
+        let absence = checkpointed
+            .take_socket_absence()
+            .context("target Root start lacks sealed Node-global socket absence")?;
+        let prepared =
+            root.prepare_absent_owner_for_start(&intents, &intent, &current_boot, absence)?;
+        checkpointed.assert_current()?;
+        let result = self
+            .inner
+            .start_target_checkpointed(checkpointed, context)?;
+        prepared.assert_post_submit_owner_current(
+            &current_boot,
+            root_start_post_submit_outcome(&result),
+        )?;
+        Ok(result)
+    }
+}
+
+fn root_start_post_submit_outcome(
+    result: &RootProvisionProcessStart,
+) -> BlockdSocketPostSubmitOutcome {
+    match result {
+        RootProvisionProcessStart::Started(_) => BlockdSocketPostSubmitOutcome::HandshakeVerified,
+        RootProvisionProcessStart::CancelledClean | RootProvisionProcessStart::Unavailable => {
+            BlockdSocketPostSubmitOutcome::DefinitelyNotStarted
+        }
+        RootProvisionProcessStart::Conflict(_) | RootProvisionProcessStart::Ambiguous => {
+            BlockdSocketPostSubmitOutcome::MayHaveStarted
+        }
     }
 }
 
@@ -2552,11 +2750,30 @@ fn proc_unix_listener_inode(
         "/proc/net/unix exceeds byte bound"
     );
     let text = std::str::from_utf8(&bytes).context("/proc/net/unix is not UTF-8")?;
+    inspect_proc_net_unix_text(text, socket_path)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_proc_net_unix_text(
+    text: &str,
+    socket_path: &HostPath,
+) -> anyhow::Result<ListenerInodeInspection> {
+    let mut lines = text.lines();
+    let header = lines.next().context("/proc/net/unix lacks its header")?;
+    anyhow::ensure!(
+        header
+            .split_ascii_whitespace()
+            .eq(["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",]),
+        "/proc/net/unix header changed shape"
+    );
     let mut matching = Vec::new();
-    for line in text.lines().skip(1) {
-        let Some(fields) = parse_proc_net_unix_line(line) else {
-            continue;
-        };
+    for (index, line) in lines.enumerate() {
+        anyhow::ensure!(
+            !line.trim().is_empty(),
+            "/proc/net/unix contains an empty row"
+        );
+        let fields = parse_proc_net_unix_line(line)
+            .with_context(|| format!("parse /proc/net/unix row {}", index + 2))?;
         if fields.path == socket_path.as_str() {
             if fields.flags != "00010000" || fields.socket_type != "0001" || fields.state != "01" {
                 return Ok(ListenerInodeInspection::Conflict);
@@ -2569,6 +2786,34 @@ fn proc_unix_listener_inode(
         [] => ListenerInodeInspection::Unavailable,
         _ => ListenerInodeInspection::Conflict,
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn platform_managed_blockd_listeners_absent<'a>(
+    socket_paths: impl IntoIterator<Item = &'a HostPath>,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<bool> {
+    for socket_path in socket_paths {
+        match proc_unix_listener_inode(socket_path, context)? {
+            // `Unavailable` is the exact zero-match result at this boundary;
+            // read/parse failures are returned as errors and never become
+            // absence.
+            ListenerInodeInspection::Unavailable => {}
+            ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Conflict => {
+                return Ok(false)
+            }
+        }
+    }
+    context.check_active()?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn platform_managed_blockd_listeners_absent<'a>(
+    _socket_paths: impl IntoIterator<Item = &'a HostPath>,
+    _context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -2602,12 +2847,18 @@ fn parse_proc_net_unix_line(line: &str) -> Option<ProcNetUnixLine<'_>> {
     }
 
     let mut offset = 0;
-    let _number = next_field(line, &mut offset)?;
-    let _reference_count = next_field(line, &mut offset)?;
-    let _protocol = next_field(line, &mut offset)?;
+    let number = next_field(line, &mut offset)?;
+    u64::from_str_radix(number.strip_suffix(':')?, 16).ok()?;
+    let reference_count = next_field(line, &mut offset)?;
+    u64::from_str_radix(reference_count, 16).ok()?;
+    let protocol = next_field(line, &mut offset)?;
+    u64::from_str_radix(protocol, 16).ok()?;
     let flags = next_field(line, &mut offset)?;
+    u64::from_str_radix(flags, 16).ok()?;
     let socket_type = next_field(line, &mut offset)?;
+    u64::from_str_radix(socket_type, 16).ok()?;
     let state = next_field(line, &mut offset)?;
+    u64::from_str_radix(state, 16).ok()?;
     let inode = next_field(line, &mut offset)?.parse::<u64>().ok()?;
     while line
         .as_bytes()
@@ -2617,7 +2868,7 @@ fn parse_proc_net_unix_line(line: &str) -> Option<ProcNetUnixLine<'_>> {
         offset += 1;
     }
     let path = line.get(offset..)?;
-    (!path.is_empty()).then_some(ProcNetUnixLine {
+    Some(ProcNetUnixLine {
         flags,
         socket_type,
         state,
@@ -3204,7 +3455,7 @@ mod tests {
         let port = SystemdRootProvisionProcessPort::new(config(), systemd.clone(), handshake);
         let result = port
             .start_checkpointed(
-                CheckpointedRootProvisionProcess::for_test(&expected),
+                CheckpointedRootProvisionProcess::for_test(&expected, &digest('e')),
                 &context(),
             )
             .unwrap();
@@ -4286,6 +4537,7 @@ while True:
 
     fn expectation() -> RootProvisionProcessExpectation {
         let attachment = attachment();
+        let provision_transition_id = random('3');
         let phase = RootProvisionProcessPhase::AwaitingProvision {
             expected_blank_head: attachment.head.clone(),
         };
@@ -4295,17 +4547,18 @@ while True:
             placement_epoch: Epoch::new(3).unwrap(),
             desired_revision: Revision::new(5).unwrap(),
             spec_digest: digest('f'),
-            provision_transition_id: random('3'),
+            provision_transition_id: provision_transition_id.clone(),
             volume_id: id("vol_root"),
             attachment_id: id("att_root"),
             attachment_epoch: FenceEpoch::new(7).unwrap(),
             scope_id: id("cats-root.service"),
             cgroup_path: host("/sys/fs/cgroup/system.slice/cats-root.service"),
-            control_socket_path: host("/run/cats/cat_01/root-provision.sock"),
+            control_socket_path: managed_root_control_socket(&provision_transition_id),
             data_directory: host("/var/lib/cats/cat_01/root"),
             process_identity_token: random('4'),
             size_bytes: 4_194_304,
             boot_image_digest: digest('1'),
+            socket_owner_authority_digest: digest('e'),
             attachment,
             phase,
             executable_path: host("/usr/bin/cats-blockd"),
@@ -4495,6 +4748,76 @@ while True:
         )
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_net_unix_absence_is_calibrated_against_a_known_listener() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("known.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket = HostPath::new(socket.to_string_lossy().into_owned()).unwrap();
+        let missing = HostPath::new(
+            root.path()
+                .join("missing.sock")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let context = context();
+
+        assert!(matches!(
+            proc_unix_listener_inode(&socket, &context).unwrap(),
+            ListenerInodeInspection::Exact(_)
+        ));
+        assert!(matches!(
+            proc_unix_listener_inode(&missing, &context).unwrap(),
+            ListenerInodeInspection::Unavailable
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_proc_net_unix_rows_never_prove_absence() {
+        let header = "Num RefCount Protocol Flags Type St Inode Path\n";
+        let target = host("/tmp/target.sock");
+        for malformed in [
+            "not-a-proc-row /tmp/target.sock",
+            "not-a-proc-row /tmp/unrelated.sock",
+            "00000000: 00000002 00000000 00010000 0001 01",
+            "badhex: 00000002 00000000 00010000 0001 01 123 /tmp/unrelated.sock",
+            "00000000: 00000002 00000000 00010000 0001 01 badinode /tmp/target.sock",
+        ] {
+            let snapshot = format!("{header}{malformed}\n");
+            assert!(inspect_proc_net_unix_text(&snapshot, &target).is_err());
+        }
+        assert!(
+            inspect_proc_net_unix_text("Num RefCount Protocol Flags Type St Inode\n", &target,)
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anonymous_proc_net_unix_rows_are_valid_but_never_match_a_path() {
+        let header = "Num RefCount Protocol Flags Type St Inode Path\n";
+        let anonymous = "00000000: 00000002 00000000 00010000 0001 01 123\n";
+        let target = host("/tmp/target.sock");
+        assert!(matches!(
+            inspect_proc_net_unix_text(&format!("{header}{anonymous}"), &target).unwrap(),
+            ListenerInodeInspection::Unavailable
+        ));
+        assert!(matches!(
+            inspect_proc_net_unix_text(
+                &format!(
+                    "{header}{anonymous}00000001: 00000002 00000000 00010000 0001 01 456 {}\n",
+                    target.as_str()
+                ),
+                &target,
+            )
+            .unwrap(),
+            ListenerInodeInspection::Exact(456)
+        ));
+    }
+
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()
     }
@@ -4505,6 +4828,14 @@ while True:
 
     fn random(value: char) -> RandomId128 {
         RandomId128::new(std::iter::repeat_n(value, 32).collect::<String>()).unwrap()
+    }
+
+    fn managed_root_control_socket(provision_transition_id: &RandomId128) -> HostPath {
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone()
     }
 
     fn digest(value: char) -> Sha256Digest {

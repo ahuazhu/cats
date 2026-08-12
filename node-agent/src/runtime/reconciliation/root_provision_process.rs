@@ -19,7 +19,8 @@ use cats_api::runtime_reconciliation::{
     RuntimeCheckpoint, Sequence, Sha256Digest, WireU64,
 };
 use cats_blockd::target_control::{
-    target_control_authorization_file_name, ProvisionRootAuthorizationContextDigest,
+    provision_root_authorization_context_digest, target_control_authorization_file_name,
+    ProvisionRootAuthorizationContextDigest,
 };
 use cats_storage::authority::{
     validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
@@ -28,7 +29,10 @@ use cats_storage::authority::{
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
-use super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE;
+use super::blockd_socket_namespace::{
+    ExactManagedBlockdSocketOwnerStartAbsence, ManagedBlockdRootStopOwnerEvidence,
+    ManagedBlockdSocketOwnerRetirement,
+};
 use super::checkpoint::CurrentCheckpointGuard;
 use super::serving_handoff::{
     target_control_process_launch_identity, TargetControlAuthorizationReady,
@@ -83,6 +87,30 @@ pub(crate) trait TargetControlProcessPort:
 pub(crate) trait RootProvisionProcessRetirementPort:
     retirement_sealed::Sealed + Send + Sync
 {
+    fn inspect_exact_stop_owner_after_node_global_sweep(
+        &self,
+        _expected: &RootProvisionProcessExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<RootProvisionManagedStopInspection> {
+        Ok(RootProvisionManagedStopInspection::Unavailable)
+    }
+
+    fn retire_absent_socket_owner(
+        &self,
+        _expected: &RootProvisionProcessExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+        anyhow::bail!("Root socket-owner retirement requires the production Node-global scanner")
+    }
+
+    fn retain_start_socket_absence(
+        &self,
+        _expected: &RootProvisionProcessExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+        anyhow::bail!("Root start socket absence requires the production Node-global scanner")
+    }
+
     /// Re-prove one exact live attempt across the same Node-global sweep used
     /// by full inventory. The default is fail-closed for test/provider ports
     /// which only implement the later absence proof.
@@ -112,6 +140,17 @@ pub(crate) trait RootProvisionProcessRetirementPort:
         expected: &RootProvisionProcessExpectation,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<RootProvisionProcessInspection>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootProvisionManagedStopInspection {
+    Exact {
+        process: Box<RootProvisionProcessEvidence>,
+        owner: ManagedBlockdRootStopOwnerEvidence,
+    },
+    Absent,
+    Conflict(RootProvisionProcessConflict),
+    Unavailable,
 }
 
 /// The only two authority states in which the persisted root-provision
@@ -153,6 +192,7 @@ pub(crate) struct RootProvisionProcessExpectation {
     pub desired_revision: Revision,
     pub spec_digest: Sha256Digest,
     pub provision_transition_id: RandomId128,
+    pub socket_owner_authority_digest: Sha256Digest,
     pub volume_id: Id,
     pub attachment_id: Id,
     pub attachment_epoch: FenceEpoch,
@@ -323,6 +363,18 @@ impl RootProvisionProcessExpectation {
         let cgroup_path =
             HostPath::new(format!("/sys/fs/cgroup/system.slice/{}", scope_id.as_str()))
                 .context("root-provision service does not form a canonical cgroup path")?;
+        let managed_sockets =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(provision_transition_id)
+                .context("derive checkpointed root-provision socket namespace")?;
+        anyhow::ensure!(
+            control_socket_path == managed_sockets.control_socket(),
+            "root-provision checkpoint carries a non-managed control socket"
+        );
+        let socket_owner_authority_digest = provision_root_authorization_context_digest(checkpoint)
+            .context("derive Root socket owner authority")?
+            .as_sha256_digest()
+            .clone();
         Ok(Self {
             cat_id: checkpoint.cat_id.clone(),
             node_id: checkpoint.node_id.clone(),
@@ -330,6 +382,7 @@ impl RootProvisionProcessExpectation {
             desired_revision: checkpoint.desired_revision,
             spec_digest: checkpoint.spec_digest.clone(),
             provision_transition_id: provision_transition_id.clone(),
+            socket_owner_authority_digest,
             volume_id: volume_id.clone(),
             attachment_id: attachment_id.clone(),
             attachment_epoch: *attachment_epoch,
@@ -406,6 +459,14 @@ impl RootProvisionProcessExpectation {
                     == format!("/sys/fs/cgroup/system.slice/{}", attempt.scope_id.as_str()),
             "retained Root process attempt has a noncanonical physical owner"
         );
+        let managed_sockets =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(&attempt.provision_transition_id)
+                .context("derive retained root-provision socket namespace")?;
+        anyhow::ensure!(
+            attempt.control_socket_path == *managed_sockets.control_socket(),
+            "retained Root process attempt changed its managed control socket"
+        );
         let mut expectation = Self {
             cat_id: attempt.cat_id.clone(),
             node_id: attempt.node_id.clone(),
@@ -413,6 +474,10 @@ impl RootProvisionProcessExpectation {
             desired_revision: attempt.desired_revision,
             spec_digest: attempt.spec_digest.clone(),
             provision_transition_id: attempt.provision_transition_id.clone(),
+            socket_owner_authority_digest: attempt
+                .target_control_launch
+                .provision_context_digest()
+                .clone(),
             volume_id: attempt.volume_id.clone(),
             attachment_id: attempt.attachment_id.clone(),
             attachment_epoch: attempt.attachment_epoch,
@@ -650,10 +715,20 @@ pub(crate) enum NodeGlobalManagedProcessKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StopReceiptSocketAdmission {
     receipt_socket: HostPath,
+    socket_owner: Option<ManagedBlockdRootStopOwnerEvidence>,
     physical_paths: BTreeSet<HostPath>,
 }
 
 impl StopReceiptSocketAdmission {
+    pub(crate) fn from_managed(socket_owner: ManagedBlockdRootStopOwnerEvidence) -> Self {
+        Self {
+            receipt_socket: socket_owner.control_socket_path().clone(),
+            socket_owner: Some(socket_owner),
+            physical_paths: BTreeSet::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         receipt_socket: HostPath,
         physical_paths: BTreeSet<HostPath>,
@@ -662,34 +737,31 @@ impl StopReceiptSocketAdmission {
             physical_paths.len() <= 1,
             "stop receipt retains more than one physical socket path"
         );
-        let receipt_path = Path::new(receipt_socket.as_str());
         anyhow::ensure!(
-            receipt_path.file_name().is_some_and(|name| {
-                name != std::ffi::OsStr::new(ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
-            }),
-            "stop receipt public socket cannot use the quarantine basename"
-        );
-        let parent = receipt_path
-            .parent()
-            .context("stop receipt socket has no parent")?;
-        let quarantine_path = parent.join(ROOT_PROVISION_STOP_SOCKET_QUARANTINE);
-        let quarantine = HostPath::new(
-            quarantine_path
-                .to_str()
-                .context("stop receipt quarantine path is not UTF-8")?
-                .to_owned(),
-        )
-        .context("stop receipt quarantine path is not canonical")?;
-        anyhow::ensure!(
-            physical_paths
-                .iter()
-                .all(|path| path == &receipt_socket || path == &quarantine),
-            "stop receipt physical socket lies outside its closed public/quarantine union"
+            physical_paths.iter().all(|path| path == &receipt_socket),
+            "managed stop receipt physical listener changed from its public binding"
         );
         Ok(Self {
             receipt_socket,
+            socket_owner: None,
             physical_paths,
         })
+    }
+
+    pub(crate) fn bind_managed_snapshot(
+        &mut self,
+        snapshot: &super::blockd_socket_namespace::ManagedBlockdSocketWholeRootSnapshot,
+    ) -> anyhow::Result<()> {
+        let owner = self
+            .socket_owner
+            .as_ref()
+            .context("stop receipt admission lacks managed owner evidence")?;
+        anyhow::ensure!(
+            owner.control_socket_path() == &self.receipt_socket,
+            "managed stop receipt path changed from its owner evidence"
+        );
+        self.physical_paths = snapshot.bind_root_stop_owner(owner)?;
+        Ok(())
     }
 
     pub(crate) fn receipt_socket(&self) -> &HostPath {
@@ -1491,6 +1563,10 @@ fn compare_process_evidence(left: &ProcessEvidence, right: &ProcessEvidence) -> 
 }
 
 impl NodeGlobalManagedProcessAdmission {
+    pub(crate) fn node_boot_id(&self) -> &NodeBootId {
+        &self.node_boot_id
+    }
+
     pub(crate) fn exact_process_count(&self, cat_id: &Id) -> usize {
         self.entries
             .iter()
@@ -2066,6 +2142,20 @@ fn accepted_full_proves_exact_process_absence(
 /// crossed the checkpoint directory durability barrier.
 pub(crate) struct CheckpointedRootProvisionProcess<'a> {
     expected: &'a RootProvisionProcessExpectation,
+    authority: RootCheckpointAuthority<'a>,
+    socket_absence: Option<ExactManagedBlockdSocketOwnerStartAbsence>,
+}
+
+enum RootCheckpointAuthority<'a> {
+    Current {
+        store: &'a FileCheckpointStore,
+        stored: &'a StoredCheckpoint,
+        guard: CurrentCheckpointGuard<'a>,
+    },
+    #[cfg(test)]
+    Test {
+        checkpoint_content_digest: &'a Sha256Digest,
+    },
 }
 
 /// Retains both the exact target artifact and current checkpoint writer guard
@@ -2075,6 +2165,7 @@ pub(crate) struct CheckpointedTargetControlProcess<'a> {
     authorization: &'a TargetControlAuthorizationReady,
     stored: &'a StoredCheckpoint,
     _current_checkpoint: CurrentCheckpointGuard<'a>,
+    socket_absence: Option<ExactManagedBlockdSocketOwnerStartAbsence>,
 }
 
 impl<'a> CheckpointedTargetControlProcess<'a> {
@@ -2084,6 +2175,16 @@ impl<'a> CheckpointedTargetControlProcess<'a> {
 
     pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
         self.authorization.assert_current(self.stored)
+    }
+
+    pub(crate) fn checkpoint_content_digest(&self) -> &Sha256Digest {
+        self.stored.content_digest()
+    }
+
+    pub(crate) fn take_socket_absence(
+        &mut self,
+    ) -> Option<ExactManagedBlockdSocketOwnerStartAbsence> {
+        self.socket_absence.take()
     }
 }
 
@@ -2110,7 +2211,20 @@ pub(crate) fn retain_target_control_process_start<'a>(
         authorization,
         stored,
         _current_checkpoint: current,
+        socket_absence: None,
     })
+}
+
+pub(crate) fn retain_target_control_process_start_with_socket_absence<'a>(
+    store: &'a FileCheckpointStore,
+    stored: &'a StoredCheckpoint,
+    expected: &'a RootProvisionProcessExpectation,
+    authorization: &'a TargetControlAuthorizationReady,
+    socket_absence: ExactManagedBlockdSocketOwnerStartAbsence,
+) -> anyhow::Result<CheckpointedTargetControlProcess<'a>> {
+    let mut retained = retain_target_control_process_start(store, stored, expected, authorization)?;
+    retained.socket_absence = Some(socket_absence);
+    Ok(retained)
 }
 
 impl<'a> CheckpointedRootProvisionProcess<'a> {
@@ -2118,9 +2232,50 @@ impl<'a> CheckpointedRootProvisionProcess<'a> {
         self.expected
     }
 
+    pub(crate) fn checkpoint_content_digest(&self) -> &'a Sha256Digest {
+        match &self.authority {
+            RootCheckpointAuthority::Current { stored, .. } => stored.content_digest(),
+            #[cfg(test)]
+            RootCheckpointAuthority::Test {
+                checkpoint_content_digest,
+            } => checkpoint_content_digest,
+        }
+    }
+
+    pub(crate) fn take_socket_absence(
+        &mut self,
+    ) -> Option<ExactManagedBlockdSocketOwnerStartAbsence> {
+        self.socket_absence.take()
+    }
+
+    /// Revalidates the same descriptor-retained checkpoint object that minted
+    /// this process-start capability. Callers must bracket every namespace
+    /// mutation and the final process submission with this check; a digest by
+    /// itself is deliberately not current-checkpoint authority.
+    pub(crate) fn assert_current(&self) -> anyhow::Result<()> {
+        match &self.authority {
+            RootCheckpointAuthority::Current {
+                store,
+                stored,
+                guard,
+            } => Ok(store.revalidate_current(stored, guard)?),
+            #[cfg(test)]
+            RootCheckpointAuthority::Test { .. } => Ok(()),
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn for_test(expected: &'a RootProvisionProcessExpectation) -> Self {
-        Self { expected }
+    pub(crate) fn for_test(
+        expected: &'a RootProvisionProcessExpectation,
+        checkpoint_content_digest: &'a Sha256Digest,
+    ) -> Self {
+        Self {
+            expected,
+            authority: RootCheckpointAuthority::Test {
+                checkpoint_content_digest,
+            },
+            socket_absence: None,
+        }
     }
 }
 
@@ -2168,7 +2323,9 @@ where
     let persisted = store
         .replace(predecessor, checkpoint)
         .context("persist root-provision process identity before process effect")?;
-    let outcome = ensure_root_provision_process_from_expectation(expected, port, context)?;
+    let outcome = ensure_root_provision_process_from_expectation(
+        expected, store, &persisted, None, port, context,
+    )?;
     Ok(RootProvisionProcessEnsureResult {
         checkpoint: persisted,
         outcome,
@@ -2195,18 +2352,42 @@ where
         authority,
         executable_path,
     )?;
-    // A decoded value is not a durable-current proof: the checkpoint target
-    // may have been atomically replaced since it was loaded. Revalidate file
-    // identity, content digest, and decoded value while retaining the same
-    // store's per-Cat flock and in-process writer guard across all process I/O.
-    let _current = store
-        .assert_current(persisted)
-        .context("assert persisted root-provision checkpoint is still current")?;
-    ensure_root_provision_process_from_expectation(expected, port, context)
+    ensure_root_provision_process_from_expectation(expected, store, persisted, None, port, context)
 }
 
-fn ensure_root_provision_process_from_expectation<P>(
+pub(crate) fn ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence<P>(
+    store: &FileCheckpointStore,
+    persisted: &StoredCheckpoint,
+    authority: RootProvisionAuthoritySnapshot<'_>,
+    executable_path: HostPath,
+    socket_absence: ExactManagedBlockdSocketOwnerStartAbsence,
+    port: &P,
+    context: &RuntimeDesiredEffectContext,
+) -> anyhow::Result<RootProvisionProcessOutcome>
+where
+    P: RootProvisionProcessPort + ?Sized,
+{
+    context.check_active()?;
+    let expected = RootProvisionProcessExpectation::from_checkpoint(
+        persisted.checkpoint(),
+        authority,
+        executable_path,
+    )?;
+    ensure_root_provision_process_from_expectation(
+        expected,
+        store,
+        persisted,
+        Some(socket_absence),
+        port,
+        context,
+    )
+}
+
+fn ensure_root_provision_process_from_expectation<'a, P>(
     expected: RootProvisionProcessExpectation,
+    store: &'a FileCheckpointStore,
+    persisted: &'a StoredCheckpoint,
+    socket_absence: Option<ExactManagedBlockdSocketOwnerStartAbsence>,
     port: &P,
     context: &RuntimeDesiredEffectContext,
 ) -> anyhow::Result<RootProvisionProcessOutcome>
@@ -2231,9 +2412,19 @@ where
         }
         RootProvisionProcessInspection::Absent => {
             context.check_active()?;
+            let current = store
+                .assert_current(persisted)
+                .context("retain current checkpoint across root-provision start")?;
             let checkpointed = CheckpointedRootProvisionProcess {
                 expected: &expected,
+                authority: RootCheckpointAuthority::Current {
+                    store,
+                    stored: persisted,
+                    guard: current,
+                },
+                socket_absence,
             };
+            checkpointed.assert_current()?;
             match port
                 .start_checkpointed(checkpointed, context)
                 .context("start exact checkpointed root-provision process")?
@@ -2365,13 +2556,14 @@ mod tests {
         });
         predecessor.volumes = Vec::new();
         let predecessor = store.create(&predecessor).unwrap();
+        let provision_transition_id = random('3');
         let staged = checkpoint(ReconcileStep::ProvisionRootImage {
-            provision_transition_id: random('3'),
+            provision_transition_id: provision_transition_id.clone(),
             volume_id: id("vol_root"),
             attachment_id: id("att_root"),
             attachment_epoch: fence(7),
             scope_id: id("cats-root.service"),
-            control_socket_path: host("/run/cats/cat_01/root-provision.sock"),
+            control_socket_path: managed_root_control_socket(&provision_transition_id),
             data_directory: host("/var/lib/cats/cat_01/root"),
             process_identity_token: random('4'),
             size_bytes: 4_194_304,
@@ -2398,29 +2590,33 @@ mod tests {
     }
 
     #[test]
-    fn stop_receipt_socket_admission_closes_the_public_quarantine_union() {
-        let public = host("/run/cats/cat_01/root-provision.sock");
-        let quarantine = host("/run/cats/cat_01/.rp-stop.sock");
-        for physical in [
-            BTreeSet::new(),
-            BTreeSet::from([public.clone()]),
-            BTreeSet::from([quarantine]),
-        ] {
+    fn stop_receipt_socket_admission_accepts_only_its_exact_public_listener() {
+        let owner = random('3');
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(&owner)
+            .unwrap();
+        let public = paths.control_socket().clone();
+        let quarantine = host(&format!(
+            "{}/{}",
+            paths.quarantine_directory(),
+            cats_blockd::runtime_socket_namespace::BLOCKD_CONTROL_SOCKET_BASENAME
+        ));
+        for physical in [BTreeSet::new(), BTreeSet::from([public.clone()])] {
             StopReceiptSocketAdmission::new(public.clone(), physical).unwrap();
         }
         assert!(StopReceiptSocketAdmission::new(
             public.clone(),
-            BTreeSet::from([host("/run/cats/cat_01/arbitrary.sock")]),
+            BTreeSet::from([quarantine.clone()]),
         )
         .is_err());
         assert!(StopReceiptSocketAdmission::new(
             public.clone(),
-            BTreeSet::from([public, host("/run/cats/cat_01/.rp-stop.sock")]),
+            BTreeSet::from([host("/run/cats/blockd-v1/arbitrary.sock")]),
         )
         .is_err());
         assert!(StopReceiptSocketAdmission::new(
-            host("/run/cats/cat_01/.rp-stop.sock"),
-            BTreeSet::new(),
+            public.clone(),
+            BTreeSet::from([public, quarantine.clone()]),
         )
         .is_err());
     }
@@ -2454,7 +2650,14 @@ mod tests {
         )]))
         .unwrap();
 
-        let quarantine = host("/run/cats/cat_01/.rp-stop.sock");
+        let quarantine = host(&format!(
+            "{}/{}",
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(&random('8'))
+                .unwrap()
+                .quarantine_directory(),
+            cats_blockd::runtime_socket_namespace::BLOCKD_CONTROL_SOCKET_BASENAME
+        ));
         let mut other = expectation.clone();
         other.cat_id = id("cat_02");
         other.scope_id = id("cats-root-other.service");
@@ -2476,11 +2679,7 @@ mod tests {
         assert!(admission
             .with_stop_receipt_sockets(BTreeMap::from([(
                 expectation.cat_id.clone(),
-                StopReceiptSocketAdmission::new(
-                    expectation.control_socket_path.clone(),
-                    BTreeSet::from([quarantine]),
-                )
-                .unwrap(),
+                StopReceiptSocketAdmission::new(quarantine, BTreeSet::new(),).unwrap(),
             )]))
             .is_err());
     }
@@ -2951,7 +3150,7 @@ mod tests {
         assert_eq!(process.scope_id, id("cats-root.service"));
         assert_eq!(
             process.control_socket_path,
-            host("/run/cats/cat_01/root-provision.sock")
+            managed_root_control_socket(&random('3'))
         );
         assert_eq!(process.state, ProcessState::Running);
         assert_eq!(
@@ -3173,7 +3372,7 @@ mod tests {
             scope_id: id("cats-root.service"),
             cgroup_path: host("/sys/fs/cgroup/system.slice/cats-root.service"),
             cgroup_process_ids: vec![4242],
-            control_socket_path: host("/run/cats/cat_01/root-provision.sock"),
+            control_socket_path: managed_root_control_socket(&random('3')),
             data_directory: host("/var/lib/cats/cat_01/root"),
             ownership_token: random('4'),
             handshake: RootProvisionBlockdHandshake {
@@ -3211,6 +3410,14 @@ mod tests {
 
     fn random(value: char) -> RandomId128 {
         RandomId128::new(std::iter::repeat_n(value, 32).collect::<String>()).unwrap()
+    }
+
+    fn managed_root_control_socket(provision_transition_id: &RandomId128) -> HostPath {
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone()
     }
 
     fn digest(value: char) -> Sha256Digest {

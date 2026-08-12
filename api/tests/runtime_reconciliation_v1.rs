@@ -15,13 +15,13 @@ const SPEC_DIGEST: &str = "sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d6467
 const CHECKPOINT_DIGEST: &str =
     "sha256:ac539e62743af98193ed3758d4bb830e1b8d6c7adfc913c0eb8c7e8f4059eb45";
 const PROVISION_ROOT_CHECKPOINT_DIGEST: &str =
-    "sha256:f1df3e1cfe83fdd0b4a4a5ead32f1ba71533cddbb38e2dc354e0a277a92addcb";
+    "sha256:ab2d78e9db6bfdebf30566f5cfba5b12e5dc0400e0607db10f29e85ada81aef0";
 const PREPARE_DEVICE_CHECKPOINT_DIGEST: &str =
-    "sha256:393a4a5b06a3233cd2fdf01c84a062c083fd58b98711f5f168c397b4fa827cc2";
+    "sha256:76f5a91ce4517290d782587511e4f52411b0393bcbfce2127a0a18718051ca96";
 const PREPARE_NETWORK_CHECKPOINT_DIGEST: &str =
-    "sha256:552b431b1440c0f8fb6fa9656b8846f7ec7d959703884be4d3b5894f45d4a4f6";
+    "sha256:e490811f72c43ab4a80bbcd0fff7d8165bfdbd85bb1e3188f3df5e98d86b78ef";
 const START_RUNTIME_CHECKPOINT_DIGEST: &str =
-    "sha256:f37ff48ed5f7b9c5dc7c6b3d7089ed07d18ca439cf348e5555ff695c4da15b17";
+    "sha256:745318fa1cddd340e20c15bec36378f56767a31062ee8a886914853f457e6460";
 const SHARED_DESIRED_WIRE: &str =
     include_str!("../../testdata/runtime-reconciliation-v1-desired.json");
 const SHARED_PROVISION_ROOT_CHECKPOINT_WIRE: &str =
@@ -3265,7 +3265,7 @@ fn fixed_running_launch_chain_preserves_desired_binding_and_prepared_authority()
         retained_after_restart["frontend"],
         serde_json::json!({
             "kind": "vhost_user_blk",
-            "socket_path": "/run/cats/cat_01/root-vhost.sock",
+            "socket_path": "/run/cats/blockd-v1/d-88888888888888888888888888888888/io.sock",
             "queues": 2,
             "queue_size": 256,
         })

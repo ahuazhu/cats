@@ -1935,12 +1935,17 @@ mod tests {
     }
 
     fn exact_vm_info() -> Vec<u8> {
-        br#"{
+        let expected = expectation();
+        let [VmmApiDiskExpectation::VhostUserBlk { socket, .. }] = expected.disks.as_slice() else {
+            panic!("test checkpoint must contain exactly one vhost-user-blk device")
+        };
+        const VHOST_SOCKET_PLACEHOLDER: &str = "__EXPECTED_VHOST_SOCKET__";
+        let template = r#"{
           "config": {
             "cpus": {"boot_vcpus":2,"max_vcpus":2,"kvm_hyperv":false,"max_phys_bits":46,"features":{"amx":false},"nested":true,"core_scheduling":"Vm","profile":"Host"},
             "memory": {"size":0,"mergeable":false,"hotplug_method":"Acpi","shared":false,"hugepages":false,"prefault":false,"reserve":false,"zones":[{"id":"cat-ram","size":2147483648,"file":"/proc/self/fd/68","shared":true,"hugepages":false,"prefault":false,"reserve":false,"mergeable":false}],"thp":true},
             "payload": {"kernel":"/proc/self/fd/66","cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","initramfs":"/proc/self/fd/67"},
-            "disks": [{"id":"_disk0","pci_segment":0,"readonly":false,"direct":false,"num_queues":2,"queue_size":256,"vhost_user":true,"vhost_socket":"/run/cats/cat_01/root-vhost.sock","disable_io_uring":false,"disable_aio":false,"serial":"cats-root","backing_files":false,"sparse":true,"image_type":"Unknown","lock_granularity":"ByteRange"}],
+            "disks": [{"id":"_disk0","pci_segment":0,"readonly":false,"direct":false,"num_queues":2,"queue_size":256,"vhost_user":true,"vhost_socket":"__EXPECTED_VHOST_SOCKET__","disable_io_uring":false,"disable_aio":false,"serial":"cats-root","backing_files":false,"sparse":true,"image_type":"Unknown","lock_granularity":"ByteRange"}],
             "net": [{"id":"_net1","pci_segment":0,"tap":"cats0001","mac":"02:ca:0a:f0:00:06","host_mac":"02:00:00:00:00:01","num_queues":2,"queue_size":256,"vhost_user":false,"vhost_mode":"Client","offload_tso":true,"offload_ufo":true,"offload_csum":true}],
             "rng": {"pci_segment":0,"src":"/dev/urandom"},
             "serial": {"file":"/proc/self/fd/69","mode":"File"},
@@ -1952,8 +1957,11 @@ mod tests {
           "state":"Running",
           "memory_actual_size":2147483648,
           "device_tree":{}
-        }"#
-        .to_vec()
+        }"#;
+        assert_eq!(template.matches(VHOST_SOCKET_PLACEHOLDER).count(), 1);
+        template
+            .replace(VHOST_SOCKET_PLACEHOLDER, socket)
+            .into_bytes()
     }
 
     #[test]

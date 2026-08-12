@@ -32,9 +32,9 @@ use crate::runtime_spine::{
 use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
-    ExactControlSocketCleanup, RootProvisionStopReceipt, StopReceiptPublication,
-    StopReceiptSettlement,
+    RootProvisionStopReceipt, StopReceiptPublication, StopReceiptSettlement,
 };
+use super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{
     KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdInventoryConfig,
@@ -43,7 +43,8 @@ use super::network::PrepareNetworkReservationEffect;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
 use super::root_provision_process::{
     inspect_exact_root_provision_process, prove_exact_root_provision_process_absence,
-    RootProvisionAbsencePurpose, RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
+    RootProvisionAbsencePurpose, RootProvisionManagedStopInspection,
+    RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
 };
 use super::serving_blockd_process::{ServingBlockdProcessGlobalPort, ServingBlockdStartEffect};
 use super::serving_handoff::{
@@ -60,13 +61,13 @@ use super::signed_running::{
 use super::vmm_process::VmmProcessGlobalPort;
 use super::vmm_start_runtime_effect::{StartRuntimePhysicalEffect, StartRuntimeReservationEffect};
 use super::{
-    ensure_root_provision_process_from_persisted_checkpoint, AuthorizedBlockdStore,
-    FileCheckpointStore, PersistentFilesystemEffect, PlatformRootProvisionProcessIdentityPort,
-    PlatformSystemdRootProvisionProcessPort, RootProvisionProcessConflict,
-    RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
-    RootProvisionProcessRetirementPort, RootProvisionProcessStop, RootProvisionResponseHint,
-    RootProvisionSystemdConfig, RunningLaunchAuthorityRevalidator, UnixRootProvisionClient,
-    VmmCidInventoryPort, VmmLaunchArtifactPaths,
+    ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence,
+    AuthorizedBlockdStore, FileCheckpointStore, PersistentFilesystemEffect,
+    PlatformRootProvisionProcessIdentityPort, PlatformSystemdRootProvisionProcessPort,
+    RootProvisionProcessConflict, RootProvisionProcessInspection, RootProvisionProcessOutcome,
+    RootProvisionProcessPort, RootProvisionProcessRetirementPort, RootProvisionProcessStop,
+    RootProvisionResponseHint, RootProvisionSystemdConfig, RunningLaunchAuthorityRevalidator,
+    UnixRootProvisionClient, VmmCidInventoryPort, VmmLaunchArtifactPaths,
 };
 use super::{AdmissionCellRegistry, RunningAdmissionEffect, SignedRunningAcquireEffect};
 
@@ -236,11 +237,13 @@ impl SignedRunningEffect {
             .context("serving handoff blockd binary is not a canonical HostPath")?;
         let target_process = Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
             systemd.clone(),
+            state_directory.clone(),
         ));
         let prepare_device_retirement = PrepareDeviceTargetRetirementEffect::platform(
             Arc::clone(&authority),
             Arc::clone(&process_ports.root_global),
             systemd.clone(),
+            state_directory.clone(),
         );
         let serving_process_effect = ServingBlockdStartEffect::new(
             Arc::clone(&authority),
@@ -288,7 +291,7 @@ impl SignedRunningEffect {
             kernel_nbd_inventory.clone(),
         );
         let physical_start_runtime = StartRuntimePhysicalEffect::platform(
-            state_directory,
+            state_directory.clone(),
             vmm_launch_artifacts,
             Arc::clone(&prepare_network),
             Arc::clone(&authority),
@@ -303,6 +306,7 @@ impl SignedRunningEffect {
                 Arc::clone(&authority),
                 Arc::clone(&blob),
                 systemd,
+                state_directory,
                 process_ports.retirement,
             )?,
             handoff: ServingHandoffEffect::new(
@@ -426,6 +430,7 @@ impl SignedRootProvisionEffect {
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
         systemd: RootProvisionSystemdConfig,
+        state_directory: StateDirectory,
         retirement: Arc<dyn RootProvisionProcessRetirementPort>,
     ) -> anyhow::Result<Self> {
         let executable = systemd
@@ -434,7 +439,10 @@ impl SignedRootProvisionEffect {
             .context("root provision blockd binary is not UTF-8")?;
         let executable_path = HostPath::new(executable.to_owned())
             .context("root provision blockd binary is not a canonical HostPath")?;
-        let process = Arc::new(PlatformSystemdRootProvisionProcessPort::platform(systemd));
+        let process = Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
+            systemd,
+            state_directory,
+        ));
         Ok(Self {
             authority,
             blob,
@@ -596,19 +604,26 @@ impl SignedRootProvisionEffect {
             return Ok(Some(stop_local()));
         }
 
-        let _node_global_effect = context.lock_node_global_effect()?;
         if runtime.processes.is_empty() {
-            let outcome = ensure_root_provision_process_from_persisted_checkpoint(
-                &store,
-                &stored,
-                super::RootProvisionAuthoritySnapshot {
-                    attachment,
-                    volume: &record,
-                },
-                self.executable_path.clone(),
-                self.process.as_ref(),
-                context,
-            )?;
+            let Some(socket_absence) = self
+                .retirement
+                .retain_start_socket_absence(&expectation, context)?
+            else {
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            };
+            let outcome =
+                ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence(
+                    &store,
+                    &stored,
+                    super::RootProvisionAuthoritySnapshot {
+                        attachment,
+                        volume: &record,
+                    },
+                    self.executable_path.clone(),
+                    socket_absence,
+                    self.process.as_ref(),
+                    context,
+                )?;
             return Ok(Some(match outcome {
                 RootProvisionProcessOutcome::Started(_)
                 | RootProvisionProcessOutcome::Adopted(_)
@@ -805,27 +820,21 @@ impl SignedRootProvisionEffect {
         if record.head != observed_head || !observed_processes_are_exact(runtime, &expectation) {
             return Ok(stop_local());
         }
-        let Some(socket) = prepared
-            .retain_exact_control_socket()
-            .context("retain exact root-provision socket before stop inspection")?
-        else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
-        };
         context.check_active()?;
         let _node_global_effect = context.lock_node_global_effect()?;
-        let evidence = match self
+        let (evidence, socket_owner) = match self
             .retirement
-            .inspect_exact_after_node_global_sweep(&expectation, context)?
+            .inspect_exact_stop_owner_after_node_global_sweep(&expectation, context)?
         {
-            RootProvisionProcessInspection::Exact(evidence)
-                if accepted_process_matches_reinspection(runtime, &evidence) =>
+            RootProvisionManagedStopInspection::Exact { process, owner }
+                if accepted_process_matches_reinspection(runtime, &process) =>
             {
-                evidence
+                (process, owner)
             }
-            RootProvisionProcessInspection::Exact(_)
-            | RootProvisionProcessInspection::Conflict(_) => return Ok(stop_local()),
-            RootProvisionProcessInspection::Absent
-            | RootProvisionProcessInspection::Unavailable => {
+            RootProvisionManagedStopInspection::Exact { .. }
+            | RootProvisionManagedStopInspection::Conflict(_) => return Ok(stop_local()),
+            RootProvisionManagedStopInspection::Absent
+            | RootProvisionManagedStopInspection::Unavailable => {
                 return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
             }
         };
@@ -834,7 +843,7 @@ impl SignedRootProvisionEffect {
             prepared.checkpoint(),
             record,
             evidence.as_ref().clone(),
-            socket,
+            socket_owner,
             root_provision_retirement_admission(context)?,
         ) {
             Ok(receipt) => receipt,
@@ -971,16 +980,16 @@ impl SignedRootProvisionEffect {
         if !retirement_admission_strictly_succeeds(receipt.admission(), absence.admission()) {
             return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
-        if absence.stop_receipt_socket_present() {
-            return Ok(Some(
-                match retained.remove_exact_stale_control_socket(receipt.socket())? {
-                    ExactControlSocketCleanup::Removed
-                    | ExactControlSocketCleanup::AlreadyAbsent => {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
-                    }
-                    ExactControlSocketCleanup::LiveOrChanged => stop_local(),
-                },
-            ));
+        let expectation = receipt.expectation_for_current_authority(
+            stored.checkpoint(),
+            retained.checkpoint(),
+            &current,
+        )?;
+        let retirement = self
+            .retirement
+            .retire_absent_socket_owner(&expectation, context)?;
+        if retirement == ManagedBlockdSocketOwnerRetirement::Retired {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         }
         retained
             .remove_stop_receipt(&receipt)
@@ -1284,7 +1293,7 @@ fn stop_local() -> RuntimeDesiredEffectOutcome {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1318,6 +1327,10 @@ mod tests {
     use crate::state_directory::StateDirectory;
 
     use super::super::authorized_blockd::authorized_blockd_data_directory;
+    use super::super::blockd_socket_namespace::{
+        BlockdSocketIntentStore, BlockdSocketOwnershipIntentV1, CurrentBlockdSocketBoot,
+        ExactManagedBlockdSocketOwnerStartAbsence, RetainedManagedBlockdSocketRoot,
+    };
     use super::super::root_provision::RootProvisionProcessIdentityPort;
     use super::super::root_provision_process::{
         CheckpointedRootProvisionProcess, CheckpointedTargetControlProcess,
@@ -1349,6 +1362,10 @@ mod tests {
 
     fn unix_ms(value: u64) -> UnixMillis {
         UnixMillis::new(value).unwrap()
+    }
+
+    fn managed_test_node_boot_id() -> NodeBootId {
+        NodeBootId::new("33333333333333333333333333333333").unwrap()
     }
 
     fn desired() -> DesiredRuntimeSpec {
@@ -1644,7 +1661,129 @@ mod tests {
     struct FakeRetirementPort {
         calls: AtomicUsize,
         inspection: FakeRetirementInspection,
+        managed_boot: NodeBootId,
         after_exact_inspection: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    }
+
+    struct AutomatonRetirementPort {
+        managed: Arc<IsolatedManagedRootOwner>,
+        start_absences: AtomicUsize,
+        inspections: AtomicUsize,
+        retirements: AtomicUsize,
+    }
+
+    fn assert_test_absent_root_admission(
+        expected: &super::super::RootProvisionProcessExpectation,
+        context: &RuntimeDesiredEffectContext,
+        managed_boot: Option<&NodeBootId>,
+    ) -> anyhow::Result<()> {
+        let observation = context.accepted_full()?.observation();
+        let admission = context.node_global_process()?;
+        anyhow::ensure!(
+            admission.matches_observation(observation),
+            "test Root absence proof is bound to another accepted observation"
+        );
+        if let Some(managed_boot) = managed_boot {
+            anyhow::ensure!(
+                admission.node_boot_id() == managed_boot,
+                "test Root absence proof changed its managed namespace boot"
+            );
+        }
+        let Some((admitted, exact)) = admission.root_control(&expected.cat_id) else {
+            anyhow::bail!("test Root absence proof lacks its admitted target")
+        };
+        anyhow::ensure!(
+            admitted == expected && exact.is_none(),
+            "test Root absence proof is not bound to the exact admitted absent target"
+        );
+        Ok(())
+    }
+
+    impl super::super::root_provision_process::retirement_sealed::Sealed for AutomatonRetirementPort {}
+
+    impl RootProvisionProcessRetirementPort for AutomatonRetirementPort {
+        fn inspect_exact_stop_owner_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionManagedStopInspection> {
+            self.managed.assert_same_owner(expected)?;
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionManagedStopInspection::Exact {
+                process: Box::new(exact_process(expected)),
+                owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                    expected,
+                    context.accepted_full()?.observation().node_boot_id.clone(),
+                )?,
+            })
+        }
+
+        fn retire_absent_socket_owner(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+            self.managed.assert_same_owner(expected)?;
+            assert_test_absent_root_admission(
+                expected,
+                context,
+                Some(self.managed.boot.node_boot_id()),
+            )?;
+            let absence = self.managed.sealed_absence(context);
+            let retired = self.managed.root.retire_absent_owner(
+                &self.managed.intents,
+                &self.managed.intent,
+                &self.managed.boot,
+                absence,
+            )?;
+            self.retirements.fetch_add(1, Ordering::SeqCst);
+            Ok(retired)
+        }
+
+        fn inspect_absent_with_admitted_stop_receipt(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            self.managed.assert_same_owner(expected)?;
+            assert_test_absent_root_admission(
+                expected,
+                context,
+                Some(self.managed.boot.node_boot_id()),
+            )?;
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionProcessInspection::Absent)
+        }
+
+        fn retain_start_socket_absence(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+            self.managed.assert_same_owner(expected)?;
+            assert_test_absent_root_admission(
+                expected,
+                context,
+                Some(self.managed.boot.node_boot_id()),
+            )?;
+            self.start_absences.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.managed.sealed_absence(context)))
+        }
+
+        fn inspect_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionProcessInspection> {
+            self.managed.assert_same_owner(expected)?;
+            assert_test_absent_root_admission(
+                expected,
+                context,
+                Some(self.managed.boot.node_boot_id()),
+            )?;
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionProcessInspection::Absent)
+        }
     }
 
     impl FakeRetirementPort {
@@ -1652,6 +1791,7 @@ mod tests {
             Self {
                 calls: AtomicUsize::new(0),
                 inspection,
+                managed_boot: managed_test_node_boot_id(),
                 after_exact_inspection: Mutex::new(None),
             }
         }
@@ -1713,6 +1853,59 @@ mod tests {
     }
 
     impl RootProvisionProcessRetirementPort for FakeRetirementPort {
+        fn inspect_exact_stop_owner_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionManagedStopInspection> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let inspection = self.inspection(expected);
+            if let Some(hook) = self.after_exact_inspection.lock().unwrap().take() {
+                hook();
+            }
+            Ok(match inspection {
+                RootProvisionProcessInspection::Exact(process) => {
+                    let node_boot_id = context.accepted_full()?.observation().node_boot_id.clone();
+                    RootProvisionManagedStopInspection::Exact {
+                        process,
+                        owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                            expected,
+                            node_boot_id,
+                        )?,
+                    }
+                }
+                RootProvisionProcessInspection::Absent => {
+                    RootProvisionManagedStopInspection::Absent
+                }
+                RootProvisionProcessInspection::Conflict(conflict) => {
+                    RootProvisionManagedStopInspection::Conflict(conflict)
+                }
+                RootProvisionProcessInspection::Unavailable => {
+                    RootProvisionManagedStopInspection::Unavailable
+                }
+            })
+        }
+
+        fn retire_absent_socket_owner(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+            anyhow::ensure!(
+                matches!(self.inspection, FakeRetirementInspection::Absent),
+                "test retirement may report AlreadyAbsent only after an absent process inspection"
+            );
+            let installed =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&expected.provision_transition_id)?;
+            anyhow::ensure!(
+                installed.control_socket() == &expected.control_socket_path,
+                "test retirement expectation changed its installed managed socket mapping"
+            );
+            assert_test_absent_root_admission(expected, context, Some(&self.managed_boot))?;
+            Ok(ManagedBlockdSocketOwnerRetirement::AlreadyAbsent)
+        }
+
         fn inspect_exact_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
@@ -1729,8 +1922,11 @@ mod tests {
         fn inspect_absent_with_admitted_stop_receipt(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &RuntimeDesiredEffectContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
+            if matches!(self.inspection, FakeRetirementInspection::Absent) {
+                assert_test_absent_root_admission(expected, context, Some(&self.managed_boot))?;
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
         }
@@ -1738,8 +1934,11 @@ mod tests {
         fn inspect_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
-            _context: &RuntimeDesiredEffectContext,
+            context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<RootProvisionProcessInspection> {
+            if matches!(self.inspection, FakeRetirementInspection::Absent) {
+                assert_test_absent_root_admission(expected, context, Some(&self.managed_boot))?;
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.inspection(expected))
         }
@@ -1756,6 +1955,25 @@ mod tests {
     }
 
     impl RootProvisionProcessRetirementPort for TargetLaunchRetirementPort {
+        fn inspect_exact_stop_owner_after_node_global_sweep(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<RootProvisionManagedStopInspection> {
+            anyhow::ensure!(
+                expected.target_control_launch().is_some(),
+                "target-wrapper retirement lost its sealed launch identity"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RootProvisionManagedStopInspection::Exact {
+                process: Box::new(exact_process(expected)),
+                owner: super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                    expected,
+                    context.accepted_full()?.observation().node_boot_id.clone(),
+                )?,
+            })
+        }
+
         fn inspect_exact_after_node_global_sweep(
             &self,
             expected: &super::super::RootProvisionProcessExpectation,
@@ -1765,7 +1983,6 @@ mod tests {
                 expected.target_control_launch().is_some(),
                 "target-wrapper retirement lost its sealed launch identity"
             );
-            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(RootProvisionProcessInspection::Exact(Box::new(
                 exact_process(expected),
             )))
@@ -2061,17 +2278,20 @@ mod tests {
             let data_directory =
                 HostPath::new(data_directory.to_str().unwrap().to_owned()).unwrap();
             let process_token = random('4');
+            let provision_transition_id = random('3');
+            let control_socket_path =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&provision_transition_id)
+                    .unwrap()
+                    .control_socket()
+                    .clone();
             let step = ReconcileStep::ProvisionRootImage {
-                provision_transition_id: random('3'),
+                provision_transition_id,
                 volume_id: volume.volume_id.clone(),
                 attachment_id: volume.attachment_id.clone(),
                 attachment_epoch: attachment.identity.attachment_epoch,
                 scope_id: id(&format!("cats-root-{}.service", process_token.as_str())),
-                control_socket_path: HostPath::new(format!(
-                    "{}/root-provision.sock",
-                    data_directory.as_str()
-                ))
-                .unwrap(),
+                control_socket_path,
                 data_directory: data_directory.clone(),
                 process_identity_token: process_token,
                 size_bytes: volume.size_bytes,
@@ -2184,8 +2404,58 @@ mod tests {
             )]))
             .unwrap()
             .into_admission_for_test();
-            self.context_at(Vec::new(), inventory_epoch, inventory_read_position)
-                .with_node_global_process_for_test(admission)
+            let context = self.context_at(Vec::new(), inventory_epoch, inventory_read_position);
+            let admission = admission
+                .rebind_for_test(context.accepted_full().unwrap().observation())
+                .unwrap();
+            context.with_node_global_process_for_test(admission)
+        }
+
+        fn context_at_with_absent_root(
+            &self,
+            expectation: super::super::RootProvisionProcessExpectation,
+            inventory_epoch: u64,
+            inventory_read_position: u64,
+        ) -> RuntimeDesiredEffectContext {
+            let cat_id = expectation.cat_id.clone();
+            let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                std::collections::BTreeMap::from([(cat_id, expectation)]),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .into_admission_for_test();
+            let context = self.context_at(Vec::new(), inventory_epoch, inventory_read_position);
+            let admission = admission
+                .rebind_for_test(context.accepted_full().unwrap().observation())
+                .unwrap();
+            context.with_node_global_process_for_test(admission)
+        }
+
+        fn context_at_with_managed_stop_receipt_evidence(
+            &self,
+            expectation: super::super::RootProvisionProcessExpectation,
+            receipt: &RootProvisionStopReceipt,
+            inventory_epoch: u64,
+            inventory_read_position: u64,
+        ) -> RuntimeDesiredEffectContext {
+            let cat_id = expectation.cat_id.clone();
+            let socket =
+                super::super::root_provision_process::StopReceiptSocketAdmission::from_managed(
+                    receipt.socket_owner().clone(),
+                );
+            let admission = super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                std::collections::BTreeMap::from([(cat_id.clone(), expectation)]),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+            .with_stop_receipt_sockets(std::collections::BTreeMap::from([(cat_id, socket)]))
+            .unwrap()
+            .into_admission_for_test();
+            let context = self.context_at(Vec::new(), inventory_epoch, inventory_read_position);
+            let admission = admission
+                .rebind_for_test(context.accepted_full().unwrap().observation())
+                .unwrap();
+            context.with_node_global_process_for_test(admission)
         }
 
         fn context_with_lineage_path(
@@ -2272,7 +2542,7 @@ mod tests {
                 version: ContractVersion::V1,
                 node_id: self.desired.placement.node_id.clone(),
                 immutable_host_id: id("host_a"),
-                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                node_boot_id: managed_test_node_boot_id(),
                 agent_instance_id: random('5'),
                 agent_session_epoch: epoch(2),
                 registration_attempt_id: random('6'),
@@ -2355,22 +2625,25 @@ mod tests {
             }
         }
 
-        fn control_socket_path(&self) -> PathBuf {
-            let ReconcileStep::ProvisionRootImage {
-                control_socket_path,
-                ..
-            } = &self.checkpoint.step
+        fn stop_receipt_path(&self) -> PathBuf {
+            let ReconcileStep::ProvisionRootImage { data_directory, .. } = &self.checkpoint.step
             else {
                 unreachable!()
             };
-            PathBuf::from(control_socket_path.as_str())
+            Path::new(data_directory.as_str())
+                .join(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_FILE)
         }
 
-        fn stop_receipt_path(&self) -> PathBuf {
-            self.control_socket_path()
-                .parent()
-                .unwrap()
-                .join(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_FILE)
+        fn root_process_expectation(&self) -> super::super::RootProvisionProcessExpectation {
+            super::super::RootProvisionProcessExpectation::from_checkpoint(
+                &self.checkpoint,
+                super::super::root_provision_process::RootProvisionAuthoritySnapshot {
+                    attachment: self.attachment.clone(),
+                    volume: &self.authority.record(),
+                },
+                HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+            )
+            .unwrap()
         }
 
         fn effect(
@@ -2463,7 +2736,7 @@ mod tests {
     fn recovery_context(fixture: &Fixture) -> RuntimePreScanRecoveryContext {
         let session = SessionBinding {
             node_id: fixture.desired.placement.node_id.clone(),
-            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            node_boot_id: managed_test_node_boot_id(),
             agent_instance_id: random('5'),
             agent_session_epoch: epoch(2),
         };
@@ -2496,16 +2769,8 @@ mod tests {
         fixture
     }
 
-    fn stopped_receipt_fixture() -> (
-        Fixture,
-        Arc<FakeProcessPort>,
-        Arc<FakeRequestPort>,
-        UnixListener,
-    ) {
+    fn stopped_receipt_fixture() -> (Fixture, Arc<FakeProcessPort>, Arc<FakeRequestPort>) {
         let fixture = same_image_superseded_fixture();
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
@@ -2531,7 +2796,7 @@ mod tests {
         );
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert!(fixture.stop_receipt_path().exists());
-        (fixture, process, request, listener)
+        (fixture, process, request)
     }
 
     fn observed_volume(
@@ -2597,8 +2862,466 @@ mod tests {
     }
 
     #[test]
+    fn managed_root_stop_journal_survives_owner_retirement_then_is_removed() {
+        let mut fixture = Fixture::new();
+        let managed = IsolatedManagedRootOwner::new(&mut fixture);
+        let prepared = managed.prepare();
+        let socket_path = PathBuf::from(prepared.control_socket_path().as_str());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_owner = prepared
+            .retain_root_stop_owner_evidence(&managed.boot)
+            .unwrap();
+        drop(prepared);
+        let process = exact_process(&managed.expectation);
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let stored = checkpoint_store.load().unwrap().unwrap();
+        let mut authorized = AuthorizedBlockdStore::new(fixture.state.clone())
+            .retain_exact_runtime_checkpoint(&fixture.checkpoint)
+            .unwrap();
+        let admission = RootProvisionRetirementAdmission {
+            node_boot_id: managed.boot.node_boot_id().clone(),
+            agent_instance_id: random('9'),
+            agent_session_epoch: epoch(2),
+            inventory_epoch: epoch(1),
+            inventory_digest: Sha256Digest::from_bytes([8; 32]),
+            inventory_read_position: Sequence::new(1).unwrap(),
+        };
+        let receipt = RootProvisionStopReceipt::new_for_isolated_socket_root_test(
+            stored.checkpoint(),
+            authorized.checkpoint(),
+            fixture.authority.record(),
+            &managed.expectation,
+            process,
+            socket_owner,
+            admission,
+        )
+        .unwrap();
+        assert!(matches!(
+            authorized.persist_or_reopen_stop_receipt(&receipt).unwrap(),
+            StopReceiptPublication::Published(_)
+        ));
+        assert!(fixture.stop_receipt_path().exists());
+        assert!(!Path::new(managed.expectation.data_directory.as_str())
+            .join("root-provision.sock")
+            .exists());
+
+        // Exact stop has completed, but a Unix listener leaves its pathname
+        // behind. Only the accepted-full/global absence capability may move
+        // the complete managed owner to quarantine and retire its intent.
+        drop(listener);
+        assert!(socket_path.exists());
+        let context = fixture.context_at(Vec::new(), 5, 13);
+        let absence = managed.sealed_absence(&context);
+        assert_eq!(
+            managed
+                .root
+                .retire_absent_owner(&managed.intents, &managed.intent, &managed.boot, absence)
+                .unwrap(),
+            ManagedBlockdSocketOwnerRetirement::Retired
+        );
+        assert!(!socket_path.exists());
+        assert!(fixture.stop_receipt_path().exists());
+
+        // A fresh complete whole-root snapshot now joins the still-durable
+        // semantic journal to no physical paths. Only this later round may
+        // remove the journal.
+        let empty = managed
+            .root
+            .capture_closed_whole_root(&managed.intents, &[managed.intent.clone()])
+            .unwrap();
+        assert!(empty
+            .bind_root_stop_owner(receipt.socket_owner())
+            .unwrap()
+            .is_empty());
+        authorized.remove_stop_receipt(&receipt).unwrap();
+        assert!(!fixture.stop_receipt_path().exists());
+        assert!(
+            std::fs::read_dir(Path::new(managed.expectation.data_directory.as_str()))
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_type().unwrap().is_socket())
+        );
+    }
+
+    #[test]
+    fn superseded_effect_retires_managed_owner_before_semantic_stop_journal() {
+        let mut fixture = Fixture::new();
+        let ReconcileStep::ProvisionRootImage {
+            provision_transition_id,
+            control_socket_path,
+            ..
+        } = &mut fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        *control_socket_path =
+            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                .root_paths(provision_transition_id)
+                .unwrap()
+                .control_socket()
+                .clone();
+        let checkpoint_store = FileCheckpointStore::open(
+            &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+            &fixture.desired.cat_id,
+        )
+        .unwrap();
+        let predecessor = checkpoint_store.load().unwrap().unwrap();
+        checkpoint_store
+            .replace(&predecessor, &fixture.checkpoint)
+            .unwrap();
+        drop(checkpoint_store);
+        let expectation = super::super::RootProvisionProcessExpectation::from_checkpoint(
+            &fixture.checkpoint,
+            super::super::root_provision_process::RootProvisionAuthoritySnapshot {
+                attachment: fixture.attachment.clone(),
+                volume: &fixture.authority.record(),
+            },
+            HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+        )
+        .unwrap();
+        let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+            &expectation,
+        ));
+        let prepared = managed.prepare();
+        let isolated_socket = PathBuf::from(prepared.control_socket_path().as_str());
+        let listener = UnixListener::bind(&isolated_socket).unwrap();
+        std::fs::set_permissions(&isolated_socket, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(prepared);
+        drop(listener);
+
+        let process = exact_process(&expectation);
+        let socket_owner =
+            super::super::blockd_socket_namespace::ManagedBlockdRootStopOwnerEvidence::for_test(
+                &expectation,
+                managed.boot.node_boot_id().clone(),
+            )
+            .unwrap();
+        let admission = RootProvisionRetirementAdmission {
+            node_boot_id: managed.boot.node_boot_id().clone(),
+            agent_instance_id: random('5'),
+            agent_session_epoch: epoch(2),
+            inventory_epoch: epoch(1),
+            inventory_digest: Sha256Digest::from_bytes([8; 32]),
+            inventory_read_position: Sequence::new(1).unwrap(),
+        };
+        let mut authorized = AuthorizedBlockdStore::new(fixture.state.clone())
+            .retain_exact_runtime_checkpoint(&fixture.checkpoint)
+            .unwrap();
+        let receipt = RootProvisionStopReceipt::new(
+            &fixture.checkpoint,
+            authorized.checkpoint(),
+            fixture.authority.record(),
+            process,
+            socket_owner,
+            admission,
+        )
+        .unwrap();
+        authorized.persist_or_reopen_stop_receipt(&receipt).unwrap();
+        drop(authorized);
+
+        fixture.desired.desired_revision = Revision::new(2).unwrap();
+        fixture.desired.runtime.memory_bytes += 4096;
+        fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
+        let retirement = Arc::new(AutomatonRetirementPort {
+            managed: Arc::clone(&managed),
+            start_absences: AtomicUsize::new(0),
+            inspections: AtomicUsize::new(0),
+            retirements: AtomicUsize::new(0),
+        });
+        let process_port = Arc::new(FakeProcessPort::default());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        let effect = fixture.effect_with_ports(
+            process_port,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        let first_context = fixture.context_at_with_managed_stop_receipt_evidence(
+            expectation.clone(),
+            &receipt,
+            5,
+            13,
+        );
+        let accepted = first_context.accepted_full().unwrap();
+        assert_eq!(accepted.observation().runtimes[0].processes, Vec::new());
+        assert!(first_context
+            .node_global_process()
+            .unwrap()
+            .stop_receipt_socket(&fixture.desired.cat_id)
+            .is_some());
+        assert_eq!(
+            effect.try_apply(&first_context, &fixture.desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            (
+                retirement.inspections.load(Ordering::SeqCst),
+                retirement.start_absences.load(Ordering::SeqCst),
+                retirement.retirements.load(Ordering::SeqCst),
+            ),
+            (1, 0, 1)
+        );
+        assert!(
+            !isolated_socket.exists(),
+            "first effect round must consume the real managed-owner retirement automaton"
+        );
+        assert!(fixture.stop_receipt_path().exists());
+
+        let second_context =
+            fixture.context_at_with_managed_stop_receipt_evidence(expectation, &receipt, 6, 14);
+        assert_eq!(
+            effect.try_apply(&second_context, &fixture.desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(retirement.retirements.load(Ordering::SeqCst), 2);
+        assert!(!fixture.stop_receipt_path().exists());
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Isolated physical fixture for the managed Root socket owner. The
+    /// semantic stop journal remains in AuthorizedBlockd state; this object
+    /// owns only the boot-local `/run` analogue and its durable namespace
+    /// intent store.
+    struct IsolatedManagedRootOwner {
+        _temporary: tempfile::TempDir,
+        root: Arc<RetainedManagedBlockdSocketRoot>,
+        intents: Arc<BlockdSocketIntentStore>,
+        boot: CurrentBlockdSocketBoot,
+        intent: BlockdSocketOwnershipIntentV1,
+        expectation: super::super::RootProvisionProcessExpectation,
+    }
+
+    impl IsolatedManagedRootOwner {
+        fn new(fixture: &mut Fixture) -> Self {
+            let temporary = tempfile::Builder::new()
+                .prefix("signed-root-managed-")
+                .tempdir_in("/private/tmp")
+                .or_else(|_| {
+                    tempfile::Builder::new()
+                        .prefix("signed-root-managed-")
+                        .tempdir_in("/tmp")
+                })
+                .unwrap();
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let root = Arc::new(
+                RetainedManagedBlockdSocketRoot::provision_for_test(&temporary.path().join("s"))
+                    .unwrap(),
+            );
+            let intent_state = temporary.path().join("state");
+            std::fs::create_dir(&intent_state).unwrap();
+            std::fs::set_permissions(&intent_state, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let intents = Arc::new(
+                BlockdSocketIntentStore::provision_for_test(StateDirectory::unanchored(
+                    intent_state,
+                ))
+                .unwrap(),
+            );
+            let node_boot_id = managed_test_node_boot_id();
+            let boot = CurrentBlockdSocketBoot::for_test(node_boot_id);
+            let provision_transition_id = match &fixture.checkpoint.step {
+                ReconcileStep::ProvisionRootImage {
+                    provision_transition_id,
+                    ..
+                } => provision_transition_id.clone(),
+                _ => unreachable!(),
+            };
+            let paths = root.planner().root_paths(&provision_transition_id).unwrap();
+            let ReconcileStep::ProvisionRootImage {
+                control_socket_path,
+                ..
+            } = &mut fixture.checkpoint.step
+            else {
+                unreachable!()
+            };
+            *control_socket_path = paths.control_socket().clone();
+            let socket_owner_authority_digest =
+                cats_blockd::target_control::provision_root_authorization_context_digest(
+                    &fixture.checkpoint,
+                )
+                .unwrap()
+                .as_sha256_digest()
+                .clone();
+            let mut installed_checkpoint = fixture.checkpoint.clone();
+            let ReconcileStep::ProvisionRootImage {
+                control_socket_path,
+                ..
+            } = &mut installed_checkpoint.step
+            else {
+                unreachable!()
+            };
+            *control_socket_path =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&provision_transition_id)
+                    .unwrap()
+                    .control_socket()
+                    .clone();
+            let base = super::super::RootProvisionProcessExpectation::from_checkpoint(
+                &installed_checkpoint,
+                super::super::root_provision_process::RootProvisionAuthoritySnapshot {
+                    attachment: fixture.attachment.clone(),
+                    volume: &fixture.authority.record(),
+                },
+                HostPath::new("/usr/bin/cats-blockd".to_owned()).unwrap(),
+            )
+            .unwrap();
+            let mut expectation = base;
+            expectation.control_socket_path = paths.control_socket().clone();
+            expectation.socket_owner_authority_digest = socket_owner_authority_digest.clone();
+            let checkpoint_store = FileCheckpointStore::open(
+                &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+                &fixture.desired.cat_id,
+            )
+            .unwrap();
+            let previous = checkpoint_store.load().unwrap().unwrap();
+            checkpoint_store
+                .replace(&previous, &fixture.checkpoint)
+                .unwrap();
+            let intent = BlockdSocketOwnershipIntentV1::root(
+                &root,
+                &boot,
+                provision_transition_id,
+                socket_owner_authority_digest,
+            )
+            .unwrap();
+            Self {
+                _temporary: temporary,
+                root,
+                intents,
+                boot,
+                intent,
+                expectation,
+            }
+        }
+
+        fn from_installed_expectation(
+            expectation: &super::super::RootProvisionProcessExpectation,
+        ) -> Self {
+            let temporary = tempfile::Builder::new()
+                .prefix("signed-root-effect-managed-")
+                .tempdir_in("/private/tmp")
+                .or_else(|_| {
+                    tempfile::Builder::new()
+                        .prefix("signed-root-effect-managed-")
+                        .tempdir_in("/tmp")
+                })
+                .unwrap();
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let root = Arc::new(
+                RetainedManagedBlockdSocketRoot::provision_for_test(&temporary.path().join("s"))
+                    .unwrap(),
+            );
+            let intent_state = temporary.path().join("state");
+            std::fs::create_dir(&intent_state).unwrap();
+            std::fs::set_permissions(&intent_state, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let intents = Arc::new(
+                BlockdSocketIntentStore::provision_for_test(StateDirectory::unanchored(
+                    intent_state,
+                ))
+                .unwrap(),
+            );
+            let boot = CurrentBlockdSocketBoot::for_test(managed_test_node_boot_id());
+            let paths = root
+                .planner()
+                .root_paths(&expectation.provision_transition_id)
+                .unwrap();
+            let mut isolated = expectation.clone();
+            isolated.control_socket_path = paths.control_socket().clone();
+            let intent = BlockdSocketOwnershipIntentV1::root(
+                &root,
+                &boot,
+                expectation.provision_transition_id.clone(),
+                expectation.socket_owner_authority_digest.clone(),
+            )
+            .unwrap();
+            Self {
+                _temporary: temporary,
+                root,
+                intents,
+                boot,
+                intent,
+                expectation: isolated,
+            }
+        }
+
+        fn assert_same_owner(
+            &self,
+            expected: &super::super::RootProvisionProcessExpectation,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                expected.provision_transition_id == self.expectation.provision_transition_id
+                    && expected.socket_owner_authority_digest
+                        == self.expectation.socket_owner_authority_digest,
+                "automaton retirement test changed its stable Root owner generation"
+            );
+            Ok(())
+        }
+
+        fn prepare(
+            &self,
+        ) -> super::super::blockd_socket_namespace::PreparedManagedBlockdSocketOwner<'_> {
+            self.intents
+                .publish(&self.intent, &self.root, &self.boot)
+                .unwrap();
+            self.root
+                .prepare_existing_intent(&self.intents, &self.intent, &self.boot)
+                .unwrap()
+        }
+
+        fn sealed_absence(
+            &self,
+            context: &RuntimeDesiredEffectContext,
+        ) -> ExactManagedBlockdSocketOwnerStartAbsence {
+            let node_global = context.lock_node_global_effect().unwrap();
+            let capture = self
+                .root
+                .capture_start_absence(&self.intents, &self.intent, &self.boot)
+                .unwrap();
+            let expected = [self.intent.clone()];
+            let before = self
+                .root
+                .capture_closed_whole_root(&self.intents, &expected)
+                .unwrap();
+            let after = self
+                .root
+                .capture_closed_whole_root(&self.intents, &expected)
+                .unwrap();
+            ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                capture,
+                before,
+                after,
+                &self.boot,
+                node_global,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
     fn blank_full_inventory_starts_one_exact_control_process_and_rescans() {
         let fixture = Fixture::new();
+        let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+            &fixture.root_process_expectation(),
+        ));
+        let retirement = Arc::new(AutomatonRetirementPort {
+            managed,
+            start_absences: AtomicUsize::new(0),
+            inspections: AtomicUsize::new(0),
+            retirements: AtomicUsize::new(0),
+        });
         let process = Arc::new(FakeProcessPort::default());
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
@@ -2608,14 +3331,109 @@ mod tests {
             connect_failure: false,
             identity_mismatch: false,
         });
-        let effect = fixture.effect(Arc::clone(&process), Arc::clone(&request));
-        let outcome = effect
-            .try_apply(&fixture.context(Vec::new()), &fixture.desired)
-            .unwrap();
+        let effect = fixture.effect_with_ports(
+            Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+            Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
+        );
+        let context =
+            fixture.context_at_with_absent_root(fixture.root_process_expectation(), 4, 12);
+        let outcome = effect.try_apply(&context, &fixture.desired).unwrap();
         assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(process.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(retirement.start_absences.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn managed_absence_rejects_foreign_boot_and_predecessor_observation_without_retirement() {
+        let (fixture, _process, _request) = stopped_receipt_fixture();
+        let expected = fixture.root_process_expectation();
+        let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+            &expected,
+        ));
+        let prepared = managed.prepare();
+        let public_directory = PathBuf::from(prepared.public_directory().as_str());
+        let public_inode = std::fs::symlink_metadata(&public_directory).unwrap().ino();
+        drop(prepared);
+        let receipt_before = std::fs::read(fixture.stop_receipt_path()).unwrap();
+        let retirement = AutomatonRetirementPort {
+            managed: Arc::clone(&managed),
+            start_absences: AtomicUsize::new(0),
+            inspections: AtomicUsize::new(0),
+            retirements: AtomicUsize::new(0),
+        };
+
+        let predecessor = fixture.context_at_with_absent_root(expected.clone(), 5, 13);
+        let predecessor_process_admission = predecessor.node_global_process().unwrap().clone();
+        let accepted = predecessor.accepted_full().unwrap();
+        let mut foreign_session = accepted.session().clone();
+        let mut foreign_observation = accepted.observation().clone();
+        let mut foreign_attestation = accepted.attestation().clone();
+        let foreign_boot = NodeBootId::new("44444444444444444444444444444444").unwrap();
+        foreign_session.node_boot_id = foreign_boot.clone();
+        foreign_observation.node_boot_id = foreign_boot;
+        let foreign_digest = inventory_digest(&foreign_observation).unwrap();
+        foreign_observation.inventory_digest = Some(foreign_digest.clone());
+        foreign_attestation.inventory_digest = foreign_digest;
+        let foreign_process_admission = predecessor_process_admission
+            .rebind_for_test(&foreign_observation)
+            .unwrap();
+        let foreign_context = RuntimeDesiredEffectContext::for_test_with_admission(
+            fixture.state.clone(),
+            Instant::now() + Duration::from_secs(10),
+            RuntimeDesiredEffectAdmission::for_test(
+                foreign_session,
+                foreign_observation,
+                foreign_attestation,
+            ),
+        )
+        .with_node_global_process_for_test(foreign_process_admission);
+        let error = retirement
+            .retire_absent_socket_owner(&expected, &foreign_context)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed its managed namespace boot"));
+        let fake = FakeRetirementPort::absent();
+        let error = fake
+            .retire_absent_socket_owner(&expected, &foreign_context)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed its managed namespace boot"));
+
+        let successor = fixture
+            .context_at(Vec::new(), 6, 14)
+            .with_node_global_process_for_test(predecessor_process_admission);
+        let error = retirement
+            .retire_absent_socket_owner(&expected, &successor)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bound to another accepted observation"));
+        let error = fake
+            .retire_absent_socket_owner(&expected, &successor)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bound to another accepted observation"));
+
+        assert_eq!(retirement.retirements.load(Ordering::SeqCst), 0);
+        assert!(public_directory.is_dir());
+        assert_eq!(
+            std::fs::symlink_metadata(&public_directory).unwrap().ino(),
+            public_inode
+        );
+        assert_eq!(
+            managed.intents.load(managed.intent.owner()).unwrap(),
+            Some(managed.intent.clone())
+        );
+        assert_eq!(
+            std::fs::read(fixture.stop_receipt_path()).unwrap(),
+            receipt_before
+        );
     }
 
     #[test]
@@ -3024,9 +3842,6 @@ mod tests {
         fixture.desired.runtime.memory_bytes += 4096;
         fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
         fixture.blob = Arc::new(ExactBlob::new(&fixture.desired));
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let retirement = Arc::new(TargetLaunchRetirementPort::default());
         let effect = fixture.effect_with_ports(
             Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
@@ -3046,7 +3861,6 @@ mod tests {
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert!(fixture.stop_receipt_path().exists());
-        drop(listener);
     }
 
     #[test]
@@ -3596,12 +4410,22 @@ mod tests {
             drop(checkpoint_store);
             let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
             let authority_before = fixture.authority.record();
-            let socket_path = fixture.control_socket_path();
+            let managed = Arc::new(IsolatedManagedRootOwner::from_installed_expectation(
+                &fixture.root_process_expectation(),
+            ));
+            let prepared = managed.prepare();
+            let socket_path = PathBuf::from(prepared.control_socket_path().as_str());
             let listener = UnixListener::bind(&socket_path).unwrap();
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(prepared);
 
             let process = Arc::new(FakeProcessPort::exact(41, 42));
-            let retirement = Arc::new(FakeRetirementPort::exact());
+            let retirement = Arc::new(AutomatonRetirementPort {
+                managed,
+                start_absences: AtomicUsize::new(0),
+                inspections: AtomicUsize::new(0),
+                retirements: AtomicUsize::new(0),
+            });
             let request = Arc::new(FakeRequestPort {
                 authority: Arc::clone(&fixture.authority),
                 calls: AtomicUsize::new(0),
@@ -3611,28 +4435,27 @@ mod tests {
                 identity_mismatch: false,
             });
             let mutations = Arc::new(NoSignedMutationPort::default());
-            let dispatcher = fixture.dispatcher_with_retirement(
-                Arc::clone(&process),
-                Arc::clone(&retirement),
-                Arc::clone(&request),
-                Arc::clone(&mutations),
+            let effect = fixture.effect_with_ports(
+                Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
             );
-            let first = dispatcher
-                .apply(
-                    fixture.context(vec![fixture.public_process()]),
+            let first = effect
+                .try_apply(
+                    &fixture.context(vec![fixture.public_process()]),
                     &fixture.desired,
                 )
                 .unwrap();
             assert_eq!(
                 first,
-                RuntimeDesiredEffectOutcome::RefreshInventory,
-                "stops={}, retirement={}, receipt={}",
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+                "stops={}, inspections={}, receipt={}",
                 process.stops.load(Ordering::SeqCst),
-                retirement.calls.load(Ordering::SeqCst),
+                retirement.inspections.load(Ordering::SeqCst),
                 fixture.stop_receipt_path().exists(),
             );
             assert_eq!(process.stops.load(Ordering::SeqCst), 1);
-            assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(retirement.inspections.load(Ordering::SeqCst), 1);
             assert_eq!(request.calls.load(Ordering::SeqCst), 0);
             assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.authority.record(), authority_before);
@@ -3643,10 +4466,9 @@ mod tests {
             // Restart recovery must remove only that receipted refused inode.
             drop(listener);
             assert!(socket_path.exists());
-            let recovery_retirement = Arc::new(FakeRetirementPort::absent());
             let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
                 Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
-                Arc::clone(&recovery_retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
             );
             assert_eq!(
                 recovery.recover_one(recovery_context(&fixture)).unwrap(),
@@ -3654,30 +4476,28 @@ mod tests {
             );
             assert!(socket_path.exists());
             assert!(fixture.stop_receipt_path().exists());
-            assert_eq!(recovery_retirement.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(retirement.retirements.load(Ordering::SeqCst), 0);
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
 
             // Only a strictly newer full admission may unlink the typed
             // receipted inode. A still newer full then retires the receipt.
-            let absence_retirement = Arc::new(FakeRetirementPort::absent());
-            let finish = fixture.dispatcher_with_retirement(
-                Arc::clone(&process),
-                absence_retirement,
-                Arc::clone(&request),
-                Arc::clone(&mutations),
+            let finish = fixture.effect_with_ports(
+                Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
+                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
+                Arc::clone(&request) as Arc<dyn RootProvisionRequestPort>,
             );
             assert_eq!(
                 finish
-                    .apply(
-                        fixture.context_at_with_stop_receipt(
-                            [HostPath::new(socket_path.to_string_lossy().into_owned()).unwrap()],
+                    .try_apply(
+                        &fixture.context_at_with_stop_receipt(
+                            [fixture.root_process_expectation().control_socket_path],
                             5,
                             13,
                         ),
                         &fixture.desired,
                     )
                     .unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
             );
             assert!(!socket_path.exists());
             assert!(
@@ -3687,12 +4507,12 @@ mod tests {
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
             assert_eq!(
                 finish
-                    .apply(
-                        fixture.context_at_with_stop_receipt([], 6, 14),
+                    .try_apply(
+                        &fixture.context_at_with_stop_receipt([], 6, 14),
                         &fixture.desired,
                     )
                     .unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
             );
             assert!(!fixture.stop_receipt_path().exists());
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
@@ -3700,8 +4520,14 @@ mod tests {
             // A third accepted full owns the existing stale planner. Same
             // image rebinds; changed image writes CleanupRelease, and neither
             // disposition performs A22 or root-process I/O in this round.
+            let stale = fixture.dispatcher_with_retirement(
+                Arc::clone(&process),
+                Arc::new(FakeRetirementPort::absent()),
+                Arc::clone(&request),
+                Arc::clone(&mutations),
+            );
             assert_eq!(
-                finish
+                stale
                     .apply(fixture.context_at(Vec::new(), 7, 15), &fixture.desired)
                     .unwrap(),
                 RuntimeDesiredEffectOutcome::RefreshInventory
@@ -3740,9 +4566,7 @@ mod tests {
 
     #[test]
     fn receipt_cleanup_allows_lease_renewal_but_preserves_on_authority_drift() {
-        let (fixture, process, request, listener) = stopped_receipt_fixture();
-        let socket_path = fixture.control_socket_path();
-        drop(listener);
+        let (fixture, process, request) = stopped_receipt_fixture();
         fixture
             .authority
             .set_lease_expiry(unix_ms(1_900_000_120_000));
@@ -3755,7 +4579,7 @@ mod tests {
             recovery.recover_one(recovery_context(&fixture)).unwrap(),
             RuntimePreScanRecoveryOutcome::NoChange
         );
-        assert!(socket_path.exists());
+        assert!(fixture.stop_receipt_path().exists());
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
         let effect = fixture.effect_with_ports(
             Arc::clone(&process) as Arc<dyn RootProvisionProcessPort>,
@@ -3765,25 +4589,19 @@ mod tests {
         assert_eq!(
             effect
                 .try_apply(
-                    &fixture.context_at_with_stop_receipt(
-                        [HostPath::new(socket_path.to_string_lossy().into_owned()).unwrap()],
-                        5,
-                        13,
-                    ),
+                    &fixture.context_at_with_stop_receipt([], 5, 13),
                     &fixture.desired,
                 )
                 .unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
-        assert!(!socket_path.exists());
+        assert!(!fixture.stop_receipt_path().exists());
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
 
         for drift in ["owner", "head", "marker", "lease_rollback"] {
-            let (fixture, process, request, listener) = stopped_receipt_fixture();
-            let socket_path = fixture.control_socket_path();
-            drop(listener);
+            let (fixture, process, request) = stopped_receipt_fixture();
             match drift {
                 "owner" => fixture.authority.set_owner(id("att_foreign")),
                 "head" => {
@@ -3813,9 +4631,8 @@ mod tests {
             assert_eq!(
                 recovery.recover_one(recovery_context(&fixture)).unwrap(),
                 RuntimePreScanRecoveryOutcome::NoChange,
-                "{drift} drift must preserve the receipted socket"
+                "{drift} drift must preserve the receipted managed owner"
             );
-            assert!(socket_path.exists());
             assert!(fixture.stop_receipt_path().exists());
             assert_eq!(
                 retirement.calls.load(Ordering::SeqCst),
@@ -3837,9 +4654,6 @@ mod tests {
         fixture
             .authority
             .set_lease_expiry(unix_ms(receipted_expiry));
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
@@ -3896,7 +4710,6 @@ mod tests {
             receipt_before
         );
 
-        drop(listener);
         let cleanup_retirement = Arc::new(FakeRetirementPort::absent());
         let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
             Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
@@ -3907,7 +4720,6 @@ mod tests {
             RuntimePreScanRecoveryOutcome::NoChange
         );
         assert_eq!(cleanup_retirement.calls.load(Ordering::SeqCst), 0);
-        assert!(socket_path.exists());
         assert_eq!(
             std::fs::read(fixture.stop_receipt_path()).unwrap(),
             receipt_before
@@ -3925,9 +4737,6 @@ mod tests {
         artifact_fixture
             .authority
             .set_lease_expiry(unix_ms(artifact_expiry - 1));
-        let artifact_socket = artifact_fixture.control_socket_path();
-        let artifact_listener = UnixListener::bind(&artifact_socket).unwrap();
-        std::fs::set_permissions(&artifact_socket, std::fs::Permissions::from_mode(0o700)).unwrap();
         let artifact_process = Arc::new(FakeProcessPort::exact(41, 42));
         let artifact_retirement = Arc::new(FakeRetirementPort::exact());
         let artifact_request = Arc::new(FakeRequestPort {
@@ -3955,16 +4764,12 @@ mod tests {
         assert_eq!(artifact_retirement.calls.load(Ordering::SeqCst), 0);
         assert_eq!(artifact_process.stops.load(Ordering::SeqCst), 0);
         assert!(!artifact_fixture.stop_receipt_path().exists());
-        drop(artifact_listener);
     }
 
     #[test]
     fn receipt_publication_atomically_preserves_conflict_and_recovers_exact_eexist() {
         for exact_replay in [false, true] {
             let fixture = same_image_superseded_fixture();
-            let socket_path = fixture.control_socket_path();
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
             let process = Arc::new(FakeProcessPort::exact(41, 42));
             let retirement = Arc::new(FakeRetirementPort::exact());
             let request = Arc::new(FakeRequestPort {
@@ -4029,131 +4834,6 @@ mod tests {
                 assert_eq!(std::fs::read(&target).unwrap(), b"foreign receipt");
                 assert!(temporary.exists());
             }
-            drop(listener);
-        }
-    }
-
-    #[test]
-    fn socket_claim_final_window_never_unlinks_a_replacement_inode() {
-        // Positive calibration: the ordinary refused receipted inode is
-        // claimed and removed through the same quarantine path.
-        let (calibration, _, _, calibration_listener) = stopped_receipt_fixture();
-        let calibration_store = AuthorizedBlockdStore::new(calibration.state.clone());
-        let calibration_retained = calibration_store
-            .retain_exact_runtime_checkpoint(&calibration.checkpoint)
-            .unwrap();
-        let calibration_receipt = match calibration_retained.settle_stop_receipt().unwrap() {
-            StopReceiptSettlement::Stable(receipt) => receipt,
-            _ => panic!("positive calibration requires a stable stop receipt"),
-        };
-        drop(calibration_listener);
-        assert_eq!(
-            calibration_retained
-                .remove_exact_stale_control_socket(calibration_receipt.socket())
-                .unwrap(),
-            super::super::authorized_blockd::ExactControlSocketCleanup::Removed
-        );
-        assert!(!calibration.control_socket_path().exists());
-
-        let (fixture, process, request, listener) = stopped_receipt_fixture();
-        let socket_path = fixture.control_socket_path();
-        let old_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
-        let retained = AuthorizedBlockdStore::new(fixture.state.clone())
-            .retain_exact_runtime_checkpoint(&fixture.checkpoint)
-            .unwrap();
-        let receipt = match retained.settle_stop_receipt().unwrap() {
-            StopReceiptSettlement::Stable(receipt) => receipt,
-            _ => panic!("replacement barrier requires a stable stop receipt"),
-        };
-        drop(listener);
-        let moved_old = socket_path.with_file_name(".test-old-root-provision.sock");
-        let socket_for_hook = socket_path.clone();
-        let moved_for_hook = moved_old.clone();
-        let replacement = Arc::new(Mutex::new(None));
-        let replacement_for_hook = Arc::clone(&replacement);
-        let outcome = retained
-            .remove_exact_stale_control_socket_with_hook(receipt.socket(), move || {
-                std::fs::rename(&socket_for_hook, &moved_for_hook).unwrap();
-                let listener = UnixListener::bind(&socket_for_hook).unwrap();
-                std::fs::set_permissions(&socket_for_hook, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
-                *replacement_for_hook.lock().unwrap() = Some(listener);
-            })
-            .unwrap();
-        assert_eq!(
-            outcome,
-            super::super::authorized_blockd::ExactControlSocketCleanup::LiveOrChanged
-        );
-        let replacement_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
-        assert_ne!(old_inode, replacement_inode);
-        assert!(moved_old.exists());
-        assert!(fixture.stop_receipt_path().exists());
-        assert_eq!(process.stops.load(Ordering::SeqCst), 1);
-        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
-        assert!(!fixture
-            .control_socket_path()
-            .with_file_name(super::super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE)
-            .exists());
-        std::fs::remove_file(moved_old).unwrap();
-        drop(replacement.lock().unwrap().take());
-    }
-
-    #[test]
-    fn socket_quarantine_crash_state_recovers_but_preserves_a_late_basename() {
-        for late_replacement in [false, true] {
-            let (fixture, process, request, listener) = stopped_receipt_fixture();
-            let socket_path = fixture.control_socket_path();
-            let old_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
-            drop(listener);
-            let quarantine = socket_path.with_file_name(
-                super::super::authorized_blockd::ROOT_PROVISION_STOP_SOCKET_QUARANTINE,
-            );
-            std::fs::rename(&socket_path, &quarantine).unwrap();
-            assert_eq!(
-                std::fs::symlink_metadata(&quarantine).unwrap().ino(),
-                old_inode,
-                "positive calibration: the crash fixture must retain the receipted inode"
-            );
-            let replacement = if late_replacement {
-                let listener = UnixListener::bind(&socket_path).unwrap();
-                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
-                assert_ne!(
-                    std::fs::symlink_metadata(&socket_path).unwrap().ino(),
-                    old_inode
-                );
-                Some(listener)
-            } else {
-                None
-            };
-            let retirement = Arc::new(FakeRetirementPort::absent());
-            let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
-                Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
-                Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
-            );
-            if late_replacement {
-                recovery
-                    .recover_one(recovery_context(&fixture))
-                    .expect_err("a late basename must conflict with the receipted quarantine");
-                assert!(socket_path.exists());
-                assert!(quarantine.exists());
-                assert_eq!(
-                    std::fs::symlink_metadata(&quarantine).unwrap().ino(),
-                    old_inode
-                );
-            } else {
-                assert_eq!(
-                    recovery.recover_one(recovery_context(&fixture)).unwrap(),
-                    RuntimePreScanRecoveryOutcome::NoChange
-                );
-                assert!(!socket_path.exists());
-                assert!(quarantine.exists());
-            }
-            assert!(fixture.stop_receipt_path().exists());
-            assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(process.stops.load(Ordering::SeqCst), 1);
-            assert_eq!(request.calls.load(Ordering::SeqCst), 0);
-            drop(replacement);
         }
     }
 
@@ -4188,10 +4868,11 @@ mod tests {
         );
 
         let mut fixture = Fixture::new_with_desired(old_desired);
-        let launch_checkpoint_path = fixture
-            .control_socket_path()
-            .parent()
-            .unwrap()
+        let ReconcileStep::ProvisionRootImage { data_directory, .. } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        let launch_checkpoint_path = Path::new(data_directory.as_str())
             .join(super::super::authorized_blockd::LAUNCH_CHECKPOINT_FILE);
         let launch_checkpoint_bytes = std::fs::read(&launch_checkpoint_path).unwrap();
         assert!(launch_checkpoint_bytes.len() > desired_bytes.len());
@@ -4205,9 +4886,6 @@ mod tests {
         fixture.desired.runtime.memory_bytes += 4096;
         fixture.desired.spec_digest = spec_digest(&fixture.desired).unwrap();
         fixture.blob = Arc::new(ExactBlob::new(&fixture.desired));
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
         let request = Arc::new(FakeRequestPort {
             authority: Arc::clone(&fixture.authority),
@@ -4262,13 +4940,22 @@ mod tests {
         );
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
-        drop(listener);
     }
 
     #[test]
     fn late_live_socket_with_new_inode_is_never_removed_by_old_receipt() {
-        let (fixture, process, request, listener) = stopped_receipt_fixture();
-        let socket_path = fixture.control_socket_path();
+        let (fixture, process, request) = stopped_receipt_fixture();
+        let managed = IsolatedManagedRootOwner::from_installed_expectation(
+            &fixture.root_process_expectation(),
+        );
+        let prepared = managed.prepare();
+        let socket_path = PathBuf::from(prepared.control_socket_path().as_str());
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let receipted_owner = prepared
+            .retain_root_stop_owner_evidence(&managed.boot)
+            .unwrap();
+        drop(prepared);
         let old_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
         drop(listener);
         let external = tempfile::Builder::new()
@@ -4286,13 +4973,12 @@ mod tests {
         );
         std::fs::remove_file(retained_old_path).unwrap();
 
-        let retirement = Arc::new(FakeRetirementPort::absent());
-        let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
-            Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
-            Arc::clone(&retirement) as Arc<dyn RootProvisionProcessRetirementPort>,
-        );
-        recovery
-            .recover_one(recovery_context(&fixture))
+        let snapshot = managed
+            .root
+            .capture_closed_whole_root(&managed.intents, &[managed.intent.clone()])
+            .unwrap();
+        snapshot
+            .bind_root_stop_owner(&receipted_owner)
             .expect_err("a replacement inode must conflict with the durable receipt");
         assert!(socket_path.exists());
         assert_eq!(
@@ -4300,7 +4986,6 @@ mod tests {
             new_inode
         );
         assert!(fixture.stop_receipt_path().exists());
-        assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         drop(replacement);
@@ -4320,9 +5005,6 @@ mod tests {
                 .join(format!("cat-{}.checkpoint.json", fixture.desired.cat_id));
             let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
             let authority_before = fixture.authority.record();
-            let socket_path = fixture.control_socket_path();
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
             let process = Arc::new(FakeProcessPort::exact(41, 42));
             let retirement = Arc::new(FakeRetirementPort::with_inspection(inspection));
             let request = Arc::new(FakeRequestPort {
@@ -4353,14 +5035,14 @@ mod tests {
             assert!(!fixture.stop_receipt_path().exists());
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
             assert_eq!(fixture.authority.record(), authority_before);
-            drop(listener);
         }
 
         let fixture = same_image_superseded_fixture();
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let data_directory = socket_path.parent().unwrap();
+        let ReconcileStep::ProvisionRootImage { data_directory, .. } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        let data_directory = Path::new(data_directory.as_str());
         std::fs::set_permissions(data_directory, std::fs::Permissions::from_mode(0o4700)).unwrap();
         let process = Arc::new(FakeProcessPort::exact(41, 42));
         let retirement = Arc::new(FakeRetirementPort::exact());
@@ -4391,19 +5073,15 @@ mod tests {
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert!(!fixture.stop_receipt_path().exists());
         std::fs::set_permissions(data_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        drop(listener);
 
         let fixture = same_image_superseded_fixture();
-        let socket_path = fixture.control_socket_path();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let volume_directory = socket_path
-            .ancestors()
-            .find(|path| {
-                path.file_name()
-                    .is_some_and(|name| name == std::ffi::OsStr::new("volume-vol_root"))
-            })
-            .unwrap()
+        let ReconcileStep::ProvisionRootImage { data_directory, .. } = &fixture.checkpoint.step
+        else {
+            unreachable!()
+        };
+        let volume_directory = Path::new(data_directory.as_str())
+            .parent()
+            .expect("authorized data directory has a retained Volume parent")
             .to_path_buf();
         let moved_directory = volume_directory.with_file_name("volume-moved");
         let current_directory = volume_directory.clone();
@@ -4441,14 +5119,12 @@ mod tests {
         assert_eq!(process.stops.load(Ordering::SeqCst), 0);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert!(!fixture.stop_receipt_path().exists());
-        drop(listener);
     }
 
     #[test]
     fn receipt_publication_and_socket_unlink_response_loss_recover_one_effect_per_round() {
         for target_also_exists in [false, true] {
-            let (fixture, process, request, listener) = stopped_receipt_fixture();
-            drop(listener);
+            let (fixture, process, request) = stopped_receipt_fixture();
             let target = fixture.stop_receipt_path();
             let temporary = target
                 .with_file_name(super::super::authorized_blockd::ROOT_PROVISION_STOP_RECEIPT_TEMP);
@@ -4472,7 +5148,6 @@ mod tests {
             );
             assert!(target.exists());
             assert!(!temporary.exists());
-            assert!(fixture.control_socket_path().exists());
             assert_eq!(
                 retirement.calls.load(Ordering::SeqCst),
                 0,
@@ -4485,7 +5160,6 @@ mod tests {
                 recovery.recover_one(recovery_context(&fixture)).unwrap(),
                 RuntimePreScanRecoveryOutcome::NoChange
             );
-            assert!(fixture.control_socket_path().exists());
             assert!(target.exists());
             assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
             let effect = fixture.effect_with_ports(
@@ -4496,27 +5170,17 @@ mod tests {
             assert_eq!(
                 effect
                     .try_apply(
-                        &fixture.context_at_with_stop_receipt(
-                            [HostPath::new(
-                                fixture.control_socket_path().to_string_lossy().into_owned(),
-                            )
-                            .unwrap()],
-                            5,
-                            13,
-                        ),
+                        &fixture.context_at_with_stop_receipt([], 5, 13),
                         &fixture.desired,
                     )
                     .unwrap(),
                 Some(RuntimeDesiredEffectOutcome::RefreshInventory)
             );
-            assert!(!fixture.control_socket_path().exists());
+            assert!(!target.exists());
             assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         }
 
-        let (fixture, process, request, listener) = stopped_receipt_fixture();
-        let socket_path = fixture.control_socket_path();
-        drop(listener);
-        std::fs::remove_file(&socket_path).unwrap();
+        let (fixture, process, request) = stopped_receipt_fixture();
         let retirement = Arc::new(FakeRetirementPort::absent());
         let recovery = SignedRunningPublicationRecovery::with_root_process_retirement(
             Arc::clone(&fixture.authority) as Arc<dyn VolumeDataAuthority>,
@@ -4525,9 +5189,8 @@ mod tests {
         assert_eq!(
             recovery.recover_one(recovery_context(&fixture)).unwrap(),
             RuntimePreScanRecoveryOutcome::NoChange,
-            "an acknowledgement-lost unlink remains effect work for a fresh full scan"
+            "an acknowledgement-lost owner retirement remains effect work for a fresh full scan"
         );
-        assert!(!socket_path.exists());
         assert!(fixture.stop_receipt_path().exists());
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
 

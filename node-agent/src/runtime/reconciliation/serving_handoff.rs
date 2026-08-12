@@ -3873,6 +3873,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -3905,6 +3906,11 @@ mod tests {
 
     use super::*;
     use crate::ch::{ChNetwork, PendingTap, TapCreatePort};
+    use crate::runtime::reconciliation::blockd_socket_namespace::{
+        BlockdSocketIntentStore, BlockdSocketOwnershipIntentV1, BlockdSocketPostSubmitOutcome,
+        CurrentBlockdSocketBoot, ExactManagedBlockdSocketOwnerStartAbsence,
+        ManagedBlockdSocketOwnerRetirement, RetainedManagedBlockdSocketRoot,
+    };
     use crate::runtime::reconciliation::inventory::AuthorityVolumeInventoryEvidence;
     use crate::runtime::reconciliation::kernel_nbd::{
         attach_port_sealed as kernel_attach_sealed, KernelNbdAttachConflict, KernelNbdAttachEffect,
@@ -3969,19 +3975,333 @@ mod tests {
         RuntimeDesiredEffectStopReason, RuntimePhysicalReadContext,
     };
 
-    #[derive(Default)]
+    /// One isolated, physically real analogue of the production managed Root
+    /// socket namespace. Test process ports share this object so an `Absent`
+    /// result, owner retirement, and a later target-control start cross the
+    /// same descriptor-retained automaton as the platform bridge.
+    struct IsolatedManagedRootOwner {
+        _temporary: tempfile::TempDir,
+        root: Arc<RetainedManagedBlockdSocketRoot>,
+        intents: Arc<BlockdSocketIntentStore>,
+        boot: CurrentBlockdSocketBoot,
+        intent: BlockdSocketOwnershipIntentV1,
+        listener: Mutex<Option<UnixListener>>,
+    }
+
+    impl IsolatedManagedRootOwner {
+        fn new(checkpoint: &RuntimeCheckpoint) -> Self {
+            let temporary = tempfile::Builder::new()
+                .prefix("shm-")
+                .tempdir_in("/private/tmp")
+                .or_else(|_| tempfile::Builder::new().prefix("shm-").tempdir_in("/tmp"))
+                .unwrap();
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let root = Arc::new(
+                RetainedManagedBlockdSocketRoot::provision_for_test(&temporary.path().join("s"))
+                    .unwrap(),
+            );
+            let intent_state = temporary.path().join("state");
+            std::fs::create_dir(&intent_state).unwrap();
+            std::fs::set_permissions(&intent_state, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let intents = Arc::new(
+                BlockdSocketIntentStore::provision_for_test(StateDirectory::unanchored(
+                    intent_state,
+                ))
+                .unwrap(),
+            );
+            #[cfg(target_os = "linux")]
+            let node_boot_id =
+                super::super::vmm_socket_namespace::current_kernel_node_boot_id().unwrap();
+            #[cfg(not(target_os = "linux"))]
+            let node_boot_id = NodeBootId::new("11111111111111111111111111111111").unwrap();
+            let boot = CurrentBlockdSocketBoot::for_test(node_boot_id);
+            let ReconcileStep::ProvisionRootImage {
+                provision_transition_id,
+                control_socket_path,
+                ..
+            } = &checkpoint.step
+            else {
+                unreachable!("managed Root fixture requires ProvisionRootImage")
+            };
+            let provision_transition_id = provision_transition_id.clone();
+            let installed =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&provision_transition_id)
+                    .unwrap()
+                    .control_socket()
+                    .clone();
+            assert_eq!(control_socket_path, &installed);
+            let owner_authority_digest = provision_root_authorization_context_digest(checkpoint)
+                .unwrap()
+                .as_sha256_digest()
+                .clone();
+            let intent = BlockdSocketOwnershipIntentV1::root(
+                &root,
+                &boot,
+                provision_transition_id,
+                owner_authority_digest,
+            )
+            .unwrap();
+            intents.publish(&intent, &root, &boot).unwrap();
+            let prepared = root
+                .prepare_existing_intent(&intents, &intent, &boot)
+                .unwrap();
+            let listener =
+                UnixListener::bind(Path::new(prepared.control_socket_path().as_str())).unwrap();
+            UnixStream::connect(Path::new(prepared.control_socket_path().as_str()))
+                .expect("known-positive isolated managed Root listener must accept connects");
+            prepared
+                .assert_post_submit_owner_current(
+                    &boot,
+                    BlockdSocketPostSubmitOutcome::HandshakeVerified,
+                )
+                .unwrap();
+            drop(prepared);
+            Self {
+                _temporary: temporary,
+                root,
+                intents,
+                boot,
+                intent,
+                listener: Mutex::new(Some(listener)),
+            }
+        }
+
+        fn shadow_expectation(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+        ) -> anyhow::Result<RootProvisionProcessExpectation> {
+            self.assert_same_owner(expected)?;
+            let mut shadow = expected.clone();
+            shadow.control_socket_path = self.intent.control_socket_path().clone();
+            let mut installed = shadow.clone();
+            installed.control_socket_path = expected.control_socket_path.clone();
+            anyhow::ensure!(
+                installed == *expected
+                    && shadow.cat_id == expected.cat_id
+                    && shadow.provision_transition_id == expected.provision_transition_id
+                    && shadow.socket_owner_authority_digest
+                        == expected.socket_owner_authority_digest,
+                "isolated Root shadow changed more than its physical socket mapping"
+            );
+            Ok(shadow)
+        }
+
+        fn assert_same_owner(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+        ) -> anyhow::Result<()> {
+            let installed =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .root_paths(&expected.provision_transition_id)?;
+            let isolated = self
+                .root
+                .planner()
+                .root_paths(&expected.provision_transition_id)?;
+            anyhow::ensure!(
+                self.intent.owner_authority_digest() == &expected.socket_owner_authority_digest
+                    && installed.control_socket() == &expected.control_socket_path
+                    && self.intent.control_socket_path() == isolated.control_socket()
+                    && matches!(
+                        self.intent.owner(),
+                        super::super::blockd_socket_namespace::BlockdSocketOwnerV1::Root {
+                            provision_transition_id,
+                        } if provision_transition_id == &expected.provision_transition_id
+                    ),
+                "isolated managed Root fixture changed owner generation"
+            );
+            Ok(())
+        }
+
+        fn drop_listener_preserving_path(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+        ) -> anyhow::Result<()> {
+            self.assert_same_owner(expected)?;
+            if self.listener.lock().unwrap().take().is_some() {
+                let socket_path = Path::new(self.intent.control_socket_path().as_str());
+                anyhow::ensure!(
+                    socket_path.exists(),
+                    "managed Root listener pathname disappeared while its process became absent"
+                );
+                anyhow::ensure!(
+                    UnixStream::connect(socket_path).is_err(),
+                    "managed Root listener still accepted connects after its process became absent"
+                );
+            }
+            Ok(())
+        }
+
+        fn sealed_absence(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
+            self.assert_same_owner(expected)?;
+            let accepted = context.accepted_full()?;
+            anyhow::ensure!(
+                accepted.observation().node_boot_id == *self.boot.node_boot_id(),
+                "isolated managed Root fixture names another Node boot"
+            );
+            let admission = context.node_global_process()?;
+            anyhow::ensure!(
+                admission.matches_observation(accepted.observation()),
+                "isolated managed Root fixture is not bound to the accepted full observation"
+            );
+            anyhow::ensure!(
+                admission
+                    .root_control(&expected.cat_id)
+                    .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+                "isolated managed Root absence is not the exact accepted absent owner"
+            );
+            let node_global_effect = context.lock_node_global_effect()?;
+            let control_socket = Path::new(self.intent.control_socket_path().as_str());
+            anyhow::ensure!(
+                UnixStream::connect(control_socket).is_err(),
+                "isolated managed Root listener is present before the absence sweep"
+            );
+            let capture =
+                self.root
+                    .capture_start_absence(&self.intents, &self.intent, &self.boot)?;
+            let (root_expectations, _) = admission.root_control_state();
+            let (serving_expectations, _) = admission.serving_blockd_state();
+            let mut expected_intents = root_expectations
+                .values()
+                .map(|root_expectation| {
+                    let installed =
+                        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                            .root_paths(&root_expectation.provision_transition_id)?;
+                    anyhow::ensure!(
+                        installed.control_socket() == &root_expectation.control_socket_path,
+                        "accepted Root checkpoint socket is outside the installed managed mapping"
+                    );
+                    let intent = BlockdSocketOwnershipIntentV1::root(
+                        &self.root,
+                        &self.boot,
+                        root_expectation.provision_transition_id.clone(),
+                        root_expectation.socket_owner_authority_digest.clone(),
+                    )?;
+                    Ok(intent)
+                })
+                .chain(serving_expectations.values().map(|serving_expectation| {
+                    let installed =
+                        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                            .serving_paths(serving_expectation.device_ownership_token())?;
+                    anyhow::ensure!(
+                        installed.control_socket() == serving_expectation.control_socket_path()
+                            && installed.io_socket() == serving_expectation.listener_path(),
+                        "accepted Serving checkpoint sockets are outside the installed managed mapping"
+                    );
+                    let intent = BlockdSocketOwnershipIntentV1::serving(
+                        &self.root,
+                        &self.boot,
+                        serving_expectation.device_ownership_token().clone(),
+                        super::super::blockd_socket_namespace::serving_socket_owner_authority_digest(
+                            serving_expectation.prepared_device(),
+                        )?,
+                    )?;
+                    Ok(intent)
+                }))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if !expected_intents.iter().any(|intent| intent == &self.intent) {
+                expected_intents.push(self.intent.clone());
+            }
+            let before = self
+                .root
+                .capture_closed_whole_root(&self.intents, &expected_intents)?;
+            anyhow::ensure!(
+                UnixStream::connect(control_socket).is_err(),
+                "isolated managed Root listener appeared during the absence sweep"
+            );
+            let after = self
+                .root
+                .capture_closed_whole_root(&self.intents, &expected_intents)?;
+            anyhow::ensure!(
+                UnixStream::connect(control_socket).is_err(),
+                "isolated managed Root listener appeared after the absence sweep"
+            );
+            ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                capture,
+                before,
+                after,
+                &self.boot,
+                node_global_effect,
+            )
+        }
+
+        fn retire_absent_owner(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+            let absence = self.sealed_absence(expected, context)?;
+            self.root
+                .retire_absent_owner(&self.intents, &self.intent, &self.boot, absence)
+        }
+
+        fn submit_target(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            absence: ExactManagedBlockdSocketOwnerStartAbsence,
+            outcome: EffectTargetProcessOutcome,
+        ) -> anyhow::Result<()> {
+            let shadow = self.shadow_expectation(expected)?;
+            anyhow::ensure!(
+                self.intent.control_socket_path() == &shadow.control_socket_path,
+                "target start did not retain its exact isolated Root shadow"
+            );
+            anyhow::ensure!(
+                self.listener.lock().unwrap().is_none(),
+                "isolated managed Root fixture still retains a live predecessor listener"
+            );
+            let prepared = self.root.prepare_absent_owner_for_start(
+                &self.intents,
+                &self.intent,
+                &self.boot,
+                absence,
+            )?;
+            match outcome {
+                EffectTargetProcessOutcome::CancelledClean => {
+                    prepared.assert_post_submit_owner_current(
+                        &self.boot,
+                        BlockdSocketPostSubmitOutcome::DefinitelyNotStarted,
+                    )?;
+                }
+                EffectTargetProcessOutcome::ResponseLost | EffectTargetProcessOutcome::Started => {
+                    let listener =
+                        UnixListener::bind(Path::new(prepared.control_socket_path().as_str()))?;
+                    prepared.assert_post_submit_owner_current(
+                        &self.boot,
+                        if matches!(outcome, EffectTargetProcessOutcome::Started) {
+                            BlockdSocketPostSubmitOutcome::HandshakeVerified
+                        } else {
+                            BlockdSocketPostSubmitOutcome::MayHaveStarted
+                        },
+                    )?;
+                    *self.listener.lock().unwrap() = Some(listener);
+                }
+            }
+            Ok(())
+        }
+    }
+
     struct RetirementProcessPort {
         inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
         inspect_calls: Mutex<usize>,
+        managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
     impl RetirementProcessPort {
         fn with_inspections(
+            fixture: &Fixture,
             inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
         ) -> Self {
             Self {
                 inspections: Mutex::new(inspections.into_iter().collect()),
                 inspect_calls: Mutex::new(0),
+                managed_root: Arc::clone(&fixture.managed_root),
             }
         }
 
@@ -3995,16 +4315,20 @@ mod tests {
     impl RootProvisionProcessRetirementPort for RetirementProcessPort {
         fn inspect_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             _context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             *self.inspect_calls.lock().unwrap() += 1;
-            Ok(self
+            let inspection = self
                 .inspections
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(RootProvisionProcessInspection::Unavailable))
+                .unwrap_or(RootProvisionProcessInspection::Unavailable);
+            if matches!(inspection, RootProvisionProcessInspection::Absent) {
+                self.managed_root.drop_listener_preserving_path(expected)?;
+            }
+            Ok(inspection)
         }
     }
 
@@ -4116,21 +4440,27 @@ mod tests {
     struct EffectGlobalProcessPort {
         inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
         calls: AtomicUsize,
+        managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
     impl EffectGlobalProcessPort {
         fn inspect_one(
             &self,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self
+            let inspection = self
                 .inspections
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(RootProvisionProcessInspection::Unavailable))
+                .unwrap_or(RootProvisionProcessInspection::Unavailable);
+            if matches!(inspection, RootProvisionProcessInspection::Absent) {
+                self.managed_root.drop_listener_preserving_path(expected)?;
+            }
+            Ok(inspection)
         }
     }
 
@@ -4140,20 +4470,39 @@ mod tests {
     impl RootProvisionProcessRetirementPort for EffectGlobalProcessPort {
         fn inspect_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            self.inspect_one(context)
+            self.inspect_one(expected, context)
+        }
+
+        fn retire_absent_socket_owner(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<ManagedBlockdSocketOwnerRetirement> {
+            self.managed_root.retire_absent_owner(expected, context)
+        }
+
+        fn retain_start_socket_absence(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+            self.managed_root.drop_listener_preserving_path(expected)?;
+            self.managed_root
+                .sealed_absence(expected, context)
+                .map(Some)
         }
     }
 
     impl RootProvisionProcessGlobalPort for EffectGlobalProcessPort {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            self.inspect_one(context)
+            self.inspect_one(expected, context)
         }
     }
 
@@ -4161,18 +4510,24 @@ mod tests {
         inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
         calls: AtomicUsize,
         after_sweep: Mutex<Option<TestMutation>>,
+        managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
     impl RetirementEffectGlobalPort {
-        fn new(inspections: impl IntoIterator<Item = RootProvisionProcessInspection>) -> Self {
+        fn new(
+            fixture: &Fixture,
+            inspections: impl IntoIterator<Item = RootProvisionProcessInspection>,
+        ) -> Self {
             Self {
                 inspections: Mutex::new(inspections.into_iter().collect()),
                 calls: AtomicUsize::new(0),
                 after_sweep: Mutex::new(None),
+                managed_root: Arc::clone(&fixture.managed_root),
             }
         }
 
         fn with_after_sweep(
+            fixture: &Fixture,
             inspection: RootProvisionProcessInspection,
             after_sweep: impl FnOnce() + Send + 'static,
         ) -> Self {
@@ -4180,11 +4535,13 @@ mod tests {
                 inspections: Mutex::new([inspection].into()),
                 calls: AtomicUsize::new(0),
                 after_sweep: Mutex::new(Some(Box::new(after_sweep))),
+                managed_root: Arc::clone(&fixture.managed_root),
             }
         }
 
         fn inspect_one(
             &self,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
@@ -4198,6 +4555,9 @@ mod tests {
             if let Some(after_sweep) = self.after_sweep.lock().unwrap().take() {
                 after_sweep();
             }
+            if matches!(inspection, RootProvisionProcessInspection::Absent) {
+                self.managed_root.drop_listener_preserving_path(expected)?;
+            }
             Ok(inspection)
         }
     }
@@ -4208,20 +4568,28 @@ mod tests {
     impl RootProvisionProcessRetirementPort for RetirementEffectGlobalPort {
         fn inspect_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            self.inspect_one(context)
+            self.inspect_one(expected, context)
+        }
+
+        fn retire_absent_socket_owner(
+            &self,
+            expected: &RootProvisionProcessExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<ManagedBlockdSocketOwnerRetirement> {
+            self.managed_root.retire_absent_owner(expected, context)
         }
     }
 
     impl RootProvisionProcessGlobalPort for RetirementEffectGlobalPort {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
-            self.inspect_one(context)
+            self.inspect_one(expected, context)
         }
     }
 
@@ -4287,6 +4655,7 @@ mod tests {
     struct AuthorityDriftingGlobalPort {
         authority: Arc<FixedEffectAuthority>,
         drift: AuthorityDrift,
+        managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
     impl root_process_global_sealed::Sealed for AuthorityDriftingGlobalPort {}
@@ -4295,10 +4664,11 @@ mod tests {
     impl RootProvisionProcessRetirementPort for AuthorityDriftingGlobalPort {
         fn inspect_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
+            self.managed_root.drop_listener_preserving_path(expected)?;
             Ok(RootProvisionProcessInspection::Unavailable)
         }
     }
@@ -4306,7 +4676,7 @@ mod tests {
     impl RootProvisionProcessGlobalPort for AuthorityDriftingGlobalPort {
         fn inspect_exact_or_absent_after_node_global_sweep(
             &self,
-            _expected: &RootProvisionProcessExpectation,
+            expected: &RootProvisionProcessExpectation,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessInspection> {
             context.check_active()?;
@@ -4317,6 +4687,7 @@ mod tests {
                     record.lease_owner = Some(id("att_foreign"));
                 }
             }
+            self.managed_root.drop_listener_preserving_path(expected)?;
             Ok(RootProvisionProcessInspection::Absent)
         }
     }
@@ -4325,6 +4696,7 @@ mod tests {
         starts: AtomicUsize,
         evidence: RootProvisionProcessEvidence,
         outcome: EffectTargetProcessOutcome,
+        managed_root: Arc<IsolatedManagedRootOwner>,
     }
 
     #[derive(Clone, Copy)]
@@ -4339,16 +4711,28 @@ mod tests {
     impl TargetControlProcessPort for EffectTargetProcessPort {
         fn start_target_checkpointed(
             &self,
-            checkpointed: CheckpointedTargetControlProcess<'_>,
+            mut checkpointed: CheckpointedTargetControlProcess<'_>,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<RootProvisionProcessStart> {
             context.check_active()?;
             checkpointed.assert_current()?;
+            let socket_absence = checkpointed
+                .take_socket_absence()
+                .context("fake target start lacks the real managed Root absence capability")?;
             self.starts.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 self.evidence.exactly_matches(checkpointed.expected()),
                 "fake target process evidence is not exact"
             );
+            // The fake systemd edge returns the installed-path evidence that
+            // production matches. Before doing so, consume the same real
+            // managed-owner automaton in an isolated shadow namespace; Linux
+            // systemd acceptance covers the installed pathname end to end.
+            self.managed_root.submit_target(
+                checkpointed.expected(),
+                socket_absence,
+                self.outcome,
+            )?;
             match self.outcome {
                 EffectTargetProcessOutcome::ResponseLost => {
                     return Ok(RootProvisionProcessStart::Ambiguous)
@@ -4368,6 +4752,7 @@ mod tests {
 
     struct Fixture {
         _root: tempfile::TempDir,
+        managed_root: Arc<IsolatedManagedRootOwner>,
         state_directory: StateDirectory,
         checkpoint_directory: PathBuf,
         data_directory: PathBuf,
@@ -4536,93 +4921,142 @@ mod tests {
         let node_global_process = if bind_node_global_process
             && matches!(
                 checkpoint.step,
-                ReconcileStep::PrepareDevice { .. }
+                ReconcileStep::ProvisionRootImage { .. }
+                    | ReconcileStep::PrepareDevice { .. }
                     | ReconcileStep::PrepareNetwork { .. }
                     | ReconcileStep::StartRuntime { .. }
             ) {
-            let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
-                .retain_prepare_device_handoff(checkpoint, desired)
-                .unwrap();
-            let ready = fixture
-                .store()
-                .reopen_prepare_device_handoff(
-                    checkpoint,
-                    desired,
-                    &fixture.authority.volume,
-                    retained,
-                )
-                .unwrap();
-            let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint).unwrap();
-            let root_expectation = RootProvisionProcessExpectation::from_retained_prepare_device(
-                &prepared_checkpoint,
-                desired,
-                ready.attempt(),
-            )
-            .unwrap();
-            let root_proof = root_expectation
-                .clone()
-                .prove_exact_process(fixture.process.clone())
-                .unwrap();
-            let root_public = root_proof.clone().into_process_evidence();
-            let root_exact = processes
-                .iter()
-                .any(|process| process == &root_public)
-                .then_some(root_proof);
-
-            let serving_expectation =
-                if matches!(&checkpoint.step, ReconcileStep::StartRuntime { .. }) {
-                    ServingBlockdExpectation::from_running_handoff(
-                        &ready,
-                        &serving_systemd_config(fixture),
+            let mut root_expectation =
+                if matches!(checkpoint.step, ReconcileStep::ProvisionRootImage { .. }) {
+                    RootProvisionProcessExpectation::from_checkpoint(
                         checkpoint,
-                        desired,
-                        &fixture.authority.volume,
+                        RootProvisionAuthoritySnapshot {
+                            attachment: fixture.acquired.attachment.clone(),
+                            volume: &fixture.authority.volume,
+                        },
+                        fixture.expected_executable_path.clone(),
                     )
                     .unwrap()
                 } else {
-                    ServingBlockdExpectation::from_handoff(
-                        &ready,
-                        &serving_systemd_config(fixture),
+                    let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+                        .retain_prepare_device_handoff(checkpoint, desired)
+                        .unwrap();
+                    let ready = fixture
+                        .store()
+                        .reopen_prepare_device_handoff(
+                            checkpoint,
+                            desired,
+                            &fixture.authority.volume,
+                            retained,
+                        )
+                        .unwrap();
+                    let prepared_checkpoint = prepare_device_checkpoint_view(checkpoint).unwrap();
+                    RootProvisionProcessExpectation::from_retained_prepare_device(
+                        &prepared_checkpoint,
+                        desired,
+                        ready.attempt(),
+                    )
+                    .unwrap()
+            };
+            if matches!(checkpoint.step, ReconcileStep::ProvisionRootImage { .. }) {
+                match fixture
+                    .store()
+                    .reopen_target_control_authorization(
+                        &fixture.stored_checkpoint,
+                        &fixture.acquired,
+                        &fixture.authority,
+                    )
+                {
+                    Ok(ReopenedTargetControlAuthorization::Absent) => {}
+                    Ok(ReopenedTargetControlAuthorization::Exact(target)) => {
+                        root_expectation = root_expectation
+                            .with_target_control_launch(target_control_process_launch_identity(
+                                target.identity(),
+                            ))
+                            .unwrap();
+                    }
+                    Err(error) => panic!(
+                        "test inventory cannot bind a malformed target-control artifact: {error:#}"
+                    ),
+                }
+            }
+            let root_exact = root_expectation
+                .clone()
+                .prove_exact_process(fixture.process.clone())
+                .ok()
+                .filter(|proof| {
+                    let public = proof.clone().into_process_evidence();
+                    processes.iter().any(|process| process == &public)
+                });
+
+            let mut scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                BTreeMap::from([(desired.cat_id.clone(), root_expectation)]),
+                root_exact
+                    .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
+                    .unwrap_or_default(),
+            )
+            .unwrap();
+            if !matches!(checkpoint.step, ReconcileStep::ProvisionRootImage { .. }) {
+                let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+                    .retain_prepare_device_handoff(checkpoint, desired)
+                    .unwrap();
+                let ready = fixture
+                    .store()
+                    .reopen_prepare_device_handoff(
                         checkpoint,
                         desired,
                         &fixture.authority.volume,
+                        retained,
                     )
-                    .unwrap()
-                };
-            let serving_proof = serving_expectation
-                .clone()
-                .prove_exact_process(serving_expectation.exact_evidence_for_test(51))
-                .unwrap();
-            let serving_public = serving_proof.clone().into_process_evidence();
-            let serving_exact = processes
-                .iter()
-                .any(|process| process == &serving_public)
-                .then_some(serving_proof);
-            let serving_key = super::super::root_provision_process::ManagedServingKey::new(
-                desired.cat_id.clone(),
-                serving_expectation.volume_id().clone(),
-            );
-            if let Some((_, device)) = serving_exact
-                .as_ref()
-                .and_then(|proof| proof.vhost_device_projection())
-            {
-                observed_volume.devices = vec![device];
+                    .unwrap();
+                let serving_expectation =
+                    if matches!(&checkpoint.step, ReconcileStep::StartRuntime { .. }) {
+                        ServingBlockdExpectation::from_running_handoff(
+                            &ready,
+                            &serving_systemd_config(fixture),
+                            checkpoint,
+                            desired,
+                            &fixture.authority.volume,
+                        )
+                        .unwrap()
+                    } else {
+                        ServingBlockdExpectation::from_handoff(
+                            &ready,
+                            &serving_systemd_config(fixture),
+                            checkpoint,
+                            desired,
+                            &fixture.authority.volume,
+                        )
+                        .unwrap()
+                    };
+                let serving_proof = serving_expectation
+                    .clone()
+                    .prove_exact_process(serving_expectation.exact_evidence_for_test(51))
+                    .unwrap();
+                let serving_public = serving_proof.clone().into_process_evidence();
+                let serving_exact = processes
+                    .iter()
+                    .any(|process| process == &serving_public)
+                    .then_some(serving_proof);
+                let serving_key = ManagedServingKey::new(
+                    desired.cat_id.clone(),
+                    serving_expectation.volume_id().clone(),
+                );
+                if let Some((_, device)) = serving_exact
+                    .as_ref()
+                    .and_then(|proof| proof.vhost_device_projection())
+                {
+                    observed_volume.devices = vec![device];
+                }
+                scan = scan
+                    .with_serving_blockds(
+                        BTreeMap::from([(serving_key.clone(), serving_expectation)]),
+                        serving_exact
+                            .map(|proof| BTreeMap::from([(serving_key, proof)]))
+                            .unwrap_or_default(),
+                    )
+                    .unwrap();
             }
-            let scan =
-                super::super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
-                    BTreeMap::from([(desired.cat_id.clone(), root_expectation)]),
-                    root_exact
-                        .map(|proof| BTreeMap::from([(desired.cat_id.clone(), proof)]))
-                        .unwrap_or_default(),
-                )
-                .unwrap()
-                .with_serving_blockds(
-                    BTreeMap::from([(serving_key.clone(), serving_expectation)]),
-                    serving_exact
-                        .map(|proof| BTreeMap::from([(serving_key, proof)]))
-                        .unwrap_or_default(),
-                )
-                .unwrap();
             let scan = if matches!(checkpoint.step, ReconcileStep::StartRuntime { .. }) {
                 let checkpoint_path = host(
                     super::super::runtime_checkpoint_path(
@@ -4808,6 +5242,8 @@ mod tests {
         let mut observation = accepted.observation().clone();
         let mut attestation = accepted.attestation().clone();
         mutate(&mut session, &mut observation, &mut attestation);
+        let node_global_process = node_global_process
+            .and_then(|admission| admission.rebind_for_test(&observation).ok());
         let context = RuntimeDesiredEffectContext::for_test_with_admission(
             fixture.state_directory.clone(),
             Instant::now() + Duration::from_secs(10),
@@ -4832,6 +5268,7 @@ mod tests {
         let volume = &fixture.acquired.volume;
         let process_identity_token = random('7');
         let ownership_token = random('8');
+        let (serving_control_socket, serving_io_socket) = managed_serving_sockets(&ownership_token);
         let data_directory = host(fixture.data_directory.to_str().unwrap());
         checkpoint.step = ReconcileStep::PrepareDevice {
             devices: vec![PreparedDeviceInput {
@@ -4855,19 +5292,13 @@ mod tests {
                         "cats-serving-{}.service",
                         process_identity_token.as_str()
                     )),
-                    control_socket_path: host(&format!(
-                        "{}/serving-control.sock",
-                        fixture.data_directory.display()
-                    )),
+                    control_socket_path: serving_control_socket,
                     data_directory,
                     executable_path: fixture.expected_executable_path.clone(),
                     process_identity_token,
                 },
                 frontend: PrepareDeviceFrontend::VhostUserBlk {
-                    socket_path: host(&format!(
-                        "{}/serving-vhost.sock",
-                        fixture.data_directory.display()
-                    )),
+                    socket_path: serving_io_socket,
                     queues: 2,
                     queue_size: 256,
                 },
@@ -4951,17 +5382,34 @@ mod tests {
 
     fn complete_old_process_retirement(fixture: &mut Fixture) {
         advance_fixture_to_prepare_device(fixture);
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Absent,
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([]));
-        let effect = prepare_device_retirement_effect(fixture, global, process);
+        let effect = prepare_device_retirement_effect(fixture, global, process.clone());
         assert_eq!(
             effect
                 .try_apply(&absent_effect_context(fixture), &fixture.acquired.desired)
                 .unwrap(),
-            None
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+            "the first absent round must durably retire the real managed Root owner"
         );
+        assert!(!Path::new(fixture.managed_root.intent.control_socket_path().as_str()).exists());
+        assert_eq!(
+            effect
+                .try_apply(
+                    &successor_absent_effect_context(fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
+            None,
+            "a fresh accepted full may fall through only after owner retirement is already durable"
+        );
+        assert!(process.stopped().is_empty());
     }
 
     fn replace_with_kernel_nbd_prepare_device(fixture: &mut Fixture) {
@@ -4970,10 +5418,7 @@ mod tests {
             panic!("kernel-NBD test fixture is not at PrepareDevice")
         };
         devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
-            listener_socket_path: host(&format!(
-                "{}/serving-nbd.sock",
-                fixture.data_directory.display()
-            )),
+            listener_socket_path: managed_serving_sockets(&devices[0].ownership_token).1,
             device_path: host("/dev/nbd7"),
             direct: false,
         };
@@ -5011,6 +5456,7 @@ mod tests {
         starts: AtomicUsize,
         start: ServingBlockdProcessStart,
         before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        managed_owner: Mutex<Option<IsolatedManagedServingOwner>>,
     }
 
     #[derive(Clone, Copy)]
@@ -5033,7 +5479,21 @@ mod tests {
                 starts: AtomicUsize::new(0),
                 start,
                 before_start: Mutex::new(None),
+                managed_owner: Mutex::new(None),
             }
+        }
+
+        fn managed_owner<'a>(
+            slot: &'a mut Option<IsolatedManagedServingOwner>,
+            expected: &ServingBlockdExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<&'a mut IsolatedManagedServingOwner> {
+            if slot.is_none() {
+                *slot = Some(IsolatedManagedServingOwner::new(expected, context)?);
+            }
+            let owner = slot.as_mut().unwrap();
+            owner.assert_same_owner(expected)?;
+            Ok(owner)
         }
 
         fn inspection(
@@ -5131,22 +5591,45 @@ mod tests {
 
         fn start_checkpointed(
             &self,
-            checkpointed: CheckpointedServingBlockdProcess<'_>,
+            mut checkpointed: CheckpointedServingBlockdProcess<'_>,
             context: &RuntimeDesiredEffectContext,
         ) -> Result<ServingBlockdProcessStart> {
             context.check_active()?;
+            let socket_absence = checkpointed
+                .take_socket_absence()
+                .context("fake Serving start lacks the real managed absence capability")?;
             if let Some(hook) = self.before_start.lock().unwrap().take() {
                 hook();
             }
             checkpointed.assert_current()?;
             context.check_active()?;
             self.starts.fetch_add(1, Ordering::SeqCst);
+            Self::managed_owner(
+                &mut self.managed_owner.lock().unwrap(),
+                checkpointed.expected(),
+                context,
+            )?
+            .submit(socket_absence, self.start)?;
             checkpointed.assert_current()?;
             Ok(self.start)
         }
     }
 
     impl ServingBlockdProcessGlobalPort for FakeServingBlockdPort {
+        fn retain_start_socket_absence(
+            &self,
+            expected: &ServingBlockdExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> Result<Option<ExactManagedBlockdSocketOwnerStartAbsence>> {
+            Self::managed_owner(
+                &mut self.managed_owner.lock().unwrap(),
+                expected,
+                context,
+            )?
+            .sealed_absence(expected, context)
+            .map(Some)
+        }
+
         fn inspect_serving_exact_or_absent_after_node_global_sweep(
             &self,
             expected: &ServingBlockdExpectation,
@@ -6210,10 +6693,9 @@ mod tests {
             "cats-root-{}.service",
             process_identity_token.as_str()
         ));
-        let control_socket_path =
-            host(&format!("{}/root-provision.sock", data_directory.display()));
         let data_directory_host = host(data_directory.to_str().unwrap());
         let provision_transition_id = random('3');
+        let control_socket_path = managed_root_control_socket(&provision_transition_id);
         let target = target_head();
         let checkpoint = RuntimeCheckpoint {
             version: ContractVersion::V1,
@@ -6254,6 +6736,7 @@ mod tests {
             require_idle: RequireIdleCheckpoint::NotApplicable,
             updated_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
         };
+        let managed_root = Arc::new(IsolatedManagedRootOwner::new(&checkpoint));
         encode_runtime_checkpoint(&checkpoint).expect("fixture checkpoint is valid");
         let checkpoint_directory = root
             .path()
@@ -6307,6 +6790,7 @@ mod tests {
         };
         Fixture {
             _root: root,
+            managed_root,
             state_directory,
             checkpoint_directory,
             data_directory,
@@ -6707,9 +7191,10 @@ mod tests {
         );
         assert_eq!(port.starts.load(Ordering::SeqCst), 1);
         let exact_context = effect_context_with_processes(&fixture, vec![accepted]);
-        let retirement_global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Absent,
-        ]));
+        let retirement_global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [RootProvisionProcessInspection::Absent],
+        ));
         let retirement_stop = Arc::new(RetirementEffectStopPort::new([]));
         assert_eq!(
             prepare_device_retirement_effect(&fixture, retirement_global, retirement_stop.clone(),)
@@ -8109,10 +8594,7 @@ mod tests {
                     unreachable!()
                 };
                 devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
-                    listener_socket_path: host(&format!(
-                        "{}/serving-nbd.sock",
-                        fixture.data_directory.display()
-                    )),
+                    listener_socket_path: managed_serving_sockets(&devices[0].ownership_token).1,
                     device_path: host("/dev/nbd7"),
                     direct: false,
                 };
@@ -8243,10 +8725,7 @@ mod tests {
                 unreachable!()
             };
             devices[0].frontend = PrepareDeviceFrontend::KernelNbd {
-                listener_socket_path: host(&format!(
-                    "{}/serving-nbd.sock",
-                    fixture.data_directory.display()
-                )),
+                listener_socket_path: managed_serving_sockets(&devices[0].ownership_token).1,
                 device_path: host("/dev/nbd7"),
                 direct: false,
             };
@@ -8452,9 +8931,12 @@ mod tests {
         let checkpoint_digest = fixture.stored_checkpoint.content_digest().clone();
         let target_inode = std::fs::metadata(fixture.target_path()).unwrap().ino();
         let record_inode = std::fs::metadata(fixture.record_path()).unwrap().ino();
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [RootProvisionProcessInspection::Exact(Box::new(
+                fixture.process.clone(),
+            ))],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([
             RootProvisionProcessStop::Submitted,
         ]));
@@ -8497,15 +8979,28 @@ mod tests {
     fn prepare_device_retirement_absent_falls_through_dispatcher_exactly_once() {
         let mut fixture = fixture();
         advance_fixture_to_prepare_device(&mut fixture);
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Absent,
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([]));
         let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
         let mut downstream_dispatches = 0;
 
-        match effect
+        assert_eq!(
+            effect
             .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
+            .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        match effect
+            .try_apply(
+                &successor_absent_effect_context(&fixture),
+                &fixture.acquired.desired,
+            )
             .unwrap()
         {
             None => downstream_dispatches += 1,
@@ -8513,7 +9008,7 @@ mod tests {
         }
 
         assert_eq!(downstream_dispatches, 1);
-        assert_eq!(global.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 2);
         assert!(process.stopped().is_empty());
     }
 
@@ -8532,7 +9027,7 @@ mod tests {
         ] {
             let mut fixture = fixture();
             let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
-            let global = Arc::new(RetirementEffectGlobalPort::new([inspection]));
+            let global = Arc::new(RetirementEffectGlobalPort::new(&fixture, [inspection]));
             let process = Arc::new(RetirementEffectStopPort::new([]));
             let effect =
                 prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
@@ -8575,9 +9070,12 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let global = Arc::new(RetirementEffectGlobalPort::new([
-                RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-            ]));
+            let global = Arc::new(RetirementEffectGlobalPort::new(
+                &fixture,
+                [RootProvisionProcessInspection::Exact(Box::new(
+                    fixture.process.clone(),
+                ))],
+            ));
             let process = Arc::new(RetirementEffectStopPort::new([]));
             let effect =
                 prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
@@ -8609,6 +9107,7 @@ mod tests {
         let authority = Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone()));
         let drifted_authority = Arc::clone(&authority);
         let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            &fixture,
             RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
             move || {
                 drifted_authority.record.lock().unwrap().lease_owner = Some(id("att_foreign"));
@@ -8650,12 +9149,16 @@ mod tests {
             .unwrap();
             let global = if rollback_before_sweep {
                 authority.record.lock().unwrap().lease_expires_at = Some(rollback_expiry);
-                Arc::new(RetirementEffectGlobalPort::new([
-                    RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-                ]))
+                Arc::new(RetirementEffectGlobalPort::new(
+                    &fixture,
+                    [RootProvisionProcessInspection::Exact(Box::new(
+                        fixture.process.clone(),
+                    ))],
+                ))
             } else {
                 let rollback = Arc::clone(&authority);
                 Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+                    &fixture,
                     RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
                     move || {
                         rollback.record.lock().unwrap().lease_expires_at = Some(rollback_expiry);
@@ -8706,6 +9209,7 @@ mod tests {
         )
         .unwrap();
         let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            &fixture,
             RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
             move || renewal.record.lock().unwrap().lease_expires_at = Some(renewed_expiry),
         ));
@@ -8735,9 +9239,12 @@ mod tests {
     fn prepare_device_retirement_rejects_late_process_after_accepted_absence() {
         let mut fixture = fixture();
         advance_fixture_to_prepare_device(&mut fixture);
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [RootProvisionProcessInspection::Exact(Box::new(
+                fixture.process.clone(),
+            ))],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([]));
         let effect = prepare_device_retirement_effect(&fixture, global.clone(), process.clone());
 
@@ -8769,6 +9276,7 @@ mod tests {
             ));
             let artifact_bytes = std::fs::read(&artifact_path).unwrap();
             let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+                &fixture,
                 RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
                 move || {
                     std::fs::rename(&artifact_path, &replaced_path).unwrap();
@@ -8800,6 +9308,7 @@ mod tests {
         let context = effect_context_with_processes(&fixture, vec![accepted_process]);
         let canceller = context.clone();
         let global = Arc::new(RetirementEffectGlobalPort::with_after_sweep(
+            &fixture,
             RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
             move || canceller.cancel_for_test(),
         ));
@@ -8816,10 +9325,14 @@ mod tests {
     fn prepare_device_retirement_response_loss_converges_to_absent_without_second_stop() {
         let mut fixture = fixture();
         let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-            RootProvisionProcessInspection::Absent,
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([
             RootProvisionProcessStop::Unavailable,
         ]));
@@ -8842,19 +9355,31 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            effect
+                .try_apply(
+                    &restarted_absent_effect_context(&fixture),
+                    &fixture.acquired.desired,
+                )
+                .unwrap(),
             None
         );
         assert_eq!(process.stopped().len(), 1);
-        assert_eq!(global.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(global.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
     fn prepare_device_retirement_one_effect_refreshes_when_stop_reports_already_absent() {
         let mut fixture = fixture();
         let accepted_process = advance_fixture_to_prepare_device(&mut fixture);
-        let global = Arc::new(RetirementEffectGlobalPort::new([
-            RootProvisionProcessInspection::Exact(Box::new(fixture.process.clone())),
-        ]));
+        let global = Arc::new(RetirementEffectGlobalPort::new(
+            &fixture,
+            [RootProvisionProcessInspection::Exact(Box::new(
+                fixture.process.clone(),
+            ))],
+        ));
         let process = Arc::new(RetirementEffectStopPort::new([
             RootProvisionProcessStop::AlreadyAbsent,
         ]));
@@ -8894,11 +9419,13 @@ mod tests {
                 .into(),
             ),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::ResponseLost,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             authority.clone(),
@@ -9079,6 +9606,12 @@ mod tests {
             .scope_id
             .as_str()
             .ends_with(".service"));
+        let (expected_control_socket, expected_io_socket) =
+            managed_serving_sockets(&device.ownership_token);
+        assert_eq!(
+            device.serving_process.control_socket_path,
+            expected_control_socket
+        );
         let ServingAuthorityProvenance::AfterRootProvision { handoff } =
             device.serving_authority.as_ref()
         else {
@@ -9095,10 +9628,7 @@ mod tests {
         assert_eq!(
             &device.frontend,
             &PrepareDeviceFrontend::VhostUserBlk {
-                socket_path: host(&format!(
-                    "{}/serving-vhost.sock",
-                    fixture.data_directory.display()
-                )),
+                socket_path: expected_io_socket,
                 queues: fixture.acquired.desired.runtime.vcpus as u16,
                 queue_size: 256,
             }
@@ -9222,11 +9752,13 @@ mod tests {
         let global = Arc::new(EffectGlobalProcessPort {
             inspections: Mutex::new([RootProvisionProcessInspection::Absent].into()),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::Started,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
@@ -9278,11 +9810,13 @@ mod tests {
                 .into(),
             ),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let forbidden_start = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::Started,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let retirement_effect = ServingHandoffEffect::new(
             authority.clone(),
@@ -9389,11 +9923,13 @@ mod tests {
                 .into(),
             ),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::ResponseLost,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let converge_effect = ServingHandoffEffect::new(
             authority,
@@ -9455,11 +9991,13 @@ mod tests {
                 .into(),
             ),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::Started,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             authority,
@@ -9500,11 +10038,13 @@ mod tests {
             let global = Arc::new(AuthorityDriftingGlobalPort {
                 authority: authority.clone(),
                 drift,
+                managed_root: Arc::clone(&fixture.managed_root),
             });
             let target_process = Arc::new(EffectTargetProcessPort {
                 starts: AtomicUsize::new(0),
                 evidence: fixture.process.clone(),
                 outcome: EffectTargetProcessOutcome::Started,
+                managed_root: Arc::clone(&fixture.managed_root),
             });
             let effect = ServingHandoffEffect::new(
                 authority.clone(),
@@ -9536,11 +10076,13 @@ mod tests {
         let global = Arc::new(EffectGlobalProcessPort {
             inspections: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::Started,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
@@ -9573,11 +10115,13 @@ mod tests {
         let global = Arc::new(EffectGlobalProcessPort {
             inspections: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::Started,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             authority.clone(),
@@ -9605,11 +10149,13 @@ mod tests {
         let global = Arc::new(EffectGlobalProcessPort {
             inspections: Mutex::new([RootProvisionProcessInspection::Absent].into()),
             calls: AtomicUsize::new(0),
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let target_process = Arc::new(EffectTargetProcessPort {
             starts: AtomicUsize::new(0),
             evidence: fixture.process.clone(),
             outcome: EffectTargetProcessOutcome::CancelledClean,
+            managed_root: Arc::clone(&fixture.managed_root),
         });
         let effect = ServingHandoffEffect::new(
             authority.clone(),
@@ -9760,10 +10306,13 @@ mod tests {
             &fixture.acquired.desired.cat_id,
         )
         .unwrap();
-        let process_port = RetirementProcessPort::with_inspections([
-            RootProvisionProcessInspection::Absent,
-            RootProvisionProcessInspection::Absent,
-        ]);
+        let process_port = RetirementProcessPort::with_inspections(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
         assert_eq!(
             handoff_store
                 .retire_record_after_exact_process_absence(
@@ -9987,11 +10536,14 @@ mod tests {
             &fixture.acquired.desired.cat_id,
         )
         .unwrap();
-        let port = RetirementProcessPort::with_inspections([
-            RootProvisionProcessInspection::Absent,
-            RootProvisionProcessInspection::Absent,
-            RootProvisionProcessInspection::Absent,
-        ]);
+        let port = RetirementProcessPort::with_inspections(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
         let retirement_context = absent_effect_context(&fixture);
         handoff_store
             .retire_record_after_exact_process_absence(
@@ -10078,10 +10630,13 @@ mod tests {
                 &fixture.acquired.desired.cat_id,
             )
             .unwrap();
-            let port = RetirementProcessPort::with_inspections([
-                RootProvisionProcessInspection::Absent,
-                RootProvisionProcessInspection::Absent,
-            ]);
+            let port = RetirementProcessPort::with_inspections(
+                &fixture,
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ],
+            );
             handoff_store.inject_crash_once(PublicationStage::new(
                 PublicationArtifact::HandoffRetirementReceipt,
                 point,
@@ -10144,11 +10699,14 @@ mod tests {
                 &fixture.acquired.desired.cat_id,
             )
             .unwrap();
-            let process_port = RetirementProcessPort::with_inspections([
-                RootProvisionProcessInspection::Absent,
-                RootProvisionProcessInspection::Absent,
-                RootProvisionProcessInspection::Absent,
-            ]);
+            let process_port = RetirementProcessPort::with_inspections(
+                &fixture,
+                [
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                    RootProvisionProcessInspection::Absent,
+                ],
+            );
             handoff_store.inject_crash_once(PublicationStage::new(
                 PublicationArtifact::HandoffRetirement,
                 stage,
@@ -10232,8 +10790,10 @@ mod tests {
             .exact_process_proof()
             .unwrap()
             .into_process_evidence();
-        let not_inspected =
-            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        let not_inspected = RetirementProcessPort::with_inspections(
+            &fixture,
+            [RootProvisionProcessInspection::Absent],
+        );
         assert!(handoff_store
             .retire_record_after_exact_process_absence(
                 &checkpoint_store,
@@ -10255,7 +10815,7 @@ mod tests {
             ),
             RootProvisionProcessInspection::Unavailable,
         ] {
-            let port = RetirementProcessPort::with_inspections([inspection]);
+            let port = RetirementProcessPort::with_inspections(&fixture, [inspection]);
             assert!(handoff_store
                 .retire_record_after_exact_process_absence(
                     &checkpoint_store,
@@ -10278,8 +10838,10 @@ mod tests {
             ),
             move || swap_same_bytes(&swap_path, "retirement-aba"),
         );
-        let absent =
-            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        let absent = RetirementProcessPort::with_inspections(
+            &fixture,
+            [RootProvisionProcessInspection::Absent],
+        );
         assert!(handoff_store
             .retire_record_after_exact_process_absence(
                 &checkpoint_store,
@@ -10340,10 +10902,10 @@ mod tests {
                 observation.runtimes.push(observation.runtimes[0].clone());
             }),
         ];
-        let port = RetirementProcessPort::with_inspections(std::iter::repeat_n(
-            RootProvisionProcessInspection::Absent,
-            contexts.len(),
-        ));
+        let port = RetirementProcessPort::with_inspections(
+            &fixture,
+            std::iter::repeat_n(RootProvisionProcessInspection::Absent, contexts.len()),
+        );
         for context in contexts {
             assert!(handoff_store
                 .retire_record_after_exact_process_absence(
@@ -10410,8 +10972,10 @@ mod tests {
                 &fixture.acquired.desired.cat_id,
             )
             .unwrap();
-            let port =
-                RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+            let port = RetirementProcessPort::with_inspections(
+                &fixture,
+                [RootProvisionProcessInspection::Absent],
+            );
             assert!(handoff_store
                 .retire_record_after_exact_process_absence(
                     &checkpoint_store,
@@ -10481,8 +11045,10 @@ mod tests {
                 );
             },
         );
-        let port =
-            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        let port = RetirementProcessPort::with_inspections(
+            &fixture,
+            [RootProvisionProcessInspection::Absent],
+        );
         assert_eq!(
             handoff_store
                 .retire_record_after_exact_process_absence(
@@ -10540,8 +11106,10 @@ mod tests {
             ),
             move || cancel.cancel_for_test(),
         );
-        let port =
-            RetirementProcessPort::with_inspections([RootProvisionProcessInspection::Absent]);
+        let port = RetirementProcessPort::with_inspections(
+            &fixture,
+            [RootProvisionProcessInspection::Absent],
+        );
         assert!(handoff_store
             .retire_record_after_exact_process_absence(
                 &checkpoint_store,
@@ -11424,6 +11992,21 @@ mod tests {
 
     fn random(value: char) -> RandomId128 {
         RandomId128::new(value.to_string().repeat(32)).unwrap()
+    }
+
+    fn managed_root_control_socket(provision_transition_id: &RandomId128) -> HostPath {
+        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(provision_transition_id)
+            .unwrap()
+            .control_socket()
+            .clone()
+    }
+
+    fn managed_serving_sockets(device_ownership_token: &RandomId128) -> (HostPath, HostPath) {
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(device_ownership_token)
+            .unwrap();
+        (paths.control_socket().clone(), paths.io_socket().clone())
     }
 
     fn digest(value: char) -> Sha256Digest {

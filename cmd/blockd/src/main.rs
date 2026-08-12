@@ -96,12 +96,9 @@ struct Args {
     #[arg(long, value_name = "PATH", requires = "control_only")]
     authorized_target_control_spec: Option<PathBuf>,
 
-    /// Exact provision transition expected inside the target-control wrapper.
-    #[arg(
-        long,
-        value_name = "RANDOM_ID_128",
-        requires = "authorized_target_control_spec"
-    )]
+    /// Exact checkpointed provision transition which owns the managed Root
+    /// control socket. Both blank and target control-only modes require it.
+    #[arg(long, value_name = "RANDOM_ID_128", requires = "control_only")]
     provision_transition_id: Option<String>,
 
     /// Stable RuntimeCheckpoint authorization context expected in the wrapper.
@@ -1367,6 +1364,7 @@ fn main() -> Result<()> {
         .init();
     let mut args = Args::parse();
     validate_process_mode(&args)?;
+    validate_runtime_socket_paths(&args)?;
     let runtime_process_identity = runtime_process_identity(&args)?;
     // Copied out before the adapter option vectors are consumed below.
     let vhost_user_args = VhostUserArgs {
@@ -2021,11 +2019,11 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             );
         }
         if args.authorized_control_spec.is_some()
-            && (args.provision_transition_id.is_some()
+            && (args.provision_transition_id.is_none()
                 || args.provision_root_authorization_context_digest.is_some())
         {
             bail!(
-                "blank --authorized-control-spec forbids target transition and checkpoint expectations"
+                "blank --authorized-control-spec requires --provision-transition-id and forbids target checkpoint expectations"
             );
         }
         if args.attachment_epoch.is_none() {
@@ -2129,6 +2127,59 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         bail!("--listen-vhost-user requires --guest-device-serial");
     }
     let _ = runtime_process_identity(args)?;
+    Ok(())
+}
+
+/// Reject an arbitrary Runtime-supplied AF_UNIX pathname before opening an
+/// engine or binding a listener. The public CLI fields remain persisted wire
+/// values, but only the provider-owned mapping may reach a signed process.
+fn validate_runtime_socket_paths(args: &Args) -> Result<()> {
+    if args.control_only {
+        let transition = RandomId128::new(
+            args.provision_transition_id
+                .clone()
+                .context("control-only mode requires --provision-transition-id")?,
+        )
+        .context("--provision-transition-id is not a valid RandomId128")?;
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .root_paths(&transition)
+            .context("derive managed Root blockd socket paths")?;
+        let control = args
+            .listen_control
+            .as_deref()
+            .context("control-only mode requires --listen-control")?;
+        anyhow::ensure!(
+            control == Path::new(paths.control_socket().as_str()),
+            "control-only listener is outside the transition-owned blockd namespace"
+        );
+        return Ok(());
+    }
+
+    if args.authorized_serving_spec.is_some() || args.authorized_serving_handoff_record.is_some() {
+        let ownership = RandomId128::new(
+            args.device_ownership_token
+                .clone()
+                .context("authorized serving requires --device-ownership-token")?,
+        )
+        .context("--device-ownership-token is not a valid RandomId128")?;
+        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+            .serving_paths(&ownership)
+            .context("derive managed serving blockd socket paths")?;
+        let control = args
+            .listen_control
+            .as_deref()
+            .context("authorized serving requires --listen-control")?;
+        let frontend = args
+            .listen_unix
+            .as_deref()
+            .or(args.listen_vhost_user.as_deref())
+            .context("authorized serving requires one Guest frontend")?;
+        anyhow::ensure!(
+            control == Path::new(paths.control_socket().as_str())
+                && frontend == Path::new(paths.io_socket().as_str()),
+            "authorized serving listeners are outside the device-owned blockd namespace"
+        );
+    }
     Ok(())
 }
 
@@ -2312,6 +2363,7 @@ mod tests {
         HostPath, NormalAcquireRequest, NormalAcquireResult, RemoteHead, Revision, UnixMillis,
         WireU64,
     };
+    use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
     use cats_blockd::serving_handoff::{
         encode_serving_handoff_record, ServingControlProcessIdentity,
         ServingControlReloadHandshake, TargetControlAuthorizationIdentity,
@@ -2328,6 +2380,27 @@ mod tests {
     const TARGET_VOLUME_ID: &str = "vol_target";
     const TARGET_ATTACHMENT_ID: &str = "att_target";
     const TARGET_TRANSITION: &str = "13579bdf2468ace013579bdf2468ace0";
+    const TARGET_DEVICE_OWNERSHIP_TOKEN: &str = "cccccccccccccccccccccccccccccccc";
+
+    fn managed_root_control_socket(transition: &RandomId128) -> PathBuf {
+        PathBuf::from(
+            ManagedBlockdSocketRoot::installed()
+                .root_paths(transition)
+                .unwrap()
+                .control_socket()
+                .as_str(),
+        )
+    }
+
+    fn managed_serving_sockets(ownership_token: &RandomId128) -> (PathBuf, PathBuf) {
+        let paths = ManagedBlockdSocketRoot::installed()
+            .serving_paths(ownership_token)
+            .unwrap();
+        (
+            PathBuf::from(paths.control_socket().as_str()),
+            PathBuf::from(paths.io_socket().as_str()),
+        )
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -2498,7 +2571,7 @@ mod tests {
         }
         let context_digest = Sha256Digest::from_bytes([0x6b; 32]);
         let runtime_scope_id = Id::new("cats-root-fixed.service").unwrap();
-        let control_socket_path = data_dir.join("root-provision.sock");
+        let control_socket_path = managed_root_control_socket(&transition);
         let request = ProvisionRootImageRequest {
             provision_transition_id: transition.clone(),
             volume_id: attachment.identity.volume_id.clone(),
@@ -2578,6 +2651,9 @@ mod tests {
         fn args(&self) -> Args {
             let metadata = std::fs::metadata(&self.record_path).unwrap();
             let digest = Sha256Digest::from_bytes(cats_blockd::format::sha256(&self.record_bytes));
+            let device_ownership_token = RandomId128::new(TARGET_DEVICE_OWNERSHIP_TOKEN).unwrap();
+            let (control_socket, frontend_socket) =
+                managed_serving_sockets(&device_ownership_token);
             Args::try_parse_from(vec![
                 "cats-blockd".to_owned(),
                 "--volume-id".to_owned(),
@@ -2607,23 +2683,15 @@ mod tests {
                 "--lease-ttl-ms".to_owned(),
                 "60000".to_owned(),
                 "--listen-control".to_owned(),
-                self.target
-                    .data_dir
-                    .join("serving-control.sock")
-                    .display()
-                    .to_string(),
+                control_socket.display().to_string(),
                 "--listen-unix".to_owned(),
-                self.target
-                    .data_dir
-                    .join("block.sock")
-                    .display()
-                    .to_string(),
+                frontend_socket.display().to_string(),
                 "--runtime-scope-id".to_owned(),
                 "cats-serving-fixed.service".to_owned(),
                 "--process-identity-token".to_owned(),
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 "--device-ownership-token".to_owned(),
-                "cccccccccccccccccccccccccccccccc".to_owned(),
+                device_ownership_token.as_str().to_owned(),
                 "--guest-device-serial".to_owned(),
                 "cats-root".to_owned(),
             ])
@@ -3407,70 +3475,89 @@ mod tests {
     }
 
     fn parse_target_control_mode(extra: &[&str]) -> Args {
+        let transition = RandomId128::new(TARGET_TRANSITION).unwrap();
+        let control_socket = managed_root_control_socket(&transition);
         let mut arguments = vec![
-            "cats-blockd",
-            "--volume-id",
-            TARGET_VOLUME_ID,
-            "--data-dir",
-            "/runtime/root-data",
-            "--attachment-id",
-            TARGET_ATTACHMENT_ID,
-            "--object-store-adapter",
-            "file",
-            "--metadata-store-adapter",
-            "postgres",
-            "--control-only",
-            "--authorized-target-control-spec",
-            "/runtime/root-data/authorized-target-control-13579bdf2468ace013579bdf2468ace0.json",
-            "--provision-transition-id",
-            TARGET_TRANSITION,
-            "--provision-root-authorization-context-digest",
-            "sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b",
-            "--attachment-epoch",
-            "7",
-            "--listen-control",
-            "/runtime/root-data/root-provision.sock",
-            "--runtime-scope-id",
-            "cats-root-fixed.service",
-            "--process-identity-token",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "cats-blockd".to_owned(),
+            "--volume-id".to_owned(),
+            TARGET_VOLUME_ID.to_owned(),
+            "--data-dir".to_owned(),
+            "/runtime/root-data".to_owned(),
+            "--attachment-id".to_owned(),
+            TARGET_ATTACHMENT_ID.to_owned(),
+            "--object-store-adapter".to_owned(),
+            "file".to_owned(),
+            "--metadata-store-adapter".to_owned(),
+            "postgres".to_owned(),
+            "--control-only".to_owned(),
+            "--authorized-target-control-spec".to_owned(),
+            "/runtime/root-data/authorized-target-control-13579bdf2468ace013579bdf2468ace0.json"
+                .to_owned(),
+            "--provision-transition-id".to_owned(),
+            transition.as_str().to_owned(),
+            "--provision-root-authorization-context-digest".to_owned(),
+            "sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b".to_owned(),
+            "--attachment-epoch".to_owned(),
+            "7".to_owned(),
+            "--listen-control".to_owned(),
+            control_socket.display().to_string(),
+            "--runtime-scope-id".to_owned(),
+            "cats-root-fixed.service".to_owned(),
+            "--process-identity-token".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         ];
-        arguments.extend_from_slice(extra);
+        arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
         Args::try_parse_from(arguments).unwrap()
     }
 
     #[test]
-    fn target_control_cli_is_distinct_and_legacy_blank_mode_stays_compatible() {
-        assert!(validate_process_mode(&parse_target_control_mode(&[])).is_ok());
+    fn target_control_cli_is_distinct_and_blank_mode_requires_the_transition_owner() {
+        let target = parse_target_control_mode(&[]);
+        assert!(validate_process_mode(&target).is_ok());
+        assert!(validate_runtime_socket_paths(&target).is_ok());
 
-        let legacy_blank = Args::try_parse_from([
-            "cats-blockd",
-            "--volume-id",
-            TARGET_VOLUME_ID,
-            "--data-dir",
-            "/runtime/root-data",
-            "--attachment-id",
-            TARGET_ATTACHMENT_ID,
-            "--object-store-adapter",
-            "file",
-            "--metadata-store-adapter",
-            "postgres",
-            "--control-only",
-            "--authorized-control-spec",
-            "/runtime/root-data/authorized-serving.json",
-            "--attachment-epoch",
-            "7",
-            "--listen-control",
-            "/runtime/root-data/root-provision.sock",
-            "--runtime-scope-id",
-            "cats-root-fixed.service",
-            "--process-identity-token",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ])
-        .unwrap();
-        assert!(validate_process_mode(&legacy_blank).is_ok());
+        let transition = RandomId128::new(TARGET_TRANSITION).unwrap();
+        let control_socket = managed_root_control_socket(&transition);
+        let blank_arguments = |include_transition: bool| {
+            let mut arguments = vec![
+                "cats-blockd".to_owned(),
+                "--volume-id".to_owned(),
+                TARGET_VOLUME_ID.to_owned(),
+                "--data-dir".to_owned(),
+                "/runtime/root-data".to_owned(),
+                "--attachment-id".to_owned(),
+                TARGET_ATTACHMENT_ID.to_owned(),
+                "--object-store-adapter".to_owned(),
+                "file".to_owned(),
+                "--metadata-store-adapter".to_owned(),
+                "postgres".to_owned(),
+                "--control-only".to_owned(),
+                "--authorized-control-spec".to_owned(),
+                "/runtime/root-data/authorized-serving.json".to_owned(),
+                "--attachment-epoch".to_owned(),
+                "7".to_owned(),
+                "--listen-control".to_owned(),
+                control_socket.display().to_string(),
+                "--runtime-scope-id".to_owned(),
+                "cats-root-fixed.service".to_owned(),
+                "--process-identity-token".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ];
+            if include_transition {
+                arguments.extend([
+                    "--provision-transition-id".to_owned(),
+                    transition.as_str().to_owned(),
+                ]);
+            }
+            Args::try_parse_from(arguments).unwrap()
+        };
+        assert!(validate_process_mode(&blank_arguments(false)).is_err());
+
+        let blank = blank_arguments(true);
+        assert!(validate_process_mode(&blank).is_ok());
+        assert!(validate_runtime_socket_paths(&blank).is_ok());
         assert_eq!(
-            runtime_process_identity(&legacy_blank)
+            runtime_process_identity(&blank)
                 .unwrap()
                 .unwrap()
                 .guest_device_serial,

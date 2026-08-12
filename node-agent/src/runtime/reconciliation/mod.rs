@@ -18,6 +18,14 @@ mod admission_cell;
 mod admission_port;
 mod admission_registry;
 mod authorized_blockd;
+// blockd listeners live in one short installation-owned namespace. This
+// provider-private intent WAL and descriptor-retained root land before the
+// production Root/Serving submit adapters consume them.
+#[expect(
+    dead_code,
+    reason = "managed blockd socket ownership awaits process-port composition"
+)]
+mod blockd_socket_namespace;
 mod checkpoint;
 mod clean_slate_probes;
 mod gate_planner;
@@ -232,10 +240,12 @@ pub(crate) use vmm_socket_namespace::{
 #[allow(unused_imports)]
 pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint,
-    ensure_root_provision_process_from_persisted_checkpoint, NodeGlobalManagedProcessAdmission,
-    NodeGlobalManagedProcessScanAdmission, RootProvisionAuthoritySnapshot,
-    RootProvisionBlockdHandshake, RootProvisionProcessConflict, RootProvisionProcessEnsureResult,
-    RootProvisionProcessEvidence, RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
+    ensure_root_provision_process_from_persisted_checkpoint,
+    ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence,
+    NodeGlobalManagedProcessAdmission, NodeGlobalManagedProcessScanAdmission,
+    RootProvisionAuthoritySnapshot, RootProvisionBlockdHandshake, RootProvisionProcessConflict,
+    RootProvisionProcessEnsureResult, RootProvisionProcessEvidence,
+    RootProvisionProcessExpectation, RootProvisionProcessGlobalPort,
     RootProvisionProcessInspection, RootProvisionProcessOutcome, RootProvisionProcessPort,
     RootProvisionProcessRetirementPort, RootProvisionProcessStart, RootProvisionProcessStop,
     TargetControlProcessLaunchIdentity, TargetControlProcessPort,
