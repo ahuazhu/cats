@@ -749,7 +749,11 @@ main() {
     # Rust's exact test filter exits successfully even when it selects zero
     # tests. Calibrate this probe before trusting the focused run: exactly one
     # listed test entry must exist, and it must be the intended ignored E2E.
-    if docker_cli capture 300 exec "$LINUX_SYSTEMD_GATE" \
+    # The fresh systemd image may initialize Rust components before Cargo can
+    # reuse the workspace target, so give this compile-capable probe the same
+    # bounded execution window as the focused test itself.
+    if docker_cli capture 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
       cargo test -p cats-node-agent --lib --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
         runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
