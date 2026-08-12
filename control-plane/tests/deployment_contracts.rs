@@ -671,6 +671,7 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
         "Container create\n  # and start are separate",
         "probe_owned_container",
         "probe_owned_network",
+        "rm --force --volumes \"$id\"",
         "remove_owned_container \"$LINUX_SYSTEMD_INTENDED\" \"$LINUX_SYSTEMD_GATE\" true",
         "remove_owned_container \"$LINUX_WORKSPACE_INTENDED\" \"$LINUX_WORKSPACE_GATE\" false",
         "remove_owned_container \"$LINUX_PG_INTENDED\" \"$LINUX_PG\" false",
@@ -988,10 +989,13 @@ case "${1:-} ${2:-}" in
     ;;
   "stop "*)
     ;;
-  "rm -f")
+  "rm --force")
+    [[ "${3:-}" == --volumes ]] || exit 64
     id="${!#}"
     path="$(object_by_id container "$id")"
+    name="${path#"$state/container."}"
     rm -f -- "$path"
+    rm -f -- "$state/anonymous-volume.$name"
     if [[ "$id" == late-workspace-id \
       || "$id" == response-loss-workspace-id \
       || "$id" == owned-cats-linux-workspace-gate-*-id ]]; then
@@ -1058,6 +1062,10 @@ case "${1:-} ${2:-}" in
       while [[ ! -e "$path" ]]; do sleep 0.1; done
       : >"$state/idempotent-name-reserved"
       exit 125
+    fi
+    if [[ "$name" == cats-linux-pg-* ]]; then
+      : >"$state/anonymous-volume.$name"
+      : >"$state/anonymous-volume-created.$name"
     fi
     printf 'owned-%s-id|%s\n' "$name" "$owner" >"$path"
     printf 'owned-%s-id\n' "$name"
@@ -1194,7 +1202,7 @@ fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collisi
         assert!(
             !trace.lines().any(|line| {
                 line == format!("stop --time 20 {id}")
-                    || line == format!("rm -f {id}")
+                    || line == format!("rm --force --volumes {id}")
                     || line == format!("network rm {id}")
             }),
             "the Linux gate attempted to remove foreign immutable ID {id}:\n{trace}"
@@ -1214,8 +1222,12 @@ fn linux_quality_gate_preserves_same_name_foreign_resources_after_create_collisi
         }
         if id == "foreign-systemd-id" {
             for exact_cleanup in [
-                format!("rm -f owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"),
-                format!("rm -f owned-cats-linux-pg-{LINUX_GATE_TEST_TOKEN}-id"),
+                format!(
+                    "rm --force --volumes owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
+                ),
+                format!(
+                    "rm --force --volumes owned-cats-linux-pg-{LINUX_GATE_TEST_TOKEN}-id"
+                ),
                 "network rm owned-network-id".to_owned(),
             ] {
                 assert!(
@@ -1313,7 +1325,7 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
         .find("LATE_CREATE late-workspace-id")
         .expect("late daemon-side create trace");
     let immutable_remove = trace
-        .find("rm -f late-workspace-id")
+        .find("rm --force --volumes late-workspace-id")
         .expect("immutable-ID cleanup trace");
     assert!(
         late_create < immutable_remove,
@@ -1368,12 +1380,21 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
         format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("anonymous-volume.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
     ] {
         assert!(
             !state.join(&resource).exists(),
             "intended resource remained after response-loss settlement: {resource}"
         );
     }
+    assert!(
+        state
+            .join(format!(
+                "anonymous-volume-created.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"
+            ))
+            .exists(),
+        "the response-loss regression did not model postgres:16's anonymous data volume"
+    );
 
     let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
     let create_call = format!("create --name cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}");
@@ -1386,7 +1407,7 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         .find("RESPONSE_LOSS_LATE_CREATE response-loss-workspace-id")
         .expect("late daemon create trace");
     let immutable_remove = trace
-        .find("rm -f response-loss-workspace-id")
+        .find("rm --force --volumes response-loss-workspace-id")
         .expect("response-loss immutable-ID removal trace");
     assert!(
         late_create < immutable_remove,
@@ -1408,7 +1429,7 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
     let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
     assert!(
         trace.contains(&format!("stop --time 20 {systemd_id}"))
-            && trace.contains(&format!("rm -f {systemd_id}")),
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
         "focused systemd container was not gracefully and exactly cleaned:\n{trace}"
     );
 }
@@ -1458,7 +1479,7 @@ fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
     let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
     assert!(
         trace.contains(&format!("stop --time 20 {systemd_id}"))
-            && trace.contains(&format!("rm -f {systemd_id}")),
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
         "empty test-inventory failure did not clean the focused container exactly:\n{trace}"
     );
 }
@@ -1509,7 +1530,7 @@ fn linux_quality_gate_cleans_exact_resources_when_focused_test_inventory_times_o
     let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
     assert!(
         trace.contains(&format!("stop --time 20 {systemd_id}"))
-            && trace.contains(&format!("rm -f {systemd_id}")),
+            && trace.contains(&format!("rm --force --volumes {systemd_id}")),
         "test-inventory timeout did not clean the focused container exactly:\n{trace}"
     );
 }
@@ -1671,7 +1692,7 @@ fn linux_quality_gate_term_interrupts_start_after_create_receipt_and_cleans_exac
         .expect("workspace start trace");
     let remove = trace
         .find(&format!(
-            "rm -f owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
+            "rm --force --volumes owned-cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}-id"
         ))
         .expect("workspace immutable-ID removal trace");
     assert!(

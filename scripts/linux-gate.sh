@@ -455,7 +455,11 @@ remove_owned_container() {
   if [[ "$graceful" == true ]]; then
     cleanup_docker_cli capture 250 stop --time 20 "$id" || true
   fi
-  cleanup_docker_cli capture 50 rm -f "$id" || true
+  # `postgres:16` declares an anonymous data volume. Remove anonymous volumes
+  # with their already owner-verified immutable container ID; Docker preserves
+  # the explicitly named Cargo/target cache volumes mounted by the other two
+  # containers.
+  cleanup_docker_cli capture 50 rm --force --volumes "$id" || true
 }
 
 remove_owned_network() {
