@@ -108,6 +108,30 @@ that receipt. Target worker systemd `ExecStart` and Control Kubernetes container
 `--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; missing or mismatched
 receipt/boot files fail closed. Rebuilding from the Host kernel is not a fallback.
 
+When GitHub Actions is unavailable, `tools/build-manual-release.sh` is the
+repository-owned artifact builder. Run it from a clean checkout of the exact
+40-hex commit on a native x86_64 Linux build Host with the Guest-image tools,
+Docker Buildx and passwordless or interactive `sudo` available:
+
+```sh
+deploy/aws/tools/build-manual-release.sh \
+  --source-sha "$(git rev-parse HEAD)" \
+  --output /approved/private-output/cats-release \
+  --image registry.example/cats/control-plane:exact-tag \
+  --push
+```
+
+It exports and rechecks the exact Git tree, invokes the Guest-image generator
+once, feeds that one closed payload to both Dockerfiles, extracts the receipt
+and manifest from the final Control image and the complete Guest payload from
+the worker artifact, and compares all logical members byte for byte. The
+canonical `release-manifest.v1.json` binds source commit/tree/fingerprint,
+build-input fingerprints, Guest release ID, Control OCI/config digests and the
+worker tar SHA-256. Without `--push`, the image remains only in the local
+Docker store and the manifest records `registry_verified=false`; that output
+is useful for dry-run qualification but is not a registry deployment receipt.
+The builder never invokes Terraform, Kubernetes or a production service.
+
 The application rollout also mounts the central provisioner's canonical public
 trust bundle as the root-owned regular file
 `/etc/cats/identity/runtime-provisioner-trust.v1.json` and passes exactly

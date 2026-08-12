@@ -3057,6 +3057,58 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
 }
 
 #[test]
+fn manual_release_builder_verifies_both_final_artifacts_and_writes_one_receipt() {
+    let root = workspace_root();
+    let builder = read_workspace_file("deploy/aws/tools/build-manual-release.sh");
+    for required in [
+        "manual release builds require a clean checkout",
+        "git archive --format=tar \"$source_sha\"",
+        "rustup target add x86_64-unknown-linux-musl",
+        "RELEASE_OUT=\"$guest_release\"",
+        "--file deploy/aws/Dockerfile.control-plane",
+        "--file deploy/aws/Dockerfile.worker-artifact",
+        "docker create --platform linux/amd64 \"$control_image_id\"",
+        "verify-manual-release.py",
+        "--control-image-registry-verified false",
+        "--control-image-registry-verified true",
+        "--input-file \"guest_host_kernel=$guest_kernel\"",
+    ] {
+        assert!(
+            builder.contains(required),
+            "manual release builder lost {required:?}"
+        );
+    }
+    assert_eq!(
+        builder.matches("RELEASE_OUT=\"$guest_release\"").count(),
+        1,
+        "the manual builder must run the Guest release generator exactly once"
+    );
+    assert!(
+        !builder.contains("kubectl") && !builder.contains("terraform apply"),
+        "artifact construction must not contain a deployment path"
+    );
+    assert!(
+        builder.find("--control-image-registry-verified false")
+            < builder.find("docker push \"$image_reference\""),
+        "both local artifacts must pass the verifier before an optional registry push"
+    );
+
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/tools/manual-release-fixture.py"))
+        .arg("--verifier")
+        .arg(root.join("deploy/aws/tools/verify-manual-release.py"))
+        .output()
+        .expect("run manual release verifier fixture");
+    assert!(
+        output.status.success(),
+        "manual release verifier fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture passed"));
+}
+
+#[test]
 fn runtime_node_authority_deployments_pin_exact_trust_artifact_and_shutdown_window() {
     let argument =
         "--runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json";
