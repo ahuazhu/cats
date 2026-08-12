@@ -833,6 +833,7 @@ impl Store {
                             | Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
                     )
                 {
+                    metrics::record_postgres_error(&error);
                     ApiError::unavailable(format!(
                         "control-store PostgreSQL operation was unavailable: {error}"
                     ))
