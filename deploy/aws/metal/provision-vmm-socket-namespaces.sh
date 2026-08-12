@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
-# Provision the installation-owned VMM state and socket namespaces. Per-attempt
-# launch code is intentionally unable to create or replace any of these roots.
+# Provision the installation-owned VMM state namespace and the fixed runtime
+# socket roots. Per-attempt launch code is intentionally unable to create or
+# replace any of these roots.
 set -euo pipefail
 
 cats_vmm_namespace_crash_probe() { :; }
+
+validate_installed_runtime_socket_root() {
+  local directory=$1
+  local label=$2
+
+  [[ -d $directory && ! -L $directory ]] \
+    && [[ $(stat -c '%u:%g:%a' "$directory") == 0:0:700 ]] || {
+    echo "installed $label socket root violates root:root/0700" >&2
+    return 1
+  }
+}
+
+validate_or_absent_installed_runtime_socket_root() {
+  local directory=$1
+  local label=$2
+
+  if [[ -e $directory || -L $directory ]]; then
+    validate_installed_runtime_socket_root "$directory" "$label"
+  fi
+}
 
 provision_identity_state_namespaces() {
   local identity=$1
@@ -101,9 +122,11 @@ done
 
 provision_identity_state_namespaces "$identity" /var/lib/cats/node
 
+# Do not let tmpfiles repair or traverse a pre-existing foreign inode. The
+# deployment transaction may create an absent installation root, but an
+# existing root is authority only when it already has the frozen identity.
+validate_or_absent_installed_runtime_socket_root /run/cats/vmm-v1 VMM
+validate_or_absent_installed_runtime_socket_root /run/cats/blockd-v1 blockd
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/cats-vmm.conf
-[[ -d /run/cats/vmm-v1 && ! -L /run/cats/vmm-v1 ]] \
-  && [[ $(stat -c '%u:%g:%a' /run/cats/vmm-v1) == 0:0:700 ]] || {
-  echo "installed VMM socket root violates root:root/0700" >&2
-  exit 1
-}
+validate_installed_runtime_socket_root /run/cats/vmm-v1 VMM
+validate_installed_runtime_socket_root /run/cats/blockd-v1 blockd
