@@ -589,13 +589,16 @@ impl ServingBlockdExpectation {
             peer.cgroup_path =
                 HostPath::new("/sys/fs/cgroup/system.slice/cats-blockd-persistent.service")
                     .unwrap();
-            peer.control_socket_path =
-                HostPath::new("/run/cats/cat_01/persistent-control.sock").unwrap();
             peer.data_directory = HostPath::new("/var/lib/cats/cat_01/persistent").unwrap();
             peer.process_identity_token =
                 RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
             peer.device_ownership_token =
                 RandomId128::new("ffffffffffffffffffffffffffffffff").unwrap();
+            let sockets =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .serving_paths(&peer.device_ownership_token)
+                    .unwrap();
+            peer.control_socket_path = sockets.control_socket().clone();
             peer.prepared_device.serving_process.scope_id = peer.unit_id.clone();
             peer.prepared_device.serving_process.control_socket_path =
                 peer.control_socket_path.clone();
@@ -606,7 +609,7 @@ impl ServingBlockdExpectation {
             let PrepareDeviceFrontend::VhostUserBlk { socket_path, .. } = &mut peer.frontend else {
                 panic!("test serving expectation is vhost-user")
             };
-            *socket_path = HostPath::new("/run/cats/cat_01/persistent-vhost.sock").unwrap();
+            *socket_path = sockets.io_socket().clone();
             peer.prepared_device.frontend = peer.frontend.clone();
         }
         peer

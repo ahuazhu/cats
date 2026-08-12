@@ -12342,6 +12342,16 @@ mod tests {
                 std::fs::create_dir(installed).unwrap();
             }
             std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let blockd_socket_root =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed();
+            let blockd_installed = Path::new(blockd_socket_root.path().as_str());
+            std::fs::create_dir_all(blockd_installed.parent().unwrap()).unwrap();
+            if !blockd_installed.exists() {
+                std::fs::create_dir(blockd_installed).unwrap();
+            }
+            std::fs::set_permissions(blockd_installed, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            BlockdSocketIntentStore::provision_for_test(state.clone()).unwrap();
             VmmSocketReceiptStore::provision_for_test(state.clone()).unwrap();
             let launch_root = state.path().join(VMM_LAUNCH_FILE_NAMESPACE);
             std::fs::create_dir(&launch_root).unwrap();
@@ -12381,6 +12391,8 @@ mod tests {
             config.checkpoint_directory,
             state.path().join(CHECKPOINT_NAMESPACE)
         );
+        assert!(config.managed_blockd_socket_root.is_some());
+        assert!(config.blockd_socket_intents.is_some());
     }
 
     #[cfg(target_os = "linux")]

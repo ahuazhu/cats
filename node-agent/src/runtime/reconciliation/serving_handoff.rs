@@ -4287,6 +4287,228 @@ mod tests {
         }
     }
 
+    /// Per-port shadow of one production Serving owner. Both role-specific
+    /// listeners are real Unix sockets, while the public expectation remains
+    /// bound to the installed mapper used by production inventory.
+    struct IsolatedManagedServingOwner {
+        _temporary: tempfile::TempDir,
+        root: Arc<RetainedManagedBlockdSocketRoot>,
+        intents: Arc<BlockdSocketIntentStore>,
+        boot: CurrentBlockdSocketBoot,
+        intent: BlockdSocketOwnershipIntentV1,
+        listeners: Option<(UnixListener, UnixListener)>,
+    }
+
+    impl IsolatedManagedServingOwner {
+        fn new(
+            expected: &ServingBlockdExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<Self> {
+            let temporary = tempfile::Builder::new()
+                .prefix("shs-")
+                .tempdir_in("/private/tmp")
+                .or_else(|_| tempfile::Builder::new().prefix("shs-").tempdir_in("/tmp"))?;
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
+            let root = Arc::new(RetainedManagedBlockdSocketRoot::provision_for_test(
+                &temporary.path().join("s"),
+            )?);
+            let intent_state = temporary.path().join("state");
+            std::fs::create_dir(&intent_state)?;
+            std::fs::set_permissions(&intent_state, std::fs::Permissions::from_mode(0o700))?;
+            let intents = Arc::new(BlockdSocketIntentStore::provision_for_test(
+                StateDirectory::unanchored(intent_state),
+            )?);
+            let boot = CurrentBlockdSocketBoot::for_test(
+                context.accepted_full()?.observation().node_boot_id.clone(),
+            );
+            let intent = BlockdSocketOwnershipIntentV1::serving(
+                &root,
+                &boot,
+                expected.device_ownership_token().clone(),
+                super::super::blockd_socket_namespace::serving_socket_owner_authority_digest(
+                    expected.prepared_device(),
+                )?,
+            )?;
+            let owner = Self {
+                _temporary: temporary,
+                root,
+                intents,
+                boot,
+                intent,
+                listeners: None,
+            };
+            owner.assert_same_owner(expected)?;
+            Ok(owner)
+        }
+
+        fn assert_same_owner(&self, expected: &ServingBlockdExpectation) -> anyhow::Result<()> {
+            let installed =
+                cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                    .serving_paths(expected.device_ownership_token())?;
+            let isolated = self
+                .root
+                .planner()
+                .serving_paths(expected.device_ownership_token())?;
+            anyhow::ensure!(
+                installed.control_socket() == expected.control_socket_path()
+                    && installed.io_socket() == expected.listener_path()
+                    && self.intent.control_socket_path() == isolated.control_socket()
+                    && self.intent.io_socket_path() == Some(isolated.io_socket())
+                    && self.intent.owner_authority_digest()
+                        == &super::super::blockd_socket_namespace::serving_socket_owner_authority_digest(
+                            expected.prepared_device(),
+                        )?,
+                "isolated managed Serving fixture changed owner generation or socket mapping"
+            );
+            Ok(())
+        }
+
+        fn socket_paths(&self) -> [&Path; 2] {
+            [
+                Path::new(self.intent.control_socket_path().as_str()),
+                Path::new(self.intent.io_socket_path().unwrap().as_str()),
+            ]
+        }
+
+        fn assert_listeners_absent(&self, phase: &str) -> anyhow::Result<()> {
+            for socket in self.socket_paths() {
+                anyhow::ensure!(
+                    UnixStream::connect(socket).is_err(),
+                    "isolated managed Serving listener is present {phase}"
+                );
+            }
+            Ok(())
+        }
+
+        fn expected_intents(
+            &self,
+            admission: &super::super::root_provision_process::NodeGlobalManagedProcessAdmission,
+        ) -> anyhow::Result<Vec<BlockdSocketOwnershipIntentV1>> {
+            let (root_expectations, _) = admission.root_control_state();
+            let (serving_expectations, _) = admission.serving_blockd_state();
+            let mut intents = root_expectations
+                .values()
+                .map(|expected| {
+                    let installed =
+                        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                            .root_paths(&expected.provision_transition_id)?;
+                    anyhow::ensure!(
+                        installed.control_socket() == &expected.control_socket_path,
+                        "accepted Root socket is outside the installed managed mapping"
+                    );
+                    BlockdSocketOwnershipIntentV1::root(
+                        &self.root,
+                        &self.boot,
+                        expected.provision_transition_id.clone(),
+                        expected.socket_owner_authority_digest.clone(),
+                    )
+                })
+                .chain(serving_expectations.values().map(|expected| {
+                    let installed =
+                        cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+                            .serving_paths(expected.device_ownership_token())?;
+                    anyhow::ensure!(
+                        installed.control_socket() == expected.control_socket_path()
+                            && installed.io_socket() == expected.listener_path(),
+                        "accepted Serving sockets are outside the installed managed mapping"
+                    );
+                    BlockdSocketOwnershipIntentV1::serving(
+                        &self.root,
+                        &self.boot,
+                        expected.device_ownership_token().clone(),
+                        super::super::blockd_socket_namespace::serving_socket_owner_authority_digest(
+                            expected.prepared_device(),
+                        )?,
+                    )
+                }))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if !intents.iter().any(|intent| intent == &self.intent) {
+                intents.push(self.intent.clone());
+            }
+            Ok(intents)
+        }
+
+        fn sealed_absence(
+            &mut self,
+            expected: &ServingBlockdExpectation,
+            context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ExactManagedBlockdSocketOwnerStartAbsence> {
+            self.assert_same_owner(expected)?;
+            self.listeners.take();
+            self.assert_listeners_absent("before the absence sweep")?;
+            let accepted = context.accepted_full()?;
+            let admission = context.node_global_process()?;
+            anyhow::ensure!(
+                admission.matches_observation(accepted.observation())
+                    && accepted.observation().node_boot_id == *self.boot.node_boot_id()
+                    && admission
+                        .serving_blockd(expected.cat_id(), expected.volume_id())
+                        .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+                "isolated managed Serving absence is not the exact accepted owner"
+            );
+            let node_global_effect = context.lock_node_global_effect()?;
+            let capture =
+                self.root
+                    .capture_start_absence(&self.intents, &self.intent, &self.boot)?;
+            let intents = self.expected_intents(admission)?;
+            let before = self
+                .root
+                .capture_closed_whole_root(&self.intents, &intents)?;
+            self.assert_listeners_absent("during the absence sweep")?;
+            let after = self
+                .root
+                .capture_closed_whole_root(&self.intents, &intents)?;
+            self.assert_listeners_absent("after the absence sweep")?;
+            ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                capture,
+                before,
+                after,
+                &self.boot,
+                node_global_effect,
+            )
+        }
+
+        fn submit(
+            &mut self,
+            absence: ExactManagedBlockdSocketOwnerStartAbsence,
+            outcome: ServingBlockdProcessStart,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.listeners.is_none(),
+                "isolated managed Serving fixture retains an old listener"
+            );
+            let prepared = self.root.prepare_absent_owner_for_start(
+                &self.intents,
+                &self.intent,
+                &self.boot,
+                absence,
+            )?;
+            match outcome {
+                ServingBlockdProcessStart::DefinitelyNotStarted => {
+                    prepared.assert_post_submit_owner_current(
+                        &self.boot,
+                        BlockdSocketPostSubmitOutcome::DefinitelyNotStarted,
+                    )?;
+                }
+                ServingBlockdProcessStart::Submitted
+                | ServingBlockdProcessStart::OutcomeUnknown => {
+                    let ctl = UnixListener::bind(Path::new(
+                        prepared.control_socket_path().as_str(),
+                    ))?;
+                    let io = UnixListener::bind(Path::new(
+                        prepared.io_socket_path().unwrap().as_str(),
+                    ))?;
+                    prepared.assert_post_submit_owner_current(
+                        &self.boot,
+                        BlockdSocketPostSubmitOutcome::MayHaveStarted,
+                    )?;
+                    self.listeners = Some((ctl, io));
+                }
+            }
+            Ok(())
+        }
+    }
+
     struct RetirementProcessPort {
         inspections: Mutex<VecDeque<RootProvisionProcessInspection>>,
         inspect_calls: Mutex<usize>,

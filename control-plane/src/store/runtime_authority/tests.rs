@@ -23,6 +23,7 @@ use cats_api::runtime_reconciliation::{
     SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
     VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WarmSnapshotEvidence, WireU64,
 };
+use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
 use cats_storage::authority::{
     complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire, AsciiText,
     AuthorityError, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
@@ -342,6 +343,9 @@ fn commit_initialized_checkpoint(
     let persistent_device_token = random_id(6_004);
     let vmm_token = random_id(6_005);
     let network_token = random_id(6_006);
+    let socket_root = ManagedBlockdSocketRoot::installed();
+    let root_sockets = socket_root.serving_paths(&root_device_token).unwrap();
+    let persistent_sockets = socket_root.serving_paths(&persistent_device_token).unwrap();
     let origin = |intent: &VolumeIntent| match &intent.acquire {
         VolumeAcquire::Normal { transition_id, .. } => serde_json::json!({
             "kind": "normal",
@@ -385,14 +389,14 @@ fn commit_initialized_checkpoint(
         },
         "serving_process": {
             "scope_id": "cats-root-serving",
-            "control_socket_path": "/run/cats/root-blockd.sock",
+            "control_socket_path": root_sockets.control_socket(),
             "data_directory": "/var/lib/cats/volumes/root",
             "executable_path": "/usr/bin/cats-blockd",
             "process_identity_token": root_process_token,
         },
         "frontend": {
             "kind": "vhost_user_blk",
-            "socket_path": "/run/cats/root-vhost.sock",
+            "socket_path": root_sockets.io_socket(),
             "queues": 1,
             "queue_size": 256,
         },
@@ -432,14 +436,14 @@ fn commit_initialized_checkpoint(
         },
         "serving_process": {
             "scope_id": "cats-data-serving",
-            "control_socket_path": "/run/cats/data-blockd.sock",
+            "control_socket_path": persistent_sockets.control_socket(),
             "data_directory": "/var/lib/cats/volumes/data",
             "executable_path": "/usr/bin/cats-blockd",
             "process_identity_token": persistent_process_token,
         },
         "frontend": {
             "kind": "vhost_user_blk",
-            "socket_path": "/run/cats/data-vhost.sock",
+            "socket_path": persistent_sockets.io_socket(),
             "queues": 1,
             "queue_size": 256,
         },
@@ -593,7 +597,7 @@ fn commit_initialized_checkpoint(
             &persistent.attachment_id,
             persistent_volume.lease_epoch,
             "cats-data-serving",
-            "/run/cats/data-blockd.sock",
+            persistent_sockets.control_socket().as_str(),
             &persistent_process_token,
             7_003,
         ), observed_process(
@@ -601,7 +605,7 @@ fn commit_initialized_checkpoint(
             &root.attachment_id,
             root_volume.lease_epoch,
             "cats-root-serving",
-            "/run/cats/root-blockd.sock",
+            root_sockets.control_socket().as_str(),
             &root_process_token,
             7_002,
         )],
@@ -610,14 +614,14 @@ fn commit_initialized_checkpoint(
             persistent_volume,
             "persistent",
             "/var/lib/cats/volumes/data",
-            "/run/cats/data-vhost.sock",
+            persistent_sockets.io_socket().as_str(),
             &persistent_device_token,
         ), observed_volume(
             root,
             root_volume,
             "root",
             "/var/lib/cats/volumes/root",
-            "/run/cats/root-vhost.sock",
+            root_sockets.io_socket().as_str(),
             &root_device_token,
         )],
         "mounts": [],
