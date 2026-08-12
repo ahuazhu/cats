@@ -24,6 +24,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -65,9 +66,10 @@ use crate::state_directory::StateDirectory;
 
 use super::authorized_blockd::{
     authorized_blockd_data_directory, validate_authorized_blockd_checkpoint,
-    AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, PreparedAuthorizedBlockd,
-    RetainedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE, LAUNCH_CHECKPOINT_FILE,
-    MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES, MAX_LAUNCH_CHECKPOINT_BYTES,
+    AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, LockedAttachmentDirectory,
+    PreparedAuthorizedBlockd, RetainedAuthorizedBlockd, AUTHORIZED_SERVING_FILE, IDENTITY_FILE,
+    LAUNCH_CHECKPOINT_FILE, MAX_AUTHORIZED_SERVING_BYTES, MAX_IDENTITY_BYTES,
+    MAX_LAUNCH_CHECKPOINT_BYTES,
 };
 use super::network::{prepare_device_checkpoint_view, prepared_device_input};
 use super::root_provision_process::{
@@ -3032,7 +3034,7 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> serde_json::Resu
 struct RetainedAttachmentContext {
     state_directory: StateDirectory,
     root_directory: File,
-    attachment_directory: File,
+    attachment_directory: Arc<LockedAttachmentDirectory>,
     data_directory: PathBuf,
     local_state: ServingHandoffLocalStateIdentity,
     acquire_inputs: RetainedAcquireInputs,
@@ -3065,17 +3067,18 @@ impl RetainedAttachmentContext {
             .context("clone retained Node state directory")?;
         verify_retained_state_directory(&root_directory, state_directory.path())?;
         let state_identity = stable_directory_identity(&root_directory, state_directory.path())?;
-        let attachment_directory = open_attachment_directory_from_root(
-            &root_directory,
-            state_directory.path(),
-            data_directory,
-        )?;
-        lock_directory(&attachment_directory).with_context(|| {
-            format!(
-                "lock serving handoff attachment directory {}",
-                data_directory.display()
-            )
-        })?;
+        let attachment_directory =
+            LockedAttachmentDirectory::acquire(open_attachment_directory_from_root(
+                &root_directory,
+                state_directory.path(),
+                data_directory,
+            )?)
+            .with_context(|| {
+                format!(
+                    "lock serving handoff attachment directory {}",
+                    data_directory.display()
+                )
+            })?;
         validate_handoff_namespace(&attachment_directory, expected_target, expected_target_temp)?;
         let attachment_identity = stable_directory_identity(&attachment_directory, data_directory)?;
         let identity = RetainedFile::open_required(
@@ -3140,7 +3143,7 @@ impl RetainedAttachmentContext {
         acquired: &AuthorizedBlockdCheckpoint,
         expected_target: &str,
         expected_target_temp: &str,
-        attachment_directory: File,
+        attachment_directory: Arc<LockedAttachmentDirectory>,
     ) -> Result<Self> {
         let root_directory = state_directory
             .try_clone_directory()
@@ -3485,17 +3488,6 @@ fn assert_file_identity(file: &File, expected: &StableFileIdentity) -> Result<()
 
 fn wire_filesystem_value(value: u64, label: &'static str) -> Result<WireU64> {
     WireU64::new(value).with_context(|| format!("serving handoff {label} exceeds wire range"))
-}
-
-fn lock_directory(directory: &File) -> io::Result<()> {
-    // SAFETY: the live descriptor remains owned by the caller and flock
-    // retains no Rust memory.
-    let result = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 fn validate_handoff_namespace(
@@ -7212,6 +7204,104 @@ mod tests {
                 &fixture.authority,
             )
             .is_err());
+    }
+
+    fn error_chain_has_would_block(error: &anyhow::Error) -> bool {
+        error.chain().any(|source| {
+            source
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        })
+    }
+
+    #[test]
+    fn owned_handoff_lock_unlocks_before_an_inherited_descriptor_closes() {
+        let fixture = fixture();
+        let store = fixture.store();
+        let ready = store
+            .seal_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+        let inherited = ready
+            .retained
+            .attachment_directory
+            .as_file()
+            .try_clone()
+            .unwrap();
+
+        drop(ready);
+        let successor = store
+            .reopen_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            successor,
+            ReopenedTargetControlAuthorization::Exact(_)
+        ));
+        drop(successor);
+        drop(inherited);
+    }
+
+    #[test]
+    fn shared_handoff_context_never_unlocks_its_live_predecessor() {
+        let fixture = fixture();
+        let store = fixture.store();
+        drop(
+            store
+                .seal_target_control_authorization(
+                    &fixture.stored_checkpoint,
+                    &fixture.acquired,
+                    &fixture.authority,
+                )
+                .unwrap(),
+        );
+        let predecessor = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+            .retain_exact_runtime_checkpoint(fixture.stored_checkpoint.checkpoint())
+            .unwrap();
+        let shared = store
+            .reopen_target_control_authorization_from_retained(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &predecessor,
+            )
+            .unwrap();
+        let ReopenedTargetControlAuthorization::Exact(shared) = shared else {
+            panic!("published target authorization must reopen exactly")
+        };
+        let inherited = predecessor.retained_directory().try_clone().unwrap();
+
+        drop(predecessor);
+        let blocked = store
+            .reopen_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap_err();
+        assert!(error_chain_has_would_block(&blocked), "{blocked:#}");
+        drop(shared);
+        let successor = store
+            .reopen_target_control_authorization(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            successor,
+            ReopenedTargetControlAuthorization::Exact(_)
+        ));
+        drop(successor);
+        drop(inherited);
     }
 
     #[test]

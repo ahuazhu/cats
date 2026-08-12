@@ -15,6 +15,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cats_api::blockd::DurabilityStatus;
@@ -534,7 +535,7 @@ impl AuthorizedBlockdStore {
                 open_existing_directory_at(&directory, component, &relative, &root_identity)?;
             component_identities.push(stable_identity(&directory, &relative)?);
         }
-        lock_directory(&directory).with_context(|| {
+        let directory = LockedAttachmentDirectory::acquire(directory).with_context(|| {
             format!(
                 "lock exact authorized blockd directory {}",
                 relative.display()
@@ -691,7 +692,7 @@ impl AuthorizedBlockdStore {
                 open_existing_directory_at(&directory, component, &relative, &root_identity)?;
             component_identities.push(stable_identity(&directory, &relative)?);
         }
-        lock_directory(&directory).with_context(|| {
+        let directory = LockedAttachmentDirectory::acquire(directory).with_context(|| {
             format!(
                 "lock exact authorized blockd handoff directory {}",
                 relative.display()
@@ -842,7 +843,7 @@ impl AuthorizedBlockdStore {
             relative.push(&component);
             directory = ensure_directory_at(&directory, &component, &relative)?;
         }
-        lock_directory(&directory).with_context(|| {
+        let directory = LockedAttachmentDirectory::acquire(directory).with_context(|| {
             format!(
                 "lock authorized blockd directory {}",
                 self.state_directory.path().join(&relative).display()
@@ -906,7 +907,7 @@ pub struct PreparedAuthorizedBlockd {
     authorized_serving_path: PathBuf,
     launch_checkpoint_path: PathBuf,
     checkpoint: AuthorizedBlockdCheckpoint,
-    _directory_lock: File,
+    _directory_lock: Arc<LockedAttachmentDirectory>,
 }
 
 /// Read-only, descriptor-retained proof of the immutable launch inputs for a
@@ -922,8 +923,44 @@ pub(crate) struct RetainedAuthorizedBlockd {
     component_identities: Vec<StableFsIdentity>,
     data_directory: PathBuf,
     checkpoint: AuthorizedBlockdCheckpoint,
-    directory: File,
+    directory: Arc<LockedAttachmentDirectory>,
     files: [RetainedExactFile; 3],
+}
+
+/// One cooperatively locked attachment directory shared by typed in-process
+/// proofs. The final typed owner explicitly unlocks before closing its File so
+/// an unexeced fork child cannot strand the flock through an inherited OFD.
+#[derive(Debug)]
+pub(crate) struct LockedAttachmentDirectory {
+    directory: File,
+}
+
+impl LockedAttachmentDirectory {
+    pub(crate) fn acquire(directory: File) -> io::Result<Arc<Self>> {
+        lock_directory(&directory)?;
+        // No fallible step remains between acquiring the flock and installing
+        // its last-owner Drop guard. Callers receive the Arc before performing
+        // any validation which can return early.
+        Ok(Arc::new(Self { directory }))
+    }
+
+    pub(crate) fn as_file(&self) -> &File {
+        &self.directory
+    }
+}
+
+impl std::ops::Deref for LockedAttachmentDirectory {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_file()
+    }
+}
+
+impl Drop for LockedAttachmentDirectory {
+    fn drop(&mut self) {
+        unlock_directory(&self.directory);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -972,16 +1009,14 @@ impl RetainedAuthorizedBlockd {
         &self.checkpoint
     }
 
-    /// Duplicate the already-flocked attachment descriptor for another typed
-    /// verifier. `File::try_clone` uses the same open file description, so it
-    /// preserves (and does not recursively reacquire) the cooperative flock.
-    /// The caller must keep this retained owner live while consuming the
-    /// duplicate.
-    pub(crate) fn duplicate_locked_attachment_directory(&self) -> Result<File> {
+    /// Share the already-flocked attachment owner with another typed verifier.
+    /// The final typed owner explicitly unlocks even when an unexeced fork
+    /// child still retains a raw duplicate of the underlying OFD.
+    pub(crate) fn duplicate_locked_attachment_directory(
+        &self,
+    ) -> Result<Arc<LockedAttachmentDirectory>> {
         self.assert_current()?;
-        self.directory
-            .try_clone()
-            .context("duplicate retained authorized blockd attachment descriptor")
+        Ok(Arc::clone(&self.directory))
     }
 
     pub(crate) fn data_directory(&self) -> &Path {
@@ -989,7 +1024,7 @@ impl RetainedAuthorizedBlockd {
     }
 
     pub(crate) fn retained_directory(&self) -> &File {
-        &self.directory
+        self.directory.as_file()
     }
 
     pub(crate) fn state_directory_path(&self) -> &Path {
@@ -1380,7 +1415,7 @@ impl PreparedAuthorizedBlockd {
     }
 
     pub(crate) fn retained_directory(&self) -> &File {
-        &self._directory_lock
+        self._directory_lock.as_file()
     }
 
     pub(crate) fn state_directory_path(&self) -> &Path {
@@ -2053,6 +2088,21 @@ fn lock_directory(directory: &File) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+fn unlock_directory(directory: &File) {
+    loop {
+        // SAFETY: the descriptor is live and flock retains no Rust memory.
+        // Explicit unlock is required before close because a forked child or
+        // duplicated descriptor can retain the same open file description.
+        let result = unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) };
+        if result == 0 {
+            return;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
     }
 }
 
@@ -2786,6 +2836,47 @@ mod tests {
         path
     }
 
+    fn retained_runtime_checkpoint(
+        root: &Path,
+        desired: &DesiredRuntimeSpec,
+        volume: &VolumeIntent,
+        attachment: &AuthorizedServingAttachment,
+    ) -> RuntimeCheckpoint {
+        let mut checkpoint =
+            cats_api::runtime_reconciliation::decode_runtime_checkpoint(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-provision-checkpoint.json"
+            )))
+            .unwrap();
+        checkpoint.cat_id = desired.cat_id.clone();
+        checkpoint.node_id = desired.placement.node_id.clone();
+        checkpoint.placement_epoch = desired.placement.placement_epoch;
+        checkpoint.desired_revision = desired.desired_revision;
+        checkpoint.spec_digest = desired.spec_digest.clone();
+        let ReconcileStep::ProvisionRootImage {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+            data_directory,
+            size_bytes,
+            boot_image_digest,
+            expected_blank_head,
+            ..
+        } = &mut checkpoint.step
+        else {
+            unreachable!("fixture is a provision checkpoint")
+        };
+        *volume_id = volume.volume_id.clone();
+        *attachment_id = attachment.identity.attachment_id.clone();
+        *attachment_epoch = attachment.identity.attachment_epoch;
+        *data_directory =
+            HostPath::new(final_directory(root).to_str().unwrap().to_owned()).unwrap();
+        *size_bytes = volume.size_bytes;
+        *boot_image_digest = desired.runtime.boot_image_digest.clone();
+        *expected_blank_head = attachment.head.clone();
+        checkpoint
+    }
+
     fn launch_config() -> AuthorizedBlockdLaunchConfig {
         AuthorizedBlockdLaunchConfig {
             blockd_binary: "/opt/cats/bin/cats-blockd".into(),
@@ -3159,6 +3250,71 @@ mod tests {
         for (path, expected) in paths.iter().zip(&before) {
             assert_eq!(std::fs::metadata(path).unwrap().ino(), expected.0);
             assert_eq!(std::fs::read(path).unwrap(), expected.1);
+        }
+    }
+
+    #[test]
+    fn prepared_drop_unlocks_before_an_inherited_descriptor_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (desired, volume, attachment) = fixture();
+        let store =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()));
+        let prepared = store.prepare(&desired, &volume, &attachment).unwrap();
+        let inherited = prepared.retained_directory().try_clone().unwrap();
+
+        drop(prepared);
+        let successor = store.prepare(&desired, &volume, &attachment).unwrap();
+
+        drop(successor);
+        drop(inherited);
+    }
+
+    #[test]
+    fn retained_lock_waits_for_last_typed_owner_then_unlocks_before_inherited_close() {
+        for drop_shared_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (desired, volume, mut attachment) = fixture();
+            attachment.head = empty_head();
+            let store =
+                AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()));
+            drop(store.prepare(&desired, &volume, &attachment).unwrap());
+            let checkpoint =
+                retained_runtime_checkpoint(temp.path(), &desired, &volume, &attachment);
+            let mut retained = Some(store.retain_exact_runtime_checkpoint(&checkpoint).unwrap());
+            let mut shared = Some(
+                retained
+                    .as_ref()
+                    .unwrap()
+                    .duplicate_locked_attachment_directory()
+                    .unwrap(),
+            );
+            let inherited = retained
+                .as_ref()
+                .unwrap()
+                .retained_directory()
+                .try_clone()
+                .unwrap();
+
+            if drop_shared_first {
+                drop(shared.take());
+            } else {
+                drop(retained.take());
+            }
+            let blocked = match store.retain_exact_runtime_checkpoint(&checkpoint) {
+                Ok(_) => panic!("a live typed owner must keep the attachment flock held"),
+                Err(error) => error,
+            };
+            assert!(blocked.chain().any(|source| {
+                source
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            }));
+            drop(shared.take());
+            drop(retained.take());
+            let successor = store.retain_exact_runtime_checkpoint(&checkpoint).unwrap();
+
+            drop(successor);
+            drop(inherited);
         }
     }
 
