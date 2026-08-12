@@ -64,14 +64,18 @@ Operations/HA；依赖和实现顺序见[技术架构 §12](architecture.md#12-�
 
 ## 当前跨组件证据边界
 
-`node-agent/src/runtime_cutover/cross_component_e2e.rs`中的PostgreSQL测试从production Control/A23开始，
-经过真实A19、A20、Cat-create v2与runner restart，校准旧五入口404，并证明exact accepted Desired只dispatch
-给一个per-Cat effect。它有意注入受控`CompleteAssignedScanner`与`RecordingRefreshEffect`，终点是recording
-`RefreshInventory` seam；它不执行installed clean-slate scanner、production `SignedRunningEffect`或物理
-Guest/VMM。production composition有独立组件测试，但这些测试不能替代public-spawn组合证据；当前新的
-production-public-spawn PostgreSQL/Linux E2E尚未绿色，也没有把两段合成PG-backed physical E2E，更没有
-可归属于当前clean SHA的Linux/metal exact-SHA receipt。后续combined production PG/Linux E2E落地时，只在
-本节按实际终点升级证据边界，其他文档继续引用这里。
+`node-agent/src/runtime_cutover/cross_component_e2e.rs`中的portable PostgreSQL测试从production
+Control/A23开始，经过真实A19、A20、Cat-create v2与runner restart，校准旧入口404，
+并证明exact accepted Desired只dispatch给一个per-Cat effect。它有意注入受控
+`CompleteAssignedScanner`与`RecordingRefreshEffect`，终点是recording `RefreshInventory` seam。
+
+同文件的Linux-only ignored测试另外组成真实PostgreSQL、production public spawn、installed
+scanner、systemd PID 1与production `SignedRunningEffect`，证明`ProvisionRootImage`、root-blockd
+进程与checkpoint、Agent重启adoption及exact namespace退役。该测试仍使用loopback-test A19
+transport、hermetic IMDS和fixed image blob，要求S3对象请求为零；它不执行block device/TAP/VMM/
+Guest或稳定Running，因此只是真实Linux systemd physical prefix，不是完整physical/KVM E2E。
+具体release仍必须在exact clean SHA上通过Mac full、Linux full及适用的metal qualification，
+不能用portable seam或历史绿色代替当次immutable receipt。
 
 ## 尚需实现和证明
 

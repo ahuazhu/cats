@@ -38,9 +38,11 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 
 生产composition及current-Desired Running路径的attach、conditional takeover、checkpoint、ext4 readiness与
 AdmissionCell已有typed recovery和故障回归；这不宣称superseded pre-acquire publication或完整lifecycle已经
-闭合。PG测试的精确终点见[当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)；新的
-production-public-spawn PG/Linux E2E尚未绿色。任何具体部署仍必须以exact clean SHA通过Mac full、Linux full及
-适用的systemd/KVM资格测试；文档状态不是release准入。
+闭合。PG/Linux production-public-spawn测试已组成真实PostgreSQL、installed scanner、systemd PID 1与
+production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、checkpoint、restart adoption与exact
+退役；它不执行S3数据面、device/TAP/VMM/Guest或稳定Running。精确证据边界见
+[当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)。任何具体部署仍必须以exact clean SHA
+通过Mac full、Linux full及适用的systemd/KVM资格测试；文档状态不是release准入。
 
 ## Active architecture
 
