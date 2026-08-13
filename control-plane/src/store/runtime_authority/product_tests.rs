@@ -301,6 +301,13 @@ fn begin_disk_delete(
     store.begin_disk_delete_covered(request, &state)
 }
 
+fn system_mutation_guard() -> SystemDesiredMutationCommitGuard {
+    SystemDesiredMutationCommitGuard::new(
+        "RequireIdle system mutation test",
+        Instant::now() + Duration::from_secs(30),
+    )
+}
+
 fn desired_mutation_from_route_plan(
     plan: RouteEpochMutationPlan,
     operation_id: &str,
@@ -3126,12 +3133,48 @@ fn g4_cancelled_endpoint_commit_writes_nothing() {
 }
 
 #[test]
-fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
+fn g4_cancelled_require_idle_system_commit_writes_nothing() {
     use super::runtime_spine_tests::{
         refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
     };
 
     let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-idle-cancel", 1, "g4-idle-cancel-create");
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        690,
+        AcceptedRouteRuntimeKind::Running,
+    );
+    let plan = store
+        .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x6901))
+        .unwrap();
+    let expected_revision = plan.desired.desired_revision;
+    let guard = system_mutation_guard();
+    assert!(guard.cancel_before_commit());
+    let error = store
+        .commit_route_epoch_system_plan(plan, &guard)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+
+    let replanned = store
+        .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x6902))
+        .unwrap();
+    assert_eq!(replanned.desired.desired_revision, expected_revision);
+}
+
+#[test]
+fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
+    use super::runtime_spine_tests::{
+        refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
+    };
+
+    let (url, store, _unused, workspace) = stores();
     let mut create = request(&workspace, "g4-idle-open", 1, "g4-idle-open-create");
     let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
     store
@@ -3169,11 +3212,14 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
         suspend_plan.desired.endpoints[0].route_epoch,
         create.candidate.desired.endpoints[0].route_epoch
     );
-    let suspend = desired_mutation_from_route_plan(suspend_plan, "op_g4_idle", "g4-idle");
-    assert!(matches!(
-        commit_desired_mutation(&store, &suspend).unwrap(),
-        DesiredMutationCommit::Changed(_)
-    ));
+    let suspended = suspend_plan.desired.clone();
+    let guard = system_mutation_guard();
+    assert_eq!(
+        store
+            .commit_route_epoch_system_plan(suspend_plan, &guard)
+            .unwrap(),
+        SystemDesiredMutationCommit::Changed
+    );
 
     refresh_assigned_route_runtime_for_test(
         &store,
@@ -3182,13 +3228,24 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
         701,
         AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: false },
     );
+    let suspended_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                suspended.desired_revision,
+            )
+        })
+        .unwrap()
+        .expect("RequireIdle revision has an Operation");
+    assert_eq!(suspended_operation.phase, OperationPhase::Failed);
     let recovery_plan = store
         .plan_require_idle_busy_recovery(&create.candidate.cat_id)
         .unwrap();
     assert_eq!(recovery_plan.desired.target, RuntimeTarget::Running);
     assert_eq!(
         recovery_plan.desired.endpoints[0].route_epoch,
-        suspend.desired.endpoints[0].route_epoch
+        suspended.endpoints[0].route_epoch
     );
     let proof = recovery_plan
         .require_idle_open_busy_proof
@@ -3211,16 +3268,58 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
             .unwrap(),
         Some(RequireIdleGateOutcome::NeverClosed)
     );
-    let recovery =
-        desired_mutation_from_route_plan(recovery_plan, "op_g4_idle_recovery", "g4-idle-recovery");
-    assert!(matches!(
-        commit_desired_mutation(&store, &recovery).unwrap(),
-        DesiredMutationCommit::Changed(_)
-    ));
-    assert!(matches!(
-        commit_desired_mutation(&store, &recovery).unwrap(),
-        DesiredMutationCommit::Replayed(_)
-    ));
+    let recovery_revision = recovery_plan.desired.desired_revision;
+    let replay_plan = recovery_plan.clone();
+    let first_plan = recovery_plan.clone();
+    let second_plan = recovery_plan;
+    let first = Store::connect(&url, None).unwrap();
+    let second = Store::connect(&url, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = Arc::clone(&barrier);
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first
+            .commit_route_epoch_system_plan(first_plan, &system_mutation_guard())
+            .unwrap()
+    });
+    let second = std::thread::spawn(move || {
+        barrier.wait();
+        second
+            .commit_route_epoch_system_plan(second_plan, &system_mutation_guard())
+            .unwrap()
+    });
+    let outcomes = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == SystemDesiredMutationCommit::Changed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == SystemDesiredMutationCommit::Replayed)
+            .count(),
+        1
+    );
+    let recovery_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                recovery_revision,
+            )
+        })
+        .unwrap()
+        .expect("Busy recovery revision has an Operation");
+    assert_eq!(recovery_operation.phase, OperationPhase::Pending);
+    assert_eq!(
+        store
+            .commit_route_epoch_system_plan(replay_plan, &system_mutation_guard())
+            .unwrap(),
+        SystemDesiredMutationCommit::Replayed
+    );
 }
 
 #[test]
@@ -3242,17 +3341,16 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
         710,
         AcceptedRouteRuntimeKind::Running,
     );
-    let suspend = desired_mutation_from_route_plan(
+    let suspend_plan = store
+        .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7101))
+        .unwrap();
+    let suspended = suspend_plan.desired.clone();
+    assert_eq!(
         store
-            .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7101))
+            .commit_route_epoch_system_plan(suspend_plan, &system_mutation_guard())
             .unwrap(),
-        "op_g4_closed_idle",
-        "g4-closed-idle",
+        SystemDesiredMutationCommit::Changed
     );
-    assert!(matches!(
-        commit_desired_mutation(&store, &suspend).unwrap(),
-        DesiredMutationCommit::Changed(_)
-    ));
 
     refresh_assigned_route_runtime_for_test(
         &store,
@@ -3269,8 +3367,6 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
         _ => panic!("Busy recovery omitted its typed system source"),
     };
     let old_expected = old_plan.expected_current.clone();
-    let old_recovery =
-        desired_mutation_from_route_plan(old_plan, "op_g4_old_session", "g4-old-session");
     refresh_assigned_route_runtime_for_test(
         &store,
         &identity,
@@ -3290,11 +3386,12 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
             .unwrap(),
         None
     );
-    assert!(matches!(
-        commit_desired_mutation(&store, &old_recovery),
-        Err(CoveredDesiredMutationError::Stale)
-    ));
-    assert_desired_mutation_artifacts_absent(&store, &old_recovery);
+    assert_eq!(
+        store
+            .commit_route_epoch_system_plan(old_plan, &system_mutation_guard())
+            .unwrap(),
+        SystemDesiredMutationCommit::Stale
+    );
 
     refresh_assigned_route_runtime_for_test(
         &store,
@@ -3309,7 +3406,7 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
     assert!(closed_plan.require_idle_open_busy_proof.is_none());
     assert_eq!(
         closed_plan.desired.endpoints[0].route_epoch.get(),
-        suspend.desired.endpoints[0].route_epoch.get() + 1
+        suspended.endpoints[0].route_epoch.get() + 1
     );
     let closed_evidence = match &closed_plan.system_source {
         Some(RouteEpochSystemSource::RequireIdleBusy { evidence }) => evidence,
@@ -3326,6 +3423,12 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
             })
             .unwrap(),
         Some(RequireIdleGateOutcome::ClosedOrAmbiguous)
+    );
+    assert_eq!(
+        store
+            .commit_route_epoch_system_plan(closed_plan, &system_mutation_guard())
+            .unwrap(),
+        SystemDesiredMutationCommit::Changed
     );
 }
 

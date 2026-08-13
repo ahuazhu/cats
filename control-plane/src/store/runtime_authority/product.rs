@@ -54,13 +54,16 @@ use super::product_rows::{
     load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
     update_operation,
 };
-use super::route_epoch_engine::RequireIdleOpenBusyProof;
+use super::route_epoch_engine::{
+    RequireIdleBusyEvidence, RequireIdleGateOutcome, RequireIdleOpenBusyProof,
+};
 use super::rows::{
     database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
     volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
-    lock_placement_admission_for_desired_mutation, validate_require_idle_open_busy_proof_in,
+    lock_placement_admission_for_desired_mutation, validate_require_idle_attempt_source_in,
+    validate_require_idle_busy_evidence_in, validate_require_idle_open_busy_proof_in,
     PlacementAdmissionLoad, PlacementAdmissionSnapshot,
 };
 use crate::store::agent_sessions::load_identity_by_node_for_update;
@@ -499,6 +502,10 @@ pub(crate) enum CoveredDesiredMutationError {
 /// a hint only and re-reads the complete current Desired under the A1 lock
 /// order before it can publish a successor revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the A3 Billing composition consumes this common scan hint"
+)]
 pub(crate) struct BillingDesiredCandidate {
     pub(crate) cat_id: Id,
     pub(crate) workspace_id: Id,
@@ -517,6 +524,10 @@ pub(crate) enum SystemDesiredMutationCommit {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the A3 Billing composition retains this compatibility alias"
+)]
 pub(super) type BillingDesiredCommit = SystemDesiredMutationCommit;
 
 /// Exact, stable facts that caused the Billing domain to request downward
@@ -576,6 +587,7 @@ pub(crate) struct SystemDesiredMutationRequest {
     placement_snapshots: Vec<PlacementTargetSnapshot>,
     active_guest_digest: Sha256Digest,
     endpoint_records: Vec<EndpointRecordCandidate>,
+    require_idle_open_busy_proof: Option<RequireIdleOpenBusyProof>,
 }
 
 impl SystemDesiredMutationRequest {
@@ -604,6 +616,7 @@ impl SystemDesiredMutationRequest {
             placement_snapshots: Vec::new(),
             active_guest_digest,
             endpoint_records,
+            require_idle_open_busy_proof: None,
         })
     }
 
@@ -637,6 +650,7 @@ impl SystemDesiredMutationRequest {
             placement_snapshots,
             active_guest_digest,
             endpoint_records,
+            require_idle_open_busy_proof: None,
         }
     }
 
@@ -648,6 +662,7 @@ impl SystemDesiredMutationRequest {
         placement_snapshots: Vec<PlacementTargetSnapshot>,
         active_guest_digest: Sha256Digest,
         endpoint_records: Vec<EndpointRecordCandidate>,
+        require_idle_open_busy_proof: Option<RequireIdleOpenBusyProof>,
     ) -> Self {
         Self {
             source: SystemDesiredMutationSource::RequireIdleBusy(source),
@@ -656,6 +671,7 @@ impl SystemDesiredMutationRequest {
             placement_snapshots,
             active_guest_digest,
             endpoint_records,
+            require_idle_open_busy_proof,
         }
     }
 }
@@ -663,6 +679,10 @@ impl SystemDesiredMutationRequest {
 /// Request-lifetime cancellation/deadline owner for a system mutation. Drop
 /// wins only before PostgreSQL COMMIT is claimed; after that, exact Operation
 /// replay resolves ambiguity without inventing an API result row.
+#[allow(
+    dead_code,
+    reason = "commit phase accessors are shared with the A3 async service owner"
+)]
 pub(crate) struct SystemDesiredMutationCommitGuard {
     _cancellation: CoveredCommitCancellation,
     state: CoveredCommitState,
@@ -1411,6 +1431,7 @@ impl Store {
     /// production BillingEnforcer. This is deliberately a hint page: funding
     /// is checked outside the Control transaction and the mutation below
     /// performs an exact revision CAS before changing authority.
+    #[allow(dead_code, reason = "consumed by the A3 Billing singleton")]
     pub(crate) fn billing_desired_candidates_after(
         &self,
         after: Option<&Id>,
@@ -1483,7 +1504,7 @@ impl Store {
                     active_guest_digest: &request.active_guest_digest,
                     endpoint_records: &request.endpoint_records,
                     volume_mutation: &volume_mutation,
-                    require_idle_open_busy_proof: None,
+                    require_idle_open_busy_proof: request.require_idle_open_busy_proof.as_ref(),
                     exact_replay: true,
                     system_request: Some(request),
                 };
@@ -1663,6 +1684,10 @@ impl Store {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "the A3 Billing composition owns the focused compatibility tests"
+    )]
     pub(super) fn commit_billing_cold(
         &self,
         candidate: &BillingDesiredCandidate,
@@ -1724,7 +1749,7 @@ impl Store {
 fn validate_system_desired_mutation_source(
     transaction: &mut Transaction<'_>,
     request: &SystemDesiredMutationRequest,
-) -> AuthorityTxResult<()> {
+) -> AuthorityTxResult<bool> {
     match &request.source {
         SystemDesiredMutationSource::BillingExhaustion(decision) => {
             let exhausted = i128::try_from(decision.usage_nanos)
@@ -1761,15 +1786,72 @@ fn validate_system_desired_mutation_source(
                 )
                 .into());
             }
-            Ok(())
+            Ok(true)
         }
-        // G4 composes exact accepted checkpoint/Condition validation here.
-        // Until then these variants are typed but mechanically fail closed.
-        SystemDesiredMutationSource::RequireIdleAttempt(_)
-        | SystemDesiredMutationSource::RequireIdleBusy(_) => Err(ApiError::unavailable(
-            "RequireIdle system mutation proof validator is not composed",
-        )
-        .into()),
+        SystemDesiredMutationSource::RequireIdleAttempt(source) => {
+            let transition_matches = matches!(
+                &request.desired.transition,
+                RuntimeTransition::RequireIdle {
+                    attempt_id,
+                    source_revision,
+                    source_runtime_incarnation,
+                } if request.expected_current.target == RuntimeTarget::Running
+                    && request.desired.target == RuntimeTarget::Suspended
+                    && attempt_id == &source.attempt_id
+                    && *source_revision == source.source_revision
+                    && source_runtime_incarnation == &source.source_runtime_incarnation
+                    && source.source_revision
+                        == request.expected_current.desired_revision
+            );
+            if !transition_matches || request.require_idle_open_busy_proof.is_some() {
+                return Ok(false);
+            }
+            validate_require_idle_attempt_source_in(
+                transaction,
+                &request.expected_current,
+                &source.source_runtime_incarnation,
+            )
+        }
+        SystemDesiredMutationSource::RequireIdleBusy(source) => {
+            let evidence = RequireIdleBusyEvidence {
+                node_id: source.node_id.clone(),
+                agent_session_epoch: source.agent_session_epoch,
+                inventory_epoch: source.inventory_epoch,
+                observation_id: source.observation_id.clone(),
+                heartbeat_sequence: source.heartbeat_sequence,
+                attempt_id: source.attempt_id.clone(),
+                source_revision: source.source_revision,
+                source_runtime_incarnation: source.source_runtime_incarnation.clone(),
+            };
+            let Some(outcome) = validate_require_idle_busy_evidence_in(
+                transaction,
+                &request.expected_current,
+                &evidence,
+            )?
+            else {
+                return Ok(false);
+            };
+            let proof_matches_source =
+                request
+                    .require_idle_open_busy_proof
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        proof.node_id == source.node_id
+                            && proof.agent_session_epoch == source.agent_session_epoch
+                            && proof.inventory_epoch == source.inventory_epoch
+                            && proof.observation_id == source.observation_id
+                            && proof.heartbeat_sequence == source.heartbeat_sequence
+                            && proof.attempt_id == source.attempt_id
+                            && proof.source_revision == source.source_revision
+                            && proof.source_runtime_incarnation == source.source_runtime_incarnation
+                    });
+            Ok(match outcome {
+                RequireIdleGateOutcome::NeverClosed => proof_matches_source,
+                RequireIdleGateOutcome::ClosedOrAmbiguous => {
+                    request.require_idle_open_busy_proof.is_none()
+                }
+            })
+        }
     }
 }
 
@@ -1945,6 +2027,7 @@ fn commit_desired_publication_in(
     )?;
     checkpoint_covered_commit(transaction, commit_state)?;
 
+    let mut potential_system_replay = false;
     match mutation_class {
         DesiredMutationClass::SourceOnly => {
             let nodes = BTreeSet::from([
@@ -1965,6 +2048,12 @@ fn commit_desired_publication_in(
                     ));
                 }
             }
+            if publication.exact_replay && publication.system_request.is_some() {
+                checkpoint_covered_commit(transaction, commit_state)?;
+                potential_system_replay =
+                    load_desired_unlocked(transaction, &publication.expected_current.cat_id)?
+                        .is_some_and(|current| current == *publication.desired);
+            }
         }
         DesiredMutationClass::PlacementRequired => {
             for planned in publication.placement_snapshots {
@@ -1979,29 +2068,37 @@ fn commit_desired_publication_in(
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
             }
-            for planned in publication.placement_snapshots {
-                let mut checkpoint = |transaction: &mut Transaction<'_>| {
-                    checkpoint_covered_commit(transaction, commit_state)
-                };
-                if revalidate_desired_mutation_placement_after_identity_locks(
-                    transaction,
-                    planned,
+            if publication.exact_replay && publication.system_request.is_some() {
+                checkpoint_covered_commit(transaction, commit_state)?;
+                potential_system_replay =
+                    load_desired_unlocked(transaction, &publication.expected_current.cat_id)?
+                        .is_some_and(|current| current == *publication.desired);
+            }
+            if !potential_system_replay {
+                for planned in publication.placement_snapshots {
+                    let mut checkpoint = |transaction: &mut Transaction<'_>| {
+                        checkpoint_covered_commit(transaction, commit_state)
+                    };
+                    if revalidate_desired_mutation_placement_after_identity_locks(
+                        transaction,
+                        planned,
+                        publication.active_guest_digest,
+                        &mut checkpoint,
+                    )? == PlacementCommitLoad::Stale
+                    {
+                        return Ok(DesiredPublicationOutcome::Stale);
+                    }
+                }
+                checkpoint_covered_commit(transaction, commit_state)?;
+                if revalidate_desired_mutation_post_assignment(
+                    publication.placement_snapshots,
+                    publication.expected_current,
+                    publication.desired,
                     publication.active_guest_digest,
-                    &mut checkpoint,
                 )? == PlacementCommitLoad::Stale
                 {
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
-            }
-            checkpoint_covered_commit(transaction, commit_state)?;
-            if revalidate_desired_mutation_post_assignment(
-                publication.placement_snapshots,
-                publication.expected_current,
-                publication.desired,
-                publication.active_guest_digest,
-            )? == PlacementCommitLoad::Stale
-            {
-                return Ok(DesiredPublicationOutcome::Stale);
             }
         }
     }
@@ -2011,29 +2108,36 @@ fn commit_desired_publication_in(
     // the stable source-derived Operation plus current==desired is its durable
     // oracle even when a later observation replaced the original Busy fact.
     if let Some(request) = publication.system_request {
-        checkpoint_covered_commit(transaction, commit_state)?;
-        let current = load_desired_unlocked(transaction, &request.expected_current.cat_id)?;
-        match current {
-            Some(current) if publication.exact_replay && current == request.desired => {}
-            Some(current) if current == request.expected_current => {
-                validate_system_desired_mutation_source(transaction, request)?;
+        if !potential_system_replay {
+            checkpoint_covered_commit(transaction, commit_state)?;
+            let current = load_desired_unlocked(transaction, &request.expected_current.cat_id)?;
+            match current {
+                Some(current) if current == request.expected_current => {
+                    if !validate_system_desired_mutation_source(transaction, request)? {
+                        return Ok(DesiredPublicationOutcome::Stale);
+                    }
+                }
+                _ => return Ok(DesiredPublicationOutcome::Stale),
             }
-            _ => return Ok(DesiredPublicationOutcome::Stale),
         }
     }
 
-    if let Some(proof) = publication.require_idle_open_busy_proof {
-        checkpoint_covered_commit(transaction, commit_state)?;
-        if !validate_require_idle_open_busy_proof_in(
-            transaction,
-            publication.expected_current,
-            proof,
-        )? {
-            return Ok(DesiredPublicationOutcome::Stale);
+    if publication.system_request.is_none() {
+        if let Some(proof) = publication.require_idle_open_busy_proof {
+            checkpoint_covered_commit(transaction, commit_state)?;
+            if !validate_require_idle_open_busy_proof_in(
+                transaction,
+                publication.expected_current,
+                proof,
+            )? {
+                return Ok(DesiredPublicationOutcome::Stale);
+            }
         }
     }
 
-    if publication.expected_current.placement.node_id != publication.desired.placement.node_id {
+    if !potential_system_replay
+        && publication.expected_current.placement.node_id != publication.desired.placement.node_id
+    {
         let network_id = &publication.desired.runtime.network_config.network_id;
         checkpoint_covered_commit(transaction, commit_state)?;
         lock_candidate_id(transaction, "network", network_id)?;

@@ -19,7 +19,10 @@ use cats_api::runtime_reconciliation::{
 };
 
 use super::placement_planner::{load_current_placement_target_in, PlacementTargetSnapshot};
-use super::product::{EndpointRecord, EndpointRecordCandidate};
+use super::product::{
+    EndpointRecord, EndpointRecordCandidate, RequireIdleAttemptSource, RequireIdleBusySource,
+    SystemDesiredMutationCommit, SystemDesiredMutationCommitGuard, SystemDesiredMutationRequest,
+};
 use super::product_rows::{load_desired_unlocked, load_endpoint_by_id_unlocked};
 use super::runtime_spine::{load_current_cat_runtime_unlocked, CurrentCatRuntime};
 use crate::store::{Result, Store};
@@ -115,7 +118,74 @@ pub(crate) struct RouteEpochMutationPlan {
     pub(crate) system_source: Option<RouteEpochSystemSource>,
 }
 
+impl RouteEpochMutationPlan {
+    fn into_system_request(self) -> Result<SystemDesiredMutationRequest> {
+        let Self {
+            expected_current,
+            desired,
+            endpoint_records,
+            placement_snapshots,
+            active_guest_digest,
+            require_idle_open_busy_proof,
+            system_source,
+        } = self;
+        match system_source {
+            Some(RouteEpochSystemSource::RequireIdleAttempt {
+                attempt_id,
+                source_revision,
+                source_runtime_incarnation,
+            }) => Ok(SystemDesiredMutationRequest::require_idle_attempt(
+                RequireIdleAttemptSource {
+                    attempt_id,
+                    source_revision,
+                    source_runtime_incarnation,
+                },
+                expected_current,
+                desired,
+                placement_snapshots,
+                active_guest_digest,
+                endpoint_records,
+            )),
+            Some(RouteEpochSystemSource::RequireIdleBusy { evidence }) => {
+                Ok(SystemDesiredMutationRequest::require_idle_busy(
+                    RequireIdleBusySource {
+                        node_id: evidence.node_id,
+                        agent_session_epoch: evidence.agent_session_epoch,
+                        inventory_epoch: evidence.inventory_epoch,
+                        observation_id: evidence.observation_id,
+                        heartbeat_sequence: evidence.heartbeat_sequence,
+                        attempt_id: evidence.attempt_id,
+                        source_revision: evidence.source_revision,
+                        source_runtime_incarnation: evidence.source_runtime_incarnation,
+                    },
+                    expected_current,
+                    desired,
+                    placement_snapshots,
+                    active_guest_digest,
+                    endpoint_records,
+                    require_idle_open_busy_proof,
+                ))
+            }
+            None => Err(ApiError::invalid(
+                "Endpoint product mutation cannot use the system Desired authority",
+            )),
+        }
+    }
+}
+
 impl Store {
+    /// Publishes a G4 system plan through A1's shared system-domain suffix.
+    /// The caller supplies neither an API replay key nor an Operation ID;
+    /// commit ambiguity is resolved by the stable RequireIdle source identity.
+    pub(crate) fn commit_route_epoch_system_plan(
+        &self,
+        plan: RouteEpochMutationPlan,
+        guard: &SystemDesiredMutationCommitGuard,
+    ) -> Result<SystemDesiredMutationCommit> {
+        let request = plan.into_system_request()?;
+        self.commit_system_desired_mutation(&request, guard.state())
+    }
+
     /// Plans one Endpoint-only successor from a complete, repeatable-read
     /// snapshot.  The caller supplies product identity/name but never a
     /// revision or serving epoch.
@@ -311,9 +381,10 @@ fn plan_require_idle(
         .clone()
         .ok_or_else(|| ApiError::failed_precondition("Running runtime has no incarnation"))?;
     if observed.runtime.stable_state != Some(cats_api::runtime_reconciliation::StableState::Running)
+        || observed.runtime.lifecycle_admission != LifecycleAdmission::Open
     {
         return Err(ApiError::failed_precondition(
-            "RequireIdle source is not observed stable Running",
+            "RequireIdle source is not observed stable Running with open admission",
         ));
     }
     let mut desired = successor_shell(&current)?;

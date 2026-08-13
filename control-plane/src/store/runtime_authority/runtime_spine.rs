@@ -3270,6 +3270,45 @@ pub(super) fn validate_require_idle_open_busy_proof_in(
     Ok(open_busy_proof_matches(expected_current, &observed, proof))
 }
 
+/// Revalidates the Running source of a new one-shot RequireIdle attempt under
+/// the current AgentSession and per-Cat observation locks.  The attempt ID is
+/// a stable system-domain identity; the runtime incarnation is the physical
+/// compare condition that prevents a stale planner from targeting a replaced
+/// runtime.
+pub(super) fn validate_require_idle_attempt_source_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    source_runtime_incarnation: &RandomId128,
+) -> AuthorityTxResult<bool> {
+    if expected_current.target != RuntimeTarget::Running {
+        return Ok(false);
+    }
+    let node_id = &expected_current.placement.node_id;
+    let Some(session) = load_current_session_for_update(transaction, node_id)? else {
+        return Ok(false);
+    };
+    let Some(observed) =
+        load_current_cat_runtime_for_update(transaction, node_id, &expected_current.cat_id)?
+    else {
+        return Ok(false);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(false);
+    }
+    let expected_applied = AppliedDesiredEvidence {
+        desired_revision: expected_current.desired_revision,
+        spec_digest: expected_current.spec_digest.clone(),
+        placement: expected_current.placement.clone(),
+        target: expected_current.target,
+    };
+    Ok(
+        observed.runtime.applied_desired.as_ref() == Some(&expected_applied)
+            && observed.runtime.stable_state == Some(StableState::Running)
+            && observed.runtime.runtime_incarnation.as_ref() == Some(source_runtime_incarnation)
+            && observed.runtime.lifecycle_admission == LifecycleAdmission::Open,
+    )
+}
+
 /// Commit-side validator for the system-domain Busy source.  Unlike the
 /// narrow old-epoch exception above, this accepts both Busy outcomes and
 /// returns the gate classification derived from the exact stored fact.
