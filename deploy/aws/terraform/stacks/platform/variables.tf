@@ -1,7 +1,44 @@
 variable "aws_region" {
   type        = string
-  description = "Region for the whole platform."
+  description = "Exact AWS region for the whole platform."
   default     = "us-east-1"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
+}
+
+variable "expected_account_id" {
+  type        = string
+  description = "Exact AWS account allowed to contain the production platform."
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  type        = string
+  description = "Exact AWS partition allowed to contain the production platform."
+  default     = "aws"
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
 }
 
 variable "name_prefix" {
@@ -118,19 +155,39 @@ variable "database_log_retention_days" {
 
 # Alerting -------------------------------------------------------------------
 
-variable "alert_email_addresses" {
-  type        = list(string)
-  description = "Addresses subscribed to the platform alert topic. Each recipient must confirm the AWS subscription mail before the topic reaches them."
+variable "alert_email_recipients" {
+  type        = map(string)
+  description = "Email recipients keyed by opaque, stable operator IDs. Values are sensitive and each recipient must confirm the AWS subscription mail."
+  sensitive   = true
+  nullable    = false
 
   validation {
     condition = (
-      length(var.alert_email_addresses) > 0 &&
       alltrue([
-        for address in var.alert_email_addresses :
+        for recipient_id in keys(var.alert_email_recipients) :
+        can(regex("^[a-z][a-z0-9_-]{0,63}$", recipient_id))
+      ]) &&
+      alltrue([
+        for address in values(var.alert_email_recipients) :
         address == trimspace(address) && can(regex("^[^@[:space:]]+@[^@[:space:]]+$", address))
       ])
     )
-    error_message = "alert_email_addresses must contain at least one non-empty operator email address without surrounding whitespace. Terraform cannot prove confirmation; run the alarm-recipient preflight after the recipient clicks the AWS email."
+    error_message = "alert_email_recipients must use opaque lowercase IDs and non-empty email values without surrounding whitespace. Terraform cannot prove confirmation; run the alarm-recipient preflight after confirmation."
+  }
+
+  validation {
+    condition = (
+      var.environment != "production" || length(var.alert_email_recipients) > 0
+    )
+    error_message = "alert_email_recipients must contain at least one recipient in production; an empty map is allowed only outside production."
+  }
+
+  validation {
+    condition = (
+      length(distinct(values(var.alert_email_recipients))) ==
+      length(var.alert_email_recipients)
+    )
+    error_message = "alert_email_recipients must not contain duplicate email values."
   }
 }
 

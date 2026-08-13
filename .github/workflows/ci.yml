@@ -132,4 +132,6 @@ jobs:
           terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
           terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
           terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+          python3 deploy/aws/terraform/test-alert-recipient-privacy.py
           python3 deploy/aws/preflight-alarm-recipients-fixture.py
+          python3 deploy/aws/run-controlled-alarm-recipient-test-fixture.py

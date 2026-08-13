@@ -1,3 +1,49 @@
+data "aws_partition" "current" {}
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  expected_platform_alert_topic_arn = join(":", [
+    "arn",
+    var.expected_aws_partition,
+    "sns",
+    var.aws_region,
+    var.expected_account_id,
+    "cats-${var.environment}-alerts",
+  ])
+}
+
+resource "terraform_data" "platform_alert_topic_identity" {
+  input = {
+    account_id = data.aws_caller_identity.current.account_id
+    partition  = data.aws_partition.current.partition
+    region     = data.aws_region.current.region
+    topic_arn  = var.platform_alert_sns_topic_arn
+  }
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_account_id
+      error_message = "Resolved AWS caller account does not match expected_account_id."
+    }
+
+    precondition {
+      condition     = data.aws_partition.current.partition == var.expected_aws_partition
+      error_message = "Resolved AWS partition does not match expected_aws_partition."
+    }
+
+    precondition {
+      condition     = data.aws_region.current.region == var.aws_region
+      error_message = "Resolved AWS provider region does not match aws_region."
+    }
+
+    precondition {
+      condition     = var.platform_alert_sns_topic_arn == local.expected_platform_alert_topic_arn
+      error_message = "Platform alert topic is not the exact expected production topic."
+    }
+  }
+}
+
 module "usage_infrastructure" {
   source = "../../modules/usage-infrastructure"
 
@@ -13,6 +59,8 @@ module "usage_infrastructure" {
   consumer_lag_alarm_threshold_ms = var.usage_consumer_lag_alarm_threshold_ms
   alarm_action_arns               = [var.platform_alert_sns_topic_arn]
   tags                            = var.tags
+
+  depends_on = [terraform_data.platform_alert_topic_identity]
 }
 
 locals {

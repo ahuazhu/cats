@@ -108,18 +108,18 @@ variable "consumer_lag_alarm_threshold_ms" {
 }
 
 variable "alarm_action_arns" {
-  description = "SNS topic ARNs notified by every usage-pipeline alarm. Required: an alarm without an action is not a detector."
+  description = "The single SNS topic ARN notified by every usage-pipeline alarm. The closed singleton prevents duplicate or unreviewed actions."
   type        = list(string)
 
   validation {
     condition = (
-      length(var.alarm_action_arns) > 0 &&
-      alltrue([
-        for arn in var.alarm_action_arns :
-        can(regex("^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$", arn))
-      ])
+      length(var.alarm_action_arns) == 1 &&
+      can(regex(
+        "^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$",
+        one(var.alarm_action_arns),
+      ))
     )
-    error_message = "alarm_action_arns must name at least one exact SNS topic ARN; usage alarms with no actions notify nobody. A configured topic is not enough: confirm its recipient subscription and run the alarm-recipient preflight before cutover."
+    error_message = "alarm_action_arns must be a closed singleton containing one exact SNS topic ARN; empty, duplicate, and additional actions are rejected. Confirm its recipient subscription and run the alarm-recipient preflight before cutover."
   }
 }
 

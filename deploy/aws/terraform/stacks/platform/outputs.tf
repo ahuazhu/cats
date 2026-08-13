@@ -72,6 +72,11 @@ output "alert_sns_topic_arn" {
   value       = aws_sns_topic.alerts.arn
 }
 
+output "alert_sns_topic_name" {
+  description = "Exact deterministic platform alert topic name."
+  value       = local.alert_topic_name
+}
+
 output "metal_worker_security_group_id" {
   value = aws_security_group.metal_worker.id
 }

@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -44,6 +45,7 @@ def alarm(name: str, metric: str) -> dict[str, Any]:
         "MetricName": metric,
         "Namespace": "AWS/Kinesis",
         "OKActions": [TOPIC],
+        "InsufficientDataActions": [],
         "StateValue": "OK",
     }
 
@@ -178,7 +180,10 @@ def main() -> int:
         ),
         ("cloudwatch", "describe-alarms", ("--alarm-names", *ALARM_NAMES)),
     ]
-    observed_calls = [(service, operation, arguments) for _, service, operation, arguments, _ in runner.calls]
+    observed_calls = [
+        (service, operation, arguments)
+        for _, service, operation, arguments, _ in runner.calls
+    ]
     if observed_calls != expected_calls:
         raise AssertionError(f"unexpected AWS operation sequence: {observed_calls!r}")
     if any(region != REGION for region, *_rest in runner.calls):
@@ -196,8 +201,13 @@ def main() -> int:
     if command[-4:] != ["sns", "get-topic-attributes", "--topic-arn", TOPIC]:
         # Keep the executable contract visible without ever invoking it.
         raise AssertionError(f"unexpected AWS CLI command: {command!r}")
-    if "--output" not in command or "json" not in command or "--no-cli-pager" not in command:
-        raise AssertionError("AWS CLI command lost bounded JSON/no-pager options")
+    if (
+        "--output" not in command
+        or "json" not in command
+        or "--no-cli-pager" not in command
+        or "--no-paginate" not in command
+    ):
+        raise AssertionError("AWS CLI command lost bounded JSON/no-pagination options")
 
     for status in sorted(preflight.STATUS_ONLY_SUBSCRIPTIONS):
         values = responses()
@@ -238,7 +248,26 @@ def main() -> int:
     values[("cloudwatch", "describe-alarms")]["MetricAlarms"][1][
         "AlarmActions"
     ] = []
-    expect_failure("missing alarm action", values, "does not include the exact topic")
+    expect_failure("missing alarm action", values, "exactly the alert topic")
+
+    for field, actions in (
+        ("AlarmActions", [TOPIC, TOPIC]),
+        ("AlarmActions", [TOPIC, f"{TOPIC}-extra"]),
+        ("AlarmActions", [f"{TOPIC}-wrong"]),
+        ("OKActions", []),
+        ("OKActions", [TOPIC, TOPIC]),
+        ("OKActions", [TOPIC, f"{TOPIC}-extra"]),
+        ("OKActions", [f"{TOPIC}-wrong"]),
+        ("InsufficientDataActions", [TOPIC]),
+        ("InsufficientDataActions", [TOPIC, TOPIC]),
+    ):
+        values = responses()
+        values[("cloudwatch", "describe-alarms")]["MetricAlarms"][0][field] = actions
+        expect_failure(
+            f"closed action set {field} {actions!r}", values, "exactly the alert topic"
+            if field != "InsufficientDataActions"
+            else "InsufficientDataActions must be empty",
+        )
 
     values = responses()
     values[("cloudwatch", "describe-alarms")]["MetricAlarms"].pop()
@@ -251,8 +280,54 @@ def main() -> int:
     expect_failure("duplicate alarm", values, "duplicate alarm")
 
     values = responses()
+    values[("cloudwatch", "describe-alarms")]["MetricAlarms"].append(
+        alarm("cats-production-usage-extra", "IncomingBytes")
+    )
+    expect_failure("extra alarm", values, "exactly the three usage alarms")
+
+    for field, replacement, expected in (
+        (
+            "AlarmArn",
+            f"arn:aws:cloudwatch:{REGION}:999999999999:alarm:{ALARM_NAMES[0]}",
+            "wrong ARN/account/region",
+        ),
+        (
+            "AlarmArn",
+            f"arn:aws:cloudwatch:us-west-2:{ACCOUNT}:alarm:{ALARM_NAMES[0]}",
+            "wrong ARN/account/region",
+        ),
+        ("Namespace", "Custom/Cats", "wrong metric namespace"),
+        ("MetricName", "IncomingBytes", "wrong metric"),
+        ("Dimensions", [{"Name": "StreamName", "Value": "another-stream"}], "exact stream"),
+        ("Dimensions", [{"Name": "Wrong", "Value": USAGE_NAME}], "exact stream"),
+        (
+            "Dimensions",
+            [
+                {"Name": "StreamName", "Value": USAGE_NAME},
+                {"Name": "Extra", "Value": "x"},
+            ],
+            "exact stream",
+        ),
+    ):
+        values = responses()
+        values[("cloudwatch", "describe-alarms")]["MetricAlarms"][0][field] = replacement
+        expect_failure(f"wrong alarm {field}", values, expected)
+
+    values = responses()
     values[("sts", "get-caller-identity")]["Account"] = "999999999999"
     expect_failure("wrong account", values, "caller account does not match")
+
+    values = responses()
+    values[("sts", "get-caller-identity")]["Arn"] = (
+        f"arn:aws-us-gov:iam::{ACCOUNT}:role/offline-fixture"
+    )
+    expect_failure("wrong caller partition", values, "caller ARN partition/account")
+
+    values = responses()
+    values[("sts", "get-caller-identity")]["Arn"] = (
+        "arn:aws:iam::999999999999:role/offline-fixture"
+    )
+    expect_failure("wrong caller ARN account", values, "caller ARN partition/account")
 
     if preflight.decode_aws_json('{"ok":true}', "positive") != {"ok": True}:
         raise AssertionError("known-positive JSON parser control failed")
@@ -263,6 +338,15 @@ def main() -> int:
             pass
         else:
             raise AssertionError(f"malformed AWS JSON passed: {malformed!r}")
+
+    oversized = '{"padding":"' + ("x" * preflight.MAX_AWS_JSON_BYTES) + '"}'
+    try:
+        preflight.decode_aws_json(oversized, "oversized fixture")
+    except preflight.PreflightError as error:
+        if "bounded parser input" not in str(error):
+            raise
+    else:
+        raise AssertionError("oversized AWS JSON passed")
 
     for status in sorted(preflight.STATUS_ONLY_SUBSCRIPTIONS):
         try:
@@ -279,8 +363,31 @@ def main() -> int:
         else:
             raise AssertionError(f"status-only subscription {status} passed input validation")
 
+    for malformed_topic in (
+        "arn:unknown:sns:us-east-1:123456789012:cats-production-alerts",
+        "arn:aws:sns:not a region:123456789012:cats-production-alerts",
+        "arn:aws:sns:us-east-1:not-an-account:cats-production-alerts",
+        "arn:aws:sqs:us-east-1:123456789012:cats-production-alerts",
+    ):
+        try:
+            preflight.run_preflight(
+                runner=FakeRunner(responses()),
+                topic_arn=malformed_topic,
+                subscription_arn=SUBSCRIPTION,
+                usage_resource_name=USAGE_NAME,
+                deadline_seconds=30,
+            )
+        except preflight.PreflightError:
+            pass
+        else:
+            raise AssertionError(f"malformed topic passed: {malformed_topic!r}")
+
     environment = dict(os.environ)
     environment.pop("CATS_ALARM_PREFLIGHT_FAKE_MODE", None)
+    environment["AWS_ENDPOINT_URL"] = "https://global-override.invalid"
+    environment["AWS_ENDPOINT_URL_STS"] = "https://sts-override.invalid"
+    environment["AWS_ENDPOINT_URL_SNS"] = "https://sns-override.invalid"
+    environment["AWS_ENDPOINT_URL_CLOUDWATCH"] = "https://cloudwatch-override.invalid"
     command = [
         sys.executable,
         str(SCRIPT),
@@ -314,6 +421,7 @@ def main() -> int:
     for mode, expected_error in (
         ("empty", "returned an empty response"),
         ("error", "failed with exit status 42"),
+        ("oversized", "bounded parser input"),
     ):
         negative_environment = dict(environment)
         negative_environment["CATS_ALARM_PREFLIGHT_FAKE_MODE"] = mode
@@ -333,6 +441,24 @@ def main() -> int:
             raise AssertionError(f"offline AWS CLI {mode} leaked provider stderr")
         if "Traceback" in completed.stderr:
             raise AssertionError(f"offline AWS CLI {mode} exposed a traceback")
+
+    slow_environment = dict(environment)
+    slow_environment["CATS_ALARM_PREFLIGHT_FAKE_MODE"] = "slow"
+    slow_command = [*command, "--deadline-seconds", "1"]
+    started = time.monotonic()
+    completed = subprocess.run(
+        slow_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=4,
+        env=slow_environment,
+    )
+    elapsed = time.monotonic() - started
+    if completed.returncode == 0 or "absolute deadline" not in completed.stderr:
+        raise AssertionError(f"slow AWS CLI did not hit the deadline: {completed!r}")
+    if elapsed >= 3:
+        raise AssertionError(f"absolute deadline was not bounded: {elapsed:.3f}s")
 
     print("alarm recipient preflight fixture: ok")
     return 0

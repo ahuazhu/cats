@@ -47,21 +47,70 @@ module "cluster" {
 #
 # Not encrypted: the alarm text carries no secret, and the AWS-managed SNS key
 # cannot be used, because CloudWatch cannot be granted access to it.
-resource "aws_sns_topic" "alerts" {
-  name = "${var.name_prefix}-${var.environment}-alerts"
+locals {
+  alert_topic_name = "${var.name_prefix}-${var.environment}-alerts"
+  expected_alert_topic_arn = join(":", [
+    "arn",
+    var.expected_aws_partition,
+    "sns",
+    var.aws_region,
+    var.expected_account_id,
+    local.alert_topic_name,
+  ])
+}
 
-  tags = merge(var.tags, { Name = "${var.name_prefix}-${var.environment}-alerts" })
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+resource "terraform_data" "aws_target" {
+  input = {
+    account_id = data.aws_caller_identity.current.account_id
+    partition  = data.aws_partition.current.partition
+    region     = data.aws_region.current.region
+  }
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_account_id
+      error_message = "Resolved AWS caller account does not match expected_account_id."
+    }
+
+    precondition {
+      condition     = data.aws_partition.current.partition == var.expected_aws_partition
+      error_message = "Resolved AWS partition does not match expected_aws_partition."
+    }
+
+    precondition {
+      condition     = data.aws_region.current.region == var.aws_region
+      error_message = "Resolved AWS provider region does not match aws_region."
+    }
+  }
+}
+
+resource "aws_sns_topic" "alerts" {
+  name = local.alert_topic_name
+
+  tags = merge(var.tags, { Name = local.alert_topic_name })
+
+  depends_on = [terraform_data.aws_target]
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn == local.expected_alert_topic_arn
+      error_message = "Created alert topic ARN does not match the exact expected AWS target."
+    }
+  }
 }
 
 # An email subscription stays "pending confirmation" until the recipient clicks
 # the link AWS sends. Terraform reports it as created either way, so confirm out
 # of band before treating the alarm as wired up.
 resource "aws_sns_topic_subscription" "alert_email" {
-  for_each = toset(var.alert_email_addresses)
+  for_each = nonsensitive(toset(keys(var.alert_email_recipients)))
 
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
-  endpoint  = each.value
+  endpoint  = var.alert_email_recipients[each.key]
 }
 
 module "database" {

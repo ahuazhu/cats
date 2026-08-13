@@ -1,7 +1,44 @@
 variable "aws_region" {
-  description = "AWS region containing the Cats production platform."
+  description = "Exact AWS region containing the Cats production platform."
   type        = string
   default     = "us-east-1"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
+}
+
+variable "expected_account_id" {
+  description = "Exact AWS account allowed to contain the production infrastructure."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  description = "Exact AWS partition allowed to contain the production infrastructure."
+  type        = string
+  default     = "aws"
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
 }
 
 variable "environment" {
@@ -58,16 +95,20 @@ variable "usage_consumer_lag_alarm_threshold_ms" {
 variable "platform_alert_sns_topic_arn" {
   description = "Exact alert_sns_topic_arn output from the reviewed platform Terraform state. Every usage-pipeline alarm uses this topic."
   type        = string
+  nullable    = false
 
   validation {
     condition = (
-      can(regex(
-        "^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$",
-        var.platform_alert_sns_topic_arn,
-      )) &&
-      try(split(":", var.platform_alert_sns_topic_arn)[3] == var.aws_region, false)
+      var.platform_alert_sns_topic_arn == join(":", [
+        "arn",
+        var.expected_aws_partition,
+        "sns",
+        var.aws_region,
+        var.expected_account_id,
+        "cats-${var.environment}-alerts",
+      ])
     )
-    error_message = "platform_alert_sns_topic_arn must be one exact SNS topic ARN in aws_region, copied from the platform stack's alert_sns_topic_arn output."
+    error_message = "platform_alert_sns_topic_arn must exactly match the expected partition, account, region, and cats-<environment>-alerts platform output."
   }
 }
 

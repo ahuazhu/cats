@@ -29,6 +29,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 PARTITION_RE = re.compile(r"^[a-z0-9-]+$")
 REGION_RE = re.compile(r"^[a-z0-9-]+$")
 ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+AWS_PARTITIONS = frozenset(
+    {"aws", "aws-cn", "aws-iso", "aws-iso-b", "aws-iso-e", "aws-iso-f", "aws-us-gov"}
+)
 
 
 class PreflightError(RuntimeError):
@@ -93,6 +96,7 @@ class AwsCliRunner:
             "--output",
             "json",
             "--no-cli-pager",
+            "--no-paginate",
             "--cli-connect-timeout",
             "5",
             "--cli-read-timeout",
@@ -121,6 +125,12 @@ class AwsCliRunner:
             arguments=arguments,
         )
         environment = dict(os.environ)
+        for name in tuple(environment):
+            if name.upper().startswith("AWS_ENDPOINT_URL"):
+                del environment[name]
+        # Ignore endpoint_url values in shared/configured AWS profiles as well.
+        # Evidence must come from AWS, never a caller-controlled compatible API.
+        environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"] = "true"
         environment["AWS_PAGER"] = ""
         environment["AWS_MAX_ATTEMPTS"] = "2"
         try:
@@ -162,6 +172,7 @@ def parse_topic_arn(value: str) -> TopicIdentity:
     partition, region, account_id, name = parts[1], parts[3], parts[4], parts[5]
     if (
         not PARTITION_RE.fullmatch(partition)
+        or partition not in AWS_PARTITIONS
         or not REGION_RE.fullmatch(region)
         or not ACCOUNT_RE.fullmatch(account_id)
         or not 1 <= len(name) <= 256
@@ -225,6 +236,18 @@ def validate_caller(payload: dict[str, Any], topic: TopicIdentity) -> None:
     if account_id != topic.account_id:
         raise PreflightError(
             "AWS caller account does not match the account encoded in the alert topic"
+        )
+    caller_arn = require_string(payload.get("Arn"), "caller Arn")
+    parts = caller_arn.split(":", 5)
+    if (
+        len(parts) != 6
+        or parts[0] != "arn"
+        or parts[1] != topic.partition
+        or parts[4] != topic.account_id
+        or not parts[5]
+    ):
+        raise PreflightError(
+            "AWS caller ARN partition/account does not match the exact alert topic"
         )
 
 
@@ -326,10 +349,17 @@ def validate_alarms(
             raise PreflightError(f"usage alarm {name} has ActionsEnabled=false")
         for field in ("AlarmActions", "OKActions"):
             actions = require_list(alarm.get(field), f"{name}.{field}")
-            if any(not isinstance(action, str) for action in actions):
-                raise PreflightError(f"{name}.{field} contains a non-string action")
-            if topic.arn not in actions:
-                raise PreflightError(f"usage alarm {name} does not include the exact topic in {field}")
+            if actions != [topic.arn]:
+                raise PreflightError(
+                    f"usage alarm {name}.{field} must contain exactly the alert topic"
+                )
+        insufficient_actions = require_list(
+            alarm.get("InsufficientDataActions"), f"{name}.InsufficientDataActions"
+        )
+        if insufficient_actions:
+            raise PreflightError(
+                f"usage alarm {name}.InsufficientDataActions must be empty"
+            )
         expected_arn = (
             f"arn:{topic.partition}:cloudwatch:{topic.region}:{topic.account_id}:alarm:{name}"
         )

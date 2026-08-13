@@ -140,7 +140,13 @@ Before the cutover window, complete the tracked SNS output/input seam, confirm
 the recipient out of band, run the fail-closed live preflight and retain one
 controlled delivery test as described in the
 [alarm recipient runbook](../alarm-recipients-runbook.md). Terraform cannot
-infer subscription confirmation from a created subscription resource.
+infer subscription confirmation from a created subscription resource. Both
+production states require the same explicit AWS account, partition and region;
+the AWS provider allowlist and plan-time identity reads enforce them. Platform
+recipient keys are opaque stable IDs and values are sensitive. If an earlier
+state used an email address as the `for_each` key, follow the runbook's reviewed
+state-move/import procedure before applying; otherwise Terraform will propose a
+subscription replacement.
 
 Copy the examples outside source control, replace the bucket name, then:
 
@@ -472,5 +478,7 @@ terraform -chdir=deploy/aws/terraform/stacks/production-application validate
 terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
 terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
 terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+python3 deploy/aws/terraform/test-alert-recipient-privacy.py
 python3 deploy/aws/preflight-alarm-recipients-fixture.py
+python3 deploy/aws/run-controlled-alarm-recipient-test-fixture.py
 ```

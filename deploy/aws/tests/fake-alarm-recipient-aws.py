@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from typing import Any, Sequence
 
 
@@ -52,6 +53,7 @@ def alarm(name: str, topic: str) -> dict[str, Any]:
         "MetricName": ALARM_METRICS[suffix],
         "Namespace": "AWS/Kinesis",
         "OKActions": [topic],
+        "InsufficientDataActions": [],
         "StateValue": "OK",
     }
 
@@ -63,6 +65,7 @@ def response(arguments: Sequence[str]) -> dict[str, Any]:
         "--output",
         "json",
         "--no-cli-pager",
+        "--no-paginate",
         "--cli-connect-timeout",
         "5",
         "--cli-read-timeout",
@@ -149,12 +152,23 @@ def response(arguments: Sequence[str]) -> dict[str, Any]:
 
 def main() -> int:
     mode = os.environ.get("CATS_ALARM_PREFLIGHT_FAKE_MODE", "ok")
+    if any(name.upper().startswith("AWS_ENDPOINT_URL") for name in os.environ):
+        return fail("AWS endpoint override escaped verifier sanitization")
+    if os.environ.get("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS") != "true":
+        return fail("configured AWS endpoints were not disabled")
     if mode == "error":
         # The real verifier must never echo provider stderr, which can carry a
         # subscription endpoint or other inventory.
         print("fake provider error for operator@example.invalid", file=sys.stderr)
         return 42
     if mode == "empty":
+        return 0
+    if mode == "oversized":
+        print(json.dumps({"padding": "x" * (1024 * 1024)}))
+        return 0
+    if mode == "slow":
+        time.sleep(2)
+        print("{}")
         return 0
     if mode != "ok":
         return fail("invalid fake mode")

@@ -1,6 +1,10 @@
 aws_region  = "us-east-1"
 environment = "production"
 
+# Fail closed if credentials resolve to another AWS account or partition.
+expected_account_id    = "REPLACE_WITH_12_DIGIT_PRODUCTION_ACCOUNT_ID"
+expected_aws_partition = "aws"
+
 # Network. Keep clear of CATS_GUEST_NETWORK_CIDR (10.240.0.0/16).
 vpc_cidr                = "10.20.0.0/16"
 availability_zone_count = 2
@@ -25,7 +29,9 @@ database_skip_final_snapshot   = false
 
 # Actual recipients belong only in the ignored operator tfvars. Every address
 # must click the AWS confirmation email before the alarm preflight can pass.
-alert_email_addresses = ["REPLACE_WITH_OPERATOR_ALERT_EMAIL"]
+alert_email_recipients = {
+  primary_oncall = "REPLACE_WITH_OPERATOR_ALERT_EMAIL"
+}
 
 # Worker capacity. Two stable identities across private subnets let Cats cold
 # restore onto the surviving host after one bare-metal worker is lost. The
