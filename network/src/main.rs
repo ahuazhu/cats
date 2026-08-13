@@ -44,6 +44,7 @@ struct Args {
         env = "CATS_GATEWAY_PUBLIC_EGRESS_DEADLINE_MS",
         default_value_t = 5_000
     )]
+    /// Absolute backpressure deadline for one public write; 1..=60000 ms.
     public_egress_deadline_ms: u64,
     #[arg(
         long,

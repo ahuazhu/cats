@@ -29,6 +29,7 @@ const DEFAULT_MAX_PUBLIC_REQUEST_HEAD_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_PUBLIC_CONNECTIONS: usize = 4_096;
 const DEFAULT_PUBLIC_HEAD_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_PUBLIC_EGRESS_DEADLINE: Duration = Duration::from_secs(5);
+const MAX_PUBLIC_EGRESS_DEADLINE: Duration = Duration::from_secs(60);
 const DEFAULT_SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 
@@ -51,6 +52,11 @@ pub struct GatewayIngressConfig {
     pub max_public_connections: usize,
     pub max_public_request_head_bytes: usize,
     pub public_request_head_deadline: Duration,
+    /// Absolute backpressure window for one buffered public write.
+    ///
+    /// It must be positive and no greater than 60 seconds. Partial progress
+    /// never renews this window; an idle WebSocket with no buffered egress does
+    /// not start one.
     pub public_egress_deadline: Duration,
     pub shutdown_drain_deadline: Duration,
 }
@@ -77,11 +83,20 @@ impl GatewayIngressConfig {
         }
         if self.max_public_request_head_bytes == 0
             || self.public_request_head_deadline.is_zero()
-            || self.public_egress_deadline.is_zero()
             || self.shutdown_drain_deadline.is_zero()
         {
             return Err(GatewayIngressError::InvalidConfig(
-                "public header, egress and shutdown bounds must be positive",
+                "public header and shutdown bounds must be positive",
+            ));
+        }
+        if self.public_egress_deadline.is_zero()
+            || self.public_egress_deadline > MAX_PUBLIC_EGRESS_DEADLINE
+            || Instant::now()
+                .checked_add(self.public_egress_deadline)
+                .is_none()
+        {
+            return Err(GatewayIngressError::InvalidConfig(
+                "public egress deadline must be positive, at most 60 seconds and fit the monotonic clock",
             ));
         }
         Ok(self)

@@ -226,6 +226,11 @@ HTTP/1.1、exact `application/json`、`Connection: upgrade`与
 `Upgrade: cats-route-v2-tunnel`；不接受Authorization、Cookie、content/transfer encoding、条件、
 method override或未知header。TLS/header/body/Guest connect各有独立deadline，connections与tunnels有硬上限。
 
+Gateway公网listener对每个已经缓冲的client egress write使用一个不可续期的absolute backpressure
+deadline：默认`5000 ms`，部署只可配置`1..=60000 ms`；zero、超上限或当前monotonic clock不能表示的值都在
+listener bind前拒绝。partial write进展不能重置deadline，public reader EOF/error/overflow与该write竞速并立即
+取消同task的tunnel/guard/permit；没有待写bytes的空闲WebSocket不启动这个deadline。
+
 request body最多5120 bytes，是canonical JSON：
 
 ```json

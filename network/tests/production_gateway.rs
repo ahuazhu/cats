@@ -1610,7 +1610,7 @@ async fn duplicate_host_is_rejected_before_cache_or_tunnel_authority_case() {
     server.await.unwrap().unwrap();
 }
 
-async fn zero_public_egress_deadline_is_rejected_at_startup_case() {
+async fn invalid_public_egress_deadlines_are_rejected_at_startup_case() {
     let resolver: RouteResolver = Arc::new(|_| {
         Box::pin(async { Err(cats_network::route_v2::ResolveFailure::InvalidAuthority) })
             as ResolveFuture
@@ -1618,12 +1618,27 @@ async fn zero_public_egress_deadline_is_rejected_at_startup_case() {
     let cache = RouteCache::new(cache_config(), resolver).unwrap();
     let connector: TunnelConnector =
         Arc::new(|_| Box::pin(async { Err(GatewayNodeRouteV2Error::Protocol) }) as TunnelFuture);
-    let config = GatewayIngressConfig {
-        public_egress_deadline: Duration::ZERO,
-        ..GatewayIngressConfig::default()
-    };
+    assert!(GatewayIngress::new(
+        GatewayIngressConfig {
+            public_egress_deadline: Duration::from_secs(60),
+            ..GatewayIngressConfig::default()
+        },
+        cache.clone(),
+        connector.clone(),
+    )
+    .is_ok());
 
-    assert!(GatewayIngress::new(config, cache, connector).is_err());
+    for public_egress_deadline in [
+        Duration::ZERO,
+        Duration::from_millis(60_001),
+        Duration::from_millis(u64::MAX),
+    ] {
+        let config = GatewayIngressConfig {
+            public_egress_deadline,
+            ..GatewayIngressConfig::default()
+        };
+        assert!(GatewayIngress::new(config, cache.clone(), connector.clone()).is_err());
+    }
 }
 
 const PRODUCTION_GATEWAY_CASE_DEADLINE: Duration = Duration::from_secs(20);
@@ -1731,6 +1746,6 @@ bounded_production_gateway_tests!(
         guard_acquired_failure_never_refreshes_the_route_case,
     duplicate_host_is_rejected_before_cache_or_tunnel_authority =>
         duplicate_host_is_rejected_before_cache_or_tunnel_authority_case,
-    zero_public_egress_deadline_is_rejected_at_startup =>
-        zero_public_egress_deadline_is_rejected_at_startup_case,
+    invalid_public_egress_deadlines_are_rejected_at_startup =>
+        invalid_public_egress_deadlines_are_rejected_at_startup_case,
 );
