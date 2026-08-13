@@ -725,6 +725,87 @@ fn control_plane_image_manifest_access_is_exact_and_read_only() {
 }
 
 #[test]
+fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
+    let reset_runbook = read_workspace_file("deploy/aws/production-clean-slate-reset.md");
+    assert!(
+        reset_runbook.contains("--fresh-chunkstore-prefix cats-fresh"),
+        "the contract needs a non-default prefix to calibrate the former hardcoded-worker mismatch"
+    );
+
+    let infrastructure =
+        read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
+    assert_eq!(
+        infrastructure.matches("= var.chunkstore_prefix").count(),
+        2,
+        "one reviewed infrastructure input must feed both usage IAM and the worker deployment"
+    );
+
+    let worker_variables =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
+    assert!(worker_variables.contains("variable \"chunkstore_prefix\""));
+    assert_eq!(
+        worker_variables
+            .matches("\"CATS_CHUNKSTORE_PREFIX\"")
+            .count(),
+        2,
+        "neither caller-owned environment map may replace the exact module input"
+    );
+
+    let worker_module =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert_eq!(
+        worker_module
+            .matches("CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}")
+            .count(),
+        2,
+        "both a fresh seed and an existing worker environment must receive the exact prefix"
+    );
+
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("--object-store-option prefix=${CATS_CHUNKSTORE_PREFIX}"));
+    assert!(!worker_unit.contains("--object-store-option prefix=cats"));
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains("CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}"));
+    assert!(workflow.contains("-var=\"chunkstore_prefix=$CHUNKSTORE_PREFIX\""));
+
+    for variables_path in [
+        "deploy/aws/terraform/stacks/production-infrastructure/variables.tf",
+        "deploy/aws/terraform/stacks/production-application/variables.tf",
+    ] {
+        let variables = read_workspace_file(variables_path);
+        let prefix = variables
+            .split_once("variable \"chunkstore_prefix\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(section, _)| section)
+            .expect("production chunkstore_prefix variable");
+        assert!(
+            !prefix.contains("default"),
+            "{variables_path} must require the reviewed prefix"
+        );
+        for canonical_guard in [
+            "!startswith(var.chunkstore_prefix, \"/\")",
+            "!endswith(var.chunkstore_prefix, \"/\")",
+            "!strcontains(var.chunkstore_prefix, \"..\")",
+            "!strcontains(var.chunkstore_prefix, \"//\")",
+        ] {
+            assert!(prefix.contains(canonical_guard));
+        }
+    }
+
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    assert!(application.contains("chunkstore_prefix                     = var.chunkstore_prefix"));
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(kubernetes.contains("prefix=${var.chunkstore_prefix}"));
+
+    let manual_environment = read_workspace_file("deploy/aws/metal/worker.env.example");
+    assert!(manual_environment.contains("CATS_CHUNKSTORE_PREFIX=cats"));
+    let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    assert!(verifier.contains("\"cats-worker.service\""));
+}
+
+#[test]
 fn production_deploy_has_no_legacy_route_grant_admin_preflight() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     for forbidden in [

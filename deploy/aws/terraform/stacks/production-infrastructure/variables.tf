@@ -65,7 +65,18 @@ variable "chunkstore_bucket_name" {
 variable "chunkstore_prefix" {
   description = "Exact object-key prefix used by blockd and cats-controld."
   type        = string
-  default     = "cats"
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..") &&
+      !strcontains(var.chunkstore_prefix, "//") &&
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", var.chunkstore_prefix))
+    )
+    error_message = "chunkstore_prefix must be one non-empty relative canonical prefix."
+  }
 }
 
 variable "usage_archive_object_lock_days" {

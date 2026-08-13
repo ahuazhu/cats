@@ -47,6 +47,7 @@ variables {
   runtime_provisioner_trust_bundle_json = "{}"
   storage_postgres_url                  = "postgresql://fixture.invalid/cats"
   chunkstore_bucket_name                = "cats-production-chunkstore-fixture"
+  chunkstore_prefix                     = "cats-fresh"
   usage_postgres_url                    = "postgresql://fixture.invalid/cats_usage"
   rds_ca_pem                            = "fixture-ca"
   acm_certificate_arn                   = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555"

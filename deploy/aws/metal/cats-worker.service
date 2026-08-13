@@ -42,7 +42,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --object-store-adapter aws-s3 \
   --object-store-option bucket=${CATS_S3_BUCKET} \
   --object-store-option region=${CATS_AWS_REGION} \
-  --object-store-option prefix=cats \
+  --object-store-option prefix=${CATS_CHUNKSTORE_PREFIX} \
   --vmm ch \
   --ch-bin /opt/cats/bin/cloud-hypervisor \
   --ch-seed-image /opt/cats/guest/rootfs.ext4

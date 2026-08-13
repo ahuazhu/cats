@@ -13,10 +13,13 @@ locals {
   # Non-secret worker configuration, used only to seed a host that has no
   # worker.env yet. Secrets never appear here: they arrive through Secrets
   # Manager and are merged over this by the overlay below.
-  worker_base_environment = join("\n", [
-    for key in sort(keys(var.worker_base_environment)) :
-    "${key}=${var.worker_base_environment[key]}"
-  ])
+  worker_base_environment = join("\n", concat(
+    [
+      for key in sort(keys(var.worker_base_environment)) :
+      "${key}=${var.worker_base_environment[key]}"
+    ],
+    ["CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}"],
+  ))
 
   # Non-secret configuration Terraform owns outright, merged onto an existing
   # worker.env on every deployment rather than only seeding a new one.
@@ -29,6 +32,7 @@ locals {
       for key in sort(keys(var.worker_managed_environment)) :
       "${key}=${var.worker_managed_environment[key]}"
     ],
+    ["CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}"],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
     ],

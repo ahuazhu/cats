@@ -55,6 +55,7 @@ variables {
   expected_aws_partition       = "aws"
   usage_archive_bucket_name    = "cats-production-usage-fixture"
   chunkstore_bucket_name       = "cats-production-chunkstore-fixture"
+  chunkstore_prefix            = "cats-fresh"
   platform_alert_sns_topic_arn = "arn:aws:sns:us-east-1:123456789012:cats-production-alerts"
   worker_artifact_bucket_name  = "cats-production-worker-fixture"
   metal_worker_enabled         = false

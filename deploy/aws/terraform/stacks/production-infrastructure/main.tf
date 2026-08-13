@@ -118,6 +118,7 @@ module "metal_worker_deployment" {
   worker_runtime_secret_data               = var.worker_runtime_secret_data
   route_v2_node_artifact_secret_arn        = var.route_v2_node_artifact_secret_arn
   route_v2_node_artifact_secret_version_id = var.route_v2_node_artifact_secret_version_id
+  chunkstore_prefix                        = var.chunkstore_prefix
   worker_base_environment                  = var.worker_base_environment
 
   # The worker reads the database password from its authority instead of a copy.

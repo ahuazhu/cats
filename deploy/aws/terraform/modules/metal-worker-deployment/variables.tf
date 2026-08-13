@@ -53,6 +53,23 @@ variable "artifact_bucket_name" {
   type        = string
 }
 
+variable "chunkstore_prefix" {
+  description = "Exact canonical object-key prefix shared with cats-controld and usage IAM."
+  type        = string
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..") &&
+      !strcontains(var.chunkstore_prefix, "//") &&
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", var.chunkstore_prefix))
+    )
+    error_message = "chunkstore_prefix must be one non-empty relative canonical prefix."
+  }
+}
+
 variable "worker_bundle_path" {
   description = "Absolute local path to the reviewed linux/amd64 worker tar.zst bundle."
   type        = string
@@ -225,6 +242,7 @@ variable "worker_managed_environment" {
       toset(keys(var.worker_managed_environment)),
       toset([
         "CATS_AUTH_TOKEN",
+        "CATS_CHUNKSTORE_PREFIX",
         "CATS_POSTGRES_URL",
         "CATS_POSTGRES_SECRET_ARN",
         "CATS_METERING_CGROUP_ROOT",
@@ -233,7 +251,7 @@ variable "worker_managed_environment" {
         "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX comes only from chunkstore_prefix; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
   }
 
   validation {
@@ -292,9 +310,9 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]),
+      toset(["CATS_AUTH_TOKEN", "CATS_CHUNKSTORE_PREFIX", "CATS_POSTGRES_URL"]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX comes only from chunkstore_prefix; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
   }
 
   # Everything in this map reaches every fresh host identically, and a second
