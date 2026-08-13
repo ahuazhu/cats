@@ -7,6 +7,10 @@ kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
 # terminal-release plan that selects disjoint fresh data/usage targets; route
 # and mutation admission remain Closed until qualification and old retirement.
 maintenance_mode = false
+# Keep false through fresh qualification and exact old retirement. Enabling
+# public ingress is a separate reviewed post-reset transition and does not
+# establish the Control/Node mutation-admission proof by itself.
+enable_public_ingress = false
 
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"

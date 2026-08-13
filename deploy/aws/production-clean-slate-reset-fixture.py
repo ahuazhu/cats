@@ -19,7 +19,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 SCRIPT = Path(__file__).with_name("production-clean-slate-reset.py")
@@ -37,6 +37,7 @@ class FakeRunner(reset.CommandRunner):
         self.region = region
         self.cluster = cluster
         self.endpoint = "https://fixture.eks.example"
+        self.ingress_closed = True
         self.objects = {
             "cats-chunks-old-fixture": [
                 {
@@ -341,7 +342,19 @@ class FakeRunner(reset.CommandRunner):
             return reset.CommandResult(0, self.endpoint)
         resource = arguments[arguments.index("get") + 1]
         if resource == "namespace":
-            return self._json({"metadata": {"name": "cats", "uid": "namespace-uid"}})
+            return self._json(
+                {
+                    "metadata": {
+                        "name": "cats",
+                        "uid": "namespace-uid",
+                        "labels": {
+                            "cats.run/ingress": (
+                                "disabled" if self.ingress_closed else "enabled"
+                            )
+                        },
+                    }
+                }
+            )
         if resource == "deployments":
             return self._json(
                 {
@@ -369,7 +382,8 @@ class FakeRunner(reset.CommandRunner):
             }
             return self._json({"items": [pod, pod]})
         if resource in {"ingresses", "ingressclasses"}:
-            return self._json({"items": [{"metadata": {"uid": f"{resource}-uid"}}]})
+            items = [] if self.ingress_closed else [{"metadata": {"uid": "public"}}]
+            return self._json({"items": items})
         return reset.CommandResult(64, "", f"unexpected kubectl resource {resource}")
 
     def _psql(
@@ -413,7 +427,9 @@ class FakeRunner(reset.CommandRunner):
                     "database": "cats",
                     "server_address": "10.0.0.10",
                     "server_port": 5432,
-                    "current_user": "cats_owner",
+                    "current_user": (
+                        "cats_readonly" if schema.endswith("_fresh") else "cats_owner"
+                    ),
                     "schema_exists": self.schemas[schema],
                     "schema_owner": "cats_owner",
                     "marker_exists": self.schemas[schema],
@@ -504,12 +520,31 @@ def write_private(path: Path, value: str) -> None:
 FIXTURE_NOW = dt.datetime(2026, 8, 13, 0, 0, tzinfo=dt.timezone.utc)
 
 
+def fixture_executor(
+    config: reset.Config,
+    runner: FakeRunner,
+    *,
+    now: dt.datetime = FIXTURE_NOW,
+    receipt_publication_hook: Callable[[str, Path], None] | None = None,
+) -> reset.ResetExecutor:
+    return reset.ResetExecutor(
+        config,
+        runner,
+        now=now,
+        allow_unaccepted_e13_proof_for_fixture=True,
+        allow_unaccepted_e9_barrier_for_fixture=True,
+        allow_unaccepted_closed_admission_for_fixture=True,
+        receipt_publication_hook=receipt_publication_hook,
+    )
+
+
 def build_scenario(
     parent: Path,
     reset_id: str,
     *,
     lost_effect: str | None = None,
     observed_at: str = "2026-08-12T23:55:00Z",
+    qualification_digest: str = "b" * 64,
 ) -> tuple[reset.Config, FakeRunner, reset.ResetExecutor, Path, str]:
     root = parent / reset_id
     root.mkdir()
@@ -531,7 +566,8 @@ def build_scenario(
             paths[name],
             f"postgresql://cats:fixture-secret@{host}/cats?sslmode=require\n",
         )
-    release_sha = "a" * 64
+    release_commit = "a" * 40
+    artifact_sha256 = "d" * 64
     evidence = root / "post-green.json"
     evidence.write_text(
         json.dumps(
@@ -540,7 +576,8 @@ def build_scenario(
                 "version": 1,
                 "reset_id": reset_id,
                 "observed_at": observed_at,
-                "qualified_release_sha": release_sha,
+                "qualified_release_commit": release_commit,
+                "qualified_artifact_sha256": artifact_sha256,
                 "aws_account_id": "123456789012",
                 "aws_region": "us-east-1",
                 "eks_cluster_name": "cats-production",
@@ -555,7 +592,7 @@ def build_scenario(
                     "usage_archive_bucket": "cats-usage-archive-fresh-fixture",
                 },
                 "qualification": "passed",
-                "qualification_manifest_sha256": "b" * 64,
+                "qualification_manifest_sha256": qualification_digest,
                 "old_writers": {
                     name: "stopped_or_isolated" for name in reset.COMPONENTS
                 },
@@ -565,7 +602,8 @@ def build_scenario(
     )
     config = reset.Config(
         reset_id=reset_id,
-        release_sha=release_sha,
+        release_commit=release_commit,
+        artifact_sha256=artifact_sha256,
         aws_account_id="123456789012",
         aws_region="us-east-1",
         eks_cluster_name="cats-production",
@@ -604,7 +642,7 @@ def build_scenario(
             config.eks_cluster_name,
             lost_effect,
         )
-    executor = reset.ResetExecutor(config, runner, now=FIXTURE_NOW)
+    executor = fixture_executor(config, runner)
     plan_path, plan_digest = executor.plan()
     return config, runner, executor, plan_path, plan_digest
 
@@ -641,14 +679,14 @@ def assert_forward_resume(parent: Path) -> None:
             pass
         else:
             raise AssertionError(f"{effect} response loss did not interrupt the first apply")
-        resumed = reset.ResetExecutor(config, runner, now=FIXTURE_NOW)
+        resumed = fixture_executor(config, runner)
         final_path, final_digest = resumed.apply(
             plan_path, plan_digest, config.reset_id, execute=True
         )
         if mutation_counts(runner) != expected_final:
             raise AssertionError(f"{effect} was repeated or left a later effect incomplete")
         before_replay = mutation_counts(runner)
-        replay_path, replay_digest = reset.ResetExecutor(
+        replay_path, replay_digest = fixture_executor(
             config, runner, now=FIXTURE_NOW + dt.timedelta(days=2)
         ).apply(plan_path, plan_digest, config.reset_id, execute=True)
         if (replay_path, replay_digest) != (final_path, final_digest):
@@ -695,19 +733,189 @@ def assert_forward_resume(parent: Path) -> None:
                 raise AssertionError(f"{stage} crash point did not interrupt apply")
         finally:
             reset.write_receipt = original_write_receipt
-        final_path, final_digest = reset.ResetExecutor(
+        final_path, final_digest = fixture_executor(
             config, runner, now=FIXTURE_NOW + dt.timedelta(days=2)
         ).apply(plan_path, plan_digest, config.reset_id, execute=True)
         if mutation_counts(runner) != expected_final:
             raise AssertionError(f"{stage} crash replay repeated or missed an effect")
         before_replay = mutation_counts(runner)
-        replay_path, replay_digest = reset.ResetExecutor(
+        replay_path, replay_digest = fixture_executor(
             config, runner, now=FIXTURE_NOW + dt.timedelta(days=3)
         ).apply(plan_path, plan_digest, config.reset_id, execute=True)
         if (replay_path, replay_digest) != (final_path, final_digest):
             raise AssertionError(f"{stage} crash replay changed final receipt identity")
         if mutation_counts(runner) != before_replay:
             raise AssertionError(f"{stage} duplicate replay executed an effect")
+
+
+def assert_receipt_publication_recovery(parent: Path) -> None:
+    case = 0
+    for receipt_name, operation in (("plan", "plan"), ("dry-run", "dry-run")):
+        for suffix in (".json", ".sha256"):
+            for crash_point in ("after_link", "after_directory_fsync"):
+                case += 1
+                config, runner, _executor, plan_path, plan_digest = build_scenario(
+                    parent, f"cutover-publish-read-only-{case:04d}"
+                )
+                if operation == "plan":
+                    plan_path.unlink()
+                    plan_path.with_suffix(".sha256").unlink()
+                crashed = False
+
+                def crash_read_only_publication(point: str, path: Path) -> None:
+                    nonlocal crashed
+                    if (
+                        not crashed
+                        and point == crash_point
+                        and path.name
+                        == f"{config.reset_id}.{receipt_name}{suffix}"
+                    ):
+                        crashed = True
+                        raise reset.ResetError(
+                            f"simulated {receipt_name}{suffix} {crash_point} crash"
+                        )
+
+                executor = fixture_executor(
+                    config,
+                    runner,
+                    receipt_publication_hook=crash_read_only_publication,
+                )
+                try:
+                    if operation == "plan":
+                        executor.plan()
+                    else:
+                        executor.apply(
+                            plan_path,
+                            plan_digest,
+                            config.reset_id,
+                            execute=False,
+                        )
+                except reset.ResetError as error:
+                    if f"{receipt_name}{suffix} {crash_point}" not in str(error):
+                        raise
+                else:
+                    raise AssertionError(
+                        f"{receipt_name}{suffix} {crash_point} did not interrupt publication"
+                    )
+                if operation == "plan":
+                    fixture_executor(config, runner).plan()
+                else:
+                    fixture_executor(config, runner).apply(
+                        plan_path,
+                        plan_digest,
+                        config.reset_id,
+                        execute=False,
+                    )
+                if mutation_counts(runner) != (0, 0, 0, 0, ()):
+                    raise AssertionError(
+                        f"{receipt_name}{suffix} {crash_point} crossed the mutation boundary"
+                    )
+
+    expected_final = (2, 1, 1, 1, ("cats_control_old", "cats_usage_old"))
+    stages = [
+        "reset-started",
+        "s3-empty",
+        "usage-transport-empty",
+        "control-schema-empty",
+        "usage-schema-empty",
+        "reset-complete",
+    ]
+    case = 0
+    for stage in stages:
+        for suffix in (".json", ".sha256"):
+            for crash_point in ("after_link", "after_directory_fsync"):
+                case += 1
+                config, runner, _executor, plan_path, plan_digest = build_scenario(
+                    parent, f"cutover-publish-{case:04d}"
+                )
+                crashed = False
+
+                def crash_publication(point: str, path: Path) -> None:
+                    nonlocal crashed
+                    if (
+                        not crashed
+                        and point == crash_point
+                        and path.name == f"{config.reset_id}.{stage}{suffix}"
+                    ):
+                        crashed = True
+                        raise reset.ResetError(
+                            f"simulated {stage}{suffix} {crash_point} crash"
+                        )
+
+                try:
+                    fixture_executor(
+                        config,
+                        runner,
+                        receipt_publication_hook=crash_publication,
+                    ).apply(plan_path, plan_digest, config.reset_id, execute=True)
+                except reset.ResetError as error:
+                    if f"{stage}{suffix} {crash_point}" not in str(error):
+                        raise
+                else:
+                    raise AssertionError(
+                        f"{stage}{suffix} {crash_point} did not interrupt publication"
+                    )
+                final_path, final_digest = fixture_executor(config, runner).apply(
+                    plan_path, plan_digest, config.reset_id, execute=True
+                )
+                if mutation_counts(runner) != expected_final:
+                    raise AssertionError(
+                        f"{stage}{suffix} {crash_point} repeated or missed an effect"
+                    )
+                before = mutation_counts(runner)
+                replay_path, replay_digest = fixture_executor(config, runner).apply(
+                    plan_path, plan_digest, config.reset_id, execute=True
+                )
+                if (replay_path, replay_digest) != (final_path, final_digest):
+                    raise AssertionError(
+                        f"{stage}{suffix} {crash_point} changed final authority"
+                    )
+                if mutation_counts(runner) != before:
+                    raise AssertionError(
+                        f"{stage}{suffix} {crash_point} replayed a physical effect"
+                    )
+
+
+def assert_unaccepted_proofs_block_execute(parent: Path) -> None:
+    random_digest = os.urandom(32).hex()
+    config, _plan_runner, _executor, plan_path, plan_digest = build_scenario(
+        parent,
+        "cutover-proof-block-0001",
+        qualification_digest=random_digest,
+    )
+    cases = [
+        (
+            "E13",
+            {},
+        ),
+        (
+            "E9",
+            {"allow_unaccepted_e13_proof_for_fixture": True},
+        ),
+        (
+            "Closed route/mutation",
+            {
+                "allow_unaccepted_e13_proof_for_fixture": True,
+                "allow_unaccepted_e9_barrier_for_fixture": True,
+            },
+        ),
+    ]
+    for label, overrides in cases:
+        runner = FakeRunner(
+            config.aws_account_id, config.aws_region, config.eks_cluster_name
+        )
+        executor = reset.ResetExecutor(config, runner, now=FIXTURE_NOW, **overrides)
+        try:
+            executor.apply(plan_path, plan_digest, config.reset_id, execute=True)
+        except reset.ResetError as error:
+            if label not in str(error):
+                raise
+        else:
+            raise AssertionError(f"unaccepted {label} proof did not mechanically block")
+        if runner.calls or mutation_counts(runner) != (0, 0, 0, 0, ()):
+            raise AssertionError(
+                f"random digest crossed AWS/PostgreSQL boundary before {label} block"
+            )
 
 
 def assert_binding_failures(parent: Path) -> None:
@@ -758,7 +966,7 @@ def assert_binding_failures(parent: Path) -> None:
     evidence_value["qualification_manifest_sha256"] = "c" * 64
     config.post_green_evidence_file.write_text(json.dumps(evidence_value) + "\n")
     try:
-        reset.ResetExecutor(config, runner, now=FIXTURE_NOW).apply(
+        fixture_executor(config, runner).apply(
             plan_path, plan_digest, config.reset_id, execute=True
         )
     except reset.ResetError as error:
@@ -807,7 +1015,7 @@ def assert_binding_failures(parent: Path) -> None:
     tampered_path.write_bytes(reset.canonical_bytes(tampered))
     tampered_digest = reset.sha256_bytes(tampered_path.read_bytes())
     try:
-        reset.ResetExecutor(plan_config, plan_runner, now=FIXTURE_NOW).apply(
+        fixture_executor(plan_config, plan_runner).apply(
             tampered_path, tampered_digest, plan_config.reset_id, execute=True
         )
     except reset.ResetError as error:
@@ -826,7 +1034,7 @@ def assert_binding_failures(parent: Path) -> None:
     for suffix in ("json", "sha256"):
         (gap_config.receipt_directory / f"{gap_config.reset_id}.control-schema-empty.{suffix}").unlink()
     try:
-        reset.ResetExecutor(gap_config, gap_runner, now=FIXTURE_NOW).apply(
+        fixture_executor(gap_config, gap_runner).apply(
             gap_plan, gap_digest, gap_config.reset_id, execute=True
         )
     except reset.ResetError as error:
@@ -846,17 +1054,32 @@ def assert_binding_failures(parent: Path) -> None:
         pair_config.receipt_directory
         / f"{pair_config.reset_id}.s3-empty.sha256"
     ).unlink()
+    fixture_executor(pair_config, pair_runner).apply(
+        pair_plan, pair_digest, pair_config.reset_id, execute=True
+    )
+    repaired_checksum = (
+        pair_config.receipt_directory
+        / f"{pair_config.reset_id}.s3-empty.sha256"
+    )
+    if not repaired_checksum.is_file():
+        raise AssertionError("missing derived checksum was not repaired from JSON authority")
+    if mutation_counts(pair_runner) != before:
+        raise AssertionError("derived checksum repair executed another effect")
+    (
+        pair_config.receipt_directory
+        / f"{pair_config.reset_id}.s3-empty.json"
+    ).unlink()
     try:
-        reset.ResetExecutor(pair_config, pair_runner, now=FIXTURE_NOW).apply(
+        fixture_executor(pair_config, pair_runner).apply(
             pair_plan, pair_digest, pair_config.reset_id, execute=True
         )
     except reset.ResetError as error:
-        if "incomplete" not in str(error):
+        if "without JSON authority" not in str(error):
             raise
     else:
-        raise AssertionError("an incomplete receipt/SHA pair was accepted")
+        raise AssertionError("orphan receipt checksum was accepted as authority")
     if mutation_counts(pair_runner) != before:
-        raise AssertionError("an incomplete receipt pair executed another effect")
+        raise AssertionError("orphan receipt checksum executed another effect")
 
     ahead_config, ahead_runner, ahead_executor, ahead_plan, ahead_digest = build_scenario(
         parent, "cutover-ahead-0001"
@@ -892,7 +1115,7 @@ def assert_binding_failures(parent: Path) -> None:
     ahead_runner.schemas["cats_control_old"] = False
     before = mutation_counts(ahead_runner)
     try:
-        reset.ResetExecutor(ahead_config, ahead_runner, now=FIXTURE_NOW).apply(
+        fixture_executor(ahead_config, ahead_runner).apply(
             ahead_plan, ahead_digest, ahead_config.reset_id, execute=True
         )
     except reset.ResetError as error:
@@ -910,7 +1133,7 @@ def assert_binding_failures(parent: Path) -> None:
     stale_value["observed_at"] = "2026-08-12T23:44:59Z"
     stale_config.post_green_evidence_file.write_text(json.dumps(stale_value) + "\n")
     try:
-        reset.ResetExecutor(stale_config, stale_runner, now=FIXTURE_NOW).plan()
+        fixture_executor(stale_config, stale_runner).plan()
     except reset.ResetError as error:
         if "older than" not in str(error):
             raise
@@ -924,7 +1147,7 @@ def assert_binding_failures(parent: Path) -> None:
     wrong_id_value["reset_id"] = "cutover-evidence-id-wrong"
     wrong_id_config.post_green_evidence_file.write_text(json.dumps(wrong_id_value) + "\n")
     try:
-        reset.ResetExecutor(wrong_id_config, wrong_id_runner, now=FIXTURE_NOW).plan()
+        fixture_executor(wrong_id_config, wrong_id_runner).plan()
     except reset.ResetError as error:
         if "reset_id" not in str(error):
             raise
@@ -979,7 +1202,8 @@ def main() -> int:
                 fresh_usage_url,
                 "postgresql://cats:fixture-secret@fresh-usage-db/cats?sslmode=require\n",
             )
-            release_sha = "a" * 64
+            release_commit = "a" * 40
+            artifact_sha256 = "d" * 64
             fresh_targets = {
                 "control_schema": "cats_control_fresh",
                 "usage_schema": "cats_usage_fresh",
@@ -997,7 +1221,8 @@ def main() -> int:
                         "version": 1,
                         "reset_id": "cutover-fixture-0001",
                         "observed_at": "2026-08-12T23:55:00Z",
-                        "qualified_release_sha": release_sha,
+                        "qualified_release_commit": release_commit,
+                        "qualified_artifact_sha256": artifact_sha256,
                         "aws_account_id": "123456789012",
                         "aws_region": "us-east-1",
                         "eks_cluster_name": "cats-production",
@@ -1014,7 +1239,8 @@ def main() -> int:
             )
             config = reset.Config(
                 reset_id="cutover-fixture-0001",
-                release_sha=release_sha,
+                release_commit=release_commit,
+                artifact_sha256=artifact_sha256,
                 aws_account_id="123456789012",
                 aws_region="us-east-1",
                 eks_cluster_name="cats-production",
@@ -1045,11 +1271,7 @@ def main() -> int:
             runner = FakeRunner(
                 config.aws_account_id, config.aws_region, config.eks_cluster_name
             )
-            executor = reset.ResetExecutor(
-                config,
-                runner,
-                now=dt.datetime(2026, 8, 13, 0, 0, tzinfo=dt.timezone.utc),
-            )
+            executor = fixture_executor(config, runner)
             plan_path, plan_digest = executor.plan()
             s3_calls = [
                 arguments
@@ -1148,6 +1370,43 @@ def main() -> int:
             else:
                 raise AssertionError("overlapping old/fresh ChunkStore prefixes were accepted")
 
+            for label, invalid_release in [
+                ("release commit", dataclasses.replace(config, release_commit="a" * 64)),
+                ("artifact digest", dataclasses.replace(config, artifact_sha256="a" * 40)),
+            ]:
+                try:
+                    reset.validate_config(invalid_release)
+                except reset.ResetError:
+                    pass
+                else:
+                    raise AssertionError(f"invalid {label} identity was accepted")
+
+            public_reset_id = "cutover-public-0001"
+            public_evidence = root / "post-green-public.json"
+            public_value = json.loads(evidence.read_text())
+            public_value["reset_id"] = public_reset_id
+            public_evidence.write_text(json.dumps(public_value) + "\n")
+            public_runner = FakeRunner(
+                config.aws_account_id, config.aws_region, config.eks_cluster_name
+            )
+            public_runner.ingress_closed = False
+            try:
+                fixture_executor(
+                    dataclasses.replace(
+                        config,
+                        reset_id=public_reset_id,
+                        post_green_evidence_file=public_evidence,
+                    ),
+                    public_runner,
+                ).plan()
+            except reset.ResetError as error:
+                if "ingress is not explicitly Closed" not in str(error):
+                    raise
+            else:
+                raise AssertionError("public fresh rollout passed reset preflight")
+            if mutation_counts(public_runner) != (0, 0, 0, 0, ()):
+                raise AssertionError("public-rollout preflight executed a physical effect")
+
             # A post-green failure must stop before any old target mutation.
             blocked_evidence = root / "post-green-blocked.json"
             blocked_value = json.loads(evidence.read_text())
@@ -1210,13 +1469,16 @@ def main() -> int:
                     raise AssertionError(f"{label} S3 expected owner crossed mutation boundary")
 
             assert_forward_resume(root)
+            assert_receipt_publication_recovery(root)
             assert_binding_failures(root)
+            assert_unaccepted_proofs_block_execute(root)
 
             print(
                 "clean-slate fixture: paginated versions+markers, multipart abort, "
                 "fresh namespace preserved, exact old retire, dry-run, receipts, "
                 "post-green blocker passed, closed forward-resume, crash replay, binding failures, "
-                "and S3 expected-owner gates passed"
+                "mechanical prerequisite blocks, recoverable receipt publication, and S3 "
+                "expected-owner gates passed; fresh DB read-only and ingress Closed passed"
             )
             return 0
     except (AssertionError, OSError, reset.ResetError) as error:

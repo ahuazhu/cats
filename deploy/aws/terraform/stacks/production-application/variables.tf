@@ -30,6 +30,12 @@ variable "maintenance_mode" {
   default     = false
 }
 
+variable "enable_public_ingress" {
+  description = "Explicit reviewed public-ingress gate; remains false through fresh qualification and old retirement."
+  type        = bool
+  default     = false
+}
+
 variable "runtime_secret_data" {
   description = "WorkOS and Cats runtime secrets. Supply with TF_VAR_runtime_secret_data or an approved CI secret store."
   type        = map(string)
