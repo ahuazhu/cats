@@ -3294,14 +3294,16 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
             .iter()
             .filter(|outcome| **outcome == SystemDesiredMutationCommit::Changed)
             .count(),
-        1
+        1,
+        "unexpected concurrent outcomes: {outcomes:?}"
     );
     assert_eq!(
         outcomes
             .iter()
             .filter(|outcome| **outcome == SystemDesiredMutationCommit::Replayed)
             .count(),
-        1
+        1,
+        "unexpected concurrent outcomes: {outcomes:?}"
     );
     let recovery_operation = store
         .authority_read_snapshot(|transaction| {

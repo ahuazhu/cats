@@ -2061,38 +2061,54 @@ fn commit_desired_publication_in(
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
             }
-            for planned in publication.placement_snapshots {
-                let mut checkpoint = |transaction: &mut Transaction<'_>| {
-                    checkpoint_covered_commit(transaction, commit_state)
-                };
-                if revalidate_desired_mutation_placement_after_identity_locks(
-                    transaction,
-                    planned,
-                    publication.active_guest_digest,
-                    &mut checkpoint,
-                )? == PlacementCommitLoad::Stale
-                {
-                    return Ok(DesiredPublicationOutcome::Stale);
-                }
-            }
+        }
+    }
+
+    // A committed system event normally returned from the retained Operation
+    // lookup before entering this suffix. Two concurrent publishers can both
+    // miss that first unlocked read, however; the NodeIdentity prefix above
+    // serializes them, so probe the exact Operation again before consuming
+    // placement/session/source evidence. Current==desired alone is never
+    // replay authority. Covered API mutations have no system_request and
+    // retain their own reservation/result protocol.
+    if let Some(request) = publication.system_request {
+        if publication.exact_replay {
             checkpoint_covered_commit(transaction, commit_state)?;
-            if revalidate_desired_mutation_post_assignment(
-                publication.placement_snapshots,
-                publication.expected_current,
-                publication.desired,
+            if let Some(operation) = load_operation_unlocked(transaction, publication.operation_id)?
+            {
+                validate_system_operation_replay(&operation, publication.operation_id, request)?;
+                return Ok(DesiredPublicationOutcome::Replayed);
+            }
+        }
+    }
+
+    if mutation_class == DesiredMutationClass::PlacementRequired {
+        for planned in publication.placement_snapshots {
+            let mut checkpoint = |transaction: &mut Transaction<'_>| {
+                checkpoint_covered_commit(transaction, commit_state)
+            };
+            if revalidate_desired_mutation_placement_after_identity_locks(
+                transaction,
+                planned,
                 publication.active_guest_digest,
+                &mut checkpoint,
             )? == PlacementCommitLoad::Stale
             {
                 return Ok(DesiredPublicationOutcome::Stale);
             }
         }
+        checkpoint_covered_commit(transaction, commit_state)?;
+        if revalidate_desired_mutation_post_assignment(
+            publication.placement_snapshots,
+            publication.expected_current,
+            publication.desired,
+            publication.active_guest_digest,
+        )? == PlacementCommitLoad::Stale
+        {
+            return Ok(DesiredPublicationOutcome::Stale);
+        }
     }
 
-    // A committed system event already returned from the retained Operation
-    // lookup before entering this suffix. An Operation miss must validate the
-    // exact current source; current==desired alone is never replay authority.
-    // Covered API mutations have no system_request and retain their own
-    // reservation/result protocol.
     if let Some(request) = publication.system_request {
         checkpoint_covered_commit(transaction, commit_state)?;
         let current = load_desired_unlocked(transaction, &request.expected_current.cat_id)?;
