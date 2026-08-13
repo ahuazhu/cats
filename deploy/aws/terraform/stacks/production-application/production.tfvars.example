@@ -1,6 +1,13 @@
 kubeconfig_path    = "/absolute/path/to/kubeconfig"
 kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
 
+# Set true only through a reviewed saved plan for Operations and HA §8.
+# This removes public ingress/DNS and scales cats-controld to zero without
+# creating out-of-band Kubernetes drift. Re-plan with false only in the exact
+# terminal-release plan that selects disjoint fresh data/usage targets; route
+# and mutation admission remain Closed until qualification and old retirement.
+maintenance_mode = false
+
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
 chunkstore_prefix        = "cats"

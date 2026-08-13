@@ -133,6 +133,71 @@ fn production_platform_preflight_requires_one_nat_gateway_per_az() {
 }
 
 #[test]
+fn production_maintenance_is_one_reviewed_terraform_transition() {
+    let stack_main =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    let stack_variables =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/variables.tf");
+    let module_main = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let example = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-application/production.tfvars.example",
+    );
+
+    let maintenance = stack_variables
+        .split_once("variable \"maintenance_mode\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("production maintenance_mode variable");
+    assert!(maintenance.contains("default     = false"));
+    for expected in [
+        "maintenance_mode                      = var.maintenance_mode",
+        "enable_public_ingress                 = !var.maintenance_mode",
+        "var.route53_zone_id != null && !var.maintenance_mode",
+    ] {
+        assert!(
+            stack_main.contains(expected),
+            "production application maintenance wiring lost {expected:?}"
+        );
+    }
+    for expected in [
+        "var.maintenance_mode ? 0 : var.control_plane_replicas",
+        "var.enable_public_ingress && !var.maintenance_mode",
+        "replicas = local.effective_control_plane_replicas",
+        "min_available = var.maintenance_mode ? \"0\" : \"1\"",
+        "suspend                       = var.maintenance_mode",
+        "for_each = local.effective_public_ingress",
+        "count = local.effective_public_ingress",
+    ] {
+        assert!(
+            module_main.contains(expected),
+            "Kubernetes maintenance boundary lost {expected:?}"
+        );
+    }
+    assert!(example.contains("maintenance_mode = false"));
+}
+
+#[test]
+fn production_clean_slate_reset_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-clean-slate-reset-fixture.py"))
+        .output()
+        .expect("run production clean-slate reset fixture");
+    assert!(
+        output.status.success(),
+        "clean-slate reset fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("paginated versions+markers"));
+    assert!(stdout.contains("fresh namespace preserved"));
+    assert!(stdout.contains("post-green blocker passed"));
+    assert!(stdout.contains("closed forward-resume"));
+    assert!(stdout.contains("crash replay"));
+    assert!(stdout.contains("S3 expected-owner gates passed"));
+}
+
+#[test]
 fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
@@ -2560,7 +2625,7 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         .expect("control-plane Deployment block");
 
     for expected in [
-        "replicas = var.control_plane_replicas",
+        "replicas = local.effective_control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
         "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
@@ -2604,7 +2669,7 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     assert!(
         terraform.contains("resource \"kubernetes_pod_disruption_budget_v1\" \"control_plane\"")
     );
-    assert!(terraform.contains("min_available = \"1\""));
+    assert!(terraform.contains("min_available = var.maintenance_mode ? \"0\" : \"1\""));
     assert!(
         !deployment.contains("type = \"Recreate\""),
         "Recreate deliberately creates a total control-plane outage"

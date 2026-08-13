@@ -24,6 +24,12 @@ variable "control_plane_replicas" {
   }
 }
 
+variable "maintenance_mode" {
+  description = "Reviewed clean-slate maintenance boundary: remove public ingress and DNS, and scale cats-controld to zero."
+  type        = bool
+  default     = false
+}
+
 variable "runtime_secret_data" {
   description = "WorkOS and Cats runtime secrets. Supply with TF_VAR_runtime_secret_data or an approved CI secret store."
   type        = map(string)
