@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod authority;
 pub mod blob;
+pub mod delete;
 pub mod image_manifest;
 pub mod metadata;
 
@@ -14,7 +15,8 @@ pub use adapter::{
     open_blob_store, open_metadata_store, AdapterConfig, AdapterError, AdapterSelection,
     BlobStoreFactory, MetadataStoreFactory,
 };
-pub use blob::{validate_key, BlobError, BlobStore};
+pub use blob::{validate_key, BlobError, BlobListPage, BlobStore, BLOB_LIST_PAGE_MAX_KEYS};
+pub use delete::{delete_volume_objects_page, volume_object_prefix, DeletePrefixPage};
 pub use image_manifest::{
     decode_image_manifest, encode_image_manifest, image_manifest_key, read_image_manifest,
     read_image_manifest_until, ImageManifestChunkV1, ImageManifestProblem, ImageManifestReadError,

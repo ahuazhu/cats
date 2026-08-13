@@ -4,6 +4,7 @@ pub(crate) mod cat_create_service;
 mod covered_commit;
 pub(crate) mod gateway_identity;
 pub(crate) mod image_manifest_resolver;
+pub(crate) mod normal_delete;
 pub(crate) mod persistent_disk_create_service;
 pub(super) mod pg_codec;
 pub(crate) mod placement_planner;

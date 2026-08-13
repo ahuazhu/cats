@@ -30,6 +30,19 @@ pub enum BlobError {
 
 pub type Result<T> = std::result::Result<T, BlobError>;
 
+/// One bounded page from the beginning of an exact object prefix.
+///
+/// Delete reconciliation deliberately does not expose provider continuation
+/// tokens.  It deletes this page and then lists from the beginning again, so
+/// an interrupted pass never persists provider-specific cursor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobListPage {
+    pub keys: Vec<String>,
+    pub is_truncated: bool,
+}
+
+pub const BLOB_LIST_PAGE_MAX_KEYS: usize = 1_000;
+
 /// Validate the portable key subset shared by every blob-store adapter.
 pub fn validate_key(key: &str) -> Result<()> {
     if key.is_empty()
@@ -93,6 +106,51 @@ pub trait BlobStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     /// Return sorted keys below `prefix`.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// Return at most `maximum` sorted keys from the beginning of `prefix`.
+    ///
+    /// Production adapters must override this method so the provider response
+    /// and local allocation are bounded.  The conservative default preserves
+    /// compatibility for test doubles but may allocate the complete listing;
+    /// it is therefore not sufficient for production delete qualification.
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        validate_list_maximum(prefix, maximum)?;
+        let mut keys = self.list(prefix)?;
+        validate_list_result(prefix, &keys)?;
+        keys.sort();
+        let is_truncated = keys.len() > maximum;
+        keys.truncate(maximum);
+        Ok(BlobListPage { keys, is_truncated })
+    }
+}
+
+pub fn validate_list_maximum(prefix: &str, maximum: usize) -> Result<()> {
+    if !(1..=BLOB_LIST_PAGE_MAX_KEYS).contains(&maximum) {
+        return Err(BlobError::InvalidKey {
+            key: prefix.to_string(),
+            message: format!("list page maximum must be in 1..={BLOB_LIST_PAGE_MAX_KEYS}"),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_list_result(prefix: &str, keys: &[String]) -> Result<()> {
+    if prefix.is_empty() || prefix.starts_with('/') {
+        return Err(BlobError::InvalidKey {
+            key: prefix.to_string(),
+            message: "expected a non-empty relative prefix".into(),
+        });
+    }
+    for key in keys {
+        validate_key(key)?;
+        if !key.starts_with(prefix) {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: format!("LIST returned key outside the requested prefix: {key}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Provider-neutral fault decorator used by crash and retry tests.
@@ -154,5 +212,9 @@ impl BlobStore for FaultyBlobStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list(prefix)
+    }
+
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        self.inner.list_bounded(prefix, maximum)
     }
 }
