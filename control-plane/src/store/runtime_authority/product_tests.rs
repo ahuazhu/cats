@@ -1147,6 +1147,142 @@ fn a2_covered_planning_holds_reservation_through_result_and_rolls_back_not_found
 }
 
 #[test]
+fn a2_resume_keeps_one_lifecycle_snapshot_across_concurrent_successor() {
+    let (url, setup, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "a2-resume-snapshot",
+        0xa2_601,
+        "a2-resume-snapshot-create",
+    );
+    let (identity, policy, release_receipt) = prepare_mutation_node(&setup, &mut create, 101);
+    setup
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let cat_id = create.candidate.cat_id.clone();
+    let active_guest_digest = guest_config_digest(&release_receipt).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let stop_service = ProductMutationService::new(
+        Arc::new(Store::connect(&url, None).unwrap()),
+        Arc::new(UuidProductIdentitySource),
+        active_guest_digest.clone(),
+    );
+    let stop_fields = ProductMutationHttpFields {
+        idempotency_key: vec![b"a2-resume-snapshot-stop".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let stop_path = format!("/v1/workspaces/{workspace}/cats/{cat_id}/actions/stop");
+    let stop = parse_authorized_product_mutation(
+        &workspace,
+        Some(cat_id.as_str()),
+        Instant::now(),
+        stop_path.as_bytes(),
+        &stop_fields,
+        b"",
+        ProductMutation::Lifecycle(CatLifecycleAction::Stop),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(stop_service.mutate(stop))
+            .unwrap()
+            .http_status,
+        202
+    );
+    let _placement =
+        refresh_mutation_target(&setup, &identity, &policy, &release_receipt, 0xa2_602);
+
+    let resume_ingress = |key: &str| {
+        let fields = ProductMutationHttpFields {
+            idempotency_key: vec![key.as_bytes().to_vec()],
+            ..ProductMutationHttpFields::default()
+        };
+        let path = format!("/v1/workspaces/{workspace}/cats/{cat_id}/actions/resume");
+        parse_authorized_product_mutation(
+            &workspace,
+            Some(cat_id.as_str()),
+            Instant::now(),
+            path.as_bytes(),
+            &fields,
+            b"",
+            ProductMutation::Lifecycle(CatLifecycleAction::Resume),
+        )
+        .unwrap()
+    };
+    let delayed_ingress = resume_ingress("a2-resume-snapshot-delayed");
+    let winner_ingress = resume_ingress("a2-resume-snapshot-winner");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let delayed_service = Arc::new(ProductMutationService::new(
+        Arc::new(Store::connect(&url, None).unwrap()),
+        Arc::new(UuidProductIdentitySource),
+        active_guest_digest.clone(),
+    ));
+    let delayed_thread = {
+        let service = Arc::clone(&delayed_service);
+        let ingress = delayed_ingress.clone();
+        let cat_id = cat_id.clone();
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            service.commit_lifecycle_once_paused_for_test(
+                ingress,
+                cat_id,
+                CatLifecycleAction::Resume,
+                id("op_a2_resume_snapshot_delayed"),
+                entered,
+                release,
+            )
+        })
+    };
+    entered.wait();
+
+    let winner_service = ProductMutationService::new(
+        Arc::new(Store::connect(&url, None).unwrap()),
+        Arc::new(UuidProductIdentitySource),
+        active_guest_digest,
+    );
+    let winner = runtime
+        .block_on(winner_service.mutate(winner_ingress))
+        .unwrap();
+    assert_eq!(winner.http_status, 202);
+    let _new_placement =
+        refresh_mutation_target(&setup, &identity, &policy, &release_receipt, 0xa2_603);
+    release.wait();
+    let delayed = delayed_thread.join().unwrap();
+    assert!(
+        matches!(delayed, Err(CoveredDesiredMutationError::Stale)),
+        "delayed Resume used a mixed lifecycle snapshot: {delayed:?}"
+    );
+
+    let converged = runtime
+        .block_on(delayed_service.mutate(delayed_ingress.clone()))
+        .unwrap();
+    assert_eq!(converged.http_status, 200);
+    let replayed = runtime
+        .block_on(delayed_service.mutate(delayed_ingress))
+        .unwrap();
+    assert_eq!(replayed, converged);
+    setup
+        .authority_transaction(|transaction| {
+            let current = super::product_rows::load_desired_for_update(transaction, &cat_id)?
+                .expect("winner Desired must remain current");
+            assert_eq!(current.desired_revision, revision(3));
+            assert_eq!(current.target, RuntimeTarget::Running);
+            assert!(
+                load_operation_by_cat_revision_unlocked(transaction, &cat_id, revision(4))?
+                    .is_none()
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn a2_cat_and_endpoint_cross_workspace_misses_persist_nothing() {
     let (_url, store, _unused, owner_workspace) = stores();
     let caller_workspace = bootstrap_workspace(&store, "f2c");

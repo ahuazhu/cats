@@ -389,8 +389,6 @@ fn load_lifecycle_snapshot_in(
     transaction: &mut Transaction<'_>,
     workspace_id: &Id,
     cat_id: &Id,
-    active_guest_digest: &Sha256Digest,
-    placement_required: bool,
 ) -> AuthorityTxResult<LifecycleSnapshot> {
     let cat = load_cat_by_id_unlocked(transaction, cat_id)?
         .filter(|cat| cat.workspace_id == *workspace_id)
@@ -417,35 +415,39 @@ fn load_lifecycle_snapshot_in(
             name: record.name,
         });
     }
-    let placement_snapshots = if placement_required {
-        let node_id = &current.placement.node_id;
-        let now = database_now(transaction)?;
-        let policy = load_policy_unlocked(transaction, node_id)?
-            .ok_or_else(|| ApiError::internal("assigned Node placement policy is missing"))?;
-        let active_host_fence_event = load_active_event_by_node_unlocked(transaction, node_id)?;
-        let admission =
-            match load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)? {
-                PlacementAdmissionLoad::Accepted(admission) => *admission,
-                PlacementAdmissionLoad::Rejected(_) => {
-                    return Err(ApiError::unavailable(
-                        "current placement is not admitted for lifecycle resume",
-                    )
-                    .into());
-                }
-            };
-        vec![PlacementTargetSnapshot {
-            policy,
-            admission,
-            active_host_fence_event,
-        }]
-    } else {
-        Vec::new()
-    };
     Ok(LifecycleSnapshot {
         current,
         endpoint_records,
-        placement_snapshots,
+        placement_snapshots: Vec::new(),
     })
+}
+
+fn enrich_lifecycle_placement_in(
+    transaction: &mut Transaction<'_>,
+    snapshot: &mut LifecycleSnapshot,
+    active_guest_digest: &Sha256Digest,
+) -> AuthorityTxResult<()> {
+    let node_id = &snapshot.current.placement.node_id;
+    let now = database_now(transaction)?;
+    let policy = load_policy_unlocked(transaction, node_id)?
+        .ok_or_else(|| ApiError::internal("assigned Node placement policy is missing"))?;
+    let active_host_fence_event = load_active_event_by_node_unlocked(transaction, node_id)?;
+    let admission =
+        match load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)? {
+            PlacementAdmissionLoad::Accepted(admission) => *admission,
+            PlacementAdmissionLoad::Rejected(_) => {
+                return Err(ApiError::unavailable(
+                    "current placement is not admitted for lifecycle resume",
+                )
+                .into());
+            }
+        };
+    snapshot.placement_snapshots = vec![PlacementTargetSnapshot {
+        policy,
+        admission,
+        active_host_fence_event,
+    }];
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +486,13 @@ enum CommitOutcome {
     CandidateCollision(CandidateCollision),
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct LifecycleSnapshotPause {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
 #[derive(Clone)]
 enum PlannedProductMutationRequest {
     Lifecycle {
@@ -493,6 +502,8 @@ enum PlannedProductMutationRequest {
         delete_id: Option<Id>,
         operation_id: Id,
         active_guest_digest: Sha256Digest,
+        #[cfg(test)]
+        snapshot_pause: Option<LifecycleSnapshotPause>,
     },
     Endpoint {
         ingress: AuthorizedProductMutationIngress,
@@ -523,23 +534,26 @@ impl Store {
                     delete_id,
                     operation_id,
                     active_guest_digest,
+                    #[cfg(test)]
+                    snapshot_pause,
                 } => {
                     let mut snapshot = load_lifecycle_snapshot_in(
                         transaction,
                         &ingress.idempotency.authenticated_workspace_id,
                         cat_id,
-                        active_guest_digest,
-                        false,
                     )?;
+                    #[cfg(test)]
+                    if let Some(pause) = snapshot_pause {
+                        pause.entered.wait();
+                        pause.release.wait();
+                    }
                     if *action == Some(CatLifecycleAction::Resume)
                         && snapshot.current.target != RuntimeTarget::Running
                     {
-                        snapshot = load_lifecycle_snapshot_in(
+                        enrich_lifecycle_placement_in(
                             transaction,
-                            &ingress.idempotency.authenticated_workspace_id,
-                            cat_id,
+                            &mut snapshot,
                             active_guest_digest,
-                            true,
                         )?;
                     }
                     if ingress.if_match.is_some_and(|if_match| {
@@ -728,6 +742,8 @@ impl ProductMutationService {
                 delete_id: delete_id.clone(),
                 operation_id,
                 active_guest_digest: self.active_guest_digest.clone(),
+                #[cfg(test)]
+                snapshot_pause: None,
             };
             match self
                 .commit(planned, ingress.absolute_deadline, &mut shutdown)
@@ -955,6 +971,31 @@ impl ProductMutationService {
         tokio::time::timeout(SHUTDOWN_DEADLINE, self.commit_resolutions.wait_empty())
             .await
             .map_err(|_| ApiError::unavailable("product mutation commit resolution timed out"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_lifecycle_once_paused_for_test(
+        &self,
+        ingress: AuthorizedProductMutationIngress,
+        cat_id: Id,
+        action: CatLifecycleAction,
+        operation_id: Id,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
+        let deadline = ingress.absolute_deadline;
+        let planned = PlannedProductMutationRequest::Lifecycle {
+            ingress,
+            cat_id,
+            action: Some(action),
+            delete_id: None,
+            operation_id,
+            active_guest_digest: self.active_guest_digest.clone(),
+            snapshot_pause: Some(LifecycleSnapshotPause { entered, release }),
+        };
+        let (_cancellation, state) =
+            CoveredCommitCancellation::new("paused lifecycle snapshot test", deadline);
+        self.store.commit_product_mutation_covered(&planned, &state)
     }
 }
 
