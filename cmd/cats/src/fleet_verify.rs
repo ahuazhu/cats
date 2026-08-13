@@ -3,8 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::future::Future;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,8 +15,7 @@ use cats_api::agent_registration::JSON_CONTENT_TYPE;
 use cats_api::fleet_verification::{
     decode_fleet_verification_snapshot, encode_fleet_verification_evidence, FleetExpectedKeyRing,
     FleetVerificationEvidence, FleetVerificationInventory, FleetVerificationSnapshot,
-    FLEET_INVENTORY_MAX_AGE_MS, FLEET_VERIFICATION_MAX_NODES, FLEET_VERIFICATION_MAX_WIRE_BYTES,
-    FLEET_VERIFICATION_PATH,
+    FLEET_INVENTORY_MAX_AGE_MS, FLEET_VERIFICATION_MAX_WIRE_BYTES, FLEET_VERIFICATION_PATH,
 };
 use cats_api::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, RouteGrantV2PublicKeyRingArtifact,
@@ -181,7 +183,7 @@ impl PollState {
                 } else {
                     anyhow::ensure!(
                         current.attestation.accepted_at_unix_ms
-                            > previous.attestation.accepted_at_unix_ms
+                            >= previous.attestation.accepted_at_unix_ms
                             && current.attestation.inventory_read_position
                                 >= previous.attestation.inventory_read_position
                             && current.source_heartbeat_sequence
@@ -258,40 +260,60 @@ pub(crate) fn run(
         signer_binding: None,
     };
 
-    let result = runtime.block_on(poll_or_cancel(
-        poll(&origin, &authority, deadline, poll_interval, &mut state),
-        tokio::signal::ctrl_c(),
-    ));
-    authority
-        .assert_current()
-        .context("fleet-administrator lock changed during fleet verification")?;
-    let snapshot = result?;
-    let completed_at = unix_millis()?;
-    anyhow::ensure!(
-        completed_at <= deadline_at,
-        "fleet verification completed after its absolute deadline"
-    );
-    let evidence = FleetVerificationEvidence {
-        version: ContractVersion::V1,
-        release_commit_sha: release_commit_sha.to_owned(),
-        started_at_unix_ms: started_at,
-        deadline_unix_ms: deadline_at,
-        completed_at_unix_ms: completed_at,
-        expected_nodes,
-        expected_key_ring: expected_ring,
-        snapshot,
-    };
-    let bytes = encode_fleet_verification_evidence(&evidence)
-        .map_err(|error| anyhow!("encode canonical fleet verification evidence: {error}"))?;
-    std::io::stdout()
-        .write_all(&bytes)
-        .context("write canonical fleet verification evidence")?;
-    std::io::stdout()
-        .flush()
-        .context("flush canonical fleet verification evidence")?;
-    Ok(())
+    runtime.block_on(async {
+        let cancellation = tokio::signal::ctrl_c();
+        let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(cancellation);
+        tokio::pin!(deadline_sleep);
+
+        let snapshot = {
+            let polling = poll(&origin, &authority, deadline, poll_interval, &mut state);
+            tokio::pin!(polling);
+            tokio::select! {
+                biased;
+                signal = &mut cancellation => {
+                    signal.context("listen for fleet verification cancellation")?;
+                    return Err(anyhow!("fleet verification cancelled"));
+                }
+                () = &mut deadline_sleep => {
+                    return Err(anyhow!(
+                        "fleet verification timed out before every expected Node was ready"
+                    ));
+                }
+                result = &mut polling => result?,
+            }
+        };
+
+        cancellation_checkpoint(cancellation.as_mut(), deadline_sleep.as_mut()).await?;
+        authority
+            .assert_current()
+            .context("fleet-administrator lock changed during fleet verification")?;
+        cancellation_checkpoint(cancellation.as_mut(), deadline_sleep.as_mut()).await?;
+
+        let completed_at = unix_millis()?;
+        anyhow::ensure!(
+            completed_at <= deadline_at,
+            "fleet verification completed after its wall-clock deadline"
+        );
+        let evidence = FleetVerificationEvidence {
+            version: ContractVersion::V1,
+            release_commit_sha: release_commit_sha.to_owned(),
+            started_at_unix_ms: started_at,
+            deadline_unix_ms: deadline_at,
+            completed_at_unix_ms: completed_at,
+            expected_nodes,
+            expected_key_ring: expected_ring,
+            snapshot,
+        };
+        cancellation_checkpoint(cancellation.as_mut(), deadline_sleep.as_mut()).await?;
+        let bytes = encode_fleet_verification_evidence(&evidence)
+            .map_err(|error| anyhow!("encode canonical fleet verification evidence: {error}"))?;
+        cancellation_checkpoint(cancellation.as_mut(), deadline_sleep.as_mut()).await?;
+        write_stdout_or_cancel(bytes, cancellation.as_mut(), deadline_sleep.as_mut()).await
+    })
 }
 
+#[cfg(test)]
 async fn poll_or_cancel<T, P, C>(poll: P, cancel: C) -> Result<T>
 where
     P: Future<Output = Result<T>>,
@@ -301,12 +323,199 @@ where
     tokio::pin!(cancel);
     tokio::select! {
         biased;
-        result = &mut poll => result,
         signal = &mut cancel => {
             signal.context("listen for fleet verification cancellation")?;
             Err(anyhow!("fleet verification cancelled"))
+        },
+        result = &mut poll => result,
+    }
+}
+
+async fn cancellation_checkpoint<C>(
+    mut cancellation: Pin<&mut C>,
+    mut deadline: Pin<&mut tokio::time::Sleep>,
+) -> Result<()>
+where
+    C: Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        biased;
+        signal = cancellation.as_mut() => {
+            signal.context("listen for fleet verification cancellation")?;
+            Err(anyhow!("fleet verification cancelled"))
+        }
+        () = deadline.as_mut() => {
+            Err(anyhow!("fleet verification exceeded its monotonic deadline"))
+        }
+        () = std::future::ready(()) => Ok(()),
+    }
+}
+
+async fn write_stdout_or_cancel<C>(
+    bytes: Vec<u8>,
+    mut cancellation: Pin<&mut C>,
+    mut deadline: Pin<&mut tokio::time::Sleep>,
+) -> Result<()>
+where
+    C: Future<Output = std::io::Result<()>>,
+{
+    enum Selection {
+        Completed(std::result::Result<std::io::Result<()>, tokio::sync::oneshot::error::RecvError>),
+        Cancelled(std::io::Result<()>),
+        Deadline,
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let writer_cancelled = Arc::clone(&cancelled);
+    let (completed_tx, mut completed_rx) = tokio::sync::oneshot::channel();
+    let writer = std::thread::Builder::new()
+        .name("cats-fleet-evidence-stdout".to_owned())
+        .spawn(move || {
+            let result = write_stdout_cancellable(&bytes, &writer_cancelled);
+            let _ = completed_tx.send(result);
+        })
+        .context("start bounded fleet evidence stdout writer")?;
+
+    let selection = tokio::select! {
+        biased;
+        signal = cancellation.as_mut() => Selection::Cancelled(signal),
+        () = deadline.as_mut() => Selection::Deadline,
+        result = &mut completed_rx => Selection::Completed(result),
+    };
+    if !matches!(&selection, Selection::Completed(_)) {
+        cancelled.store(true, Ordering::Release);
+        // The Unix writer checks cancellation between nonblocking writes and
+        // bounded poll calls, so this join cannot inherit a non-reading pipe.
+        let _ = (&mut completed_rx).await;
+    }
+    let joined = tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .context("join fleet evidence stdout owner")?;
+    anyhow::ensure!(joined.is_ok(), "fleet evidence stdout writer panicked");
+
+    match selection {
+        Selection::Completed(result) => result
+            .context("fleet evidence stdout writer stopped without a result")?
+            .context("write canonical fleet verification evidence"),
+        Selection::Cancelled(signal) => {
+            signal.context("listen for fleet verification cancellation")?;
+            Err(anyhow!(
+                "fleet verification cancelled while writing evidence"
+            ))
+        }
+        Selection::Deadline => Err(anyhow!(
+            "fleet verification exceeded its monotonic deadline while writing evidence"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn write_stdout_cancellable(bytes: &[u8], cancelled: &AtomicBool) -> std::io::Result<()> {
+    const WRITE_CHUNK: usize = 64 * 1024;
+    const POLL_MILLIS: libc::c_int = 25;
+
+    struct NonblockingGuard {
+        fd: libc::c_int,
+        original_flags: libc::c_int,
+    }
+
+    impl Drop for NonblockingGuard {
+        fn drop(&mut self) {
+            // SAFETY: `fd` is the process stdout descriptor and F_SETFL only
+            // restores the flags read successfully by F_GETFL below.
+            let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.original_flags) };
         }
     }
+
+    let fd = libc::STDOUT_FILENO;
+    // SAFETY: F_GETFL does not dereference a third argument and stdout is a
+    // process-owned descriptor for the duration of this command.
+    let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if original_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor and integer flag set are valid; the guard below
+    // restores the exact original flags on every return path.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _guard = NonblockingGuard { fd, original_flags };
+
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "fleet evidence stdout write cancelled",
+            ));
+        }
+        let length = (bytes.len() - offset).min(WRITE_CHUNK);
+        // SAFETY: the slice is live for `length` bytes, stdout remains open
+        // while this function runs, and O_NONBLOCK prevents a full pipe from
+        // trapping this owner in the kernel.
+        let written =
+            unsafe { libc::write(fd, bytes[offset..].as_ptr().cast::<libc::c_void>(), length) };
+        if written > 0 {
+            let written = usize::try_from(written)
+                .map_err(|_| std::io::Error::other("invalid stdout write length"))?;
+            offset = offset.checked_add(written).ok_or_else(|| {
+                std::io::Error::other("fleet evidence stdout byte count overflow")
+            })?;
+            continue;
+        }
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "fleet evidence stdout accepted zero bytes",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is a valid one-element pollfd array and the
+        // finite timeout bounds each cancellation checkpoint.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, POLL_MILLIS) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fleet evidence stdout descriptor became invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_stdout_cancellable(bytes: &[u8], cancelled: &AtomicBool) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout().lock();
+    for chunk in bytes.chunks(64 * 1024) {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "fleet evidence stdout write cancelled",
+            ));
+        }
+        stdout.write_all(chunk)?;
+    }
+    stdout.flush()
 }
 
 async fn poll(
@@ -489,10 +698,6 @@ fn request_authority(cli: &Cli) -> Result<(String, RequestAuthority)> {
 
 fn parse_expected_nodes(raw: &[String]) -> Result<Vec<Id>> {
     anyhow::ensure!(!raw.is_empty(), "at least one --expected-node is required");
-    anyhow::ensure!(
-        raw.len() <= FLEET_VERIFICATION_MAX_NODES,
-        "expected Node set exceeds the fleet verification bound"
-    );
     let mut nodes = raw
         .iter()
         .map(|value| Id::new(value.clone()).context("invalid --expected-node"))
@@ -820,9 +1025,29 @@ mod tests {
     }
 
     #[test]
+    fn next_inventory_epoch_may_share_the_same_database_millisecond() {
+        let (mut state, mut snapshot) = fixture(true);
+        assert!(state.observe(&snapshot).unwrap());
+        let inventory = snapshot.nodes[0].inventory.as_mut().unwrap();
+        inventory.attestation.inventory_epoch = Epoch::new(2).unwrap();
+        inventory.attestation.inventory_read_position = Sequence::new(2).unwrap();
+        inventory.source_heartbeat_sequence = Sequence::new(2).unwrap();
+        inventory.source_observation_id = random('8');
+
+        assert!(
+            state.observe(&snapshot).unwrap(),
+            "same-ms epoch+1 acceptance is causally valid"
+        );
+    }
+
+    #[test]
     fn parser_rejects_empty_duplicate_and_noncanonical_release() {
         assert!(parse_expected_nodes(&[]).is_err());
         assert!(parse_expected_nodes(&["node_a".into(), "node_a".into()]).is_err());
+        let large = (0..1_025)
+            .map(|index| format!("node_{index:04}"))
+            .collect::<Vec<_>>();
+        assert_eq!(parse_expected_nodes(&large).unwrap().len(), 1_025);
         assert!(validate_release_commit(&"A".repeat(40)).is_err());
         assert!(validate_release_commit("0123456789abcdef0123456789abcdef01234567").is_ok());
     }
@@ -1017,5 +1242,85 @@ mod tests {
         let rendered = String::from_utf8(first).unwrap();
         assert!(!rendered.contains("public_key_spki"));
         assert!(!rendered.contains("secret_reference"));
+    }
+
+    #[cfg(unix)]
+    const STDOUT_SIGINT_CHILD: &str = "CATS_TEST_FLEET_STDOUT_SIGINT_CHILD";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn stdout_nonreading_pipe_sigint_child() {
+        if std::env::var_os(STDOUT_SIGINT_CHILD).is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            let cancellation = tokio::signal::ctrl_c();
+            let deadline = tokio::time::sleep(Duration::from_secs(30));
+            tokio::pin!(cancellation);
+            tokio::pin!(deadline);
+            // Poll once before publishing the marker so SIGINT cannot race
+            // Tokio's process-signal handler installation.
+            cancellation_checkpoint(cancellation.as_mut(), deadline.as_mut()).await?;
+            eprintln!("fleet-stdout-writer-ready");
+            write_stdout_or_cancel(
+                vec![b'x'; FLEET_VERIFICATION_MAX_WIRE_BYTES],
+                cancellation.as_mut(),
+                deadline.as_mut(),
+            )
+            .await
+        });
+        if result
+            .as_ref()
+            .is_err_and(|error| format!("{error:#}").contains("cancelled"))
+        {
+            std::process::exit(0);
+        }
+        eprintln!("unexpected fleet stdout child result: {result:?}");
+        std::process::exit(2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_cancels_a_full_nonreading_stdout_pipe_and_joins_the_writer() {
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fleet_verify::tests::stdout_nonreading_pipe_sigint_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(STDOUT_SIGINT_CHILD, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut lines = std::io::BufReader::new(stderr).lines();
+        let marker = lines.next().unwrap().unwrap();
+        assert!(marker.contains("fleet-stdout-writer-ready"), "{marker}");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: `pid` names the live child created above and SIGINT carries
+        // no pointer or process-local memory contract.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "stdout SIGINT child failed: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stdout writer remained blocked after SIGINT");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

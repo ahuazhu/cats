@@ -13,7 +13,6 @@ use crate::runtime_reconciliation::{
 
 pub const FLEET_VERIFICATION_PATH: &str = "/v1/admin/runtime/fleet-verification";
 pub const FLEET_VERIFICATION_METHOD: &str = "GET";
-pub const FLEET_VERIFICATION_MAX_NODES: usize = 1_024;
 pub const FLEET_VERIFICATION_MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
 pub const FLEET_INVENTORY_MAX_AGE_MS: u64 = 60_000;
 
@@ -170,7 +169,6 @@ fn validate_snapshot(
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             })
-        || snapshot.nodes.len() > FLEET_VERIFICATION_MAX_NODES
         || !strict_ids(snapshot.nodes.iter().map(|node| &node.node_id))
     {
         return Err(FleetVerificationContractError::Invalid);
@@ -210,7 +208,6 @@ fn validate_evidence(
     if evidence.version != ContractVersion::V1
         || !valid_sha
         || evidence.expected_nodes.is_empty()
-        || evidence.expected_nodes.len() > FLEET_VERIFICATION_MAX_NODES
         || !strict_ids(evidence.expected_nodes.iter())
         || evidence.expected_key_ring.kids.is_empty()
         || !strict_ids(evidence.expected_key_ring.kids.iter())
@@ -340,5 +337,33 @@ mod tests {
             format!("{{\"approved_guest_config_digest\":\"{digest}\",\"control_release_commit_sha\":null,\"current_runtime_observation_count\":0,\"desired_runtime_count\":0,\"evaluated_at_unix_ms\":1,\"nodes\":[],\"nodes\":[],\"route_signing_authority\":null,\"version\":1}}").as_bytes()
         )
         .is_err());
+    }
+
+    #[test]
+    fn snapshot_contract_has_a_wire_bound_but_no_node_count_bound() {
+        let digest = Sha256Digest::from_bytes([7; 32]);
+        let snapshot = FleetVerificationSnapshot {
+            version: ContractVersion::V1,
+            control_release_commit_sha: None,
+            evaluated_at_unix_ms: UnixMillis::new(1).unwrap(),
+            approved_guest_config_digest: digest,
+            desired_runtime_count: WireU64::new(0).unwrap(),
+            current_runtime_observation_count: WireU64::new(0).unwrap(),
+            route_signing_authority: None,
+            nodes: (0..1_025)
+                .map(|index| FleetVerificationNode {
+                    node_id: Id::new(format!("node_{index:04}")).unwrap(),
+                    session: None,
+                    inventory: None,
+                })
+                .collect(),
+        };
+
+        let encoded = encode_fleet_verification_snapshot(&snapshot).unwrap();
+        assert!(encoded.len() < FLEET_VERIFICATION_MAX_WIRE_BYTES);
+        assert_eq!(
+            decode_fleet_verification_snapshot(&encoded).unwrap(),
+            snapshot
+        );
     }
 }

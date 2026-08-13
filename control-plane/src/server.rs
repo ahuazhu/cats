@@ -28,6 +28,7 @@ const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
 const ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT: usize = 32;
 const GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT: usize = 32;
 const RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const FLEET_VERIFICATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
 /// PostgreSQL remains the concurrency authority; these permits only bound
@@ -77,6 +78,117 @@ impl RuntimeSpineAdmission {
     #[cfg(test)]
     pub(crate) fn available_global_permits_for_test(&self) -> usize {
         self.global.available_permits()
+    }
+}
+
+/// Owns each fleet-verification Store execution independently of its HTTP
+/// connection. A dropped response cancels the request context, while this
+/// registry keeps graceful shutdown from abandoning the claimed connection
+/// lane or PostgreSQL transaction before physical settlement.
+pub(crate) struct FleetVerificationService {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    next_request_id: AtomicU64,
+    active_requests: Mutex<BTreeMap<u64, AuthorityRequestContext>>,
+    changed: tokio::sync::Notify,
+}
+
+impl FleetVerificationService {
+    pub(crate) fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            next_request_id: AtomicU64::new(1),
+            active_requests: Mutex::new(BTreeMap::new()),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        request_context: AuthorityRequestContext,
+    ) -> Option<FleetVerificationRequestGuard> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        let request_id = self
+            .next_request_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()?;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, request_context.clone());
+        if !self.accepting.load(Ordering::Acquire) {
+            request_context.cancel();
+            self.finish(request_id);
+            return None;
+        }
+        Some(FleetVerificationRequestGuard {
+            service: self.clone(),
+            request_id,
+        })
+    }
+
+    fn finish(&self, request_id: u64) {
+        self.active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+        for context in self
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            context.cancel();
+        }
+        self.changed.notify_waiters();
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.begin_shutdown();
+        let joined = tokio::time::timeout(FLEET_VERIFICATION_SHUTDOWN_TIMEOUT, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        anyhow::ensure!(
+            joined.is_ok(),
+            "fleet-verification requests exceeded the shutdown deadline"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct FleetVerificationRequestGuard {
+    service: Arc<FleetVerificationService>,
+    request_id: u64,
+}
+
+impl Drop for FleetVerificationRequestGuard {
+    fn drop(&mut self) {
+        self.service.finish(self.request_id);
     }
 }
 
@@ -526,6 +638,7 @@ pub struct AppState {
     pub(crate) route_resolve_admission: Arc<crate::api::route_resolve_v2::RouteResolveV2Admission>,
     pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
+    pub(crate) fleet_verification_service: Arc<FleetVerificationService>,
     pub(crate) runtime_node_authority:
         Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
     /// The retired product authority exists only in debug test compositions.
@@ -594,6 +707,7 @@ impl Handle {
         self.state
             .runtime_volume_transition_service
             .begin_shutdown();
+        self.state.fleet_verification_service.begin_shutdown();
         self.state.route_resolve_admission.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
         self.image_manifest_resolver.begin_shutdown();
@@ -624,6 +738,7 @@ impl Handle {
         self.begin_shutdown();
         let observation_store = self.state.observation_store.shutdown();
         let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
+        let fleet_verifications = self.state.fleet_verification_service.shutdown();
         let route_resolutions = self.state.route_resolve_admission.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
         let persistent_disk_commit_resolutions = self
@@ -647,6 +762,7 @@ impl Handle {
         let (
             _,
             transition_result,
+            fleet_verification_result,
             route_result,
             commit_result,
             persistent_disk_commit_result,
@@ -657,6 +773,7 @@ impl Handle {
         ) = tokio::join!(
             observation_store,
             volume_transitions,
+            fleet_verifications,
             route_resolutions,
             commit_resolutions,
             persistent_disk_commit_resolutions,
@@ -672,6 +789,7 @@ impl Handle {
         // long-lived HTTP connection after Cat commit ownership is resolved.
         self.server_task.abort();
         transition_result?;
+        fleet_verification_result?;
         route_result?;
         gateway_machine_result?;
         commit_result.map_err(anyhow::Error::from)?;
@@ -1145,6 +1263,7 @@ async fn spawn_inner(
         ),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
+        fleet_verification_service: Arc::new(FleetVerificationService::new()),
         #[cfg(debug_assertions)]
         retired_product_authority_for_tests,
     };
