@@ -20,6 +20,7 @@ pub(crate) mod route_signer;
 pub(crate) mod route_signing_authority;
 pub(super) mod rows;
 pub(crate) mod runtime_spine;
+pub(crate) mod sweepers;
 mod volume;
 #[allow(
     dead_code,
@@ -27,7 +28,7 @@ mod volume;
 )]
 pub(crate) mod volume_transition_auth;
 
-pub(crate) use product::RuntimeOperationRead;
+pub(crate) use product::{RuntimeOperationRead, SystemDesiredMutationCommit};
 #[allow(
     dead_code,
     reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"
