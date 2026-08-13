@@ -278,7 +278,9 @@ fn running_scan_components_are_exact(
         vmm_expectation.checkpoint() == checkpoint && vmm_expectation.checkpoint_path().is_some(),
         "Running scan VMM expectation changed its current checkpoint"
     );
-    all_exact &= exact_vmm.is_some();
+    all_exact &= exact_vmm.is_some_and(|vmm| {
+        vmm.evidence().state() == cats_api::runtime_reconciliation::ProcessState::Running
+    });
     Ok(all_exact)
 }
 
@@ -884,7 +886,8 @@ fn validate_running_exact_set<'a>(
     anyhow::ensure!(
         vmm.expectation() == vmm_expectation
             && vmm_expectation.checkpoint() == checkpoint
-            && vmm_expectation.checkpoint_path().is_some(),
+            && vmm_expectation.checkpoint_path().is_some()
+            && vmm.evidence().state() == cats_api::runtime_reconciliation::ProcessState::Running,
         "retained Running VMM does not bind the exact current checkpoint"
     );
     Ok(vmm)
