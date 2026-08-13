@@ -79,6 +79,60 @@ fn production_platform_defaults_to_independent_az_dependencies() {
 }
 
 #[test]
+fn production_platform_preflight_requires_one_nat_gateway_per_az() {
+    let checker = workspace_root().join("deploy/aws/terraform/check-platform-tfvars.sh");
+    let guide = read_workspace_file("deploy/aws/terraform/README.md");
+    let preflight = guide
+        .find("../../check-platform-tfvars.sh platform.auto.tfvars")
+        .expect("platform tfvars preflight in operator guide");
+    let plan = guide
+        .find("terraform plan -refresh-only -out=platform-refresh.tfplan")
+        .expect("platform refresh-only plan in operator guide");
+    assert!(
+        preflight < plan,
+        "the private production tfvars must be checked before Terraform reads them",
+    );
+    let fixture_dir = tempfile::tempdir().expect("temporary tfvars directory");
+    let run = |name: &str, contents: &str| {
+        let path = fixture_dir.path().join(name);
+        std::fs::write(&path, contents).expect("write tfvars fixture");
+        Command::new(&checker)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|error| panic!("run {}: {error}", checker.display()))
+    };
+
+    let accepted = run(
+        "accepted.tfvars",
+        "availability_zone_count = 2\none_nat_gateway_per_az = true # deployed topology\n",
+    );
+    assert!(
+        accepted.status.success(),
+        "preflight rejected the safe production NAT setting: {}",
+        String::from_utf8_lossy(&accepted.stderr),
+    );
+
+    for (name, contents) in [
+        ("false.tfvars", "one_nat_gateway_per_az = false\n"),
+        ("missing.tfvars", "availability_zone_count = 2\n"),
+        (
+            "duplicate.tfvars",
+            "one_nat_gateway_per_az = true\none_nat_gateway_per_az = true\n",
+        ),
+        (
+            "expression.tfvars",
+            "one_nat_gateway_per_az = local.expected_nat_topology\n",
+        ),
+    ] {
+        let rejected = run(name, contents);
+        assert!(
+            !rejected.status.success(),
+            "preflight accepted unsafe or ambiguous fixture {name}",
+        );
+    }
+}
+
+#[test]
 fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
