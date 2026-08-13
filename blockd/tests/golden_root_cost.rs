@@ -112,7 +112,7 @@ struct Env {
     _dir: tempfile::TempDir,
     root: PathBuf,
     blob: Arc<GoldenRootAccountingBlob>,
-    meta: Arc<dyn MetadataStore>,
+    meta: Arc<SqliteMetadataStore>,
     counters: Arc<Counters>,
 }
 
@@ -123,8 +123,7 @@ fn env(run: &str) -> Env {
         inner: object_store(dir.path(), run),
         counters: counters.clone(),
     });
-    let meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
