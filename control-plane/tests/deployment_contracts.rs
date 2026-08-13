@@ -342,14 +342,23 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     assert!(!worker.contains("base64encode(var.route_grant_public_key_pem)"));
     assert!(!worker_variables.contains("route_grant_public_key_pem"));
     assert!(
-        worker_variables.contains("strcontains(var.route_v2_node_artifact_secret_arn, \"-r1-\")")
+        worker_variables.contains(
+            "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-"
+        ),
+        "worker Route v2 secret ARN validation must stay bound to the exact partition/account/region/name"
+    );
+    assert!(
+        worker_variables.contains(
+            "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region"
+        ),
+        "worker Route v2 secret ARN validation must remain exact rather than suffix-only"
     );
     assert!(worker.contains("--version-id \"${var.route_v2_node_artifact_secret_version_id}\""));
     for expected in [
-        "verify_installed_route_v2_r1",
-        "route_v2_already_installed=false",
-        ".ring_version == 1 and .expected_previous == null",
-        "mv -T -- \"$route_v2_publish\" /etc/cats/route-v2",
+        "cats_classify_route_v2_node_r1",
+        "route_v2_install_state",
+        "cats_publish_route_v2_node_r1",
+        "case \"$route_v2_install_state\" in absent|exact) ;; *) exit 1 ;; esac",
     ] {
         assert!(
             worker.contains(expected),
@@ -357,20 +366,17 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
         );
     }
     assert!(!worker.contains("find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -delete"));
-    for unit in [
-        "deploy/aws/metal/cats-worker.service",
-        "deploy/metal/systemd/cats-noded.service",
-    ] {
-        let source = read_workspace_file(unit);
-        assert!(source.contains("CATS_ROUTE_V2_MACHINE_LISTEN=0.0.0.0:7444"));
-        assert!(source.contains("--route-v2-machine-listen"));
-        assert!(!source.contains("--route-grant-public-key-file"));
-        assert!(
-            source.find("EnvironmentFile=")
-                < source.find("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="),
-            "{unit} must not let its environment file override the fixed Route v2 listener"
-        );
-    }
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
+    assert!(worker_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
+    assert!(!worker_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
+    assert!(!worker_unit.contains("--route-grant-public-key-file"));
+
+    let direct_unit = read_workspace_file("deploy/metal/systemd/cats-noded.service");
+    assert!(direct_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
+    assert!(!direct_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
+    assert!(!direct_unit.contains("--route-v2-machine-listen"));
+    assert!(!direct_unit.contains("--route-grant-public-key-file"));
 }
 
 #[test]
@@ -3268,22 +3274,45 @@ fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
     let required = script
         .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required")
         .expect("required Node Route v2 artifact input");
+    let real_directory = script
+        .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory")
+        .expect("absolute real Node Route v2 artifact directory check");
     let closed_set = script
         .find("Node Route v2 artifact source must contain exactly four")
         .expect("closed Node Route v2 artifact set check");
-    let existing_check = script
-        .find("verify_installed_route_v2_r1")
-        .expect("exact existing revision-1 check");
     let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
     assert!(
-        required < closed_set
-            && closed_set < existing_check
-            && existing_check < first_package_mutation,
-        "missing, malformed or conflicting revision-1 artifacts must fail before package mutation"
+        required < real_directory
+            && real_directory < closed_set
+            && closed_set < first_package_mutation,
+        "missing or malformed revision-1 artifacts must fail before package mutation"
+    );
+    let host_lock = script
+        .find("cats_acquire_worker_deployment_lock")
+        .expect("Host-global worker deployment lock");
+    let exact_classification = script
+        .find("ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1")
+        .expect("exact existing revision-1 classification");
+    let first_systemd_mutation = script
+        .find("cats_gate_node_service cats-worker")
+        .expect("first serialized systemd mutation");
+    let publish_call = script
+        .find("cats_publish_route_v2_node_r1")
+        .expect("exact revision-1 publish");
+    let first_installed_mutation = script
+        .find("install -D -m 0755 \"$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh\"")
+        .expect("first installed-file mutation");
+    assert!(
+        host_lock < exact_classification
+            && exact_classification < first_systemd_mutation
+            && exact_classification < first_installed_mutation
+            && publish_call < first_installed_mutation,
+        "exact replay/conflict classification must happen under the Host lock before any systemd or installed-file mutation, and first publish must precede later installed-file mutation"
     );
     for expected in [
-        "ROUTE_V2_ALREADY_INSTALLED=false",
-        "mv -T -- \"$ROUTE_V2_PUBLISH_STAGE\" /etc/cats/route-v2",
+        "ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1",
+        "cats_publish_route_v2_node_r1",
+        "[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]",
         "after-install-route-v2-artifacts",
         "node-machine-server-private-key.pem",
     ] {
