@@ -977,7 +977,6 @@ impl Controller {
                     },
                 };
                 let _ = self.dispatch(&node.agent_url, &cleanup).await;
-                self.fence_cat_volumes(cat).await?;
                 let cat_id = cat.id.clone();
                 self.store
                     .execute(move |store| {
@@ -1072,7 +1071,6 @@ impl Controller {
         self.store
             .execute(move |store| store.unbind_routes(&cat_id))
             .await?;
-        self.fence_cat_volumes(cat).await?;
         let cat_id = cat.id.clone();
         self.store
             .execute(move |store| {
@@ -1087,7 +1085,7 @@ impl Controller {
 
     async fn delete_flow(&self, cat: &Cat) -> anyhow::Result<()> {
         if cat.node_id.is_some() {
-            // Stop first (also fences + unbinds routes). The RootDisk is being
+            // Stop first (also unbinds routes). The RootDisk is being
             // deleted, so the node may discard only its local journal/cache;
             // PersistentDisks still cross the mandatory remote-drain boundary.
             let mut disposable_root_disk_ids = Vec::new();
