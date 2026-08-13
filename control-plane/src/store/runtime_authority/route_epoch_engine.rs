@@ -91,13 +91,7 @@ impl Store {
         mutation: EndpointMutation,
     ) -> Result<RouteEpochMutationPlan> {
         self.authority_read_snapshot(|transaction| {
-            let current = load_desired_unlocked(transaction, cat_id)?
-                .ok_or_else(|| ApiError::not_found("Cat"))?;
-            if current.workspace_id != *workspace_id {
-                return Err(ApiError::not_found("Cat").into());
-            }
-            let records = load_endpoint_candidates(transaction, &current)?;
-            plan_endpoint_mutation(current, records, mutation.clone()).map_err(Into::into)
+            plan_endpoint_route_mutation_in(transaction, workspace_id, cat_id, mutation.clone())
         })
     }
 
@@ -151,6 +145,21 @@ impl Store {
             plan_busy_recovery(current, records, observed, vec![placement]).map_err(Into::into)
         })
     }
+}
+
+pub(super) fn plan_endpoint_route_mutation_in(
+    transaction: &mut postgres::Transaction<'_>,
+    workspace_id: &Id,
+    cat_id: &Id,
+    mutation: EndpointMutation,
+) -> crate::store::transaction::AuthorityTxResult<RouteEpochMutationPlan> {
+    let current =
+        load_desired_unlocked(transaction, cat_id)?.ok_or_else(|| ApiError::not_found("Cat"))?;
+    if current.workspace_id != *workspace_id {
+        return Err(ApiError::not_found("Cat").into());
+    }
+    let records = load_endpoint_candidates(transaction, &current)?;
+    plan_endpoint_mutation(current, records, mutation).map_err(Into::into)
 }
 
 fn load_endpoint_candidates(

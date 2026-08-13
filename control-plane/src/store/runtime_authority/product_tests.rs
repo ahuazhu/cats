@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use cats_api::error::ErrorCode;
+use cats_api::error::{ApiError, ErrorCode};
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, encode_operation, guest_config_digest, spec_digest,
     AllocatableMemoryBytes, AllocatableVcpus, AsciiText, AssignedKind, AssignedPlacement,
@@ -39,10 +39,11 @@ use super::product::{
     persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
     CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
-    CoveredDiskDeleteRequest, CoveredProductMutationTarget, DesiredMutationCommit,
-    DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
-    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
+    CoveredDiskDeleteRequest, CoveredPlannedDesiredMutation, CoveredProductMutationTarget,
+    DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate,
+    DiskRole, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
+    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
+    PersistentDiskInitialization, RuntimeOperationRead,
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
@@ -52,8 +53,8 @@ use super::product_mutation_service::{
 };
 use super::product_reads::{ProductPageRead, ProductRead};
 use super::product_rows::{
-    insert_cat, insert_disk, load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
-    operation_by_workspace_candidates_sql,
+    insert_cat, insert_disk, load_cat_by_id_unlocked, load_disk_by_id_for_update,
+    load_operation_by_cat_revision_unlocked, operation_by_workspace_candidates_sql,
 };
 use super::route_epoch_engine::{
     EndpointBindingWithoutEpoch, EndpointMutation, RouteEpochMutationPlan,
@@ -1040,91 +1041,105 @@ fn a2_persistent_disk_delete_rejects_every_top_level_inventory_residue() {
 }
 
 #[test]
-fn a2_preflight_serializes_result_before_target_visibility_and_rolls_back_not_found() {
-    let (_url, store, holder, workspace) = stores();
+fn a2_covered_planning_holds_reservation_through_result_and_rolls_back_not_found() {
+    let (_url, first, second, workspace) = stores();
+    let cat_id = seed_a2_http_cat(&first, &workspace);
     let route = AsciiText::new(super::product_mutation_service::CAT_ACTION_ROUTE).unwrap();
     let first_request = ApiIdempotencyRequest {
         authenticated_workspace_id: workspace.clone(),
         canonical_route: route.clone(),
-        idempotency_key: AsciiText::new("a2-preflight-barrier").unwrap(),
-        request_fingerprint: Sha256Digest::from_bytes([0xa1; 32]),
+        idempotency_key: AsciiText::new("a2-covered-planning-barrier").unwrap(),
+        request_fingerprint: Sha256Digest::from_bytes([0x91; 32]),
     };
     let conflicting_request = ApiIdempotencyRequest {
-        request_fingerprint: Sha256Digest::from_bytes([0xb2; 32]),
+        request_fingerprint: Sha256Digest::from_bytes([0x92; 32]),
         ..first_request.clone()
     };
-    let committed = super::product::ApiIdempotencyResult {
-        authenticated_workspace_id: workspace.clone(),
-        canonical_route: route,
-        idempotency_key: first_request.idempotency_key.clone(),
-        request_fingerprint: first_request.request_fingerprint.clone(),
-        http_status: 202,
-        content_type: Some(ExactContentType::ApplicationJson),
-        response_body: br#"{"operation_id":"op_preflight"}"#.to_vec(),
-        created_at: unix_millis(1),
-    };
-    let locked = Arc::new(Barrier::new(2));
+    let target_checked = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
-    let holder_locked = Arc::clone(&locked);
-    let holder_release = Arc::clone(&release);
-    let held_request = first_request.clone();
-    let held_result = committed.clone();
-    let holder_thread = std::thread::spawn(move || {
-        holder
-            .authority_transaction(|transaction| {
-                transaction.query_one(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(
-                        current_schema() || ':api-result:' || $1 || ':' || $2 || ':' || $3,
-                        0::BIGINT
-                     ))",
-                    &[
-                        &held_request.authenticated_workspace_id.as_str(),
-                        &held_request.canonical_route.as_str(),
-                        &held_request.idempotency_key.as_str(),
-                    ],
-                )?;
-                holder_locked.wait();
-                holder_release.wait();
-                super::product_rows::insert_api_result(transaction, &held_result)
-            })
-            .unwrap();
+    let checked_in_worker = Arc::clone(&target_checked);
+    let release_in_worker = Arc::clone(&release);
+    let first_request_in_worker = first_request.clone();
+    let first_worker = std::thread::spawn(move || {
+        let (_cancellation, state) = CoveredCommitCancellation::new(
+            "A2 covered planning barrier A",
+            Instant::now() + Duration::from_secs(30),
+        );
+        first.commit_planned_desired_mutation_covered(
+            &first_request_in_worker,
+            &state,
+            |transaction| {
+                let cat = load_cat_by_id_unlocked(transaction, &cat_id)?
+                    .filter(|cat| cat.workspace_id == workspace)
+                    .ok_or_else(|| ApiError::not_found("Cat"))?;
+                assert_eq!(cat.cat_id, cat_id);
+                checked_in_worker.wait();
+                release_in_worker.wait();
+                Ok(CoveredPlannedDesiredMutation::Fixed(
+                    ExactHttpResponse::new(
+                        202,
+                        Some(ExactContentType::ApplicationJson),
+                        br#"{"operation_id":"op_reserved"}"#.to_vec(),
+                    )?,
+                ))
+            },
+        )
     });
-    locked.wait();
+    target_checked.wait();
 
-    let target = CoveredProductMutationTarget::Cat {
-        // Deliberately absent: a conflict must be resolved without reading it.
-        cat_id: id("cat_absent_behind_conflict"),
-    };
-    let worker = std::thread::spawn(move || {
-        store.preflight_product_mutation_covered(&conflicting_request, &target)
+    let second_worker = std::thread::spawn(move || {
+        let (_cancellation, state) = CoveredCommitCancellation::new(
+            "A2 covered planning barrier B",
+            Instant::now() + Duration::from_secs(30),
+        );
+        second.commit_planned_desired_mutation_covered(
+            &conflicting_request,
+            &state,
+            |_transaction| -> crate::store::transaction::AuthorityTxResult<_> {
+                panic!("fingerprint conflict read the target or invoked its planner")
+            },
+        )
     });
     std::thread::sleep(Duration::from_millis(100));
     assert!(
-        !worker.is_finished(),
-        "second session bypassed the API-key barrier"
+        !second_worker.is_finished(),
+        "second session bypassed the API-key reservation during target planning"
     );
     release.wait();
-    holder_thread.join().unwrap();
-    let error = worker.join().unwrap().unwrap_err();
+    let first_result = first_worker.join().unwrap().unwrap();
+    assert!(
+        matches!(first_result, DesiredMutationCommit::Converged(result) if result.http_status == 202)
+    );
+    let error = second_worker.join().unwrap().unwrap_err();
+    let CoveredDesiredMutationError::Store(error) = error else {
+        panic!("fingerprint conflict lost its exact API error");
+    };
     assert_eq!(error.code, ErrorCode::Conflict);
 
     let (_url, store, _unused, workspace) = stores();
     let missing_request = ApiIdempotencyRequest {
         authenticated_workspace_id: workspace,
         canonical_route: AsciiText::new(super::product_mutation_service::CAT_ACTION_ROUTE).unwrap(),
-        idempotency_key: AsciiText::new("a2-preflight-not-found").unwrap(),
+        idempotency_key: AsciiText::new("a2-covered-not-found").unwrap(),
         request_fingerprint: Sha256Digest::from_bytes([0xc3; 32]),
     };
-    let missing = CoveredProductMutationTarget::Cat {
-        cat_id: id("cat_missing_preflight"),
-    };
-    assert_eq!(
-        store
-            .preflight_product_mutation_covered(&missing_request, &missing)
-            .unwrap_err()
-            .code,
-        ErrorCode::NotFound
+    let (_cancellation, state) = CoveredCommitCancellation::new(
+        "A2 covered NotFound",
+        Instant::now() + Duration::from_secs(30),
     );
+    let missing_cat = id("cat_missing_covered");
+    let error = store
+        .commit_planned_desired_mutation_covered(&missing_request, &state, |transaction| {
+            load_cat_by_id_unlocked(transaction, &missing_cat)?
+                .filter(|cat| cat.workspace_id == missing_request.authenticated_workspace_id)
+                .ok_or_else(|| ApiError::not_found("Cat"))?;
+            unreachable!()
+        })
+        .unwrap_err();
+    let CoveredDesiredMutationError::Store(error) = error else {
+        panic!("NotFound lost its exact API error");
+    };
+    assert_eq!(error.code, ErrorCode::NotFound);
     assert!(store
         .covered_api_result_fast_lookup(&missing_request)
         .unwrap()
@@ -1216,6 +1231,49 @@ fn a2_cat_and_endpoint_cross_workspace_misses_persist_nothing() {
         })
         .unwrap();
     assert_eq!(result_count, 0);
+}
+
+#[test]
+fn a2_endpoint_planning_and_result_commit_share_one_reserved_transaction() {
+    let (_url, store, _unused, workspace) = stores();
+    let cat_id = seed_a2_http_cat(&store, &workspace);
+    let store = Arc::new(store);
+    let service = ProductMutationService::new(
+        Arc::clone(&store),
+        Arc::new(UuidProductIdentitySource),
+        Sha256Digest::from_bytes([0x74; 32]),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fields = ProductMutationHttpFields {
+        content_type: vec![b"application/json".to_vec()],
+        idempotency_key: vec![b"a2-covered-endpoint-bind".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let path = format!("/v1/workspaces/{workspace}/cats/{cat_id}/endpoints");
+    let body = br#"{"name":"metrics","hostname":"metrics-covered.example.com","target_port":9090}"#;
+    let ingress = parse_authorized_endpoint_bind(
+        &workspace,
+        cat_id.as_str(),
+        Instant::now(),
+        path.as_bytes(),
+        &fields,
+        body,
+    )
+    .unwrap();
+
+    let accepted = runtime.block_on(service.mutate(ingress.clone())).unwrap();
+    let replayed = runtime.block_on(service.mutate(ingress)).unwrap();
+    assert_eq!(accepted, replayed);
+    assert_eq!(accepted.http_status, 202);
+    let location = store
+        .locate_hostname_desired(&Hostname::new("metrics-covered.example.com").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(location.cat_id, cat_id);
+    assert_eq!(location.desired_revision, revision(2));
 }
 
 #[test]

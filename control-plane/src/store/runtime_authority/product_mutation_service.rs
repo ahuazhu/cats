@@ -13,6 +13,7 @@ use cats_api::runtime_reconciliation::{
     spec_digest, AsciiText, DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Revision,
     RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeDisposition,
 };
+use postgres::Transaction;
 use serde::Deserialize;
 
 use super::covered_commit::{CommitResolutionRegistry, CoveredCommitCancellation};
@@ -21,18 +22,20 @@ use super::placement_policy::load_policy_unlocked;
 use super::product::{
     api_request_fingerprint, ApiIdempotencyRequest, ApiIdempotencyResult, CandidateCollision,
     CoveredDesiredMutationError, CoveredDesiredMutationRequest, CoveredDiskDeleteRequest,
-    CoveredProductMutationPreflight, CoveredProductMutationTarget, DesiredMutationCommit,
-    DesiredVolumeMutation, EndpointRecordCandidate, ExactContentType, IfMatchFingerprint,
+    CoveredPlannedDesiredMutation, DesiredMutationCommit, DesiredVolumeMutation,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, IfMatchFingerprint,
 };
 use super::product_identity::ProductIdentitySource;
 use super::product_rows::{
     load_cat_by_id_unlocked, load_desired_unlocked, load_endpoint_by_id_unlocked,
 };
 use super::route_epoch_engine::{
-    EndpointBindingWithoutEpoch, EndpointMutation, RouteEpochMutationPlan,
+    plan_endpoint_route_mutation_in, EndpointBindingWithoutEpoch, EndpointMutation,
+    RouteEpochMutationPlan,
 };
 use super::rows::{database_now, load_active_event_by_node_unlocked};
 use super::runtime_spine::{load_placement_admission_at_in, PlacementAdmissionLoad};
+use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result, Store};
 
 pub(crate) const PRODUCT_MUTATION_MAX_BODY_BYTES: usize = 4096;
@@ -382,72 +385,67 @@ struct LifecycleSnapshot {
     placement_snapshots: Vec<PlacementTargetSnapshot>,
 }
 
-impl Store {
-    fn load_lifecycle_snapshot(
-        &self,
-        workspace_id: &Id,
-        cat_id: &Id,
-        active_guest_digest: &Sha256Digest,
-        placement_required: bool,
-    ) -> Result<Option<LifecycleSnapshot>> {
-        self.authority_read_snapshot(|transaction| {
-            let Some(cat) = load_cat_by_id_unlocked(transaction, cat_id)? else {
-                return Ok(None);
-            };
-            if cat.workspace_id != *workspace_id {
-                return Ok(None);
-            }
-            let current = load_desired_unlocked(transaction, cat_id)?
-                .ok_or_else(|| ApiError::internal("Cat has no current Desired"))?;
-            if current.workspace_id != *workspace_id || current.cat_id != *cat_id {
-                return Err(ApiError::internal("Cat/Desired workspace binding is corrupt").into());
-            }
-            let mut endpoint_records = Vec::with_capacity(current.endpoints.len());
-            for endpoint in &current.endpoints {
-                let record = load_endpoint_by_id_unlocked(transaction, &endpoint.endpoint_id)?
-                    .ok_or_else(|| ApiError::internal("Desired Endpoint record is missing"))?;
-                if record.workspace_id != *workspace_id || record.cat_id != *cat_id {
-                    return Err(ApiError::internal("Endpoint product binding is corrupt").into());
-                }
-                endpoint_records.push(EndpointRecordCandidate {
-                    endpoint_id: record.endpoint_id,
-                    workspace_id: record.workspace_id,
-                    cat_id: record.cat_id,
-                    name: record.name,
-                });
-            }
-            let placement_snapshots = if placement_required {
-                let node_id = &current.placement.node_id;
-                let now = database_now(transaction)?;
-                let policy = load_policy_unlocked(transaction, node_id)?.ok_or_else(|| {
-                    ApiError::internal("assigned Node placement policy is missing")
-                })?;
-                let active_host_fence_event =
-                    load_active_event_by_node_unlocked(transaction, node_id)?;
-                let admission = match load_placement_admission_at_in(
-                    transaction,
-                    node_id,
-                    active_guest_digest,
-                    now,
-                )? {
-                    PlacementAdmissionLoad::Accepted(admission) => *admission,
-                    PlacementAdmissionLoad::Rejected(_) => return Ok(None),
-                };
-                vec![PlacementTargetSnapshot {
-                    policy,
-                    admission,
-                    active_host_fence_event,
-                }]
-            } else {
-                Vec::new()
-            };
-            Ok(Some(LifecycleSnapshot {
-                current,
-                endpoint_records,
-                placement_snapshots,
-            }))
-        })
+fn load_lifecycle_snapshot_in(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &Id,
+    cat_id: &Id,
+    active_guest_digest: &Sha256Digest,
+    placement_required: bool,
+) -> AuthorityTxResult<LifecycleSnapshot> {
+    let cat = load_cat_by_id_unlocked(transaction, cat_id)?
+        .filter(|cat| cat.workspace_id == *workspace_id)
+        .ok_or_else(|| ApiError::not_found("Cat"))?;
+    if cat.cat_id != *cat_id {
+        return Err(ApiError::internal("Cat ID projection is corrupt").into());
     }
+    let current = load_desired_unlocked(transaction, cat_id)?
+        .ok_or_else(|| ApiError::internal("Cat has no current Desired"))?;
+    if current.workspace_id != *workspace_id || current.cat_id != *cat_id {
+        return Err(ApiError::internal("Cat/Desired workspace binding is corrupt").into());
+    }
+    let mut endpoint_records = Vec::with_capacity(current.endpoints.len());
+    for endpoint in &current.endpoints {
+        let record = load_endpoint_by_id_unlocked(transaction, &endpoint.endpoint_id)?
+            .ok_or_else(|| ApiError::internal("Desired Endpoint record is missing"))?;
+        if record.workspace_id != *workspace_id || record.cat_id != *cat_id {
+            return Err(ApiError::internal("Endpoint product binding is corrupt").into());
+        }
+        endpoint_records.push(EndpointRecordCandidate {
+            endpoint_id: record.endpoint_id,
+            workspace_id: record.workspace_id,
+            cat_id: record.cat_id,
+            name: record.name,
+        });
+    }
+    let placement_snapshots = if placement_required {
+        let node_id = &current.placement.node_id;
+        let now = database_now(transaction)?;
+        let policy = load_policy_unlocked(transaction, node_id)?
+            .ok_or_else(|| ApiError::internal("assigned Node placement policy is missing"))?;
+        let active_host_fence_event = load_active_event_by_node_unlocked(transaction, node_id)?;
+        let admission =
+            match load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)? {
+                PlacementAdmissionLoad::Accepted(admission) => *admission,
+                PlacementAdmissionLoad::Rejected(_) => {
+                    return Err(ApiError::unavailable(
+                        "current placement is not admitted for lifecycle resume",
+                    )
+                    .into());
+                }
+            };
+        vec![PlacementTargetSnapshot {
+            policy,
+            admission,
+            active_host_fence_event,
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(LifecycleSnapshot {
+        current,
+        endpoint_records,
+        placement_snapshots,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +482,161 @@ enum CommitOutcome {
     Committed(ApiIdempotencyResult),
     Stale,
     CandidateCollision(CandidateCollision),
+}
+
+#[derive(Clone)]
+enum PlannedProductMutationRequest {
+    Lifecycle {
+        ingress: AuthorizedProductMutationIngress,
+        cat_id: Id,
+        action: Option<CatLifecycleAction>,
+        delete_id: Option<Id>,
+        operation_id: Id,
+        active_guest_digest: Sha256Digest,
+    },
+    Endpoint {
+        ingress: AuthorizedProductMutationIngress,
+        cat_id: Id,
+        mutation: EndpointMutation,
+        operation_id: Id,
+    },
+}
+
+impl Store {
+    fn commit_product_mutation_covered(
+        &self,
+        request: &PlannedProductMutationRequest,
+        commit_state: &super::covered_commit::CoveredCommitState,
+    ) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
+        let idempotency = match request {
+            PlannedProductMutationRequest::Lifecycle { ingress, .. }
+            | PlannedProductMutationRequest::Endpoint { ingress, .. } => {
+                ingress.idempotency.clone()
+            }
+        };
+        self.commit_planned_desired_mutation_covered(&idempotency, commit_state, |transaction| {
+            match request {
+                PlannedProductMutationRequest::Lifecycle {
+                    ingress,
+                    cat_id,
+                    action,
+                    delete_id,
+                    operation_id,
+                    active_guest_digest,
+                } => {
+                    let mut snapshot = load_lifecycle_snapshot_in(
+                        transaction,
+                        &ingress.idempotency.authenticated_workspace_id,
+                        cat_id,
+                        active_guest_digest,
+                        false,
+                    )?;
+                    if *action == Some(CatLifecycleAction::Resume)
+                        && snapshot.current.target != RuntimeTarget::Running
+                    {
+                        snapshot = load_lifecycle_snapshot_in(
+                            transaction,
+                            &ingress.idempotency.authenticated_workspace_id,
+                            cat_id,
+                            active_guest_digest,
+                            true,
+                        )?;
+                    }
+                    if ingress.if_match.is_some_and(|if_match| {
+                        if_match.get() != snapshot.current.desired_revision.get()
+                    }) {
+                        return fixed_planned_result(409, IF_MATCH_BODY);
+                    }
+                    if snapshot.current.target == RuntimeTarget::Deleted && action.is_some() {
+                        return fixed_planned_result(412, RETIRED_BODY);
+                    }
+                    if action.is_some_and(|action| {
+                        !lifecycle_precondition(action, snapshot.current.target)
+                    }) {
+                        return fixed_planned_result(412, PRECONDITION_BODY);
+                    }
+                    let covered = build_lifecycle_request(
+                        ingress,
+                        snapshot,
+                        *action,
+                        delete_id.as_ref(),
+                        operation_id.clone(),
+                        active_guest_digest.clone(),
+                    )?;
+                    Ok(CoveredPlannedDesiredMutation::Mutation {
+                        request: Box::new(covered),
+                        fixed_collision: None,
+                    })
+                }
+                PlannedProductMutationRequest::Endpoint {
+                    ingress,
+                    cat_id,
+                    mutation,
+                    operation_id,
+                } => {
+                    let workspace_id = &ingress.idempotency.authenticated_workspace_id;
+                    let cat = load_cat_by_id_unlocked(transaction, cat_id)?
+                        .filter(|cat| cat.workspace_id == *workspace_id)
+                        .ok_or_else(|| ApiError::not_found("Cat"))?;
+                    if cat.cat_id != *cat_id {
+                        return Err(ApiError::internal("Cat ID projection is corrupt").into());
+                    }
+                    let plan = match plan_endpoint_route_mutation_in(
+                        transaction,
+                        workspace_id,
+                        cat_id,
+                        mutation.clone(),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(AuthorityTransactionError::Application(error))
+                            if error.code == ErrorCode::Conflict =>
+                        {
+                            return fixed_planned_result(409, ENDPOINT_CONFLICT_BODY);
+                        }
+                        Err(AuthorityTransactionError::Application(error))
+                            if error.code == ErrorCode::FailedPrecondition =>
+                        {
+                            return fixed_planned_result(412, ENDPOINT_PRECONDITION_BODY);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if ingress.if_match.is_some_and(|if_match| {
+                        if_match.get() != plan.expected_current.desired_revision.get()
+                    }) {
+                        return fixed_planned_result(409, IF_MATCH_BODY);
+                    }
+                    if plan.expected_current.target == RuntimeTarget::Deleted {
+                        return fixed_planned_result(412, ENDPOINT_PRECONDITION_BODY);
+                    }
+                    let covered = covered_endpoint_request(ingress, plan, operation_id.clone());
+                    Ok(CoveredPlannedDesiredMutation::Mutation {
+                        request: Box::new(covered),
+                        fixed_collision: Some((
+                            CandidateCollision::Hostname,
+                            fixed_response(409, ENDPOINT_CONFLICT_BODY)?,
+                        )),
+                    })
+                }
+            }
+        })
+    }
+}
+
+fn fixed_response(status: u16, body: &'static [u8]) -> Result<ExactHttpResponse> {
+    ExactHttpResponse::new(
+        status,
+        Some(ExactContentType::ApplicationJson),
+        body.to_vec(),
+    )
+}
+
+fn fixed_planned_result(
+    status: u16,
+    body: &'static [u8],
+) -> AuthorityTxResult<CoveredPlannedDesiredMutation> {
+    fixed_response(status, body)
+        .map(CoveredPlannedDesiredMutation::Fixed)
+        .map_err(Into::into)
 }
 
 pub(crate) struct ProductMutationService {
@@ -567,92 +720,17 @@ impl ProductMutationService {
             if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
                 return Err(ProductMutationServiceError::TemporarilyUnavailable);
             }
-            let preflight_request = ingress.idempotency.clone();
-            let preflight_cat_id = cat_id.clone();
-            let preflight = await_before_deadline(
-                ingress.absolute_deadline,
-                self.store.execute(move |store| {
-                    store.preflight_product_mutation_covered(
-                        &preflight_request,
-                        &CoveredProductMutationTarget::Cat {
-                            cat_id: preflight_cat_id,
-                        },
-                    )
-                }),
-            )
-            .await
-            .map_err(ProductMutationServiceError::from_api)?;
-            if let CoveredProductMutationPreflight::Replayed(result) = preflight {
-                return Ok(http_result(result));
-            }
-            let placement_required = false;
-            let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
-            let plan_cat_id = cat_id.clone();
-            let guest_digest = self.active_guest_digest.clone();
-            let snapshot = await_before_deadline(
-                ingress.absolute_deadline,
-                self.store.execute(move |store| {
-                    store.load_lifecycle_snapshot(
-                        &workspace_id,
-                        &plan_cat_id,
-                        &guest_digest,
-                        placement_required,
-                    )
-                }),
-            )
-            .await
-            .map_err(ProductMutationServiceError::from_api)?;
-            let mut snapshot = match snapshot {
-                Some(snapshot) => snapshot,
-                // Only the covered preflight above may reveal NotFound. A Cat
-                // removed between that transaction and this snapshot is a
-                // stale plan and must re-enter the reservation barrier.
-                None => continue,
-            };
-            if action == Some(CatLifecycleAction::Resume)
-                && snapshot.current.target != RuntimeTarget::Running
-            {
-                let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
-                let plan_cat_id = cat_id.clone();
-                let guest_digest = self.active_guest_digest.clone();
-                snapshot = await_before_deadline(
-                    ingress.absolute_deadline,
-                    self.store.execute(move |store| {
-                        store.load_lifecycle_snapshot(
-                            &workspace_id,
-                            &plan_cat_id,
-                            &guest_digest,
-                            true,
-                        )
-                    }),
-                )
-                .await
-                .map_err(ProductMutationServiceError::from_api)?
-                .ok_or(ProductMutationServiceError::TemporarilyUnavailable)?;
-            }
-            if let Some(if_match) = ingress.if_match {
-                if if_match.get() != snapshot.current.desired_revision.get() {
-                    return self.fixed_result(ingress, 409, IF_MATCH_BODY).await;
-                }
-            }
-            if snapshot.current.target == RuntimeTarget::Deleted && action.is_some() {
-                return self.fixed_result(ingress, 412, RETIRED_BODY).await;
-            }
-            if action.is_some_and(|action| !lifecycle_precondition(action, snapshot.current.target))
-            {
-                return self.fixed_result(ingress, 412, PRECONDITION_BODY).await;
-            }
             let operation_id = prefixed_id("op_", self.identities.random_id()?)?;
-            let covered = build_lifecycle_request(
-                &ingress,
-                snapshot,
+            let planned = PlannedProductMutationRequest::Lifecycle {
+                ingress: ingress.clone(),
+                cat_id: cat_id.clone(),
                 action,
-                delete_id.as_ref(),
+                delete_id: delete_id.clone(),
                 operation_id,
-                self.active_guest_digest.clone(),
-            )?;
+                active_guest_digest: self.active_guest_digest.clone(),
+            };
             match self
-                .commit(covered, ingress.absolute_deadline, &mut shutdown)
+                .commit(planned, ingress.absolute_deadline, &mut shutdown)
                 .await?
             {
                 CommitOutcome::Committed(result) => return Ok(http_result(result)),
@@ -668,67 +746,6 @@ impl ProductMutationService {
         Err(ProductMutationServiceError::TemporarilyUnavailable)
     }
 
-    async fn fixed_result(
-        &self,
-        ingress: AuthorizedProductMutationIngress,
-        status: u16,
-        body: &'static [u8],
-    ) -> std::result::Result<ProductMutationHttpResult, ProductMutationServiceError> {
-        let response = super::product::ExactHttpResponse::new(
-            status,
-            Some(ExactContentType::ApplicationJson),
-            body.to_vec(),
-        )?;
-        let deadline = ingress.absolute_deadline;
-        let resolution_request = ingress.idempotency.clone();
-        let fixed_request = ingress.idempotency;
-        let (cancellation, state) =
-            CoveredCommitCancellation::new("fixed product mutation result", deadline);
-        let observer = state.clone();
-        let cancellation_observer = state.clone();
-        let store = Arc::clone(&self.store);
-        let Some(active) = self.commit_resolutions.begin() else {
-            return Err(ProductMutationServiceError::TemporarilyUnavailable);
-        };
-        let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let execution_store = Arc::clone(&store);
-            let execution = execution_store.execute(move |store| {
-                store.commit_fixed_api_result_covered(&fixed_request, &response, &state)
-            });
-            tokio::pin!(execution);
-            let execution = tokio::select! {
-                outcome = &mut execution => outcome,
-                () = cancellation_observer.cancelled_before_commit() => {
-                    Err(ApiError::unavailable("fixed product result cancelled before commit"))
-                }
-            };
-            let outcome = match execution {
-                Ok(result) => Ok(result),
-                Err(error) if observer.commit_was_sent() => {
-                    resolve_commit_loop(store, resolution_request, error).await
-                }
-                Err(error) => Err(error),
-            };
-            let _ = sender.send(outcome);
-            drop(active);
-        });
-        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        tokio::pin!(sleep);
-        let outcome = tokio::select! {
-            result = &mut receiver => result.map_err(|_| ApiError::internal("fixed result commit owner stopped"))?,
-            () = &mut sleep => {
-                if cancellation.cancel_before_commit() {
-                    return Err(ProductMutationServiceError::TemporarilyUnavailable);
-                }
-                receiver.await.map_err(|_| ApiError::internal("fixed result commit owner stopped"))?
-            }
-        };
-        outcome
-            .map(http_result)
-            .map_err(ProductMutationServiceError::from_api)
-    }
-
     async fn mutate_endpoint(
         &self,
         ingress: AuthorizedProductMutationIngress,
@@ -740,27 +757,6 @@ impl ProductMutationService {
         for _ in 0..MAX_REPLANS {
             if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
                 return Err(ProductMutationServiceError::TemporarilyUnavailable);
-            }
-            let preflight_request = ingress.idempotency.clone();
-            let preflight_target = match &unbind {
-                Some(endpoint_id) => CoveredProductMutationTarget::Endpoint {
-                    cat_id: cat_id.clone(),
-                    endpoint_id: endpoint_id.clone(),
-                },
-                None => CoveredProductMutationTarget::Cat {
-                    cat_id: cat_id.clone(),
-                },
-            };
-            let preflight = await_before_deadline(
-                ingress.absolute_deadline,
-                self.store.execute(move |store| {
-                    store.preflight_product_mutation_covered(&preflight_request, &preflight_target)
-                }),
-            )
-            .await
-            .map_err(ProductMutationServiceError::from_api)?;
-            if let CoveredProductMutationPreflight::Replayed(result) = preflight {
-                return Ok(http_result(result));
             }
             let endpoint = if let Some(body) = &bind {
                 let endpoint_id = prefixed_id("ep_", self.identities.random_id()?)?;
@@ -783,51 +779,15 @@ impl ProductMutationService {
                         .ok_or_else(|| ApiError::internal("Endpoint unbind ID is missing"))?,
                 }
             };
-            let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
-            let plan_cat_id = cat_id.clone();
-            let plan = await_before_deadline(
-                ingress.absolute_deadline,
-                self.store.execute(move |store| {
-                    store.plan_endpoint_route_mutation(&workspace_id, &plan_cat_id, endpoint)
-                }),
-            )
-            .await;
-            let plan = match plan {
-                Ok(plan) => plan,
-                Err(error) => {
-                    let (status, body) = match error.code {
-                        // A result miss cannot distinguish absent from another
-                        // Workspace's resource without checking ownership. The
-                        // frozen covered contract therefore rolls the key
-                        // reservation back and persists nothing for NotFound.
-                        ErrorCode::NotFound => continue,
-                        ErrorCode::Conflict => (409, ENDPOINT_CONFLICT_BODY),
-                        ErrorCode::FailedPrecondition => (412, ENDPOINT_PRECONDITION_BODY),
-                        ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => {
-                            return Err(ProductMutationServiceError::TemporarilyUnavailable);
-                        }
-                        ErrorCode::Internal => {
-                            return Err(ProductMutationServiceError::Fatal(error))
-                        }
-                        _ => return Err(ProductMutationServiceError::Request(error)),
-                    };
-                    return self.fixed_result(ingress, status, body).await;
-                }
-            };
-            if let Some(if_match) = ingress.if_match {
-                if if_match.get() != plan.expected_current.desired_revision.get() {
-                    return self.fixed_result(ingress, 409, IF_MATCH_BODY).await;
-                }
-            }
-            if plan.expected_current.target == RuntimeTarget::Deleted {
-                return self
-                    .fixed_result(ingress, 412, ENDPOINT_PRECONDITION_BODY)
-                    .await;
-            }
             let operation_id = prefixed_id("op_", self.identities.random_id()?)?;
-            let covered = covered_endpoint_request(&ingress, plan, operation_id);
+            let planned = PlannedProductMutationRequest::Endpoint {
+                ingress: ingress.clone(),
+                cat_id: cat_id.clone(),
+                mutation: endpoint,
+                operation_id,
+            };
             match self
-                .commit(covered, ingress.absolute_deadline, &mut shutdown)
+                .commit(planned, ingress.absolute_deadline, &mut shutdown)
                 .await?
             {
                 CommitOutcome::Committed(result) => return Ok(http_result(result)),
@@ -837,9 +797,9 @@ impl ProductMutationService {
                     continue;
                 }
                 CommitOutcome::CandidateCollision(CandidateCollision::Hostname) => {
-                    return self
-                        .fixed_result(ingress, 409, ENDPOINT_CONFLICT_BODY)
-                        .await;
+                    return Err(ProductMutationServiceError::Fatal(ApiError::internal(
+                        "Endpoint hostname collision escaped the covered transaction",
+                    )));
                 }
                 CommitOutcome::CandidateCollision(_) => {
                     return Err(ProductMutationServiceError::Fatal(ApiError::internal(
@@ -913,11 +873,16 @@ impl ProductMutationService {
 
     async fn commit(
         &self,
-        covered: CoveredDesiredMutationRequest,
+        planned: PlannedProductMutationRequest,
         deadline: Instant,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> std::result::Result<CommitOutcome, ProductMutationServiceError> {
-        let resolution_request = covered.idempotency.clone();
+        let resolution_request = match &planned {
+            PlannedProductMutationRequest::Lifecycle { ingress, .. }
+            | PlannedProductMutationRequest::Endpoint { ingress, .. } => {
+                ingress.idempotency.clone()
+            }
+        };
         let (cancellation, state) =
             CoveredCommitCancellation::new("product lifecycle mutation", deadline);
         let observer = state.clone();
@@ -930,7 +895,7 @@ impl ProductMutationService {
         tokio::spawn(async move {
             let execution_store = Arc::clone(&store);
             let execution = execution_store
-                .execute(move |store| Ok(store.commit_desired_mutation_covered(&covered, &state)));
+                .execute(move |store| Ok(store.commit_product_mutation_covered(&planned, &state)));
             tokio::pin!(execution);
             let execution = tokio::select! {
                 outcome = &mut execution => outcome,

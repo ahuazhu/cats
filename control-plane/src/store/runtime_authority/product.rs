@@ -517,15 +517,12 @@ pub(crate) struct ApiIdempotencyResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum CoveredProductMutationTarget {
-    Cat { cat_id: Id },
-    Endpoint { cat_id: Id, endpoint_id: Id },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum CoveredProductMutationPreflight {
-    Replayed(ApiIdempotencyResult),
-    Proceed,
+pub(super) enum CoveredPlannedDesiredMutation {
+    Fixed(ExactHttpResponse),
+    Mutation {
+        request: Box<CoveredDesiredMutationRequest>,
+        fixed_collision: Option<(CandidateCollision, ExactHttpResponse)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,94 +722,117 @@ impl Store {
         })
     }
 
-    /// Serializes a result miss with the same covered API-key transaction
-    /// family before revealing whether a Cat or Endpoint exists. A stored
-    /// result (including a fingerprint conflict) is resolved before any
-    /// product row is read. NotFound returns an error so both the advisory
-    /// reservation and every transaction effect are rolled back.
-    pub(super) fn preflight_product_mutation_covered(
+    /// Runs target/ownership reads, domain planning, revalidation, mutation and
+    /// exact-result persistence inside the one transaction that reserves the
+    /// API key. A stored result or fingerprint conflict is resolved before the
+    /// planner is invoked. Any planner error, including NotFound, rolls the
+    /// reservation back and persists no result.
+    pub(super) fn commit_planned_desired_mutation_covered(
         &self,
         request: &ApiIdempotencyRequest,
-        target: &CoveredProductMutationTarget,
-    ) -> Result<CoveredProductMutationPreflight> {
-        self.authority_transaction(|transaction| {
-            reserve_api_key(transaction, request)?;
-            if let Some(result) = load_api_result_for_update(transaction, request)? {
-                return check_replay(result, &request.request_fingerprint)
-                    .map(CoveredProductMutationPreflight::Replayed)
-                    .map_err(AuthorityTransactionError::from);
-            }
-
-            let cat_id = match target {
-                CoveredProductMutationTarget::Cat { cat_id }
-                | CoveredProductMutationTarget::Endpoint { cat_id, .. } => cat_id,
-            };
-            let cat = load_cat_by_id_for_update(transaction, cat_id)?
-                .filter(|cat| cat.workspace_id == request.authenticated_workspace_id)
-                .ok_or_else(|| ApiError::not_found("Cat"))?;
-            if cat.cat_id != *cat_id {
-                return Err(ApiError::internal("Cat ID projection is corrupt").into());
-            }
-
-            if let CoveredProductMutationTarget::Endpoint { endpoint_id, .. } = target {
-                let desired = load_desired_for_update(transaction, cat_id)?
-                    .ok_or_else(|| ApiError::internal("Cat has no current Desired"))?;
-                let endpoint = load_endpoint_by_id_for_update(transaction, endpoint_id)?
-                    .filter(|endpoint| {
-                        endpoint.workspace_id == request.authenticated_workspace_id
-                            && endpoint.cat_id == *cat_id
-                    })
-                    .ok_or_else(|| ApiError::not_found("Endpoint"))?;
-                if !desired
-                    .endpoints
-                    .iter()
-                    .any(|intent| intent.endpoint_id == endpoint.endpoint_id)
-                {
-                    return Err(ApiError::not_found("Endpoint").into());
-                }
-            }
-            Ok(CoveredProductMutationPreflight::Proceed)
-        })
-    }
-
-    /// Atomically records one deterministic covered HTTP outcome that has no
-    /// business-row mutation (for example an authenticated NotFound or a
-    /// lifecycle precondition failure). The API-key reservation remains the
-    /// first transaction action and replay never re-reads the resource.
-    pub(super) fn commit_fixed_api_result_covered(
-        &self,
-        request: &ApiIdempotencyRequest,
-        response: &ExactHttpResponse,
         commit_state: &CoveredCommitState,
-    ) -> Result<ApiIdempotencyResult> {
-        match self.authority_transaction_outcome_with_definite_retry(
+        mut planner: impl FnMut(&mut Transaction<'_>) -> AuthorityTxResult<CoveredPlannedDesiredMutation>
+            + Send,
+    ) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
+        let mut collision = None;
+        let result = self.authority_transaction_outcome_with_definite_retry(
             |transaction| {
                 checkpoint_covered_commit(transaction, Some(commit_state))?;
                 reserve_api_key(transaction, request)?;
                 checkpoint_covered_commit(transaction, Some(commit_state))?;
-                let result = if let Some(result) = load_api_result_for_update(transaction, request)?
-                {
-                    check_replay(result, &request.request_fingerprint)
-                        .map_err(AuthorityTransactionError::from)?
-                } else {
-                    let now = database_now(transaction)?;
-                    let result = result_from_envelope(request, response, now);
-                    insert_api_result(transaction, &result)?;
-                    result
+                if let Some(result) = load_api_result_for_update(transaction, request)? {
+                    let result = check_replay(result, &request.request_fingerprint)
+                        .map_err(AuthorityTransactionError::from)?;
+                    checkpoint_covered_commit(transaction, Some(commit_state))?;
+                    commit_state.begin_commit(transaction)?;
+                    return Ok(DesiredMutationTransactionOutcome::Replayed(result));
+                }
+
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                let planned = planner(transaction)?;
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                let outcome = match planned {
+                    CoveredPlannedDesiredMutation::Fixed(response) => {
+                        let now = database_now(transaction)?;
+                        let result = result_from_envelope(request, &response, now);
+                        insert_api_result(transaction, &result)?;
+                        DesiredMutationTransactionOutcome::Converged(result)
+                    }
+                    CoveredPlannedDesiredMutation::Mutation {
+                        request: mutation,
+                        fixed_collision,
+                    } => {
+                        if mutation.idempotency != *request {
+                            return Err(ApiError::internal(
+                                "planned Desired mutation changed its covered API identity",
+                            )
+                            .into());
+                        }
+                        match commit_desired_mutation_in(
+                            transaction,
+                            &mutation,
+                            Some(commit_state),
+                        )? {
+                            DesiredMutationTransactionOutcome::CandidateCollision(kind) => {
+                                if let Some((fixed_kind, response)) = fixed_collision {
+                                    if kind == fixed_kind {
+                                        let now = database_now(transaction)?;
+                                        let result = result_from_envelope(request, &response, now);
+                                        insert_api_result(transaction, &result)?;
+                                        DesiredMutationTransactionOutcome::Converged(result)
+                                    } else {
+                                        collision = Some(kind);
+                                        return Err(AuthorityTransactionError::CandidateCollision);
+                                    }
+                                } else {
+                                    collision = Some(kind);
+                                    return Err(AuthorityTransactionError::CandidateCollision);
+                                }
+                            }
+                            DesiredMutationTransactionOutcome::Stale => {
+                                return Err(AuthorityTransactionError::PlacementStale);
+                            }
+                            outcome => outcome,
+                        }
+                    }
                 };
                 checkpoint_covered_commit(transaction, Some(commit_state))?;
                 commit_state.begin_commit(transaction)?;
-                Ok(result)
+                Ok(outcome)
             },
             || commit_state.reset_after_definite_retry(),
-        ) {
-            Ok(result) => Ok(result),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(ApiError::internal(
-                "fixed API result returned an impossible candidate collision",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(ApiError::internal(
-                "fixed API result returned an impossible placement marker",
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(AuthorityExecutionError::CandidateCollision) => {
+                return Err(CoveredDesiredMutationError::CandidateCollision(
+                    collision.take().ok_or_else(|| {
+                        CoveredDesiredMutationError::Store(ApiError::internal(
+                            "candidate-collision transaction lost its typed reason",
+                        ))
+                    })?,
+                ));
+            }
+            Err(AuthorityExecutionError::PlacementStale) => {
+                return Err(CoveredDesiredMutationError::Stale);
+            }
+            Err(AuthorityExecutionError::Store(error)) => {
+                return Err(CoveredDesiredMutationError::Store(error));
+            }
+        };
+        match outcome {
+            DesiredMutationTransactionOutcome::Replayed(result) => {
+                Ok(DesiredMutationCommit::Replayed(result))
+            }
+            DesiredMutationTransactionOutcome::Converged(result) => {
+                Ok(DesiredMutationCommit::Converged(result))
+            }
+            DesiredMutationTransactionOutcome::Changed(result) => {
+                Ok(DesiredMutationCommit::Changed(result))
+            }
+            DesiredMutationTransactionOutcome::CandidateCollision(_)
+            | DesiredMutationTransactionOutcome::Stale => Err(CoveredDesiredMutationError::Store(
+                ApiError::internal("planned Desired mutation returned an unrolled control marker"),
             )),
         }
     }
