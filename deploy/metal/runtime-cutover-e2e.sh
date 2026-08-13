@@ -392,10 +392,9 @@ for index in "${!case_ids[@]}"; do
 done
 
 inventory_work=$scratch/final-inventory.json
-inventory_error=$scratch/final-inventory-error.txt
 set +e
 "$timeout_bin" --signal=TERM --kill-after=5 60 \
-  "$scenario_driver" inventory final "$block_path" "$scratch" 2>"$inventory_error" \
+  "$scenario_driver" inventory final "$block_path" "$scratch" 2>/dev/null \
   | "$filter" --mode inventory --max-bytes 1048576 >"$inventory_work"
 inventory_statuses=("${PIPESTATUS[@]}")
 set -e
@@ -404,8 +403,7 @@ inventory_filter_status=${inventory_statuses[1]:-125}
 if [[ $inventory_command_status -ne 0 || $inventory_filter_status -ne 0 ]]; then
   failed_cases=$((failed_cases + 1))
   printf '%s\n' '{"status":"unavailable"}' >"$inventory_work"
-  "$filter" --mode text --max-bytes 16384 <"$inventory_error" >"$scratch/inventory-diagnostic.txt" || \
-    printf '%s\n' '[inventory diagnostic filter failed closed]' >"$scratch/inventory-diagnostic.txt"
+  printf '%s\n' '[final inventory command or evidence filter failed closed]' >"$scratch/inventory-diagnostic.txt"
   append_summary final-inventory diagnostics "$scratch/inventory-diagnostic.txt"
 fi
 atomic_copy "$inventory_work" final-inventory.json

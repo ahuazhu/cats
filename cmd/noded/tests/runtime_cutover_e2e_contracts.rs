@@ -116,6 +116,16 @@ exec "$@"
         block_path: &str,
         configure: impl FnOnce(&mut Command),
     ) -> Output {
+        self.run_with_binary_digest(output_dir, block_path, &sha256(&self.binary), configure)
+    }
+
+    fn run_with_binary_digest(
+        &self,
+        output_dir: &Path,
+        block_path: &str,
+        binary_digest: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Output {
         let mut command = Command::new("bash");
         command
             .arg(self.root.join("deploy/metal/runtime-cutover-e2e.sh"))
@@ -133,7 +143,7 @@ exec "$@"
             .arg(format!(
                 "noded={}@sha256:{}",
                 self.binary.display(),
-                sha256(&self.binary)
+                binary_digest
             ))
             .arg("--config")
             .arg(format!("public={}", self.config.display()))
@@ -197,6 +207,19 @@ fn runtime_cutover_runner_rejects_mismatched_build_receipt() {
     let output = fixture.run(&fixture.output_dir("mismatch"), "kernel-nbd", |_| {});
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("build receipt"));
+}
+
+#[test]
+fn runtime_cutover_runner_rejects_a_dirty_binary() {
+    let fixture = Fixture::new();
+    let output = fixture.run_with_binary_digest(
+        &fixture.output_dir("dirty-binary"),
+        "kernel-nbd",
+        &"f".repeat(64),
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected sha256"));
 }
 
 #[test]
