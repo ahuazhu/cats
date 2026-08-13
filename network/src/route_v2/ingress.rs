@@ -18,6 +18,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use super::{
     CacheLookup, GatewayNodeRouteV2Error, NegativeRoute, RefreshableRejection, RequestKind,
@@ -27,6 +28,7 @@ use super::{
 const DEFAULT_MAX_PUBLIC_REQUEST_HEAD_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_PUBLIC_CONNECTIONS: usize = 4_096;
 const DEFAULT_PUBLIC_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+const DEFAULT_PUBLIC_EGRESS_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 
@@ -49,6 +51,7 @@ pub struct GatewayIngressConfig {
     pub max_public_connections: usize,
     pub max_public_request_head_bytes: usize,
     pub public_request_head_deadline: Duration,
+    pub public_egress_deadline: Duration,
     pub shutdown_drain_deadline: Duration,
 }
 
@@ -58,6 +61,7 @@ impl Default for GatewayIngressConfig {
             max_public_connections: DEFAULT_MAX_PUBLIC_CONNECTIONS,
             max_public_request_head_bytes: DEFAULT_MAX_PUBLIC_REQUEST_HEAD_BYTES,
             public_request_head_deadline: DEFAULT_PUBLIC_HEAD_DEADLINE,
+            public_egress_deadline: DEFAULT_PUBLIC_EGRESS_DEADLINE,
             shutdown_drain_deadline: DEFAULT_SHUTDOWN_DRAIN_DEADLINE,
         }
     }
@@ -73,10 +77,11 @@ impl GatewayIngressConfig {
         }
         if self.max_public_request_head_bytes == 0
             || self.public_request_head_deadline.is_zero()
+            || self.public_egress_deadline.is_zero()
             || self.shutdown_drain_deadline.is_zero()
         {
             return Err(GatewayIngressError::InvalidConfig(
-                "public header and shutdown bounds must be positive",
+                "public header, egress and shutdown bounds must be positive",
             ));
         }
         Ok(self)
@@ -208,24 +213,46 @@ async fn handle_connection(
             Ok(header_end) => header_end,
             Err(ReadRequestHeadError::CleanClose) if served_request => return,
             Err(_) => {
-                write_public_error(&mut public_writer, PublicError::BadRequest).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::BadRequest,
+                )
+                .await;
                 return;
             }
         };
         let parsed = match parse_request_head(&pending[..header_end], header_end) {
             Some(parsed) => parsed,
             None => {
-                write_public_error(&mut public_writer, PublicError::BadRequest).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::BadRequest,
+                )
+                .await;
                 return;
             }
         };
         match parsed.local_health {
             LocalHealthDisposition::RespondOk => {
-                write_local_health(&mut public_writer).await;
+                write_local_health(&mut public_reader, &mut public_writer, &mut pending, config)
+                    .await;
                 return;
             }
             LocalHealthDisposition::Reject => {
-                write_public_error(&mut public_writer, PublicError::BadRequest).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::BadRequest,
+                )
+                .await;
                 return;
             }
             LocalHealthDisposition::NotHealth => {}
@@ -252,15 +279,36 @@ async fn handle_connection(
         let route = match lookup {
             Ok(CacheLookup::Positive(route)) => route,
             Ok(CacheLookup::Negative(NegativeRoute::NotFound)) => {
-                write_public_error(&mut public_writer, PublicError::NotFound).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::NotFound,
+                )
+                .await;
                 return;
             }
             Ok(CacheLookup::Negative(NegativeRoute::Gone)) => {
-                write_public_error(&mut public_writer, PublicError::Gone).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::Gone,
+                )
+                .await;
                 return;
             }
             Err(_) => {
-                write_public_error(&mut public_writer, PublicError::Unavailable).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::Unavailable,
+                )
+                .await;
                 return;
             }
         };
@@ -306,11 +354,25 @@ async fn handle_connection(
                 } else {
                     PublicError::Unavailable
                 };
-                write_public_error(&mut public_writer, response).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    response,
+                )
+                .await;
                 return;
             }
             Err(_) => {
-                write_public_error(&mut public_writer, PublicError::BadGateway).await;
+                write_public_error(
+                    &mut public_reader,
+                    &mut public_writer,
+                    &mut pending,
+                    config,
+                    PublicError::BadGateway,
+                )
+                .await;
                 return;
             }
         };
@@ -389,7 +451,9 @@ async fn handle_connection(
         {
             ResponseDisposition::ReusePublic => served_request = true,
             ResponseDisposition::ClosePublic => {
-                let _ = public_writer.shutdown().await;
+                // Returning drops both public halves and the authenticated
+                // tunnel together. Do not hold route authority or the
+                // connection permit behind another public egress await.
                 return;
             }
         }
@@ -607,10 +671,7 @@ where
         let mut public_chunk = [0_u8; 4 * 1024];
         let read_limit = capacity.min(public_chunk.len()).max(1);
         tokio::select! {
-            // The stage future and peer watcher have the same task lifetime.
-            // Dropping this select on close/error/overflow therefore cancels
-            // the stage without a detached observer or lingering authority.
-            output = &mut future => return Ok(output),
+            biased;
             public_read = public.read(&mut public_chunk[..read_limit]) => {
                 let read = public_read.map_err(|_| ())?;
                 if read == 0 || capacity == 0 {
@@ -618,8 +679,62 @@ where
                 }
                 pending.extend_from_slice(&public_chunk[..read]);
             }
+            // The stage future and peer watcher have the same task lifetime.
+            // Dropping this select on close/error/overflow therefore cancels
+            // the stage without a detached observer or lingering authority.
+            output = &mut future => return Ok(output),
         }
     }
+}
+
+async fn write_public_while_open<W>(
+    public_writer: &mut W,
+    bytes: &[u8],
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_public_pending: usize,
+    egress_bound: Duration,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let deadline = Instant::now().checked_add(egress_bound).ok_or(())?;
+    let write = public_writer.write_all(bytes);
+    let timeout = tokio::time::sleep_until(deadline);
+    tokio::pin!(write);
+    tokio::pin!(timeout);
+    loop {
+        let capacity = max_public_pending.saturating_sub(public_pending.len());
+        let mut public_chunk = [0_u8; 4 * 1024];
+        let read_limit = capacity.min(public_chunk.len()).max(1);
+        tokio::select! {
+            biased;
+            public_read = public_reader.read(&mut public_chunk[..read_limit]) => {
+                let read = public_read.map_err(|_| ())?;
+                if read == 0 || capacity == 0 {
+                    return Err(());
+                }
+                public_pending.extend_from_slice(&public_chunk[..read]);
+            }
+            _ = &mut timeout => return Err(()),
+            result = &mut write => return result.map_err(|_| ()),
+        }
+    }
+}
+
+async fn write_public_with_deadline<W>(
+    public_writer: &mut W,
+    bytes: &[u8],
+    egress_bound: Duration,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let deadline = Instant::now().checked_add(egress_bound).ok_or(())?;
+    tokio::time::timeout_at(deadline, public_writer.write_all(bytes))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 async fn write_tunnel_while_public_open<W>(
@@ -943,16 +1058,32 @@ async fn proxy_websocket(
     if !valid_websocket_response(&upstream_pending[..response_head_end]) {
         return;
     }
-    if public_writer
-        .write_all(&upstream_pending[..response_head_end])
-        .await
-        .is_err()
+    if write_public_while_open(
+        &mut public_writer,
+        &upstream_pending[..response_head_end],
+        &mut public_reader,
+        &mut public_pending,
+        config.max_public_request_head_bytes,
+        config.public_egress_deadline,
+    )
+    .await
+    .is_err()
     {
         return;
     }
     upstream_pending.drain(..response_head_end);
 
-    if public_writer.write_all(&upstream_pending).await.is_err() {
+    if write_public_while_open(
+        &mut public_writer,
+        &upstream_pending,
+        &mut public_reader,
+        &mut public_pending,
+        config.max_public_request_head_bytes,
+        config.public_egress_deadline,
+    )
+    .await
+    .is_err()
+    {
         return;
     }
 
@@ -967,10 +1098,15 @@ async fn proxy_websocket(
         &mut public_pending,
         config.max_public_request_head_bytes,
     );
-    let guest_to_client = tokio::io::copy(&mut tunnel_reader, &mut public_writer);
+    let guest_to_client = forward_websocket_guest(
+        &mut tunnel_reader,
+        &mut public_writer,
+        config.public_egress_deadline,
+    );
     tokio::pin!(client_to_guest);
     tokio::pin!(guest_to_client);
     tokio::select! {
+        biased;
         _ = &mut client_to_guest => {}
         _ = &mut guest_to_client => {}
     }
@@ -991,6 +1127,28 @@ where
         }
         let bytes = std::mem::take(pending);
         write_tunnel_while_public_open(tunnel, &bytes, public, pending, max_pending).await?;
+    }
+}
+
+async fn forward_websocket_guest<R, W>(
+    tunnel: &mut R,
+    public_writer: &mut W,
+    public_egress_deadline: Duration,
+) -> Result<(), ()>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buffer = [0_u8; 4 * 1024];
+    loop {
+        let read = tunnel.read(&mut buffer).await.map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        // One absolute deadline covers every partial write of this buffered
+        // Guest chunk. Progress cannot renew the deadline, while an idle
+        // WebSocket with no pending public egress remains admitted.
+        write_public_with_deadline(public_writer, &buffer[..read], public_egress_deadline).await?;
     }
 }
 
@@ -1023,10 +1181,16 @@ async fn proxy_http_response(
     ) else {
         return ResponseDisposition::ClosePublic;
     };
-    if public_writer
-        .write_all(&upstream_pending[..response_head_end])
-        .await
-        .is_err()
+    if write_public_while_open(
+        public_writer,
+        &upstream_pending[..response_head_end],
+        public_reader,
+        public_pending,
+        config.max_public_request_head_bytes,
+        config.public_egress_deadline,
+    )
+    .await
+    .is_err()
     {
         return ResponseDisposition::ClosePublic;
     }
@@ -1040,7 +1204,7 @@ async fn proxy_http_response(
                 &mut upstream_pending,
                 public_reader,
                 public_pending,
-                config.max_public_request_head_bytes,
+                config,
                 length,
             )
             .await
@@ -1063,7 +1227,7 @@ async fn proxy_http_response(
                 &mut upstream_pending,
                 public_reader,
                 public_pending,
-                config.max_public_request_head_bytes,
+                config,
             )
             .await;
             return ResponseDisposition::ClosePublic;
@@ -1143,6 +1307,10 @@ async fn read_upstream_more(
         if public_capacity == 0 {
             let mut overflow = [0_u8; 1];
             return tokio::select! {
+                biased;
+                // Peer loss/overflow owns cancellation even if a noisy Guest
+                // is simultaneously readable.
+                _ = public_reader.read(&mut overflow) => Err(()),
                 upstream_read = upstream.read(&mut upstream_chunk) => {
                     match upstream_read.map_err(|_| ())? {
                         0 => Ok(UpstreamProgress::Eof),
@@ -1152,15 +1320,19 @@ async fn read_upstream_more(
                         }
                     }
                 }
-                // Once the bounded pipeline buffer is full, any additional
-                // public byte or EOF closes this request instead of hiding a
-                // disconnect behind unconsumed attacker-controlled bytes.
-                _ = public_reader.read(&mut overflow) => Err(()),
             };
         }
         let mut public_chunk = [0_u8; 4 * 1024];
         let public_read_limit = public_capacity.min(public_chunk.len());
         tokio::select! {
+            biased;
+            public_read = public_reader.read(&mut public_chunk[..public_read_limit]) => {
+                let read = public_read.map_err(|_| ())?;
+                if read == 0 {
+                    return Err(());
+                }
+                public_pending.extend_from_slice(&public_chunk[..read]);
+            }
             upstream_read = upstream.read(&mut upstream_chunk) => {
                 return match upstream_read.map_err(|_| ())? {
                     0 => Ok(UpstreamProgress::Eof),
@@ -1169,13 +1341,6 @@ async fn read_upstream_more(
                         Ok(UpstreamProgress::Data)
                     }
                 };
-            }
-            public_read = public_reader.read(&mut public_chunk[..public_read_limit]) => {
-                let read = public_read.map_err(|_| ())?;
-                if read == 0 {
-                    return Err(());
-                }
-                public_pending.extend_from_slice(&public_chunk[..read]);
             }
         }
     }
@@ -1187,7 +1352,7 @@ async fn forward_upstream_exact(
     upstream_pending: &mut Vec<u8>,
     public_reader: &mut OwnedReadHalf,
     public_pending: &mut Vec<u8>,
-    max_public_pending: usize,
+    config: GatewayIngressConfig,
     length: usize,
 ) -> Result<(), ()> {
     let mut remaining = length;
@@ -1198,7 +1363,7 @@ async fn forward_upstream_exact(
                 upstream_pending,
                 public_reader,
                 public_pending,
-                max_public_pending,
+                config.max_public_request_head_bytes,
             )
             .await?
                 == UpstreamProgress::Eof
@@ -1206,10 +1371,15 @@ async fn forward_upstream_exact(
             return Err(());
         }
         let forwarded = remaining.min(upstream_pending.len());
-        public_writer
-            .write_all(&upstream_pending[..forwarded])
-            .await
-            .map_err(|_| ())?;
+        write_public_while_open(
+            public_writer,
+            &upstream_pending[..forwarded],
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+            config.public_egress_deadline,
+        )
+        .await?;
         upstream_pending.drain(..forwarded);
         remaining -= forwarded;
     }
@@ -1235,7 +1405,15 @@ async fn forward_upstream_chunked(
         )
         .await?;
         let chunk_size = parse_chunk_size(&line).ok_or(())?;
-        public_writer.write_all(&line).await.map_err(|_| ())?;
+        write_public_while_open(
+            public_writer,
+            &line,
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+            config.public_egress_deadline,
+        )
+        .await?;
         if chunk_size == 0 {
             let mut trailer_bytes = 0_usize;
             loop {
@@ -1254,7 +1432,15 @@ async fn forward_upstream_chunked(
                 {
                     return Err(());
                 }
-                public_writer.write_all(&trailer).await.map_err(|_| ())?;
+                write_public_while_open(
+                    public_writer,
+                    &trailer,
+                    public_reader,
+                    public_pending,
+                    config.max_public_request_head_bytes,
+                    config.public_egress_deadline,
+                )
+                .await?;
                 if trailer == b"\r\n" {
                     return Ok(());
                 }
@@ -1267,7 +1453,7 @@ async fn forward_upstream_chunked(
             upstream_pending,
             public_reader,
             public_pending,
-            config.max_public_request_head_bytes,
+            config,
             chunk_size,
         )
         .await?;
@@ -1283,10 +1469,15 @@ async fn forward_upstream_chunked(
         if upstream_pending.get(..2) != Some(b"\r\n") {
             return Err(());
         }
-        public_writer
-            .write_all(&upstream_pending[..2])
-            .await
-            .map_err(|_| ())?;
+        write_public_while_open(
+            public_writer,
+            &upstream_pending[..2],
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+            config.public_egress_deadline,
+        )
+        .await?;
         upstream_pending.drain(..2);
     }
 }
@@ -1297,14 +1488,19 @@ async fn forward_close_delimited(
     upstream_pending: &mut Vec<u8>,
     public_reader: &mut OwnedReadHalf,
     public_pending: &mut Vec<u8>,
-    max_public_pending: usize,
+    config: GatewayIngressConfig,
 ) -> Result<(), ()> {
     loop {
         if !upstream_pending.is_empty() {
-            public_writer
-                .write_all(upstream_pending)
-                .await
-                .map_err(|_| ())?;
+            write_public_while_open(
+                public_writer,
+                upstream_pending,
+                public_reader,
+                public_pending,
+                config.max_public_request_head_bytes,
+                config.public_egress_deadline,
+            )
+            .await?;
             upstream_pending.clear();
         }
         if read_upstream_more(
@@ -1312,7 +1508,7 @@ async fn forward_close_delimited(
             upstream_pending,
             public_reader,
             public_pending,
-            max_public_pending,
+            config.max_public_request_head_bytes,
         )
         .await?
             == UpstreamProgress::Eof
@@ -1585,7 +1781,13 @@ enum PublicError {
     Unavailable,
 }
 
-async fn write_public_error(stream: &mut OwnedWriteHalf, error: PublicError) {
+async fn write_public_error(
+    public_reader: &mut OwnedReadHalf,
+    public_writer: &mut OwnedWriteHalf,
+    public_pending: &mut Vec<u8>,
+    config: GatewayIngressConfig,
+    error: PublicError,
+) {
     let response: &[u8] = match error {
         PublicError::BadRequest => {
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbad request\n"
@@ -1603,15 +1805,32 @@ async fn write_public_error(stream: &mut OwnedWriteHalf, error: PublicError) {
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\nRetry-After: 1\r\n\r\nservice unavailable\n"
         }
     };
-    let _ = stream.write_all(response).await;
-    let _ = stream.shutdown().await;
+    let _ = write_public_while_open(
+        public_writer,
+        response,
+        public_reader,
+        public_pending,
+        config.max_public_request_head_bytes,
+        config.public_egress_deadline,
+    )
+    .await;
+    let _ = tokio::time::timeout(config.public_egress_deadline, public_writer.shutdown()).await;
 }
 
-async fn write_local_health(stream: &mut OwnedWriteHalf) {
-    let _ = stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
-        )
-        .await;
-    let _ = stream.shutdown().await;
+async fn write_local_health(
+    public_reader: &mut OwnedReadHalf,
+    public_writer: &mut OwnedWriteHalf,
+    public_pending: &mut Vec<u8>,
+    config: GatewayIngressConfig,
+) {
+    let _ = write_public_while_open(
+        public_writer,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+        public_reader,
+        public_pending,
+        config.max_public_request_head_bytes,
+        config.public_egress_deadline,
+    )
+    .await;
+    let _ = tokio::time::timeout(config.public_egress_deadline, public_writer.shutdown()).await;
 }

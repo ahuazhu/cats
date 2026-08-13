@@ -41,6 +41,12 @@ struct Args {
     request_head_deadline_ms: u64,
     #[arg(
         long,
+        env = "CATS_GATEWAY_PUBLIC_EGRESS_DEADLINE_MS",
+        default_value_t = 5_000
+    )]
+    public_egress_deadline_ms: u64,
+    #[arg(
+        long,
         env = "CATS_GATEWAY_SHUTDOWN_DRAIN_DEADLINE_MS",
         default_value_t = 10_000
     )]
@@ -118,6 +124,7 @@ async fn main() -> Result<()> {
             max_public_connections: args.max_connections,
             max_public_request_head_bytes: args.max_request_head_bytes,
             public_request_head_deadline: Duration::from_millis(args.request_head_deadline_ms),
+            public_egress_deadline: Duration::from_millis(args.public_egress_deadline_ms),
             shutdown_drain_deadline: Duration::from_millis(args.shutdown_drain_deadline_ms),
         },
         cache,

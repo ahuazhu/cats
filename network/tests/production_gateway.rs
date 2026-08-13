@@ -108,6 +108,116 @@ struct BlockingStageTunnel {
     dropped: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PublicEgressStage {
+    HttpHead,
+    HttpBody,
+    WebSocketRaw,
+}
+
+struct FloodingResponseTunnel {
+    response: Vec<u8>,
+    offset: usize,
+    notify_after: usize,
+    egress_started: Option<oneshot::Sender<()>>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for FloodingResponseTunnel {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+impl AsyncRead for FloodingResponseTunnel {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset == self.response.len() {
+            return Poll::Pending;
+        }
+        let read = buffer.remaining().min(self.response.len() - self.offset);
+        let end = self.offset + read;
+        buffer.put_slice(&self.response[self.offset..end]);
+        self.offset = end;
+        if self.offset >= self.notify_after {
+            if let Some(started) = self.egress_started.take() {
+                let _ = started.send(());
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for FloodingResponseTunnel {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn flooding_response(stage: PublicEgressStage) -> (Vec<u8>, usize, &'static [u8], usize) {
+    const FLOOD_BYTES: usize = 16 * 1024 * 1024;
+    match stage {
+        PublicEgressStage::HttpHead => {
+            let mut response = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
+            response.resize(2 * 1024 * 1024, b'a');
+            response.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+            let notify_after = response.len();
+            (
+                response,
+                notify_after,
+                b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+                3 * 1024 * 1024,
+            )
+        }
+        PublicEgressStage::HttpBody => {
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {FLOOD_BYTES}\r\n\r\n").into_bytes();
+            let notify_after = response.len() + 1;
+            response.resize(response.len() + FLOOD_BYTES, b'b');
+            (
+                response,
+                notify_after,
+                b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+                32 * 1024,
+            )
+        }
+        PublicEgressStage::WebSocketRaw => {
+            let mut response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+            let notify_after = response.len() + 1;
+            response.resize(response.len() + FLOOD_BYTES, b'w');
+            (
+                response,
+                notify_after,
+                b"GET /socket HTTP/1.1\r\nHost: app.cats.run\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                32 * 1024,
+            )
+        }
+    }
+}
+
 impl Drop for BlockingStageTunnel {
     fn drop(&mut self) {
         if let Some(dropped) = self.dropped.take() {
@@ -208,8 +318,7 @@ impl AsyncWrite for SilentTunnel {
     }
 }
 
-#[tokio::test]
-async fn exact_local_health_is_the_only_request_that_bypasses_route_authority() {
+async fn exact_local_health_is_the_only_request_that_bypasses_route_authority_case() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
     let resolver: RouteResolver = Arc::new(move |hostname| {
@@ -272,8 +381,7 @@ async fn exact_local_health_is_the_only_request_that_bypasses_route_authority() 
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn public_http_bytes_cross_one_route_lookup_and_one_node_tunnel() {
+async fn public_http_bytes_cross_one_route_lookup_and_one_node_tunnel_case() {
     let resolved_hostname = Arc::new(Mutex::new(None));
     let resolved_hostname_call = Arc::clone(&resolved_hostname);
     let resolver: RouteResolver = Arc::new(move |hostname| {
@@ -321,8 +429,7 @@ async fn public_http_bytes_cross_one_route_lookup_and_one_node_tunnel() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn keep_alive_requests_with_different_hosts_get_distinct_tunnels() {
+async fn keep_alive_requests_with_different_hosts_get_distinct_tunnels_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"per-request-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -374,8 +481,7 @@ async fn keep_alive_requests_with_different_hosts_get_distinct_tunnels() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn chunked_http_body_and_trailer_stay_on_one_request_tunnel() {
+async fn chunked_http_body_and_trailer_stay_on_one_request_tunnel_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"chunked-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -414,8 +520,7 @@ async fn chunked_http_body_and_trailer_stay_on_one_request_tunnel() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn split_chunked_body_retains_pipelined_next_host_for_a_distinct_tunnel() {
+async fn split_chunked_body_retains_pipelined_next_host_for_a_distinct_tunnel_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"split-chunked-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -483,8 +588,7 @@ async fn split_chunked_body_retains_pipelined_next_host_for_a_distinct_tunnel() 
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn ambiguous_transfer_framing_is_rejected_before_route_authority() {
+async fn ambiguous_transfer_framing_is_rejected_before_route_authority_case() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
     let resolver: RouteResolver = Arc::new(move |_| {
@@ -508,7 +612,6 @@ async fn ambiguous_transfer_framing_is_rejected_before_route_authority() {
     ] {
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(request).await.unwrap();
-        client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
@@ -520,8 +623,7 @@ async fn ambiguous_transfer_framing_is_rejected_before_route_authority() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
+async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes_case() {
     const REQUEST_HEAD: &[u8] =
         b"POST / HTTP/1.1\r\nHost: app.cats.run\r\nTransfer-Encoding: chunked\r\n\r\n";
     let resolver: RouteResolver = Arc::new(move |hostname| {
@@ -532,13 +634,19 @@ async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
     let (captured_sender, mut captured_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (head_forwarded_sender, mut head_forwarded_receiver) =
         tokio::sync::mpsc::unbounded_channel();
+    let tunnel_attempts = Arc::new(AtomicUsize::new(0));
+    let tunnel_attempts_call = Arc::clone(&tunnel_attempts);
     let connector: TunnelConnector = Arc::new(move |_| {
+        tunnel_attempts_call.fetch_add(1, Ordering::SeqCst);
         let captured_sender = captured_sender.clone();
         let head_forwarded_sender = head_forwarded_sender.clone();
         let (gateway_side, mut node_side) = tokio::io::duplex(128 * 1024);
         tokio::spawn(async move {
             let mut request = vec![0_u8; REQUEST_HEAD.len()];
-            node_side.read_exact(&mut request).await.unwrap();
+            if node_side.read_exact(&mut request).await.is_err() {
+                captured_sender.send(Vec::new()).unwrap();
+                return;
+            }
             head_forwarded_sender.send(()).unwrap();
             node_side.read_to_end(&mut request).await.unwrap();
             captured_sender.send(request).unwrap();
@@ -551,31 +659,90 @@ async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
         "0\r\nX-Large: {}\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n",
         "x".repeat(33 * 1024)
     );
-    for malformed in [
-        b"4;extension=yes\r\ndata\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
-        b"10000000000000000\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
-        b"1\r\naXGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
-        b"0\r\n".to_vec(),
-        b"0\r\nHost: other.cats.run\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
-        oversized_trailer.into_bytes(),
-    ] {
+    for (case_index, (malformed, head_is_forwarded)) in [
+        (
+            b"4;extension=yes\r\ndata\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
+            true,
+        ),
+        (
+            b"10000000000000000\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
+            true,
+        ),
+        (
+            b"1\r\naXGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
+            true,
+        ),
+        (b"0\r\n".to_vec(), true),
+        (
+            b"0\r\nHost: other.cats.run\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
+            true,
+        ),
+        // The bounded public watcher sees this overflow before the request
+        // head write wins. Cancellation must leave the Guest with zero bytes.
+        (oversized_trailer.into_bytes(), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let attempts_before = tunnel_attempts.load(Ordering::SeqCst);
         let truncated = malformed == b"0\r\n";
         let mut request = REQUEST_HEAD.to_vec();
         request.extend_from_slice(&malformed);
-        let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(&request).await.unwrap();
-        head_forwarded_receiver.recv().await.unwrap();
+        let mut client = await_production_gateway_stage(
+            format!("malformed-chunk[{case_index}]/connect"),
+            TcpStream::connect(address),
+        )
+        .await
+        .unwrap();
+        await_production_gateway_stage(
+            format!("malformed-chunk[{case_index}]/request-write"),
+            client.write_all(&request),
+        )
+        .await
+        .unwrap();
+        if head_is_forwarded {
+            await_production_gateway_stage(
+                format!("malformed-chunk[{case_index}]/head-forwarded-channel"),
+                head_forwarded_receiver.recv(),
+            )
+            .await
+            .unwrap();
+        }
         if truncated {
-            client.shutdown().await.unwrap();
+            await_production_gateway_stage(
+                format!("malformed-chunk[{case_index}]/client-shutdown"),
+                client.shutdown(),
+            )
+            .await
+            .unwrap();
         }
         let mut response = Vec::new();
-        if let Err(error) = client.read_to_end(&mut response).await {
+        if let Err(error) = await_production_gateway_stage(
+            format!("malformed-chunk[{case_index}]/response-read"),
+            client.read_to_end(&mut response),
+        )
+        .await
+        {
             assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
         }
         assert!(response.is_empty());
 
-        let captured = captured_receiver.recv().await.unwrap();
-        assert!(captured.starts_with(REQUEST_HEAD));
+        let connector_was_called = tunnel_attempts.load(Ordering::SeqCst) != attempts_before;
+        let captured = if connector_was_called {
+            await_production_gateway_stage(
+                format!("malformed-chunk[{case_index}]/captured-channel"),
+                captured_receiver.recv(),
+            )
+            .await
+            .unwrap()
+        } else {
+            Vec::new()
+        };
+        if head_is_forwarded {
+            assert!(captured.starts_with(REQUEST_HEAD));
+        } else {
+            assert!(captured.is_empty());
+        }
         assert!(!captured
             .windows(b"GET /smuggled".len())
             .any(|window| window == b"GET /smuggled"));
@@ -585,8 +752,7 @@ async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn authenticated_stale_rejection_refreshes_only_for_a_later_request() {
+async fn authenticated_stale_rejection_refreshes_only_for_a_later_request_case() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
     let resolver: RouteResolver = Arc::new(move |hostname| {
@@ -627,8 +793,7 @@ async fn authenticated_stale_rejection_refreshes_only_for_a_later_request() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel() {
+async fn websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"websocket-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -686,8 +851,7 @@ async fn websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn rejected_websocket_discards_buffered_bytes_before_the_guest() {
+async fn rejected_websocket_discards_buffered_bytes_before_the_guest_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"rejected-websocket-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -748,8 +912,7 @@ async fn rejected_websocket_discards_buffered_bytes_before_the_guest() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn malformed_websocket_101_never_commits_raw_mode() {
+async fn malformed_websocket_101_never_commits_raw_mode_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"malformed-websocket-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -811,8 +974,7 @@ async fn malformed_websocket_101_never_commits_raw_mode() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn content_length_response_never_forwards_a_second_response_frame() {
+async fn content_length_response_never_forwards_a_second_response_frame_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"response-boundary-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -861,8 +1023,7 @@ async fn content_length_response_never_forwards_a_second_response_frame() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn chunked_response_is_self_delimited_before_the_next_host_request() {
+async fn chunked_response_is_self_delimited_before_the_next_host_request_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"chunked-response-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -913,8 +1074,7 @@ async fn chunked_response_is_self_delimited_before_the_next_host_request() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn close_delimited_and_connection_close_responses_close_public_connection() {
+async fn close_delimited_and_connection_close_responses_close_public_connection_case() {
     for response in [
         b"HTTP/1.1 200 OK\r\n\r\nbody".as_slice(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".as_slice(),
@@ -957,8 +1117,7 @@ async fn close_delimited_and_connection_close_responses_close_public_connection(
     }
 }
 
-#[tokio::test]
-async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot() {
+async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"disconnect-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -1029,8 +1188,7 @@ async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authority() {
+async fn public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authority_case() {
     let (started_sender, started_receiver) = oneshot::channel();
     let started_sender = Arc::new(Mutex::new(Some(started_sender)));
     let resolver: RouteResolver = Arc::new(move |_| {
@@ -1069,8 +1227,7 @@ async fn public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authorit
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn public_disconnect_cancels_a_blocked_connector_before_tunnel_authority() {
+async fn public_disconnect_cancels_a_blocked_connector_before_tunnel_authority_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"blocked-connector-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -1112,8 +1269,7 @@ async fn public_disconnect_cancels_a_blocked_connector_before_tunnel_authority()
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_slot() {
+async fn public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_slot_case() {
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"overflow-connector-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
@@ -1156,8 +1312,7 @@ async fn public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_s
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn public_disconnect_cancels_each_blocked_tunnel_write_stage() {
+async fn public_disconnect_cancels_each_blocked_tunnel_write_stage_case() {
     const REQUEST_HEAD: &[u8] =
         b"POST /mutate HTTP/1.1\r\nHost: one.cats.run\r\nContent-Length: 4\r\n\r\n";
     for stage in [
@@ -1219,6 +1374,93 @@ async fn public_disconnect_cancels_each_blocked_tunnel_write_stage() {
     }
 }
 
+async fn run_blocked_public_egress_case(stage: PublicEgressStage, disconnect: bool) {
+    let resolver: RouteResolver = Arc::new(move |hostname| {
+        let route = route(hostname, b"blocked-public-egress-grant");
+        Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let (response, notify_after, request, max_head_bytes) = flooding_response(stage);
+    let (started_sender, started_receiver) = oneshot::channel();
+    let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+    let (dropped_sender, dropped_receiver) = oneshot::channel();
+    let dropped_sender = Arc::new(Mutex::new(Some(dropped_sender)));
+    let response = Arc::new(response);
+    let connector: TunnelConnector = Arc::new(move |_| {
+        let tunnel = FloodingResponseTunnel {
+            response: response.as_ref().clone(),
+            offset: 0,
+            notify_after,
+            egress_started: started_sender.lock().unwrap().take(),
+            dropped: dropped_sender.lock().unwrap().take(),
+        };
+        Box::pin(async move { Ok(Box::new(tunnel) as BoxedGatewayTunnel) }) as TunnelFuture
+    });
+    let config = GatewayIngressConfig {
+        max_public_connections: 1,
+        max_public_request_head_bytes: max_head_bytes,
+        public_egress_deadline: Duration::from_millis(100),
+        shutdown_drain_deadline: Duration::from_millis(250),
+        ..GatewayIngressConfig::default()
+    };
+    let (address, shutdown, server) = spawn_gateway_with_config(cache, connector, config).await;
+
+    let mut abandoned = Some(TcpStream::connect(address).await.unwrap());
+    abandoned
+        .as_mut()
+        .unwrap()
+        .write_all(request)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), started_receiver)
+        .await
+        .unwrap_or_else(|_| panic!("{stage:?}: Gateway never began the selected public egress"))
+        .unwrap();
+    if disconnect {
+        drop(abandoned.take());
+    }
+    tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{stage:?}: {} did not drop the Node tunnel",
+                if disconnect {
+                    "public EOF"
+                } else {
+                    "absolute public-egress deadline"
+                }
+            )
+        })
+        .unwrap();
+    if !disconnect {
+        drop(abandoned.take());
+    }
+    assert_health_gets_released_permit(address).await;
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+async fn public_eof_cancels_blocked_http_and_websocket_egress_case() {
+    for stage in [
+        PublicEgressStage::HttpHead,
+        PublicEgressStage::HttpBody,
+        PublicEgressStage::WebSocketRaw,
+    ] {
+        run_blocked_public_egress_case(stage, true).await;
+    }
+}
+
+async fn absolute_egress_deadline_cancels_nonreading_http_and_websocket_peers_case() {
+    for stage in [
+        PublicEgressStage::HttpHead,
+        PublicEgressStage::HttpBody,
+        PublicEgressStage::WebSocketRaw,
+    ] {
+        run_blocked_public_egress_case(stage, false).await;
+    }
+}
+
 async fn assert_health_gets_released_permit(address: std::net::SocketAddr) {
     let mut next = TcpStream::connect(address).await.unwrap();
     next.write_all(b"GET /healthz HTTP/1.1\r\nHost: alb.internal\r\n\r\n")
@@ -1232,8 +1474,7 @@ async fn assert_health_gets_released_permit(address: std::net::SocketAddr) {
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 }
 
-#[tokio::test]
-async fn response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed() {
+async fn response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed_case() {
     struct Case {
         request: &'static [u8],
         upstream: &'static [u8],
@@ -1310,8 +1551,7 @@ async fn response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed() {
     }
 }
 
-#[tokio::test]
-async fn guard_acquired_failure_never_refreshes_the_route() {
+async fn guard_acquired_failure_never_refreshes_the_route_case() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
     let resolver: RouteResolver = Arc::new(move |hostname| {
@@ -1343,8 +1583,7 @@ async fn guard_acquired_failure_never_refreshes_the_route() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn duplicate_host_is_rejected_before_cache_or_tunnel_authority() {
+async fn duplicate_host_is_rejected_before_cache_or_tunnel_authority_case() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
     let resolver: RouteResolver = Arc::new(move |_| {
@@ -1362,7 +1601,6 @@ async fn duplicate_host_is_rejected_before_cache_or_tunnel_authority() {
         .write_all(b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nHost: other.cats.run\r\n\r\n")
         .await
         .unwrap();
-    client.shutdown().await.unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).await.unwrap();
 
@@ -1371,3 +1609,128 @@ async fn duplicate_host_is_rejected_before_cache_or_tunnel_authority() {
     shutdown.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
+
+async fn zero_public_egress_deadline_is_rejected_at_startup_case() {
+    let resolver: RouteResolver = Arc::new(|_| {
+        Box::pin(async { Err(cats_network::route_v2::ResolveFailure::InvalidAuthority) })
+            as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let connector: TunnelConnector =
+        Arc::new(|_| Box::pin(async { Err(GatewayNodeRouteV2Error::Protocol) }) as TunnelFuture);
+    let config = GatewayIngressConfig {
+        public_egress_deadline: Duration::ZERO,
+        ..GatewayIngressConfig::default()
+    };
+
+    assert!(GatewayIngress::new(config, cache, connector).is_err());
+}
+
+const PRODUCTION_GATEWAY_CASE_DEADLINE: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy)]
+struct ProductionGatewayCaseContext {
+    case: &'static str,
+    deadline: Instant,
+}
+
+tokio::task_local! {
+    static PRODUCTION_GATEWAY_CASE: ProductionGatewayCaseContext;
+}
+
+async fn await_production_gateway_stage<T>(
+    stage: impl std::fmt::Display,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let context = PRODUCTION_GATEWAY_CASE.with(|context| *context);
+    tokio::time::timeout_at(context.deadline, future)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "production_gateway case={} stage={} exceeded its absolute total deadline",
+                context.case, stage
+            )
+        })
+}
+
+async fn run_production_gateway_case(
+    case: &'static str,
+    future: impl std::future::Future<Output = ()>,
+) {
+    let deadline = Instant::now()
+        .checked_add(PRODUCTION_GATEWAY_CASE_DEADLINE)
+        .expect("fixed production Gateway test deadline fits");
+    let context = ProductionGatewayCaseContext { case, deadline };
+    tokio::time::timeout_at(deadline, PRODUCTION_GATEWAY_CASE.scope(context, future))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "production_gateway case={case} stage=total-e2e exceeded absolute {}s deadline",
+                PRODUCTION_GATEWAY_CASE_DEADLINE.as_secs()
+            )
+        });
+}
+
+macro_rules! bounded_production_gateway_tests {
+    ($( $test:ident => $case:ident ),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                run_production_gateway_case(stringify!($test), $case()).await;
+            }
+        )+
+    };
+}
+
+bounded_production_gateway_tests!(
+    exact_local_health_is_the_only_request_that_bypasses_route_authority =>
+        exact_local_health_is_the_only_request_that_bypasses_route_authority_case,
+    public_http_bytes_cross_one_route_lookup_and_one_node_tunnel =>
+        public_http_bytes_cross_one_route_lookup_and_one_node_tunnel_case,
+    keep_alive_requests_with_different_hosts_get_distinct_tunnels =>
+        keep_alive_requests_with_different_hosts_get_distinct_tunnels_case,
+    chunked_http_body_and_trailer_stay_on_one_request_tunnel =>
+        chunked_http_body_and_trailer_stay_on_one_request_tunnel_case,
+    split_chunked_body_retains_pipelined_next_host_for_a_distinct_tunnel =>
+        split_chunked_body_retains_pipelined_next_host_for_a_distinct_tunnel_case,
+    ambiguous_transfer_framing_is_rejected_before_route_authority =>
+        ambiguous_transfer_framing_is_rejected_before_route_authority_case,
+    malformed_chunk_framing_never_forwards_smuggled_request_bytes =>
+        malformed_chunk_framing_never_forwards_smuggled_request_bytes_case,
+    authenticated_stale_rejection_refreshes_only_for_a_later_request =>
+        authenticated_stale_rejection_refreshes_only_for_a_later_request_case,
+    websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel =>
+        websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel_case,
+    rejected_websocket_discards_buffered_bytes_before_the_guest =>
+        rejected_websocket_discards_buffered_bytes_before_the_guest_case,
+    malformed_websocket_101_never_commits_raw_mode =>
+        malformed_websocket_101_never_commits_raw_mode_case,
+    content_length_response_never_forwards_a_second_response_frame =>
+        content_length_response_never_forwards_a_second_response_frame_case,
+    chunked_response_is_self_delimited_before_the_next_host_request =>
+        chunked_response_is_self_delimited_before_the_next_host_request_case,
+    close_delimited_and_connection_close_responses_close_public_connection =>
+        close_delimited_and_connection_close_responses_close_public_connection_case,
+    public_disconnect_drops_silent_tunnel_and_releases_connection_slot =>
+        public_disconnect_drops_silent_tunnel_and_releases_connection_slot_case,
+    public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authority =>
+        public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authority_case,
+    public_disconnect_cancels_a_blocked_connector_before_tunnel_authority =>
+        public_disconnect_cancels_a_blocked_connector_before_tunnel_authority_case,
+    public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_slot =>
+        public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_slot_case,
+    public_disconnect_cancels_each_blocked_tunnel_write_stage =>
+        public_disconnect_cancels_each_blocked_tunnel_write_stage_case,
+    public_eof_cancels_blocked_http_and_websocket_egress =>
+        public_eof_cancels_blocked_http_and_websocket_egress_case,
+    absolute_egress_deadline_cancels_nonreading_http_and_websocket_peers =>
+        absolute_egress_deadline_cancels_nonreading_http_and_websocket_peers_case,
+    response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed =>
+        response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed_case,
+    guard_acquired_failure_never_refreshes_the_route =>
+        guard_acquired_failure_never_refreshes_the_route_case,
+    duplicate_host_is_rejected_before_cache_or_tunnel_authority =>
+        duplicate_host_is_rejected_before_cache_or_tunnel_authority_case,
+    zero_public_egress_deadline_is_rejected_at_startup =>
+        zero_public_egress_deadline_is_rejected_at_startup_case,
+);
