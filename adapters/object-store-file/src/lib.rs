@@ -3,13 +3,18 @@
 //! This is a development, test, and fault-injection adapter. Local files are
 //! not a production durability substitute for a remote object store.
 
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use cats_storage::blob::{validate_key, BlobError, BlobStore, Result};
+use cats_storage::blob::{
+    validate_key, validate_list_maximum, validate_list_result, BlobError, BlobListPage, BlobStore,
+    QualifiedDeleteListPage, Result,
+};
 use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
 
 pub const ADAPTER_NAME: &str = "file";
@@ -74,6 +79,98 @@ impl FileBlobStore {
                 Err(source) => return Err(Self::io_err(key, source)),
             }
         }
+    }
+
+    fn list_page(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        validate_list_maximum(prefix, maximum)?;
+        let directory_prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        if directory_prefix
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err(BlobError::InvalidKey {
+                key: prefix.to_string(),
+                message: "expected a non-empty relative slash-separated prefix".into(),
+            });
+        }
+        let anchor = if prefix.ends_with('/') {
+            self.root.join(directory_prefix)
+        } else {
+            let parent = directory_prefix
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+            self.root.join(parent)
+        };
+        // Walk the exact prefix subtree while retaining only the lexically
+        // smallest requested page. Traversal may inspect every directory
+        // entry, but memory remains O(maximum + directory depth), never O(all
+        // objects).
+        let mut output = BinaryHeap::with_capacity(maximum);
+        let mut is_truncated = false;
+        self.collect_page_entries(&anchor, prefix, maximum, &mut output, &mut is_truncated)?;
+        let output = output.into_sorted_vec();
+        validate_list_result(prefix, &output)?;
+        Ok(BlobListPage {
+            keys: output,
+            is_truncated,
+        })
+    }
+
+    fn collect_page_entries(
+        &self,
+        path: &Path,
+        prefix: &str,
+        maximum: usize,
+        output: &mut BinaryHeap<String>,
+        is_truncated: &mut bool,
+    ) -> Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(Self::io_err(prefix, source)),
+        };
+        if metadata.is_dir() {
+            let entries = match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(source) => return Err(Self::io_err(prefix, source)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(|source| Self::io_err(prefix, source))?;
+                self.collect_page_entries(&entry.path(), prefix, maximum, output, is_truncated)?;
+            }
+            return Ok(());
+        }
+        if !metadata.is_file()
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
+        {
+            return Ok(());
+        }
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|error| BlobError::Backend {
+                key: prefix.to_string(),
+                message: error.to_string(),
+            })?;
+        let key = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if key.starts_with(prefix) {
+            if output.len() < maximum {
+                output.push(key);
+            } else {
+                *is_truncated = true;
+                if output.peek().is_some_and(|largest| &key < largest) {
+                    output.pop();
+                    output.push(key);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -222,6 +319,34 @@ impl BlobStore for FileBlobStore {
         output.sort();
         Ok(output)
     }
+
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        self.list_page(prefix, maximum)
+    }
+
+    fn list_for_delete_bounded_until(
+        &self,
+        prefix: &str,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<QualifiedDeleteListPage> {
+        if Instant::now() >= deadline {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "destructive LIST deadline elapsed".into(),
+            });
+        }
+        let page = self.list_page(prefix, maximum)?;
+        if Instant::now() > deadline {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "destructive LIST deadline elapsed".into(),
+            });
+        }
+        Ok(QualifiedDeleteListPage::from_strongly_consistent_adapter(
+            page,
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -277,6 +402,27 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let stored = store.get("volumes/v1/data/race").unwrap();
         assert!(stored == b"first" || stored == b"second");
+    }
+
+    #[test]
+    fn bounded_list_stops_at_one_page_and_preserves_lexical_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::open(directory.path()).unwrap();
+        for key in [
+            "volumes/v1/maps/c",
+            "volumes/v1/data/b",
+            "volumes/v1/data/a",
+            "volumes/v2/data/keep",
+        ] {
+            store.put_immutable(key, b"x").unwrap();
+        }
+        assert_eq!(
+            store.list_bounded("volumes/v1/", 2).unwrap(),
+            BlobListPage {
+                keys: vec!["volumes/v1/data/a".into(), "volumes/v1/data/b".into()],
+                is_truncated: true,
+            }
+        );
     }
 
     #[test]

@@ -864,6 +864,38 @@ pub(super) fn load_any_disk_snapshot_for_update(
     Ok(first)
 }
 
+/// Repeatable-read candidate qualification before any external delete. The
+/// completion transaction takes the `FOR UPDATE` version again to close a
+/// snapshot-create race before metadata removal.
+pub(super) fn load_any_disk_snapshot_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+    volume_id: &Id,
+    size_bytes: u64,
+) -> AuthorityTxResult<Option<DiskSnapshotRecord>> {
+    let sql = format!(
+        "SELECT {DISK_SNAPSHOT_COLUMNS}
+           FROM disk_snapshot_records
+          WHERE disk_id=$1 OR volume_id=$2
+             OR record->>'disk_id'=$1 OR record->>'volume_id'=$2
+          ORDER BY snapshot_id
+          LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str(), &volume_id.as_str()])?;
+    let mut first = None;
+    for row in rows {
+        let record = decode_disk_snapshot(&row)?;
+        if record.disk_id != *disk_id
+            || record.volume_id != *volume_id
+            || record.size_bytes != size_bytes
+        {
+            return Err(corrupt(()));
+        }
+        first.get_or_insert(record);
+    }
+    Ok(first)
+}
+
 #[cfg(test)]
 pub(super) fn insert_disk_snapshot(
     transaction: &mut Transaction<'_>,

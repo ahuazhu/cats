@@ -63,14 +63,27 @@ where
 
     checkpoint(transaction)?;
     let disk_hint = transaction.query_opt(
-        "SELECT volume_id FROM disk_records WHERE disk_id=$1",
+        "SELECT volume_id, record->>'volume_id' AS json_volume_id,
+                record->>'disk_id' AS json_disk_id
+           FROM disk_records
+          WHERE disk_id=$1 OR record->>'disk_id'=$1
+          ORDER BY disk_id COLLATE \"C\" LIMIT 2",
         &[&context.disk_id.as_str()],
     )?;
     let Some(disk_hint) = disk_hint else {
         return Err(AuthorityError::NotFound.into());
     };
-    let hinted_volume = Id::new(disk_hint.try_get::<_, String>("volume_id")?)
-        .ok_or(AuthorityError::BackendUnknown)?;
+    // A scalar/JSON projection split is corruption, never an identity hint.
+    // The full row is decoded after Volume -> Disk locks are acquired.
+    let scalar_volume = disk_hint.try_get::<_, String>("volume_id")?;
+    let json_volume = disk_hint.try_get::<_, Option<String>>("json_volume_id")?;
+    let json_disk = disk_hint.try_get::<_, Option<String>>("json_disk_id")?;
+    if json_volume.as_deref() != Some(&scalar_volume)
+        || json_disk.as_deref() != Some(context.disk_id.as_str())
+    {
+        return Err(AuthorityError::BackendUnknown.into());
+    }
+    let hinted_volume = Id::new(scalar_volume).ok_or(AuthorityError::BackendUnknown)?;
 
     // The global lock DAG places Volume before Control Disk. The unlocked
     // scalar lookup above is only an identity hint; both complete rows are

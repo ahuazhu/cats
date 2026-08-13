@@ -15,7 +15,10 @@ pub use adapter::{
     open_blob_store, open_metadata_store, AdapterConfig, AdapterError, AdapterSelection,
     BlobStoreFactory, MetadataStoreFactory,
 };
-pub use blob::{validate_key, BlobError, BlobListPage, BlobStore, BLOB_LIST_PAGE_MAX_KEYS};
+pub use blob::{
+    validate_key, BlobError, BlobListPage, BlobStore, QualifiedDeleteListPage,
+    BLOB_LIST_PAGE_MAX_KEYS,
+};
 pub use delete::{delete_volume_objects_page, volume_object_prefix, DeletePrefixPage};
 pub use image_manifest::{
     decode_image_manifest, encode_image_manifest, image_manifest_key, read_image_manifest,

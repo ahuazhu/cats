@@ -5,6 +5,7 @@
 //! exact volume prefix and authoritative completion is an empty re-list.
 
 use cats_api::runtime_reconciliation::Id;
+use std::time::Instant;
 
 use crate::blob::{validate_list_result, BlobError, BlobStore, Result};
 
@@ -30,19 +31,20 @@ pub fn delete_volume_objects_page(
     blob: &dyn BlobStore,
     volume_id: &Id,
     maximum: usize,
+    deadline: Instant,
 ) -> Result<DeletePrefixPage> {
     let prefix = volume_object_prefix(volume_id);
-    let page = checked_page(blob, &prefix, maximum)?;
-    if page.keys.is_empty() {
+    let page = checked_page(blob, &prefix, maximum, deadline)?;
+    if page.keys.is_empty() && !page.is_truncated {
         return Ok(DeletePrefixPage::Empty);
     }
 
     let mut deleted = 0;
     for key in page.keys {
-        match blob.delete(&key) {
+        match blob.delete_until(&key, deadline) {
             Ok(()) => deleted += 1,
             Err(delete_error) => {
-                let discovery = checked_page(blob, &prefix, maximum)?;
+                let discovery = checked_page(blob, &prefix, maximum, deadline)?;
                 if discovery.keys.iter().any(|candidate| candidate == &key) {
                     return Err(delete_error);
                 }
@@ -51,10 +53,10 @@ pub fn delete_volume_objects_page(
         }
     }
 
-    let discovery = checked_page(blob, &prefix, maximum)?;
+    let discovery = checked_page(blob, &prefix, maximum, deadline)?;
     Ok(DeletePrefixPage::Progress {
         deleted,
-        now_empty: discovery.keys.is_empty(),
+        now_empty: discovery.keys.is_empty() && !discovery.is_truncated,
     })
 }
 
@@ -62,8 +64,11 @@ fn checked_page(
     blob: &dyn BlobStore,
     prefix: &str,
     maximum: usize,
+    deadline: Instant,
 ) -> Result<crate::blob::BlobListPage> {
-    let page = blob.list_bounded(prefix, maximum)?;
+    let page = blob
+        .list_for_delete_bounded_until(prefix, maximum, deadline)?
+        .into_page();
     if page.keys.len() > maximum {
         return Err(BlobError::Backend {
             key: prefix.to_string(),
@@ -86,13 +91,74 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    use crate::{BlobListPage, BlobStore};
+    use crate::{BlobListPage, BlobStore, QualifiedDeleteListPage};
 
     use super::*;
 
     struct LostDeleteResponseBlob {
         objects: Mutex<BTreeMap<String, Vec<u8>>>,
         lose_once: AtomicBool,
+    }
+
+    struct StaleEmptyBlob {
+        object: Mutex<Option<String>>,
+    }
+
+    struct EmptyTruncatedBlob;
+
+    impl BlobStore for StaleEmptyBlob {
+        fn put_immutable(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn get(&self, _key: &str) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn exists(&self, _key: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn delete(&self, _key: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn list_bounded(&self, _prefix: &str, _maximum: usize) -> Result<BlobListPage> {
+            Ok(BlobListPage {
+                keys: Vec::new(),
+                is_truncated: false,
+            })
+        }
+    }
+
+    impl BlobStore for EmptyTruncatedBlob {
+        fn put_immutable(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn get(&self, _key: &str) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn exists(&self, _key: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn delete(&self, _key: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        fn list_for_delete_bounded_until(
+            &self,
+            _prefix: &str,
+            _maximum: usize,
+            _deadline: Instant,
+        ) -> Result<QualifiedDeleteListPage> {
+            Ok(QualifiedDeleteListPage::from_strongly_consistent_adapter(
+                BlobListPage {
+                    keys: Vec::new(),
+                    is_truncated: true,
+                },
+            ))
+        }
     }
 
     impl LostDeleteResponseBlob {
@@ -141,6 +207,16 @@ mod tests {
             Ok(())
         }
 
+        fn delete_until(&self, key: &str, deadline: Instant) -> Result<()> {
+            if Instant::now() >= deadline {
+                return Err(BlobError::Backend {
+                    key: key.to_string(),
+                    message: "test delete deadline elapsed".into(),
+                });
+            }
+            self.delete(key)
+        }
+
         fn list(&self, prefix: &str) -> Result<Vec<String>> {
             Ok(self
                 .objects
@@ -158,6 +234,22 @@ mod tests {
             keys.truncate(maximum);
             Ok(BlobListPage { keys, is_truncated })
         }
+
+        fn list_for_delete_bounded_until(
+            &self,
+            prefix: &str,
+            maximum: usize,
+            deadline: Instant,
+        ) -> Result<QualifiedDeleteListPage> {
+            if Instant::now() >= deadline {
+                return Err(BlobError::Backend {
+                    key: prefix.to_string(),
+                    message: "test LIST deadline elapsed".into(),
+                });
+            }
+            self.list_bounded(prefix, maximum)
+                .map(QualifiedDeleteListPage::from_strongly_consistent_adapter)
+        }
     }
 
     #[test]
@@ -171,14 +263,26 @@ mod tests {
         let volume = Id::new("vol_a").unwrap();
 
         assert_eq!(
-            delete_volume_objects_page(&blob, &volume, 2).unwrap(),
+            delete_volume_objects_page(
+                &blob,
+                &volume,
+                2,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
             DeletePrefixPage::Progress {
                 deleted: 2,
                 now_empty: true,
             }
         );
         assert_eq!(
-            delete_volume_objects_page(&blob, &volume, 2).unwrap(),
+            delete_volume_objects_page(
+                &blob,
+                &volume,
+                2,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
             DeletePrefixPage::Empty
         );
         assert!(blob.exists("volumes/vol_ab/data/keep").unwrap());
@@ -203,18 +307,57 @@ mod tests {
         let volume = Id::new("vol_a").unwrap();
 
         assert_eq!(
-            delete_volume_objects_page(&blob, &volume, 2).unwrap(),
+            delete_volume_objects_page(
+                &blob,
+                &volume,
+                2,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
             DeletePrefixPage::Progress {
                 deleted: 2,
                 now_empty: false,
             }
         );
         assert_eq!(
-            delete_volume_objects_page(&blob, &volume, 2).unwrap(),
+            delete_volume_objects_page(
+                &blob,
+                &volume,
+                2,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
             DeletePrefixPage::Progress {
                 deleted: 1,
                 now_empty: true,
             }
         );
+    }
+
+    #[test]
+    fn unqualified_stale_empty_list_cannot_stamp_delete_completion() {
+        let blob = StaleEmptyBlob {
+            object: Mutex::new(Some("volumes/vol_a/data/late".into())),
+        };
+        let error = delete_volume_objects_page(
+            &blob,
+            &Id::new("vol_a").unwrap(),
+            2,
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BlobError::Backend { .. }));
+        assert!(blob.object.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn empty_truncated_page_is_never_delete_completion() {
+        assert!(delete_volume_objects_page(
+            &EmptyTruncatedBlob,
+            &Id::new("vol_a").unwrap(),
+            2,
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .is_err());
     }
 }

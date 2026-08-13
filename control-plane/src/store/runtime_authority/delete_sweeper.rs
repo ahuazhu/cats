@@ -16,7 +16,7 @@ use cats_storage::{delete_volume_objects_page, BlobStore, DeletePrefixPage};
 use super::product::{DiskAdminState, DiskRecord};
 use super::product_rows::{
     delete_disk, load_any_disk_by_id_for_update, load_any_disk_snapshot_for_update,
-    load_disk_by_volume_unlocked,
+    load_any_disk_snapshot_unlocked, load_disk_by_volume_unlocked,
 };
 use super::rows::{
     database_now, delete_volume, insert_delete_completion, load_authorization_for_update,
@@ -140,7 +140,7 @@ impl DeleteSweeper {
             let volume_id = candidate.volume.volume_id.clone();
             let maximum = budget.max_objects_per_candidate;
             let effect = tokio::task::spawn_blocking(move || {
-                delete_volume_objects_page(blob.as_ref(), &volume_id, maximum)
+                delete_volume_objects_page(blob.as_ref(), &volume_id, maximum, deadline)
             })
             .await
             .context("volume object delete worker panicked")?
@@ -237,6 +237,20 @@ impl Store {
                     .ok_or(cats_storage::authority::AuthorityError::BackendUnknown)?;
                 let disk = load_disk_by_volume_unlocked(transaction, &volume_id)?
                     .ok_or(cats_storage::authority::AuthorityError::BackendUnknown)?;
+                // A live snapshot is an independent GC root. This check must
+                // happen before returning a candidate because object deletion
+                // begins outside PostgreSQL; the completion-time lock below
+                // remains the second half of the race closure.
+                if load_any_disk_snapshot_unlocked(
+                    transaction,
+                    &disk.disk_id,
+                    &volume.volume_id,
+                    disk.size_bytes,
+                )?
+                .is_some()
+                {
+                    continue;
+                }
                 let (authorization, eligibility) = candidate_origin(transaction, &disk, &volume)?;
                 candidates.push(DeleteSweepCandidate {
                     disk,
@@ -343,9 +357,6 @@ fn candidate_origin(
                 && result.resulting_epoch == volume.lease_epoch
                 && result.resulting_head == volume.head =>
         {
-            if !matches!(disk.role, super::product::DiskRole::Persistent { .. }) {
-                return Err(cats_storage::authority::AuthorityError::BackendUnknown.into());
-            }
             Ok((None, DeleteCandidateEligibility::Eligible))
         }
         Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => {
@@ -443,7 +454,7 @@ mod tests {
         HostFenceEventState, HostIsolationState, NormalAcquireRequest, RemoteHead,
         VolumeAuthorization, VolumeDurability, VolumeOwnerBinding,
     };
-    use cats_storage::{BlobError, BlobListPage};
+    use cats_storage::{BlobError, BlobListPage, QualifiedDeleteListPage};
 
     use super::*;
     use crate::store::runtime_authority::product::{
@@ -766,6 +777,22 @@ mod tests {
             keys.truncate(maximum);
             Ok(BlobListPage { keys, is_truncated })
         }
+
+        fn list_for_delete_bounded_until(
+            &self,
+            prefix: &str,
+            maximum: usize,
+            deadline: Instant,
+        ) -> cats_storage::blob::Result<QualifiedDeleteListPage> {
+            if Instant::now() >= deadline {
+                return Err(BlobError::Backend {
+                    key: prefix.to_string(),
+                    message: "test destructive LIST deadline elapsed".into(),
+                });
+            }
+            self.list_bounded(prefix, maximum)
+                .map(QualifiedDeleteListPage::from_strongly_consistent_adapter)
+        }
     }
 
     fn stored_receipt_for(store: &Store, delete_id: &Id) -> DeleteCompletionReceipt {
@@ -914,6 +941,107 @@ mod tests {
                 assert!(
                     load_any_disk_by_id_for_update(transaction, &id("disk_disposable_test"))?
                         .is_none()
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_snapshot_prevents_any_object_delete_and_keeps_metadata() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap(),
+        );
+        seed_normal_delete(&store);
+        store
+            .authority_transaction(|transaction| {
+                insert_disk_snapshot(
+                    transaction,
+                    &DiskSnapshotRecord {
+                        snapshot_id: id("snapshot_pre_delete_test"),
+                        disk_id: id("disk_delete_test"),
+                        volume_id: id("vol_delete_test"),
+                        size_bytes: 4 * 1024 * 1024,
+                        head: head(3),
+                        created_at: UnixMillis::new(2).unwrap(),
+                    },
+                )
+            })
+            .unwrap();
+        let blob = Arc::new(MemoryBlob::with_keys(&[
+            "volumes/vol_delete_test/data/snapshot-live",
+        ]));
+        let sweeper = DeleteSweeper::new(store.clone(), blob.clone());
+
+        let pass = sweeper
+            .run_once(
+                DeleteSweepBudget::new(1, 1).unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pass.candidates_examined, 0);
+        assert!(blob
+            .exists("volumes/vol_delete_test/data/snapshot-live")
+            .unwrap());
+        store
+            .authority_transaction(|transaction| {
+                assert!(load_volume_for_update(transaction, &id("vol_delete_test"))?.is_some());
+                assert!(
+                    load_any_disk_by_id_for_update(transaction, &id("disk_delete_test"))?.is_some()
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn normal_root_delete_is_a_closed_eligible_candidate() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap(),
+        );
+        seed_normal_delete(&store);
+        store
+            .authority_transaction(|transaction| {
+                insert_cat(
+                    transaction,
+                    &CatRecord {
+                        cat_id: id("cat_normal_root_test"),
+                        workspace_id: id("workspace-delete-test"),
+                        name: id("cat_normal_root_test"),
+                        created_at: UnixMillis::new(1).unwrap(),
+                    },
+                )?;
+                let mut disk =
+                    load_any_disk_by_id_for_update(transaction, &id("disk_delete_test"))?.unwrap();
+                disk.name = disk.disk_id.clone();
+                disk.role = DiskRole::Root {
+                    cat_id: id("cat_normal_root_test"),
+                };
+                update_disk(transaction, &disk)
+            })
+            .unwrap();
+        let sweeper = DeleteSweeper::new(store.clone(), Arc::new(MemoryBlob::default()));
+
+        let pass = sweeper
+            .run_once(
+                DeleteSweepBudget::new(1, 1).unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pass.completions_committed, 1);
+        assert!(matches!(
+            stored_receipt(&store),
+            DeleteCompletionReceipt::Normal { .. }
+        ));
+        store
+            .authority_transaction(|transaction| {
+                assert!(load_volume_for_update(transaction, &id("vol_delete_test"))?.is_none());
+                assert!(
+                    load_any_disk_by_id_for_update(transaction, &id("disk_delete_test"))?.is_none()
                 );
                 Ok(())
             })
@@ -1103,6 +1231,16 @@ mod tests {
             maximum: usize,
         ) -> cats_storage::blob::Result<BlobListPage> {
             self.inner.list_bounded(prefix, maximum)
+        }
+
+        fn list_for_delete_bounded_until(
+            &self,
+            prefix: &str,
+            maximum: usize,
+            deadline: Instant,
+        ) -> cats_storage::blob::Result<QualifiedDeleteListPage> {
+            self.inner
+                .list_for_delete_bounded_until(prefix, maximum, deadline)
         }
     }
 
