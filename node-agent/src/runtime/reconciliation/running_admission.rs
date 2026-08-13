@@ -1115,7 +1115,10 @@ fn exact_require_idle_source_snapshot(
 }
 
 impl RuntimePreScanAdmission for RunningAdmissionPreScan {
-    fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+    fn reconcile(
+        &self,
+        context: RuntimePreScanAdmissionContext,
+    ) -> anyhow::Result<crate::runtime_spine::RuntimePreScanAdmissionOutcome> {
         let result = (|| {
             context.check_active()?;
             let desired_specs = &context.coordinates().desired.desired_specs;
@@ -1125,7 +1128,20 @@ impl RuntimePreScanAdmission for RunningAdmissionPreScan {
                     .find(|desired| desired.cat_id == cat_id);
                 self.reconcile_session(&context, desired, &session)?;
             }
-            Ok(())
+            let retained =
+                self.registry
+                    .ready_sessions()?
+                    .into_iter()
+                    .filter_map(|(cat_id, session)| {
+                        (session.cell().snapshot().lifecycle_admission()
+                            == LifecycleAdmission::Open)
+                            .then_some(cat_id)
+                    });
+            Ok(
+                crate::runtime_spine::RuntimePreScanAdmissionOutcome::retained_running_cats(
+                    retained,
+                ),
+            )
         })();
         if result.is_err() {
             self.registry.fail_close_all();

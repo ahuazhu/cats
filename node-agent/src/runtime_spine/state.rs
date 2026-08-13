@@ -210,9 +210,14 @@ impl RuntimeSpineJournal {
         self.desired_snapshot.as_ref()
     }
 
-    #[cfg(test)]
     pub(super) fn full_observation(&self) -> Option<(&NodeObservation, &ObservationAcceptance)> {
         self.full_observation
+            .as_ref()
+            .map(|record| (&record.observation, &record.acceptance))
+    }
+
+    pub(super) fn last_observation(&self) -> Option<(&NodeObservation, &ObservationAcceptance)> {
+        self.last_observation
             .as_ref()
             .map(|record| (&record.observation, &record.acceptance))
     }
@@ -884,11 +889,6 @@ impl RuntimeSpineJournal {
                     .ok_or(RuntimeSpineJournalError::Transition(
                         "partial observation has no accepted full inventory",
                     ))?;
-            if !self.desired_is_consumed(snapshot) {
-                return Err(RuntimeSpineJournalError::Transition(
-                    "partial observation cannot consume a new Desired snapshot",
-                ));
-            }
             if candidate.inventory_epoch != full.observation.inventory_epoch {
                 return Err(RuntimeSpineJournalError::Transition(
                     "partial observation uses the wrong inventory epoch",
@@ -904,6 +904,22 @@ impl RuntimeSpineJournal {
                 return Err(RuntimeSpineJournalError::Transition(
                     "partial observation introduces a Cat absent from the full inventory",
                 ));
+            }
+            for runtime in &candidate.runtimes {
+                let Some(desired) = snapshot
+                    .desired_specs
+                    .iter()
+                    .find(|desired| desired.cat_id == runtime.cat_id)
+                else {
+                    return Err(RuntimeSpineJournalError::Transition(
+                        "partial observation names a Cat absent from the current Desired snapshot",
+                    ));
+                };
+                if runtime.applied_desired.as_ref() != Some(&applied_projection(desired)) {
+                    return Err(RuntimeSpineJournalError::Transition(
+                        "partial observation has the wrong applied Desired binding",
+                    ));
+                }
             }
         }
         Ok(())
@@ -954,12 +970,7 @@ fn validate_assigned_coverage(
                 "full observation omits an assigned Cat",
             ));
         };
-        let expected = AppliedDesiredEvidence {
-            desired_revision: desired.desired_revision,
-            spec_digest: desired.spec_digest.clone(),
-            placement: desired.placement.clone(),
-            target: desired.target,
-        };
+        let expected = applied_projection(desired);
         if runtime.applied_desired.as_ref() != Some(&expected) {
             return Err(RuntimeSpineJournalError::Transition(
                 "full observation has the wrong applied Desired binding",
@@ -967,6 +978,17 @@ fn validate_assigned_coverage(
         }
     }
     Ok(())
+}
+
+fn applied_projection(
+    desired: &cats_api::runtime_reconciliation::DesiredRuntimeSpec,
+) -> AppliedDesiredEvidence {
+    AppliedDesiredEvidence {
+        desired_revision: desired.desired_revision,
+        spec_digest: desired.spec_digest.clone(),
+        placement: desired.placement.clone(),
+        target: desired.target,
+    }
 }
 
 fn encode_observation_record(
@@ -1607,6 +1629,78 @@ mod tests {
         assert_eq!(next_scan.heartbeat_sequence.get(), 2);
         assert_eq!(next_scan.inventory_epoch.get(), 2);
         assert_eq!(next_scan.desired, next_desired);
+    }
+
+    #[test]
+    fn accepted_partial_advances_heartbeat_without_replacing_full_attestation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_directory(&root);
+        let registered = session();
+        let mut journal = RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+        journal.desired_work().unwrap();
+        let first_desired = snapshot();
+        journal
+            .accept_desired(first_desired.clone(), SNAPSHOT)
+            .unwrap();
+        let full = full_observation(&registered, &first_desired);
+        journal.prepare_observation(full.clone()).unwrap();
+        let full_acceptance = acceptance(&registered, &full);
+        journal
+            .accept_observation(
+                full_acceptance.clone(),
+                &encode_observation_acceptance(&full_acceptance).unwrap(),
+            )
+            .unwrap();
+
+        let RuntimeSpineDesiredWork::Request(request) = journal.desired_work().unwrap() else {
+            panic!("accepted full inventory must advance Desired delivery")
+        };
+        let mut next_desired = first_desired;
+        next_desired.request_sequence = request.value().request_sequence;
+        next_desired.read_position = Sequence::new(13).unwrap();
+        next_desired.issued_at_unix_ms = UnixMillis::new(1_720_000_010_000).unwrap();
+        next_desired.expires_at_unix_ms = UnixMillis::new(1_720_000_040_000).unwrap();
+        let next_bytes = encode_desired_read_snapshot(&next_desired).unwrap();
+        journal
+            .accept_desired(next_desired.clone(), &next_bytes)
+            .unwrap();
+
+        let mut partial = full.clone();
+        partial.observation_id = RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        partial.heartbeat_sequence = Sequence::new(2).unwrap();
+        partial.observed_at_unix_ms = UnixMillis::new(1_720_000_011_000).unwrap();
+        partial.complete_inventory = false;
+        partial.inventory_digest = None;
+        partial.inventory_read_position = None;
+        partial.runtimes.clear();
+        journal.prepare_observation(partial.clone()).unwrap();
+        let partial_acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: session_binding(&registered),
+            observation_id: partial.observation_id.clone(),
+            heartbeat_sequence: partial.heartbeat_sequence,
+            accepted_at_unix_ms: UnixMillis::new(1_720_000_012_000).unwrap(),
+            lease_deadline_unix_ms: UnixMillis::new(1_720_000_072_000).unwrap(),
+            inventory: ObservationInventoryAcceptance::Partial {
+                inventory_epoch: full.inventory_epoch,
+            },
+        };
+        journal
+            .accept_observation(
+                partial_acceptance.clone(),
+                &encode_observation_acceptance(&partial_acceptance).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(journal.full_observation(), Some((&full, &full_acceptance)));
+        assert_eq!(
+            journal.last_observation(),
+            Some((&partial, &partial_acceptance))
+        );
+        let scan = journal.full_scan().unwrap();
+        assert_eq!(scan.heartbeat_sequence, Sequence::new(3).unwrap());
+        assert_eq!(scan.inventory_epoch, Epoch::new(2).unwrap());
+        assert_eq!(scan.desired, next_desired);
     }
 
     #[test]
