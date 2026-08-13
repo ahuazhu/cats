@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context as _};
+use anyhow::Context as _;
 use cats_api::agent_registration::{
     decode_agent_registration_error, AgentRegistrationErrorDetail, Ed25519RequestSigner,
     HttpRequestRejection, JSON_CONTENT_TYPE, NODE_AUTHENTICATE_CHALLENGE,
@@ -19,11 +19,10 @@ use cats_api::agent_registration::{
     REGISTRATION_SUCCESS_MAX_WIRE_BYTES,
 };
 use cats_api::runtime_reconciliation::{
-    decode_agent_registration_attempt, decode_agent_session, decode_node_identity,
-    encode_agent_registration_attempt, encode_agent_session, encode_node_identity,
-    guest_config_digest, AgentRegistrationAttempt, AgentSession, ContractVersion,
-    CredentialBinding, Epoch, GuestRuntimeProfileReceipt, NodeBootId, NodeIdentity,
-    NodeIdentityState, RandomId128,
+    decode_agent_registration_attempt, decode_agent_session, encode_agent_registration_attempt,
+    encode_agent_session, guest_config_digest, AgentRegistrationAttempt, AgentSession,
+    ContractVersion, CredentialBinding, Epoch, GuestRuntimeProfileReceipt, NodeBootId,
+    NodeIdentity, NodeIdentityState, RandomId128,
 };
 
 use crate::state_directory::StateDirectory;
@@ -696,36 +695,12 @@ fn validate_identity_material(
     key_bytes: &[u8],
     credential_bytes: &[u8],
 ) -> anyhow::Result<(NodeIdentity, Ed25519RequestSigner)> {
-    let identity = decode_node_identity(identity_bytes)
-        .map_err(|_| anyhow::anyhow!("NodeIdentity artifact is invalid"))?;
-    anyhow::ensure!(
-        encode_node_identity(&identity).is_ok_and(|canonical| canonical == identity_bytes),
-        "NodeIdentity artifact is not canonical"
-    );
-    anyhow::ensure!(
-        identity.state == NodeIdentityState::Provisioned,
-        "NodeIdentity is not provisioned"
-    );
-    cats_api::agent_registration::validate_state_path_component(&identity.state_path_id)
-        .context("NodeIdentity state_path_id is not a safe path component")?;
-    let expected_credential = format!("{}\n", identity.credential_id);
-    anyhow::ensure!(
-        credential_bytes == expected_credential.as_bytes(),
-        "credential ID file does not exactly match NodeIdentity"
-    );
-    let signer = Ed25519RequestSigner::from_pkcs8_pem(identity.credential_id.clone(), key_bytes)
-        .context("parse Node registration private key")?;
-    let CredentialBinding::PublicKey {
-        public_key_spki_sha256,
-    } = &identity.credential_binding
-    else {
-        bail!("NodeIdentity credential binding is not an Ed25519 public key")
-    };
-    anyhow::ensure!(
-        public_key_spki_sha256 == &signer.public_key_spki_sha256(),
-        "Node registration private key does not match NodeIdentity binding"
-    );
-    Ok((identity, signer))
+    cats_api::agent_registration::validate_node_identity_material(
+        identity_bytes,
+        key_bytes,
+        credential_bytes,
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn open_installed_identity_directory() -> anyhow::Result<File> {
@@ -1207,6 +1182,7 @@ fn unlink_at(directory: &File, name: &OsStr) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use cats_api::runtime_reconciliation::encode_node_identity;
     use cats_api::runtime_reconciliation::{AsciiText, Id, Sha256Digest};
     use std::sync::{Arc, Barrier};
 

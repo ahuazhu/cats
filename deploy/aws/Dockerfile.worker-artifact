@@ -13,20 +13,24 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json \
+    -p cats-cli \
     -p cats-node-agent-daemon \
     -p cats-blockd-daemon \
     -p cats-guest-agent
 
 COPY . .
 RUN cargo build --locked --release \
+      -p cats-cli \
       -p cats-node-agent-daemon \
       -p cats-blockd-daemon \
       -p cats-guest-agent \
     && strip \
+      target/release/cats \
       target/release/cats-noded \
       target/release/cats-vmm-launcher \
       target/release/cats-blockd \
       target/release/cats-guest-agent \
+    && install -D -m 0755 target/release/cats /out/cats \
     && install -D -m 0755 target/release/cats-noded /out/cats-noded \
     && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
@@ -42,6 +46,7 @@ COPY deploy/metal/guest-systemd /out/guest-systemd
 
 FROM scratch AS artifact
 
+COPY --from=builder /out/cats /cats
 COPY --from=builder /out/cats-noded /cats-noded
 COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
 COPY --from=builder /out/cats-blockd /cats-blockd

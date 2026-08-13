@@ -210,6 +210,8 @@ locals {
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
+    install -D -m 0755 "$stage_path/cats" "${var.install_root}/bin/cats"
+    cats_worker_deployment_crash_probe after-install-cats-cli
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     cats_worker_deployment_crash_probe after-install-cats-noded
     install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"

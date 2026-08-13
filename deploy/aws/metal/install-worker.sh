@@ -64,7 +64,7 @@ if ! command -v cargo >/dev/null; then
 fi
 
 (cd "$CATS_REPO" && cargo build --locked --release \
-  -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
+  -p cats-cli -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
 
 release_installer="$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
@@ -180,6 +180,8 @@ cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
 install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
   /etc/cats/route-grant-public.pem
 cats_worker_deployment_crash_probe after-install-route-key
+install -m 0755 "$CATS_REPO/target/release/cats" "$CATS_PREFIX/bin/cats"
+cats_worker_deployment_crash_probe after-install-cats-cli
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 cats_worker_deployment_crash_probe after-install-cats-noded
 install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"

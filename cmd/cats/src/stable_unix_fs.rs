@@ -232,7 +232,7 @@ pub(crate) fn open_file_at(
     }
 }
 
-fn mkdir_at(directory: &File, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
+pub(crate) fn mkdir_at(directory: &File, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
     // SAFETY: `name` is a live NUL-terminated component resolved against the
     // held directory descriptor.
     let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), mode) };
@@ -240,6 +240,70 @@ fn mkdir_at(directory: &File, name: &CStr, mode: libc::mode_t) -> io::Result<()>
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+pub(crate) fn unlink_at(directory: &File, name: &CStr, flags: i32) -> io::Result<()> {
+    // SAFETY: `name` is a live NUL-terminated component resolved against the
+    // held directory descriptor; no Rust-owned memory is exposed.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub(crate) fn rename_noreplace_at(
+    directory: &File,
+    source: &CStr,
+    destination: &CStr,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: both names are live NUL-terminated path components beneath
+        // the retained directory descriptor. RENAME_NOREPLACE is atomic.
+        let result = unsafe {
+            libc::renameat2(
+                directory.as_raw_fd(),
+                source.as_ptr(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: same invariant as the Linux branch; RENAME_EXCL gives the
+        // required no-replace atomic rename on Apple platforms.
+        let result = unsafe {
+            libc::renameatx_np(
+                directory.as_raw_fd(),
+                source.as_ptr(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (directory, source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unsupported on this Unix platform",
+        ))
     }
 }
 
@@ -280,4 +344,10 @@ pub(crate) fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no pointers and only reads the calling process's
     // effective credential; it cannot violate Rust memory invariants.
     unsafe { libc::geteuid() }
+}
+
+pub(crate) fn effective_gid() -> u32 {
+    // SAFETY: `getegid` has the same no-pointer credential-read contract as
+    // `geteuid` above.
+    unsafe { libc::getegid() }
 }

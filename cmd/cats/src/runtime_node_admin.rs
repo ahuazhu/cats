@@ -1174,13 +1174,14 @@ fn report_terminal(cli: &Cli, terminal: TerminalOutcome) -> Result<()> {
     match terminal {
         TerminalOutcome::Applied(result) => {
             if cli.json {
-                println!(
-                    "{}",
-                    String::from_utf8(
-                        encode_runtime_node_authority_apply_result(&result)
-                            .map_err(|error| anyhow!("encode Runtime Node result: {error:?}"))?
-                    )?
-                );
+                let canonical = encode_runtime_node_authority_apply_result(&result)
+                    .map_err(|error| anyhow!("encode Runtime Node result: {error:?}"))?;
+                io::stdout()
+                    .write_all(&canonical)
+                    .context("write canonical Runtime Node result to stdout")?;
+                io::stdout()
+                    .flush()
+                    .context("flush canonical Runtime Node result")?;
             } else {
                 println!(
                     "apply {} {:?}: node={} state={:?} policy-revision={}",

@@ -28,6 +28,7 @@ fs2 = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+ring = { workspace = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { workspace = true }

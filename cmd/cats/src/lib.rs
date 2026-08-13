@@ -26,6 +26,14 @@ mod runtime_node_admin;
 #[cfg(all(test, unix))]
 #[path = "runtime_node_admin_unsupported.rs"]
 mod runtime_node_admin_unsupported_compile_shape;
+#[cfg(unix)]
+mod runtime_provisioner;
+#[cfg(not(unix))]
+#[path = "runtime_provisioner_unsupported.rs"]
+mod runtime_provisioner;
+#[cfg(all(test, unix))]
+#[path = "runtime_provisioner_unsupported.rs"]
+mod runtime_provisioner_unsupported_compile_shape;
 mod shell;
 #[cfg(unix)]
 mod stable_unix_fs;
@@ -372,6 +380,71 @@ pub enum AdminCommand {
         provisioner_private_key_file: Option<std::path::PathBuf>,
         #[command(subcommand)]
         cmd: RuntimeNodeCommand,
+    },
+    /// Prepare and verify deployment-provisioner authority artifacts offline.
+    RuntimeProvisioner {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerCommand {
+    /// Generate or offline-verify the central A23 trust bundle.
+    Trust {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerTrustCommand,
+    },
+    /// Prepare, export or activate the fixed Host-local Node identity set.
+    NodeIdentity {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerNodeIdentityCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerTrustCommand {
+    /// Idempotently generate a revision-1/null-previous bundle and PKCS#8 v2 key.
+    Generate {
+        #[arg(long)]
+        deployment_id: String,
+        #[arg(long)]
+        credential_id: String,
+        #[arg(long)]
+        private_key_out: std::path::PathBuf,
+        #[arg(long)]
+        trust_bundle_out: std::path::PathBuf,
+    },
+    /// Verify canonical bytes, strict PKCS#8 v2 and the exact SPKI binding offline.
+    Verify {
+        #[arg(long)]
+        credential_id: String,
+        #[arg(long)]
+        private_key: std::path::PathBuf,
+        #[arg(long)]
+        trust_bundle: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerNodeIdentityCommand {
+    /// Create the durable initial recovery set without contacting Control.
+    Prepare {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        immutable_host_id: String,
+        #[arg(long)]
+        state_path_id: String,
+        #[arg(long)]
+        credential_id: String,
+    },
+    /// Write the canonical public NodeIdentity recovery artifact to stdout.
+    Export,
+    /// Activate only after a canonical successful official-CLI apply result.
+    Activate {
+        #[arg(long)]
+        apply_result: std::path::PathBuf,
     },
 }
 
@@ -994,7 +1067,11 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
         | Command::Token { .. }
         | Command::Create { .. }
         | Command::Admin {
-            cmd: AdminCommand::Login | AdminCommand::Logout | AdminCommand::RuntimeNode { .. },
+            cmd:
+                AdminCommand::Login
+                | AdminCommand::Logout
+                | AdminCommand::RuntimeNode { .. }
+                | AdminCommand::RuntimeProvisioner { .. },
         } => None,
     }
 }
@@ -1145,6 +1222,9 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             return runtime_node_admin::run(&cli, &authority, cmd);
         }
+        Command::Admin {
+            cmd: AdminCommand::RuntimeProvisioner { cmd },
+        } => return runtime_provisioner::run(&cli, cmd),
         _ => {}
     }
     if let Some(surface) = runtime_cutover_unsupported(&cli.command) {
@@ -1808,6 +1888,9 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
         }
         AdminCommand::RuntimeNode { .. } => {
             unreachable!("Runtime Node authority commands bypass workspace API construction")
+        }
+        AdminCommand::RuntimeProvisioner { .. } => {
+            unreachable!("Runtime provisioner commands bypass workspace API construction")
         }
         AdminCommand::Login | AdminCommand::Logout => {
             unreachable!("fleet administrator login commands bypass workspace API construction")
