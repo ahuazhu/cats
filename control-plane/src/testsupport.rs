@@ -924,6 +924,97 @@ pub async fn corrupt_runtime_operation_projection_for_test(
         .expect("corrupt isolated test Operation projection");
 }
 
+/// Move one Cat Desired to the Deleted product target and one independent
+/// PersistentDisk to Deleting while keeping each canonical JSON/projection
+/// pair exact. This is isolated lifecycle-state setup, not a mutation API.
+pub async fn set_runtime_product_read_states_for_test(
+    store: &Arc<crate::store::Store>,
+    cat_id: cats_api::runtime_reconciliation::Id,
+    disk_id: cats_api::runtime_reconciliation::Id,
+) {
+    use cats_api::runtime_reconciliation::{
+        decode_desired_runtime_spec, encode_desired_runtime_spec, spec_digest, RuntimeTarget,
+        Sha256Digest, VolumeDisposition,
+    };
+
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let mut transaction = client.transaction()?;
+                let desired_json: String = transaction
+                    .query_one(
+                        "SELECT record::text FROM desired_runtime_specs WHERE cat_id=$1",
+                        &[&cat_id.as_str()],
+                    )?
+                    .get(0);
+                let mut desired = decode_desired_runtime_spec(desired_json.as_bytes())
+                    .expect("test DesiredRuntimeSpec is valid");
+                desired.target = RuntimeTarget::Deleted;
+                desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: cats_api::runtime_reconciliation::Id::new("delete_read_test")
+                        .unwrap(),
+                };
+                desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+                desired.spec_digest = spec_digest(&desired).expect("Deleted test Desired is valid");
+                let encoded = String::from_utf8(
+                    encode_desired_runtime_spec(&desired).expect("encode Deleted test Desired"),
+                )
+                .expect("runtime wire JSON is UTF-8");
+                let changed = transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$2::TEXT::jsonb, target='deleted', spec_digest=$3
+                      WHERE cat_id=$1",
+                    &[&cat_id.as_str(), &encoded, &desired.spec_digest.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test Cat Desired must already exist");
+
+                let changed = transaction.execute(
+                    "UPDATE disk_records
+                        SET record=jsonb_set(
+                                record,
+                                '{admin_state}',
+                                '{\"kind\":\"deleting\",\"delete_id\":\"delete_read_test\"}'::jsonb
+                            ),
+                            admin_state='deleting', delete_id='delete_read_test'
+                      WHERE disk_id=$1",
+                    &[&disk_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test PersistentDisk must already exist");
+                transaction.commit()
+            })
+        })
+        .await
+        .expect("set isolated runtime product read states");
+}
+
+/// Put one Cat's JSON workspace and ID projections on the far side of a
+/// keyset cursor while its scalar projections remain on the near side. The
+/// row must still be reachable through the bounded record/record list index.
+pub async fn corrupt_runtime_cat_list_boundary_for_test(
+    store: &Arc<crate::store::Store>,
+    cat_id: cats_api::runtime_reconciliation::Id,
+    claimed_workspace_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE cat_records
+                        SET record=jsonb_set(
+                            jsonb_set(record, '{workspace_id}', to_jsonb($2::TEXT)),
+                            '{cat_id}', to_jsonb('cat_zz'::TEXT)
+                        )
+                      WHERE cat_id=$1",
+                    &[&cat_id.as_str(), &claimed_workspace_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test Cat must already exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("corrupt isolated Cat list projections across cursor boundary");
+}
+
 /// Expire one isolated test session while preserving every JSON/projection
 /// invariant. The immutable-attempt trigger is disabled only inside this
 /// disposable-schema transaction and is restored before commit.

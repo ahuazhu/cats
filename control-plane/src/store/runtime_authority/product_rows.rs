@@ -18,11 +18,12 @@ use super::product::{
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
 
-const CAT_COLUMNS: &str = "cat_id, record::text AS record_json, workspace_id, name, created_at";
+pub(super) const CAT_COLUMNS: &str =
+    "cat_id, record::text AS record_json, workspace_id, name, created_at";
 const ENDPOINT_COLUMNS: &str = "
     endpoint_id, record::text AS record_json, workspace_id, cat_id, name,
     created_at";
-const DISK_COLUMNS: &str = "
+pub(super) const DISK_COLUMNS: &str = "
     disk_id, record::text AS record_json, workspace_id, name, volume_id,
     size_bytes, durability, created_at, admin_state, delete_id, role_kind,
     root_cat_id, initialization_kind, initialization_token, filesystem_uuid,
@@ -32,7 +33,7 @@ const DISK_COLUMNS: &str = "
 const DISK_SNAPSHOT_COLUMNS: &str = "
     snapshot_id, record::text AS record_json, disk_id, volume_id, size_bytes,
     head_generation, head_root_hash, head_root_object_id, created_at";
-const DESIRED_COLUMNS: &str = "
+pub(super) const DESIRED_COLUMNS: &str = "
     cat_id, record::text AS record_json, workspace_id, desired_revision,
     spec_digest, target, node_id, placement_epoch";
 const HOSTNAME_LOOKUP_COLUMNS: &str = "
@@ -491,7 +492,7 @@ pub(super) fn load_root_disk_by_cat_unlocked(
         .transpose()
 }
 
-fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
+pub(super) fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
     let stored = CatProjection::from_row(row)?;
     let record: CatRecord = decode_json(row.try_get("record_json")?)?;
     if stored != CatProjection::from_record(&record) {
@@ -780,7 +781,7 @@ fn decode_at_most_one_disk(rows: Vec<Row>) -> AuthorityTxResult<Option<DiskRecor
     Ok(decoded.pop())
 }
 
-fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
+pub(super) fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
     let stored = DiskProjection::from_row(row)?;
     let record: DiskRecord = decode_json(row.try_get("record_json")?)?;
     if stored != DiskProjection::from_record(&record)? {

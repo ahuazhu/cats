@@ -39,6 +39,7 @@ use super::product::{
     ExactContentType, ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup,
     IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
 };
+use super::product_reads::ProductPageRead;
 use super::product_rows::{
     insert_disk, load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
     operation_by_workspace_candidates_sql,
@@ -3838,6 +3839,98 @@ fn runtime_operation_exact_get_reaches_all_scalar_and_record_key_combinations() 
                 .unwrap(),
             RuntimeOperationRead::Corrupt,
             "{drift} drift escaped the workspace-qualified reachability set"
+        );
+    }
+}
+
+#[test]
+fn runtime_cat_list_reaches_all_scalar_and_record_workspace_id_combinations() {
+    for drift in [
+        "scalar workspace and scalar ID",
+        "scalar workspace and record ID",
+        "record workspace and scalar ID",
+        "record workspace and record ID",
+    ] {
+        let (_url, store, _second, workspace) = stores();
+        let foreign_workspace = bootstrap_workspace(&store, "f2b");
+        let create = request(&workspace, "cat-list-key-drift", 1, "cat-list-key-drift");
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        let cat_id = create.candidate.cat_id.clone();
+        let (listed_workspace, after) = match drift {
+            "scalar workspace and scalar ID" => {
+                store
+                    .with(|client| {
+                        client.execute(
+                            "UPDATE cat_records
+                                SET record=jsonb_set(
+                                    record, '{name}', to_jsonb('corrupt_name'::TEXT), FALSE
+                                )
+                              WHERE cat_id=$1",
+                            &[&cat_id.as_str()],
+                        )
+                    })
+                    .unwrap();
+                (workspace.clone(), None)
+            }
+            "scalar workspace and record ID" => {
+                store
+                    .with(|client| {
+                        client.execute(
+                            "UPDATE cat_records
+                                SET record=jsonb_set(
+                                    record, '{cat_id}', to_jsonb('cat_zz'::TEXT), FALSE
+                                )
+                              WHERE cat_id=$1",
+                            &[&cat_id.as_str()],
+                        )
+                    })
+                    .unwrap();
+                (workspace.clone(), Some(id("cat_zy")))
+            }
+            "record workspace and scalar ID" => {
+                store
+                    .with(|client| {
+                        client.execute(
+                            "UPDATE cat_records
+                                SET record=jsonb_set(
+                                    record, '{workspace_id}', to_jsonb($2::TEXT), FALSE
+                                )
+                              WHERE cat_id=$1",
+                            &[&cat_id.as_str(), &foreign_workspace.as_str()],
+                        )
+                    })
+                    .unwrap();
+                (foreign_workspace.clone(), None)
+            }
+            "record workspace and record ID" => {
+                store
+                    .with(|client| {
+                        client.execute(
+                            "UPDATE cat_records
+                                SET record=jsonb_set(
+                                    jsonb_set(
+                                        record, '{workspace_id}', to_jsonb($2::TEXT), FALSE
+                                    ),
+                                    '{cat_id}', to_jsonb('cat_zz'::TEXT), FALSE
+                                )
+                              WHERE cat_id=$1",
+                            &[&cat_id.as_str(), &foreign_workspace.as_str()],
+                        )
+                    })
+                    .unwrap();
+                (foreign_workspace, Some(id("cat_zy")))
+            }
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            store
+                .list_runtime_cats(&listed_workspace, after.as_ref(), 1)
+                .unwrap(),
+            ProductPageRead::Corrupt,
+            "{drift} candidate escaped the bounded list reachability set"
         );
     }
 }

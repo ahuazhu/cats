@@ -190,18 +190,30 @@ test("accepted response is flat and exact", () => {
   ));
 });
 
-test("closed legacy authority paths fail locally while exact create remains allowed", () => {
+test("runtime read paths and exact creates are allowed while retired authority stays local", () => {
   assert.doesNotThrow(() => assertRuntimeCutoverClientRequestSupported(
     "/v1/workspaces/ws_01/cats",
     "POST",
   ));
+  for (const path of [
+    "/v1/workspaces/ws_01/cats",
+    "/v1/workspaces/ws_01/cats?limit=100",
+    "/v1/workspaces/ws_01/cats/cat_01",
+    "/v1/workspaces/ws_01/disks",
+    "/v1/workspaces/ws_01/disks/disk_01",
+    "/v1/workspaces/ws_01/operations/op_01",
+  ]) {
+    assert.doesNotThrow(() => assertRuntimeCutoverClientRequestSupported(path, "GET"), path);
+  }
   for (const [method, path] of [
-    ["GET", "/v1/workspaces/ws_01/cats"],
     ["POST", "/v1/workspaces//cats"],
-    ["GET", "/v1/workspaces/ws_01/cats/cat_01"],
+    ["GET", "/v1/workspaces/ws_01/cats/app"],
+    ["GET", "/v1/workspaces/ws_01/cats/disk_01"],
+    ["GET", "/v1/workspaces/ws_01/cats/cat_01?view=full"],
     ["POST", "/v1/workspaces/ws_01/cats/cat_01/actions/start"],
     ["POST", "/v1/workspaces/ws_01/cats/cat_01/endpoints"],
-    ["GET", "/v1/workspaces/ws_01/disks"],
+    ["GET", "/v1/workspaces/ws_01/disks/data"],
+    ["GET", "/v1/workspaces/ws_01/disks/cat_01"],
     ["GET", "/v1/workspaces/ws_01/operations"],
     ["GET", "/v1/operations/op_01"],
     ["GET", "/v1/admin/monitoring"],

@@ -37,7 +37,7 @@ A Workspace token is a revocable machine credential for CI. It can manage resour
                      [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
                      [--expires-in SECONDS]
     cats ls
-    cats get NAME
+    cats get ID
     cats start NAME
     cats stop NAME
     cats suspend NAME
@@ -70,11 +70,13 @@ Status reports platform and Guest work leases, signal freshness, eligibility, an
 
     cats disk create NAME --size SIZE
     cats disk ls
-    cats disk get NAME
+    cats disk get ID
     cats disk snapshot NAME
     cats disk delete NAME
     cats mount DISK --cat CAT [--at /data]
     cats unmount DISK
+
+`cats ls` and `cats disk ls` follow every bounded server cursor automatically. `cats get` and `cats disk get` require immutable IDs; names are not accepted as item keys. `--json` prints the runtime read DTOs directly.
 
 ## Endpoint commands
 

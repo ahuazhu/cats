@@ -48,6 +48,10 @@ Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_susp
 
 Cat, Disk, and Operation responses include the immutable `workspace_id`, which is the only ownership key.
 
+Cat and Disk collection reads accept only `limit` (default 50, maximum 100) and an opaque `cursor`. They use stable immutable-ID byte order and return `{ "items": […], "next_cursor": <string-or-null> }`. A client must return `next_cursor` unchanged; cursors are canonical base64url without padding and bind their version and resource type, so a Cat cursor is invalid for Disks and vice versa. Malformed, noncanonical, duplicate, unknown, or out-of-range query fields are rejected. Cat and Disk item paths accept immutable `cat_…` / `disk_…` IDs only, never names or a name-or-ID guess.
+
+Cat reads compose the current Cat record, current `DesiredRuntimeSpec`, and the current observation summary in one read snapshot. Disk reads compose the current Disk record and any current Desired binding. `Deleted` Cats and `Deleting` Disks remain visible while their authority rows exist; completed deletion is absence. These product projections do not copy or expose lifecycle, volume-ownership, attachment, initialization, checkpoint, or physical-inventory authority.
+
 `exec` accepts `command`, optional `timeout_ms`, an optional string map `env`, and optional byte array `stdin`. `env` is passed only to the child process and is not stored in the Cats registry. The response contains `exit_code`, `stdout`, and `stderr`.
 
 `oci-deployments` accepts a stable `app`, a digest-pinned `image`, optional argv override `command`, persistent non-secret `env`, and optional one-pull `registry_auth`. Cats does not store Registry credentials. The Guest verifies and flattens the OCI layers and returns the requested image digest, selected platform-manifest digest, systemd service name, and active state.

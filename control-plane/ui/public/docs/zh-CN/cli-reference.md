@@ -37,7 +37,7 @@ Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签
                      [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
                      [--expires-in SECONDS]
     cats ls
-    cats get NAME
+    cats get ID
     cats start NAME
     cats stop NAME
     cats suspend NAME
@@ -70,11 +70,13 @@ Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签
 
     cats disk create NAME --size SIZE
     cats disk ls
-    cats disk get NAME
+    cats disk get ID
     cats disk snapshot NAME
     cats disk delete NAME
     cats mount DISK --cat CAT [--at /data]
     cats unmount DISK
+
+`cats ls` 与 `cats disk ls` 会自动跟随服务端的全部有界 Cursor。`cats get` 与 `cats disk get` 要求不可变 ID，名称不能作为 Item Key；`--json` 直接输出 Runtime Read DTO。
 
 ## Endpoint 命令
 

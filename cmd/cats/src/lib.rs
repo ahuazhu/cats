@@ -48,6 +48,7 @@ use cats_api::cat_create::{
 use cats_api::persistent_disk::{
     PersistentDiskCreateV1Request, PERSISTENT_DISK_NAME_CONFLICT_BODY,
 };
+use cats_api::runtime_product_reads::{CatReadV2, DiskReadV2, ProductReadPage};
 use cats_api::runtime_reconciliation::{
     decode_operation as decode_runtime_operation, encode_operation as encode_runtime_operation,
     Id as RuntimeId, Operation as RuntimeOperation, OperationPhase as RuntimeOperationPhase,
@@ -128,11 +129,9 @@ pub enum Command {
         durability: String,
     },
     /// List cats.
-    #[command(hide = true)]
     Ls,
-    /// Show one cat.
-    #[command(hide = true)]
-    Get { name: String },
+    /// Show one cat by immutable ID.
+    Get { id: String },
     /// Start (or wake) a cat.
     #[command(hide = true)]
     Start { name: String },
@@ -223,7 +222,6 @@ pub enum Command {
         never: bool,
     },
     /// Disk management.
-    #[command(hide = true)]
     Disk {
         #[command(subcommand)]
         cmd: DiskCommand,
@@ -314,11 +312,13 @@ pub enum DiskCommand {
     },
     Ls,
     Get {
-        name: String,
+        /// Immutable Disk ID.
+        id: String,
     },
     Delete {
         name: String,
     },
+    #[command(hide = true)]
     Snapshot(SnapshotArgs),
 }
 
@@ -748,6 +748,35 @@ impl Client {
         self.send(self.http.get(self.url(path)))
     }
 
+    fn get_all_product_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let path = match cursor.as_deref() {
+                Some(cursor) => format!("{collection}?limit=100&cursor={cursor}"),
+                None => format!("{collection}?limit=100"),
+            };
+            let page: ProductReadPage<T> = serde_json::from_value(self.get(&path)?)?;
+            anyhow::ensure!(
+                page.next_cursor.is_none() || !page.items.is_empty(),
+                "product collection returned a cursor without an item"
+            );
+            items.extend(page.items);
+            let Some(next) = page.next_cursor else {
+                return Ok(items);
+            };
+            anyhow::ensure!(
+                seen.insert(next.clone()),
+                "product collection cursor repeated"
+            );
+            cursor = Some(next);
+        }
+    }
+
     fn post(&self, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let mut req = self.http.post(self.url(path));
         req = match body {
@@ -1017,6 +1046,37 @@ fn print_cat(cat: &Cat, json_mode: bool) {
     }
 }
 
+fn print_runtime_cat(cat: &CatReadV2, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(cat).unwrap());
+    } else {
+        let observed = cat
+            .observed
+            .as_ref()
+            .and_then(|observed| observed.stable_state)
+            .map(|state| format!("{state:?}").to_lowercase())
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!(
+            "{:<16} id={:<38} {:>4} cpu {:>6} MiB desired={:<9} observed={:<9} node={}",
+            cat.name,
+            cat.id,
+            cat.desired.vcpus,
+            cat.desired.memory_bytes >> 20,
+            format!("{:?}", cat.desired.target).to_lowercase(),
+            observed,
+            cat.desired.node_id,
+        );
+    }
+}
+
+fn runtime_product_item_id<'a>(value: &'a str, prefix: &str, resource: &str) -> Result<&'a str> {
+    anyhow::ensure!(
+        RuntimeId::new(value.to_owned()).is_some() && value.starts_with(prefix),
+        "{resource} item key must be an immutable {prefix} ID"
+    );
+    Ok(value)
+}
+
 const RUNTIME_CUTOVER_UNSUPPORTED: &str =
     "is unavailable until its signed runtime-authority projection lands; no HTTP request was sent";
 
@@ -1026,7 +1086,7 @@ const RUNTIME_CUTOVER_UNSUPPORTED: &str =
 /// turning an unsupported invocation into outbound traffic.
 fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
     match command {
-        Command::Ls | Command::Get { .. } => Some("Cat read/list"),
+        Command::Ls | Command::Get { .. } => None,
         Command::Start { .. }
         | Command::Stop { .. }
         | Command::Suspend { .. }
@@ -1041,6 +1101,9 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
         | Command::Expiry { .. } => Some("Cat lifecycle"),
         Command::Disk {
             cmd: DiskCommand::Create { .. },
+        } => None,
+        Command::Disk {
+            cmd: DiskCommand::Ls | DiskCommand::Get { .. },
         } => None,
         Command::Disk { .. } | Command::Mount { .. } | Command::Unmount { .. } => {
             Some("PersistentDisk")
@@ -1366,27 +1429,20 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Ls => {
-            let v = client.get("/cats")?;
-            let list: ListResponse<Cat> = serde_json::from_value(v)?;
+            let cats: Vec<CatReadV2> = client.get_all_product_pages("/cats")?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&list.items).unwrap());
+                println!("{}", serde_json::to_string_pretty(&cats).unwrap());
             } else {
-                for cat in &list.items {
-                    print_cat(cat, false);
+                for cat in &cats {
+                    print_runtime_cat(cat, false);
                 }
             }
             Ok(())
         }
-        Command::Get { name } => {
-            let cat: Cat = serde_json::from_value(client.get(&format!("/cats/{name}"))?)?;
-            print_cat(&cat, cli.json);
-            if !cli.json {
-                let endpoints: ListResponse<Endpoint> =
-                    serde_json::from_value(client.get(&format!("/cats/{name}/endpoints"))?)?;
-                if let Some(endpoint) = endpoints.items.iter().find(|ep| ep.name == "web") {
-                    println!("URL: https://{}", endpoint.hostname);
-                }
-            }
+        Command::Get { id } => {
+            let id = runtime_product_item_id(id, "cat_", "Cat")?;
+            let cat: CatReadV2 = serde_json::from_value(client.get(&format!("/cats/{id}"))?)?;
+            print_runtime_cat(&cat, cli.json);
             Ok(())
         }
         Command::Start { name } => {
@@ -1983,16 +2039,16 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             }
         }
         DiskCommand::Ls => {
-            let v = client.get("/disks")?;
-            let list: ListResponse<Disk> = serde_json::from_value(v)?;
-            for d in &list.items {
-                print_disk(d, cli.json);
+            let disks: Vec<DiskReadV2> = client.get_all_product_pages("/disks")?;
+            for disk in &disks {
+                print_runtime_disk(disk, cli.json);
             }
             Ok(())
         }
-        DiskCommand::Get { name } => {
-            let disk: Disk = serde_json::from_value(client.get(&format!("/disks/{name}"))?)?;
-            print_disk(&disk, cli.json);
+        DiskCommand::Get { id } => {
+            let id = runtime_product_item_id(id, "disk_", "Disk")?;
+            let disk: DiskReadV2 = serde_json::from_value(client.get(&format!("/disks/{id}"))?)?;
+            print_runtime_disk(&disk, cli.json);
             Ok(())
         }
         DiskCommand::Delete { name } => {
@@ -2020,6 +2076,32 @@ fn print_disk(d: &Disk, json_mode: bool) {
             format!("{:?}", d.state).to_lowercase(),
             d.durability.as_str(),
             d.bound_cat_id.as_deref().unwrap_or("-")
+        );
+    }
+}
+
+fn print_runtime_disk(disk: &DiskReadV2, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(disk).unwrap());
+    } else {
+        let kind = match disk.kind {
+            cats_api::runtime_product_reads::DiskReadKind::Root { .. } => "root",
+            cats_api::runtime_product_reads::DiskReadKind::Persistent => "persistent",
+        };
+        let bound_cat = disk
+            .binding
+            .as_ref()
+            .map(|binding| binding.cat_id.as_str())
+            .unwrap_or("-");
+        println!(
+            "{:<16} id={:<38} {:>8} MiB kind={:<10} admin={:<8} durability={:<7} cat={}",
+            disk.name,
+            disk.id,
+            disk.size_bytes >> 20,
+            kind,
+            format!("{:?}", disk.admin_state).to_lowercase(),
+            format!("{:?}", disk.durability).to_lowercase(),
+            bound_cat,
         );
     }
 }
@@ -2635,6 +2717,57 @@ mod tests {
             .unwrap();
         assert_eq!(operation, expected);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn product_collection_client_fetches_every_page_in_cursor_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (expected_path, body) in [
+                (
+                    "GET /v1/workspaces/ws_01/cats?limit=100 HTTP/1.1",
+                    br#"{"items":[{"id":"cat_01"}],"next_cursor":"cursor_01"}"#.as_slice(),
+                ),
+                (
+                    "GET /v1/workspaces/ws_01/cats?limit=100&cursor=cursor_01 HTTP/1.1",
+                    br#"{"items":[{"id":"cat_02"}],"next_cursor":null}"#.as_slice(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, request_body) = read_request(&mut stream);
+                assert!(request_body.is_empty());
+                assert_eq!(headers.lines().next().unwrap(), expected_path);
+                assert_eq!(
+                    request_header(&headers, "authorization"),
+                    "Bearer test-token"
+                );
+                write_runtime_operation_response(&mut stream, body, None);
+            }
+        });
+
+        let items: Vec<serde_json::Value> = runtime_test_client(base)
+            .get_all_product_pages("/cats")
+            .unwrap();
+        assert_eq!(
+            items,
+            vec![
+                serde_json::json!({ "id": "cat_01" }),
+                serde_json::json!({ "id": "cat_02" }),
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn product_item_keys_are_resource_typed_immutable_ids() {
+        assert_eq!(
+            runtime_product_item_id("cat_01", "cat_", "Cat").unwrap(),
+            "cat_01"
+        );
+        assert!(runtime_product_item_id("demo", "cat_", "Cat").is_err());
+        assert!(runtime_product_item_id("disk_01", "cat_", "Cat").is_err());
+        assert!(runtime_product_item_id("cat_01/operations", "cat_", "Cat").is_err());
     }
 
     #[test]
@@ -3332,8 +3465,6 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let commands: &[&[&str]] = &[
-            &["ls"],
-            &["get", "app"],
             &["start", "app"],
             &["stop", "app"],
             &["suspend", "app"],
@@ -3354,8 +3485,6 @@ mod tests {
             &["sleep", "off", "app"],
             &["sleep", "status", "app"],
             &["expiry", "app"],
-            &["disk", "ls"],
-            &["disk", "get", "data"],
             &["disk", "delete", "data"],
             &["disk", "snapshot", "data"],
             &["mount", "data", "--cat", "app"],
@@ -3422,16 +3551,34 @@ mod tests {
         let mut root = Cli::command();
         let root_help = root.render_long_help().to_string();
         for command in [
-            "ls", "get", "start", "stop", "suspend", "resume", "warm", "sync", "destroy", "exec",
-            "deploy", "shell", "sleep", "expiry", "disk", "mount", "unmount", "expose", "endpoint",
+            "start", "stop", "suspend", "resume", "warm", "sync", "destroy", "exec", "deploy",
+            "shell", "sleep", "expiry", "mount", "unmount", "expose", "endpoint",
         ] {
             assert!(
                 !root_help.contains(&format!("\n  {command} ")),
                 "retired command {command:?} remains visible in root help"
             );
         }
+        for read in ["ls", "get", "disk"] {
+            assert!(
+                root_help.contains(&format!("\n  {read} ")),
+                "production read command {read:?} is hidden from root help"
+            );
+        }
         assert!(root_help.contains("\n  operation "));
         assert!(!root_help.contains("--no-wait"));
+
+        let mut disk = Cli::command()
+            .find_subcommand("disk")
+            .expect("Disk command")
+            .clone();
+        let disk_help = disk.render_long_help().to_string();
+        for supported in ["create", "ls", "get"] {
+            assert!(disk_help.contains(&format!("\n  {supported} ")));
+        }
+        for retired in ["resize", "delete", "snapshot"] {
+            assert!(!disk_help.contains(&format!("\n  {retired} ")));
+        }
 
         let mut operation = Cli::command()
             .find_subcommand("operation")

@@ -48,6 +48,10 @@ Lifecycle Verb 包括 `start`、`stop`、`suspend`、`resume` 与 `warm`。Creat
 
 Cat、Disk 和 Operation 响应都包含不可变 `workspace_id`，它是唯一的资源归属键。
 
+Cat 与 Disk Collection Read 只接受 `limit`（默认 50，最大 100）和 opaque `cursor`，按不可变 ID 的 byte order 稳定排序，返回 `{ "items": […], "next_cursor": <string-or-null> }`。客户端必须原样回传 `next_cursor`；Cursor 使用不带 Padding 的 canonical base64url，并绑定版本和资源类型，因此 Cat Cursor 不能用于 Disk，反之亦然。格式错误、非 canonical、重复、未知或越界的 Query Field 都会被拒绝。Cat/Disk Item Path 只接受不可变 `cat_…` / `disk_…` ID，不接受名称，也不猜测一个字符串是名称还是 ID。
+
+Cat Read 在同一 Read Snapshot 中组合当前 Cat Record、当前 `DesiredRuntimeSpec` 与当前 Observation Summary。Disk Read 组合当前 Disk Record 与当前 Desired Binding。`Deleted` Cat 和 `Deleting` Disk 在其 Authority Row 仍存在时继续可见；删除完成后表现为不存在。这些 Product Projection 不复制或暴露 Lifecycle、Volume Ownership、Attachment、Initialization、Checkpoint 或 Physical Inventory Authority。
+
 `exec` 接受 `command`、可选 `timeout_ms`、可选字符串 Map `env` 与可选字节数组 `stdin`。`env` 只传给子进程，不写入 Cats Registry。响应包含 `exit_code`、`stdout` 与 `stderr`。
 
 `oci-deployments` 接受稳定的 `app`、固定到 digest 的 `image`、可选 argv 覆盖 `command`、持久非 Secret `env`，以及仅用于一次拉取的可选 `registry_auth`。Cats 不保存 Registry Credential。Guest 校验并扁平化 OCI layer，返回请求 image digest、选中的平台 manifest digest、systemd service 名和 active 状态。

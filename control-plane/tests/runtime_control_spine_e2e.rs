@@ -22,6 +22,7 @@ use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, PROVISIONER_CREDENTIAL_ID_HEADER,
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
+use cats_api::runtime_product_reads::{CatReadV2, DiskReadAdminState, DiskReadV2, ProductReadPage};
 use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
     decode_operation, decode_runtime_node_authority_apply_result,
@@ -724,6 +725,231 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         reads_after_commit,
         "PersistentDisk create must not read the Root image manifest"
     );
+
+    let cat_list = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?limit=1",
+            context.second.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let cat_page: ProductReadPage<CatReadV2> =
+        serde_json::from_slice(&json_body(cat_list, StatusCode::OK).await).unwrap();
+    assert_eq!(cat_page.items.len(), 1);
+    assert_eq!(cat_page.items[0].id, created.cat_id);
+    assert_eq!(cat_page.items[0].workspace_id.as_str(), workspace_id);
+    assert_eq!(cat_page.items[0].name.as_str(), "app");
+    let desired_root_disk_id = cat_page.items[0].desired.root_disk_id.clone();
+    assert_eq!(
+        cat_page.items[0].desired.target,
+        cats_api::runtime_reconciliation::RuntimeTarget::Running
+    );
+    assert!(cat_page.items[0].observed.is_none());
+    assert!(cat_page.next_cursor.is_none());
+
+    let exact_cat: CatReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/cats/{}",
+                    context.first.base_url(),
+                    created.cat_id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(exact_cat, cat_page.items[0]);
+    let name_is_not_an_item_key = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/app",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(name_is_not_an_item_key.status(), StatusCode::NOT_FOUND);
+
+    let unauthenticated_malformed_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/%FF",
+            context.first.base_url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_malformed_cat.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let authenticated_malformed_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/%FF",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_malformed_cat.status(), StatusCode::NOT_FOUND);
+
+    let invalid_page_queries = [
+        "limit=0",
+        "limit=01",
+        "limit=101",
+        "limit=1&limit=2",
+        "cursor=not-base64!",
+        "unknown=1",
+    ];
+    let unauthenticated_invalid_query = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?cursor=not-base64!",
+            context.second.base_url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_invalid_query.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for query in invalid_page_queries {
+        let response = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{workspace_id}/cats?{query}",
+                context.second.base_url()
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    let wrong_resource_cursor = cats_api::runtime_product_reads::encode_product_read_cursor(
+        cats_api::runtime_product_reads::ProductReadResource::Disks,
+        &id("disk_cursor_probe"),
+    );
+    let response = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?cursor={wrong_resource_cursor}",
+            context.second.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let first_disk_page: ProductReadPage<DiskReadV2> = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks?limit=1",
+                    context.second.base_url()
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(first_disk_page.items.len(), 1);
+    let cursor = first_disk_page.next_cursor.as_deref().unwrap();
+    let second_disk_page: ProductReadPage<DiskReadV2> = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks?limit=1&cursor={cursor}",
+                    context.first.base_url()
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(second_disk_page.items.len(), 1);
+    assert!(second_disk_page.next_cursor.is_none());
+    let mut paged_disk_ids = vec![
+        first_disk_page.items[0].id.clone(),
+        second_disk_page.items[0].id.clone(),
+    ];
+    paged_disk_ids.sort();
+    let mut expected_disk_ids = vec![desired_root_disk_id.clone(), id(&disk.id)];
+    expected_disk_ids.sort();
+    assert_eq!(paged_disk_ids, expected_disk_ids);
+
+    let exact_disk: DiskReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks/{}",
+                    context.first.base_url(),
+                    disk.id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(exact_disk.name.as_str(), "data");
+    assert!(exact_disk.binding.is_none());
+    let disk_name_is_not_an_item_key = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/disks/data",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disk_name_is_not_an_item_key.status(), StatusCode::NOT_FOUND);
+
+    let retired_operation_collection = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/operations",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retired_operation_collection.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
     let disk_replay = context
         .persistent_disk_create_request(&context.first, &workspace_id, disk_key)
         .send()
@@ -839,6 +1065,40 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         .execute(move |store| store.create_workspace(&account_id, "sibling", "Sibling"))
         .await
         .unwrap();
+    for path in [
+        format!("cats/{}", created.cat_id),
+        format!("disks/{}", disk.id),
+    ] {
+        let hidden = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{}/{path}",
+                context.second.base_url(),
+                sibling_workspace.id
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for collection in ["cats", "disks"] {
+        let page = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{}/{collection}",
+                context.second.base_url(),
+                sibling_workspace.id
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let page: serde_json::Value =
+            serde_json::from_slice(&json_body(page, StatusCode::OK).await).unwrap();
+        assert_eq!(page["items"], serde_json::json!([]), "{collection}");
+        assert!(page["next_cursor"].is_null(), "{collection}");
+    }
     let wrong_workspace = context
         .operation_request(
             &context.second,
@@ -925,6 +1185,54 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         assert_exact_operation_response(response, &terminal).await;
     }
 
+    cats_control_plane::testsupport::set_runtime_product_read_states_for_test(
+        &context.first.state.store,
+        created.cat_id.clone(),
+        id(&disk.id),
+    )
+    .await;
+    let deleted_cat: CatReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/cats/{}",
+                    context.second.base_url(),
+                    created.cat_id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        deleted_cat.desired.target,
+        cats_api::runtime_reconciliation::RuntimeTarget::Deleted
+    );
+    let deleting_disk: DiskReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks/{}",
+                    context.first.base_url(),
+                    disk.id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(deleting_disk.admin_state, DiskReadAdminState::Deleting);
+
     let facts = cats_control_plane::testsupport::runtime_cutover_acceptance_facts(
         &context.first.state.store,
         session.node_id.clone(),
@@ -963,6 +1271,39 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             stored_api_response_body: Some(first_create_body),
             stored_persistent_disk_response_body: Some(first_disk_body),
         }
+    );
+
+    cats_control_plane::testsupport::corrupt_runtime_cat_list_boundary_for_test(
+        &context.first.state.store,
+        created.cat_id.clone(),
+        id(&sibling_workspace.id),
+    )
+    .await;
+    let boundary_cursor = cats_api::runtime_product_reads::encode_product_read_cursor(
+        cats_api::runtime_product_reads::ProductReadResource::Cats,
+        &id("cat_zy"),
+    );
+    let corrupt_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{}/cats?limit=1&cursor={boundary_cursor}",
+            context.second.base_url(),
+            sibling_workspace.id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrupt_cat.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", context.second.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
 
     // A transient PostgreSQL lock timeout is an ordinary unavailable read and

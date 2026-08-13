@@ -562,6 +562,45 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (table, index, first_key, second_key, predicate) in REQUIRED_PRODUCT_READ_LOOKUP_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1
+                       AND index_relation.relname=$2
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=2 AND i.indnatts=2
+                       AND i.indoption::TEXT='0 0'
+                       AND access_method.amname='btree'
+                       AND i.indcollation[0]='pg_catalog.\"C\"'::regcollation
+                       AND i.indcollation[1]='pg_catalog.\"C\"'::regcollation
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$3
+                       AND pg_get_indexdef(i.indexrelid, 2, FALSE)=$4
+                       AND (($5::TEXT IS NULL AND i.indpred IS NULL)
+                            OR pg_get_expr(i.indpred, i.indrelid)=$5)
+                 )",
+                &[table, index, first_key, second_key, predicate],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority product read lookup-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, trigger, function, trigger_type, body_sha256) in REQUIRED_IMMUTABILITY_TRIGGERS {
         let body = transaction
             .query_opt(
@@ -1227,13 +1266,22 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     ),
 ];
 
-const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[(
-    "volume_authorizations",
-    "volume_authorizations_record_authorization",
-    "gin",
-    "jsonb_path_ops",
-    "(record -> 'authorization'::text)",
-)];
+const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "volume_authorizations",
+        "volume_authorizations_record_authorization",
+        "gin",
+        "jsonb_path_ops",
+        "(record -> 'authorization'::text)",
+    ),
+    (
+        "desired_runtime_specs",
+        "desired_runtime_specs_record_volumes",
+        "gin",
+        "jsonb_path_ops",
+        "(record -> 'volumes'::text)",
+    ),
+];
 
 const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
@@ -1264,6 +1312,85 @@ const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&st
         "((record ->> 'operation_id'::text))",
         Some(
             "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((operation_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'operation_id'::text) COLLATE \"C\")))",
+        ),
+    ),
+];
+
+type RequiredProductReadLookupIndex = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+const REQUIRED_PRODUCT_READ_LOOKUP_INDEXES: &[RequiredProductReadLookupIndex] = &[
+    (
+        "cat_records",
+        "cat_records_lookup_scalar_scalar",
+        "workspace_id",
+        "cat_id",
+        None,
+    ),
+    (
+        "cat_records",
+        "cat_records_lookup_scalar_record",
+        "workspace_id",
+        "((record ->> 'cat_id'::text))",
+        Some(
+            "((cat_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'cat_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "cat_records",
+        "cat_records_lookup_record_scalar",
+        "((record ->> 'workspace_id'::text))",
+        "cat_id",
+        Some(
+            "((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "cat_records",
+        "cat_records_lookup_record_record",
+        "((record ->> 'workspace_id'::text))",
+        "((record ->> 'cat_id'::text))",
+        Some(
+            "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((cat_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'cat_id'::text) COLLATE \"C\")))",
+        ),
+    ),
+    (
+        "disk_records",
+        "disk_records_lookup_scalar_scalar",
+        "workspace_id",
+        "disk_id",
+        None,
+    ),
+    (
+        "disk_records",
+        "disk_records_lookup_scalar_record",
+        "workspace_id",
+        "((record ->> 'disk_id'::text))",
+        Some(
+            "((disk_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'disk_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "disk_records",
+        "disk_records_lookup_record_scalar",
+        "((record ->> 'workspace_id'::text))",
+        "disk_id",
+        Some(
+            "((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\"))",
+        ),
+    ),
+    (
+        "disk_records",
+        "disk_records_lookup_record_record",
+        "((record ->> 'workspace_id'::text))",
+        "((record ->> 'disk_id'::text))",
+        Some(
+            "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((disk_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'disk_id'::text) COLLATE \"C\")))",
         ),
     ),
 ];
@@ -1988,6 +2115,18 @@ CREATE TABLE IF NOT EXISTS cat_records (
     UNIQUE (workspace_id, name),
     UNIQUE (workspace_id, cat_id)
 );
+CREATE INDEX IF NOT EXISTS cat_records_lookup_scalar_scalar
+ON cat_records(workspace_id COLLATE \"C\", cat_id COLLATE \"C\");
+CREATE INDEX IF NOT EXISTS cat_records_lookup_scalar_record
+ON cat_records(workspace_id COLLATE \"C\", (record->>'cat_id') COLLATE \"C\")
+WHERE cat_id COLLATE \"C\" IS DISTINCT FROM (record->>'cat_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS cat_records_lookup_record_scalar
+ON cat_records((record->>'workspace_id') COLLATE \"C\", cat_id COLLATE \"C\")
+WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM (record->>'workspace_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS cat_records_lookup_record_record
+ON cat_records((record->>'workspace_id') COLLATE \"C\", (record->>'cat_id') COLLATE \"C\")
+WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM (record->>'workspace_id') COLLATE \"C\"
+  AND cat_id COLLATE \"C\" IS DISTINCT FROM (record->>'cat_id') COLLATE \"C\";
 CREATE TABLE IF NOT EXISTS endpoint_records (
     endpoint_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -2076,6 +2215,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS disk_records_initialization_token_unique
 ON disk_records(initialization_token) WHERE role_kind = 'persistent';
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_filesystem_uuid_unique
 ON disk_records(filesystem_uuid) WHERE role_kind = 'persistent';
+CREATE INDEX IF NOT EXISTS disk_records_lookup_scalar_scalar
+ON disk_records(workspace_id COLLATE \"C\", disk_id COLLATE \"C\");
+CREATE INDEX IF NOT EXISTS disk_records_lookup_scalar_record
+ON disk_records(workspace_id COLLATE \"C\", (record->>'disk_id') COLLATE \"C\")
+WHERE disk_id COLLATE \"C\" IS DISTINCT FROM (record->>'disk_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS disk_records_lookup_record_scalar
+ON disk_records((record->>'workspace_id') COLLATE \"C\", disk_id COLLATE \"C\")
+WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM (record->>'workspace_id') COLLATE \"C\";
+CREATE INDEX IF NOT EXISTS disk_records_lookup_record_record
+ON disk_records((record->>'workspace_id') COLLATE \"C\", (record->>'disk_id') COLLATE \"C\")
+WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM (record->>'workspace_id') COLLATE \"C\"
+  AND disk_id COLLATE \"C\" IS DISTINCT FROM (record->>'disk_id') COLLATE \"C\";
 CREATE TABLE IF NOT EXISTS disk_snapshot_records (
     snapshot_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -2112,6 +2263,8 @@ CREATE TABLE IF NOT EXISTS desired_runtime_specs (
     FOREIGN KEY (workspace_id, cat_id)
         REFERENCES cat_records(workspace_id, cat_id)
 );
+CREATE INDEX IF NOT EXISTS desired_runtime_specs_record_volumes
+ON desired_runtime_specs USING gin ((record->'volumes') jsonb_path_ops);
 CREATE TABLE IF NOT EXISTS hostname_desired_lookups (
     hostname TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

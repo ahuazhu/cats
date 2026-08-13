@@ -3218,6 +3218,16 @@ fn load_current_cat_observation(
     }))
 }
 
+pub(super) fn load_product_cat_observation(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<(ObservedRuntimeStatus, UnixMillis)>> {
+    load_current_cat_observation(transaction, node_id, cat_id).map(|observation| {
+        observation.map(|observation| (observation.runtime, observation.accepted_at_unix_ms))
+    })
+}
+
 fn upsert_cat_observation(
     transaction: &mut Transaction<'_>,
     observation: &NodeObservation,

@@ -230,10 +230,13 @@ async function loadAll({ quiet = false } = {}) {
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
   try {
-    // Read projections remain closed in production. Preserve an honest empty
-    // local view instead of probing retired authority routes on every refresh.
-    state.cats = [];
-    state.disks = [];
+    const [cats, disks] = await Promise.all([
+      loadRuntimeProductPages("cats"),
+      loadRuntimeProductPages("disks"),
+    ]);
+    state.cats = cats.map(runtimeCatView);
+    state.disks = disks.map(runtimeDiskView);
+    // The frozen runtime contract intentionally has no Operation collection.
     state.operations = [];
     render();
   } catch (error) {
@@ -247,6 +250,50 @@ async function loadAll({ quiet = false } = {}) {
     state.loading = false;
     if (!quiet) setBusy(button, false);
   }
+}
+
+async function loadRuntimeProductPages(resource) {
+  const items = [];
+  const seen = new Set();
+  let cursor = "";
+  do {
+    const suffix = cursor ? `&cursor=${cursor}` : "";
+    const page = await apiFetch(`/v1/workspaces/${encodeURIComponent(state.workspaceId)}/${resource}?limit=100${suffix}`);
+    if (!page || !Array.isArray(page.items) || !(page.next_cursor === null || typeof page.next_cursor === "string")) {
+      throw new Error("invalid runtime product page");
+    }
+    if (page.next_cursor !== null && page.items.length === 0) {
+      throw new Error("runtime product page advanced without an item");
+    }
+    items.push(...page.items);
+    cursor = page.next_cursor || "";
+    if (cursor && seen.has(cursor)) throw new Error("runtime product cursor repeated");
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return items;
+}
+
+function runtimeCatView(cat) {
+  return {
+    ...cat,
+    spec: { cpus: cat.desired.vcpus, memory_mib: Math.floor(cat.desired.memory_bytes / 1048576) },
+    desired_state: cat.desired.target,
+    observed_state: cat.observed?.stable_state || "unknown",
+    node_id: cat.desired.node_id,
+    created_at_unix: Math.floor(Number(cat.created_at_unix_ms) / 1000),
+    auto_suspend: false,
+    expires_at_unix: null,
+  };
+}
+
+function runtimeDiskView(disk) {
+  return {
+    ...disk,
+    kind: disk.kind.kind,
+    state: disk.admin_state === "deleting" ? "deleting" : (disk.binding ? "bound" : "available"),
+    bound_cat_id: disk.binding?.cat_id || null,
+    created_at_unix: Math.floor(Number(disk.created_at_unix_ms) / 1000),
+  };
 }
 
 function render() {

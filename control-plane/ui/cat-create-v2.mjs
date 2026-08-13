@@ -143,12 +143,18 @@ export function parseCatCreateV2AcceptedResponseBody(body) {
   return accepted;
 }
 
-// Fail locally for every production route whose legacy authority is closed.
-// The sole resource exception is the exact Cat-create collection POST.
+// Fail locally for every production route whose authority remains closed.
+// Cat/Disk reads and exact Operation reads are the bounded runtime-authority
+// projections; mutations other than the two exact create collections remain
+// retired.
 export function assertRuntimeCutoverClientRequestSupported(path, method = "GET") {
   const normalizedMethod = String(method).toUpperCase();
   const catCollection = /^\/v1\/workspaces\/[^/?]+\/cats$/;
   if (catCollection.test(path) && normalizedMethod === "POST") return;
+  const catRead = /^\/v1\/workspaces\/[^/?]+\/cats(?:$|\?[^#]*$|\/cat_[^/?]+$)/;
+  const diskRead = /^\/v1\/workspaces\/[^/?]+\/disks(?:$|\?[^#]*$|\/disk_[^/?]+$)/;
+  const exactOperationRead = /^\/v1\/workspaces\/[^/?]+\/operations\/op_[^/?]+$/;
+  if (normalizedMethod === "GET" && (catRead.test(path) || diskRead.test(path) || exactOperationRead.test(path))) return;
   const retiredWorkspaceSurface = /^\/v1\/workspaces\/[^/]*\/(?:cats|disks|operations)(?:[/?]|$)/;
   const retiredGlobalOperation = /^\/v1\/operations(?:[/?]|$)/;
   const retiredFleetSurface = /^\/v1\/admin\/(?:nodes|monitoring)(?:[/?]|$)/;
