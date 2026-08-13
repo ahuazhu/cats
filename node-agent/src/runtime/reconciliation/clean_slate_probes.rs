@@ -244,6 +244,11 @@ pub(crate) enum LocalPublicationRecoveryEvidence {
     AuthorizedBlockd {
         cat_id: Id,
     },
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    ReleasedDataDirectoryPrefix {
+        cat_id: Id,
+        retained: Arc<super::residue_reclaim::RetainedEmptyDataDirectoryPrefix>,
+    },
     /// The current Takeover target artifact is already the one exact extra
     /// member beyond the checkpoint's prepared set. The checkpoint CAS may
     /// have lost its response; pre-scan recovery may read fresh signed
@@ -2128,6 +2133,41 @@ pub(crate) fn classify_local_publication_recovery(
         &scan_context,
         ProbeLimits::default(),
     )?;
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if !data.unattributed_incomplete
+        && data.residue.is_empty()
+        && data.handoff_temps.is_empty()
+        && data.stable_stop_receipts.is_empty()
+        && data.recoverable_stop_receipts.is_empty()
+        && !data.recoverable_cleanup_prefixes.is_empty()
+        && data.recoverable_publication_prefixes.len() == data.recoverable_cleanup_prefixes.len()
+    {
+        let prefix_leaf_count = data
+            .recoverable_cleanup_prefixes
+            .keys()
+            .filter(|prefix| !matches!(prefix, RecoverableAuthorizedBlockdPrefix::Cat { .. }))
+            .count();
+        if data.evidence_count() + prefix_leaf_count == data.leaf_count
+            && data
+                .recoverable_cleanup_prefixes
+                .keys()
+                .all(|prefix| data.recoverable_publication_prefixes.contains(prefix))
+        {
+            for (prefix, retained) in &data.recoverable_cleanup_prefixes {
+                if let Some((cat_id, _)) = checkpoints
+                    .iter()
+                    .find(|(_, checkpoint)| released_cleanup_prefix_matches(checkpoint, prefix))
+                {
+                    return Ok(
+                        LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix {
+                            cat_id: cat_id.clone(),
+                            retained: Arc::clone(retained),
+                        },
+                    );
+                }
+            }
+        }
+    }
     if data.handoff_temps.len() == 1
         && data.evidence_count() + data.handoff_temps.len() == data.leaf_count
     {
@@ -2284,6 +2324,11 @@ struct AuthorizedBlockdDataScan {
     candidate_volume_ids: BTreeSet<Id>,
     observed_volume_paths: BTreeSet<(Id, Id)>,
     recoverable_publication_prefixes: BTreeSet<RecoverableAuthorizedBlockdPrefix>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    recoverable_cleanup_prefixes: BTreeMap<
+        RecoverableAuthorizedBlockdPrefix,
+        Arc<super::residue_reclaim::RetainedEmptyDataDirectoryPrefix>,
+    >,
     unattributed_incomplete: bool,
     leaf_count: usize,
     complete: bool,
@@ -2396,6 +2441,56 @@ enum RecoverableAuthorizedBlockdPrefix {
         attachment_name: String,
         epoch_name: String,
     },
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn released_cleanup_prefix_matches(
+    checkpoint: &RuntimeCheckpoint,
+    prefix: &RecoverableAuthorizedBlockdPrefix,
+) -> bool {
+    let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
+        return false;
+    };
+    let cats_api::runtime_reconciliation::CleanupTarget::Volume {
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+    } = &cleanup.target
+    else {
+        return false;
+    };
+    if cleanup.volume_release.is_none() {
+        return false;
+    }
+    let attachment_name = format!("attachment-{attachment_id}");
+    let epoch_name = format!("epoch-{}", attachment_epoch.get());
+    match prefix {
+        RecoverableAuthorizedBlockdPrefix::Cat { cat_id } => cat_id == &checkpoint.cat_id,
+        RecoverableAuthorizedBlockdPrefix::Volume {
+            cat_id,
+            volume_id: observed,
+        } => cat_id == &checkpoint.cat_id && observed == volume_id,
+        RecoverableAuthorizedBlockdPrefix::Attachment {
+            cat_id,
+            volume_id: observed,
+            attachment_name: observed_attachment,
+        } => {
+            cat_id == &checkpoint.cat_id
+                && observed == volume_id
+                && observed_attachment == &attachment_name
+        }
+        RecoverableAuthorizedBlockdPrefix::Epoch {
+            cat_id,
+            volume_id: observed,
+            attachment_name: observed_attachment,
+            epoch_name: observed_epoch,
+        } => {
+            cat_id == &checkpoint.cat_id
+                && observed == volume_id
+                && observed_attachment == &attachment_name
+                && observed_epoch == &epoch_name
+        }
+    }
 }
 
 /// One immutable checkpoint-namespace join for the whole data-directory
@@ -2810,6 +2905,8 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
                 recoverable_publication_prefixes: BTreeSet::new(),
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                recoverable_cleanup_prefixes: BTreeMap::new(),
                 unattributed_incomplete: false,
                 leaf_count: 0,
                 complete: true,
@@ -2825,6 +2922,8 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
                 recoverable_publication_prefixes: BTreeSet::new(),
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                recoverable_cleanup_prefixes: BTreeMap::new(),
                 unattributed_incomplete: true,
                 leaf_count: 0,
                 complete: false,
@@ -2861,6 +2960,8 @@ fn scan_authorized_blockd_data_with_projection_barrier(
             candidate_volume_ids: BTreeSet::new(),
             observed_volume_paths: BTreeSet::new(),
             recoverable_publication_prefixes: BTreeSet::new(),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            recoverable_cleanup_prefixes: BTreeMap::new(),
             unattributed_incomplete: true,
             leaf_count: 0,
             complete: false,
@@ -2875,6 +2976,8 @@ fn scan_authorized_blockd_data_with_projection_barrier(
         candidate_volume_ids: BTreeSet::new(),
         observed_volume_paths: BTreeSet::new(),
         recoverable_publication_prefixes: BTreeSet::new(),
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        recoverable_cleanup_prefixes: BTreeMap::new(),
         unattributed_incomplete: false,
         leaf_count: 0,
         complete: true,
@@ -2943,10 +3046,20 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 scan.unattributed_incomplete = true;
                 continue;
             }
-            scan.recoverable_publication_prefixes
-                .insert(RecoverableAuthorizedBlockdPrefix::Cat {
-                    cat_id: desired.cat_id.clone(),
-                });
+            let prefix = RecoverableAuthorizedBlockdPrefix::Cat {
+                cat_id: desired.cat_id.clone(),
+            };
+            scan.recoverable_publication_prefixes.insert(prefix.clone());
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            scan.recoverable_cleanup_prefixes.insert(
+                prefix,
+                Arc::new(
+                    super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                        &[(&directory, cat_entry.name.as_os_str(), &cat_directory)],
+                        context,
+                    )?,
+                ),
+            );
             continue;
         }
         for volume_entry in volume_entries {
@@ -3066,11 +3179,23 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                             scan.unattributed_incomplete = true;
                             continue;
                         }
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Volume {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                            },
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Volume {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        scan.recoverable_cleanup_prefixes.insert(
+                            prefix,
+                            Arc::new(
+                                super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                    &[
+                                        (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                        (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                    ],
+                                    context,
+                                )?,
+                            ),
                         );
                     }
                     continue;
@@ -3112,12 +3237,25 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                             scan.unattributed_incomplete = true;
                             continue;
                         }
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Attachment {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                                attachment_name: attachment_name.clone(),
-                            },
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Attachment {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                            attachment_name: attachment_name.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        scan.recoverable_cleanup_prefixes.insert(
+                            prefix,
+                            Arc::new(
+                                super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                    &[
+                                        (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                        (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                        (&volume_directory, attachment_entry.name.as_os_str(), &attachment_directory),
+                                    ],
+                                    context,
+                                )?,
+                            ),
                         );
                     }
                     continue;
@@ -3132,6 +3270,18 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 .to_str()
                 .context("authorized blockd epoch path is not UTF-8")?
                 .to_owned();
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let Some(allocated_bytes) = observed_allocated_bytes_at(
+                &epoch_directory,
+                root,
+                &mut budget,
+                context,
+                limits.recursion_depth,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
             else {
@@ -3172,6 +3322,65 @@ fn scan_authorized_blockd_data_with_projection_barrier(
             }) {
                 bail!("authorized blockd leaf retains foreign entry {foreign}")
             }
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let reclaim_checkpoint = if by_name.contains_key(LAUNCH_CHECKPOINT_FILE)
+                && !has_unvalidated_handoff_artifact
+                && [
+                    IDENTITY_TEMP,
+                    AUTHORIZED_SERVING_TEMP,
+                    LAUNCH_CHECKPOINT_TEMP,
+                    ROOT_PROVISION_STOP_RECEIPT_FILE,
+                    ROOT_PROVISION_STOP_RECEIPT_TEMP,
+                    ".cache.data.init",
+                    ".dirty.bitmap.init",
+                ]
+                .into_iter()
+                .all(|name| !by_name.contains_key(name))
+            {
+                let bytes = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[LAUNCH_CHECKPOINT_FILE],
+                    root,
+                    MAX_LAUNCH_CHECKPOINT_BYTES,
+                    context,
+                )?;
+                let checkpoint = bytes
+                    .as_deref()
+                    .map(|bytes| decode_exact_json(bytes, "reclaim launch checkpoint"))
+                    .transpose()?;
+                checkpoint.filter(|checkpoint: &AuthorizedBlockdCheckpoint| {
+                    validate_authorized_blockd_checkpoint(checkpoint).is_ok()
+                        && checkpoint_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                            .is_some_and(|runtime| {
+                                runtime.desired_revision == desired.desired_revision
+                                    && runtime.spec_digest == desired.spec_digest
+                                    && runtime.node_id == desired.placement.node_id
+                                    && runtime.placement_epoch
+                                        == desired.placement.placement_epoch
+                                    && matches!(
+                                        &runtime.step,
+                                        ReconcileStep::CleanupRelease { cleanup }
+                                            if matches!(
+                                                &cleanup.target,
+                                                cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                                                    volume_id,
+                                                    attachment_id,
+                                                    attachment_epoch,
+                                                } if Some(volume_id) == scanned_volume_id.as_ref()
+                                                    && attachment_id == &checkpoint.attachment.identity.attachment_id
+                                                    && *attachment_epoch == checkpoint.attachment.identity.attachment_epoch
+                                                    && cleanup.volume_release.is_some()
+                                            )
+                                    )
+                            })
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+            let reclaim_checkpoint: Option<AuthorizedBlockdCheckpoint> = None;
             let recoverable_publication_window = matches!(
                 (
                     by_name.contains_key(IDENTITY_FILE),
@@ -3189,22 +3398,23 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     | (true, false, true, false, false, false, 2)
                     | (true, false, true, false, false, true, 3)
             );
-            if [
-                IDENTITY_TEMP,
-                AUTHORIZED_SERVING_TEMP,
-                LAUNCH_CHECKPOINT_TEMP,
-                ".cache.data.init",
-                ".dirty.bitmap.init",
-            ]
-            .into_iter()
-            .any(|name| by_name.contains_key(name))
-                || [
-                    IDENTITY_FILE,
-                    AUTHORIZED_SERVING_FILE,
-                    LAUNCH_CHECKPOINT_FILE,
+            if reclaim_checkpoint.is_none()
+                && ([
+                    IDENTITY_TEMP,
+                    AUTHORIZED_SERVING_TEMP,
+                    LAUNCH_CHECKPOINT_TEMP,
+                    ".cache.data.init",
+                    ".dirty.bitmap.init",
                 ]
                 .into_iter()
-                .any(|name| !by_name.contains_key(name))
+                .any(|name| by_name.contains_key(name))
+                    || [
+                        IDENTITY_FILE,
+                        AUTHORIZED_SERVING_FILE,
+                        LAUNCH_CHECKPOINT_FILE,
+                    ]
+                    .into_iter()
+                    .any(|name| !by_name.contains_key(name)))
             {
                 scan.complete = false;
                 if recoverable_publication_window {
@@ -3225,65 +3435,127 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                             scan.unattributed_incomplete = true;
                             continue;
                         }
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Epoch {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                                attachment_name: attachment_name.clone(),
-                                epoch_name: epoch_name.clone(),
-                            },
-                        );
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Epoch {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                            attachment_name: attachment_name.clone(),
+                            epoch_name: epoch_name.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        if by_name.is_empty() {
+                            scan.recoverable_cleanup_prefixes.insert(
+                                prefix,
+                                Arc::new(
+                                    super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                        &[
+                                            (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                            (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                            (&volume_directory, attachment_entry.name.as_os_str(), &attachment_directory),
+                                            (&attachment_directory, epoch_entry.name.as_os_str(), &epoch_directory),
+                                        ],
+                                        context,
+                                    )?,
+                                ),
+                            );
+                        }
                     } else {
                         scan.unattributed_incomplete = true;
                     }
                 }
                 continue;
             }
-            let Some(identity_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[IDENTITY_FILE],
-                root,
-                MAX_IDENTITY_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let Some(attachment_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[AUTHORIZED_SERVING_FILE],
-                root,
-                MAX_AUTHORIZED_SERVING_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let Some(checkpoint_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[LAUNCH_CHECKPOINT_FILE],
-                root,
-                MAX_LAUNCH_CHECKPOINT_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
+            let reclaim_in_progress = reclaim_checkpoint.is_some();
+            let checkpoint = if let Some(checkpoint) = reclaim_checkpoint {
+                if let Some(entry) = by_name.get(IDENTITY_FILE) {
+                    let Some(bytes) = read_strict_regular_at(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        MAX_IDENTITY_BYTES,
+                        context,
+                    )?
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    let identity: AttachmentLineageIdentity =
+                        decode_exact_json(&bytes, "reclaim attachment identity")?;
+                    anyhow::ensure!(
+                        identity == checkpoint.attachment.identity,
+                        "reclaim attachment identity conflicts with its launch checkpoint"
+                    );
+                }
+                if let Some(entry) = by_name.get(AUTHORIZED_SERVING_FILE) {
+                    let Some(bytes) = read_strict_regular_at(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        MAX_AUTHORIZED_SERVING_BYTES,
+                        context,
+                    )?
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    let attachment: AuthorizedServingAttachment =
+                        decode_exact_json(&bytes, "reclaim authorized serving attachment")?;
+                    anyhow::ensure!(
+                        attachment == checkpoint.attachment,
+                        "reclaim serving attachment conflicts with its launch checkpoint"
+                    );
+                }
+                checkpoint
+            } else {
+                let Some(identity_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[IDENTITY_FILE],
+                    root,
+                    MAX_IDENTITY_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let Some(attachment_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[AUTHORIZED_SERVING_FILE],
+                    root,
+                    MAX_AUTHORIZED_SERVING_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let Some(checkpoint_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[LAUNCH_CHECKPOINT_FILE],
+                    root,
+                    MAX_LAUNCH_CHECKPOINT_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
 
-            let identity: AttachmentLineageIdentity =
-                decode_exact_json(&identity_bytes, "attachment identity")?;
-            let attachment: AuthorizedServingAttachment =
-                decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
-            let checkpoint: AuthorizedBlockdCheckpoint =
-                decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
-            validate_authorized_blockd_checkpoint(&checkpoint)?;
-            anyhow::ensure!(
-                identity == attachment.identity && attachment == checkpoint.attachment,
-                "authorized blockd files do not form one exact lineage"
-            );
+                let identity: AttachmentLineageIdentity =
+                    decode_exact_json(&identity_bytes, "attachment identity")?;
+                let attachment: AuthorizedServingAttachment =
+                    decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
+                let checkpoint: AuthorizedBlockdCheckpoint =
+                    decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
+                validate_authorized_blockd_checkpoint(&checkpoint)?;
+                anyhow::ensure!(
+                    identity == attachment.identity && attachment == checkpoint.attachment,
+                    "authorized blockd files do not form one exact lineage"
+                );
+                checkpoint
+            };
+            let attachment = checkpoint.attachment.clone();
+            let identity = attachment.identity.clone();
             let stop_target = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_FILE) {
                 read_strict_regular_at(
                     &epoch_directory,
@@ -3351,7 +3623,14 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 .into_iter()
                 .filter(|name| by_name.contains_key(*name))
                 .count();
-            let control_state = if present_control_files == 0 {
+            let control_state = if reclaim_in_progress {
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                {
+                    AuthorizedBlockdControlState::ReclaimInProgress
+                }
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                unreachable!("reclaim checkpoint cannot exist without the compatibility feature")
+            } else if present_control_files == 0 {
                 AuthorizedBlockdControlState::NotStarted
             } else if present_control_files == control_files.len() {
                 let root_metadata = root.metadata().context("inspect retained state root")?;
@@ -3692,6 +3971,23 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 continue;
             }
             scan.candidate_volume_ids.insert(identity.volume_id.clone());
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let reclaim = Arc::new(super::residue_reclaim::RetainedDataDirectory::from_scanner(
+                &directory,
+                &cat_entry.name,
+                &cat_directory,
+                &volume_entry.name,
+                &volume_directory,
+                &attachment_entry.name,
+                &attachment_directory,
+                &epoch_entry.name,
+                &epoch_directory,
+                data_directory.clone(),
+                by_name
+                    .values()
+                    .map(|entry| (entry.name.as_os_str(), &entry.metadata)),
+                context,
+            )?);
             anyhow::ensure!(
                 scan.evidence
                     .entry(desired.cat_id.clone())
@@ -3700,12 +3996,16 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                         identity.volume_id.clone(),
                         AuthorizedBlockdInventoryEvidence {
                             data_directory,
+                            #[cfg(feature = "proposed-node-residue-reclamation")]
+                            allocated_bytes,
                             checkpoint,
                             binding,
                             control_state,
                             retained_root_process,
                             target_control_launch,
                             stop_receipt_socket,
+                            #[cfg(feature = "proposed-node-residue-reclamation")]
+                            reclaim,
                         },
                     )
                     .is_none(),
@@ -3835,7 +4135,7 @@ fn scan_unassigned_cat_data_with_projection_barrier(
             projection_barrier,
         )?;
         let observed = match exact {
-            UnassignedVolumeLineageScan::Readable(exact) => exact,
+            UnassignedVolumeLineageScan::Readable(exact) => *exact,
             UnassignedVolumeLineageScan::Unreadable => {
                 let Some(residue) =
                     unreadable_data_residue(&volume_path, volume_hint, allocated_bytes)
@@ -3862,7 +4162,7 @@ fn scan_unassigned_cat_data_with_projection_barrier(
 }
 
 enum UnassignedVolumeLineageScan {
-    Readable(NodeResidue),
+    Readable(Box<NodeResidue>),
     Unreadable,
     Unstable,
 }
@@ -3909,7 +4209,7 @@ fn scan_unassigned_volume_lineage_at(
     let Some(epoch_name) = epoch_directory_entry.name.to_str() else {
         return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
-    let epoch_path = volume_path.join(&attachment_name).join(&epoch_name);
+    let epoch_path = volume_path.join(attachment_name).join(epoch_name);
     let Some(allocated_bytes) =
         observed_allocated_bytes_at(&epoch_directory, root, entry_budget, context, maximum_depth)?
     else {
@@ -4017,7 +4317,7 @@ fn scan_unassigned_volume_lineage_at(
     ) {
         return Ok(UnassignedVolumeLineageScan::Unstable);
     }
-    Ok(UnassignedVolumeLineageScan::Readable(
+    Ok(UnassignedVolumeLineageScan::Readable(Box::new(
         NodeResidue::DataDirectory {
             #[cfg(feature = "proposed-node-residue-reclamation")]
             cat_id_hint: Some(checkpoint.desired.cat_id.clone()),
@@ -4074,7 +4374,7 @@ fn scan_unassigned_volume_lineage_at(
                 fenced: false,
             },
         },
-    ))
+    )))
 }
 
 fn validate_residue_pending_packs_at(
@@ -10095,6 +10395,8 @@ mod tests {
         SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
         VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
     };
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    use cats_api::runtime_reconciliation::{LastVolumeTransition, ReleaseRequest, ReleaseResult};
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
         LowerHexSha256,
@@ -12133,6 +12435,8 @@ mod tests {
             .take_node_global_network_admission()
             .expect("filesystem scan lacks its sealed network authority");
         let kernel_nbd_scan = inventory.take_kernel_nbd_pool_admission();
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim_scan = inventory.take_data_directory_reclaim_admission();
         let coordinates = scan_context.coordinates().clone();
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
@@ -12157,6 +12461,9 @@ mod tests {
         let process = process_scan.bind(&observation).unwrap();
         let network = network_scan.bind(&observation).unwrap();
         let kernel_nbd = kernel_nbd_scan.map(|scan| scan.bind(&observation).unwrap());
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim =
+            data_directory_reclaim_scan.map(|scan| scan.bind(&observation).unwrap());
         let desired = coordinates
             .desired
             .desired_specs
@@ -12187,6 +12494,13 @@ mod tests {
         };
         let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
             .bind_assigned_cats_for_test(&coordinates.desired);
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let admission = match data_directory_reclaim {
+            Some(data_directory_reclaim) => {
+                admission.with_data_directory_reclaim_for_test(data_directory_reclaim)
+            }
+            None => admission,
+        };
         let context = RuntimeDesiredEffectContext::for_test_with_admission(
             state_directory,
             Instant::now() + Duration::from_secs(5),
@@ -20095,6 +20409,311 @@ mod tests {
         for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {
             assert!(!fixture.data_directory.join(name).exists(), "{name}");
         }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn released_cleanup_fixture(environment: &TestEnvironment) -> FullRootScannerFixture {
+        let mut fixture = full_root_scanner_fixture(environment);
+        let (desired_revision, desired_digest) = {
+            let desired = &mut fixture.scan_context.coordinates_mut().desired.desired_specs[0];
+            desired.target = RuntimeTarget::Cold;
+            desired.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+            desired.spec_digest = spec_digest(desired).unwrap();
+            (desired.desired_revision, desired.spec_digest.clone())
+        };
+        let attachment = fixture.acquired.attachment.clone();
+        let release_transition_id = RandomId128::new("edededededededededededededededed").unwrap();
+        let resulting_epoch =
+            FenceEpoch::new(attachment.identity.attachment_epoch.get() + 1).unwrap();
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+            },
+            inventory_session: fixture.scan_context.coordinates().session.clone(),
+            inventory_epoch: fixture.scan_context.coordinates().inventory_epoch,
+            inventory_read_position: fixture.scan_context.coordinates().desired.read_position,
+            desired_read_position: fixture.scan_context.coordinates().desired.read_position,
+            volume_release: Some(VolumeReleaseReplay {
+                release_transition_id: release_transition_id.clone(),
+                generation: fixture.record.head.generation,
+                disposition: fixture.acquired.volume.disposition.clone(),
+            }),
+        };
+        let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        checkpoint.desired_revision = desired_revision;
+        checkpoint.spec_digest = desired_digest;
+        checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: cleanup.clone(),
+        };
+        checkpoint.updated_at_unix_ms =
+            UnixMillis::new(checkpoint.updated_at_unix_ms.get() + 1).unwrap();
+        let store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        fixture.stored_checkpoint = store
+            .replace(&fixture.stored_checkpoint, &checkpoint)
+            .unwrap();
+
+        fixture.record.lease_owner = None;
+        fixture.record.lease_epoch = resulting_epoch;
+        fixture.record.lease_expires_at = None;
+        fixture.record.last_transition = Some(LastVolumeTransition::Release {
+            request: ReleaseRequest {
+                volume_id: attachment.identity.volume_id.clone(),
+                transition_id: release_transition_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                expected_epoch: attachment.identity.attachment_epoch,
+            },
+            result: ReleaseResult {
+                volume_id: attachment.identity.volume_id.clone(),
+                transition_id: release_transition_id,
+                released_attachment_id: attachment.identity.attachment_id.clone(),
+                resulting_epoch,
+                resulting_head: fixture.record.head.clone(),
+            },
+        });
+        fixture
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn released_cleanup_projects_data_directory_residue_with_retained_reclaim_admission() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        let attachment = fixture.acquired.attachment.clone();
+
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("exact released cleanup must remain a complete inventory")
+        };
+        assert!(inventory.runtimes()[0].volumes[0].local_lineages.is_empty());
+        assert!(matches!(
+            inventory.residue(),
+            [NodeResidue::DataDirectory {
+                cat_id_hint: Some(cat_id),
+                disk_id_hint: Some(disk_id),
+                volume_id_hint: Some(volume_id),
+                retention_reason: DataDirectoryRetentionReason::ExactReclaimPending,
+                lineage: ResidueLineageEvidence::Readable { lineage },
+                ..
+            }] if cat_id == &fixture.acquired.desired.cat_id
+                && disk_id == &fixture.acquired.volume.disk_id
+                && volume_id == &fixture.acquired.volume.volume_id
+                && lineage.attachment_id == attachment.identity.attachment_id
+                && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                && lineage.acquisition == attachment.acquire
+                && lineage.local_durable_generation == lineage.remote_durable_generation
+                && lineage.pending_pack_count.get() == 0
+                && lineage.fenced
+        ));
+        assert!(inventory.take_data_directory_reclaim_admission().is_some());
+        assert!(fixture.data_directory.exists());
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    struct ExactReleasedResidueAuthority {
+        record: VolumeRecord,
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    struct EmptyResidueNetworkBridge;
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl network_inventory_bridge_sealed::Sealed for EmptyResidueNetworkBridge {}
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl NetworkInventoryBridge for EmptyResidueNetworkBridge {
+        fn inspect_all(
+            &self,
+            _checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<NetworkInventoryBridgeOutcome> {
+            Ok(NetworkInventoryBridgeOutcome::Complete(
+                NodeGlobalNetworkScanAdmission::empty_for_test(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl super::super::residue_reclaim::ResidueAuthorityPort for ExactReleasedResidueAuthority {
+        fn request(
+            &self,
+            request: &cats_api::runtime_reconciliation::RuntimeResidueAuthorityRequest,
+            _deadline: Instant,
+        ) -> Result<
+            super::super::RuntimeResidueAuthorityAttempt,
+            cats_api::runtime_reconciliation::ContractError,
+        > {
+            Ok(super::super::RuntimeResidueAuthorityAttempt::Qualified(
+                Box::new(
+                    cats_api::runtime_reconciliation::RuntimeResidueAuthoritySuccess {
+                        version: ContractVersion::V1,
+                        session: request.session.clone(),
+                        lineage: request.lineage.clone(),
+                        outcome: cats_api::runtime_reconciliation::RuntimeResidueAuthorityOutcome::Reclaimable {
+                            proof: Box::new(
+                                cats_api::runtime_reconciliation::ResidueReclaimProof::OrdinaryRelease {
+                                    current_volume: self.record.clone(),
+                                },
+                            ),
+                        },
+                    },
+                ),
+            ))
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn checkpointed_exact_release_proof_reclaims_the_retained_data_directory() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        )
+        .with_network_bridge(Arc::new(EmptyResidueNetworkBridge));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("exact released cleanup must form a complete reclaim admission")
+        };
+        let context = bind_inventory_for_running_effect(
+            inventory,
+            &fixture.scan_context,
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let desired = &fixture.scan_context.coordinates().desired.desired_specs[0];
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        let checkpoint_bytes = std::fs::read(store.path()).unwrap();
+        let current = store.assert_current(&stored).unwrap();
+        let effect = super::super::DataDirectoryReclaimEffect::for_test(Arc::new(
+            ExactReleasedResidueAuthority {
+                record: fixture.record.clone(),
+            },
+        ));
+
+        assert_eq!(
+            effect
+                .try_apply(&context, desired, &store, &stored, &current)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(!fixture.data_directory.exists());
+        assert_eq!(std::fs::read(store.path()).unwrap(), checkpoint_bytes);
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn restart_rediscovers_a_partial_reclaim_from_the_retained_launch_checkpoint() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        std::fs::remove_file(fixture.data_directory.join(IDENTITY_FILE)).unwrap();
+        std::fs::remove_file(fixture.data_directory.join(AUTHORIZED_SERVING_FILE)).unwrap();
+
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        )
+        .with_network_bridge(Arc::new(EmptyResidueNetworkBridge));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("partial reclaim with its launch anchor must remain rediscoverable")
+        };
+        let context = bind_inventory_for_running_effect(
+            inventory,
+            &fixture.scan_context,
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let desired = &fixture.scan_context.coordinates().desired.desired_specs[0];
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        let current = store.assert_current(&stored).unwrap();
+        let effect = super::super::DataDirectoryReclaimEffect::for_test(Arc::new(
+            ExactReleasedResidueAuthority {
+                record: fixture.record.clone(),
+            },
+        ));
+
+        assert_eq!(
+            effect
+                .try_apply(&context, desired, &store, &stored, &current)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(!fixture.data_directory.exists());
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn restart_finishes_an_empty_reclaim_prefix_only_after_the_exact_release_successor() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        for entry in std::fs::read_dir(&fixture.data_directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let recovery_context = RuntimePreScanRecoveryContext::for_test(
+            StateDirectory::unanchored(environment.state.clone()),
+            fixture.scan_context.coordinates().clone(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(matches!(
+            classify_local_publication_recovery(&recovery_context).unwrap(),
+            LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix { cat_id, .. }
+                if cat_id == fixture.acquired.desired.cat_id
+        ));
+        let (authority, _) = TestVolumeDataAuthority::exact(fixture.record.clone());
+        let outcome = SignedRunningPublicationRecovery::new(authority)
+            .recover_one(recovery_context)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                RuntimePreScanRecoveryOutcome::Recovered { ref cat_id }
+                    if cat_id == &fixture.acquired.desired.cat_id
+            ),
+            "unexpected empty-prefix recovery outcome: {outcome:?}"
+        );
+        assert!(!fixture.data_directory.exists());
+        assert!(!fixture
+            .data_directory
+            .ancestors()
+            .nth(3)
+            .expect("fixture has a Cat directory")
+            .exists());
     }
 
     #[test]

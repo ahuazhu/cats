@@ -48,6 +48,8 @@ use super::clean_slate_probes::{
 use super::clean_slate_probes::{
     runtime_checkpoint_recovery_set, InstalledStaleBootVmmRecoveryPorts,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use super::recover_lifecycle_release_from_authority;
 use super::serving_handoff::ServingHandoffStore;
 use super::DisposableRootDeleteAttempt;
 #[cfg(test)]
@@ -645,6 +647,83 @@ impl SignedRunningPublicationRecovery {
         })
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn recover_released_data_directory_prefix(
+        &self,
+        context: &RuntimePreScanRecoveryContext,
+        cat_id: &Id,
+        retained: &super::residue_reclaim::RetainedEmptyDataDirectoryPrefix,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        let desired = context
+            .coordinates()
+            .desired
+            .desired_specs
+            .iter()
+            .find(|desired| &desired.cat_id == cat_id)
+            .context("released data-prefix Cat is absent from current Desired")?;
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store =
+            FileCheckpointStore::open_preserving_checkpoint_temp(&checkpoint_directory, cat_id)
+                .context("open released data-prefix checkpoint store")?;
+        let Some(stored) = store
+            .load()
+            .context("load released data-prefix checkpoint")?
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let ReconcileStep::CleanupRelease { cleanup } = &stored.checkpoint().step else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let CleanupTarget::Volume { volume_id, .. } = &cleanup.target else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let Some(volume) = desired
+            .volumes
+            .iter()
+            .find(|volume| &volume.volume_id == volume_id)
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let Some(expected_generation) = cleanup
+            .volume_release
+            .as_ref()
+            .map(|replay| replay.generation)
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        context.check_active()?;
+        let record = match self.authority.load_volume(volume_id) {
+            Ok(record) => record,
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        if record.head.generation != expected_generation {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        }
+        let request = release_transition_request(desired, cleanup.clone());
+        let recovery =
+            recover_lifecycle_release_from_authority(&request, volume, &record.head, &record);
+        if !matches!(recovery, Ok(NormalReleaseAuthorityRecovery::Released(_))) {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        }
+        let current = store
+            .assert_current(&stored)
+            .context("retain released data-prefix checkpoint")?;
+        context.check_active()?;
+        store
+            .revalidate_current(&stored, &current)
+            .context("revalidate released data-prefix checkpoint before unlink")?;
+        let physical = context.inventory_context();
+        retained
+            .reclaim_after_exact_release(&physical)
+            .context("remove exact empty released data-directory prefix")?;
+        store
+            .revalidate_current(&stored, &current)
+            .context("revalidate released data-prefix checkpoint after unlink")?;
+        Ok(RuntimePreScanRecoveryOutcome::Recovered {
+            cat_id: cat_id.clone(),
+        })
+    }
+
     fn recover_root_provision_stop_receipt(
         &self,
         context: &RuntimePreScanRecoveryContext,
@@ -782,6 +861,10 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             }
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id, false)
+            }
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix { cat_id, retained } => {
+                self.recover_released_data_directory_prefix(&context, &cat_id, retained.as_ref())
             }
             LocalPublicationRecoveryEvidence::AuthorizedBlockdTakeoverPublication { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id, true)

@@ -217,8 +217,14 @@ impl SignedRunningProcessPorts {
 }
 
 impl SignedRunningEffect {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "production composition keeps each signed authority and physical port explicit"
+    )]
     pub(crate) fn platform(
         acquire: SignedRunningAcquireEffect,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        residue_authority: super::RuntimeVolumeTransitionHttpClient,
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
         host: SignedRunningHostConfig,
@@ -319,6 +325,8 @@ impl SignedRunningEffect {
                 Arc::clone(&process_ports.serving_global),
                 Arc::clone(&process_ports.vmm_global),
                 kernel_nbd_detach,
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                residue_authority,
             )),
             acquire,
             provision: SignedRootProvisionEffect::platform(

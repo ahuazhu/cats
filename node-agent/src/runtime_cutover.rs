@@ -570,6 +570,8 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         let volume_evidence: Arc<dyn SignedVolumeEvidencePort> = Arc::new(
             ControlBlockingSignedVolumeEvidenceClient::new(volume_transition_transport.clone()),
         );
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let residue_authority = volume_transition_transport.clone();
         let acquire = SignedRunningAcquireEffect::new(
             Arc::new(ControlSignedNormalAcquireClient::new(
                 volume_transition_transport,
@@ -585,6 +587,8 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 let process_ports = $process_ports;
                 let effect = SignedRunningEffect::platform(
                     acquire,
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    residue_authority.clone(),
                     Arc::clone(&effect_volume_authority),
                     effect_blob_store,
                     SignedRunningHostConfig::new(

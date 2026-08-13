@@ -52,6 +52,8 @@ mod network;
 mod normal_acquire;
 mod persistent_filesystem;
 mod prepare_device_retirement;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+mod residue_reclaim;
 mod retained_runtime_launch;
 mod root_provision;
 mod route_retirement;
@@ -203,6 +205,10 @@ pub use normal_acquire::{
 #[cfg(feature = "proposed-node-residue-reclamation")]
 pub use normal_acquire::{residue_authority_request_from_observed, RuntimeResidueAuthorityAttempt};
 pub(crate) use persistent_filesystem::PersistentFilesystemEffect;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub(crate) use residue_reclaim::{
+    DataDirectoryReclaimAdmission, DataDirectoryReclaimEffect, DataDirectoryReclaimScanAdmission,
+};
 pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,

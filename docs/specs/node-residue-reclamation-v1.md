@@ -5,11 +5,11 @@
 - Volume authority: [ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
 - Observation contract: [Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 
-This note records the clean-slate wire and recovery design implemented for
-review in `feat/108-residue-reporting`. It does not amend either accepted ADR.
-Until this proposal is accepted and the physical reclaimer has its durable
-restart record, every reported residue remains retained and lifecycle/route
-admission remains fail-closed.
+This note records the clean-slate wire and recovery design first reviewed in
+`feat/108-residue-reporting`. It does not amend either accepted ADR and is not
+an independent authority. The N2 release composition implements the bounded
+parts below under ADR-0040/0042; residue outside those exact inputs remains
+retained and lifecycle/route admission remains fail-closed.
 
 ## 1. Observation is not authority
 
@@ -60,13 +60,12 @@ checkpoint as process, route or mutation authority.
 
 ## 2. Exact Control query
 
-The proposed signed endpoint name is
-`POST /v1/internal/runtime/residue-authority`, but the production router does
-not install it while this document remains Proposed. Its read-only Store seam
-uses the common current AgentSession proof and binds the request lineage's
-Node to that authenticated session. Control evaluates one exact lineage in one
-repeatable-read PostgreSQL snapshot and returns the same session and lineage
-plus exactly one outcome:
+The signed endpoint is `POST /v1/internal/runtime/residue-authority`. The N2
+production router installs it through the normal authenticated internal
+runtime route. Its read-only Store seam uses the common current AgentSession
+proof and binds the request lineage's Node to that authenticated session.
+Control evaluates one exact lineage in one repeatable-read PostgreSQL snapshot
+and returns the same session and lineage plus exactly one outcome:
 
 - `retained { reason }`, which is diagnostic only; or
 - `reclaimable { proof }`, containing one of the three proofs in §3.
@@ -81,9 +80,9 @@ this seam cannot become a metadata-existence oracle.
 
 The query is read-only. Response loss is resolved by repeating the same exact
 query; no reply is a deletion authorization. Missing, duplicate, split or
-corrupt authority rows fail closed. Enabling the HTTP route or using a proof
-for physical deletion requires a separately accepted decision and release
-composition change.
+corrupt authority rows fail closed. HTTP 401 and the exact typed 403 identity
+failure surface reauthentication and session replacement respectively;
+transport ambiguity retains the residue.
 
 ## 3. Closed reclaim proofs
 
@@ -109,16 +108,22 @@ pair always remain retained. Observation fields, directory names, audit logs,
 timeouts, lease expiry and ownership-token hints cannot substitute for these
 proofs.
 
-## 4. Physical effect remains a separate acceptance item
+## 4. Bounded physical effect
 
-Even a closed Control proof is insufficient by itself. A future physical
-reclaimer must retain an already-open descriptor to the scanned directory,
-revalidate its device/inode and complete child set, prove the exact local
-lineage and absence of every live process, device, mount, network and socket
-owner, then persist a bounded restart checkpoint before the first unlink. It
-must unlink only descriptor-relative validated entries and fsync each parent.
+Even a closed Control proof is insufficient by itself. The N2 DataDirectory
+effect retains the scanner-opened descriptor chain, revalidates its
+device/inode and complete child set, proves the exact local lineage and absence
+of every live process, device, mount, network and socket owner, and revalidates
+the durable `CleanupRelease::Volume` RuntimeCheckpoint before the first
+unlink. It unlinks only descriptor-relative validated entries and fsyncs each
+parent.
 
 Blind `remove_dir_all`, path re-resolution after qualification and best-effort
-cleanup are forbidden. Crash, cancellation, restart and ambiguous completion
-must rediscover the checkpoint and exact postcondition. This reporting/query
-slice deliberately installs no physical data-directory deletion effect.
+cleanup are forbidden. The immutable launch checkpoint is removed last as the
+bounded restart anchor. A restart with that anchor re-forms the exact lineage;
+an empty suffix left after its unlink is settled only after the durable cleanup
+checkpoint and fresh ordinary Release successor are both revalidated.
+
+The current Node inventory port cannot supply V2 normal-delete or disposable-
+Root completion receipts after their Volume row is gone. Those two proof kinds,
+and every other residue target, therefore remain fail-closed in this release.

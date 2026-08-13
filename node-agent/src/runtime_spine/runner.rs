@@ -23,6 +23,10 @@ use cats_api::runtime_reconciliation::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use crate::runtime::reconciliation::{
+    DataDirectoryReclaimAdmission, DataDirectoryReclaimScanAdmission,
+};
 use crate::runtime::reconciliation::{
     KernelNbdPoolAdmission, KernelNbdPoolScanAdmission, NodeGlobalManagedProcessAdmission,
     NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkAdmission,
@@ -289,6 +293,8 @@ pub struct RuntimeDesiredEffectContext {
     node_global_network: Option<NodeGlobalNetworkAdmission>,
     kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     running_tail: Option<RunningTailAdmission>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    data_directory_reclaim: Option<DataDirectoryReclaimAdmission>,
     node_global_effect_gate: Arc<NodeGlobalEffectGate>,
     node_global_effect_open: Arc<AtomicBool>,
     effect_worker_id: u64,
@@ -525,9 +531,15 @@ pub struct RuntimeDesiredEffectAdmission {
     node_global_network: Option<NodeGlobalNetworkAdmission>,
     kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     running_tail: Option<RunningTailAdmission>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    data_directory_reclaim: Option<DataDirectoryReclaimAdmission>,
 }
 
 impl RuntimeDesiredEffectAdmission {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each provider-private scan proof stays an explicit member of one accepted full observation"
+    )]
     fn from_acceptance(
         mut session: AgentSession,
         observation: NodeObservation,
@@ -536,10 +548,19 @@ impl RuntimeDesiredEffectAdmission {
         node_global_network: Option<NodeGlobalNetworkAdmission>,
         kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
         running_tail: Option<RunningTailAdmission>,
+        #[cfg(feature = "proposed-node-residue-reclamation")] data_directory_reclaim: Option<
+            DataDirectoryReclaimAdmission,
+        >,
     ) -> Option<Self> {
         let ObservationInventoryAcceptance::Full { attestation } = &acceptance.inventory else {
             return None;
         };
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim_matches = data_directory_reclaim
+            .as_ref()
+            .is_none_or(|admission| admission.matches_observation(&observation));
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+        let data_directory_reclaim_matches = true;
         if !super::acceptance_matches_observation(acceptance, &observation)
             || session.node_id != observation.node_id
             || session.node_boot_id != observation.node_boot_id
@@ -559,6 +580,7 @@ impl RuntimeDesiredEffectAdmission {
             || running_tail
                 .as_ref()
                 .is_some_and(|admission| !admission.matches_observation(&observation))
+            || !data_directory_reclaim_matches
         {
             return None;
         }
@@ -573,6 +595,8 @@ impl RuntimeDesiredEffectAdmission {
             node_global_network,
             kernel_nbd_pool,
             running_tail,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim,
         })
     }
 
@@ -631,6 +655,8 @@ impl RuntimeDesiredEffectAdmission {
             node_global_network: None,
             kernel_nbd_pool: None,
             running_tail: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
         }
     }
 
@@ -652,6 +678,15 @@ impl RuntimeDesiredEffectAdmission {
     #[cfg(test)]
     pub(crate) fn with_running_tail_for_test(mut self, admission: RunningTailAdmission) -> Self {
         self.running_tail = Some(admission);
+        self
+    }
+
+    #[cfg(all(test, feature = "proposed-node-residue-reclamation"))]
+    pub(crate) fn with_data_directory_reclaim_for_test(
+        mut self,
+        admission: DataDirectoryReclaimAdmission,
+    ) -> Self {
+        self.data_directory_reclaim = Some(admission);
         self
     }
 }
@@ -678,6 +713,10 @@ impl RuntimeDesiredEffectContext {
         let running_tail = accepted_full
             .as_ref()
             .and_then(|admission| admission.running_tail.clone());
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim = accepted_full
+            .as_ref()
+            .and_then(|admission| admission.data_directory_reclaim.clone());
         Self {
             state_directory,
             deadline,
@@ -687,6 +726,8 @@ impl RuntimeDesiredEffectContext {
             node_global_network,
             kernel_nbd_pool,
             running_tail,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim,
             node_global_effect_gate,
             node_global_effect_open,
             effect_worker_id,
@@ -762,6 +803,11 @@ impl RuntimeDesiredEffectContext {
         self.running_tail.as_ref()
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) fn optional_data_directory_reclaim(&self) -> Option<&DataDirectoryReclaimAdmission> {
+        self.data_directory_reclaim.as_ref()
+    }
+
     /// Serializes the use of one accepted full scan as Node-global mutation
     /// authority while leaving Cat-local reconciliation independent. The
     /// caller must acquire this only after it has classified its exact Cat
@@ -817,6 +863,8 @@ impl RuntimeDesiredEffectContext {
             node_global_network: None,
             kernel_nbd_pool: None,
             running_tail: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
             node_global_effect_gate: Arc::new(NodeGlobalEffectGate::default()),
             node_global_effect_open: Arc::new(AtomicBool::new(true)),
             effect_worker_id: next_runtime_effect_worker_id(),
@@ -1027,6 +1075,8 @@ pub struct CompleteRuntimeInventory {
     node_global_network: Option<Box<NodeGlobalNetworkScanAdmission>>,
     kernel_nbd_pool: Option<Box<KernelNbdPoolScanAdmission>>,
     running_tail: Option<Box<RunningTailScanAdmission>>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    data_directory_reclaim: Option<Box<DataDirectoryReclaimScanAdmission>>,
 }
 
 impl CompleteRuntimeInventory {
@@ -1048,6 +1098,8 @@ impl CompleteRuntimeInventory {
             node_global_network: None,
             kernel_nbd_pool: None,
             running_tail: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
         }
     }
 
@@ -1103,6 +1155,24 @@ impl CompleteRuntimeInventory {
         self.running_tail.take().map(|admission| *admission)
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) fn with_data_directory_reclaim_admission(
+        mut self,
+        admission: Option<DataDirectoryReclaimScanAdmission>,
+    ) -> Self {
+        self.data_directory_reclaim = admission.map(Box::new);
+        self
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) fn take_data_directory_reclaim_admission(
+        &mut self,
+    ) -> Option<DataDirectoryReclaimScanAdmission> {
+        self.data_directory_reclaim
+            .take()
+            .map(|admission| *admission)
+    }
+
     fn residue_sources(&self) -> Vec<InventorySource> {
         self.residue_sources.iter().copied().collect()
     }
@@ -1146,6 +1216,8 @@ impl CompleteRuntimeInventory {
             node_global_network: None,
             kernel_nbd_pool: None,
             running_tail: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
         }
     }
 
@@ -2604,6 +2676,8 @@ pub struct RuntimeSpineRunner {
     current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
     current_process_kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
     current_process_running_tail: Option<RunningTailAdmission>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    current_process_data_directory_reclaim: Option<DataDirectoryReclaimAdmission>,
     effect_admission_open: bool,
     effect_admission: Option<RuntimeDesiredEffectAdmission>,
     node_global_effect_gate: Option<Arc<NodeGlobalEffectGate>>,
@@ -2769,6 +2843,8 @@ impl RuntimeSpineRunner {
             current_process_node_global_network: None,
             current_process_kernel_nbd_pool: None,
             current_process_running_tail: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            current_process_data_directory_reclaim: None,
             effect_admission_open: false,
             effect_admission: None,
             node_global_effect_gate: None,
@@ -2815,6 +2891,10 @@ impl RuntimeSpineRunner {
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
                 self.current_process_running_tail = None;
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                {
+                    self.current_process_data_directory_reclaim = None;
+                }
                 if self
                     .coordinator_lane
                     .as_ref()
@@ -2955,6 +3035,8 @@ impl RuntimeSpineRunner {
                 let node_global_network = inventory.take_node_global_network_admission();
                 let kernel_nbd_pool = inventory.take_kernel_nbd_pool_admission();
                 let running_tail = inventory.take_running_tail_admission();
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                let data_directory_reclaim = inventory.take_data_directory_reclaim_admission();
                 let mut candidate =
                     build_full_observation_candidate(coordinates.clone(), inventory);
                 if node_observation_exceeds_wire_budget(&candidate)? {
@@ -3013,10 +3095,23 @@ impl RuntimeSpineRunner {
                             "provider-private Running-tail admission conflicts with full observation",
                         )
                     })?;
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                let data_directory_reclaim = data_directory_reclaim
+                    .map(|admission| admission.bind(&candidate))
+                    .transpose()
+                    .map_err(|_| {
+                        RuntimeSpineRunError::InvalidScan(
+                            "provider-private DataDirectory admission conflicts with full observation",
+                        )
+                    })?;
                 self.current_process_node_global_process = node_global_process;
                 self.current_process_node_global_network = node_global_network;
                 self.current_process_kernel_nbd_pool = kernel_nbd_pool;
                 self.current_process_running_tail = running_tail;
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                {
+                    self.current_process_data_directory_reclaim = data_directory_reclaim;
+                }
                 let request = self.journal_lane()?.prepare_observation(candidate).await?;
                 self.current_process_scan_observation_id =
                     Some(request.value().observation_id.clone());
@@ -3442,6 +3537,8 @@ impl RuntimeSpineRunner {
                     let node_global_network = self.current_process_node_global_network.take();
                     let kernel_nbd_pool = self.current_process_kernel_nbd_pool.take();
                     let running_tail = self.current_process_running_tail.take();
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    let data_directory_reclaim = self.current_process_data_directory_reclaim.take();
                     Some(
                         RuntimeDesiredEffectAdmission::from_acceptance(
                             self.registered_session.clone(),
@@ -3451,6 +3548,8 @@ impl RuntimeSpineRunner {
                             node_global_network,
                             kernel_nbd_pool,
                             running_tail,
+                            #[cfg(feature = "proposed-node-residue-reclamation")]
+                            data_directory_reclaim,
                         )
                         .ok_or(RuntimeSpineRunError::InvalidScan(
                             "accepted full observation does not form one effect admission",
@@ -3468,6 +3567,10 @@ impl RuntimeSpineRunner {
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
                 self.current_process_running_tail = None;
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                {
+                    self.current_process_data_directory_reclaim = None;
+                }
                 if establishes_effect_admission {
                     self.effect_admission = admission;
                     self.effect_admission_open = true;
@@ -3496,6 +3599,10 @@ impl RuntimeSpineRunner {
                         self.current_process_node_global_network = None;
                         self.current_process_kernel_nbd_pool = None;
                         self.current_process_running_tail = None;
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        {
+                            self.current_process_data_directory_reclaim = None;
+                        }
                         Ok(RuntimeSpineRunStep::DesiredInvalidated { status, error })
                     }
                     DesiredInvalidationBinding::Mismatch => Ok(RuntimeSpineRunStep::RetryExact(
@@ -5433,6 +5540,8 @@ mod tests {
             None,
             None,
             None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            None,
         )
         .expect("exact private scan binding must enter the effect context");
         assert!(admitted.node_global_process.is_some());
@@ -5454,6 +5563,8 @@ mod tests {
             Some(foreign_private),
             None,
             None,
+            None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
             None,
         )
         .is_none());

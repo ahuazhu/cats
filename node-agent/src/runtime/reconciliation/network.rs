@@ -120,6 +120,12 @@ impl NodeGlobalNetworkScanAdmission {
         Ok(Self { entries, physical })
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new(std::iter::empty(), HostNetworkSnapshot::empty_for_test())
+            .expect("empty network inventory is canonical")
+    }
+
     pub(crate) fn network_projections(&self) -> BTreeMap<Id, Vec<ObservedNetwork>> {
         self.entries
             .iter()

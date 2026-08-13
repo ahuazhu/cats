@@ -1113,6 +1113,8 @@ pub(crate) struct LifecycleStepEffect {
     physical: Arc<dyn LifecyclePhysicalPort>,
     volume_transition: Arc<dyn SignedLifecycleVolumePort>,
     volume_authority: Arc<dyn VolumeDataAuthority>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    data_directory_reclaim: Option<super::DataDirectoryReclaimEffect>,
 }
 
 impl LifecycleStepEffect {
@@ -1123,6 +1125,8 @@ impl LifecycleStepEffect {
         serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
         vmm_process: Arc<dyn VmmProcessGlobalPort>,
         kernel_nbd_detach: Option<Arc<dyn KernelNbdDetachPort>>,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        residue_authority: super::RuntimeVolumeTransitionHttpClient,
     ) -> Self {
         let physical_volume_authority = Arc::clone(&volume_authority);
         Self {
@@ -1136,6 +1140,8 @@ impl LifecycleStepEffect {
             }),
             volume_transition,
             volume_authority,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: Some(super::DataDirectoryReclaimEffect::new(residue_authority)),
         }
     }
 
@@ -1260,6 +1266,17 @@ impl LifecycleStepEffect {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
             }
             if matches!(cleanup.target, CleanupTarget::Volume { .. }) {
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                if let Some(reclaim) = &self.data_directory_reclaim {
+                    if let Some(outcome) =
+                        reclaim.try_apply(context, desired, &store, &stored, &current)?
+                    {
+                        store.revalidate_current(&stored, &current).context(
+                            "revalidate lifecycle checkpoint after DataDirectory reclaim",
+                        )?;
+                        return Ok(Some(outcome));
+                    }
+                }
                 return self
                     .apply_volume_release(
                         context, accepted, desired, runtime, &store, &stored, &current, cleanup,
@@ -4694,6 +4711,8 @@ mod tests {
                 physical: Arc::new(NeverLifecyclePhysical),
                 volume_transition: Arc::clone(&port) as Arc<dyn SignedLifecycleVolumePort>,
                 volume_authority: Arc::new(UnavailableVolumeAuthority),
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                data_directory_reclaim: None,
             };
             let context = deleting_effect_context(&directory, &desired, runtime);
             let outcome = effect.try_apply(&context, &desired).unwrap().unwrap();
