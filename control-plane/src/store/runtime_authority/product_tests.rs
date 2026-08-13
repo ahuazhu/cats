@@ -19,8 +19,12 @@ use cats_api::runtime_reconciliation::{
     VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
+    complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire,
+    AuthorizationRecord, AuthorizationState, DisposableDeleteIsolationBasis,
+    DisposableRootDeleteAuthorization,
     HostFenceEvent, HostFenceEventState, HostIsolationState, LastVolumeTransition, NodeBootId,
-    RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
+    NormalAcquireRequest, RemoteHead, VolumeAdminState, VolumeAuthorization, VolumeDurability,
+    VolumeRecord,
 };
 use postgres::error::SqlState;
 use sha2::{Digest, Sha256};
@@ -33,18 +37,23 @@ use super::product::{
     api_request_fingerprint, candidate_matches_placement_mutation,
     encode_cat_create_accepted_response, encode_cat_name_conflict_response,
     persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
-    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    CoveredDesiredMutationError, CoveredDesiredMutationRequest, DesiredMutationCommit,
-    DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate,
-    ExactContentType, ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup,
-    IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
+    CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
+    CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
+    DesiredMutationCommit, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
+    EndpointRecord, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
+    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
+    PersistentDiskInitialization, RuntimeOperationRead,
 };
-use super::product_reads::ProductPageRead;
+use super::product_reads::{ProductPageRead, ProductRead};
 use super::product_rows::{
-    insert_disk, load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
+    insert_cat, insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
+    load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
     operation_by_workspace_candidates_sql,
 };
-use super::rows::{insert_event, insert_volume};
+use super::rows::{
+    database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
+    update_authorization,
+};
 use crate::store::{internal, DsnSource, Store};
 
 const ROUTE: &str = "POST /v1/workspaces/{workspace}/cats";
@@ -3933,6 +3942,242 @@ fn runtime_cat_list_reaches_all_scalar_and_record_workspace_id_combinations() {
             "{drift} candidate escaped the bounded list reachability set"
         );
     }
+}
+
+fn sweep_completed_root_for_product_read(
+    store: &Store,
+    create: &CoveredCatCreateRequest,
+) -> AuthorizationRecord {
+    let mut desired = create.candidate.desired.clone();
+    let root = desired.volumes.first().unwrap().clone();
+    let delete_id = id("delete_product_read");
+    desired.target = RuntimeTarget::Deleted;
+    desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+        delete_id: delete_id.clone(),
+    };
+    desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    desired.spec_digest = spec_digest(&desired).unwrap();
+
+    let VolumeAcquire::Normal {
+        transition_id,
+        expected_unowned_epoch,
+    } = &root.acquire
+    else {
+        panic!("initial Cat Root must use normal acquire")
+    };
+    let (owned, _) = normal_acquire(
+        &create.candidate.volume,
+        &NormalAcquireRequest {
+            volume_id: root.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: root.attachment_id.clone(),
+            expected_unowned_epoch: *expected_unowned_epoch,
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 30_000,
+        },
+        unix_millis(10_000),
+    )
+    .unwrap();
+    let original = AuthorizationRecord {
+        authorization: VolumeAuthorization::DisposableRootDelete(
+            DisposableRootDeleteAuthorization {
+                authorization_id: id("authorization_product_read"),
+                authorized_node_id: desired.placement.node_id.clone(),
+                delete_id,
+                disk_id: root.disk_id.clone(),
+                volume_id: root.volume_id.clone(),
+                cat_id: desired.cat_id.clone(),
+                desired_revision: desired.desired_revision,
+                placement_epoch: desired.placement.placement_epoch,
+                expected_attachment_id: root.attachment_id.clone(),
+                expected_epoch: owned.lease_epoch,
+                expected_head: owned.head.clone(),
+                isolation_basis: DisposableDeleteIsolationBasis::RuntimeStopped {
+                    node_id: desired.placement.node_id.clone(),
+                    agent_session_epoch: epoch(1),
+                    runtime_incarnation: random_id(91),
+                    observation_id: random_id(92),
+                },
+                not_after: unix_millis(50_000),
+            },
+        ),
+        state: AuthorizationState::Unconsumed,
+    };
+    let (deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        None,
+        &original,
+        &id("authorization_product_read"),
+        unix_millis(20_000),
+    )
+    .unwrap();
+    let completion =
+        complete_disposable_root_delete(&deleting, &consumed, unix_millis(40_000)).unwrap();
+    let desired_json = String::from_utf8(encode_desired_runtime_spec(&desired).unwrap()).unwrap();
+
+    store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$2::TEXT::jsonb, spec_digest=$3, target='deleted'
+                      WHERE cat_id=$1",
+                    &[
+                        &desired.cat_id.as_str(),
+                        &desired_json,
+                        &desired.spec_digest.as_str(),
+                    ],
+                )?,
+                1
+            );
+            insert_authorization(transaction, &original)?;
+            update_authorization(transaction, &original, &consumed)?;
+            insert_delete_completion(transaction, &completion)?;
+            assert_eq!(
+                transaction.execute(
+                    "DELETE FROM disk_records WHERE disk_id=$1",
+                    &[&root.disk_id.as_str()],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "DELETE FROM volume_records WHERE volume_id=$1",
+                    &[&root.volume_id.as_str()],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    consumed
+}
+
+#[test]
+fn runtime_cat_read_accepts_only_a_completed_disposable_root_sweep() {
+    let (_url, store, _second, workspace) = stores();
+    let create = request(&workspace, "deleted-read", 1, "deleted-read");
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    sweep_completed_root_for_product_read(&store, &create);
+
+    let ProductRead::Found(cat) = store
+        .get_runtime_cat(&workspace, &create.candidate.cat_id)
+        .unwrap()
+    else {
+        panic!("closed disposable Root completion graph was rejected")
+    };
+    assert_eq!(cat.desired.target, RuntimeTarget::Deleted);
+    assert_eq!(cat.desired.root_disk_id, create.candidate.root_disk.disk_id);
+}
+
+#[test]
+fn runtime_cat_read_rejects_incomplete_duplicate_or_drifted_delete_graphs() {
+    for (index, (case, mutation)) in [
+        ("missing-authorization", "DELETE FROM volume_authorizations"),
+        (
+            "authorization-projection-drift",
+            "UPDATE volume_authorizations
+                SET desired_revision=desired_revision+1",
+        ),
+        (
+            "completion-projection-drift",
+            "UPDATE delete_completion_receipts
+                SET deleting_epoch=deleting_epoch+1",
+        ),
+        (
+            "duplicate-authorization-identity",
+            "INSERT INTO volume_authorizations (
+                authorization_id, record, kind, authorized_node_id,
+                host_fence_event_id, volume_id, state, desired_revision,
+                placement_epoch, lease_duration_ms, not_after, consumed_at
+             ) SELECT
+                'authorization_product_read_duplicate', record, kind,
+                authorized_node_id, host_fence_event_id, volume_id, state,
+                desired_revision, placement_epoch, lease_duration_ms,
+                not_after, consumed_at
+               FROM volume_authorizations",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_url, store, _second, workspace) = stores();
+        let fixture_name = format!("graph-{index}");
+        let create = request(&workspace, &fixture_name, 1, &fixture_name);
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        sweep_completed_root_for_product_read(&store, &create);
+        store.with(|client| client.batch_execute(mutation)).unwrap();
+
+        assert_eq!(
+            store
+                .get_runtime_cat(&workspace, &create.candidate.cat_id)
+                .unwrap(),
+            ProductRead::Corrupt,
+            "{case} escaped the closed disposable Root authority graph"
+        );
+    }
+}
+
+#[test]
+fn runtime_cat_read_does_not_treat_a_projection_hidden_root_row_as_swept() {
+    let (_url, store, _second, workspace) = stores();
+    let create = request(&workspace, "hidden-root", 1, "hidden-root");
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    sweep_completed_root_for_product_read(&store, &create);
+
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: id("cat_sibling"),
+                    workspace_id: workspace.clone(),
+                    name: id("sibling"),
+                    created_at: now,
+                },
+            )?;
+            insert_volume(transaction, &create.candidate.volume)?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: create.candidate.root_disk.disk_id.clone(),
+                    workspace_id: create.candidate.root_disk.workspace_id.clone(),
+                    name: create.candidate.root_disk.name.clone(),
+                    volume_id: create.candidate.root_disk.volume_id.clone(),
+                    size_bytes: create.candidate.root_disk.size_bytes,
+                    durability: create.candidate.root_disk.durability,
+                    created_at: now,
+                    admin_state: create.candidate.root_disk.admin_state.clone(),
+                    role: create.candidate.root_disk.role.clone(),
+                },
+            )?;
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE disk_records SET root_cat_id='cat_sibling'
+                      WHERE disk_id=$1",
+                    &[&create.candidate.root_disk.disk_id.as_str()],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_runtime_cat(&workspace, &create.candidate.cat_id)
+            .unwrap(),
+        ProductRead::Corrupt,
+        "a Root row hidden from the scalar Cat selector was mistaken for a completed sweep"
+    );
 }
 
 #[test]

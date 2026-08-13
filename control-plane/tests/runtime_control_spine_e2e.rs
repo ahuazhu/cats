@@ -1252,8 +1252,8 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             admission_inventory_state_count: 1,
             current_cat_observation_count: 0,
             cat_record_count: 1,
-            disk_record_count: 2,
-            volume_record_count: 2,
+            disk_record_count: 1,
+            volume_record_count: 1,
             desired_spec_count: 1,
             endpoint_record_count: 1,
             hostname_lookup_count: 1,
@@ -1272,6 +1272,38 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             stored_persistent_disk_response_body: Some(first_disk_body),
         }
     );
+
+    let graph_reader = spawn(context.config.clone()).await.unwrap();
+    cats_control_plane::testsupport::corrupt_deleted_root_authorization_projection_for_test(
+        &context.first.state.store,
+    )
+    .await;
+    let corrupt_deleted_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/{}",
+            graph_reader.base_url(),
+            created.cat_id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        corrupt_deleted_cat.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", graph_reader.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    graph_reader.shutdown().await.unwrap();
 
     cats_control_plane::testsupport::corrupt_runtime_cat_list_boundary_for_test(
         &context.first.state.store,

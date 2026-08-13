@@ -956,12 +956,90 @@ pub(super) fn load_authorization_unlocked(
     authorization_id: &Id,
 ) -> AuthorityTxResult<Option<AuthorizationRecord>> {
     let sql = format!(
-        "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations WHERE authorization_id=$1"
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE authorization_id=$1 LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'authorization_id', $1::text
+                    )
+              LIMIT 2)
+         )
+         SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id IN (SELECT authorization_id FROM candidate_ids)
+          ORDER BY authorization_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&authorization_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt("duplicate canonical authorization id"));
+    }
+    rows.first().map(decode_authorization).transpose()
+}
+
+pub(super) fn load_disposable_root_graph_authorizations(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    volume_id: &Id,
+    delete_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> AuthorityTxResult<Vec<AuthorizationRecord>> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
+    let sql = format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE authorization_id=$1 LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE kind='disposable_root_delete'
+                AND volume_id=$2
+                AND desired_revision=$4
+                AND placement_epoch=$5
+              ORDER BY authorization_id COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'authorization_id', $1::text
+                    )
+              LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'volume_id', $2::text,
+                        'desired_revision', $4::bigint,
+                        'placement_epoch', $5::bigint
+                    )
+              LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'delete_id', $3::text
+                    )
+              LIMIT 2)
+         )
+         SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id IN (SELECT authorization_id FROM candidate_ids)
+          ORDER BY authorization_id COLLATE \"C\" LIMIT 2"
     );
     transaction
-        .query_opt(&sql, &[&authorization_id.as_str()])?
-        .map(|row| decode_authorization(&row))
-        .transpose()
+        .query(
+            &sql,
+            &[
+                &authorization_id.as_str(),
+                &volume_id.as_str(),
+                &delete_id.as_str(),
+                &desired_revision,
+                &placement_epoch,
+            ],
+        )?
+        .iter()
+        .map(decode_authorization)
+        .collect()
 }
 
 // Authorization creation is intentionally transaction-local so the event row
@@ -1200,6 +1278,46 @@ pub(super) fn load_delete_completions_by_volume(
     );
     transaction
         .query(&sql, &[&volume_id.as_str()])?
+        .iter()
+        .map(decode_delete_completion)
+        .collect()
+}
+
+pub(super) fn load_disposable_root_completion_candidates(
+    transaction: &mut Transaction<'_>,
+    delete_id: &Id,
+    disk_id: &Id,
+    volume_id: &Id,
+) -> AuthorityTxResult<Vec<DeleteCompletionReceipt>> {
+    let sql = format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE delete_id=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE volume_id=$3 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE disk_id=$2 ORDER BY delete_id COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'delete_id'=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'disk_id'=$2 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'volume_id'=$3 LIMIT 2)
+         )
+         SELECT {DELETE_COMPLETION_COLUMNS} FROM delete_completion_receipts
+          WHERE delete_id IN (SELECT delete_id FROM candidate_ids)
+          ORDER BY delete_id COLLATE \"C\" LIMIT 2"
+    );
+    transaction
+        .query(
+            &sql,
+            &[&delete_id.as_str(), &disk_id.as_str(), &volume_id.as_str()],
+        )?
         .iter()
         .map(decode_delete_completion)
         .collect()

@@ -714,6 +714,10 @@ pub fn router(state: AppState) -> Router {
             "/ui/cat-create-v2.mjs",
             get(crate::ui::cat_create_v2_script),
         )
+        .route(
+            "/ui/runtime-product-load.mjs",
+            get(crate::ui::runtime_product_load_script),
+        )
         .route("/auth/config", get(crate::auth::config))
         .route("/auth/login", get(crate::auth::login))
         .route("/auth/callback", get(crate::auth::callback))

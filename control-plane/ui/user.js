@@ -22,6 +22,7 @@ import {
   listPendingCatCreateV2,
   sendDurableCatCreateV2,
 } from "/ui/cat-create-v2.mjs";
+import { loadAll as loadRuntimeProductReads } from "/ui/runtime-product-load.mjs";
 
 initI18n();
 
@@ -43,7 +44,8 @@ const state = {
   selectedBillingCatName: "",
   activeView: "overview",
   execCat: "",
-  loading: false,
+  runtimeProductLoadGeneration: 0,
+  runtimeProductLoad: null,
   paymentRedirecting: false,
 };
 
@@ -107,6 +109,7 @@ function renderWorkspaceSwitcher() {
 
 async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
   if (!workspaceId || workspaceId === state.activeWorkspaceId) return;
+  cancelRuntimeProductLoad();
   const session = await request("/auth/workspace", {
     method: "POST",
     body: JSON.stringify({ workspace_id: workspaceId }),
@@ -225,21 +228,34 @@ function consumeTopupStatus() {
 }
 
 async function loadAll({ quiet = false } = {}) {
-  if (state.loading) return;
-  state.loading = true;
+  const workspaceId = state.activeWorkspaceId;
+  if (!workspaceId) return;
+  cancelRuntimeProductLoad();
+  const generation = ++state.runtimeProductLoadGeneration;
+  const controller = new AbortController();
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
+  state.runtimeProductLoad = { generation, workspaceId, controller, button, quiet };
   try {
-    const [cats, disks] = await Promise.all([
-      loadRuntimeProductPages("cats"),
-      loadRuntimeProductPages("disks"),
-    ]);
-    state.cats = cats.map(runtimeCatView);
-    state.disks = disks.map(runtimeDiskView);
+    const result = await loadRuntimeProductReads({
+      workspaceId,
+      signal: controller.signal,
+      requestPage: authenticatedRequest,
+    });
+    if (controller.signal.aborted
+      || generation !== state.runtimeProductLoadGeneration
+      || state.activeWorkspaceId !== workspaceId
+      || result.workspaceId !== workspaceId) return;
+    state.cats = result.cats.map(runtimeCatView);
+    state.disks = result.disks.map(runtimeDiskView);
     // The frozen runtime contract intentionally has no Operation collection.
     state.operations = [];
     render();
   } catch (error) {
+    if (controller.signal.aborted
+      || generation !== state.runtimeProductLoadGeneration
+      || state.activeWorkspaceId !== workspaceId
+      || error.name === "AbortError") return;
     if (error.status === 401 || error.status === 403) {
       showLogin(error.message);
     } else if (!quiet) {
@@ -247,30 +263,20 @@ async function loadAll({ quiet = false } = {}) {
     }
     throw error;
   } finally {
-    state.loading = false;
-    if (!quiet) setBusy(button, false);
+    if (state.runtimeProductLoad?.generation === generation) {
+      state.runtimeProductLoad = null;
+      if (!quiet) setBusy(button, false);
+    }
   }
 }
 
-async function loadRuntimeProductPages(resource) {
-  const items = [];
-  const seen = new Set();
-  let cursor = "";
-  do {
-    const suffix = cursor ? `&cursor=${cursor}` : "";
-    const page = await apiFetch(`/v1/workspaces/${encodeURIComponent(state.workspaceId)}/${resource}?limit=100${suffix}`);
-    if (!page || !Array.isArray(page.items) || !(page.next_cursor === null || typeof page.next_cursor === "string")) {
-      throw new Error("invalid runtime product page");
-    }
-    if (page.next_cursor !== null && page.items.length === 0) {
-      throw new Error("runtime product page advanced without an item");
-    }
-    items.push(...page.items);
-    cursor = page.next_cursor || "";
-    if (cursor && seen.has(cursor)) throw new Error("runtime product cursor repeated");
-    if (cursor) seen.add(cursor);
-  } while (cursor);
-  return items;
+function cancelRuntimeProductLoad() {
+  const active = state.runtimeProductLoad;
+  ++state.runtimeProductLoadGeneration;
+  state.runtimeProductLoad = null;
+  if (!active) return;
+  active.controller.abort();
+  if (!active.quiet) setBusy(active.button, false);
 }
 
 function runtimeCatView(cat) {

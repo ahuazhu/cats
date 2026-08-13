@@ -2040,8 +2040,12 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
         }
         DiskCommand::Ls => {
             let disks: Vec<DiskReadV2> = client.get_all_product_pages("/disks")?;
-            for disk in &disks {
-                print_runtime_disk(disk, cli.json);
+            if cli.json {
+                println!("{}", runtime_disk_list_json(&disks)?);
+            } else {
+                for disk in &disks {
+                    print_runtime_disk(disk, false);
+                }
             }
             Ok(())
         }
@@ -2078,6 +2082,10 @@ fn print_disk(d: &Disk, json_mode: bool) {
             d.bound_cat_id.as_deref().unwrap_or("-")
         );
     }
+}
+
+fn runtime_disk_list_json(disks: &[DiskReadV2]) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(disks)
 }
 
 fn print_runtime_disk(disk: &DiskReadV2, json_mode: bool) {
@@ -2720,18 +2728,18 @@ mod tests {
     }
 
     #[test]
-    fn product_collection_client_fetches_every_page_in_cursor_order() {
+    fn disk_ls_json_is_one_parseable_document_after_two_pages() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             for (expected_path, body) in [
                 (
-                    "GET /v1/workspaces/ws_01/cats?limit=100 HTTP/1.1",
-                    br#"{"items":[{"id":"cat_01"}],"next_cursor":"cursor_01"}"#.as_slice(),
+                    "GET /v1/workspaces/ws_01/disks?limit=100 HTTP/1.1",
+                    br#"{"items":[{"version":1,"id":"disk_01","workspace_id":"ws_01","name":"one","size_bytes":1048576,"durability":"strict","created_at_unix_ms":1,"kind":{"kind":"persistent"},"admin_state":"active","binding":null}],"next_cursor":"cursor_01"}"#.as_slice(),
                 ),
                 (
-                    "GET /v1/workspaces/ws_01/cats?limit=100&cursor=cursor_01 HTTP/1.1",
-                    br#"{"items":[{"id":"cat_02"}],"next_cursor":null}"#.as_slice(),
+                    "GET /v1/workspaces/ws_01/disks?limit=100&cursor=cursor_01 HTTP/1.1",
+                    br#"{"items":[{"version":1,"id":"disk_02","workspace_id":"ws_01","name":"two","size_bytes":2097152,"durability":"relaxed","created_at_unix_ms":2,"kind":{"kind":"persistent"},"admin_state":"deleting","binding":null}],"next_cursor":null}"#.as_slice(),
                 ),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -2746,16 +2754,13 @@ mod tests {
             }
         });
 
-        let items: Vec<serde_json::Value> = runtime_test_client(base)
-            .get_all_product_pages("/cats")
+        let items: Vec<DiskReadV2> = runtime_test_client(base)
+            .get_all_product_pages("/disks")
             .unwrap();
-        assert_eq!(
-            items,
-            vec![
-                serde_json::json!({ "id": "cat_01" }),
-                serde_json::json!({ "id": "cat_02" }),
-            ]
-        );
+        assert_eq!(items.len(), 2);
+        let document = runtime_disk_list_json(&items).unwrap();
+        let reparsed: Vec<DiskReadV2> = serde_json::from_str(&document).unwrap();
+        assert_eq!(reparsed, items);
         server.join().unwrap();
     }
 

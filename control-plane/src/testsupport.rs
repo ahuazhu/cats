@@ -924,17 +924,22 @@ pub async fn corrupt_runtime_operation_projection_for_test(
         .expect("corrupt isolated test Operation projection");
 }
 
-/// Move one Cat Desired to the Deleted product target and one independent
-/// PersistentDisk to Deleting while keeping each canonical JSON/projection
-/// pair exact. This is isolated lifecycle-state setup, not a mutation API.
+/// Move one Cat Desired through a fully closed disposable-Root completion and
+/// one independent PersistentDisk to Deleting. The Root Disk/Volume rows are
+/// then swept exactly as the terminal production lifecycle permits.
 pub async fn set_runtime_product_read_states_for_test(
     store: &Arc<crate::store::Store>,
     cat_id: cats_api::runtime_reconciliation::Id,
     disk_id: cats_api::runtime_reconciliation::Id,
 ) {
     use cats_api::runtime_reconciliation::{
-        decode_desired_runtime_spec, encode_desired_runtime_spec, spec_digest, RuntimeTarget,
-        Sha256Digest, VolumeDisposition,
+        decode_desired_runtime_spec, encode_desired_runtime_spec, spec_digest, Epoch, RandomId128,
+        RuntimeTarget, Sha256Digest, UnixMillis, VolumeDisposition,
+    };
+    use cats_storage::authority::{
+        complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire,
+        AuthorizationRecord, AuthorizationState, DisposableDeleteIsolationBasis,
+        DisposableRootDeleteAuthorization, NormalAcquireRequest, VolumeAuthorization, VolumeRecord,
     };
 
     store
@@ -949,10 +954,12 @@ pub async fn set_runtime_product_read_states_for_test(
                     .get(0);
                 let mut desired = decode_desired_runtime_spec(desired_json.as_bytes())
                     .expect("test DesiredRuntimeSpec is valid");
+                let root = desired.volumes[0].clone();
+                let delete_id =
+                    cats_api::runtime_reconciliation::Id::new("delete_read_test").unwrap();
                 desired.target = RuntimeTarget::Deleted;
                 desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
-                    delete_id: cats_api::runtime_reconciliation::Id::new("delete_read_test")
-                        .unwrap(),
+                    delete_id: delete_id.clone(),
                 };
                 desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
                 desired.spec_digest = spec_digest(&desired).expect("Deleted test Desired is valid");
@@ -967,6 +974,176 @@ pub async fn set_runtime_product_read_states_for_test(
                     &[&cat_id.as_str(), &encoded, &desired.spec_digest.as_str()],
                 )?;
                 assert_eq!(changed, 1, "test Cat Desired must already exist");
+
+                let volume_json: String = transaction
+                    .query_one(
+                        "SELECT record::text FROM volume_records WHERE volume_id=$1",
+                        &[&root.volume_id.as_str()],
+                    )?
+                    .get(0);
+                let unowned: VolumeRecord =
+                    serde_json::from_str(&volume_json).expect("test Root Volume is valid");
+                let cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                    transition_id,
+                    expected_unowned_epoch,
+                } = &root.acquire
+                else {
+                    panic!("initial test Root must use normal acquire")
+                };
+                let (owned, _) = normal_acquire(
+                    &unowned,
+                    &NormalAcquireRequest {
+                        volume_id: root.volume_id.clone(),
+                        transition_id: transition_id.clone(),
+                        attachment_id: root.attachment_id.clone(),
+                        expected_unowned_epoch: *expected_unowned_epoch,
+                        desired_revision: desired.desired_revision,
+                        placement_epoch: desired.placement.placement_epoch,
+                        lease_duration_ms: 30_000,
+                    },
+                    UnixMillis::new(10_000).unwrap(),
+                )
+                .expect("test Root normal acquire is valid");
+                let authorization_id =
+                    cats_api::runtime_reconciliation::Id::new("authorization_read_test").unwrap();
+                let original = AuthorizationRecord {
+                    authorization: VolumeAuthorization::DisposableRootDelete(
+                        DisposableRootDeleteAuthorization {
+                            authorization_id: authorization_id.clone(),
+                            authorized_node_id: desired.placement.node_id.clone(),
+                            delete_id: delete_id.clone(),
+                            disk_id: root.disk_id.clone(),
+                            volume_id: root.volume_id.clone(),
+                            cat_id: desired.cat_id.clone(),
+                            desired_revision: desired.desired_revision,
+                            placement_epoch: desired.placement.placement_epoch,
+                            expected_attachment_id: root.attachment_id.clone(),
+                            expected_epoch: owned.lease_epoch,
+                            expected_head: owned.head.clone(),
+                            isolation_basis: DisposableDeleteIsolationBasis::RuntimeStopped {
+                                node_id: desired.placement.node_id.clone(),
+                                agent_session_epoch: Epoch::new(1).unwrap(),
+                                runtime_incarnation: RandomId128::new(
+                                    "91919191919191919191919191919191",
+                                )
+                                .unwrap(),
+                                observation_id: RandomId128::new(
+                                    "92929292929292929292929292929292",
+                                )
+                                .unwrap(),
+                            },
+                            not_after: UnixMillis::new(50_000).unwrap(),
+                        },
+                    ),
+                    state: AuthorizationState::Unconsumed,
+                };
+                let (deleting, consumed, consumed_receipt) = consume_disposable_root_delete(
+                    &owned,
+                    None,
+                    &original,
+                    &authorization_id,
+                    UnixMillis::new(20_000).unwrap(),
+                )
+                .expect("test disposable Root authorization is valid");
+                let completion = complete_disposable_root_delete(
+                    &deleting,
+                    &consumed,
+                    UnixMillis::new(40_000).unwrap(),
+                )
+                .expect("test disposable Root completion is valid");
+                let authorization_json = serde_json::to_string(&consumed)
+                    .expect("encode test disposable Root authorization");
+                let completion_json = serde_json::to_string(&completion)
+                    .expect("encode test disposable Root completion");
+                let desired_revision =
+                    i64::try_from(desired.desired_revision.get()).expect("test revision fits PG");
+                let placement_epoch = i64::try_from(desired.placement.placement_epoch.get())
+                    .expect("test placement epoch fits PG");
+                let consumed_at = i64::try_from(consumed_receipt.consumed_at.get())
+                    .expect("test consumed time fits PG");
+                assert_eq!(
+                    transaction.execute(
+                        "INSERT INTO volume_authorizations (
+                            authorization_id, record, kind, authorized_node_id,
+                            host_fence_event_id, volume_id, state,
+                            desired_revision, placement_epoch, lease_duration_ms,
+                            not_after, consumed_at
+                         ) VALUES (
+                            $1, $2::TEXT::jsonb, 'disposable_root_delete', $3,
+                            NULL, $4, 'consumed', $5, $6, NULL, $7, $8
+                         )",
+                        &[
+                            &authorization_id.as_str(),
+                            &authorization_json,
+                            &desired.placement.node_id.as_str(),
+                            &root.volume_id.as_str(),
+                            &desired_revision,
+                            &placement_epoch,
+                            &50_000_i64,
+                            &consumed_at,
+                        ],
+                    )?,
+                    1
+                );
+                let cats_storage::authority::DeleteCompletionReceipt::DisposableRoot {
+                    deleting_epoch,
+                    deleting_head,
+                    completed_at,
+                    ..
+                } = &completion
+                else {
+                    unreachable!()
+                };
+                let deleting_epoch =
+                    i64::try_from(deleting_epoch.get()).expect("test deleting epoch fits PG");
+                let head_generation = i64::try_from(deleting_head.generation.get())
+                    .expect("test head generation fits PG");
+                let completed_at =
+                    i64::try_from(completed_at.get()).expect("test completion time fits PG");
+                assert_eq!(
+                    transaction.execute(
+                        "INSERT INTO delete_completion_receipts (
+                            delete_id, record, kind, disk_id, volume_id,
+                            authorization_id, prior_attachment_id, deleting_epoch,
+                            head_generation, head_root_hash, head_root_object_id,
+                            completed_at
+                         ) VALUES (
+                            $1, $2::TEXT::jsonb, 'disposable_root', $3, $4,
+                            $5, $6, $7, $8, $9, $10, $11
+                         )",
+                        &[
+                            &delete_id.as_str(),
+                            &completion_json,
+                            &root.disk_id.as_str(),
+                            &root.volume_id.as_str(),
+                            &authorization_id.as_str(),
+                            &root.attachment_id.as_str(),
+                            &deleting_epoch,
+                            &head_generation,
+                            &deleting_head.root_hash.as_ref().map(ToString::to_string),
+                            &deleting_head
+                                .root_object_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            &completed_at,
+                        ],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    transaction.execute(
+                        "DELETE FROM disk_records WHERE disk_id=$1",
+                        &[&root.disk_id.as_str()],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    transaction.execute(
+                        "DELETE FROM volume_records WHERE volume_id=$1",
+                        &[&root.volume_id.as_str()],
+                    )?,
+                    1
+                );
 
                 let changed = transaction.execute(
                     "UPDATE disk_records
@@ -985,6 +1162,28 @@ pub async fn set_runtime_product_read_states_for_test(
         })
         .await
         .expect("set isolated runtime product read states");
+}
+
+/// Break only one scalar authorization projection after a valid completed
+/// Root sweep, so a public read must fail closed and poison local readiness.
+pub async fn corrupt_deleted_root_authorization_projection_for_test(
+    store: &Arc<crate::store::Store>,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE volume_authorizations
+                        SET desired_revision=desired_revision+1
+                      WHERE authorization_id='authorization_read_test'",
+                    &[],
+                )?;
+                assert_eq!(changed, 1, "test disposable authorization must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("corrupt isolated disposable Root authorization projection");
 }
 
 /// Put one Cat's JSON workspace and ID projections on the far side of a

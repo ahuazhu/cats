@@ -1281,6 +1281,41 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "jsonb_path_ops",
         "(record -> 'volumes'::text)",
     ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_delete",
+        "btree",
+        "text_ops",
+        "(record ->> 'delete_id'::text)",
+    ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_disk",
+        "btree",
+        "text_ops",
+        "(record ->> 'disk_id'::text)",
+    ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_volume",
+        "btree",
+        "text_ops",
+        "(record ->> 'volume_id'::text)",
+    ),
+    (
+        "disk_records",
+        "disk_records_record_root_cat",
+        "btree",
+        "text_ops",
+        "((record -> 'role'::text) ->> 'cat_id'::text)",
+    ),
+    (
+        "disk_records",
+        "disk_records_record_volume",
+        "btree",
+        "text_ops",
+        "(record ->> 'volume_id'::text)",
+    ),
 ];
 
 const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
@@ -2106,6 +2141,14 @@ CREATE TABLE IF NOT EXISTS delete_completion_receipts (
         (head_generation > 0 AND head_root_hash IS NOT NULL AND head_root_object_id IS NOT NULL)
     )
 );
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_disk
+ON delete_completion_receipts(disk_id);
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_delete
+ON delete_completion_receipts((record->>'delete_id'));
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_disk
+ON delete_completion_receipts((record->>'disk_id'));
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_volume
+ON delete_completion_receipts((record->>'volume_id'));
 CREATE TABLE IF NOT EXISTS cat_records (
     cat_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -2215,6 +2258,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS disk_records_initialization_token_unique
 ON disk_records(initialization_token) WHERE role_kind = 'persistent';
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_filesystem_uuid_unique
 ON disk_records(filesystem_uuid) WHERE role_kind = 'persistent';
+CREATE INDEX IF NOT EXISTS disk_records_record_root_cat
+ON disk_records((record->'role'->>'cat_id'));
+CREATE INDEX IF NOT EXISTS disk_records_record_volume
+ON disk_records((record->>'volume_id'));
 CREATE INDEX IF NOT EXISTS disk_records_lookup_scalar_scalar
 ON disk_records(workspace_id COLLATE \"C\", disk_id COLLATE \"C\");
 CREATE INDEX IF NOT EXISTS disk_records_lookup_scalar_record

@@ -5,15 +5,20 @@ use cats_api::runtime_product_reads::{
     DiskReadKind, DiskReadV2, ProductReadPage, ProductReadResource, RuntimeConditionKind,
 };
 use cats_api::runtime_reconciliation::{
-    Condition, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, Id, VolumeDisposition,
+    AuthorizationConsumedReceipt, AuthorizationState, Condition, ContractVersion,
+    DeleteCompletionReceipt, DesiredRuntimeSpec, DiskKind, Durability, Id, RuntimeTarget,
+    VolumeAuthorization, VolumeDisposition,
 };
 use cats_storage::authority::VolumeDurability;
 use postgres::{Row, Transaction};
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
 use super::product_rows::{
-    decode_cat, decode_desired, decode_disk, load_desired_unlocked, load_root_disk_by_cat_unlocked,
-    CAT_COLUMNS, DESIRED_COLUMNS, DISK_COLUMNS,
+    decode_cat, decode_desired, decode_disk, load_desired_unlocked, CAT_COLUMNS, DESIRED_COLUMNS,
+    DISK_COLUMNS,
+};
+use super::rows::{
+    load_disposable_root_completion_candidates, load_disposable_root_graph_authorizations,
 };
 use super::runtime_spine::load_product_cat_observation;
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
@@ -313,15 +318,16 @@ fn compose_cat(
     let [root] = roots.as_slice() else {
         return Err(ComposeError::Corrupt);
     };
-    let root_record = projection_result(load_root_disk_by_cat_unlocked(transaction, &cat.cat_id))?
-        .ok_or(ComposeError::Corrupt)?;
-    if root_record.workspace_id != cat.workspace_id
-        || root_record.disk_id != root.disk_id
-        || root_record.volume_id != root.volume_id
-        || root_record.size_bytes != root.size_bytes
-        || durability(root_record.durability) != root.durability
-    {
-        return Err(ComposeError::Corrupt);
+    let root_candidates = root_disk_candidates(transaction, &cat, root)?;
+    match root_candidates.as_slice() {
+        [root_record]
+            if root_record.workspace_id == cat.workspace_id
+                && root_record.disk_id == root.disk_id
+                && root_record.volume_id == root.volume_id
+                && root_record.size_bytes == root.size_bytes
+                && durability(root_record.durability) == root.durability => {}
+        [] => completed_disposable_root_sweep(transaction, &desired, root)?,
+        _ => return Err(ComposeError::Corrupt),
     }
     let observed = projection_result(load_product_cat_observation(
         transaction,
@@ -353,6 +359,155 @@ fn compose_cat(
         },
         observed,
     })
+}
+
+fn root_disk_candidates(
+    transaction: &mut Transaction<'_>,
+    cat: &CatRecord,
+    root: &cats_api::runtime_reconciliation::VolumeIntent,
+) -> std::result::Result<Vec<DiskRecord>, ComposeError> {
+    let sql = format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT disk_id FROM disk_records
+              WHERE workspace_id COLLATE \"C\"=$1
+                AND disk_id COLLATE \"C\"=$2 LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE workspace_id COLLATE \"C\"=$1
+                AND (record->>'disk_id') COLLATE \"C\"=$2
+                AND disk_id COLLATE \"C\" IS DISTINCT FROM
+                    (record->>'disk_id') COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE (record->>'workspace_id') COLLATE \"C\"=$1
+                AND disk_id COLLATE \"C\"=$2
+                AND workspace_id COLLATE \"C\" IS DISTINCT FROM
+                    (record->>'workspace_id') COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE (record->>'workspace_id') COLLATE \"C\"=$1
+                AND (record->>'disk_id') COLLATE \"C\"=$2
+                AND workspace_id COLLATE \"C\" IS DISTINCT FROM
+                    (record->>'workspace_id') COLLATE \"C\"
+                AND disk_id COLLATE \"C\" IS DISTINCT FROM
+                    (record->>'disk_id') COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE root_cat_id=$3 LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE volume_id=$4 LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE record->'role'->>'cat_id'=$3 LIMIT 2)
+            UNION
+            (SELECT disk_id FROM disk_records
+              WHERE record->>'volume_id'=$4 LIMIT 2)
+         )
+         SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE disk_id IN (SELECT disk_id FROM candidate_ids)
+          ORDER BY disk_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction
+        .query(
+            &sql,
+            &[
+                &cat.workspace_id.as_str(),
+                &root.disk_id.as_str(),
+                &cat.cat_id.as_str(),
+                &root.volume_id.as_str(),
+            ],
+        )
+        .map_err(AuthorityTransactionError::from)
+        .map_err(ComposeError::Store)?;
+    rows.iter()
+        .map(|row| decode_disk(row).map_err(|_| ComposeError::Corrupt))
+        .collect()
+}
+
+fn completed_disposable_root_sweep(
+    transaction: &mut Transaction<'_>,
+    desired: &DesiredRuntimeSpec,
+    root: &cats_api::runtime_reconciliation::VolumeIntent,
+) -> std::result::Result<(), ComposeError> {
+    if desired.target != RuntimeTarget::Deleted {
+        return Err(ComposeError::Corrupt);
+    }
+    let VolumeDisposition::DeleteDisposableRoot { delete_id } = &root.disposition else {
+        return Err(ComposeError::Corrupt);
+    };
+    let completions = projection_result(load_disposable_root_completion_candidates(
+        transaction,
+        delete_id,
+        &root.disk_id,
+        &root.volume_id,
+    ))?;
+    let [DeleteCompletionReceipt::DisposableRoot {
+        disk_id,
+        volume_id,
+        delete_id: completed_delete_id,
+        authorization_id,
+        prior_attachment_id,
+        deleting_epoch,
+        deleting_head,
+        completed_at,
+    }] = completions.as_slice()
+    else {
+        return Err(ComposeError::Corrupt);
+    };
+    if disk_id != &root.disk_id
+        || volume_id != &root.volume_id
+        || completed_delete_id != delete_id
+        || prior_attachment_id != &root.attachment_id
+    {
+        return Err(ComposeError::Corrupt);
+    }
+    let authorizations = projection_result(load_disposable_root_graph_authorizations(
+        transaction,
+        authorization_id,
+        &root.volume_id,
+        delete_id,
+        desired.desired_revision,
+        desired.placement.placement_epoch,
+    ))?;
+    let [authorization] = authorizations.as_slice() else {
+        return Err(ComposeError::Corrupt);
+    };
+    let (
+        VolumeAuthorization::DisposableRootDelete(authorization),
+        AuthorizationState::Consumed(consumed),
+    ) = (&authorization.authorization, &authorization.state)
+    else {
+        return Err(ComposeError::Corrupt);
+    };
+    let AuthorizationConsumedReceipt::BeginDisposableDelete(consumed) = consumed.as_ref() else {
+        return Err(ComposeError::Corrupt);
+    };
+    if authorization.authorization_id != *authorization_id
+        || authorization.authorized_node_id != desired.placement.node_id
+        || authorization.delete_id != *delete_id
+        || authorization.disk_id != root.disk_id
+        || authorization.volume_id != root.volume_id
+        || authorization.cat_id != desired.cat_id
+        || authorization.desired_revision != desired.desired_revision
+        || authorization.placement_epoch != desired.placement.placement_epoch
+        || authorization.expected_attachment_id != root.attachment_id
+        || consumed.authorization_id != authorization.authorization_id
+        || consumed.delete_id != authorization.delete_id
+        || consumed.disk_id != authorization.disk_id
+        || consumed.volume_id != authorization.volume_id
+        || consumed.cat_id != authorization.cat_id
+        || consumed.prior_attachment_id != authorization.expected_attachment_id
+        || consumed.prior_attachment_id != *prior_attachment_id
+        || consumed.resulting_head != authorization.expected_head
+        || authorization.expected_epoch.get().checked_add(1) != Some(consumed.resulting_epoch.get())
+        || consumed.resulting_epoch != *deleting_epoch
+        || consumed.resulting_head != *deleting_head
+        || consumed.consumed_at > *completed_at
+    {
+        return Err(ComposeError::Corrupt);
+    }
+    Ok(())
 }
 
 fn compose_disk(

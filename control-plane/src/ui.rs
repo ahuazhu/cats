@@ -16,6 +16,7 @@ const COMMON_JS: &str = include_str!("../ui/common.js");
 const USER_JS: &str = include_str!("../ui/user.js");
 const ADMIN_JS: &str = include_str!("../ui/admin.js");
 const CAT_CREATE_V2_JS: &str = include_str!("../ui/cat-create-v2.mjs");
+const RUNTIME_PRODUCT_LOAD_JS: &str = include_str!("../ui/runtime-product-load.mjs");
 
 const PUBLIC_CSS: &str = include_str!("../ui/public/public.css");
 const LANDING_EN: &str = include_str!("../ui/public/landing-en.html");
@@ -905,6 +906,10 @@ pub async fn cat_create_v2_script() -> Response {
     console_asset("text/javascript; charset=utf-8", CAT_CREATE_V2_JS)
 }
 
+pub async fn runtime_product_load_script() -> Response {
+    console_asset("text/javascript; charset=utf-8", RUNTIME_PRODUCT_LOAD_JS)
+}
+
 pub async fn public_styles() -> Response {
     public_asset("text/css; charset=utf-8", PUBLIC_CSS)
 }
@@ -983,7 +988,7 @@ mod tests {
 
     use super::{
         not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS, COMMON_JS, DOCS, I18N_JS,
-        LANDING_EN, LANDING_ZH, USER_HTML, USER_JS,
+        LANDING_EN, LANDING_ZH, RUNTIME_PRODUCT_LOAD_JS, USER_HTML, USER_JS,
     };
 
     #[tokio::test]
@@ -1100,31 +1105,30 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("function render()").next())
             .expect("loadAll is present");
-        for contract in [
-            "state.cats = []",
-            "state.disks = []",
-            "state.operations = []",
-        ] {
+        for contract in ["result.cats", "result.disks", "state.operations = []"] {
             assert!(
                 load_all.contains(contract),
                 "missing local reset {contract:?}"
             );
         }
-        assert!(
-            !load_all.contains("authenticatedRequest("),
-            "background refresh must not probe a closed authority projection"
-        );
         for contract in [
             "window.setInterval(",
             "!document.hidden",
             "loadAll({ quiet: true })",
-            "state.loading",
+            "state.activeWorkspaceId",
+            "new AbortController()",
+            "runtimeProductLoadGeneration",
+            "requestPage: authenticatedRequest",
+            "cancelRuntimeProductLoad()",
         ] {
             assert!(
                 USER_JS.contains(contract),
                 "missing polling contract: {contract}"
             );
         }
+        assert!(!USER_JS.contains("apiFetch("));
+        assert!(!USER_JS.contains("state.workspaceId"));
+        assert!(RUNTIME_PRODUCT_LOAD_JS.contains("export async function loadAll"));
     }
 
     #[test]
