@@ -2774,6 +2774,8 @@ fn checkpoint_set_recovery_bindings(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataDirectoryProjectionBoundary {
+    Epoch,
+    Attachment,
     Volume,
     Cat,
 }
@@ -3037,14 +3039,14 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 scan.complete = false;
                 continue;
             };
-            let (attachment_name, attachment_directory) = match descend_only_directory(
+            let (attachment_entry, attachment_directory) = match descend_only_directory(
                 &volume_directory,
                 root,
                 &mut budget,
                 context,
                 "attachment",
             )? {
-                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Open { entry, directory } => (entry, directory),
                 OnlyDirectoryDescent::Empty => {
                     scan.complete = false;
                     if let Some(volume_id) = &scanned_volume_id {
@@ -3078,14 +3080,19 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     continue;
                 }
             };
-            let (epoch_name, epoch_directory) = match descend_only_directory(
+            let attachment_name = attachment_entry
+                .name
+                .to_str()
+                .context("authorized blockd attachment path is not UTF-8")?
+                .to_owned();
+            let (epoch_entry, epoch_directory) = match descend_only_directory(
                 &attachment_directory,
                 root,
                 &mut budget,
                 context,
                 "epoch",
             )? {
-                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Open { entry, directory } => (entry, directory),
                 OnlyDirectoryDescent::Empty => {
                     scan.complete = false;
                     if let Some(volume_id) = &scanned_volume_id {
@@ -3120,6 +3127,11 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     continue;
                 }
             };
+            let epoch_name = epoch_entry
+                .name
+                .to_str()
+                .context("authorized blockd epoch path is not UTF-8")?
+                .to_owned();
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
             else {
@@ -3645,6 +3657,28 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     &target,
                 )?);
             }
+            projection_barrier(DataDirectoryProjectionBoundary::Epoch);
+            if !revalidate_directory_entry(
+                &attachment_directory,
+                &epoch_entry,
+                &epoch_directory,
+                root,
+            ) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
+            projection_barrier(DataDirectoryProjectionBoundary::Attachment);
+            if !revalidate_directory_entry(
+                &volume_directory,
+                &attachment_entry,
+                &attachment_directory,
+                root,
+            ) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
             projection_barrier(DataDirectoryProjectionBoundary::Volume);
             if !revalidate_directory_entry(&cat_directory, &volume_entry, &volume_directory, root) {
                 scan.complete = false;
@@ -3798,10 +3832,11 @@ fn scan_unassigned_cat_data_with_projection_barrier(
             entry_budget,
             context,
             maximum_depth,
+            projection_barrier,
         )?;
         let observed = match exact {
-            Some(exact) => exact,
-            None => {
+            UnassignedVolumeLineageScan::Readable(exact) => exact,
+            UnassignedVolumeLineageScan::Unreadable => {
                 let Some(residue) =
                     unreadable_data_residue(&volume_path, volume_hint, allocated_bytes)
                 else {
@@ -3809,6 +3844,7 @@ fn scan_unassigned_cat_data_with_projection_barrier(
                 };
                 residue
             }
+            UnassignedVolumeLineageScan::Unstable => return Ok(None),
         };
         projection_barrier(DataDirectoryProjectionBoundary::Volume);
         if !revalidate_directory_entry(cat_directory, &entry, &volume_directory, root) {
@@ -3825,6 +3861,12 @@ fn scan_unassigned_cat_data_with_projection_barrier(
     Ok(Some(residue))
 }
 
+enum UnassignedVolumeLineageScan {
+    Readable(NodeResidue),
+    Unreadable,
+    Unstable,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_unassigned_volume_lineage_at(
     root: &File,
@@ -3835,43 +3877,50 @@ fn scan_unassigned_volume_lineage_at(
     entry_budget: &mut usize,
     context: &RuntimeInventoryScanContext,
     maximum_depth: usize,
-) -> anyhow::Result<Option<NodeResidue>> {
-    let (attachment_name, attachment_directory) = match descend_only_directory(
+    projection_barrier: &mut impl FnMut(DataDirectoryProjectionBoundary),
+) -> anyhow::Result<UnassignedVolumeLineageScan> {
+    let (attachment_directory_entry, attachment_directory) = match descend_only_directory(
         volume_directory,
         root,
         entry_budget,
         context,
         "unassigned attachment",
     ) {
-        Ok(OnlyDirectoryDescent::Open { name, directory }) => (name, directory),
+        Ok(OnlyDirectoryDescent::Open { entry, directory }) => (entry, directory),
         Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
-            return Ok(None)
+            return Ok(UnassignedVolumeLineageScan::Unreadable)
         }
     };
-    let (epoch_name, epoch_directory) = match descend_only_directory(
+    let Some(attachment_name) = attachment_directory_entry.name.to_str() else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let (epoch_directory_entry, epoch_directory) = match descend_only_directory(
         &attachment_directory,
         root,
         entry_budget,
         context,
         "unassigned epoch",
     ) {
-        Ok(OnlyDirectoryDescent::Open { name, directory }) => (name, directory),
+        Ok(OnlyDirectoryDescent::Open { entry, directory }) => (entry, directory),
         Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
-            return Ok(None)
+            return Ok(UnassignedVolumeLineageScan::Unreadable)
         }
+    };
+    let Some(epoch_name) = epoch_directory_entry.name.to_str() else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let epoch_path = volume_path.join(&attachment_name).join(&epoch_name);
     let Some(allocated_bytes) =
         observed_allocated_bytes_at(&epoch_directory, root, entry_budget, context, maximum_depth)?
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     let _ = allocated_bytes;
     let entries = match strict_directory_entries(&epoch_directory, entry_budget, context) {
         Ok(Some(entries)) => entries,
         Ok(None) | Err(_) => {
-            return Ok(None);
+            return Ok(UnassignedVolumeLineageScan::Unreadable);
         }
     };
     let by_name = entries
@@ -3879,13 +3928,13 @@ fn scan_unassigned_volume_lineage_at(
         .filter_map(|entry| entry.name.to_str().map(|name| (name, entry)))
         .collect::<BTreeMap<_, _>>();
     let Some(identity_entry) = by_name.get(IDENTITY_FILE) else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
-    let Some(attachment_entry) = by_name.get(AUTHORIZED_SERVING_FILE) else {
-        return Ok(None);
+    let Some(authorized_serving_entry) = by_name.get(AUTHORIZED_SERVING_FILE) else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let Some(checkpoint_entry) = by_name.get(LAUNCH_CHECKPOINT_FILE) else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let Some(identity): Option<AttachmentLineageIdentity> = read_residue_exact_json_at(
         &epoch_directory,
@@ -3895,17 +3944,17 @@ fn scan_unassigned_volume_lineage_at(
         context,
     )?
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let Some(attachment): Option<AuthorizedServingAttachment> = read_residue_exact_json_at(
         &epoch_directory,
-        attachment_entry,
+        authorized_serving_entry,
         root,
         MAX_AUTHORIZED_SERVING_BYTES,
         context,
     )?
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let Some(checkpoint): Option<AuthorizedBlockdCheckpoint> = read_residue_exact_json_at(
         &epoch_directory,
@@ -3915,10 +3964,10 @@ fn scan_unassigned_volume_lineage_at(
         context,
     )?
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     if validate_authorized_blockd_checkpoint(&checkpoint).is_err() {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     }
     if identity != attachment.identity
         || attachment != checkpoint.attachment
@@ -3928,7 +3977,7 @@ fn scan_unassigned_volume_lineage_at(
         || attachment_name != format!("attachment-{}", identity.attachment_id)
         || epoch_name != format!("epoch-{}", identity.attachment_epoch.get())
     {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     }
     let Some(pending_pack_count) = validate_residue_pending_packs_at(
         root,
@@ -3940,7 +3989,7 @@ fn scan_unassigned_volume_lineage_at(
         context,
     )?
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
     let remote_generation = attachment.head.generation;
     let Some(local_generation) = remote_generation
@@ -3948,64 +3997,84 @@ fn scan_unassigned_volume_lineage_at(
         .checked_add(pending_pack_count)
         .and_then(Generation::new)
     else {
-        return Ok(None);
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
     };
-    Ok(Some(NodeResidue::DataDirectory {
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        cat_id_hint: Some(checkpoint.desired.cat_id.clone()),
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        disk_id_hint: Some(checkpoint.volume.disk_id.clone()),
-        volume_id_hint: Some(identity.volume_id.clone()),
-        data_directory: host_path(&epoch_path)?,
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        allocated_bytes,
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        retention_reason: if pending_pack_count == 0 {
-            DataDirectoryRetentionReason::AuthorityProofPending
-        } else {
-            DataDirectoryRetentionReason::UniqueLocalTail
-        },
-        ownership_token: OwnershipTokenEvidence::Missing,
-        lineage: ResidueLineageEvidence::Readable {
+    projection_barrier(DataDirectoryProjectionBoundary::Epoch);
+    if !revalidate_directory_entry(
+        &attachment_directory,
+        &epoch_directory_entry,
+        &epoch_directory,
+        root,
+    ) {
+        return Ok(UnassignedVolumeLineageScan::Unstable);
+    }
+    projection_barrier(DataDirectoryProjectionBoundary::Attachment);
+    if !revalidate_directory_entry(
+        volume_directory,
+        &attachment_directory_entry,
+        &attachment_directory,
+        root,
+    ) {
+        return Ok(UnassignedVolumeLineageScan::Unstable);
+    }
+    Ok(UnassignedVolumeLineageScan::Readable(
+        NodeResidue::DataDirectory {
             #[cfg(feature = "proposed-node-residue-reclamation")]
-            lineage: Box::new(ResidueDataDirectoryLineage {
-                workspace_id: checkpoint.desired.workspace_id.clone(),
-                cat_id: checkpoint.desired.cat_id.clone(),
-                disk_id: checkpoint.volume.disk_id.clone(),
-                disk_kind: checkpoint.volume.disk_kind,
-                volume_id: identity.volume_id.clone(),
-                attachment_id: identity.attachment_id.clone(),
-                attachment_epoch: identity.attachment_epoch,
-                acquire_origin: identity.acquire_origin.clone(),
-                node_id: identity.node_id.clone(),
-                desired_revision: checkpoint.desired.desired_revision,
-                spec_digest: checkpoint.desired.spec_digest.clone(),
-                placement: checkpoint.desired.placement.clone(),
-                placement_epoch: identity.placement_epoch,
-                acquisition: attachment.acquire.clone(),
-                acquisition_digest: residue_acquisition_digest(&attachment.acquire)?,
+            cat_id_hint: Some(checkpoint.desired.cat_id.clone()),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            disk_id_hint: Some(checkpoint.volume.disk_id.clone()),
+            volume_id_hint: Some(identity.volume_id.clone()),
+            data_directory: host_path(&epoch_path)?,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            allocated_bytes,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            retention_reason: if pending_pack_count == 0 {
+                DataDirectoryRetentionReason::AuthorityProofPending
+            } else {
+                DataDirectoryRetentionReason::UniqueLocalTail
+            },
+            ownership_token: OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Readable {
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                lineage: Box::new(ResidueDataDirectoryLineage {
+                    workspace_id: checkpoint.desired.workspace_id.clone(),
+                    cat_id: checkpoint.desired.cat_id.clone(),
+                    disk_id: checkpoint.volume.disk_id.clone(),
+                    disk_kind: checkpoint.volume.disk_kind,
+                    volume_id: identity.volume_id.clone(),
+                    attachment_id: identity.attachment_id.clone(),
+                    attachment_epoch: identity.attachment_epoch,
+                    acquire_origin: identity.acquire_origin.clone(),
+                    node_id: identity.node_id.clone(),
+                    desired_revision: checkpoint.desired.desired_revision,
+                    spec_digest: checkpoint.desired.spec_digest.clone(),
+                    placement: checkpoint.desired.placement.clone(),
+                    placement_epoch: identity.placement_epoch,
+                    acquisition: attachment.acquire.clone(),
+                    acquisition_digest: residue_acquisition_digest(&attachment.acquire)?,
+                    local_durable_generation: local_generation,
+                    remote_durable_generation: remote_generation,
+                    remote_head: attachment.head.clone(),
+                    pending_pack_count: WireU64::new(pending_pack_count)
+                        .context("pending-pack count exceeds WireU64")?,
+                    fenced: false,
+                }),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                attachment_id_hint: Some(identity.attachment_id.clone()),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                attachment_epoch_hint: Some(identity.attachment_epoch),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
                 local_durable_generation: local_generation,
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
                 remote_durable_generation: remote_generation,
-                remote_head: attachment.head.clone(),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
                 pending_pack_count: WireU64::new(pending_pack_count)
                     .context("pending-pack count exceeds WireU64")?,
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
                 fenced: false,
-            }),
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            attachment_id_hint: Some(identity.attachment_id.clone()),
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            attachment_epoch_hint: Some(identity.attachment_epoch),
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            local_durable_generation: local_generation,
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            remote_durable_generation: remote_generation,
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            pending_pack_count: WireU64::new(pending_pack_count)
-                .context("pending-pack count exceeds WireU64")?,
-            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-            fenced: false,
+            },
         },
-    }))
+    ))
 }
 
 fn validate_residue_pending_packs_at(
@@ -4589,7 +4658,10 @@ fn read_scanned_handoff_artifact(
 enum OnlyDirectoryDescent {
     Empty,
     Unavailable,
-    Open { name: String, directory: File },
+    Open {
+        entry: StrictDirectoryEntry,
+        directory: File,
+    },
 }
 
 fn descend_only_directory(
@@ -4609,15 +4681,18 @@ fn descend_only_directory(
         entries.len() == 1,
         "authorized blockd {label} directory contains duplicate or foreign entries"
     );
-    let name = entries[0]
+    entries[0]
         .name
         .to_str()
-        .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?
-        .to_owned();
-    let Some(directory) = open_strict_child_directory(parent, &entries[0], root)? else {
+        .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?;
+    let entry = entries
+        .into_iter()
+        .next()
+        .expect("nonempty singleton entry");
+    let Some(directory) = open_strict_child_directory(parent, &entry, root)? else {
         return Ok(OnlyDirectoryDescent::Unavailable);
     };
-    Ok(OnlyDirectoryDescent::Open { name, directory })
+    Ok(OnlyDirectoryDescent::Open { entry, directory })
 }
 
 fn authorized_blockd_binding(
@@ -12930,8 +13005,10 @@ mod tests {
     }
 
     #[test]
-    fn data_directory_projection_revalidates_volume_and_cat_parent_entries_after_descriptor_scan() {
+    fn data_directory_projection_revalidates_every_parent_entry_after_descriptor_scan() {
         for boundary in [
+            DataDirectoryProjectionBoundary::Epoch,
+            DataDirectoryProjectionBoundary::Attachment,
             DataDirectoryProjectionBoundary::Volume,
             DataDirectoryProjectionBoundary::Cat,
         ] {
@@ -12978,6 +13055,14 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("descriptor scan did not reach its pre-projection barrier");
             let (entry_path, retained_path) = match boundary {
+                DataDirectoryProjectionBoundary::Epoch => (
+                    data_directory.clone(),
+                    data_directory.parent().unwrap().join("retained-epoch"),
+                ),
+                DataDirectoryProjectionBoundary::Attachment => (
+                    data_directory.parent().unwrap().to_path_buf(),
+                    volume_path.join("retained-attachment"),
+                ),
                 DataDirectoryProjectionBoundary::Volume => {
                     (volume_path.clone(), cat_path.join("retained-volume"))
                 }
