@@ -37,7 +37,8 @@ use super::authorized_blockd::{
 use super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{
-    KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdInventoryConfig,
+    KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdDetachPort,
+    KernelNbdInventoryConfig, PlatformKernelNbdDetachPort,
 };
 use super::network::PrepareNetworkReservationEffect;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
@@ -252,11 +253,17 @@ impl SignedRunningEffect {
             systemd.clone(),
             Arc::clone(&process_ports.serving_global),
         );
+        let kernel_nbd_detach = kernel_nbd_inventory.clone().map(|config| {
+            Arc::new(PlatformKernelNbdDetachPort::new(
+                config,
+                Arc::clone(&kernel_nbd_cleanup_owner),
+            )) as Arc<dyn KernelNbdDetachPort>
+        });
         let kernel_nbd_attach = kernel_nbd_inventory.clone().map(|config| {
             KernelNbdAttachEffect::platform(
                 Arc::clone(&authority),
                 config,
-                kernel_nbd_cleanup_owner,
+                Arc::clone(&kernel_nbd_cleanup_owner),
             )
         });
         let prepare_network = Arc::new(PrepareNetworkReservationEffect::new(
@@ -309,6 +316,7 @@ impl SignedRunningEffect {
                 Arc::clone(&authority),
                 Arc::clone(&process_ports.serving_global),
                 Arc::clone(&process_ports.vmm_global),
+                kernel_nbd_detach,
             )),
             acquire,
             provision: SignedRootProvisionEffect::platform(
