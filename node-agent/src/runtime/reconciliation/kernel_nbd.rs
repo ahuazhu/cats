@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, CheckpointEvidence, Epoch, FenceEpoch, GuestDeviceIdentity,
-    HostPath, Id, NodeBootId, NodeObservation, ObservedDevice, OwnershipTokenEvidence,
+    HostPath, Id, NodeBootId, NodeObservation, NodeResidue, ObservedDevice, OwnershipTokenEvidence,
     PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RuntimeCheckpoint,
     RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, WireU64,
 };
@@ -516,7 +516,25 @@ pub(crate) struct KernelNbdPoolScanAdmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KernelNbdPoolScanOutcome {
     Complete(KernelNbdPoolScanAdmission),
+    CompleteWithResidue {
+        admission: KernelNbdPoolScanAdmission,
+        residue: Vec<NodeResidue>,
+    },
     Unavailable,
+}
+
+fn kernel_nbd_residue(
+    device_path: &HostPath,
+    expected: Option<&KernelNbdDeviceExpectation>,
+) -> NodeResidue {
+    NodeResidue::KernelNbd {
+        volume_id_hint: expected.map(|expected| expected.volume_id.clone()),
+        guest_device: expected.map(|expected| expected.guest_device.clone()),
+        device_path: device_path.clone(),
+        // The kernel tuple has no ownership-token field. A checkpoint hint is
+        // not physical token evidence, including for a reserved leaked slot.
+        ownership_token: OwnershipTokenEvidence::Missing,
+    }
 }
 
 /// The same closed scan after binding the exact observation bytes accepted by
@@ -1490,6 +1508,7 @@ impl KernelNbdInventoryPort {
             );
 
             let mut devices_by_key = BTreeMap::new();
+            let mut residue = Vec::new();
             for (device_path, slot) in permit.snapshot().iter() {
                 let reservation = reservations.by_device.get(device_path);
                 let expected = expectations.get(device_path);
@@ -1501,9 +1520,7 @@ impl KernelNbdInventoryPort {
                             return Ok(KernelNbdPoolScanOutcome::Unavailable);
                         }
                         KernelNbdSlotState::Serving(_) | KernelNbdSlotState::Leaked { .. } => {
-                            anyhow::bail!(
-                                "physical kernel-NBD slot has no exact durable reservation"
-                            )
+                            residue.push(kernel_nbd_residue(device_path, None));
                         }
                     }
                     continue;
@@ -1559,6 +1576,9 @@ impl KernelNbdInventoryPort {
                         expected: expected.clone(),
                     },
                 };
+                if matches!(state, KernelNbdDeviceScanState::Leaked { .. }) {
+                    residue.push(kernel_nbd_residue(device_path, Some(expected)));
+                }
                 let key =
                     ManagedServingKey::new(expected.cat_id.clone(), expected.volume_id.clone());
                 anyhow::ensure!(
@@ -1572,9 +1592,14 @@ impl KernelNbdInventoryPort {
             );
             permit.assert_current_scan_paths(&namespace)?;
             context.check_active()?;
-            Ok(KernelNbdPoolScanOutcome::Complete(
-                KernelNbdPoolScanAdmission { devices_by_key },
-            ))
+            let admission = KernelNbdPoolScanAdmission { devices_by_key };
+            Ok(
+                if admission.has_unavailable_device() || residue.is_empty() {
+                    KernelNbdPoolScanOutcome::Complete(admission)
+                } else {
+                    KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue }
+                },
+            )
         })();
         let released = permit
             .release()
@@ -4346,6 +4371,83 @@ mod tests {
                 .unwrap(),
             KernelNbdPoolScanOutcome::Unavailable
         ));
+    }
+
+    #[test]
+    fn complete_pool_scan_reports_stable_reserved_leak_as_residue() {
+        let fixture = Fixture::new(2);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        store.create(&source).unwrap();
+        fs::write(fixture.sys.join("nbd0/size"), b"4096\n").unwrap();
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } =
+            KernelNbdInventoryPort::new(fixture.config(2))
+                .scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+                .unwrap()
+        else {
+            panic!("stable reserved leak must remain a complete residue observation")
+        };
+        assert!(matches!(
+            admission
+                .devices_by_key
+                .get(&ManagedServingKey::new(id("cat_a"), id("vol_a"))),
+            Some(KernelNbdDeviceScanState::Leaked {
+                recorded_process_id: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            residue,
+            [NodeResidue::KernelNbd {
+                volume_id_hint: Some(id("vol_a")),
+                guest_device: Some(
+                    prepared_device_inputs(&source).unwrap()[0]
+                        .guest_device
+                        .clone()
+                ),
+                device_path: host("/dev/nbd0"),
+                ownership_token: OwnershipTokenEvidence::Missing,
+            }]
+        );
+    }
+
+    #[test]
+    fn complete_pool_scan_reports_stable_unreserved_serving_slot_as_residue() {
+        let fixture = Fixture::new(1);
+        fs::create_dir(fixture.state.join(CHECKPOINT_NAMESPACE)).unwrap();
+        fixture.serving(0, 42, "/run/cats/orphan.sock");
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } =
+            KernelNbdInventoryPort::new(fixture.config(1))
+                .scan_complete_pool(&inventory_scan_context(&[]), &processes)
+                .unwrap()
+        else {
+            panic!("stable unreserved serving NBD must remain complete residue")
+        };
+        assert!(admission.devices_by_key.is_empty());
+        assert_eq!(
+            residue,
+            [NodeResidue::KernelNbd {
+                volume_id_hint: None,
+                guest_device: None,
+                device_path: host("/dev/nbd0"),
+                ownership_token: OwnershipTokenEvidence::Missing,
+            }]
+        );
+        assert!(fixture.sys.join("nbd0/pid").exists());
     }
 
     #[test]

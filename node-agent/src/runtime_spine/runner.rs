@@ -12,13 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    inventory_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
-    Condition, ContractError, ContractErrorDetail, ContractVersion, DegradedReason, DegradedSource,
-    DesiredReadRequest, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId,
-    LifecycleAdmission, NodeObservation, NodeResidue, ObservationAcceptance,
-    ObservationInventoryAcceptance, ObservedRuntimeStatus, ProcessRole, ProcessState, RandomId128,
-    ReadyReason, ReconcileStep, RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeTarget,
-    RuntimeVolumeAuthorityRejection, Sha256Digest, StableState, UnixMillis,
+    inventory_digest, node_observation_canonical_wire_size, AdmissionInventoryAttestation,
+    AgentSession, AppliedDesiredEvidence, Condition, ContractError, ContractErrorDetail,
+    ContractVersion, DegradedReason, DegradedSource, DesiredReadRequest, DesiredReadSnapshot,
+    DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId, LifecycleAdmission, NodeObservation,
+    NodeResidue, ObservationAcceptance, ObservationInventoryAcceptance, ObservedRuntimeStatus,
+    ProcessRole, ProcessState, RandomId128, ReadyReason, ReconcileStep, RuntimeSpineError,
+    RuntimeSpineErrorDetail, RuntimeTarget, RuntimeVolumeAuthorityRejection, Sha256Digest,
+    StableState, UnixMillis, NODE_OBSERVATION_MAX_WIRE_BYTES,
 };
 use thiserror::Error;
 
@@ -127,6 +128,7 @@ impl RuntimePreScanAdmissionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DegradedObservationCause {
     SourceUnavailable(Vec<InventorySource>),
+    WireBudgetExceeded(Vec<InventorySource>),
     AttestationRefreshFailed,
 }
 
@@ -1016,6 +1018,7 @@ pub struct CompleteRuntimeInventory {
     key_ring: RuntimeInventoryKeyRing,
     runtimes: Vec<ObservedRuntimeStatus>,
     residue: Vec<NodeResidue>,
+    residue_sources: BTreeSet<InventorySource>,
     node_global_process: Option<NodeGlobalManagedProcessScanAdmission>,
     node_global_network: Option<Box<NodeGlobalNetworkScanAdmission>>,
     kernel_nbd_pool: Option<Box<KernelNbdPoolScanAdmission>>,
@@ -1029,12 +1032,14 @@ impl CompleteRuntimeInventory {
         key_ring: RuntimeInventoryKeyRing,
         runtimes: Vec<ObservedRuntimeStatus>,
         residue: Vec<NodeResidue>,
+        residue_sources: BTreeSet<InventorySource>,
     ) -> Self {
         Self {
             observed_at_unix_ms,
             key_ring,
             runtimes,
             residue,
+            residue_sources,
             node_global_process: None,
             node_global_network: None,
             kernel_nbd_pool: None,
@@ -1094,6 +1099,10 @@ impl CompleteRuntimeInventory {
         self.running_tail.take().map(|admission| *admission)
     }
 
+    fn residue_sources(&self) -> Vec<InventorySource> {
+        self.residue_sources.iter().copied().collect()
+    }
+
     /// Binds one scanner-produced Node-global process admission through the
     /// same full-observation builder used by the production runner. Linux
     /// acceptance teardown needs a fresh physical scan after the runner has
@@ -1128,6 +1137,7 @@ impl CompleteRuntimeInventory {
             key_ring,
             runtimes,
             residue,
+            residue_sources: BTreeSet::new(),
             node_global_process: None,
             node_global_network: None,
             kernel_nbd_pool: None,
@@ -2932,11 +2942,31 @@ impl RuntimeSpineRunner {
                             .await;
                     }
                 };
+                let mut wire_budget_sources = inventory.residue_sources();
                 let node_global_process = inventory.take_node_global_process_admission();
                 let node_global_network = inventory.take_node_global_network_admission();
                 let kernel_nbd_pool = inventory.take_kernel_nbd_pool_admission();
                 let running_tail = inventory.take_running_tail_admission();
-                let candidate = build_full_observation(coordinates, inventory)?;
+                let mut candidate =
+                    build_full_observation_candidate(coordinates.clone(), inventory);
+                if node_observation_exceeds_wire_budget(&candidate)? {
+                    if wire_budget_sources.is_empty() {
+                        wire_budget_sources.extend(REQUIRED_INVENTORY_SOURCES);
+                    }
+                    return self
+                        .publish_degraded_partial(
+                            coordinates,
+                            DegradedObservationCause::WireBudgetExceeded(
+                                wire_budget_sources.clone(),
+                            ),
+                            retained_admission,
+                            RuntimeSpineRunStep::ScanIncomplete {
+                                unavailable_sources: wire_budget_sources,
+                            },
+                        )
+                        .await;
+                }
+                candidate.inventory_digest = Some(inventory_digest(&candidate)?);
                 let node_global_process = node_global_process
                     .map(|admission| admission.bind(&candidate))
                     .transpose()
@@ -3645,9 +3675,11 @@ fn build_degraded_partial_observation(
             && observation.node_boot_id == scan.session.node_boot_id
             && observation.agent_instance_id == scan.session.agent_instance_id
             && observation.agent_session_epoch == scan.session.agent_session_epoch
-    })?;
+    });
+    let wire_budget_exceeded = matches!(&cause, DegradedObservationCause::WireBudgetExceeded(_));
     let reason = match cause {
-        DegradedObservationCause::SourceUnavailable(unavailable_sources) => {
+        DegradedObservationCause::SourceUnavailable(unavailable_sources)
+        | DegradedObservationCause::WireBudgetExceeded(unavailable_sources) => {
             let sources = unavailable_sources
                 .into_iter()
                 .map(degraded_source)
@@ -3663,6 +3695,12 @@ fn build_degraded_partial_observation(
             DegradedReasonTemplate::AttestationRefreshFailed
         }
     };
+    // Accepted Runtime Inventory §5 permits a partial only after Control has
+    // accepted a full attestation for this session.  In particular, a first
+    // scan which exceeds the wire budget must remain a local Incomplete result;
+    // inventing an unanchored empty partial here would create a protocol that
+    // both the durable journal and Control correctly reject.
+    let full = full?;
 
     let desired_by_cat = scan
         .desired
@@ -3722,11 +3760,11 @@ fn build_degraded_partial_observation(
         });
         runtimes.push(degraded);
     }
-    if runtimes.is_empty() {
+    if runtimes.is_empty() && !wire_budget_exceeded {
         return None;
     }
 
-    Some(NodeObservation {
+    let mut observation = NodeObservation {
         version: ContractVersion::V1,
         observation_id: RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
             .expect("a simple UUID is a valid RandomId128"),
@@ -3745,7 +3783,42 @@ fn build_degraded_partial_observation(
         loaded_kids: full.loaded_kids.clone(),
         runtimes,
         residue: Vec::new(),
-    })
+    };
+    if !fit_partial_observation_to_wire_budget(&mut observation) {
+        return None;
+    }
+    if observation.runtimes.is_empty() && !wire_budget_exceeded {
+        return None;
+    }
+    Some(observation)
+}
+
+fn fit_partial_observation_to_wire_budget(observation: &mut NodeObservation) -> bool {
+    let Ok(mut wire_size) = node_observation_canonical_wire_size(observation) else {
+        return false;
+    };
+    while wire_size > NODE_OBSERVATION_MAX_WIRE_BYTES {
+        let Some(removed) = observation.runtimes.pop() else {
+            return false;
+        };
+        let Ok(encoded) = serde_json::to_vec(&removed) else {
+            return false;
+        };
+        // Removing a final array member removes its exact JSON bytes and, when
+        // another member remains, the separating comma. Object-key order does
+        // not change encoded length, so this stays exact without repeatedly
+        // serializing an up-to-8-MiB observation.
+        let separator = usize::from(!observation.runtimes.is_empty());
+        let Some(smaller) = wire_size.checked_sub(encoded.len() + separator) else {
+            return false;
+        };
+        wire_size = smaller;
+    }
+    debug_assert_eq!(
+        node_observation_canonical_wire_size(observation).ok(),
+        Some(wire_size)
+    );
+    true
 }
 
 enum DegradedReasonTemplate {
@@ -3830,10 +3903,20 @@ fn degraded_source(source: InventorySource) -> DegradedSource {
     }
 }
 
+#[cfg(test)]
 fn build_full_observation(
     scan: RuntimeSpineFullScan,
     inventory: CompleteRuntimeInventory,
 ) -> Result<NodeObservation, ContractError> {
+    let mut observation = build_full_observation_candidate(scan, inventory);
+    observation.inventory_digest = Some(inventory_digest(&observation)?);
+    Ok(observation)
+}
+
+fn build_full_observation_candidate(
+    scan: RuntimeSpineFullScan,
+    inventory: CompleteRuntimeInventory,
+) -> NodeObservation {
     let (key_ring_version, key_ring_digest, loaded_kids) = match inventory.key_ring {
         RuntimeInventoryKeyRing::Unavailable => (None, None, Vec::new()),
         RuntimeInventoryKeyRing::Loaded {
@@ -3842,7 +3925,7 @@ fn build_full_observation(
             kids,
         } => (Some(version), Some(digest), kids),
     };
-    let mut observation = NodeObservation {
+    NodeObservation {
         version: ContractVersion::V1,
         observation_id: RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
             .expect("a simple UUID is a valid RandomId128"),
@@ -3861,9 +3944,13 @@ fn build_full_observation(
         loaded_kids,
         runtimes: inventory.runtimes,
         residue: inventory.residue,
-    };
-    observation.inventory_digest = Some(inventory_digest(&observation)?);
-    Ok(observation)
+    }
+}
+
+fn node_observation_exceeds_wire_budget(
+    observation: &NodeObservation,
+) -> Result<bool, ContractError> {
+    Ok(node_observation_canonical_wire_size(observation)? > NODE_OBSERVATION_MAX_WIRE_BYTES)
 }
 
 fn desired_in_progress(error: &RuntimeSpineError) -> bool {
@@ -3946,16 +4033,16 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_agent_session, decode_desired_read_request, decode_desired_read_snapshot,
         decode_node_observation, decode_runtime_checkpoint, encode_desired_read_snapshot,
-        encode_observation_acceptance, encode_runtime_spine_error, spec_digest,
-        AdmissionInventoryAttestation, AppliedDesiredEvidence, AssignedKind, AssignedPlacement,
-        CheckpointEvidence, Condition, ContractVersion, ControlHandshakeEvidence, FenceEpoch,
-        GuestBootId, GuestTransportEvidence, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, NetworkConfig, ObservationAcceptance,
-        ObservationInventoryAcceptance, ObservedVmShape, OwnershipTokenEvidence, ProcessEvidence,
-        ProcessRole, ProcessState, ReadyReason, ReconcileStep, Revision, RuntimeConfig,
-        RuntimeLaunch, RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, Sequence,
-        SessionBinding, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
-        DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
+        encode_node_observation, encode_observation_acceptance, encode_runtime_spine_error,
+        spec_digest, AdmissionInventoryAttestation, AppliedDesiredEvidence, AssignedKind,
+        AssignedPlacement, CheckpointEvidence, Condition, ContractVersion,
+        ControlHandshakeEvidence, FenceEpoch, GuestBootId, GuestTransportEvidence, HostPath, Id,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig,
+        ObservationAcceptance, ObservationInventoryAcceptance, ObservedVmShape,
+        OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, ReadyReason,
+        ReconcileStep, Revision, RuntimeConfig, RuntimeLaunch, RuntimeSpineErrorDetail,
+        RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, StableState, UnixMillis,
+        WarmSnapshotEvidence, WireU64, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
     };
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -3977,6 +4064,10 @@ mod tests {
     }
 
     struct IncompleteScanner;
+
+    struct WireOverflowScanner {
+        calls: AtomicUsize,
+    }
 
     struct TransientRunningProbeScanner {
         calls: AtomicUsize,
@@ -4003,6 +4094,38 @@ mod tests {
                 unavailable_sources: vec![InventorySource::Process],
                 exact_physical_negative_cats: BTreeSet::new(),
             })
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for WireOverflowScanner {}
+
+    impl RuntimeInventoryScanner for WireOverflowScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            context.check_active()?;
+            let residue = (0..cats_api::runtime_reconciliation::NODE_OBSERVATION_MAX_RESIDUE_ITEMS)
+                .map(|index| NodeResidue::ControlSocket {
+                    // 4,096 stable items can exceed the wire budget even
+                    // though the independent item-count budget is satisfied.
+                    socket_path: HostPath::new(format!("/{}-{index:04}", "x".repeat(2_194)))
+                        .unwrap(),
+                    role_hint: None,
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                })
+                .collect();
+            let mut inventory = CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                Vec::new(),
+                residue,
+            );
+            inventory
+                .residue_sources
+                .insert(InventorySource::ControlSocket);
+            Ok(RuntimeInventoryScanOutcome::Complete(inventory))
         }
     }
 
@@ -5913,6 +6036,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_scan_wire_overflow_stays_local_without_transport_or_pending_journal() {
+        let observation_calls = Arc::new(AtomicUsize::new(0));
+        let serving_observation_calls = Arc::clone(&observation_calls);
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(|| async { wire_response(StatusCode::OK, SNAPSHOT.to_vec()) }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(move || {
+                    let observation_calls = Arc::clone(&serving_observation_calls);
+                    async move {
+                        observation_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let registered = decode_agent_session(SESSION).unwrap();
+        let scanner = Arc::new(WireOverflowScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new(
+            state.clone(),
+            registered.clone(),
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            scanner.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        for _ in 0..2 {
+            let RuntimeSpineRunStep::ScanIncomplete {
+                unavailable_sources,
+            } = runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap()
+            else {
+                panic!("wire overflow must remain a typed local Incomplete result")
+            };
+            assert_eq!(unavailable_sources, vec![InventorySource::ControlSocket]);
+        }
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(observation_calls.load(Ordering::SeqCst), 0);
+
+        runner.shutdown().await.unwrap();
+        let journal = RuntimeSpineJournal::open_for_test(&state, registered).unwrap();
+        assert!(journal.pending_observation().is_none());
+        assert!(journal.full_observation().is_none());
+        assert!(journal.last_observation().is_none());
+        assert!(journal.full_scan().is_ok(), "overflow must not block retry");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unavailable_full_inventory_never_reaches_the_typed_effect_seam() {
         let snapshot = snapshot_with_network();
         let app = Router::new().route(
@@ -7555,6 +7743,124 @@ mod tests {
         assert_eq!(
             observation.inventory_digest,
             Some(inventory_digest(&observation).unwrap())
+        );
+    }
+
+    #[test]
+    fn complete_observation_wire_budget_accepts_exact_8_mib_and_closes_plus_one() {
+        fn path_with_len(length: usize, index: usize) -> HostPath {
+            let suffix = format!("{index:04}");
+            HostPath::new(format!("/{}{}", "x".repeat(length - 5), suffix)).unwrap()
+        }
+
+        let target = NODE_OBSERVATION_MAX_WIRE_BYTES;
+        let mut empty = pending_full_observation();
+        empty.residue.clear();
+        empty.inventory_digest = Some(inventory_digest(&empty).unwrap());
+        let empty_len = serde_json::to_vec(&empty).unwrap().len();
+        let mut shape = None;
+        for path_len in 1_500..4_096 {
+            let item = NodeResidue::ControlSocket {
+                socket_path: path_with_len(path_len, 0),
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            };
+            let item_len = serde_json::to_vec(&item).unwrap().len();
+            let count = (target - empty_len + 1) / (item_len + 1);
+            if count == 0
+                || count > cats_api::runtime_reconciliation::NODE_OBSERVATION_MAX_RESIDUE_ITEMS
+            {
+                continue;
+            }
+            let current = empty_len + count * item_len + count - 1;
+            let gap = target - current;
+            if path_len + gap < 4_096 {
+                shape = Some((path_len, count, gap));
+                break;
+            }
+        }
+        let (path_len, count, gap) = shape.expect("one valid 8 MiB residue packing exists");
+        let mut exact = empty;
+        exact.residue = (0..count)
+            .map(|index| NodeResidue::ControlSocket {
+                socket_path: path_with_len(
+                    path_len + if index + 1 == count { gap } else { 0 },
+                    index,
+                ),
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            })
+            .collect();
+        exact.inventory_digest = Some(inventory_digest(&exact).unwrap());
+        assert_eq!(serde_json::to_vec(&exact).unwrap().len(), target);
+        assert_eq!(encode_node_observation(&exact).unwrap().len(), target);
+        assert!(!node_observation_exceeds_wire_budget(&exact).unwrap());
+
+        let NodeResidue::ControlSocket { socket_path, .. } = exact.residue.last_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        *socket_path = HostPath::new(format!("{}x", socket_path.as_str())).unwrap();
+        assert_eq!(serde_json::to_vec(&exact).unwrap().len(), target + 1);
+        assert!(node_observation_exceeds_wire_budget(&exact).unwrap());
+    }
+
+    #[test]
+    fn first_scan_wire_overflow_cannot_manufacture_an_unanchored_partial() {
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        assert!(build_degraded_partial_observation(
+            RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: registered.node_id,
+                    node_boot_id: registered.node_boot_id,
+                    agent_instance_id: registered.agent_instance_id,
+                    agent_session_epoch: registered.agent_session_epoch,
+                },
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired,
+            },
+            None,
+            None,
+            DegradedObservationCause::WireBudgetExceeded(vec![InventorySource::ControlSocket]),
+            &RuntimePreScanAdmissionOutcome::retained_running_cats([]),
+            UnixMillis::new(1_720_000_004_000).unwrap(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn wire_overflow_after_an_accepted_full_has_a_bounded_anchored_partial() {
+        let full = pending_full_observation();
+        let registered = decode_agent_session(SESSION).unwrap();
+        let desired = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        let partial = build_degraded_partial_observation(
+            RuntimeSpineFullScan {
+                session: SessionBinding {
+                    node_id: registered.node_id,
+                    node_boot_id: registered.node_boot_id,
+                    agent_instance_id: registered.agent_instance_id,
+                    agent_session_epoch: registered.agent_session_epoch,
+                },
+                heartbeat_sequence: Sequence::new(2).unwrap(),
+                inventory_epoch: Epoch::new(2).unwrap(),
+                desired,
+            },
+            Some(&full),
+            Some(&full),
+            DegradedObservationCause::WireBudgetExceeded(vec![InventorySource::ControlSocket]),
+            &RuntimePreScanAdmissionOutcome::retained_running_cats([]),
+            UnixMillis::new(1_720_000_004_000).unwrap(),
+        )
+        .expect("an accepted full attestation may anchor an empty bounded partial");
+        assert!(!partial.complete_inventory);
+        assert_eq!(partial.inventory_epoch, full.inventory_epoch);
+        assert_eq!(partial.inventory_digest, None);
+        assert_eq!(partial.inventory_read_position, None);
+        assert!(partial.runtimes.is_empty() && partial.residue.is_empty());
+        assert!(
+            encode_node_observation(&partial).unwrap().len() <= NODE_OBSERVATION_MAX_WIRE_BYTES
         );
     }
 

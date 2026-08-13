@@ -2,11 +2,12 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use super::types::AuthorizedServingAcquire;
 use super::types::{
-    AuthorizedServingAcquire, Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName,
-    ContractVersion, DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId,
-    MalformedProblem, NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet,
-    Sha256Digest,
+    Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
+    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem,
+    NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
@@ -14,11 +15,13 @@ const CHECKPOINT_DOMAIN: &[u8] = b"cats.runtime.checkpoint-content.v1";
 const INVENTORY_DOMAIN: &[u8] = b"cats.runtime.inventory.v1";
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
 const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
+#[cfg(feature = "proposed-node-residue-reclamation")]
 const RESIDUE_ACQUISITION_DOMAIN: &[u8] = b"cats.runtime.residue-acquisition.v1";
 
 /// Computes the digest of the complete immutable acquire receipt carried by a
 /// residue authority request. The digest is diagnostic binding, never an
 /// authority substitute for the receipt itself.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub fn residue_acquisition_digest(
     acquisition: &AuthorizedServingAcquire,
 ) -> Result<Sha256Digest, ContractError> {
@@ -132,6 +135,18 @@ pub fn inventory_digest(observation: &NodeObservation) -> Result<Sha256Digest, C
     let projected_digest = digest_value(INVENTORY_DOMAIN, &Value::Object(projection));
     debug_assert_eq!(projected_digest, digest);
     Ok(projected_digest)
+}
+
+/// Returns the exact canonical JSON wire size of a typed Node observation.
+///
+/// This is a size-only preflight: callers must still use
+/// [`super::wire::encode_node_observation`] to validate and encode observations
+/// that fit the wire budget.
+pub fn node_observation_canonical_wire_size(
+    observation: &NodeObservation,
+) -> Result<usize, ContractError> {
+    let value = as_value(observation, ContractName::NodeObservation)?;
+    Ok(value_bytes(&value).len())
 }
 
 /// Computes the digest for one atomically loaded key-ring version.

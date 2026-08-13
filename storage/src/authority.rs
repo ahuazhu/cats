@@ -6,16 +6,21 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub use cats_api::runtime_reconciliation::{
-    residue_acquisition_digest, AcquireOrigin, AsciiText, AuthorizationConsumedReceipt,
-    AuthorizationRecord, AuthorizationState, AuthorizedServingAcquire, BeginDeleteRequest,
-    BeginDeleteResult, BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DiskKind,
-    DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
-    Generation, Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest, NormalAcquireResult,
-    RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, ResidueAuthorityRetentionReason,
-    ResidueDataDirectoryLineage, ResidueReclaimProof, Revision, RuntimeResidueAuthorityOutcome,
-    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAcquireRequest, VolumeAdminState,
-    VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization, WireU64,
+    residue_acquisition_digest, AuthorizedServingAcquire, DiskKind,
+    ResidueAuthorityRetentionReason, ResidueDataDirectoryLineage, ResidueReclaimProof,
+    RuntimeResidueAuthorityOutcome, WireU64,
+};
+pub use cats_api::runtime_reconciliation::{
+    AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
+    AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
+    BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
+    DisposableRootDeleteAuthorization, Epoch, FenceEpoch, Generation, Id, LastVolumeTransition,
+    NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
+    ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt, UnixMillis,
+    VolumeAcquireRequest, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
+    VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +54,23 @@ pub struct AuthorizedServingAttachment {
     pub head: RemoteHead,
     pub lease_expires_at: UnixMillis,
     pub acquire: AuthorizedServingAcquire,
+}
+
+/// Immutable, thick authority that created one serving attachment. Normal
+/// acquire keeps its exact request/result pair; takeover keeps the complete
+/// consumed authorization and receipt rather than a lossy projection.
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizedServingAcquire {
+    Normal {
+        request: NormalAcquireRequest,
+        result: NormalAcquireResult,
+    },
+    Takeover {
+        authorization: VolumeTakeoverAuthorization,
+        receipt: TakeoverConsumedReceipt,
+    },
 }
 
 impl AuthorizedServingAttachment {
@@ -714,6 +736,7 @@ pub fn validate_volume_transition_evidence_bundle(
 /// Classifies one exact local lineage against one repeatable-read authority
 /// snapshot.  A retained outcome is diagnostic and never authorizes I/O; the
 /// three reclaimable arms are independently closed by the public wire codec.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub fn classify_residue_reclaim_authority(
     lineage: &ResidueDataDirectoryLineage,
     current_volume: Option<&VolumeRecord>,

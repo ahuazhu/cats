@@ -33,6 +33,7 @@ pub(crate) use product::{
     BillingExhaustionDecision, RuntimeOperationRead, SystemDesiredMutationCommit,
     SystemDesiredMutationResolutionOwner,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub(crate) mod residue_authority;
 #[allow(
     dead_code,

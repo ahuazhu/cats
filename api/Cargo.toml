@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# Experimental implementation of docs/specs/node-residue-reclamation-v1.md.
+# The proposal is not part of the accepted Runtime Reconciliation V1 wire and
+# production crates do not enable this feature.
+proposed-node-residue-reclamation = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

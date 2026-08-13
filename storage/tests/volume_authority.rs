@@ -111,6 +111,7 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
     )
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
     let acquired = acquired_volume();
     let Some(LastVolumeTransition::NormalAcquire { request, result }) = acquired.last_transition
@@ -1131,6 +1132,7 @@ fn disposable_completion_reconnects_to_the_unique_consumed_receipt() {
 }
 
 #[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_reclaim_accepts_only_exact_direct_ordinary_release() {
     let owned = acquired_volume();
     let (released, _) = release(
@@ -1179,6 +1181,7 @@ fn residue_reclaim_accepts_only_exact_direct_ordinary_release() {
 }
 
 #[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_reclaim_accepts_exact_normal_delete_completion_only_at_r_equals_l() {
     let owned = acquired_volume();
     let (released, _) = release(
@@ -1217,6 +1220,7 @@ fn residue_reclaim_accepts_exact_normal_delete_completion_only_at_r_equals_l() {
 }
 
 #[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);

@@ -14,16 +14,19 @@ use cats_api::agent_registration::{
     NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
 };
 use cats_api::error::ErrorCode;
+#[cfg(feature = "proposed-node-residue-reclamation")]
 use cats_api::runtime_reconciliation::{
-    decode_runtime_residue_authority_request, decode_runtime_volume_transition_evidence_request,
-    decode_runtime_volume_transition_request, encode_runtime_residue_authority_success,
+    decode_runtime_residue_authority_request, encode_runtime_residue_authority_success,
+    RuntimeResidueAuthorityRequest, RuntimeResidueAuthoritySuccess, RUNTIME_RESIDUE_AUTHORITY_PATH,
+    RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
+};
+use cats_api::runtime_reconciliation::{
+    decode_runtime_volume_transition_evidence_request, decode_runtime_volume_transition_request,
     encode_runtime_volume_transition_error, encode_runtime_volume_transition_evidence_success,
     encode_runtime_volume_transition_success, ContractError, ContractErrorDetail, ContractName,
-    ContractVersion, JsonPointer, LimitKind, RuntimeResidueAuthorityRequest,
-    RuntimeResidueAuthoritySuccess, RuntimeVolumeTransitionError,
+    ContractVersion, JsonPointer, LimitKind, RuntimeVolumeTransitionError,
     RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionHttpProblem, RuntimeVolumeTransitionRequest, WireU64,
-    RUNTIME_RESIDUE_AUTHORITY_PATH, RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
     RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
@@ -47,6 +50,7 @@ const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-int
 enum Route {
     Mutation,
     Evidence,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     ResidueAuthority,
 }
 
@@ -55,6 +59,7 @@ impl Route {
         match self {
             Self::Mutation => RUNTIME_VOLUME_TRANSITION_PATH,
             Self::Evidence => RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
             Self::ResidueAuthority => RUNTIME_RESIDUE_AUTHORITY_PATH,
         }
     }
@@ -63,6 +68,7 @@ impl Route {
         match self {
             Self::Mutation => RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES,
             Self::Evidence => RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
             Self::ResidueAuthority => RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
         }
     }
@@ -71,6 +77,7 @@ impl Route {
         match self {
             Self::Mutation => ContractName::RuntimeVolumeTransitionRequest,
             Self::Evidence => ContractName::RuntimeVolumeTransitionEvidenceRequest,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
             Self::ResidueAuthority => ContractName::RuntimeResidueAuthorityRequest,
         }
     }
@@ -78,7 +85,9 @@ impl Route {
     fn deadline(self) -> Duration {
         match self {
             Self::Mutation => MUTATION_DEADLINE,
-            Self::Evidence | Self::ResidueAuthority => EVIDENCE_DEADLINE,
+            Self::Evidence => EVIDENCE_DEADLINE,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            Self::ResidueAuthority => EVIDENCE_DEADLINE,
         }
     }
 }
@@ -86,6 +95,7 @@ impl Route {
 enum DecodedRequest {
     Mutation(Box<RuntimeVolumeTransitionRequest>),
     Evidence(RuntimeVolumeTransitionEvidenceRequest),
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     ResidueAuthority(Box<RuntimeResidueAuthorityRequest>),
 }
 
@@ -98,6 +108,7 @@ enum ExecutionOutcome {
         >,
     ),
     Evidence(VolumeTransitionStoreOutcome<VolumeTransitionEvidenceLoad>),
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     ResidueAuthority(VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>),
 }
 
@@ -125,6 +136,7 @@ pub(super) async fn evidence(State(state): State<AppState>, request: Request<Bod
     handle(state, request, Route::Evidence).await
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub(super) async fn residue_authority(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -275,6 +287,7 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
             Ok(request) => DecodedRequest::Evidence(request),
             Err(error) => return contract_error_response(decode_status(&error), error),
         },
+        #[cfg(feature = "proposed-node-residue-reclamation")]
         Route::ResidueAuthority => match decode_runtime_residue_authority_request(&body) {
             Ok(request) => DecodedRequest::ResidueAuthority(Box::new(request)),
             Err(error) => return contract_error_response(decode_status(&error), error),
@@ -331,6 +344,7 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
                                         &store_context,
                                     )
                                     .map(ExecutionOutcome::Evidence),
+                                #[cfg(feature = "proposed-node-residue-reclamation")]
                                 DecodedRequest::ResidueAuthority(request) => store
                                     .runtime_residue_authority_with_context(
                                         &authenticated,
@@ -422,12 +436,14 @@ fn owned_execution_response(
         OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Evidence(
             VolumeTransitionStoreOutcome::Rejected(rejection),
         ))) => rejection_response(rejection),
+        #[cfg(feature = "proposed-node-residue-reclamation")]
         OwnedExecutionResult::Executed(Ok(ExecutionOutcome::ResidueAuthority(
             VolumeTransitionStoreOutcome::Accepted(success),
         ))) => match encode_runtime_residue_authority_success(&success) {
             Ok(body) => success_response(body),
             Err(_) => internal_response(),
         },
+        #[cfg(feature = "proposed-node-residue-reclamation")]
         OwnedExecutionResult::Executed(Ok(ExecutionOutcome::ResidueAuthority(
             VolumeTransitionStoreOutcome::Rejected(rejection),
         ))) => rejection_response(rejection),
@@ -684,7 +700,6 @@ mod tests {
         ContractVersion, CredentialBinding, Id, NodeBootId, NodeIdentity, NodeIdentityState,
         RandomId128, RuntimeVolumeTransition, RuntimeVolumeTransitionErrorDetail,
         RuntimeVolumeTransitionEvidenceRequest, SessionBinding, VolumeAcquireRequest,
-        RUNTIME_RESIDUE_AUTHORITY_PATH,
     };
     use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
@@ -1254,12 +1269,17 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     #[tokio::test]
     async fn proposed_residue_authority_route_is_not_installed() {
         let context = Context::new().await;
         let node = context.register("residue", '7').await;
         let response = context
-            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, b"{}".to_vec())
+            .signed(
+                &node,
+                "/v1/internal/runtime/residue-authority",
+                b"{}".to_vec(),
+            )
             .send()
             .await
             .unwrap();

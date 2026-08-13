@@ -641,6 +641,7 @@ pub(super) fn load_disk_by_id_for_update(
         .transpose()
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 pub(super) fn load_disk_by_id_unlocked(
     transaction: &mut Transaction<'_>,
     disk_id: &Id,

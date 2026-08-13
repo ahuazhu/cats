@@ -320,6 +320,7 @@ impl RuntimeInventoryScanner for CompleteAssignedScanner {
                 RuntimeInventoryKeyRing::Unavailable,
                 runtimes,
                 Vec::new(),
+                Default::default(),
             ),
         ))
     }

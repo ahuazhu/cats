@@ -8,8 +8,8 @@
 use cats_api::runtime_reconciliation::{
     encode_runtime_residue_authority_success, AuthorizationConsumedReceipt, AuthorizationRecord,
     AuthorizationState, AuthorizedServingAcquire, ContractVersion, DeleteCompletionReceipt,
-    DiskKind, RuntimeResidueAuthorityRequest, RuntimeResidueAuthoritySuccess, UnixMillis,
-    VolumeAcquire,
+    DiskKind, RuntimeResidueAuthorityRequest, RuntimeResidueAuthoritySuccess, RuntimeTarget,
+    UnixMillis, VolumeAcquire, VolumeDisposition,
 };
 use cats_storage::authority::classify_residue_reclaim_authority;
 
@@ -18,13 +18,10 @@ use super::product_rows::{load_desired_unlocked, load_disk_by_id_unlocked};
 use super::rows::{
     load_authorization_unlocked, load_delete_completions_by_volume, load_volume_unlocked,
 };
-use super::volume_transition_auth::EvidenceTransactionContext;
+use super::volume_transition_auth::{
+    release_disposition_matches_current, EvidenceTransactionContext,
+};
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
-
-/// This entire Proposed Store/API seam stays mechanically unavailable until
-/// the reclamation contract is accepted. Tests exercise the inner read-only
-/// transaction function directly; production entrypoints check this constant.
-pub(super) const PROPOSED_RESIDUE_AUTHORITY_ENABLED: bool = false;
 
 pub(super) fn load_runtime_residue_authority_in(
     context: EvidenceTransactionContext<'_, '_>,
@@ -119,28 +116,42 @@ fn request_matches_control_snapshot(
     }) else {
         return false;
     };
-    let disk_is_exact = disk.is_some_and(|disk| {
-        disk.disk_id == lineage.disk_id
-            && disk.workspace_id == lineage.workspace_id
-            && disk.volume_id == lineage.volume_id
-            && (matches!(
-                (&disk.role, lineage.disk_kind),
-                (DiskRole::Root { cat_id }, DiskKind::Root) if cat_id == &lineage.cat_id
-            ) || matches!(
-                (&disk.role, lineage.disk_kind),
-                (DiskRole::Persistent { .. }, DiskKind::Persistent)
-            ))
-    });
-    let completed_disk_is_exact = disk.is_none()
-        && delete_completion.is_some_and(|completion| match completion {
-            DeleteCompletionReceipt::Normal { request, .. } => {
-                request.disk_id == lineage.disk_id && request.volume_id == lineage.volume_id
-            }
-            DeleteCompletionReceipt::DisposableRoot {
-                disk_id, volume_id, ..
-            } => disk_id == &lineage.disk_id && volume_id == &lineage.volume_id,
-        });
-    if !disk_is_exact && !completed_disk_is_exact {
+    let disk_binding_is_exact = match delete_completion {
+        None => {
+            release_disposition_matches_current(desired, intent)
+                && disk.is_some_and(|disk| {
+                    disk.disk_id == lineage.disk_id
+                        && disk.workspace_id == lineage.workspace_id
+                        && disk.volume_id == lineage.volume_id
+                        && (matches!(
+                            (&disk.role, lineage.disk_kind),
+                            (DiskRole::Root { cat_id }, DiskKind::Root)
+                                if cat_id == &lineage.cat_id
+                        ) || matches!(
+                            (&disk.role, lineage.disk_kind),
+                            (DiskRole::Persistent { .. }, DiskKind::Persistent)
+                        ))
+                })
+        }
+        Some(completion) => {
+            let VolumeDisposition::DeleteDisposableRoot { delete_id } = &intent.disposition else {
+                return false;
+            };
+            disk.is_none()
+                && desired.target == RuntimeTarget::Deleted
+                && lineage.disk_kind == DiskKind::Root
+                && completion_delete_id(completion) == delete_id
+                && match completion {
+                    DeleteCompletionReceipt::Normal { request, .. } => {
+                        request.disk_id == lineage.disk_id && request.volume_id == lineage.volume_id
+                    }
+                    DeleteCompletionReceipt::DisposableRoot {
+                        disk_id, volume_id, ..
+                    } => disk_id == &lineage.disk_id && volume_id == &lineage.volume_id,
+                }
+        }
+    };
+    if !disk_binding_is_exact {
         return false;
     }
     match (&intent.acquire, &lineage.acquisition) {
@@ -159,6 +170,15 @@ fn request_matches_control_snapshot(
             AuthorizedServingAcquire::Takeover { authorization, .. },
         ) => authorization_id == &authorization.authorization_id,
         _ => false,
+    }
+}
+
+fn completion_delete_id(
+    receipt: &DeleteCompletionReceipt,
+) -> &cats_api::runtime_reconciliation::Id {
+    match receipt {
+        DeleteCompletionReceipt::Normal { request, .. } => &request.delete_id,
+        DeleteCompletionReceipt::DisposableRoot { delete_id, .. } => delete_id,
     }
 }
 

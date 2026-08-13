@@ -1076,6 +1076,7 @@ mod tests {
                     RuntimeInventoryKeyRing::Unavailable,
                     runtimes,
                     Vec::new(),
+                    Default::default(),
                 ),
             ))
         }

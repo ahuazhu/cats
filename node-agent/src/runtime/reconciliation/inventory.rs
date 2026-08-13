@@ -197,6 +197,12 @@ pub(crate) mod root_process_inventory_bridge_sealed {
 #[derive(Debug)]
 pub(crate) enum RootProcessInventoryBridgeOutcome {
     Complete(NodeGlobalManagedProcessScanAdmission),
+    CompleteWithResidue {
+        admission: NodeGlobalManagedProcessScanAdmission,
+        systemd: Vec<NodeResidue>,
+        processes: Vec<NodeResidue>,
+        control_sockets: Vec<NodeResidue>,
+    },
     Unavailable {
         /// Per-Cat exact Running negatives learned before a later member of
         /// the closed process scan became unavailable. These are safe only
@@ -243,6 +249,10 @@ pub(crate) mod network_inventory_bridge_sealed {
 #[derive(Debug)]
 pub(crate) enum NetworkInventoryBridgeOutcome {
     Complete(NodeGlobalNetworkScanAdmission),
+    CompleteWithResidue {
+        admission: NodeGlobalNetworkScanAdmission,
+        residue: Vec<NodeResidue>,
+    },
     Unavailable,
 }
 
@@ -443,6 +453,7 @@ impl CleanSlateInventoryScanner {
 
 struct InventoryProbeAggregation {
     unavailable_sources: Vec<InventorySource>,
+    residue_sources: BTreeSet<InventorySource>,
     volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
     corrupt_checkpoints_by_cat: BTreeMap<Id, Sha256Digest>,
@@ -455,6 +466,7 @@ impl InventoryProbeAggregation {
     fn new() -> Self {
         Self {
             unavailable_sources: Vec::new(),
+            residue_sources: BTreeSet::new(),
             volumes_by_cat: BTreeMap::new(),
             checkpoints_by_cat: BTreeMap::new(),
             corrupt_checkpoints_by_cat: BTreeMap::new(),
@@ -470,6 +482,9 @@ fn append_residue_or_mark_incomplete(
     source: InventorySource,
     mut residue: Vec<NodeResidue>,
 ) {
+    if residue.is_empty() {
+        return;
+    }
     if aggregate
         .residue
         .len()
@@ -481,7 +496,20 @@ fn append_residue_or_mark_incomplete(
         }
         return;
     }
+    aggregate.residue_sources.insert(source);
     aggregate.residue.append(&mut residue);
+}
+
+fn incomplete_inventory(
+    mut unavailable_sources: Vec<InventorySource>,
+    exact_physical_negative_cats: BTreeSet<Id>,
+) -> RuntimeInventoryScanOutcome {
+    unavailable_sources.sort();
+    unavailable_sources.dedup();
+    RuntimeInventoryScanOutcome::Incomplete {
+        unavailable_sources,
+        exact_physical_negative_cats,
+    }
 }
 
 fn inspect_inventory_probe(
@@ -657,10 +685,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
             if !aggregate.unavailable_sources.is_empty() {
-                return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                    unavailable_sources: aggregate.unavailable_sources,
+                return Ok(incomplete_inventory(
+                    aggregate.unavailable_sources,
                     exact_physical_negative_cats,
-                });
+                ));
             }
 
             let root_expected = root_process_expectations(
@@ -715,6 +743,33 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     serving_status_by_cat = admission.serving_status_projections();
                     node_global_process_admission = Some(admission);
                 }
+                RootProcessInventoryBridgeOutcome::CompleteWithResidue {
+                    admission,
+                    systemd,
+                    processes,
+                    control_sockets,
+                } => {
+                    exact_physical_negative_cats = admission.exact_running_negative_cats();
+                    processes_by_cat = admission.process_projections();
+                    serving_devices_by_cat = admission.vhost_device_projections();
+                    serving_status_by_cat = admission.serving_status_projections();
+                    node_global_process_admission = Some(admission);
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Systemd,
+                        systemd,
+                    );
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Process,
+                        processes,
+                    );
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::ControlSocket,
+                        control_sockets,
+                    );
+                }
                 RootProcessInventoryBridgeOutcome::Unavailable {
                     exact_running_negative_cats,
                 } => {
@@ -732,10 +787,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     InventorySource::Process,
                     InventorySource::ControlSocket,
                 ]);
-                return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                    unavailable_sources: aggregate.unavailable_sources,
+                return Ok(incomplete_inventory(
+                    aggregate.unavailable_sources,
                     exact_physical_negative_cats,
-                });
+                ));
             }
             if let Some(kernel_nbd) = &self.kernel_nbd_port {
                 if let Some(managed_processes) = node_global_process_admission.as_ref() {
@@ -759,6 +814,27 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 }
                             }
                             kernel_nbd_pool_admission = Some(admission);
+                        }
+                        KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } => {
+                            debug_assert!(!admission.has_unavailable_device());
+                            for (cat_id, projections) in admission.device_projections() {
+                                for (volume_id, device) in projections {
+                                    anyhow::ensure!(
+                                        serving_devices_by_cat
+                                            .entry(cat_id.clone())
+                                            .or_default()
+                                            .insert(volume_id, device)
+                                            .is_none(),
+                                        "managed frontend scan projects two devices for one Volume"
+                                    );
+                                }
+                            }
+                            kernel_nbd_pool_admission = Some(admission);
+                            append_residue_or_mark_incomplete(
+                                &mut aggregate,
+                                InventorySource::BlockFrontend,
+                                residue,
+                            );
                         }
                         KernelNbdPoolScanOutcome::Unavailable => {
                             aggregate
@@ -794,15 +870,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 // the same scan did not also prove the exact empty control-only
                 // engine state, keep every involved source unavailable and do
                 // not let the proof reach wire projection.
-                return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                    unavailable_sources: vec![
+                return Ok(incomplete_inventory(
+                    vec![
                         InventorySource::Systemd,
                         InventorySource::Process,
                         InventorySource::ControlSocket,
                         InventorySource::DataDirectory,
                     ],
                     exact_physical_negative_cats,
-                });
+                ));
             }
             for source in [
                 InventorySource::Systemd,
@@ -839,6 +915,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     networks_by_cat = admission.network_projections();
                     node_global_network_admission = Some(admission);
                 }
+                NetworkInventoryBridgeOutcome::CompleteWithResidue { admission, residue } => {
+                    networks_by_cat = admission.network_projections();
+                    node_global_network_admission = Some(admission);
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Network,
+                        residue,
+                    );
+                }
                 NetworkInventoryBridgeOutcome::Unavailable => {
                     aggregate.unavailable_sources.push(InventorySource::Network);
                 }
@@ -848,10 +933,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 .context("network inventory bridge deadline expired after inspection")?;
         }
         if !aggregate.unavailable_sources.is_empty() {
-            return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                unavailable_sources: aggregate.unavailable_sources,
+            return Ok(incomplete_inventory(
+                aggregate.unavailable_sources,
                 exact_physical_negative_cats,
-            });
+            ));
         }
 
         let mut running_tail_admission = None;
@@ -1223,6 +1308,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 key_ring,
                 runtimes,
                 aggregate.residue,
+                aggregate.residue_sources,
             )
             .with_node_global_process_admission(node_global_process_admission)
             .with_node_global_network_admission(node_global_network_admission)

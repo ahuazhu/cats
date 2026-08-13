@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+proposed-node-residue-reclamation = [
+    "cats-api/proposed-node-residue-reclamation",
+    "cats-storage/proposed-node-residue-reclamation",
+]
+
 [dependencies]
 cats-api = { workspace = true }
 cats-metering = { workspace = true }

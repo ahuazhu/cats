@@ -7,20 +7,24 @@
 //! locks before they can reach an authorization or Volume row.
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
+#[cfg(feature = "proposed-node-residue-reclamation")]
 use cats_api::runtime_reconciliation::{
-    encode_runtime_residue_authority_request, encode_runtime_volume_transition_evidence_request,
-    encode_runtime_volume_transition_request, AcquireOrigin, AgentSession, AssignedPlacement,
-    CleanupRelease, CleanupTarget, ContractError, ContractErrorDetail, ContractVersion,
-    CredentialBinding, DesiredRuntimeSpec, DiskKind, FilesystemInitialization, Id,
-    LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue, ObservedDiskKind,
-    ObservedRuntimeStatus, PersistentFilesystemBinding, PersistentInitializationReceipt,
-    ProcessRole, Revision, RuntimeResidueAuthorityRequest, RuntimeResidueAuthoritySuccess,
-    RuntimeTarget, RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection,
-    RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
-    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
-    RuntimeVolumeTransitionRequest, RuntimeVolumeTransitionSuccess, SessionBinding, Sha256Digest,
-    UnixMillis, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence, VolumeDisposition,
-    VolumeIntent, VolumeLeaseGrant,
+    encode_runtime_residue_authority_request, RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess,
+};
+use cats_api::runtime_reconciliation::{
+    encode_runtime_volume_transition_evidence_request, encode_runtime_volume_transition_request,
+    AcquireOrigin, AgentSession, AssignedPlacement, CleanupRelease, CleanupTarget, ContractError,
+    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind,
+    FilesystemInitialization, Id, LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue,
+    ObservedDiskKind, ObservedRuntimeStatus, PersistentFilesystemBinding,
+    PersistentInitializationReceipt, ProcessRole, Revision, RuntimeTarget,
+    RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
+    RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
+    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
+    RuntimeVolumeTransitionSuccess, SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire,
+    VolumeAcquireRequest, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+    VolumeLeaseGrant,
 };
 use cats_storage::authority::{
     consume_disposable_root_delete, consume_takeover, normal_acquire, release,
@@ -38,6 +42,7 @@ use super::product_rows::{
     load_any_disk_snapshot_for_update, load_cat_by_id_for_update, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_disk,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
 use super::residue_authority::load_runtime_residue_authority_in;
 use super::rows::{
     database_now, load_authorization_for_update, load_event_for_update,
@@ -261,18 +266,13 @@ impl Store {
 
     /// Qualifies one exact retained local lineage under the current signed
     /// AgentSession and one repeatable-read PostgreSQL snapshot.
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     pub(crate) fn runtime_residue_authority(
         &self,
         authenticated: &AuthenticatedNodeCredential,
         request: &RuntimeResidueAuthorityRequest,
         active_guest_config_digest: &Sha256Digest,
     ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
-        if !super::residue_authority::PROPOSED_RESIDUE_AUTHORITY_ENABLED {
-            return Err(cats_api::error::ApiError::new(
-                cats_api::error::ErrorCode::NotFound,
-                "proposed residue authority is not enabled",
-            ));
-        }
         if let Err(error) = encode_runtime_residue_authority_request(request) {
             return Ok(contract_rejected(error));
         }
@@ -293,6 +293,7 @@ impl Store {
         })
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     pub(crate) fn runtime_residue_authority_with_context(
         &self,
         authenticated: &AuthenticatedNodeCredential,
@@ -300,12 +301,6 @@ impl Store {
         active_guest_config_digest: &Sha256Digest,
         request_context: &AuthorityRequestContext,
     ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
-        if !super::residue_authority::PROPOSED_RESIDUE_AUTHORITY_ENABLED {
-            return Err(cats_api::error::ApiError::new(
-                cats_api::error::ErrorCode::NotFound,
-                "proposed residue authority is not enabled",
-            ));
-        }
         if let Err(error) = encode_runtime_residue_authority_request(request) {
             return Ok(contract_rejected(error));
         }

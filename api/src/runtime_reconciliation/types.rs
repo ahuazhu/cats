@@ -1850,6 +1850,7 @@ pub struct RuntimeVolumeTransitionEvidenceSuccess {
 ///
 /// The residue contract carries this exact value (plus its domain-separated
 /// digest) instead of reconstructing authority from path or identifier hints.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizedServingAcquire {
@@ -1867,6 +1868,7 @@ pub enum AuthorizedServingAcquire {
 /// qualification.  This is physical evidence, not ownership authority.  The
 /// Control Plane must bind it to the current PostgreSQL authority snapshot and
 /// return one of the closed proofs below before the Node may delete any byte.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidueDataDirectoryLineage {
@@ -1895,6 +1897,7 @@ pub struct ResidueDataDirectoryLineage {
     pub fenced: bool,
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeResidueAuthorityRequest {
@@ -1903,6 +1906,7 @@ pub struct RuntimeResidueAuthorityRequest {
     pub lineage: ResidueDataDirectoryLineage,
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeResidueAuthoritySuccess {
@@ -1915,6 +1919,7 @@ pub struct RuntimeResidueAuthoritySuccess {
 /// A read-only Control decision from one repeatable-read authority snapshot.
 /// `Retained` is diagnostic only.  `Reclaimable` contains the complete proof
 /// that a Node must independently validate against its retained descriptor.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeResidueAuthorityOutcome {
@@ -1926,6 +1931,7 @@ pub enum RuntimeResidueAuthorityOutcome {
     },
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResidueAuthorityRetentionReason {
@@ -1938,6 +1944,7 @@ pub enum ResidueAuthorityRetentionReason {
     UnsupportedDiskKind,
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResidueReclaimProof {
@@ -2383,12 +2390,8 @@ pub enum NodeResidue {
         ownership_token: OwnershipTokenEvidence,
     },
     DataDirectory {
-        cat_id_hint: Option<Id>,
-        disk_id_hint: Option<Id>,
         volume_id_hint: Option<Id>,
         data_directory: HostPath,
-        allocated_bytes: WireU64,
-        retention_reason: DataDirectoryRetentionReason,
         ownership_token: OwnershipTokenEvidence,
         lineage: ResidueLineageEvidence,
     },
@@ -2418,12 +2421,18 @@ pub enum NodeResidue {
 pub enum ResidueLineageEvidence {
     Unreadable,
     Readable {
-        lineage: Box<ResidueDataDirectoryLineage>,
+        attachment_id_hint: Option<Id>,
+        attachment_epoch_hint: Option<FenceEpoch>,
+        local_durable_generation: Generation,
+        remote_durable_generation: Generation,
+        pending_pack_count: WireU64,
+        fenced: bool,
     },
 }
 
 /// Scanner/reconciler explanation for keeping one directory.  This field is
 /// observation-only and is deliberately absent from every reclaim proof.
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataDirectoryRetentionReason {
@@ -3150,7 +3159,9 @@ pub enum ContractName {
     RuntimeVolumeTransitionSuccess,
     RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionEvidenceSuccess,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     RuntimeResidueAuthorityRequest,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     RuntimeResidueAuthoritySuccess,
     RuntimeVolumeTransitionError,
     Operation,

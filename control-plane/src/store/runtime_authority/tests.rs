@@ -6,34 +6,42 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, encode_desired_runtime_spec, guest_config_digest, inventory_digest,
-    residue_acquisition_digest, spec_digest, AcquireOrigin, AgentRegistrationAttempt, AgentSession,
-    AppliedDesiredEvidence, AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement,
-    AuthorizedServingAcquire, CheckpointEvidence, CleanupRelease, CleanupTarget,
-    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
-    DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent, FilesystemInitialization,
-    GuestDeviceIdentity, GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Ipv4Address,
-    IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress,
-    MountAccess, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    NodeResidue, ObservedDevice, ObservedDiskKind, ObservedMount, ObservedRuntimeStatus,
-    ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding,
-    ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, ResidueAuthorityRetentionReason,
-    ResidueDataDirectoryLineage, ResidueReclaimProof, RuntimeCheckpoint, RuntimeConfig,
-    RuntimeResidueAuthorityOutcome, RuntimeResidueAuthorityRequest, RuntimeTarget,
+    spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
+    AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
+    CleanupRelease, CleanupTarget, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
+    CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent,
+    FilesystemInitialization, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
+    GuestTransportEvidence, HostPath, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
+    LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess, NetworkConfig, NodeBootId,
+    NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDevice,
+    ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
+    OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding, ProcessEvidence,
+    ProcessRole, ProcessState, ReconcileStep, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget,
     RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
     SessionBinding, VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence,
     VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WarmSnapshotEvidence, WireU64,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    residue_acquisition_digest, AcquireOrigin, AuthorizedServingAcquire,
+    ResidueAuthorityRetentionReason, ResidueDataDirectoryLineage, ResidueReclaimProof,
+    RuntimeResidueAuthorityOutcome, RuntimeResidueAuthorityRequest,
+};
 use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_storage::authority::{
+    begin_delete, complete_normal_delete, BeginDeleteRequest, NormalAcquireResult,
+};
 use cats_storage::authority::{
     complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire, AsciiText,
     AuthorityError, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
     DeleteCompletionReceipt, DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization,
     Epoch, FenceEpoch, Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id,
-    NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest, RemoteHead, Revision,
-    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization,
-    VolumeDurability, VolumeOwnerBinding, VolumeRecord, VolumeTakeoverAuthorization,
+    NormalAcquireRequest, RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest,
+    TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability,
+    VolumeOwnerBinding, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
 use super::product::{
@@ -44,6 +52,7 @@ use super::product_rows::{
     insert_cat, insert_desired, insert_disk, insert_disk_snapshot, insert_operation,
     load_desired_for_update, load_disk_by_id_for_update,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
 use super::residue_authority::load_runtime_residue_authority_in;
 use super::rows::{
     database_now, disposable_root_authorization_candidates_sql, insert_authorization,
@@ -1790,6 +1799,7 @@ fn evidence_request_for(
     }
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_authority_request(
     node: &TransitionNode,
     desired: &DesiredRuntimeSpec,
@@ -1837,19 +1847,22 @@ fn residue_authority_request(
     }
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn prepare_residue_product_snapshot(
     store: &Store,
     node: &TransitionNode,
     volume: &VolumeRecord,
     desired_revision: Revision,
     placement_epoch: Epoch,
+    target: RuntimeTarget,
+    disposition: VolumeDisposition,
 ) -> DesiredRuntimeSpec {
     let workspace = super::product_tests::bootstrap_workspace(store, "residue-authority");
     let desired = transition_desired(
         &workspace,
         node,
         volume,
-        RuntimeTarget::Running,
+        target,
         desired_revision,
         placement_epoch,
         id("attachment-old"),
@@ -1857,7 +1870,7 @@ fn prepare_residue_product_snapshot(
             transition_id: random_id(1),
             expected_unowned_epoch: fence_epoch(7),
         },
-        VolumeDisposition::Retain,
+        disposition,
     );
     store
         .authority_transaction(|transaction| {
@@ -1891,6 +1904,19 @@ fn prepare_residue_product_snapshot(
         })
         .unwrap();
     desired
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn replace_residue_desired(store: &Store, desired: &DesiredRuntimeSpec) {
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM desired_runtime_specs WHERE cat_id=$1",
+                &[&desired.cat_id.as_str()],
+            )?;
+            insert_desired(transaction, desired)
+        })
+        .unwrap();
 }
 
 fn head(value: u64) -> RemoteHead {
@@ -2331,6 +2357,7 @@ fn load_evidence_public(
     }
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 fn load_residue_authority(
     transaction: &mut postgres::Transaction<'_>,
     node: &TransitionNode,
@@ -5149,13 +5176,22 @@ fn evidence_snapshot_returns_disposable_completion_after_rows_are_gone() {
     assert_eq!(success.direct_successor_authorization, None);
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[test]
 fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
     let owned_binding = stored_volume_owner(&store, &owned.volume_id).unwrap();
     let node = transition_node(&store, "node-new");
-    let desired = prepare_residue_product_snapshot(&store, &node, &owned, revision(11), epoch(3));
+    let desired = prepare_residue_product_snapshot(
+        &store,
+        &node,
+        &owned,
+        revision(11),
+        epoch(3),
+        RuntimeTarget::Cold,
+        VolumeDisposition::Retain,
+    );
     let (released, _) = cats_storage::authority::release(
         &owned,
         &ReleaseRequest {
@@ -5171,14 +5207,17 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
         .unwrap();
 
     let request = residue_authority_request(&node, &desired, 4, 4);
-    let disabled = store
+    let public_response = store
         .runtime_residue_authority(
             &node.authenticated,
             &request,
             &node.active_guest_config_digest,
         )
-        .expect_err("the Proposed Store entrypoint must be mechanically disabled");
-    assert_eq!(disabled.code, ErrorCode::NotFound);
+        .unwrap();
+    assert!(matches!(
+        public_response,
+        VolumeTransitionStoreOutcome::Accepted(_)
+    ));
     let response = store
         .authority_locking_read_snapshot(|transaction| {
             load_residue_authority(transaction, &node, &request)
@@ -5203,6 +5242,25 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
         response, replay,
         "response loss must be an exact read replay"
     );
+
+    let mut wrong_target = desired.clone();
+    wrong_target.target = RuntimeTarget::Warm;
+    let mut wrong_disposition = desired.clone();
+    wrong_disposition.target = RuntimeTarget::Deleted;
+    wrong_disposition.volumes[0].disposition = VolumeDisposition::DetachRetained;
+    for (coordinate, mut mismatch) in [("target", wrong_target), ("disposition", wrong_disposition)]
+    {
+        mismatch.spec_digest = spec_digest(&mismatch).unwrap();
+        replace_residue_desired(&store, &mismatch);
+        let mismatch_request = residue_authority_request(&node, &mismatch, 4, 4);
+        let error = store
+            .authority_locking_read_snapshot(|transaction| {
+                load_residue_authority(transaction, &node, &mismatch_request)
+            })
+            .expect_err("ordinary release requires an exact closed disposition");
+        assert_eq!(error.code, ErrorCode::Internal, "wrong {coordinate}");
+    }
+    replace_residue_desired(&store, &desired);
 
     let existing_other_workspace =
         super::product_tests::bootstrap_workspace(&store, "residue-authority-other");
@@ -5301,12 +5359,115 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
     );
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[test]
+fn residue_authority_normal_completion_requires_current_deleted_disposition() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_residue_product_snapshot(
+        &store,
+        &node,
+        &owned,
+        revision(12),
+        epoch(4),
+        RuntimeTarget::Deleted,
+        VolumeDisposition::DeleteDisposableRoot {
+            delete_id: id("delete-1"),
+        },
+    );
+    let (released, _) = cats_storage::authority::release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: owned.lease_epoch,
+        },
+    )
+    .unwrap();
+    let delete = BeginDeleteRequest {
+        delete_id: id("delete-1"),
+        disk_id: id("disk-1"),
+        volume_id: owned.volume_id.clone(),
+        expected_unowned_epoch: released.lease_epoch,
+        expected_head: released.head.clone(),
+    };
+    let (deleting, _) = begin_delete(&released, &delete).unwrap();
+    let completion = complete_normal_delete(&deleting, unix_millis(40_000)).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            update_volume_owner(transaction, &deleting, None)?;
+            insert_delete_completion(transaction, &completion)?;
+            transaction.execute("DELETE FROM disk_records WHERE disk_id=$1", &[&"disk-1"])?;
+            transaction.execute(
+                "DELETE FROM volume_records WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let request = residue_authority_request(&node, &desired, 4, 4);
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::NormalDeleteCompletion { .. })
+    ));
+
+    let mut wrong_target = desired.clone();
+    wrong_target.target = RuntimeTarget::Running;
+    wrong_target.volumes[0].disposition = VolumeDisposition::Retain;
+    let mut wrong_disposition = desired.clone();
+    wrong_disposition.volumes[0].disposition = VolumeDisposition::DetachRetained;
+    let mut wrong_delete = desired.clone();
+    wrong_delete.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+        delete_id: id("delete-other"),
+    };
+    for (coordinate, mut mismatch) in [
+        ("target", wrong_target),
+        ("disposition", wrong_disposition),
+        ("delete ID", wrong_delete),
+    ] {
+        mismatch.spec_digest = spec_digest(&mismatch).unwrap();
+        replace_residue_desired(&store, &mismatch);
+        let request = residue_authority_request(&node, &mismatch, 4, 4);
+        let error = store
+            .authority_locking_read_snapshot(|transaction| {
+                load_residue_authority(transaction, &node, &request)
+            })
+            .expect_err("a completion without exact current delete intent must fail closed");
+        assert_eq!(error.code, ErrorCode::Internal, "wrong {coordinate}");
+    }
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
 #[test]
 fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
     let node = transition_node(&store, "node-new");
-    let desired = prepare_residue_product_snapshot(&store, &node, &owned, revision(12), epoch(4));
+    let desired = prepare_residue_product_snapshot(
+        &store,
+        &node,
+        &owned,
+        revision(12),
+        epoch(4),
+        RuntimeTarget::Deleted,
+        VolumeDisposition::DeleteDisposableRoot {
+            delete_id: id("delete-1"),
+        },
+    );
+    let disk = store
+        .authority_transaction(|transaction| {
+            Ok(load_disk_by_id_for_update(transaction, &id("disk-1"))?.unwrap())
+        })
+        .unwrap();
     let original = disposable_authorization(&owned);
     store
         .authority_transaction(|transaction| insert_authorization(transaction, &original))
@@ -5346,6 +5507,45 @@ fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
             if matches!(proof.as_ref(), ResidueReclaimProof::DisposableRootDeleteCompletion { .. })
     ));
 
+    let mut wrong_desired_delete = desired.clone();
+    wrong_desired_delete.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+        delete_id: id("delete-other"),
+    };
+    wrong_desired_delete.spec_digest = spec_digest(&wrong_desired_delete).unwrap();
+    replace_residue_desired(&store, &wrong_desired_delete);
+    let wrong_desired_request = residue_authority_request(&node, &wrong_desired_delete, 6, 4);
+    let error = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &wrong_desired_request)
+        })
+        .expect_err("a disposable completion must bind the current Desired delete ID");
+    assert_eq!(error.code, ErrorCode::Internal);
+    replace_residue_desired(&store, &desired);
+
+    store
+        .with(|client| {
+            client.batch_execute(
+                "ALTER TABLE disk_records DROP CONSTRAINT disk_records_volume_id_fkey",
+            )
+        })
+        .unwrap();
+    store
+        .authority_transaction(|transaction| insert_disk(transaction, &disk))
+        .unwrap();
+    let error = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .expect_err("a completion cannot coexist with its product Disk row");
+    assert_eq!(error.code, ErrorCode::Internal);
+    store
+        .with(|client| {
+            client
+                .execute("DELETE FROM disk_records WHERE disk_id=$1", &[&"disk-1"])
+                .map(|_| ())
+        })
+        .unwrap();
+
     let mut wrong_delete = completion.clone();
     let DeleteCompletionReceipt::DisposableRoot { delete_id, .. } = &mut wrong_delete else {
         unreachable!("fixture is a disposable-root completion")
@@ -5360,15 +5560,12 @@ fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
             insert_delete_completion(transaction, &wrong_delete)
         })
         .unwrap();
-    let response = store
+    let error = store
         .authority_locking_read_snapshot(|transaction| {
             load_residue_authority(transaction, &node, &request)
         })
-        .unwrap();
-    assert!(matches!(
-        response.outcome,
-        RuntimeResidueAuthorityOutcome::Retained { .. }
-    ));
+        .expect_err("a completion with the wrong current delete ID must fail closed");
+    assert_eq!(error.code, ErrorCode::Internal);
 
     let mut before_consumption = completion.clone();
     let DeleteCompletionReceipt::DisposableRoot { completed_at, .. } = &mut before_consumption

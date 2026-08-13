@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::runtime_reconciliation::{
-    IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
+    Id, IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
     GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
@@ -1136,6 +1136,15 @@ pub(crate) struct HostNetworkSnapshot {
     links: BTreeMap<String, HostNetworkLinkSnapshot>,
 }
 
+/// Stable Cats TAP identity which is not backed by a durable reservation.
+/// This is inventory evidence only; it carries no removal authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostNetworkResidue {
+    pub(crate) network_id: Id,
+    pub(crate) tap_name: Id,
+    pub(crate) ownership_token: RandomId128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservedHostNetworkState {
     Absent,
@@ -1281,6 +1290,58 @@ impl HostNetworkSnapshot {
             );
         }
         Ok(())
+    }
+
+    /// Classify every well-formed, stable Cats TAP outside the durable
+    /// reservation set. A partial identity or a collision with any retained
+    /// identity is uncertainty, not residue.
+    pub(crate) fn unreserved_managed_networks<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<Vec<HostNetworkResidue>> {
+        let mut durable_by_tap = BTreeMap::new();
+        let mut durable_networks = BTreeSet::new();
+        let mut durable_tokens = BTreeSet::new();
+        for identity in reserved {
+            let network = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&network)?;
+            anyhow::ensure!(
+                durable_by_tap
+                    .insert(network.tap.clone(), network.clone())
+                    .is_none()
+                    && durable_networks.insert(network.config.network_id.clone())
+                    && durable_tokens.insert(network.ownership_token.clone()),
+                "durable Host network reservations repeat one identity"
+            );
+        }
+
+        let mut residue = Vec::new();
+        for (tap_name, (network_id, ownership_token, address)) in self.managed_networks()? {
+            if let Some(expected) = durable_by_tap.get(&tap_name) {
+                anyhow::ensure!(
+                    expected.config.network_id == network_id
+                        && expected.ownership_token == ownership_token
+                        && Ipv4Cidr::parse(&host_cidr(expected))? == address,
+                    "physical Cats TAP conflicts with its durable reservation"
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                !durable_networks.contains(&network_id)
+                    && !durable_tokens.contains(&ownership_token),
+                "unreserved physical Cats TAP collides with a durable identity"
+            );
+            residue.push(HostNetworkResidue {
+                network_id,
+                tap_name: Id::new(tap_name).context("managed TAP name is not a wire Id")?,
+                ownership_token,
+            });
+        }
+        Ok(residue)
     }
 
     /// Close every durable reservation against the complete Host IPv4 set.
@@ -3453,6 +3514,30 @@ mod tests {
             tap_name: Id::new("catold000001").unwrap(),
             ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
         }
+    }
+
+    #[test]
+    fn stable_unreserved_cats_tap_retains_exact_residue_identity() {
+        let network = incumbent_network();
+        let alias = network_alias(&ChNetwork {
+            tap: network.tap_name.as_str().to_owned(),
+            ownership_token: network.ownership_token.clone(),
+            config: network.network_config.clone(),
+        });
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let snapshot = network_snapshot(links, addresses).unwrap();
+
+        let residue = snapshot
+            .unreserved_managed_networks(std::iter::empty())
+            .unwrap();
+        assert_eq!(
+            residue,
+            [HostNetworkResidue {
+                network_id: network.network_config.network_id,
+                tap_name: network.tap_name,
+                ownership_token: network.ownership_token,
+            }]
+        );
     }
 
     fn incumbent_link_json(alias: &str, address: &str) -> (serde_json::Value, serde_json::Value) {
