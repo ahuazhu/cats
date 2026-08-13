@@ -3323,7 +3323,7 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
 }
 
 #[test]
-fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
+fn g4_require_idle_old_session_busy_proof_is_stale() {
     use super::runtime_spine_tests::{
         refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
     };
@@ -3344,7 +3344,6 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
     let suspend_plan = store
         .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7101))
         .unwrap();
-    let suspended = suspend_plan.desired.clone();
     assert_eq!(
         store
             .commit_route_epoch_system_plan(suspend_plan, &system_mutation_guard())
@@ -3392,12 +3391,42 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
             .unwrap(),
         SystemDesiredMutationCommit::Stale
     );
+}
 
+#[test]
+fn g4_require_idle_closed_busy_burns_epoch_before_running_recovery() {
+    use super::runtime_spine_tests::{
+        refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
+    };
+
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-idle-closed", 1, "g4-idle-closed-create");
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
     refresh_assigned_route_runtime_for_test(
         &store,
         &identity,
         &release,
         713,
+        AcceptedRouteRuntimeKind::Running,
+    );
+    let suspend_plan = store
+        .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7131))
+        .unwrap();
+    let suspended = suspend_plan.desired.clone();
+    assert_eq!(
+        store
+            .commit_route_epoch_system_plan(suspend_plan, &system_mutation_guard())
+            .unwrap(),
+        SystemDesiredMutationCommit::Changed
+    );
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        714,
         AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: true },
     );
     let closed_plan = store

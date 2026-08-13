@@ -13,9 +13,9 @@
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     spec_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition, DesiredRuntimeSpec,
-    EndpointIntent, Epoch, Hostname, HttpProtocol, Id, LifecycleAdmission,
-    PreconditionFailureReason, RandomId128, RequireIdleCheckpoint, Revision, RuntimeTarget,
-    RuntimeTransition, Sha256Digest,
+    EndpointIntent, Epoch, Hostname, HttpProtocol, Id, LifecycleAdmission, Operation,
+    OperationFailure, OperationPhase, OperationTerminal, PreconditionFailureReason, RandomId128,
+    RequireIdleCheckpoint, Revision, RuntimeTarget, RuntimeTransition, Sha256Digest,
 };
 
 use super::placement_planner::{load_current_placement_target_in, PlacementTargetSnapshot};
@@ -23,7 +23,9 @@ use super::product::{
     EndpointRecord, EndpointRecordCandidate, RequireIdleAttemptSource, RequireIdleBusySource,
     SystemDesiredMutationCommit, SystemDesiredMutationCommitGuard, SystemDesiredMutationRequest,
 };
-use super::product_rows::{load_desired_unlocked, load_endpoint_by_id_unlocked};
+use super::product_rows::{
+    load_desired_unlocked, load_endpoint_by_id_unlocked, load_operation_by_cat_revision_unlocked,
+};
 use super::runtime_spine::{load_current_cat_runtime_unlocked, CurrentCatRuntime};
 use crate::store::{Result, Store};
 
@@ -247,7 +249,14 @@ impl Store {
                     .ok_or_else(|| {
                         ApiError::failed_precondition("RequireIdle has no accepted terminal fact")
                     })?;
-            plan_busy_recovery(current, records, observed, vec![placement]).map_err(Into::into)
+            let operation = load_operation_by_cat_revision_unlocked(
+                transaction,
+                &current.cat_id,
+                current.desired_revision,
+            )?
+            .ok_or_else(|| corrupt("current RequireIdle Desired has no exact Operation"))?;
+            plan_busy_recovery(current, records, observed, operation, vec![placement])
+                .map_err(Into::into)
         })
     }
 }
@@ -413,6 +422,7 @@ fn plan_busy_recovery(
     current: DesiredRuntimeSpec,
     endpoint_records: Vec<EndpointRecordCandidate>,
     observed: CurrentCatRuntime,
+    operation: Operation,
     placement_snapshots: Vec<PlacementTargetSnapshot>,
 ) -> Result<RouteEpochMutationPlan> {
     let RuntimeTransition::RequireIdle {
@@ -437,6 +447,7 @@ fn plan_busy_recovery(
         *source_revision,
         source_runtime_incarnation,
     )?;
+    validate_busy_operation_settlement(&current, &observed, &operation)?;
     let mut desired = successor_shell(&current)?;
     desired.target = RuntimeTarget::Running;
     desired.transition = RuntimeTransition::CancelAndDrain;
@@ -475,6 +486,46 @@ fn plan_busy_recovery(
         proof,
         Some(RouteEpochSystemSource::RequireIdleBusy { evidence }),
     )
+}
+
+fn validate_busy_operation_settlement(
+    current: &DesiredRuntimeSpec,
+    observed: &CurrentCatRuntime,
+    operation: &Operation,
+) -> Result<()> {
+    let busy_reason = observed
+        .runtime
+        .conditions
+        .iter()
+        .find_map(|condition| match condition {
+            Condition::PreconditionFailed { reason }
+                if matches!(reason, PreconditionFailureReason::Busy { .. }) =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| ApiError::failed_precondition("accepted Busy has no terminal condition"))?;
+    let terminal_matches = matches!(
+        &operation.terminal,
+        Some(OperationTerminal::Failed { error, .. })
+            if matches!(error.as_ref(), OperationFailure::PreconditionFailed { reason }
+                if reason == busy_reason)
+    );
+    if operation.workspace_id != current.workspace_id
+        || operation.cat_id != current.cat_id
+        || operation.desired_revision != current.desired_revision
+        || operation.desired_spec_digest != current.spec_digest
+        || operation.placement != current.placement
+        || operation.target != current.target
+        || operation.phase != OperationPhase::Failed
+        || !terminal_matches
+    {
+        return Err(ApiError::failed_precondition(
+            "RequireIdle Busy has not settled the exact current Operation",
+        ));
+    }
+    Ok(())
 }
 
 struct BusyFact {
