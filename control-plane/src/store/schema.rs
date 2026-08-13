@@ -1268,6 +1268,27 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
 
 const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
     (
+        "volume_records",
+        "volume_records_record_volume",
+        "btree",
+        "text_ops",
+        "(record ->> 'volume_id'::text)",
+    ),
+    (
+        "volume_records",
+        "volume_records_delete",
+        "btree",
+        "text_ops",
+        "COALESCE(delete_id, ''::text)",
+    ),
+    (
+        "volume_records",
+        "volume_records_record_delete",
+        "btree",
+        "text_ops",
+        "((record -> 'admin_state'::text) ->> 'delete_id'::text)",
+    ),
+    (
         "volume_authorizations",
         "volume_authorizations_record_authorization",
         "gin",
@@ -2069,6 +2090,12 @@ WHERE owner_node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS volume_records_owner_binding_node
 ON volume_records((owner_binding->>'owner_node_id'), volume_id COLLATE \"C\")
 WHERE owner_binding IS NOT NULL;
+CREATE INDEX IF NOT EXISTS volume_records_record_volume
+ON volume_records((record->>'volume_id'));
+CREATE INDEX IF NOT EXISTS volume_records_delete
+ON volume_records((COALESCE(delete_id, '')));
+CREATE INDEX IF NOT EXISTS volume_records_record_delete
+ON volume_records((record->'admin_state'->>'delete_id'));
 CREATE TABLE IF NOT EXISTS host_fence_events (
     event_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

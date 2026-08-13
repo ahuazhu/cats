@@ -1164,6 +1164,78 @@ pub async fn set_runtime_product_read_states_for_test(
         .expect("set isolated runtime product read states");
 }
 
+/// Reintroduce one swept Root Volume only through the canonical JSON delete
+/// lineage. Scalar identity and delete projections deliberately name unrelated
+/// values, so the public read must cover all projection reachability paths.
+pub async fn corrupt_deleted_root_volume_residual_for_test(
+    store: &Arc<crate::store::Store>,
+    persistent_disk_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "INSERT INTO volume_records (
+                        volume_id, record, size_bytes, durability, admin_state,
+                        delete_id, head_generation, head_root_hash,
+                        head_root_object_id, lease_owner, lease_epoch,
+                        lease_expires_at, last_transition_kind,
+                        last_transition_id, transition_desired_revision,
+                        transition_placement_epoch, transition_lease_duration_ms,
+                        owner_binding, owner_node_id
+                     ) SELECT
+                        'volume_hidden_read_residual',
+                        jsonb_set(
+                            jsonb_set(
+                                volume.record,
+                                '{volume_id}',
+                                to_jsonb('volume_hidden_read_residual'::TEXT),
+                                FALSE
+                            ),
+                            '{admin_state}',
+                            '{\"kind\":\"deleting\",\"delete_id\":\"delete_read_test\"}'::jsonb,
+                            FALSE
+                        ),
+                        volume.size_bytes, volume.durability, volume.admin_state,
+                        volume.delete_id, volume.head_generation,
+                        volume.head_root_hash, volume.head_root_object_id,
+                        volume.lease_owner, volume.lease_epoch,
+                        volume.lease_expires_at, volume.last_transition_kind,
+                        volume.last_transition_id,
+                        volume.transition_desired_revision,
+                        volume.transition_placement_epoch,
+                        volume.transition_lease_duration_ms,
+                        volume.owner_binding, volume.owner_node_id
+                       FROM volume_records volume
+                       JOIN disk_records disk ON disk.volume_id=volume.volume_id
+                      WHERE disk.disk_id=$1",
+                    &[&persistent_disk_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test PersistentDisk Volume must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("insert isolated hidden Root Volume residual");
+}
+
+pub async fn remove_deleted_root_volume_residual_for_test(store: &Arc<crate::store::Store>) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "DELETE FROM volume_records
+                      WHERE volume_id='volume_hidden_read_residual'",
+                    &[],
+                )?;
+                assert_eq!(changed, 1, "test hidden Root Volume residual must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("remove isolated hidden Root Volume residual");
+}
+
 /// Break only one scalar authorization projection after a valid completed
 /// Root sweep, so a public read must fail closed and poison local readiness.
 pub async fn corrupt_deleted_root_authorization_projection_for_test(

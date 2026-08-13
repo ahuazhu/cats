@@ -5,6 +5,49 @@ function assertNotAborted(signal) {
     : new DOMException("aborted", "AbortError");
 }
 
+const priorDisabled = new WeakMap();
+const runtimeProductControls = [
+  "#refresh-button",
+  "#create-cat-button",
+  "[data-create-cat]",
+  "#create-disk-button",
+  "[data-cat-action]",
+  "[data-disk-action]",
+].join(", ");
+
+export function setRuntimeProductLoadingShell(root, loading) {
+  const shell = root.querySelector("#app-shell");
+  if (loading) {
+    shell?.setAttribute("aria-busy", "true");
+    for (const selector of ["#cats-table", "#disks-table"]) {
+      const table = root.querySelector(selector);
+      if (table) table.innerHTML = "";
+    }
+  } else {
+    shell?.removeAttribute("aria-busy");
+  }
+  root.querySelectorAll(runtimeProductControls).forEach((control) => {
+    if (loading) {
+      if (!priorDisabled.has(control)) priorDisabled.set(control, Boolean(control.disabled));
+      control.disabled = true;
+    } else if (priorDisabled.has(control)) {
+      control.disabled = priorDisabled.get(control);
+      priorDisabled.delete(control);
+    }
+  });
+}
+
+export function runtimeProductActionAllowed({
+  button,
+  activeWorkspaceId,
+  loadingWorkspaceId,
+}) {
+  return !loadingWorkspaceId
+    && typeof activeWorkspaceId === "string"
+    && activeWorkspaceId !== ""
+    && button?.dataset?.workspaceId === activeWorkspaceId;
+}
+
 function validatePage(page) {
   if (!page || !Array.isArray(page.items) || !(page.next_cursor === null || typeof page.next_cursor === "string")) {
     throw new Error("invalid runtime product page");

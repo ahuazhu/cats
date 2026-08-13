@@ -22,7 +22,11 @@ import {
   listPendingCatCreateV2,
   sendDurableCatCreateV2,
 } from "/ui/cat-create-v2.mjs";
-import { loadAll as loadRuntimeProductReads } from "/ui/runtime-product-load.mjs";
+import {
+  loadAll as loadRuntimeProductReads,
+  runtimeProductActionAllowed,
+  setRuntimeProductLoadingShell,
+} from "/ui/runtime-product-load.mjs";
 
 initI18n();
 
@@ -44,8 +48,11 @@ const state = {
   selectedBillingCatName: "",
   activeView: "overview",
   execCat: "",
+  execWorkspaceId: "",
   runtimeProductLoadGeneration: 0,
   runtimeProductLoad: null,
+  runtimeProductWorkspaceLoading: null,
+  runtimeProductWorkspaceGeneration: 0,
   paymentRedirecting: false,
 };
 
@@ -75,6 +82,14 @@ const switchView = initNavigation(
 
 function workspacePath(path) {
   return `/v1/workspaces/${encodeURIComponent(state.activeWorkspaceId)}${path}`;
+}
+
+function capturedWorkspacePath(workspaceId, path) {
+  return `/v1/workspaces/${encodeURIComponent(workspaceId)}${path}`;
+}
+
+function runtimeProductWorkspaceActionable(workspaceId) {
+  return workspaceId === state.activeWorkspaceId && !state.runtimeProductWorkspaceLoading;
 }
 
 function activeWorkspace() {
@@ -110,23 +125,38 @@ function renderWorkspaceSwitcher() {
 async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
   if (!workspaceId || workspaceId === state.activeWorkspaceId) return;
   cancelRuntimeProductLoad();
-  const session = await request("/auth/workspace", {
-    method: "POST",
-    body: JSON.stringify({ workspace_id: workspaceId }),
-  });
-  applySession(session);
-  state.cats = [];
-  state.disks = [];
-  state.operations = [];
-  state.billing = null;
-  state.billingBalance = null;
-  state.billingDetail = null;
-  if (updateUrl) {
-    const workspace = activeWorkspace();
-    if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
+  const generation = ++state.runtimeProductWorkspaceGeneration;
+  const transition = { generation, workspaceId };
+  state.runtimeProductWorkspaceLoading = transition;
+  setRuntimeProductLoadingShell(document, true);
+  let switched = false;
+  try {
+    const session = await request("/auth/workspace", {
+      method: "POST",
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    if (state.runtimeProductWorkspaceLoading !== transition) return;
+    applySession(session);
+    state.cats = [];
+    state.disks = [];
+    state.operations = [];
+    state.billing = null;
+    state.billingBalance = null;
+    state.billingDetail = null;
+    if (updateUrl) {
+      const workspace = activeWorkspace();
+      if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
+    }
+    render();
+    switched = true;
+    await loadAll({ quiet: true });
+  } finally {
+    if (state.runtimeProductWorkspaceLoading === transition) {
+      state.runtimeProductWorkspaceLoading = null;
+      render();
+    }
   }
-  await loadAll({ quiet: true });
-  await resumePendingCatCreates();
+  if (switched) await resumePendingCatCreates();
 }
 
 async function authenticatedRequestWithStatus(path, options = {}) {
@@ -309,6 +339,7 @@ function render() {
   renderBillingBalance();
   renderBilling();
   renderOperations();
+  setRuntimeProductLoadingShell(document, Boolean(state.runtimeProductWorkspaceLoading));
 }
 
 function renderOverview() {
@@ -346,11 +377,12 @@ function catActions(cat) {
     unknown: ["start"],
   };
   const actions = stateActions[cat.observed_state] || [];
-  const buttons = actions.map((action) => `<button class="mini-button" data-cat-action="${action}" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t(`user.action.${action}`))}</button>`);
+  const workspace = `data-workspace-id="${escapeHtml(cat.workspace_id)}"`;
+  const buttons = actions.map((action) => `<button class="mini-button" data-cat-action="${action}" data-cat="${escapeHtml(cat.name)}" ${workspace}>${escapeHtml(t(`user.action.${action}`))}</button>`);
   if (cat.observed_state === "running") {
-    buttons.push(`<button class="mini-button" data-cat-action="expose" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.expose"))}</button>`);
+    buttons.push(`<button class="mini-button" data-cat-action="expose" data-cat="${escapeHtml(cat.name)}" ${workspace}>${escapeHtml(t("user.action.expose"))}</button>`);
   }
-  buttons.push(`<button class="mini-button danger" data-cat-action="destroy" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.destroy"))}</button>`);
+  buttons.push(`<button class="mini-button danger" data-cat-action="destroy" data-cat="${escapeHtml(cat.name)}" ${workspace}>${escapeHtml(t("user.action.destroy"))}</button>`);
   return buttons.join("");
 }
 
@@ -371,14 +403,15 @@ function renderCats() {
 }
 
 function diskActions(disk) {
-  const buttons = [`<button class="mini-button" data-disk-action="snapshot" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.snapshot"))}</button>`];
+  const workspace = `data-workspace-id="${escapeHtml(disk.workspace_id)}"`;
+  const buttons = [`<button class="mini-button" data-disk-action="snapshot" data-disk="${escapeHtml(disk.name)}" ${workspace}>${escapeHtml(t("user.action.snapshot"))}</button>`];
   if (disk.kind === "persistent") {
     if (disk.state === "bound") {
-      buttons.push(`<button class="mini-button" data-disk-action="unmount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.unmount"))}</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="unmount" data-disk="${escapeHtml(disk.name)}" ${workspace}>${escapeHtml(t("user.action.unmount"))}</button>`);
     } else if (disk.state === "available") {
-      buttons.push(`<button class="mini-button" data-disk-action="mount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.mount"))}</button>`);
-      buttons.push(`<button class="mini-button" data-disk-action="resize" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.resize"))}</button>`);
-      buttons.push(`<button class="mini-button danger" data-disk-action="delete" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.delete"))}</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="mount" data-disk="${escapeHtml(disk.name)}" ${workspace}>${escapeHtml(t("user.action.mount"))}</button>`);
+      buttons.push(`<button class="mini-button" data-disk-action="resize" data-disk="${escapeHtml(disk.name)}" ${workspace}>${escapeHtml(t("user.action.resize"))}</button>`);
+      buttons.push(`<button class="mini-button danger" data-disk-action="delete" data-disk="${escapeHtml(disk.name)}" ${workspace}>${escapeHtml(t("user.action.delete"))}</button>`);
     }
   }
   return buttons.join("");
@@ -942,9 +975,15 @@ async function waitForOperation(operation) {
   throw new Error(t("user.operationTimeout", { id: operation.id }));
 }
 
-async function mutateCat(name, action, button) {
+async function mutateCat(name, action, button, workspaceId) {
+  if (!runtimeProductActionAllowed({
+    button,
+    activeWorkspaceId: state.activeWorkspaceId,
+    loadingWorkspaceId: state.runtimeProductWorkspaceLoading?.workspaceId || "",
+  })) return;
   if (action === "exec") {
     state.execCat = name;
+    state.execWorkspaceId = workspaceId;
     document.querySelector("#exec-cat-name").textContent = name;
     const output = document.querySelector("#exec-output");
     output.classList.remove("is-error");
@@ -957,9 +996,10 @@ async function mutateCat(name, action, button) {
     if (port === null) return;
     const endpointName = window.prompt(t("user.expose.namePrompt"), "web");
     if (endpointName === null) return;
+    if (!runtimeProductWorkspaceActionable(workspaceId)) return;
     setBusy(button, true);
     try {
-      const response = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(name)}/endpoints`), {
+      const response = await authenticatedRequest(capturedWorkspacePath(workspaceId, `/cats/${encodeURIComponent(name)}/endpoints`), {
         method: "POST",
         body: JSON.stringify({ name: endpointName, target_port: Number(port), protocol: "http", wake_policy: "wake_on_request" }),
       });
@@ -970,11 +1010,12 @@ async function mutateCat(name, action, button) {
     return;
   }
   if (action === "destroy" && !window.confirm(t("user.destroy.confirm", { name }))) return;
+  if (!runtimeProductWorkspaceActionable(workspaceId)) return;
   setBusy(button, true);
   try {
     const path = action === "destroy"
-      ? workspacePath(`/cats/${encodeURIComponent(name)}`)
-      : workspacePath(`/cats/${encodeURIComponent(name)}/actions/${action}`);
+      ? capturedWorkspacePath(workspaceId, `/cats/${encodeURIComponent(name)}`)
+      : capturedWorkspacePath(workspaceId, `/cats/${encodeURIComponent(name)}/actions/${action}`);
     const response = await authenticatedRequest(path, {
       method: action === "destroy" ? "DELETE" : "POST",
       headers: idempotencyHeaders(),
@@ -988,11 +1029,16 @@ async function mutateCat(name, action, button) {
   }
 }
 
-async function mutateDisk(name, action, button) {
+async function mutateDisk(name, action, button, workspaceId) {
+  if (!runtimeProductActionAllowed({
+    button,
+    activeWorkspaceId: state.activeWorkspaceId,
+    loadingWorkspaceId: state.runtimeProductWorkspaceLoading?.workspaceId || "",
+  })) return;
   const disk = state.disks.find((item) => item.name === name);
   if (!disk) return;
   let method = "POST";
-  let path = workspacePath(`/disks/${encodeURIComponent(name)}/actions/${action}`);
+  let path = capturedWorkspacePath(workspaceId, `/disks/${encodeURIComponent(name)}/actions/${action}`);
   let body;
   if (action === "mount") {
     if (!state.cats.length) throw new Error(t("user.mount.noCats"));
@@ -1009,12 +1055,13 @@ async function mutateDisk(name, action, button) {
   } else if (action === "unmount") {
     body = {};
   } else if (action === "snapshot") {
-    path = workspacePath(`/disks/${encodeURIComponent(name)}/snapshots`);
+    path = capturedWorkspacePath(workspaceId, `/disks/${encodeURIComponent(name)}/snapshots`);
   } else if (action === "delete") {
     if (!window.confirm(t("user.disk.deleteConfirm", { name }))) return;
     method = "DELETE";
-    path = workspacePath(`/disks/${encodeURIComponent(name)}`);
+    path = capturedWorkspacePath(workspaceId, `/disks/${encodeURIComponent(name)}`);
   }
+  if (!runtimeProductWorkspaceActionable(workspaceId)) return;
   setBusy(button, true);
   try {
     const response = await authenticatedRequest(path, {
@@ -1142,8 +1189,11 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
   output.classList.remove("is-error");
   setBusy(button, true, t("user.execDialog.running"));
   try {
+    if (!runtimeProductWorkspaceActionable(state.execWorkspaceId)) {
+      throw new Error(t("user.workspace.switchFailed"));
+    }
     const command = splitCommand(new FormData(form).get("command"));
-    const result = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(state.execCat)}/exec`), {
+    const result = await authenticatedRequest(capturedWorkspacePath(state.execWorkspaceId, `/cats/${encodeURIComponent(state.execCat)}/exec`), {
       method: "POST",
       body: JSON.stringify({ command }),
     });
@@ -1160,12 +1210,12 @@ document.querySelector("#exec-form").addEventListener("submit", async (event) =>
 document.querySelector("#cats-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-cat-action]");
   if (!button) return;
-  mutateCat(button.dataset.cat, button.dataset.catAction, button).catch((error) => toast(t("user.cat.actionFailed"), error.message, "error"));
+  mutateCat(button.dataset.cat, button.dataset.catAction, button, button.dataset.workspaceId).catch((error) => toast(t("user.cat.actionFailed"), error.message, "error"));
 });
 document.querySelector("#disks-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-disk-action]");
   if (!button) return;
-  mutateDisk(button.dataset.disk, button.dataset.diskAction, button).catch((error) => toast(t("user.disk.actionFailed"), error.message, "error"));
+  mutateDisk(button.dataset.disk, button.dataset.diskAction, button, button.dataset.workspaceId).catch((error) => toast(t("user.disk.actionFailed"), error.message, "error"));
 });
 document.querySelector("#billing-cats-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-billing-cat-detail]");

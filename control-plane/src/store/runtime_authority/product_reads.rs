@@ -436,6 +436,9 @@ fn completed_disposable_root_sweep(
     let VolumeDisposition::DeleteDisposableRoot { delete_id } = &root.disposition else {
         return Err(ComposeError::Corrupt);
     };
+    if disposable_root_volume_still_reachable(transaction, &root.volume_id, delete_id)? {
+        return Err(ComposeError::Corrupt);
+    }
     let completions = projection_result(load_disposable_root_completion_candidates(
         transaction,
         delete_id,
@@ -508,6 +511,36 @@ fn completed_disposable_root_sweep(
         return Err(ComposeError::Corrupt);
     }
     Ok(())
+}
+
+fn disposable_root_volume_still_reachable(
+    transaction: &mut Transaction<'_>,
+    volume_id: &Id,
+    delete_id: &Id,
+) -> std::result::Result<bool, ComposeError> {
+    // Completion means the Volume row is gone, not merely hidden behind a
+    // drifted scalar projection. Cover both immutable identity projections and
+    // both delete-lineage projections in the same repeatable-read snapshot as
+    // the authorization and completion graph.
+    let row = transaction
+        .query_one(
+            "SELECT EXISTS (
+                (SELECT 1 FROM volume_records WHERE volume_id=$1 LIMIT 1)
+                UNION ALL
+                (SELECT 1 FROM volume_records
+                  WHERE record->>'volume_id'=$1 LIMIT 1)
+                UNION ALL
+                (SELECT 1 FROM volume_records
+                  WHERE COALESCE(delete_id, '')=$2 LIMIT 1)
+                UNION ALL
+                (SELECT 1 FROM volume_records
+                  WHERE record->'admin_state'->>'delete_id'=$2 LIMIT 1)
+             )",
+            &[&volume_id.as_str(), &delete_id.as_str()],
+        )
+        .map_err(AuthorityTransactionError::from)
+        .map_err(ComposeError::Store)?;
+    Ok(row.get(0))
 }
 
 fn compose_disk(

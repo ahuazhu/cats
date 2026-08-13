@@ -3947,7 +3947,7 @@ fn runtime_cat_list_reaches_all_scalar_and_record_workspace_id_combinations() {
 fn sweep_completed_root_for_product_read(
     store: &Store,
     create: &CoveredCatCreateRequest,
-) -> AuthorizationRecord {
+) -> VolumeRecord {
     let mut desired = create.candidate.desired.clone();
     let root = desired.volumes.first().unwrap().clone();
     let delete_id = id("delete_product_read");
@@ -4051,7 +4051,7 @@ fn sweep_completed_root_for_product_read(
             Ok(())
         })
         .unwrap();
-    consumed
+    deleting
 }
 
 #[test]
@@ -4071,6 +4071,102 @@ fn runtime_cat_read_accepts_only_a_completed_disposable_root_sweep() {
     };
     assert_eq!(cat.desired.target, RuntimeTarget::Deleted);
     assert_eq!(cat.desired.root_disk_id, create.candidate.root_disk.disk_id);
+}
+
+#[test]
+fn runtime_cat_read_rejects_all_residual_disposable_root_volume_reachability() {
+    for (index, reachability) in [
+        "scalar-volume-id",
+        "record-volume-id",
+        "scalar-delete-id",
+        "record-delete-id",
+        "duplicate-record-volume-id",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_url, store, _second, workspace) = stores();
+        let fixture_name = format!("residual-volume-{index}");
+        let create = request(&workspace, &fixture_name, 1, &fixture_name);
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        let residual = sweep_completed_root_for_product_read(&store, &create);
+        let replacement_volume_id = format!("volume_residual_{index}");
+        let replacement_delete_id = format!("delete_residual_{index}");
+
+        store
+            .authority_transaction(|transaction| {
+                insert_volume(transaction, &residual)?;
+                let changed = match reachability {
+                    "scalar-volume-id" => transaction.execute(
+                        "UPDATE volume_records
+                            SET record=jsonb_set(
+                                record, '{volume_id}', to_jsonb($2::TEXT), FALSE
+                            )
+                          WHERE volume_id=$1",
+                        &[&residual.volume_id.as_str(), &replacement_volume_id],
+                    )?,
+                    "record-volume-id" => transaction.execute(
+                        "UPDATE volume_records SET volume_id=$2 WHERE volume_id=$1",
+                        &[&residual.volume_id.as_str(), &replacement_volume_id],
+                    )?,
+                    "scalar-delete-id" => transaction.execute(
+                        "UPDATE volume_records
+                            SET volume_id=$2,
+                                record=jsonb_set(
+                                    jsonb_set(
+                                        record, '{volume_id}', to_jsonb($2::TEXT), FALSE
+                                    ),
+                                    '{admin_state,delete_id}', to_jsonb($3::TEXT), FALSE
+                                )
+                          WHERE volume_id=$1",
+                        &[
+                            &residual.volume_id.as_str(),
+                            &replacement_volume_id,
+                            &replacement_delete_id,
+                        ],
+                    )?,
+                    "record-delete-id" => transaction.execute(
+                        "UPDATE volume_records
+                            SET volume_id=$2, delete_id=$3,
+                                record=jsonb_set(
+                                    record, '{volume_id}', to_jsonb($2::TEXT), FALSE
+                                )
+                          WHERE volume_id=$1",
+                        &[
+                            &residual.volume_id.as_str(),
+                            &replacement_volume_id,
+                            &replacement_delete_id,
+                        ],
+                    )?,
+                    "duplicate-record-volume-id" => {
+                        let changed = transaction.execute(
+                            "UPDATE volume_records SET volume_id=$2 WHERE volume_id=$1",
+                            &[&residual.volume_id.as_str(), &replacement_volume_id],
+                        )?;
+                        assert_eq!(changed, 1);
+                        insert_volume(transaction, &residual)?;
+                        transaction.execute(
+                            "UPDATE volume_records SET volume_id=$2 WHERE volume_id=$1",
+                            &[&residual.volume_id.as_str(), &replacement_delete_id],
+                        )?
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(changed, 1);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_runtime_cat(&workspace, &create.candidate.cat_id)
+                .unwrap(),
+            ProductRead::Corrupt,
+            "{reachability} residual escaped the completed Root absence proof"
+        );
+    }
 }
 
 #[test]

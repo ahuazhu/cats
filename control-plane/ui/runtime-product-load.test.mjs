@@ -1,7 +1,69 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { loadAll } from "./runtime-product-load.mjs";
+import {
+  loadAll,
+  runtimeProductActionAllowed,
+  setRuntimeProductLoadingShell,
+} from "./runtime-product-load.mjs";
+
+test("workspace switch removes stale Cat actions while the next Workspace pages are paused", async () => {
+  const catsTable = { innerHTML: '<button data-cat-action="start" data-workspace-id="ws_A">start</button>' };
+  const disksTable = { innerHTML: '<button data-disk-action="delete" data-workspace-id="ws_A">delete</button>' };
+  const shell = {
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    removeAttribute(name) { this.attributes.delete(name); },
+  };
+  const controls = [{ disabled: false }, { disabled: false }];
+  const root = {
+    querySelector(selector) {
+      return new Map([
+        ["#app-shell", shell],
+        ["#cats-table", catsTable],
+        ["#disks-table", disksTable],
+      ]).get(selector) || null;
+    },
+    querySelectorAll() { return controls; },
+  };
+
+  let releaseB;
+  const pausedB = new Promise((resolve) => { releaseB = resolve; });
+  const loadB = loadAll({
+    workspaceId: "ws_B",
+    signal: new AbortController().signal,
+    requestPage: async () => {
+      await pausedB;
+      return { items: [], next_cursor: null };
+    },
+  });
+
+  // This is the synchronous boundary after selecting B while both B
+  // collection requests remain unresolved.
+  setRuntimeProductLoadingShell(root, true);
+
+  assert.equal(catsTable.innerHTML, "");
+  assert.equal(disksTable.innerHTML, "");
+  assert.equal(shell.attributes.get("aria-busy"), "true");
+  assert.ok(controls.every((control) => control.disabled));
+
+  let mutationRequests = 0;
+  const staleAButton = { dataset: { workspaceId: "ws_A" } };
+  if (runtimeProductActionAllowed({
+    button: staleAButton,
+    activeWorkspaceId: "ws_B",
+    loadingWorkspaceId: "ws_B",
+  })) {
+    mutationRequests += 1;
+  }
+  assert.equal(mutationRequests, 0, "a detached A action must not issue a request under B");
+
+  releaseB();
+  await loadB;
+  setRuntimeProductLoadingShell(root, false);
+  assert.equal(shell.attributes.has("aria-busy"), false);
+  assert.ok(controls.every((control) => !control.disabled));
+});
 
 test("loadAll captures one workspace and fetches every Cat and Disk page", async () => {
   const requested = [];

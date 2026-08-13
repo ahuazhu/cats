@@ -1273,6 +1273,43 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         }
     );
 
+    let residual_reader = spawn(context.config.clone()).await.unwrap();
+    cats_control_plane::testsupport::corrupt_deleted_root_volume_residual_for_test(
+        &context.first.state.store,
+        id(&disk.id),
+    )
+    .await;
+    let residual_deleted_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/{}",
+            residual_reader.base_url(),
+            created.cat_id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        residual_deleted_cat.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", residual_reader.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    residual_reader.shutdown().await.unwrap();
+    cats_control_plane::testsupport::remove_deleted_root_volume_residual_for_test(
+        &context.first.state.store,
+    )
+    .await;
+
     let graph_reader = spawn(context.config.clone()).await.unwrap();
     cats_control_plane::testsupport::corrupt_deleted_root_authorization_projection_for_test(
         &context.first.state.store,
