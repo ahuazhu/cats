@@ -5646,12 +5646,17 @@ impl PlatformRootProcessInventoryBridge {
             return Ok(None);
         };
         if let Some(root) = &self.metering_root {
-            if scan_cgroup_tree(
+            let no_units = BTreeSet::new();
+            if scan_cgroup_tree_allowing(
                 root,
                 CgroupKind::DedicatedMeteringRoot,
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
+                SystemdUnitAllowances {
+                    managed: &no_units,
+                    static_at_root: &no_units,
+                },
                 context,
             )? != ProbeFact::Empty
             {
@@ -7491,15 +7496,6 @@ impl InventoryAbsenceProbe for SystemdProbe {
             InventoryAbsence::Residue(residue)
         })
     }
-}
-
-fn scan_systemd_residue(
-    root: &Path,
-    budget: &mut usize,
-    depth_cap: usize,
-    context: &RuntimeInventoryScanContext,
-) -> anyhow::Result<Option<Vec<NodeResidue>>> {
-    scan_systemd_residue_allowing(root, budget, depth_cap, &BTreeSet::new(), context)
 }
 
 fn scan_systemd_residue_allowing(
@@ -21437,10 +21433,10 @@ mod tests {
             };
 
             assert_eq!(scan_systemd(), ProbeFact::Empty);
-            assert_eq!(
-                scan_processes(&process_paths, &context()).unwrap(),
-                ProbeFact::Empty
-            );
+            assert!(matches!(
+                scan_process_residue(&process_paths, &context()).unwrap(),
+                Some(residue) if residue.is_empty()
+            ));
 
             let unknown = environment
                 .systemd_root
@@ -21464,10 +21460,23 @@ mod tests {
             std::fs::create_dir(&duplicate).unwrap();
             std::os::unix::fs::symlink(&executable, duplicate.join("exe")).unwrap();
             std::fs::write(duplicate.join("cmdline"), &command_line).unwrap();
-            assert_eq!(
-                scan_processes(&process_paths, &context()).unwrap(),
-                ProbeFact::Present
-            );
+            std::fs::write(
+                duplicate.join("stat"),
+                format!(
+                    "{} (cats-noded) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 918273 ",
+                    process_id + 1
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                scan_process_residue(&process_paths, &context()).unwrap(),
+                Some(residue)
+                    if matches!(
+                        residue.as_slice(),
+                        [NodeResidue::Process { process_id: duplicate_id, .. }]
+                            if *duplicate_id == process_id + 1
+                    )
+            ));
         }
     }
 }
