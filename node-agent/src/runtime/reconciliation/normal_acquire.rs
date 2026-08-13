@@ -161,6 +161,20 @@ pub enum DisposableRootDeleteAttempt {
     Ambiguous,
 }
 
+/// Closed outcomes for the residue-qualification query. Only an exact,
+/// validated success may carry reclaim authority. Authentication and Node
+/// identity failures are surfaced separately so the caller can repair the
+/// credential or replace the ineligible identity without treating either as
+/// ordinary transport ambiguity.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeResidueAuthorityAttempt {
+    Qualified(Box<RuntimeResidueAuthoritySuccess>),
+    ReauthenticationRequired,
+    IdentityReplacementRequired,
+    Retain,
+}
+
 /// The exact accepted A20 context against which a closed A22 rejection can be
 /// interpreted. The mutation body intentionally does not duplicate these
 /// session/attestation fields, so accepting a 409 without this context would
@@ -1762,33 +1776,59 @@ impl RuntimeVolumeTransitionHttpClient {
     /// the same A19 credential, signature, fixed-path and bounded-response
     /// envelope as the accepted volume authority calls.
     ///
-    /// Any transport ambiguity, route absence or response mismatch remains
-    /// `None`; callers must retain the physical directory and retry later.
+    /// Exact typed authentication/identity failures are returned as repair
+    /// direction. Any transport ambiguity, route absence, other closed error
+    /// or response mismatch remains [`RuntimeResidueAuthorityAttempt::Retain`];
+    /// callers must retain the physical directory and retry later.
     pub fn request_residue_authority(
         &self,
         request: &RuntimeResidueAuthorityRequest,
         deadline: Instant,
-    ) -> Result<
-        Option<Box<RuntimeResidueAuthoritySuccess>>,
-        cats_api::runtime_reconciliation::ContractError,
-    > {
+    ) -> Result<RuntimeResidueAuthorityAttempt, cats_api::runtime_reconciliation::ContractError>
+    {
         let body = encode_runtime_residue_authority_request(request)?;
-        let response = self.post_exact_signed_json(
+        let Ok(response) = self.post_exact_signed_json(
             RUNTIME_RESIDUE_AUTHORITY_PATH,
             &body,
             RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
             deadline,
-        );
-        let Ok(StrictSignedJsonResponse::Success(body)) = response else {
-            return Ok(None);
+        ) else {
+            return Ok(RuntimeResidueAuthorityAttempt::Retain);
         };
-        let Ok(success) = decode_runtime_residue_authority_success(&body) else {
-            return Ok(None);
-        };
-        Ok((success.version == request.version
-            && success.session == request.session
-            && success.lineage == request.lineage)
-            .then(|| Box::new(success)))
+        match response {
+            StrictSignedJsonResponse::Success(body) => {
+                let Ok(success) = decode_runtime_residue_authority_success(&body) else {
+                    return Ok(RuntimeResidueAuthorityAttempt::Retain);
+                };
+                Ok(
+                    if success.version == request.version
+                        && success.session == request.session
+                        && success.lineage == request.lineage
+                    {
+                        RuntimeResidueAuthorityAttempt::Qualified(Box::new(success))
+                    } else {
+                        RuntimeResidueAuthorityAttempt::Retain
+                    },
+                )
+            }
+            StrictSignedJsonResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(RuntimeResidueAuthorityAttempt::Retain);
+                };
+                Ok(match (status, error.error.as_ref()) {
+                    (401, RuntimeVolumeTransitionErrorDetail::AuthenticationFailed) => {
+                        RuntimeResidueAuthorityAttempt::ReauthenticationRequired
+                    }
+                    (403, RuntimeVolumeTransitionErrorDetail::IdentityNotEligible) => {
+                        RuntimeResidueAuthorityAttempt::IdentityReplacementRequired
+                    }
+                    _ => RuntimeResidueAuthorityAttempt::Retain,
+                })
+            }
+            StrictSignedJsonResponse::PlainRouteNotFound | StrictSignedJsonResponse::Ambiguous => {
+                Ok(RuntimeResidueAuthorityAttempt::Retain)
+            }
+        }
     }
 }
 
@@ -3101,6 +3141,110 @@ mod tests {
     }
 
     #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn raw_residue_authority_attempt(raw_response: Vec<u8>) -> RuntimeResidueAuthorityAttempt {
+        let request = RuntimeResidueAuthorityRequest {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: Id::new("node_a").unwrap(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+                agent_session_epoch: Epoch::new(2).unwrap(),
+            },
+            lineage: proposal_lineage(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            reader.into_inner().write_all(&raw_response).unwrap();
+        });
+        let client = RuntimeVolumeTransitionHttpClient::for_loopback_test(
+            &format!("http://{address}/"),
+            signer(),
+        )
+        .unwrap();
+        let attempt = client
+            .request_residue_authority(&request, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        server.join().unwrap();
+        attempt
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn residue_client_surfaces_typed_reauthentication_and_replacement_but_retains_ambiguity() {
+        fn response(
+            status_line: &str,
+            detail: RuntimeVolumeTransitionErrorDetail,
+            extra_headers: &str,
+        ) -> Vec<u8> {
+            let body = encode_runtime_volume_transition_error(&RuntimeVolumeTransitionError {
+                version: ContractVersion::V1,
+                error: Box::new(detail),
+                message: "typed residue authority error".to_owned(),
+            })
+            .unwrap();
+            let mut response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        }
+
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "401 Unauthorized",
+                RuntimeVolumeTransitionErrorDetail::AuthenticationFailed,
+                &format!("WWW-Authenticate: {NODE_AUTHENTICATE_CHALLENGE}\r\n"),
+            )),
+            RuntimeResidueAuthorityAttempt::ReauthenticationRequired
+        );
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "403 Forbidden",
+                RuntimeVolumeTransitionErrorDetail::IdentityNotEligible,
+                "",
+            )),
+            RuntimeResidueAuthorityAttempt::IdentityReplacementRequired
+        );
+
+        // A typed-looking 401 without the exact challenge is not trusted as
+        // authentication direction. It remains a retained ambiguous result.
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "401 Unauthorized",
+                RuntimeVolumeTransitionErrorDetail::AuthenticationFailed,
+                "",
+            )),
+            RuntimeResidueAuthorityAttempt::Retain
+        );
+        assert_eq!(
+            raw_residue_authority_attempt(Vec::new()),
+            RuntimeResidueAuthorityAttempt::Retain,
+            "a transport EOF must retain the physical directory"
+        );
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     fn proposal_lineage() -> cats_api::runtime_reconciliation::ResidueDataDirectoryLineage {
         use cats_api::runtime_reconciliation::{
             residue_acquisition_digest, AssignedKind, AssignedPlacement,
@@ -3257,10 +3401,12 @@ mod tests {
         .unwrap();
         let received = client
             .request_residue_authority(&request, Instant::now() + Duration::from_secs(2))
-            .unwrap()
-            .expect("exact response must be forwarded");
+            .unwrap();
         server.join().unwrap();
-        assert_eq!(*received, success);
+        assert_eq!(
+            received,
+            RuntimeResidueAuthorityAttempt::Qualified(Box::new(success))
+        );
     }
 
     #[test]

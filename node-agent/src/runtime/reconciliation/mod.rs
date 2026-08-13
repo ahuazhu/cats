@@ -190,8 +190,6 @@ pub(crate) use kernel_nbd::{
 pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 #[cfg(feature = "proposed-node-residue-reclamation")]
-pub use normal_acquire::residue_authority_request_from_observed;
-#[cfg(feature = "proposed-node-residue-reclamation")]
 pub use normal_acquire::RuntimeVolumeTransitionHttpClient as ProposedResidueAuthorityHttpClient;
 pub use normal_acquire::{
     recover_lifecycle_release_from_authority, recover_normal_acquire_from_authority,
@@ -202,6 +200,8 @@ pub use normal_acquire::{
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse, TakeoverAcquireAttempt,
     VolumeTransitionTransportFailure,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use normal_acquire::{residue_authority_request_from_observed, RuntimeResidueAuthorityAttempt};
 pub(crate) use persistent_filesystem::PersistentFilesystemEffect;
 pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
