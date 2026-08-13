@@ -137,6 +137,8 @@ pub enum RouteGrantV2RingInstallError {
     StaleVersion,
     #[error("Route Grant v2 key ring version was reused for another key set")]
     VersionConflict,
+    #[error("Route Grant v2 key ring does not name the exact current predecessor")]
+    LineageMismatch,
 }
 
 /// Proof supplied only by the future trusted Node machine-transport adapter.
@@ -268,7 +270,7 @@ impl RouteGrantV2Verifier {
             .map_err(|_| RouteGrantV2RingInstallError::Unavailable)
     }
 
-    pub fn replace_ring(
+    pub(crate) fn replace_ring(
         &self,
         replacement: RouteGrantV2KeyRing,
     ) -> Result<RouteGrantV2RingInstallOutcome, RouteGrantV2RingInstallError> {
@@ -285,6 +287,44 @@ impl RouteGrantV2Verifier {
             } else {
                 Err(RouteGrantV2RingInstallError::VersionConflict)
             };
+        }
+        *current = Arc::new(replacement);
+        Ok(RouteGrantV2RingInstallOutcome::Installed)
+    }
+
+    /// Publish one decoded artifact only when it is an exact successor of the
+    /// complete in-process ring. The filesystem installer invokes this only
+    /// after the same artifact is durable at the fixed path.
+    pub(crate) fn replace_artifact(
+        &self,
+        artifact: &RouteGrantV2PublicKeyRingArtifact,
+    ) -> Result<RouteGrantV2RingInstallOutcome, RouteGrantV2RingInstallError> {
+        let replacement = RouteGrantV2KeyRing::from_artifact(artifact)
+            .map_err(|_| RouteGrantV2RingInstallError::VersionConflict)?;
+        let mut current = self
+            .ring
+            .write()
+            .map_err(|_| RouteGrantV2RingInstallError::Unavailable)?;
+        if replacement.version() < current.version() {
+            return Err(RouteGrantV2RingInstallError::StaleVersion);
+        }
+        if replacement.version() == current.version() {
+            return if replacement.digest() == current.digest()
+                && replacement.loaded_kids() == current.loaded_kids()
+            {
+                Ok(RouteGrantV2RingInstallOutcome::Replay)
+            } else {
+                Err(RouteGrantV2RingInstallError::VersionConflict)
+            };
+        }
+        let Some(previous) = artifact.expected_previous.as_ref() else {
+            return Err(RouteGrantV2RingInstallError::LineageMismatch);
+        };
+        if current.version().get().checked_add(1) != Some(replacement.version().get())
+            || previous.ring_version != current.version()
+            || &previous.key_ring_digest != current.digest()
+        {
+            return Err(RouteGrantV2RingInstallError::LineageMismatch);
         }
         *current = Arc::new(replacement);
         Ok(RouteGrantV2RingInstallOutcome::Installed)

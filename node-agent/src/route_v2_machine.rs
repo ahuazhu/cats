@@ -42,6 +42,7 @@ use crate::route_grant_v2::{
     AdmittedRouteV2, AuthenticatedGatewayPrincipal, RouteAdmissionV2RequestBinding,
     RouteGrantV2KeyRing, RouteGrantV2Verifier,
 };
+use crate::route_signing_rotation::RouteGrantV2RingInstaller;
 use crate::runtime::reconciliation::AdmissionCellRegistry;
 
 const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
@@ -93,6 +94,12 @@ impl RouteV2MachineConfig {
 
     pub(crate) fn verifier(&self) -> Arc<RouteGrantV2Verifier> {
         Arc::clone(&self.verifier)
+    }
+
+    /// Construct the fixed-path successor installer over the exact verifier
+    /// used by this listener and by full-inventory ACK observation.
+    pub fn ring_installer(&self) -> RouteGrantV2RingInstaller {
+        RouteGrantV2RingInstaller::for_production(Arc::clone(&self.verifier))
     }
 
     #[cfg(test)]
