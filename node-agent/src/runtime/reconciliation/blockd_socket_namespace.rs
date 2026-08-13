@@ -3180,13 +3180,13 @@ fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
     u64::try_from(device).context("socket device number is negative")
 }
 
-#[cfg(target_os = "linux")]
-fn stat_link_count(links: libc::nlink_t) -> u64 {
-    links
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_link_count(links: libc::nlink_t) -> u64 {
+// libc exposes `nlink_t` at different unsigned widths on supported targets.
+// The generic bound keeps the conversion lossless without making an identity
+// conversion visible to Clippy on targets where the alias is already `u64`.
+fn stat_link_count<T>(links: T) -> u64
+where
+    u64: From<T>,
+{
     u64::from(links)
 }
 
