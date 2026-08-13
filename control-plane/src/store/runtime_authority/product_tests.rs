@@ -1039,16 +1039,19 @@ fn desired_mutation_rejects_assigned_set_change_after_planning_without_any_commi
     assert_stale_mutation_wrote_nothing(&planner, &mutation);
 }
 
-fn assert_invalid_desired_mutation_wrote_nothing(
+fn assert_volume_guard_rejected_without_writes(
     store: &Store,
     request: &CoveredDesiredMutationRequest,
     label: &str,
 ) {
-    assert!(
-        matches!(
-            store.commit_desired_mutation_covered(request),
-            Err(CoveredDesiredMutationError::Store(ref error)) if error.code == ErrorCode::Internal
-        ),
+    let error = store.commit_desired_mutation_covered(request).unwrap_err();
+    let CoveredDesiredMutationError::Store(error) = error else {
+        panic!("{label}: volume mutation did not reach the typed Store guard");
+    };
+    assert_eq!(error.code, ErrorCode::Internal, "{label}");
+    assert_eq!(
+        error.message,
+        "covered Desired mutation candidate is inconsistent: volume intent changes require covered VolumeRecord and Disk authority",
         "{label}"
     );
     store
@@ -1074,6 +1077,66 @@ fn assert_invalid_desired_mutation_wrote_nothing(
         .unwrap();
 }
 
+fn current_with_persistent_volume(
+    store: &Store,
+    create: &CoveredCatCreateRequest,
+) -> DesiredRuntimeSpec {
+    let volume = blank_volume("volume-guard-persistent");
+    let initialization_token = random_id(0x7100);
+    let filesystem_uuid = random_id(0x7101);
+    let disk = persistent_disk(
+        &create.candidate.workspace_id,
+        "disk-guard-persistent",
+        "guard-persistent",
+        &volume,
+        PersistentDiskInitialization::Uninitialized {
+            initialization_token: initialization_token.clone(),
+            filesystem_uuid: filesystem_uuid.clone(),
+            expected_blank_head: volume.head.clone(),
+        },
+    );
+    store
+        .authority_transaction(|transaction| {
+            insert_volume(transaction, &volume)?;
+            insert_disk(transaction, &disk)
+        })
+        .unwrap();
+
+    let mut desired = create.candidate.desired.clone();
+    desired.volumes.push(VolumeIntent {
+        volume_intent_id: id("volume-intent_z"),
+        disk_id: disk.disk_id,
+        volume_id: volume.volume_id,
+        attachment_id: id("attachment-guard-persistent"),
+        size_bytes: volume.size_bytes,
+        disk_kind: DiskKind::Persistent,
+        access: VolumeAccess::ReadWriteOnce,
+        durability: Durability::Strict,
+        guest_device: GuestDeviceIdentity {
+            serial: id("cats-persistent"),
+            slot: 1,
+        },
+        acquire: VolumeAcquire::Normal {
+            transition_id: random_id(0x7102),
+            expected_unowned_epoch: fence_epoch(0),
+        },
+        disposition: VolumeDisposition::Retain,
+        mount: Some(Ext4MountIntent {
+            filesystem_uuid,
+            mount_path: cats_api::runtime_reconciliation::HostPath::new("/data").unwrap(),
+            initialization: FilesystemInitialization::Initialize {
+                initialization_token,
+                expected_blank_head: volume.head,
+            },
+        }),
+    });
+    desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    encode_desired_runtime_spec(&desired).expect("Persistent current Desired is codec-valid");
+    rewrite_current_desired_and_operation(store, &desired, None);
+    desired
+}
+
 #[test]
 fn desired_mutation_rejects_every_uncovered_volume_intent_change_without_any_commit_artifact() {
     let (_url, store, _unused, workspace) = stores();
@@ -1082,23 +1145,26 @@ fn desired_mutation_rejects_every_uncovered_volume_intent_change_without_any_com
     store
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
+    let current = current_with_persistent_volume(&store, &create);
     let target = refresh_mutation_target(&store, &identity, &policy, &release, 701);
     let active_digest = guest_config_digest(&release).unwrap();
 
     let mut candidates = Vec::new();
-    let mut removed = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
-    removed.volumes.clear();
-    candidates.push(("remove", removed));
+    let mut removed = current.clone();
+    removed.desired_revision = revision(2);
+    removed.volumes.pop();
+    candidates.push(("remove-persistent", removed));
 
-    let mut added = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
-    let mut extra = added.volumes[0].clone();
-    extra.volume_intent_id = id("volume-intent-extra");
+    let mut added = current.clone();
+    added.desired_revision = revision(2);
+    let mut extra = added.volumes[1].clone();
+    extra.volume_intent_id = id("volume-intent_zz");
     extra.disk_id = id("disk-extra");
     extra.volume_id = id("volume-extra");
     extra.attachment_id = id("attachment-extra");
     extra.disk_kind = DiskKind::Persistent;
     extra.guest_device.serial = id("cats-extra");
-    extra.guest_device.slot = 1;
+    extra.guest_device.slot = 2;
     extra.acquire = VolumeAcquire::Normal {
         transition_id: random_id(0x7000),
         expected_unowned_epoch: fence_epoch(0),
@@ -1109,24 +1175,30 @@ fn desired_mutation_rejects_every_uncovered_volume_intent_change_without_any_com
         initialization: FilesystemInitialization::Existing,
     });
     added.volumes.push(extra);
-    candidates.push(("add", added));
+    candidates.push(("add-persistent", added));
 
-    let mut attachment = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
-    attachment.volumes[0].attachment_id = id("attachment-replaced");
+    let mut attachment = current.clone();
+    attachment.desired_revision = revision(2);
+    attachment.volumes[1].attachment_id = id("attachment-replaced");
     candidates.push(("attachment", attachment));
 
-    let mut disposition = advance_target(&create.candidate.desired, RuntimeTarget::Deleted);
+    let mut disposition = current.clone();
+    disposition.desired_revision = revision(2);
+    disposition.target = RuntimeTarget::Deleted;
     disposition.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
         delete_id: id("delete-volume-closed"),
     };
+    disposition.volumes[1].disposition = VolumeDisposition::DetachRetained;
     candidates.push(("disposition", disposition));
 
-    let mut size = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
-    size.volumes[0].size_bytes += 4096;
+    let mut size = current.clone();
+    size.desired_revision = revision(2);
+    size.volumes[1].size_bytes += 4096;
     candidates.push(("size", size));
 
-    let mut authority = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
-    authority.volumes[0].acquire = VolumeAcquire::Normal {
+    let mut authority = current.clone();
+    authority.desired_revision = revision(2);
+    authority.volumes[1].acquire = VolumeAcquire::Normal {
         transition_id: random_id(0xfeed),
         expected_unowned_epoch: fence_epoch(1),
     };
@@ -1134,9 +1206,12 @@ fn desired_mutation_rejects_every_uncovered_volume_intent_change_without_any_com
 
     for (index, (label, mut desired)) in candidates.into_iter().enumerate() {
         desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
-        desired.spec_digest = spec_digest(&desired).unwrap();
+        desired.spec_digest = spec_digest(&desired)
+            .unwrap_or_else(|error| panic!("{label}: successor digest rejected: {error}"));
+        encode_desired_runtime_spec(&desired)
+            .unwrap_or_else(|error| panic!("{label}: successor is not codec-valid: {error}"));
         let request = desired_mutation_request(
-            &create.candidate.desired,
+            &current,
             desired,
             &format!("op_volume_closed_{label}"),
             &format!("volume-closed-{index}"),
@@ -1144,7 +1219,7 @@ fn desired_mutation_rejects_every_uncovered_volume_intent_change_without_any_com
             active_digest.clone(),
             vec![default_endpoint_record(&create)],
         );
-        assert_invalid_desired_mutation_wrote_nothing(&store, &request, label);
+        assert_volume_guard_rejected_without_writes(&store, &request, label);
     }
 }
 
