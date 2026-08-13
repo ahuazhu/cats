@@ -67,6 +67,7 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Implemented frozen v1 | Desired read-position、inventory/observation接受与freshness |
 | [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Implemented frozen v1 | local NodeIdentity artifact与单一Guest release payload |
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Implemented frozen v1 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
+| [A23 Production Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Implemented operations contract | revision-1 trust与Host initial NodeIdentity prepare/export/official-apply/activate |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
 | [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
 | [Route Grant v2](specs/route-grant-v2.md) | Core与machine tunnel implemented；public proxy closed | ADR-0041 AdmissionCell、Grant及machine tunnel；未安装ring/mTLS时不监听 |

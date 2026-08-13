@@ -140,6 +140,12 @@ The bundle checksum forces a Pod rollout; each replica pins it at startup and
 persists or exact-replays its monotonic trust revision before opening the
 administrator listener.
 
+The worker artifact also contains the exact release `cats` binary. Before the
+first worker association, an operator uses its offline
+`admin runtime-provisioner node-identity` prepare/export/activate flow and the
+official signed `admin runtime-node provision` command; the frozen crash-safe
+contract is [A23 Production Provisioner Tooling v1](../../docs/specs/a23-production-provisioner-tooling-v1.md).
+
 The same cutover provisioner installs the canonical root-only local identity at
 `/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. `cats-noded`
 derives `node_id`, immutable Host identity and `/var/lib/cats/node/<state_path_id>` only from that artifact; the
