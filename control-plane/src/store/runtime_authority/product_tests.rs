@@ -3314,11 +3314,19 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
         .unwrap()
         .expect("Busy recovery revision has an Operation");
     assert_eq!(recovery_operation.phase, OperationPhase::Pending);
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        702,
+        AcceptedRouteRuntimeKind::Running,
+    );
     assert_eq!(
         store
             .commit_route_epoch_system_plan(replay_plan, &system_mutation_guard())
             .unwrap(),
-        SystemDesiredMutationCommit::Replayed
+        SystemDesiredMutationCommit::Replayed,
+        "retained Operation replay must not consume the replaced transient Busy source"
     );
 }
 
