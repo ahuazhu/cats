@@ -746,6 +746,39 @@ def run_local_matrix(tool: Any, root: Path) -> tuple[Path, Path, dict[str, Any]]
     )
     assert not absent_runner.stop_calls
 
+    masked_case = root / "local-masked-unit"
+    masked_case.mkdir(mode=0o700)
+    masked_inv_path = masked_case / "inventory.json"
+    masked_inv, masked_digest, masked_hosts = write_inventory(
+        tool, masked_inv_path, inventory([local_host()], "positive-local-masked")
+    )
+    masked_facts = FakeLocalFacts(
+        tool, boot_id=BOOT, machine_digest=MACHINE, processes=base_processes(tool)
+    )
+    masked_units = base_units()
+    masked_units["cats-worker.service"]["UnitFileState"] = "masked-runtime"
+    masked_runner = FakeLocalRunner(tool, masked_facts, masked_units)
+    expect_refusal(
+        tool,
+        lambda: tool.execute_local_stop(
+            inventory=masked_inv,
+            inventory_digest=masked_digest,
+            hosts=masked_hosts,
+            host_id="old-local",
+            output=masked_case / "receipt.json",
+            runner=masked_runner,
+            facts=masked_facts,
+            deadline_seconds=60,
+            stable_seconds=0,
+            now=fixed_now,
+            monotonic=FakeClock().monotonic,
+            sleeper=lambda _seconds: None,
+            calibration_pid=900,
+        ),
+        "is masked",
+    )
+    assert not masked_runner.stop_calls
+
     survivor_case = root / "local-descendant-survivor"
     survivor_case.mkdir(mode=0o700)
     survivor_inv_path = survivor_case / "inventory.json"

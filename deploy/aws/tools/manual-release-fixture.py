@@ -122,6 +122,7 @@ def run_verifier(
     gateway = workspace / "gateway"
     bundle = workspace / "cats-worker.tar.zst"
     source_input = workspace / "Cargo.lock"
+    reviewed_positive_stop = workspace / "reviewed-old-host-positive-stop.py"
     command = [
         sys.executable,
         "-B",
@@ -158,6 +159,8 @@ def run_verifier(
         "sha256:" + "5" * 64,
         "--input-file",
         f"cargo_lock={source_input}",
+        "--input-file",
+        f"old_host_positive_stop={reviewed_positive_stop}",
         "--output",
         str(output),
     ]
@@ -246,6 +249,11 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
         write_member(root / "worker" / relative, f"fixture-{relative}\n".encode(), mode)
     package_worker(root)
     write_member(root / "Cargo.lock", b"fixture-lockfile")
+    write_member(
+        root / "reviewed-old-host-positive-stop.py",
+        (root / "worker/old-host-positive-stop.py").read_bytes(),
+        0o755,
+    )
     control_release = root / "control/opt/cats/release"
     write_member(control_release / "guest-runtime-release-manifest.v1.json", members["manifest"])
     write_member(control_release / "guest-runtime-profile.v1.json", members["profile"])
@@ -291,6 +299,15 @@ def main() -> int:
         assert output.read_bytes() == raw
 
         output.unlink()
+        reviewed_positive_stop = (root / "reviewed-old-host-positive-stop.py").read_bytes()
+        write_member(root / "worker/old-host-positive-stop.py", b"tampered-worker-copy\n", 0o755)
+        package_worker(root)
+        tampered_program = run_verifier(verifier, root, output, expect_success=False)
+        assert b"worker old-host-positive-stop.py is not byte-identical" in tampered_program.stderr
+        assert not output.exists()
+        write_member(root / "worker/old-host-positive-stop.py", reviewed_positive_stop, 0o755)
+        package_worker(root)
+
         write_member(
             root / "control/opt/cats/release/guest-runtime-profile.v1.json",
             members["profile"] + b"\n",

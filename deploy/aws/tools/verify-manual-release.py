@@ -533,6 +533,16 @@ def verify_exact_copy(path: Path, expected: bytes, *, label: str) -> str:
     return sha256_bytes(actual)
 
 
+def verify_reviewed_worker_program(path: Path, expected: bytes) -> str:
+    actual = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES, mode=0o755)
+    if actual != expected:
+        raise VerificationError(
+            "worker old-host-positive-stop.py is not byte-identical to reviewed input "
+            "old_host_positive_stop"
+        )
+    return sha256_bytes(actual)
+
+
 def parse_input_file(raw: str) -> tuple[str, Path]:
     label, separator, path = raw.partition("=")
     if separator != "=" or INPUT_LABEL_PATTERN.fullmatch(label) is None or not path:
@@ -690,6 +700,20 @@ def verify_gateway_image_root(root: Path) -> tuple[str, int]:
 
 def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     validate_identifier_arguments(arguments)
+    input_files: dict[str, dict[str, Any]] = {}
+    reviewed_old_host_positive_stop: bytes | None = None
+    for label, path in arguments.input_file:
+        if label in input_files:
+            raise VerificationError(f"duplicate fingerprinted input label: {label}")
+        digest, size = hash_regular(path)
+        input_files[label] = {"sha256": digest, "size_bytes": size}
+        if label == "old_host_positive_stop":
+            reviewed_old_host_positive_stop = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
+    if not input_files:
+        raise VerificationError("at least one exact build input file must be fingerprinted")
+    if reviewed_old_host_positive_stop is None:
+        raise VerificationError("reviewed input old_host_positive_stop is required")
+
     shared = verify_guest_release(arguments.shared_guest_runtime)
     worker_temporary = tempfile.TemporaryDirectory(prefix="cats-worker-verify-")
     try:
@@ -703,6 +727,15 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                 raise VerificationError(
                     f"worker {field.removesuffix('_raw')} is not byte-identical to the shared Guest release"
                 )
+        worker_old_host_positive_stop_sha = verify_reviewed_worker_program(
+            worker_root / "old-host-positive-stop.py",
+            reviewed_old_host_positive_stop,
+        )
+        if worker_old_host_positive_stop_sha != input_files["old_host_positive_stop"]["sha256"]:
+            raise VerificationError(
+                "worker old-host-positive-stop.py digest does not match reviewed input "
+                "old_host_positive_stop"
+            )
         installer = worker_root / "install-guest-runtime-release.sh"
         installer_metadata = installer.lstat()
         if (
@@ -734,15 +767,6 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     )
     if arguments.worker_bundle.name != "cats-worker.tar.zst":
         raise VerificationError("worker bundle must use the canonical cats-worker.tar.zst name")
-
-    input_files: dict[str, dict[str, Any]] = {}
-    for label, path in arguments.input_file:
-        if label in input_files:
-            raise VerificationError(f"duplicate fingerprinted input label: {label}")
-        digest, size = hash_regular(path)
-        input_files[label] = {"sha256": digest, "size_bytes": size}
-    if not input_files:
-        raise VerificationError("at least one exact build input file must be fingerprinted")
 
     source = {
         "commit": arguments.source_commit,

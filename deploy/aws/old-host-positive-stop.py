@@ -830,6 +830,26 @@ SYSTEMD_PROPERTIES = (
     "SubState",
     "UnitFileState",
 )
+KNOWN_UNIT_FILE_STATES = frozenset(
+    {
+        "alias",
+        "disabled",
+        "enabled",
+        "enabled-runtime",
+        "generated",
+        "indirect",
+        "linked",
+        "linked-runtime",
+        "masked",
+        "masked-runtime",
+        "static",
+        "transient",
+    }
+)
+ACCEPTED_LOADED_UNIT_FILE_STATES = KNOWN_UNIT_FILE_STATES - {
+    "masked",
+    "masked-runtime",
+}
 
 
 def _systemd_show(runner: Runner, unit: str, deadline: Deadline) -> dict[str, Any]:
@@ -871,6 +891,12 @@ def _systemd_show(runner: Runner, unit: str, deadline: Deadline) -> dict[str, An
 def _validate_loaded_unit(observation: Mapping[str, Any]) -> None:
     if observation["load_state"] != "loaded":
         raise PositiveStopError(f"expected unit {observation['unit']} is absent or not loaded")
+    if observation["unit_file_state"] not in KNOWN_UNIT_FILE_STATES:
+        raise PositiveStopError(
+            f"expected unit {observation['unit']} has an unsupported unit-file state"
+        )
+    if observation["unit_file_state"] not in ACCEPTED_LOADED_UNIT_FILE_STATES:
+        raise PositiveStopError(f"expected unit {observation['unit']} is masked")
 
 
 def _validate_unit_shape(value: Any, context: str) -> dict[str, Any]:
@@ -909,12 +935,15 @@ def _validate_unit_shape(value: Any, context: str) -> dict[str, Any]:
         )
     ):
         raise PositiveStopError(f"{context} is malformed")
+    if unit["unit_file_state"] not in KNOWN_UNIT_FILE_STATES:
+        raise PositiveStopError(f"{context} unit_file_state is outside the accepted closed set")
     return unit
 
 
 def _unit_is_stopped(observation: Mapping[str, Any]) -> bool:
     return (
         observation["load_state"] == "loaded"
+        and observation["unit_file_state"] in ACCEPTED_LOADED_UNIT_FILE_STATES
         and observation["active_state"] in {"inactive", "failed"}
         and observation["main_pid"] == 0
         and observation["control_pid"] == 0
@@ -991,6 +1020,7 @@ def _local_postcondition(
 ) -> dict[str, Any]:
     units = [_systemd_show(runner, unit, deadline) for unit in _local_units(host)]
     for unit in units:
+        _validate_loaded_unit(unit)
         if not _unit_is_stopped(unit):
             raise PositiveStopError(f"unit {unit['unit']} is not provably stopped")
     snapshot = facts.snapshot(calibration_pid)
@@ -1142,6 +1172,8 @@ def _validate_common_receipt(
         validated_units = [
             _validate_unit_shape(unit, "local receipt unit") for unit in post["units"]
         ]
+        for unit in validated_units:
+            _validate_loaded_unit(unit)
         if [unit["unit"] for unit in validated_units] != _local_units(host):
             raise PositiveStopError("local receipt omitted an expected unit")
         if any(not _unit_is_stopped(unit) for unit in validated_units):
@@ -1478,6 +1510,7 @@ def execute_local_stop(
             except CommandOutcomeUnknown:
                 response = "ambiguous_response"
             observation = _systemd_show(runner, unit, deadline)
+            _validate_loaded_unit(observation)
             if not _unit_is_stopped(observation):
                 raise PositiveStopError(
                     f"stop response for {unit} was not confirmed by exact discovery"
