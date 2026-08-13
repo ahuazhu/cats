@@ -5,17 +5,18 @@ use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    inventory_digest, AdmissionInventoryAttestation, AgentSession, ContractError,
-    ContractErrorDetail, ContractVersion, DesiredReadRequest, DesiredReadSnapshot,
-    DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId, NodeObservation, NodeResidue,
-    ObservationAcceptance, ObservationInventoryAcceptance, ObservedRuntimeStatus, RandomId128,
-    RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeVolumeAuthorityRejection, Sha256Digest,
-    UnixMillis,
+    inventory_digest, AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence,
+    Condition, ContractError, ContractErrorDetail, ContractVersion, DegradedReason, DegradedSource,
+    DesiredReadRequest, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId,
+    LifecycleAdmission, NodeObservation, NodeResidue, ObservationAcceptance,
+    ObservationInventoryAcceptance, ObservedRuntimeStatus, ProcessRole, ProcessState, RandomId128,
+    ReadyReason, ReconcileStep, RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeTarget,
+    RuntimeVolumeAuthorityRejection, Sha256Digest, StableState, UnixMillis,
 };
 use thiserror::Error;
 
@@ -87,8 +88,38 @@ pub(crate) trait RuntimePreScanRecovery: Send + Sync + 'static {
 /// (and durably settle the matching close edge); it cannot open a gate or
 /// repair unrelated publication artifacts.
 pub(crate) trait RuntimePreScanAdmission: Send + Sync + 'static {
-    fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()>;
+    fn reconcile(
+        &self,
+        context: RuntimePreScanAdmissionContext,
+    ) -> anyhow::Result<RuntimePreScanAdmissionOutcome>;
     fn fail_close_all(&self);
+}
+
+/// Process-local Running gates which the mandatory pre-scan proved safe to
+/// retain through a subsequently incomplete physical scan. An ordinary
+/// successful return is not enough: an untrusted session may have been
+/// deliberately fail-closed while reconciliation still completed normally.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuntimePreScanAdmissionOutcome {
+    retained_running_cats: BTreeSet<Id>,
+}
+
+impl RuntimePreScanAdmissionOutcome {
+    pub(crate) fn retained_running_cats(cat_ids: impl IntoIterator<Item = Id>) -> Self {
+        Self {
+            retained_running_cats: cat_ids.into_iter().collect(),
+        }
+    }
+
+    fn retains(&self, cat_id: &Id) -> bool {
+        self.retained_running_cats.contains(cat_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DegradedObservationCause {
+    SourceUnavailable(Vec<InventorySource>),
+    AttestationRefreshFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,6 +1176,12 @@ pub enum RuntimeSpineRunStep {
     /// It repairs an ambiguous result but cannot establish restart admission
     /// or local readiness without a new physical scan.
     ObservationReplayed,
+    /// A current-process incomplete scan refreshed only previously proven
+    /// Running Cat rows against the retained full inventory epoch. It never
+    /// opens Desired effect admission or replaces the full attestation.
+    PartialObservationAccepted {
+        degraded_runtimes: usize,
+    },
     /// One exact local crash-publication artifact was repaired. The next
     /// iteration must perform recovery classification again before scanning.
     PreScanRecovered {
@@ -1261,6 +1298,15 @@ enum JournalCommand {
             Result<DurableRuntimeSpineRequest<NodeObservation>, RuntimeSpineJournalError>,
         >,
     },
+    PrepareDegradedPartial {
+        coordinates: RuntimeSpineFullScan,
+        cause: DegradedObservationCause,
+        retained_admission: RuntimePreScanAdmissionOutcome,
+        observed_at_unix_ms: UnixMillis,
+        reply: tokio::sync::oneshot::Sender<
+            Result<Option<DurableRuntimeSpineRequest<NodeObservation>>, RuntimeSpineJournalError>,
+        >,
+    },
     AcceptObservation {
         acceptance: ObservationAcceptance,
         bytes: Vec<u8>,
@@ -1331,6 +1377,35 @@ impl JournalLane {
                         JournalCommand::PrepareObservation { candidate, reply } => {
                             let result = open_journal(&state_directory, &registered_session)
                                 .and_then(|mut journal| journal.prepare_observation(candidate));
+                            let _ = reply.send(result);
+                        }
+                        JournalCommand::PrepareDegradedPartial {
+                            coordinates,
+                            cause,
+                            retained_admission,
+                            observed_at_unix_ms,
+                            reply,
+                        } => {
+                            let result = open_journal(&state_directory, &registered_session)
+                                .and_then(|mut journal| {
+                                    let full = journal
+                                        .full_observation()
+                                        .map(|(observation, _)| observation.clone());
+                                    let last = journal
+                                        .last_observation()
+                                        .map(|(observation, _)| observation.clone());
+                                    let Some(candidate) = build_degraded_partial_observation(
+                                        coordinates,
+                                        full.as_ref(),
+                                        last.as_ref(),
+                                        cause,
+                                        &retained_admission,
+                                        observed_at_unix_ms,
+                                    ) else {
+                                        return Ok(None);
+                                    };
+                                    journal.prepare_observation(candidate).map(Some)
+                                });
                             let _ = reply.send(result);
                         }
                         JournalCommand::AcceptObservation {
@@ -1412,6 +1487,24 @@ impl JournalLane {
     ) -> Result<DurableRuntimeSpineRequest<NodeObservation>, RuntimeSpineRunError> {
         let (reply, received) = tokio::sync::oneshot::channel();
         self.send(JournalCommand::PrepareObservation { candidate, reply })?;
+        receive("journal", received).await
+    }
+
+    async fn prepare_degraded_partial(
+        &self,
+        coordinates: RuntimeSpineFullScan,
+        cause: DegradedObservationCause,
+        retained_admission: RuntimePreScanAdmissionOutcome,
+        observed_at_unix_ms: UnixMillis,
+    ) -> Result<Option<DurableRuntimeSpineRequest<NodeObservation>>, RuntimeSpineRunError> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.send(JournalCommand::PrepareDegradedPartial {
+            coordinates,
+            cause,
+            retained_admission,
+            observed_at_unix_ms,
+            reply,
+        })?;
         receive("journal", received).await
     }
 
@@ -1537,7 +1630,25 @@ impl ScanLane {
         deadline: Instant,
     ) -> Result<ScanWait, RuntimeSpineRunError> {
         if self.state.poisoned.load(Ordering::Acquire) {
-            return Err(RuntimeSpineRunError::ScanLanePoisoned);
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                return Err(RuntimeSpineRunError::WorkerStopped(
+                    "inventory scan".to_owned(),
+                ));
+            }
+            if active_scan(&self.state.active).is_some() {
+                // The cancelled read-only scanner still owns the lane. Do
+                // not overlap another physical scan; let the runner publish
+                // another bounded partial Degraded heartbeat instead.
+                return Ok(ScanWait::DeadlineExceeded);
+            }
+            // A cooperatively cancelled scanner returned after its caller's
+            // deadline. Its late result was discarded, but the single lane
+            // can now safely perform a fresh full scan.
+            self.state.poisoned.store(false, Ordering::Release);
         }
         if Instant::now() >= deadline {
             return Ok(ScanWait::DeadlineExceeded);
@@ -1624,7 +1735,7 @@ enum EffectCommand {
     },
     ReconcileAdmission {
         context: Box<RuntimePreScanAdmissionContext>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<RuntimePreScanAdmissionOutcome>>,
     },
 }
 
@@ -1690,9 +1801,10 @@ impl CoordinatorLane {
                         }
                         EffectCommand::ReconcileAdmission { context, reply } => {
                             let result = if context.check_active().is_ok() {
-                                pre_scan_admission
-                                    .as_ref()
-                                    .map_or(Ok(()), |admission| admission.reconcile(*context))
+                                pre_scan_admission.as_ref().map_or(
+                                    Ok(RuntimePreScanAdmissionOutcome::default()),
+                                    |admission| admission.reconcile(*context),
+                                )
                             } else {
                                 if let Some(admission) = &pre_scan_admission {
                                     admission.fail_close_all();
@@ -2244,7 +2356,7 @@ enum RecoveryWait {
 }
 
 enum AdmissionWait {
-    Finished(anyhow::Result<()>),
+    Finished(anyhow::Result<RuntimePreScanAdmissionOutcome>),
     DeadlineExceeded,
 }
 
@@ -2383,6 +2495,7 @@ pub struct RuntimeSpineRunner {
     cat_effect_workers: Option<CatEffectWorkers>,
     effect_resource_owner: Option<Arc<dyn RuntimeEffectResourceOwner>>,
     current_process_scan_observation_id: Option<RandomId128>,
+    current_process_partial_observation_id: Option<RandomId128>,
     current_process_node_global_process: Option<NodeGlobalManagedProcessAdmission>,
     current_process_node_global_network: Option<NodeGlobalNetworkAdmission>,
     current_process_kernel_nbd_pool: Option<KernelNbdPoolAdmission>,
@@ -2533,6 +2646,7 @@ impl RuntimeSpineRunner {
             cat_effect_workers,
             effect_resource_owner: resource_owner,
             current_process_scan_observation_id: None,
+            current_process_partial_observation_id: None,
             current_process_node_global_process: None,
             current_process_node_global_network: None,
             current_process_kernel_nbd_pool: None,
@@ -2578,6 +2692,7 @@ impl RuntimeSpineRunner {
             PendingWork::Desired(request) => self.send_desired(request).await,
             PendingWork::Observation(request) => self.send_observation(request).await,
             PendingWork::Scan(scan) => {
+                let mut retained_admission = RuntimePreScanAdmissionOutcome::default();
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
@@ -2592,7 +2707,9 @@ impl RuntimeSpineRunner {
                         .reconcile_pre_scan_admission(scan.clone(), deadlines.effect_step)
                         .await?
                     {
-                        AdmissionWait::Finished(Ok(())) => {}
+                        AdmissionWait::Finished(Ok(outcome)) => {
+                            retained_admission = outcome;
+                        }
                         AdmissionWait::Finished(Err(error)) => {
                             return Ok(RuntimeSpineRunStep::PreScanAdmissionUnavailable(error));
                         }
@@ -2657,11 +2774,25 @@ impl RuntimeSpineRunner {
                         }
                     },
                     ScanWait::DeadlineExceeded => {
-                        return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
+                        return self
+                            .publish_degraded_partial(
+                                coordinates,
+                                DegradedObservationCause::AttestationRefreshFailed,
+                                retained_admission,
+                                RuntimeSpineRunStep::ScanDeadlineExceeded,
+                            )
+                            .await;
                     }
                 };
                 if Instant::now() >= deadlines.scan {
-                    return Ok(RuntimeSpineRunStep::ScanDeadlineExceeded);
+                    return self
+                        .publish_degraded_partial(
+                            coordinates,
+                            DegradedObservationCause::AttestationRefreshFailed,
+                            retained_admission,
+                            RuntimeSpineRunStep::ScanDeadlineExceeded,
+                        )
+                        .await;
                 }
                 let mut inventory = match outcome {
                     RuntimeInventoryScanOutcome::Complete(inventory) => inventory,
@@ -2676,9 +2807,18 @@ impl RuntimeSpineRunner {
                                 "an incomplete scan has no unavailable source",
                             ));
                         }
-                        return Ok(RuntimeSpineRunStep::ScanIncomplete {
-                            unavailable_sources,
-                        });
+                        return self
+                            .publish_degraded_partial(
+                                coordinates,
+                                DegradedObservationCause::SourceUnavailable(
+                                    unavailable_sources.clone(),
+                                ),
+                                retained_admission,
+                                RuntimeSpineRunStep::ScanIncomplete {
+                                    unavailable_sources,
+                                },
+                            )
+                            .await;
                     }
                 };
                 let node_global_process = inventory.take_node_global_process_admission();
@@ -2728,6 +2868,25 @@ impl RuntimeSpineRunner {
                 self.send_observation(request).await
             }
         }
+    }
+
+    async fn publish_degraded_partial(
+        &mut self,
+        coordinates: RuntimeSpineFullScan,
+        cause: DegradedObservationCause,
+        retained_admission: RuntimePreScanAdmissionOutcome,
+        fallback: RuntimeSpineRunStep,
+    ) -> Result<RuntimeSpineRunStep, RuntimeSpineRunError> {
+        let observed_at_unix_ms = current_unix_millis()?;
+        let request = self
+            .journal_lane()?
+            .prepare_degraded_partial(coordinates, cause, retained_admission, observed_at_unix_ms)
+            .await?;
+        let Some(request) = request else {
+            return Ok(fallback);
+        };
+        self.current_process_partial_observation_id = Some(request.value().observation_id.clone());
+        self.send_observation(request).await
     }
 
     #[cfg(test)]
@@ -3113,6 +3272,10 @@ impl RuntimeSpineRunner {
                 let establishes_effect_admission = request.value().complete_inventory
                     && self.current_process_scan_observation_id.as_ref()
                         == Some(&request.value().observation_id);
+                let establishes_partial_heartbeat = !request.value().complete_inventory
+                    && self.current_process_partial_observation_id.as_ref()
+                        == Some(&request.value().observation_id);
+                let degraded_runtimes = request.value().runtimes.len();
                 let service_ready = establishes_effect_admission
                     && observation_opens_service_readiness(request.value())
                     && self
@@ -3145,6 +3308,7 @@ impl RuntimeSpineRunner {
                     .accept_observation(accepted.value, accepted.bytes)
                     .await?;
                 self.current_process_scan_observation_id = None;
+                self.current_process_partial_observation_id = None;
                 self.current_process_node_global_process = None;
                 self.current_process_node_global_network = None;
                 self.current_process_kernel_nbd_pool = None;
@@ -3157,6 +3321,8 @@ impl RuntimeSpineRunner {
                     self.effect_batch_closing = false;
                     self.deferred_effect_decision = None;
                     Ok(RuntimeSpineRunStep::ObservationAccepted { service_ready })
+                } else if establishes_partial_heartbeat {
+                    Ok(RuntimeSpineRunStep::PartialObservationAccepted { degraded_runtimes })
                 } else {
                     Ok(RuntimeSpineRunStep::ObservationReplayed)
                 }
@@ -3170,6 +3336,7 @@ impl RuntimeSpineRunner {
                     DesiredInvalidationBinding::Exact => {
                         self.journal_lane()?.invalidate_desired().await?;
                         self.current_process_scan_observation_id = None;
+                        self.current_process_partial_observation_id = None;
                         self.current_process_node_global_process = None;
                         self.current_process_node_global_network = None;
                         self.current_process_kernel_nbd_pool = None;
@@ -3308,6 +3475,216 @@ impl RunnerWorkers {
     }
 }
 
+fn current_unix_millis() -> Result<UnixMillis, RuntimeSpineRunError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RuntimeSpineRunError::InvalidScan("system clock is before the Unix epoch"))?;
+    let millis = u64::try_from(elapsed.as_millis())
+        .map_err(|_| RuntimeSpineRunError::InvalidScan("system clock exceeds UnixMillis"))?;
+    UnixMillis::new(millis).ok_or(RuntimeSpineRunError::InvalidScan(
+        "system clock is not a valid UnixMillis",
+    ))
+}
+
+fn build_degraded_partial_observation(
+    scan: RuntimeSpineFullScan,
+    full: Option<&NodeObservation>,
+    last: Option<&NodeObservation>,
+    cause: DegradedObservationCause,
+    retained_admission: &RuntimePreScanAdmissionOutcome,
+    observed_at_unix_ms: UnixMillis,
+) -> Option<NodeObservation> {
+    let full = full.filter(|observation| {
+        observation.complete_inventory
+            && observation.node_id == scan.session.node_id
+            && observation.node_boot_id == scan.session.node_boot_id
+            && observation.agent_instance_id == scan.session.agent_instance_id
+            && observation.agent_session_epoch == scan.session.agent_session_epoch
+    })?;
+    let reason = match cause {
+        DegradedObservationCause::SourceUnavailable(unavailable_sources) => {
+            let sources = unavailable_sources
+                .into_iter()
+                .map(degraded_source)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if sources.is_empty() {
+                return None;
+            }
+            DegradedReasonTemplate::SourceUnavailable(sources)
+        }
+        DegradedObservationCause::AttestationRefreshFailed => {
+            DegradedReasonTemplate::AttestationRefreshFailed
+        }
+    };
+
+    let desired_by_cat = scan
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (&desired.cat_id, desired))
+        .collect::<BTreeMap<_, _>>();
+    let mut runtimes = Vec::new();
+    for runtime in &full.runtimes {
+        let Some(desired) = desired_by_cat.get(&runtime.cat_id) else {
+            continue;
+        };
+        if !retained_admission.retains(&runtime.cat_id)
+            || !is_proven_current_running(runtime, desired)
+        {
+            continue;
+        }
+        let previous_reason = last
+            .filter(|observation| observation.inventory_epoch == full.inventory_epoch)
+            .and_then(|observation| {
+                observation
+                    .runtimes
+                    .iter()
+                    .find(|candidate| candidate.cat_id == runtime.cat_id)
+            })
+            .and_then(|runtime| runtime.conditions.iter().find_map(degraded_reason));
+        let since_unix_ms = match (&reason, previous_reason) {
+            (
+                DegradedReasonTemplate::SourceUnavailable(_),
+                Some(DegradedReason::SourceUnavailable { since_unix_ms, .. }),
+            )
+            | (
+                DegradedReasonTemplate::AttestationRefreshFailed,
+                Some(DegradedReason::AttestationRefreshFailed { since_unix_ms, .. }),
+            ) => since_unix_ms,
+            _ => observed_at_unix_ms,
+        };
+        let mut degraded = runtime.clone();
+        degraded
+            .conditions
+            .retain(|condition| !matches!(condition, Condition::Degraded { .. }));
+        degraded.conditions.push(Condition::Degraded {
+            reason: match &reason {
+                DegradedReasonTemplate::SourceUnavailable(sources) => {
+                    DegradedReason::SourceUnavailable {
+                        sources: sources.clone(),
+                        since_unix_ms,
+                    }
+                }
+                DegradedReasonTemplate::AttestationRefreshFailed => {
+                    DegradedReason::AttestationRefreshFailed {
+                        inventory_epoch: full.inventory_epoch,
+                        since_unix_ms,
+                    }
+                }
+            },
+        });
+        runtimes.push(degraded);
+    }
+    if runtimes.is_empty() {
+        return None;
+    }
+
+    Some(NodeObservation {
+        version: ContractVersion::V1,
+        observation_id: RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
+            .expect("a simple UUID is a valid RandomId128"),
+        node_id: scan.session.node_id,
+        node_boot_id: scan.session.node_boot_id,
+        agent_instance_id: scan.session.agent_instance_id,
+        agent_session_epoch: scan.session.agent_session_epoch,
+        heartbeat_sequence: scan.heartbeat_sequence,
+        observed_at_unix_ms,
+        complete_inventory: false,
+        inventory_epoch: full.inventory_epoch,
+        inventory_digest: None,
+        inventory_read_position: None,
+        key_ring_version: full.key_ring_version,
+        key_ring_digest: full.key_ring_digest.clone(),
+        loaded_kids: full.loaded_kids.clone(),
+        runtimes,
+        residue: Vec::new(),
+    })
+}
+
+enum DegradedReasonTemplate {
+    SourceUnavailable(Vec<DegradedSource>),
+    AttestationRefreshFailed,
+}
+
+fn degraded_reason(condition: &Condition) -> Option<DegradedReason> {
+    match condition {
+        Condition::Degraded { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+fn is_proven_current_running(
+    runtime: &ObservedRuntimeStatus,
+    desired: &DesiredRuntimeSpec,
+) -> bool {
+    let expected = AppliedDesiredEvidence {
+        desired_revision: desired.desired_revision,
+        spec_digest: desired.spec_digest.clone(),
+        placement: desired.placement.clone(),
+        target: desired.target,
+    };
+    let Some(incarnation) = runtime.runtime_incarnation.as_ref() else {
+        return false;
+    };
+    desired.target == RuntimeTarget::Running
+        && runtime.applied_desired.as_ref() == Some(&expected)
+        && runtime.stable_state == Some(StableState::Running)
+        && matches!(
+            runtime.step,
+            ReconcileStep::Stable {
+                state: StableState::Running
+            }
+        )
+        && runtime.lifecycle_admission == LifecycleAdmission::Open
+        && runtime.conditions.iter().any(|condition| {
+            matches!(
+                condition,
+                Condition::Ready {
+                    reason: ReadyReason::PostconditionSatisfied {
+                        target: RuntimeTarget::Running
+                    }
+                }
+            )
+        })
+        && runtime.conditions.iter().all(|condition| {
+            matches!(
+                condition,
+                Condition::Ready { .. } | Condition::Degraded { .. }
+            )
+        })
+        && runtime
+            .processes
+            .iter()
+            .filter(|process| {
+                matches!(
+                    &process.role,
+                    ProcessRole::Vmm {
+                        runtime_incarnation
+                    } if runtime_incarnation == incarnation
+                ) && process.state == ProcessState::Running
+            })
+            .count()
+            == 1
+}
+
+fn degraded_source(source: InventorySource) -> DegradedSource {
+    match source {
+        InventorySource::Checkpoint => DegradedSource::Checkpoint,
+        InventorySource::Systemd => DegradedSource::Systemd,
+        InventorySource::Process => DegradedSource::Process,
+        InventorySource::ControlSocket => DegradedSource::ControlSocket,
+        InventorySource::BlockFrontend => DegradedSource::BlockFrontend,
+        InventorySource::Network => DegradedSource::Network,
+        InventorySource::DataDirectory => DegradedSource::DataDirectory,
+        InventorySource::PendingPack => DegradedSource::PendingPack,
+        InventorySource::WarmSnapshot => DegradedSource::WarmSnapshot,
+        InventorySource::MetadataStore => DegradedSource::MetadataStore,
+        InventorySource::GuestMount => DegradedSource::GuestMount,
+    }
+}
+
 fn build_full_observation(
     scan: RuntimeSpineFullScan,
     inventory: CompleteRuntimeInventory,
@@ -3423,16 +3800,17 @@ mod tests {
     use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
     use cats_api::runtime_reconciliation::{
         decode_agent_session, decode_desired_read_request, decode_desired_read_snapshot,
-        decode_node_observation, encode_desired_read_snapshot, encode_observation_acceptance,
-        encode_runtime_spine_error, spec_digest, AdmissionInventoryAttestation,
-        AppliedDesiredEvidence, AssignedKind, AssignedPlacement, CheckpointEvidence,
-        ContractVersion, ControlHandshakeEvidence, FenceEpoch, GuestTransportEvidence, HostPath,
-        Id, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig,
-        ObservationAcceptance, ObservationInventoryAcceptance, OwnershipTokenEvidence,
-        ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, Revision, RuntimeConfig,
-        RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
-        UnixMillis, WarmSnapshotEvidence, WireU64, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
-        NODE_OBSERVATION_MAX_WIRE_BYTES,
+        decode_node_observation, decode_runtime_checkpoint, encode_desired_read_snapshot,
+        encode_observation_acceptance, encode_runtime_spine_error, spec_digest,
+        AdmissionInventoryAttestation, AppliedDesiredEvidence, AssignedKind, AssignedPlacement,
+        CheckpointEvidence, Condition, ContractVersion, ControlHandshakeEvidence, FenceEpoch,
+        GuestBootId, GuestTransportEvidence, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
+        LifecycleAdmission, MacAddress, NetworkConfig, ObservationAcceptance,
+        ObservationInventoryAcceptance, ObservedVmShape, OwnershipTokenEvidence, ProcessEvidence,
+        ProcessRole, ProcessState, ReadyReason, ReconcileStep, Revision, RuntimeConfig,
+        RuntimeLaunch, RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition, Sequence,
+        SessionBinding, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+        DESIRED_READ_REQUEST_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_WIRE_BYTES,
     };
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -3455,6 +3833,15 @@ mod tests {
 
     struct IncompleteScanner;
 
+    struct TransientRunningProbeScanner {
+        calls: AtomicUsize,
+    }
+
+    struct DelayedTransientRunningProbeScanner {
+        calls: AtomicUsize,
+        delay: Duration,
+    }
+
     struct InvalidIncompleteScanner;
 
     struct ErrorScanner;
@@ -3470,6 +3857,71 @@ mod tests {
             Ok(RuntimeInventoryScanOutcome::Incomplete {
                 unavailable_sources: vec![InventorySource::Process],
             })
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed for TransientRunningProbeScanner {}
+
+    impl RuntimeInventoryScanner for TransientRunningProbeScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            context.check_active()?;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                return Ok(RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources: vec![InventorySource::Process],
+                });
+            }
+            let desired = context
+                .coordinates()
+                .desired
+                .desired_specs
+                .first()
+                .expect("test Desired contains the Running Cat");
+            Ok(RuntimeInventoryScanOutcome::Complete(
+                CompleteRuntimeInventory::for_test(
+                    UnixMillis::new(1_720_000_020_000).unwrap(),
+                    RuntimeInventoryKeyRing::Unavailable,
+                    vec![ready_running_runtime(desired)],
+                    Vec::new(),
+                ),
+            ))
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed
+        for DelayedTransientRunningProbeScanner
+    {
+    }
+
+    impl RuntimeInventoryScanner for DelayedTransientRunningProbeScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                std::thread::sleep(self.delay);
+                context.check_active()?;
+                unreachable!("test scanner's first call must be cancelled by its deadline")
+            }
+            context.check_active()?;
+            let desired = context
+                .coordinates()
+                .desired
+                .desired_specs
+                .first()
+                .expect("test Desired contains the Running Cat");
+            Ok(RuntimeInventoryScanOutcome::Complete(
+                CompleteRuntimeInventory::for_test(
+                    UnixMillis::new(1_720_000_020_000).unwrap(),
+                    RuntimeInventoryKeyRing::Unavailable,
+                    vec![ready_running_runtime(desired)],
+                    Vec::new(),
+                ),
+            ))
         }
     }
 
@@ -3684,14 +4136,24 @@ mod tests {
     }
 
     impl RuntimePreScanAdmission for TestPreScanAdmission {
-        fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+        fn reconcile(
+            &self,
+            context: RuntimePreScanAdmissionContext,
+        ) -> anyhow::Result<RuntimePreScanAdmissionOutcome> {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 !self.fail.load(Ordering::SeqCst),
                 "injected admission failure"
             );
-            Ok(())
+            Ok(RuntimePreScanAdmissionOutcome::retained_running_cats(
+                context
+                    .coordinates()
+                    .desired
+                    .desired_specs
+                    .iter()
+                    .map(|desired| desired.cat_id.clone()),
+            ))
         }
 
         fn fail_close_all(&self) {
@@ -3700,12 +4162,15 @@ mod tests {
     }
 
     impl RuntimePreScanAdmission for OrderedPreScanAdmission {
-        fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+        fn reconcile(
+            &self,
+            context: RuntimePreScanAdmissionContext,
+        ) -> anyhow::Result<RuntimePreScanAdmissionOutcome> {
             context.check_active()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.cell_open.store(false, Ordering::SeqCst);
             self.order.lock().unwrap().push("admission");
-            Ok(())
+            Ok(RuntimePreScanAdmissionOutcome::default())
         }
 
         fn fail_close_all(&self) {
@@ -3927,7 +4392,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            AdmissionWait::Finished(Ok(()))
+            AdmissionWait::Finished(Ok(_))
         ));
         assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
         assert_eq!(owner.polls.load(Ordering::SeqCst), 0);
@@ -4239,6 +4704,94 @@ mod tests {
         desired.cat_id = Id::new(cat_id).unwrap();
         desired.spec_digest = spec_digest(&desired).unwrap();
         desired
+    }
+
+    fn ready_running_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
+        let incarnation = RandomId128::new("51515151515151515151515151515151").unwrap();
+        let step = ReconcileStep::Stable {
+            state: StableState::Running,
+        };
+        let mut runtime_launch = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap()
+        .runtime_launch;
+        let RuntimeLaunch::Present(identity) = &mut runtime_launch else {
+            panic!("fixed StartRuntime checkpoint retains launch identity")
+        };
+        identity.runtime_incarnation = incarnation.clone();
+        identity.scope_id = Id::new(format!("cats-vmm-{}.service", incarnation.as_str())).unwrap();
+        ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: RuntimeTarget::Running,
+            }),
+            runtime_incarnation: Some(incarnation.clone()),
+            stable_state: Some(StableState::Running),
+            step: step.clone(),
+            checkpoint: CheckpointEvidence::Valid {
+                checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat_01.json").unwrap(),
+                content_digest: Sha256Digest::from_bytes([0x51; 32]),
+                version: ContractVersion::V1,
+                cat_id: desired.cat_id.clone(),
+                node_id: desired.placement.node_id.clone(),
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement_epoch: desired.placement.placement_epoch,
+                runtime_incarnation: Some(incarnation.clone()),
+                runtime_launch: Box::new(runtime_launch),
+                stable_state: Some(StableState::Running),
+                step: Box::new(step),
+                require_idle: Box::new(
+                    cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+                ),
+                updated_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
+            },
+            processes: vec![ProcessEvidence {
+                role: ProcessRole::Vmm {
+                    runtime_incarnation: incarnation.clone(),
+                },
+                process_id: 101,
+                process_start_time_ticks: WireU64::new(1).unwrap(),
+                executable_path: HostPath::new("/usr/bin/cloud-hypervisor").unwrap(),
+                scope_id: Id::new(format!("cats-vmm-{}.service", incarnation.as_str())).unwrap(),
+                control_socket_path: HostPath::new("/run/cats/cat_01/vmm.sock").unwrap(),
+                state: ProcessState::Running,
+                ownership_token: OwnershipTokenEvidence::Valid {
+                    ownership_token: RandomId128::new("52525252525252525252525252525252").unwrap(),
+                },
+                control_handshake: ControlHandshakeEvidence::Verified,
+                observed_vm_shape: Some(ObservedVmShape {
+                    vcpus: desired.runtime.vcpus,
+                    memory_bytes: desired.runtime.memory_bytes,
+                    boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                    guest_config_digest: desired.runtime.guest_config_digest.clone(),
+                }),
+            }],
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::VsockReady {
+                runtime_incarnation: incarnation,
+                guest_cid: 3,
+                guest_port: 5000,
+                guest_agent_protocol_version: ContractVersion::V1,
+                guest_boot_id: GuestBootId::new("53535353535353535353535353535353").unwrap(),
+            },
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Open,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: vec![Condition::Ready {
+                reason: ReadyReason::PostconditionSatisfied {
+                    target: RuntimeTarget::Running,
+                },
+            }],
+        }
     }
 
     fn effect_admission_for(desired: &DesiredRuntimeSpec) -> RuntimeDesiredEffectAdmission {
@@ -5258,6 +5811,514 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_running_probe_failure_reports_partial_degraded_without_teardown() {
+        let desired = desired_with_network();
+        let registered = decode_agent_session(SESSION).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let mut predecessor =
+            RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+        assert!(matches!(
+            predecessor.desired_work().unwrap(),
+            RuntimeSpineDesiredWork::Request(_)
+        ));
+        let mut initial_snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        initial_snapshot.desired_specs = vec![desired.clone()];
+        let initial_snapshot_bytes = encode_desired_read_snapshot(&initial_snapshot).unwrap();
+        predecessor
+            .accept_desired(initial_snapshot.clone(), &initial_snapshot_bytes)
+            .unwrap();
+        let initial_full = build_full_observation(
+            predecessor.full_scan().unwrap(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                vec![ready_running_runtime(&desired)],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        predecessor
+            .prepare_observation(initial_full.clone())
+            .unwrap();
+        let initial_accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+        let initial_attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: initial_full.node_id.clone(),
+            agent_session_epoch: initial_full.agent_session_epoch,
+            inventory_epoch: initial_full.inventory_epoch,
+            inventory_digest: initial_full.inventory_digest.clone().unwrap(),
+            inventory_read_position: initial_full.inventory_read_position.unwrap(),
+            accepted_at_unix_ms: initial_accepted_at,
+        };
+        let initial_acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: initial_full.node_id.clone(),
+                node_boot_id: initial_full.node_boot_id.clone(),
+                agent_instance_id: initial_full.agent_instance_id.clone(),
+                agent_session_epoch: initial_full.agent_session_epoch,
+            },
+            observation_id: initial_full.observation_id.clone(),
+            heartbeat_sequence: initial_full.heartbeat_sequence,
+            accepted_at_unix_ms: initial_accepted_at,
+            lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+            inventory: ObservationInventoryAcceptance::Full {
+                attestation: initial_attestation.clone(),
+            },
+        };
+        predecessor
+            .accept_observation(
+                initial_acceptance.clone(),
+                &encode_observation_acceptance(&initial_acceptance).unwrap(),
+            )
+            .unwrap();
+        drop(predecessor);
+
+        let observed = Arc::new(Mutex::new(Vec::<NodeObservation>::new()));
+        let serving_observed = Arc::clone(&observed);
+        let serving_desired = desired.clone();
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(move |request: Request<Body>| {
+                    let desired = serving_desired.clone();
+                    async move {
+                        let body =
+                            to_bytes(request.into_body(), DESIRED_READ_REQUEST_MAX_WIRE_BYTES)
+                                .await
+                                .unwrap();
+                        let request = decode_desired_read_request(&body).unwrap();
+                        let sequence = request.request_sequence.get();
+                        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+                        snapshot.session = request.session;
+                        snapshot.request_sequence = request.request_sequence;
+                        snapshot.read_position = Sequence::new(11 + sequence).unwrap();
+                        snapshot.issued_at_unix_ms =
+                            UnixMillis::new(1_720_000_010_000 + sequence).unwrap();
+                        snapshot.expires_at_unix_ms =
+                            UnixMillis::new(1_720_000_040_000 + sequence).unwrap();
+                        snapshot.desired_specs = vec![desired];
+                        wire_response(
+                            StatusCode::OK,
+                            encode_desired_read_snapshot(&snapshot).unwrap(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(move |request: Request<Body>| {
+                    let observed = Arc::clone(&serving_observed);
+                    async move {
+                        let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                            .await
+                            .unwrap();
+                        let observation = decode_node_observation(&body).unwrap();
+                        observed.lock().unwrap().push(observation.clone());
+                        let accepted_at = UnixMillis::new(
+                            1_720_000_100_000 + observation.heartbeat_sequence.get(),
+                        )
+                        .unwrap();
+                        let inventory = if observation.complete_inventory {
+                            ObservationInventoryAcceptance::Full {
+                                attestation: AdmissionInventoryAttestation {
+                                    version: ContractVersion::V1,
+                                    node_id: observation.node_id.clone(),
+                                    agent_session_epoch: observation.agent_session_epoch,
+                                    inventory_epoch: observation.inventory_epoch,
+                                    inventory_digest: observation.inventory_digest.clone().unwrap(),
+                                    inventory_read_position: observation
+                                        .inventory_read_position
+                                        .unwrap(),
+                                    accepted_at_unix_ms: accepted_at,
+                                },
+                            }
+                        } else {
+                            ObservationInventoryAcceptance::Partial {
+                                inventory_epoch: observation.inventory_epoch,
+                            }
+                        };
+                        let acceptance = ObservationAcceptance {
+                            version: ContractVersion::V1,
+                            session: SessionBinding {
+                                node_id: observation.node_id.clone(),
+                                node_boot_id: observation.node_boot_id.clone(),
+                                agent_instance_id: observation.agent_instance_id.clone(),
+                                agent_session_epoch: observation.agent_session_epoch,
+                            },
+                            observation_id: observation.observation_id,
+                            heartbeat_sequence: observation.heartbeat_sequence,
+                            accepted_at_unix_ms: accepted_at,
+                            lease_deadline_unix_ms: UnixMillis::new(1_720_000_200_000).unwrap(),
+                            inventory,
+                        };
+                        wire_response(
+                            StatusCode::OK,
+                            encode_observation_acceptance(&acceptance).unwrap(),
+                        )
+                    }
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let scanner = Arc::new(TransientRunningProbeScanner {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_inner(
+            state,
+            registered,
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            scanner.clone(),
+            Some(effect.clone()),
+            Some(admission.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        let degraded = runner
+            .run_once_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(matches!(
+            degraded,
+            RuntimeSpineRunStep::PartialObservationAccepted {
+                degraded_runtimes: 1
+            }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 0);
+
+        let observations = observed.lock().unwrap().clone();
+        assert_eq!(observations.len(), 1);
+        let partial = &observations[0];
+        assert!(!partial.complete_inventory);
+        assert_eq!(partial.inventory_epoch, initial_attestation.inventory_epoch);
+        assert_eq!(partial.inventory_digest, None);
+        assert_eq!(partial.inventory_read_position, None);
+        let runtime = partial
+            .runtimes
+            .first()
+            .expect("Running Cat partial status");
+        assert_eq!(runtime.processes, initial_full.runtimes[0].processes);
+        assert_eq!(runtime.lifecycle_admission, LifecycleAdmission::Open);
+        let [Condition::Ready {
+            reason:
+                ReadyReason::PostconditionSatisfied {
+                    target: RuntimeTarget::Running,
+                },
+        }, Condition::Degraded {
+            reason:
+                DegradedReason::SourceUnavailable {
+                    sources,
+                    since_unix_ms,
+                },
+        }] = runtime.conditions.as_slice()
+        else {
+            panic!("Running Cat did not retain Ready alongside source-specific Degraded")
+        };
+        assert_eq!(sources, &[DegradedSource::Process]);
+        let first_degraded_since = *since_unix_ms;
+        drop(observations);
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::PartialObservationAccepted {
+                degraded_runtimes: 1
+            }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 0);
+        {
+            let observations = observed.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert!(!observations[1].complete_inventory);
+            assert_eq!(
+                observations[1].inventory_epoch,
+                initial_attestation.inventory_epoch
+            );
+            assert!(matches!(
+                observations[1].runtimes[0].conditions.as_slice(),
+                [
+                    Condition::Ready { .. },
+                    Condition::Degraded {
+                        reason: DegradedReason::SourceUnavailable { since_unix_ms, .. }
+                    }
+                ] if *since_unix_ms == first_degraded_since
+            ));
+        }
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: true
+            }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 0);
+        {
+            let observations = observed.lock().unwrap();
+            assert_eq!(observations.len(), 3);
+            assert!(observations[2].complete_inventory);
+            assert_eq!(observations[2].inventory_epoch.get(), 2);
+            assert!(observations[2].runtimes[0]
+                .conditions
+                .iter()
+                .all(|condition| !matches!(condition, Condition::Degraded { .. })));
+        }
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_running_scan_deadline_reports_attestation_degraded_then_recovers() {
+        let desired = desired_with_network();
+        let registered = decode_agent_session(SESSION).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let mut predecessor =
+            RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+        predecessor.desired_work().unwrap();
+        let mut initial_snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        initial_snapshot.desired_specs = vec![desired.clone()];
+        let snapshot_bytes = encode_desired_read_snapshot(&initial_snapshot).unwrap();
+        predecessor
+            .accept_desired(initial_snapshot.clone(), &snapshot_bytes)
+            .unwrap();
+        let initial_full = build_full_observation(
+            predecessor.full_scan().unwrap(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                vec![ready_running_runtime(&desired)],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        predecessor
+            .prepare_observation(initial_full.clone())
+            .unwrap();
+        let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+        let full_acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: initial_snapshot.session.clone(),
+            observation_id: initial_full.observation_id.clone(),
+            heartbeat_sequence: initial_full.heartbeat_sequence,
+            accepted_at_unix_ms: accepted_at,
+            lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+            inventory: ObservationInventoryAcceptance::Full {
+                attestation: AdmissionInventoryAttestation {
+                    version: ContractVersion::V1,
+                    node_id: initial_full.node_id.clone(),
+                    agent_session_epoch: initial_full.agent_session_epoch,
+                    inventory_epoch: initial_full.inventory_epoch,
+                    inventory_digest: initial_full.inventory_digest.clone().unwrap(),
+                    inventory_read_position: initial_full.inventory_read_position.unwrap(),
+                    accepted_at_unix_ms: accepted_at,
+                },
+            },
+        };
+        predecessor
+            .accept_observation(
+                full_acceptance.clone(),
+                &encode_observation_acceptance(&full_acceptance).unwrap(),
+            )
+            .unwrap();
+        drop(predecessor);
+
+        let observed = Arc::new(Mutex::new(Vec::<NodeObservation>::new()));
+        let serving_observed = Arc::clone(&observed);
+        let serving_desired = desired.clone();
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(move |request: Request<Body>| {
+                    let desired = serving_desired.clone();
+                    async move {
+                        let body =
+                            to_bytes(request.into_body(), DESIRED_READ_REQUEST_MAX_WIRE_BYTES)
+                                .await
+                                .unwrap();
+                        let request = decode_desired_read_request(&body).unwrap();
+                        let sequence = request.request_sequence.get();
+                        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+                        snapshot.session = request.session;
+                        snapshot.request_sequence = request.request_sequence;
+                        snapshot.read_position = Sequence::new(11 + sequence).unwrap();
+                        snapshot.issued_at_unix_ms =
+                            UnixMillis::new(1_720_000_010_000 + sequence).unwrap();
+                        snapshot.expires_at_unix_ms =
+                            UnixMillis::new(1_720_000_040_000 + sequence).unwrap();
+                        snapshot.desired_specs = vec![desired];
+                        wire_response(
+                            StatusCode::OK,
+                            encode_desired_read_snapshot(&snapshot).unwrap(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(move |request: Request<Body>| {
+                    let observed = Arc::clone(&serving_observed);
+                    async move {
+                        let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                            .await
+                            .unwrap();
+                        let observation = decode_node_observation(&body).unwrap();
+                        observed.lock().unwrap().push(observation.clone());
+                        let accepted_at = UnixMillis::new(
+                            1_720_000_100_000 + observation.heartbeat_sequence.get(),
+                        )
+                        .unwrap();
+                        let inventory = if observation.complete_inventory {
+                            ObservationInventoryAcceptance::Full {
+                                attestation: AdmissionInventoryAttestation {
+                                    version: ContractVersion::V1,
+                                    node_id: observation.node_id.clone(),
+                                    agent_session_epoch: observation.agent_session_epoch,
+                                    inventory_epoch: observation.inventory_epoch,
+                                    inventory_digest: observation.inventory_digest.clone().unwrap(),
+                                    inventory_read_position: observation
+                                        .inventory_read_position
+                                        .unwrap(),
+                                    accepted_at_unix_ms: accepted_at,
+                                },
+                            }
+                        } else {
+                            ObservationInventoryAcceptance::Partial {
+                                inventory_epoch: observation.inventory_epoch,
+                            }
+                        };
+                        let acceptance = ObservationAcceptance {
+                            version: ContractVersion::V1,
+                            session: SessionBinding {
+                                node_id: observation.node_id.clone(),
+                                node_boot_id: observation.node_boot_id.clone(),
+                                agent_instance_id: observation.agent_instance_id.clone(),
+                                agent_session_epoch: observation.agent_session_epoch,
+                            },
+                            observation_id: observation.observation_id,
+                            heartbeat_sequence: observation.heartbeat_sequence,
+                            accepted_at_unix_ms: accepted_at,
+                            lease_deadline_unix_ms: UnixMillis::new(1_720_000_200_000).unwrap(),
+                            inventory,
+                        };
+                        wire_response(
+                            StatusCode::OK,
+                            encode_observation_acceptance(&acceptance).unwrap(),
+                        )
+                    }
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let scanner = Arc::new(DelayedTransientRunningProbeScanner {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(100),
+        });
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let mut runner = RuntimeSpineRunner::new_inner(
+            state,
+            registered,
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            scanner.clone(),
+            Some(effect.clone()),
+            Some(admission.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::PartialObservationAccepted {
+                degraded_runtimes: 1
+            }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 0);
+        {
+            let observations = observed.lock().unwrap();
+            assert!(matches!(
+                observations[0].runtimes[0].conditions.as_slice(),
+                [
+                    Condition::Ready { .. },
+                    Condition::Degraded {
+                        reason: DegradedReason::AttestationRefreshFailed {
+                            inventory_epoch,
+                            ..
+                        }
+                    }
+                ] if *inventory_epoch == initial_full.inventory_epoch
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ObservationAccepted {
+                service_ready: true
+            }
+        ));
+        assert_eq!(scanner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 0);
+        {
+            let observations = observed.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert!(observations[1].complete_inventory);
+            assert!(observations[1].runtimes[0]
+                .conditions
+                .iter()
+                .all(|condition| !matches!(condition, Condition::Degraded { .. })));
+        }
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn explicit_scanner_error_fail_closes_successful_pre_scan_admission() {
         let snapshot = snapshot_with_network();
         let app = Router::new().route(
@@ -6025,10 +7086,16 @@ mod tests {
         );
         assert!(matches!(
             runner
-                .run_once_until(Instant::now() + Duration::from_secs(5))
-                .await,
-            Err(RuntimeSpineRunError::ScanLanePoisoned)
+                .run_once_until(Instant::now() + Duration::from_millis(50))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::ScanDeadlineExceeded
         ));
+        assert_eq!(
+            scanner.calls.load(Ordering::SeqCst),
+            1,
+            "a timed-out scanner must not overlap a second physical scan"
+        );
 
         let mut shutdown = Box::pin(runner.shutdown());
         assert!(matches!(

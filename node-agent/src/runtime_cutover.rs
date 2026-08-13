@@ -705,6 +705,16 @@ fn apply_readiness_policy(
             readiness.set(service_ready);
             Ok(RuntimeLoopAction::Continue)
         }
+        RuntimeSpineRunStep::PartialObservationAccepted { .. } => {
+            // This result is only produced in the same process after the
+            // mandatory pre-scan proved those Running gates safe to retain.
+            // It may preserve readiness established by a full attestation,
+            // but cannot establish readiness itself: full service admission
+            // also depends on there being no unsettled physical effects. A
+            // predecessor's durable partial request remains
+            // ObservationReplayed and likewise cannot restore readiness.
+            Ok(RuntimeLoopAction::Continue)
+        }
         RuntimeSpineRunStep::ObservationReplayed
         | RuntimeSpineRunStep::PreScanRecovered { .. }
         | RuntimeSpineRunStep::EffectApplied { .. }
@@ -2389,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_nonempty_full_acceptance_opens_readiness() {
+    fn full_observation_acceptance_controls_readiness() {
         let readiness = Readiness::closed();
         assert_eq!(
             apply_readiness_policy(
@@ -2407,6 +2417,35 @@ mod tests {
             apply_readiness_policy(
                 RuntimeSpineRunStep::ObservationAccepted {
                     service_ready: true,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn same_process_retained_partial_acceptance_preserves_readiness() {
+        let readiness = Readiness::closed();
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::PartialObservationAccepted {
+                    degraded_runtimes: 1,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(!readiness.is_ready());
+
+        readiness.set(true);
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::PartialObservationAccepted {
+                    degraded_runtimes: 0,
                 },
                 &readiness,
             )

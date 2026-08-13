@@ -3208,6 +3208,59 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .unwrap(),
     );
 
+    let full_attestation: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT attestation::text FROM runtime_admission_inventory_states WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    let full_inventory_epoch = full.inventory_epoch;
+    let mut partial_runtime = route_ready_runtime(&desired);
+    partial_runtime.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Process],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let partial = observation(
+        &store,
+        &session,
+        2,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![partial_runtime],
+    );
+    let partial_acceptance = accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
+    assert_eq!(
+        partial_acceptance.inventory,
+        ObservationInventoryAcceptance::Partial {
+            inventory_epoch: full_inventory_epoch,
+        }
+    );
+    let attestation_after_partial: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT attestation::text FROM runtime_admission_inventory_states WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(
+        attestation_after_partial, full_attestation,
+        "partial Degraded heartbeat must not replace the full inventory attestation",
+    );
+
     let snapshot = match store
         .load_route_grant_v2_authority(
             &hostname,
