@@ -580,6 +580,15 @@ impl VmmProcessExpectation {
 
     #[cfg(test)]
     pub(crate) fn exact_evidence_for_test(&self, process_id: u32) -> VmmProcessEvidence {
+        self.exact_evidence_with_state_for_test(process_id, ProcessState::Running)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_evidence_with_state_for_test(
+        &self,
+        process_id: u32,
+        state: ProcessState,
+    ) -> VmmProcessEvidence {
         VmmProcessEvidence {
             process_id,
             unit_main_process_id: process_id,
@@ -595,7 +604,7 @@ impl VmmProcessExpectation {
             vsock_socket_path: self.vsock_socket_path().clone(),
             process_identity_token: self.launch.process_identity_token.clone(),
             runtime_incarnation: self.launch.runtime_incarnation.clone(),
-            state: ProcessState::Running,
+            state,
             api_peer_process_id: process_id,
             fixed_descriptors_exact: true,
             api_socket_exact: true,

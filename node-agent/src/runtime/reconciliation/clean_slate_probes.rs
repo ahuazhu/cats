@@ -7695,12 +7695,13 @@ mod tests {
         AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
         DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
         DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
-        Generation, GuestBootId, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, MountAccess, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence, PersistentFilesystemBinding,
-        PersistentInitializationReceipt, PrepareDeviceFrontend, PreparedDeviceInput, RandomId128,
-        ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
-        RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
+        Generation, GuestBootId, GuestDeviceIdentity, GuestTransportEvidence, HostPath, Id,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, MountAccess, NetworkConfig,
+        NodeBootId, NodeObservation, NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence,
+        PersistentFilesystemBinding, PersistentInitializationReceipt, PrepareDeviceFrontend,
+        PreparedDeviceInput, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision,
+        RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
+        RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
         RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
         SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
         VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
@@ -7727,8 +7728,9 @@ mod tests {
         ProvisionHeadRead, SignedRunningPublicationRecovery,
     };
     use super::super::{
-        runtime_checkpoint_path, AuthorizedBlockdStore, FileCheckpointStore,
-        NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkScanAdmission, StoredCheckpoint,
+        runtime_checkpoint_path, AdmissionCell, AdmissionSnapshot, AuthorizedBlockdStore,
+        FileCheckpointStore, NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkScanAdmission,
+        StoredCheckpoint,
     };
     #[cfg(target_os = "linux")]
     use super::super::{ManagedVmmLaunchFilePaths, VmmSocketOwnershipReceiptV1};
@@ -9192,7 +9194,7 @@ mod tests {
         state_directory: StateDirectory,
         systemd: RootProvisionSystemdConfig,
         executable_path: HostPath,
-        exact_vmms: bool,
+        exact_vmm_state: Option<ProcessState>,
     }
 
     impl root_process_inventory_bridge_sealed::Sealed for ExactRunningProcessBridge {}
@@ -9247,7 +9249,7 @@ mod tests {
                     ))
                 })
                 .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-            let vmm_exact = if self.exact_vmms {
+            let vmm_exact = if let Some(state) = self.exact_vmm_state {
                 vmm_expected
                     .iter()
                     .enumerate()
@@ -9259,7 +9261,7 @@ mod tests {
                         Ok((
                             cat_id.clone(),
                             expectation.clone().prove_exact_process(
-                                expectation.exact_evidence_for_test(process_id),
+                                expectation.exact_evidence_with_state_for_test(process_id, state),
                             )?,
                         ))
                     })
@@ -14219,7 +14221,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: true,
+            exact_vmm_state: Some(ProcessState::Running),
         });
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
@@ -14259,6 +14261,59 @@ mod tests {
         let tail = inventory
             .take_running_tail_admission()
             .expect("exact scan must retain a private Running-tail admission");
+
+        let paused_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let paused_cell = AdmissionCell::new(
+            AdmissionSnapshot::from_checkpoint(start_stored.checkpoint()).unwrap(),
+        )
+        .unwrap();
+        paused_registry
+            .insert_cell_for_machine_test(desired.cat_id.clone(), paused_cell)
+            .unwrap();
+        let paused_guest_calls = Arc::new(AtomicUsize::new(0));
+        let paused_bridge = Arc::new(ExactRunningProcessBridge {
+            state_directory: state_directory.clone(),
+            systemd: test_root_provision_systemd(&environment.blockd_binary),
+            executable_path: HostPath::new(
+                environment.blockd_binary.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+            exact_vmm_state: Some(ProcessState::Paused),
+        });
+        let paused_scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(paused_bridge)
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+            .with_running_tail_transport_for_test(
+                paused_registry,
+                Arc::new(ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&paused_guest_calls),
+                    fault: RunningGuestReadyFault::Exact,
+                }),
+            );
+        let RuntimeInventoryScanOutcome::Complete(mut paused_inventory) = paused_scanner
+            .scan_complete(fixture.scan_context.clone())
+            .unwrap()
+        else {
+            panic!("a Paused VMM must remain a complete fail-closed observation")
+        };
+        drop(paused_scanner);
+        assert_eq!(
+            paused_guest_calls.load(Ordering::SeqCst),
+            0,
+            "Paused VMM must be rejected before a successful Guest-ready response can mint Ready"
+        );
+        assert!(matches!(
+            paused_inventory.runtimes()[0].guest_transport,
+            GuestTransportEvidence::Unavailable
+        ));
+        let paused_tail = paused_inventory
+            .take_running_tail_admission()
+            .expect("Paused VMM with an existing cell must mint close-only authority");
+        assert!(!paused_tail.has_ready_for_test(&desired.cat_id));
+        assert_eq!(
+            paused_tail.route_retirement_mode_for_test(&desired.cat_id),
+            Some(super::super::RouteRetirementMode::GlobalPhysicalNegative)
+        );
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
             observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
@@ -14291,7 +14346,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: false,
+            exact_vmm_state: None,
         });
         let absent_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let absent_scanner = full_root_scanner(&fixture, [])
@@ -14747,7 +14802,7 @@ mod tests {
         let records = Arc::new(Mutex::new(records));
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
-        let build_scanner = |fault, exact_vmms| {
+        let build_scanner = |fault, exact_vmms: bool| {
             let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
                 records: records.lock().unwrap().clone(),
             });
@@ -14758,7 +14813,7 @@ mod tests {
                     environment.blockd_binary.to_string_lossy().into_owned(),
                 )
                 .unwrap(),
-                exact_vmms,
+                exact_vmm_state: exact_vmms.then_some(ProcessState::Running),
             });
             let mut config = environment.config();
             if let Some(client) = &kernel_nbd_client {
@@ -15421,7 +15476,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: true,
+            exact_vmm_state: Some(ProcessState::Running),
         });
         let mut config = environment.config();
         if let Some(client) = &kernel_nbd_client {

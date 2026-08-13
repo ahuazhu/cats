@@ -159,6 +159,19 @@ impl RunningTailScanAdmission {
         self.ready.is_empty() && self.retiring.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn route_retirement_mode_for_test(
+        &self,
+        cat_id: &Id,
+    ) -> Option<RouteRetirementMode> {
+        self.retiring.get(cat_id).map(|entry| entry.mode)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ready_for_test(&self, cat_id: &Id) -> bool {
+        self.ready.contains_key(cat_id)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the scanner seals one closed physical/checkpoint/cell authority tuple"
