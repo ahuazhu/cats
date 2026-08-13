@@ -40,14 +40,12 @@ use super::product::{
     CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
     CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
     DesiredMutationCommit, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
-    EndpointRecord, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
-    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
-    PersistentDiskInitialization, RuntimeOperationRead,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use super::product_reads::{ProductPageRead, ProductRead};
 use super::product_rows::{
-    insert_cat, insert_disk, insert_endpoint, insert_hostname_lookup, insert_operation,
-    load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
+    insert_cat, insert_disk, load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
     operation_by_workspace_candidates_sql,
 };
 use super::rows::{
