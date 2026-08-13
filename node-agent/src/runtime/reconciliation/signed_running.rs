@@ -151,10 +151,17 @@ pub(crate) trait SignedLifecycleVolumePort: Send + Sync + 'static {
         accepted: &NormalAcquireAcceptedContext,
         deadline: Instant,
     ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError>;
+
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, super::VolumeEvidenceClientError>;
 }
 
 struct SignedLifecycleVolumeAdapter {
     inner: Arc<dyn SignedNormalAcquirePort>,
+    evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
 }
 
 impl SignedLifecycleVolumePort for SignedLifecycleVolumeAdapter {
@@ -187,6 +194,17 @@ impl SignedLifecycleVolumePort for SignedLifecycleVolumeAdapter {
             accepted,
             deadline,
         )
+    }
+
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, super::VolumeEvidenceClientError> {
+        let Some(evidence) = &self.evidence else {
+            return Ok(VolumeEvidenceRecovery::AuthorizationEvidenceUnavailable);
+        };
+        evidence.recover_authorization(request, deadline)
     }
 }
 
@@ -875,6 +893,7 @@ impl SignedRunningAcquireEffect {
     pub(crate) fn lifecycle_volume_port(&self) -> Arc<dyn SignedLifecycleVolumePort> {
         Arc::new(SignedLifecycleVolumeAdapter {
             inner: Arc::clone(&self.volume_transition),
+            evidence: self.volume_evidence.clone(),
         })
     }
 
