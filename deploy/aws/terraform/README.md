@@ -151,7 +151,7 @@ subscription replacement.
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
-export TF_VAR_route_v2_node_artifact_secret_arn='arn:aws:secretsmanager:us-east-1:123456789012:secret:cats-route-v2-node-r1-...'
+export TF_VAR_route_v2_node_artifact_secret_arn='arn:aws:secretsmanager:us-east-1:123456789012:secret:cats-production-route-v2-node-r1-ABC123'
 export TF_VAR_route_v2_node_artifact_secret_version_id='EXACT_32_TO_64_CHARACTER_VERSION_ID'
 cd deploy/aws/terraform/stacks/production-infrastructure
 cp backend.hcl.example backend.hcl

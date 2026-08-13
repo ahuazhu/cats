@@ -198,11 +198,15 @@ variable "route_v2_node_artifact_secret_arn" {
     condition = (
       var.route_v2_node_artifact_secret_arn == "" ||
       (
-        can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:", var.route_v2_node_artifact_secret_arn)) &&
-        strcontains(var.route_v2_node_artifact_secret_arn, "-r1-")
+        startswith(
+          var.route_v2_node_artifact_secret_arn,
+          "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:cats-${var.environment}-route-v2-node-r1-",
+        ) &&
+        length(var.route_v2_node_artifact_secret_arn) == length("arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:cats-${var.environment}-route-v2-node-r1-") + 6 &&
+        can(regex("[A-Za-z0-9]{6}$", var.route_v2_node_artifact_secret_arn))
       )
     )
-    error_message = "route_v2_node_artifact_secret_arn must be empty or a revision-1 Secrets Manager secret ARN containing -r1-."
+    error_message = "route_v2_node_artifact_secret_arn must be empty or the exact cats-<environment>-route-v2-node-r1 secret ARN in the expected partition, account, and region."
   }
 }
 

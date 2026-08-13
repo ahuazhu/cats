@@ -106,6 +106,9 @@ module "metal_worker_deployment" {
 
   name_prefix                              = "cats"
   environment                              = var.environment
+  expected_account_id                      = var.expected_account_id
+  expected_aws_partition                   = var.expected_aws_partition
+  aws_region                               = var.aws_region
   artifact_bucket_name                     = var.worker_artifact_bucket_name
   worker_bundle_path                       = var.worker_bundle_path
   worker_bundle_sha256                     = var.worker_bundle_sha256
@@ -122,6 +125,11 @@ module "metal_worker_deployment" {
   worker_managed_environment      = var.worker_managed_environment
 
   tags = var.tags
+
+  depends_on = [
+    terraform_data.platform_alert_topic_identity,
+    terraform_data.metal_worker_inputs,
+  ]
 }
 
 # AWS identity for the in-cluster credential refresher (ADR-0029, #77).

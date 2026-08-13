@@ -21,6 +21,9 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
+  EXPECTED_AWS_ACCOUNT_ID: ${{ vars.EXPECTED_AWS_ACCOUNT_ID }}
+  EXPECTED_AWS_PARTITION: ${{ vars.EXPECTED_AWS_PARTITION }}
+  EXPECTED_AWS_REGION: ${{ vars.EXPECTED_AWS_REGION }}
   TF_IN_AUTOMATION: "true"
 
 jobs:
@@ -69,6 +72,30 @@ jobs:
         with:
           ref: ${{ env.RELEASE_SHA }}
 
+      - name: Require reviewed AWS target
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION EXPECTED_AWS_ACCOUNT_ID EXPECTED_AWS_PARTITION EXPECTED_AWS_REGION; do
+            test -n "${!name:-}" || {
+              echo "::error::Missing required repository variable $name"
+              exit 1
+            }
+          done
+
+      - name: Assume production deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify production AWS target
+        run: |
+          python3 deploy/aws/verify-aws-target.py \
+            --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --expected-partition "$EXPECTED_AWS_PARTITION" \
+            --expected-region "$EXPECTED_AWS_REGION"
+
       - name: Build the one Guest payload
         run: |
           set -euo pipefail
@@ -86,12 +113,6 @@ jobs:
           find guest-runtime-release.v1 -type f -exec sha256sum {} + | LC_ALL=C sort
 
       - uses: docker/setup-buildx-action@v3
-
-      - name: Assume production deployment role
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to ECR
         id: ecr
@@ -183,6 +204,9 @@ jobs:
           umask 077
           for name in \
             AWS_REGION \
+            EXPECTED_AWS_ACCOUNT_ID \
+            EXPECTED_AWS_PARTITION \
+            EXPECTED_AWS_REGION \
             TF_STATE_BUCKET \
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
@@ -498,6 +522,9 @@ jobs:
             -var-file="$RUNNER_TEMP/production-secrets.tfvars.json" \
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
+            -var="expected_account_id=$EXPECTED_AWS_ACCOUNT_ID" \
+            -var="expected_aws_partition=$EXPECTED_AWS_PARTITION" \
+            -var="aws_region=$EXPECTED_AWS_REGION" \
             -var="control_plane_image=$IMAGE_REF" \
             -var="gateway_image=$GATEWAY_REF" \
             -var="route_v2_control_artifact_secret_name=$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \

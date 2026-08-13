@@ -1,3 +1,32 @@
+data "aws_partition" "current" {}
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+resource "terraform_data" "aws_target" {
+  input = {
+    account_id = data.aws_caller_identity.current.account_id
+    partition  = data.aws_partition.current.partition
+    region     = data.aws_region.current.region
+  }
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_account_id
+      error_message = "Resolved AWS caller account does not match expected_account_id."
+    }
+
+    precondition {
+      condition     = data.aws_partition.current.partition == var.expected_aws_partition
+      error_message = "Resolved AWS partition does not match expected_aws_partition."
+    }
+
+    precondition {
+      condition     = data.aws_region.current.region == var.aws_region
+      error_message = "Resolved AWS provider region does not match aws_region."
+    }
+  }
+}
+
 module "cats_kubernetes" {
   source = "../../modules/cats-kubernetes"
 
@@ -44,6 +73,8 @@ module "cats_kubernetes" {
   public_subnet_ids               = var.public_subnet_ids
   control_plane_hosts             = var.control_plane_hosts
   endpoint_wildcard_host          = var.endpoint_wildcard_host
+
+  depends_on = [terraform_data.aws_target]
 }
 
 # Public DNS.

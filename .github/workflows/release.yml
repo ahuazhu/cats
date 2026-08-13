@@ -15,9 +15,12 @@ name: Release
 # stored in the repository. The role is created by the platform stack.
 #
 # Required repository variables (Settings -> Secrets and variables -> Actions):
-#   AWS_REGION       e.g. us-east-1
-#   AWS_ROLE_ARN     arn:aws:iam::869621413820:role/cats-github-actions-release
-#   ECR_REPOSITORY   cats/control-plane
+#   AWS_REGION                e.g. us-east-1 (the configure-aws-credentials input)
+#   EXPECTED_AWS_ACCOUNT_ID   exact 12-digit release account
+#   EXPECTED_AWS_PARTITION    e.g. aws
+#   EXPECTED_AWS_REGION       independently reviewed target region
+#   AWS_ROLE_ARN              release role in that exact account/partition
+#   ECR_REPOSITORY            cats/control-plane
 
 on:
   push:
@@ -35,10 +38,46 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EXPECTED_AWS_ACCOUNT_ID: ${{ vars.EXPECTED_AWS_ACCOUNT_ID }}
+  EXPECTED_AWS_PARTITION: ${{ vars.EXPECTED_AWS_PARTITION }}
+  EXPECTED_AWS_REGION: ${{ vars.EXPECTED_AWS_REGION }}
 
 jobs:
+  aws-target:
+    name: Verify release AWS target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require reviewed AWS target
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION EXPECTED_AWS_ACCOUNT_ID EXPECTED_AWS_PARTITION EXPECTED_AWS_REGION; do
+            test -n "${!name:-}" || {
+              echo "::error::Missing required repository variable $name"
+              exit 1
+            }
+          done
+
+      - name: Assume AWS release role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify release AWS target
+        run: |
+          python3 deploy/aws/verify-aws-target.py \
+            --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --expected-partition "$EXPECTED_AWS_PARTITION" \
+            --expected-region "$EXPECTED_AWS_REGION"
+
   guest-runtime-release:
     name: Shared Guest runtime release
+    needs: aws-target
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -67,7 +106,7 @@ jobs:
 
   control-plane-image:
     name: Control-plane image
-    needs: guest-runtime-release
+    needs: [aws-target, guest-runtime-release]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -95,7 +134,15 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reverify release AWS target before registry access
+        if: github.event_name != 'workflow_dispatch' || inputs.push_image
+        run: |
+          python3 deploy/aws/verify-aws-target.py \
+            --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --expected-partition "$EXPECTED_AWS_PARTITION" \
+            --expected-region "$EXPECTED_AWS_REGION"
 
       - name: Log in to ECR
         if: github.event_name != 'workflow_dispatch' || inputs.push_image
@@ -134,6 +181,7 @@ jobs:
 
   gateway-image:
     name: Route v2 Gateway image
+    needs: aws-target
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -153,7 +201,15 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reverify release AWS target before registry access
+        if: github.event_name != 'workflow_dispatch' || inputs.push_image
+        run: |
+          python3 deploy/aws/verify-aws-target.py \
+            --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --expected-partition "$EXPECTED_AWS_PARTITION" \
+            --expected-region "$EXPECTED_AWS_REGION"
 
       - name: Log in to ECR
         if: github.event_name != 'workflow_dispatch' || inputs.push_image
@@ -187,7 +243,7 @@ jobs:
 
   worker-bundle:
     name: Metal worker bundle
-    needs: guest-runtime-release
+    needs: [aws-target, guest-runtime-release]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

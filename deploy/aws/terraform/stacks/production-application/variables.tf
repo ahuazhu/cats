@@ -8,6 +8,37 @@ variable "kubeconfig_context" {
   type        = string
 }
 
+variable "expected_account_id" {
+  description = "Exact AWS account allowed to contain the production application resources."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  description = "Exact AWS partition allowed to contain the production application resources."
+  type        = string
+  default     = "aws"
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
+}
+
 variable "control_plane_image" {
   description = "Immutable ECR cats-controld image with sha256 digest."
   type        = string
@@ -235,6 +266,12 @@ variable "aws_region" {
   description = "Region holding the load balancer and the hosted zone."
   type        = string
   default     = "us-east-1"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
 }
 
 variable "route53_zone_id" {

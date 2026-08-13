@@ -1,5 +1,8 @@
 kubeconfig_path    = "/absolute/path/to/kubeconfig"
 kubeconfig_context = "REPLACE_WITH_PRODUCTION_EKS_CONTEXT"
+expected_account_id    = "REPLACE_WITH_12_DIGIT_PRODUCTION_ACCOUNT_ID"
+expected_aws_partition = "aws"
+aws_region             = "us-east-1"
 
 # Set true only through a reviewed saved plan for Operations and HA §8.
 # This removes public ingress/DNS and scales cats-controld to zero without

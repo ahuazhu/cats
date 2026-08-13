@@ -7,6 +7,47 @@ variable "environment" {
   type = string
 }
 
+variable "expected_account_id" {
+  description = "Exact AWS account containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  description = "Exact AWS partition containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
+}
+
+variable "aws_region" {
+  description = "Exact AWS region containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
+}
+
 variable "artifact_bucket_name" {
   description = "Globally unique bucket for immutable worker deployment bundles and SSM output."
   type        = string
@@ -118,10 +159,14 @@ variable "route_v2_node_artifact_secret_arn" {
 
   validation {
     condition = (
-      can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:", var.route_v2_node_artifact_secret_arn)) &&
-      strcontains(var.route_v2_node_artifact_secret_arn, "-r1-")
+      startswith(
+        var.route_v2_node_artifact_secret_arn,
+        "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-",
+      ) &&
+      length(var.route_v2_node_artifact_secret_arn) == length("arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-") + 6 &&
+      can(regex("[A-Za-z0-9]{6}$", var.route_v2_node_artifact_secret_arn))
     )
-    error_message = "route_v2_node_artifact_secret_arn must be a revision-1 Secrets Manager secret ARN containing -r1-; rotation is outside the initial G2 deployment contract."
+    error_message = "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region; rotation is outside the initial G2 contract."
   }
 }
 
