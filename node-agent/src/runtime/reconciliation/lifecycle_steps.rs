@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
-    DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, NodeResidue,
+    encode_runtime_checkpoint, AuthorizationConsumedReceipt, AuthorizationState,
+    CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion, DesiredRuntimeSpec,
+    GuestTransportEvidence, HostPath, Id, LastVolumeTransition, LifecycleAdmission, NodeResidue,
     ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
     RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
-    RuntimeVolumeTransition, RuntimeVolumeTransitionRequest, SessionBinding, StableState,
-    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeHeadEvidence,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
+    RuntimeVolumeTransitionRequest, SessionBinding, StableState, VolumeAcquire, VolumeAdminState,
+    VolumeAuthorityEvidence, VolumeAuthorization, VolumeDisposition, VolumeHeadEvidence,
     VolumeReleaseReplay, WarmSnapshotEvidence,
 };
 use cats_storage::authority::VolumeDataAuthority;
@@ -30,7 +32,7 @@ use super::signed_running::SignedLifecycleVolumePort;
 use super::{
     recover_lifecycle_release_from_authority, DisposableRootDeleteAttempt, FileCheckpointStore,
     NormalAcquireAcceptedContext, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
-    StoredCheckpoint,
+    StoredCheckpoint, VolumeEvidenceRecovery, VolumeEvidenceRecoveryDecision,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,12 +846,25 @@ impl LifecycleStepEffect {
             }
             VolumeAuthorityEvidence::Deleting {
                 delete_id: observed_delete_id,
-                ..
+                attachment_epoch,
+                head,
             } if observed_delete_id == delete_id => {
-                // The signed authority mutation is complete, but this release
-                // has no descriptor-retained exact-lineage deletion permit.
-                // Re-scan without touching local data.
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                let Some(expected_epoch) = attachment_epoch
+                    .get()
+                    .checked_sub(1)
+                    .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                else {
+                    return Ok(stop_local());
+                };
+                self.recover_disposable_root_deleting(
+                    context,
+                    accepted,
+                    desired,
+                    intent,
+                    authorization_id,
+                    expected_epoch,
+                    head,
+                )
             }
             VolumeAuthorityEvidence::Owned {
                 attachment_id,
@@ -903,9 +918,19 @@ impl LifecycleStepEffect {
                     DisposableRootDeleteAttempt::RetryExact => {
                         RuntimeDesiredEffectOutcome::RetryExact
                     }
-                    DisposableRootDeleteAttempt::RefreshInventory
-                    | DisposableRootDeleteAttempt::Ambiguous => {
+                    DisposableRootDeleteAttempt::RefreshInventory => {
                         RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    DisposableRootDeleteAttempt::Ambiguous => {
+                        return self.recover_disposable_root_deleting(
+                            context,
+                            accepted,
+                            desired,
+                            intent,
+                            authorization_id,
+                            *attachment_epoch,
+                            head,
+                        );
                     }
                     DisposableRootDeleteAttempt::ReplanDesired => {
                         RuntimeDesiredEffectOutcome::ReplanDesired
@@ -932,6 +957,66 @@ impl LifecycleStepEffect {
             }
             _ => Ok(stop_local()),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_disposable_root_deleting(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        intent: &cats_api::runtime_reconciliation::VolumeIntent,
+        authorization_id: &Id,
+        expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+        expected_head: &cats_api::runtime_reconciliation::RemoteHead,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let request = RuntimeVolumeTransitionEvidenceRequest {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: accepted.session().node_id.clone(),
+                node_boot_id: accepted.session().node_boot_id.clone(),
+                agent_instance_id: accepted.session().agent_instance_id.clone(),
+                agent_session_epoch: accepted.session().agent_session_epoch,
+            },
+            authorization_id: authorization_id.clone(),
+        };
+        context.check_active()?;
+        let recovery = self
+            .volume_transition
+            .recover_authorization(&request, context.deadline())
+            .map_err(|error| anyhow::anyhow!("read signed disposable-Root evidence: {error}"))?;
+        Ok(match recovery {
+            VolumeEvidenceRecovery::Validated { evidence, decision }
+                if exact_disposable_deleting_evidence(
+                    &request,
+                    desired,
+                    intent,
+                    authorization_id,
+                    expected_epoch,
+                    expected_head,
+                    &evidence,
+                    &decision,
+                ) =>
+            {
+                // The authority mutation is exact. Local lineage deletion is
+                // still unavailable and remains a zero-I/O refresh.
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            }
+            VolumeEvidenceRecovery::Validated { .. } => stop_local(),
+            VolumeEvidenceRecovery::SessionReplacementRequired => {
+                RuntimeDesiredEffectOutcome::SessionReplacementRequired
+            }
+            VolumeEvidenceRecovery::IdentityRepairRequired => {
+                RuntimeDesiredEffectOutcome::IdentityRepairRequired
+            }
+            VolumeEvidenceRecovery::StopForDeploymentMismatch => RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::DeploymentMismatch,
+            ),
+            VolumeEvidenceRecovery::StopForLocalContract => stop_local(),
+            VolumeEvidenceRecovery::AuthorizationEvidenceUnavailable
+            | VolumeEvidenceRecovery::RetrySameRequest
+            | VolumeEvidenceRecovery::Ambiguous => RuntimeDesiredEffectOutcome::RetryExact,
+        })
     }
 
     fn plan_first(
@@ -1186,6 +1271,89 @@ fn disposable_lineage_is_exact(
             }
     });
     exact.next().is_some() && exact.next().is_none()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_disposable_deleting_evidence(
+    request: &RuntimeVolumeTransitionEvidenceRequest,
+    desired: &DesiredRuntimeSpec,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    authorization_id: &Id,
+    expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    expected_head: &cats_api::runtime_reconciliation::RemoteHead,
+    evidence: &cats_api::runtime_reconciliation::RuntimeVolumeTransitionEvidenceSuccess,
+    decision: &VolumeEvidenceRecoveryDecision,
+) -> bool {
+    let VolumeDisposition::DeleteDisposableRoot { delete_id } = &intent.disposition else {
+        return false;
+    };
+    let (
+        VolumeAuthorization::DisposableRootDelete(authorization),
+        AuthorizationState::Consumed(consumed),
+        VolumeEvidenceRecoveryDecision::AdoptDisposableDeleting(decision_receipt),
+        Some(current),
+    ) = (
+        &evidence.authorization.authorization,
+        &evidence.authorization.state,
+        decision,
+        evidence.current_volume.as_ref(),
+    )
+    else {
+        return false;
+    };
+    let AuthorizationConsumedReceipt::BeginDisposableDelete(receipt) = consumed.as_ref() else {
+        return false;
+    };
+    let Some(resulting_epoch) = expected_epoch
+        .get()
+        .checked_add(1)
+        .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+    else {
+        return false;
+    };
+    evidence.version == request.version
+        && evidence.session == request.session
+        && evidence.authorization_id == request.authorization_id
+        && evidence.authorization_id == *authorization_id
+        && evidence.delete_completion.is_none()
+        && evidence.direct_successor_authorization.is_none()
+        && authorization.authorization_id == *authorization_id
+        && authorization.authorized_node_id == desired.placement.node_id
+        && authorization.delete_id == *delete_id
+        && authorization.disk_id == intent.disk_id
+        && authorization.volume_id == intent.volume_id
+        && authorization.cat_id == desired.cat_id
+        && authorization.desired_revision == desired.desired_revision
+        && authorization.placement_epoch == desired.placement.placement_epoch
+        && authorization.expected_attachment_id == intent.attachment_id
+        && authorization.expected_epoch == expected_epoch
+        && authorization.expected_head == *expected_head
+        && decision_receipt == receipt
+        && receipt.authorization_id == *authorization_id
+        && receipt.volume_id == intent.volume_id
+        && receipt.disk_id == intent.disk_id
+        && receipt.cat_id == desired.cat_id
+        && receipt.delete_id == *delete_id
+        && receipt.prior_attachment_id == intent.attachment_id
+        && receipt.resulting_epoch == resulting_epoch
+        && receipt.resulting_head == *expected_head
+        && current.volume_id == intent.volume_id
+        && current.size_bytes == intent.size_bytes
+        && current.durability == intent.durability
+        && matches!(
+            &current.admin_state,
+            VolumeAdminState::Deleting { delete_id: current_delete } if current_delete == delete_id
+        )
+        && current.lease_owner.is_none()
+        && current.lease_expires_at.is_none()
+        && current.lease_epoch == resulting_epoch
+        && current.head == *expected_head
+        && matches!(
+            &current.last_transition,
+            Some(LastVolumeTransition::BeginDisposableDelete {
+                authorization_id: current_authorization,
+            }) if current_authorization == authorization_id
+        )
 }
 
 #[derive(Debug)]
@@ -2099,8 +2267,13 @@ fn stop_local() -> RuntimeDesiredEffectOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     use cats_api::runtime_reconciliation::{
-        decode_desired_runtime_spec, decode_runtime_checkpoint, ProcessState, RuntimeLaunch,
+        decode_desired_runtime_spec, decode_runtime_checkpoint, AdmissionInventoryAttestation,
+        AgentSession, AppliedDesiredEvidence, DesiredReadSnapshot, NodeObservation, ProcessState,
+        RuntimeLaunch,
     };
     use tempfile::TempDir;
 
@@ -2181,6 +2354,294 @@ mod tests {
             conditions: Vec::new(),
         };
         (desired, checkpoint, runtime)
+    }
+
+    fn disposable_evidence_fixture() -> (
+        DesiredRuntimeSpec,
+        cats_api::runtime_reconciliation::VolumeIntent,
+        RuntimeVolumeTransitionEvidenceRequest,
+        cats_api::runtime_reconciliation::FenceEpoch,
+        cats_api::runtime_reconciliation::RemoteHead,
+        VolumeEvidenceRecovery,
+    ) {
+        let (mut desired, _, runtime) = fixtures(RuntimeTarget::Deleted);
+        let delete_id = Id::new("delete_root_exact").unwrap();
+        desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: delete_id.clone(),
+        };
+        let intent = desired.volumes[0].clone();
+        let authorization_id = Id::new("delete_authorization_exact").unwrap();
+        let (expected_epoch, expected_head) = match &runtime.volumes[0].authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_epoch,
+                head,
+                ..
+            } => (*attachment_epoch, head.clone()),
+            _ => panic!("fixture Root is not Owned"),
+        };
+        let resulting_epoch =
+            cats_api::runtime_reconciliation::FenceEpoch::new(expected_epoch.get() + 1).unwrap();
+        let session = SessionBinding {
+            node_id: desired.placement.node_id.clone(),
+            node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                "11111111111111111111111111111111".to_owned(),
+            )
+            .unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+        };
+        let request = RuntimeVolumeTransitionEvidenceRequest {
+            version: ContractVersion::V1,
+            session: session.clone(),
+            authorization_id: authorization_id.clone(),
+        };
+        let receipt = cats_api::runtime_reconciliation::BeginDisposableDeleteConsumedReceipt {
+            authorization_id: authorization_id.clone(),
+            volume_id: intent.volume_id.clone(),
+            disk_id: intent.disk_id.clone(),
+            cat_id: desired.cat_id.clone(),
+            delete_id: delete_id.clone(),
+            prior_attachment_id: intent.attachment_id.clone(),
+            resulting_epoch,
+            resulting_head: expected_head.clone(),
+            consumed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_000_100)
+                .unwrap(),
+        };
+        let authorization = cats_api::runtime_reconciliation::DisposableRootDeleteAuthorization {
+            authorization_id: authorization_id.clone(),
+            authorized_node_id: desired.placement.node_id.clone(),
+            delete_id: delete_id.clone(),
+            disk_id: intent.disk_id.clone(),
+            volume_id: intent.volume_id.clone(),
+            cat_id: desired.cat_id.clone(),
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            expected_attachment_id: intent.attachment_id.clone(),
+            expected_epoch,
+            expected_head: expected_head.clone(),
+            isolation_basis:
+                cats_api::runtime_reconciliation::DisposableDeleteIsolationBasis::RuntimeStopped {
+                    node_id: desired.placement.node_id.clone(),
+                    agent_session_epoch: session.agent_session_epoch,
+                    runtime_incarnation: RandomId128::new("33333333333333333333333333333333")
+                        .unwrap(),
+                    observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+                },
+            not_after: cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_060_000)
+                .unwrap(),
+        };
+        let current = cats_api::runtime_reconciliation::VolumeRecord {
+            volume_id: intent.volume_id.clone(),
+            size_bytes: intent.size_bytes,
+            durability: intent.durability,
+            admin_state: VolumeAdminState::Deleting {
+                delete_id: delete_id.clone(),
+            },
+            head: expected_head.clone(),
+            lease_owner: None,
+            lease_epoch: resulting_epoch,
+            lease_expires_at: None,
+            last_transition: Some(LastVolumeTransition::BeginDisposableDelete {
+                authorization_id: authorization_id.clone(),
+            }),
+        };
+        let evidence = cats_api::runtime_reconciliation::RuntimeVolumeTransitionEvidenceSuccess {
+            version: ContractVersion::V1,
+            session,
+            authorization_id,
+            authorization: cats_api::runtime_reconciliation::AuthorizationRecord {
+                authorization: VolumeAuthorization::DisposableRootDelete(authorization),
+                state: AuthorizationState::Consumed(Box::new(
+                    AuthorizationConsumedReceipt::BeginDisposableDelete(receipt.clone()),
+                )),
+            },
+            current_volume: Some(current),
+            delete_completion: None,
+            direct_successor_authorization: None,
+        };
+        (
+            desired,
+            intent,
+            request,
+            expected_epoch,
+            expected_head,
+            VolumeEvidenceRecovery::Validated {
+                evidence: Box::new(evidence),
+                decision: Box::new(VolumeEvidenceRecoveryDecision::AdoptDisposableDeleting(
+                    receipt,
+                )),
+            },
+        )
+    }
+
+    struct ScriptedLifecycleVolumePort {
+        recovery: Mutex<Option<VolumeEvidenceRecovery>>,
+        evidence_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+    }
+
+    impl SignedLifecycleVolumePort for ScriptedLifecycleVolumePort {
+        fn release(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &cats_api::runtime_reconciliation::VolumeIntent,
+            _expected_head: &cats_api::runtime_reconciliation::RemoteHead,
+            _accepted: &NormalAcquireAcceptedContext,
+            _deadline: std::time::Instant,
+        ) -> Result<NormalReleaseAttempt, super::super::NormalAcquireClientError> {
+            panic!("Deleting evidence test must not release a Volume")
+        }
+
+        fn delete_disposable_root(
+            &self,
+            _request: &RuntimeVolumeTransitionRequest,
+            _volume: &cats_api::runtime_reconciliation::VolumeIntent,
+            _expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+            _expected_head: &cats_api::runtime_reconciliation::RemoteHead,
+            _accepted: &NormalAcquireAcceptedContext,
+            _deadline: std::time::Instant,
+        ) -> Result<DisposableRootDeleteAttempt, super::super::NormalAcquireClientError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DisposableRootDeleteAttempt::Ambiguous)
+        }
+
+        fn recover_authorization(
+            &self,
+            _request: &RuntimeVolumeTransitionEvidenceRequest,
+            _deadline: std::time::Instant,
+        ) -> Result<VolumeEvidenceRecovery, super::super::VolumeEvidenceClientError> {
+            self.evidence_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.recovery.lock().unwrap().take().unwrap())
+        }
+    }
+
+    struct NeverLifecyclePhysical;
+
+    impl LifecyclePhysicalPort for NeverLifecyclePhysical {
+        fn apply(
+            &self,
+            _context: &RuntimeDesiredEffectContext,
+            _permit: LifecycleEffectPermit<'_>,
+        ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+            panic!("Deleting evidence must not reach a physical adapter")
+        }
+    }
+
+    struct UnavailableVolumeAuthority;
+
+    impl VolumeDataAuthority for UnavailableVolumeAuthority {
+        fn load_volume(
+            &self,
+            _volume_id: &Id,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeRecord> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &cats_storage::authority::RenewLeaseRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::RenewLeaseResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &cats_storage::authority::VolumeHeadCasRequest,
+        ) -> cats_storage::authority::Result<cats_storage::authority::VolumeHeadCasResult> {
+            Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+    }
+
+    fn deleting_effect_context(
+        directory: &TempDir,
+        desired: &DesiredRuntimeSpec,
+        runtime: ObservedRuntimeStatus,
+    ) -> RuntimeDesiredEffectContext {
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: desired.placement.node_id.clone(),
+            immutable_host_id: Id::new("host_exact_delete").unwrap(),
+            node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                "11111111111111111111111111111111".to_owned(),
+            )
+            .unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+            registration_attempt_id: RandomId128::new("55555555555555555555555555555555").unwrap(),
+            guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            lease_deadline_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_120_000,
+            )
+            .unwrap(),
+        };
+        let read_position = cats_api::runtime_reconciliation::Sequence::new(9).unwrap();
+        let mut observation = NodeObservation {
+            version: ContractVersion::V1,
+            observation_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+            node_id: session.node_id.clone(),
+            node_boot_id: session.node_boot_id.clone(),
+            agent_instance_id: session.agent_instance_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            heartbeat_sequence: cats_api::runtime_reconciliation::Sequence::new(8).unwrap(),
+            observed_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_000_000,
+            )
+            .unwrap(),
+            complete_inventory: true,
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(7).unwrap(),
+            inventory_digest: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                [0; 32],
+            )),
+            inventory_read_position: Some(read_position),
+            key_ring_version: None,
+            key_ring_digest: None,
+            loaded_kids: Vec::new(),
+            runtimes: vec![runtime],
+            residue: Vec::new(),
+        };
+        observation.inventory_digest =
+            Some(cats_api::runtime_reconciliation::inventory_digest(&observation).unwrap());
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: observation.inventory_epoch,
+            inventory_digest: observation.inventory_digest.clone().unwrap(),
+            inventory_read_position: read_position,
+            accepted_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_000_100,
+            )
+            .unwrap(),
+        };
+        let snapshot = DesiredReadSnapshot {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: session.node_id.clone(),
+                node_boot_id: session.node_boot_id.clone(),
+                agent_instance_id: session.agent_instance_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+            },
+            request_sequence: read_position,
+            read_position,
+            issued_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_000_000)
+                .unwrap(),
+            expires_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_120_000,
+            )
+            .unwrap(),
+            desired_specs: vec![desired.clone()],
+        };
+        let admission = crate::runtime_spine::RuntimeDesiredEffectAdmission::for_test(
+            session,
+            observation,
+            attestation,
+        )
+        .bind_assigned_cats_for_test(&snapshot);
+        RuntimeDesiredEffectContext::for_test_with_admission(
+            crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            admission,
+        )
     }
 
     #[test]
@@ -2426,6 +2887,167 @@ mod tests {
             successor.step,
             ReconcileStep::DeleteDisposableRoot { .. }
         ));
+    }
+
+    #[test]
+    fn deleting_root_requires_exact_signed_evidence_and_wrong_bundle_changes_no_checkpoint() {
+        for (already_deleting, fault) in [false, true].into_iter().flat_map(|deleting| {
+            [
+                None,
+                Some("cat"),
+                Some("head"),
+                Some("epoch"),
+                Some("decision"),
+            ]
+            .into_iter()
+            .map(move |fault| (deleting, fault))
+        }) {
+            let (desired, intent, request, expected_epoch, expected_head, mut recovery) =
+                disposable_evidence_fixture();
+            if let Some(fault) = fault {
+                let VolumeEvidenceRecovery::Validated { evidence, decision } = &mut recovery else {
+                    unreachable!()
+                };
+                match fault {
+                    "cat" => {
+                        let VolumeAuthorization::DisposableRootDelete(authorization) =
+                            &mut evidence.authorization.authorization
+                        else {
+                            unreachable!()
+                        };
+                        authorization.cat_id = Id::new("cat_wrong").unwrap();
+                    }
+                    "head" => {
+                        evidence.current_volume.as_mut().unwrap().head =
+                            cats_api::runtime_reconciliation::RemoteHead {
+                                generation: cats_api::runtime_reconciliation::Generation::new(0)
+                                    .unwrap(),
+                                root_hash: None,
+                                root_object_id: None,
+                            }
+                    }
+                    "epoch" => {
+                        evidence.current_volume.as_mut().unwrap().lease_epoch = expected_epoch
+                    }
+                    "decision" => **decision = VolumeEvidenceRecoveryDecision::Blocked,
+                    _ => unreachable!(),
+                }
+            }
+            let exact = match &recovery {
+                VolumeEvidenceRecovery::Validated { evidence, decision } => {
+                    exact_disposable_deleting_evidence(
+                        &request,
+                        &desired,
+                        &intent,
+                        &request.authorization_id,
+                        expected_epoch,
+                        &expected_head,
+                        evidence,
+                        decision,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(exact, fault.is_none(), "{fault:?}");
+
+            let (_, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Deleted);
+            checkpoint.desired_revision = desired.desired_revision;
+            checkpoint.spec_digest = desired.spec_digest.clone();
+            checkpoint.stable_state = None;
+            checkpoint.step = ReconcileStep::DeleteDisposableRoot {
+                authorization_id: request.authorization_id.clone(),
+            };
+            checkpoint.processes.clear();
+            checkpoint.networks.clear();
+            checkpoint.mounts.clear();
+            checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+            checkpoint.runtime_incarnation = None;
+            checkpoint.runtime_launch = RuntimeLaunch::Absent;
+            runtime.applied_desired = Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            });
+            runtime.runtime_incarnation = None;
+            runtime.stable_state = None;
+            runtime.step = checkpoint.step.clone();
+            runtime.processes.clear();
+            runtime.networks.clear();
+            runtime.mounts.clear();
+            runtime.guest_transport = GuestTransportEvidence::Unavailable;
+            runtime.volumes[0].authority = if already_deleting {
+                VolumeAuthorityEvidence::Deleting {
+                    delete_id: match &intent.disposition {
+                        VolumeDisposition::DeleteDisposableRoot { delete_id } => delete_id.clone(),
+                        _ => unreachable!(),
+                    },
+                    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(
+                        expected_epoch.get() + 1,
+                    )
+                    .unwrap(),
+                    head: expected_head.clone(),
+                }
+            } else {
+                VolumeAuthorityEvidence::Owned {
+                    attachment_id: intent.attachment_id.clone(),
+                    attachment_epoch: expected_epoch,
+                    head: expected_head.clone(),
+                }
+            };
+            let directory = TempDir::new().unwrap();
+            let checkpoint_directory = directory.path().join(CHECKPOINT_NAMESPACE);
+            let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id).unwrap();
+            let stored = store.create(&checkpoint).unwrap();
+            runtime.checkpoint = CheckpointEvidence::Valid {
+                checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned())
+                    .unwrap(),
+                content_digest: stored.content_digest().clone(),
+                version: checkpoint.version,
+                cat_id: checkpoint.cat_id.clone(),
+                node_id: checkpoint.node_id.clone(),
+                desired_revision: checkpoint.desired_revision,
+                spec_digest: checkpoint.spec_digest.clone(),
+                placement_epoch: checkpoint.placement_epoch,
+                runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+                runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+                stable_state: checkpoint.stable_state,
+                step: Box::new(checkpoint.step.clone()),
+                require_idle: Box::new(checkpoint.require_idle.clone()),
+                updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+            };
+            drop(store);
+            let port = Arc::new(ScriptedLifecycleVolumePort {
+                recovery: Mutex::new(Some(recovery)),
+                evidence_calls: AtomicUsize::new(0),
+                delete_calls: AtomicUsize::new(0),
+            });
+            let effect = LifecycleStepEffect {
+                physical: Arc::new(NeverLifecyclePhysical),
+                volume_transition: Arc::clone(&port) as Arc<dyn SignedLifecycleVolumePort>,
+                volume_authority: Arc::new(UnavailableVolumeAuthority),
+            };
+            let context = deleting_effect_context(&directory, &desired, runtime);
+            let outcome = effect.try_apply(&context, &desired).unwrap().unwrap();
+            assert_eq!(port.evidence_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                port.delete_calls.load(Ordering::SeqCst),
+                usize::from(!already_deleting),
+                "{already_deleting}/{fault:?}"
+            );
+            assert_eq!(
+                outcome,
+                if fault.is_none() {
+                    RuntimeDesiredEffectOutcome::RefreshInventory
+                } else {
+                    stop_local()
+                },
+                "{already_deleting}/{fault:?}"
+            );
+            let reopened =
+                FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id).unwrap();
+            assert_eq!(reopened.load().unwrap().unwrap().checkpoint(), &checkpoint);
+        }
     }
 
     #[test]
