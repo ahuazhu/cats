@@ -811,6 +811,121 @@ pub(super) fn establish_empty_admission_for(
     accept_empty_admission(store, &identity, &authenticated, &policy, &session)
 }
 
+/// Establishes a fresh current session and full admission for whatever
+/// complete Desired set PostgreSQL currently assigns to `identity`.
+/// Product mutation tests use this to model a real plan refresh after each
+/// committed revision instead of forging admission rows.
+pub(super) fn refresh_assigned_admission_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let runtimes = snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            let mut runtime = orphan_runtime(&session, false);
+            runtime.cat_id = desired.cat_id.clone();
+            runtime.applied_desired = Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            });
+            runtime
+        })
+        .collect();
+    let full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        runtimes,
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("assigned admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+pub(super) fn replace_agent_session_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let attempt = registration_attempt(
+        &planned.node_identity,
+        number,
+        Some(planned.agent_session.agent_session_epoch),
+        policy.approved_guest_config_digest(),
+    );
+    registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+}
+
 fn accept_empty_admission(
     store: &Store,
     identity: &NodeIdentity,

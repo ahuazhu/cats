@@ -887,6 +887,63 @@ pub(super) fn insert_desired(
     )?)
 }
 
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn replace_desired(
+    transaction: &mut Transaction<'_>,
+    expected: &DesiredRuntimeSpec,
+    record: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<bool> {
+    let expected_projection = DesiredProjection::from_record(expected)?;
+    let projection = DesiredProjection::from_record(record)?;
+    let json = String::from_utf8(encode_desired_runtime_spec(record).map_err(corrupt)?)
+        .map_err(corrupt)?;
+    let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
+    let expected_revision = expected_projection
+        .desired_revision
+        .to_pg()
+        .map_err(corrupt)?;
+    let expected_placement_epoch = expected_projection
+        .placement_epoch
+        .to_pg()
+        .map_err(corrupt)?;
+    let changed = transaction.execute(
+        "UPDATE desired_runtime_specs SET
+            record=$2::TEXT::jsonb, workspace_id=$3, desired_revision=$4,
+            spec_digest=$5, target=$6, node_id=$7, placement_epoch=$8
+          WHERE cat_id=$1
+            AND workspace_id=$9
+            AND desired_revision=$10
+            AND spec_digest=$11
+            AND node_id=$12
+            AND placement_epoch=$13",
+        &[
+            &projection.cat_id,
+            &json,
+            &projection.workspace_id,
+            &desired_revision,
+            &projection.spec_digest,
+            &projection.target,
+            &projection.node_id,
+            &placement_epoch,
+            &expected_projection.workspace_id,
+            &expected_revision,
+            &expected_projection.spec_digest,
+            &expected_projection.node_id,
+            &expected_placement_epoch,
+        ],
+    )?;
+    if changed > 1 {
+        return Err(corrupt(
+            "Desired CAS update affected more than one current row",
+        ));
+    }
+    Ok(changed == 1)
+}
+
 pub(super) fn load_desired_for_update(
     transaction: &mut Transaction<'_>,
     cat_id: &Id,
@@ -1044,6 +1101,22 @@ pub(super) fn load_hostname_lookups_by_cat_unlocked(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn delete_hostname_lookups_by_cat(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+) -> AuthorityTxResult<u64> {
+    transaction
+        .execute(
+            "DELETE FROM hostname_desired_lookups WHERE cat_id=$1",
+            &[&cat_id.as_str()],
+        )
+        .map_err(AuthorityTransactionError::from)
+}
+
 fn decode_hostname_lookup(row: &Row) -> AuthorityTxResult<HostnameDesiredLookup> {
     let stored = HostnameLookupProjection::from_row(row)?;
     let record: HostnameDesiredLookup = decode_json(row.try_get("record_json")?)?;
@@ -1174,6 +1247,26 @@ pub(super) fn load_operation_by_cat_revision_unlocked(
     let sql = format!(
         "SELECT {OPERATION_COLUMNS} FROM runtime_operations
           WHERE cat_id=$1 AND desired_revision=$2"
+    );
+    let revision = revision.to_pg().map_err(corrupt)?;
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str(), &revision])?
+        .map(|row| decode_operation_row(&row))
+        .transpose()
+}
+
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn load_operation_by_cat_revision_for_update(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+    revision: Revision,
+) -> AuthorityTxResult<Option<Operation>> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          WHERE cat_id=$1 AND desired_revision=$2 FOR UPDATE"
     );
     let revision = revision.to_pg().map_err(corrupt)?;
     transaction

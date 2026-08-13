@@ -17,8 +17,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use cats_api::runtime_reconciliation::{
-    Epoch, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodePlacementPolicy,
-    NodeResidue, Revision, RuntimeSchedulingState, Sha256Digest,
+    DesiredRuntimeSpec, Epoch, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig,
+    NodePlacementPolicy, NodeResidue, Revision, RuntimeSchedulingState, Sha256Digest,
 };
 use cats_storage::authority::{AuthorityError, HostFenceEvent};
 use postgres::Transaction;
@@ -554,6 +554,157 @@ pub(super) fn lock_cat_create_placement_for_desired_mutation(
         | CandidateEvaluation::Rejected(_)
         | CandidateEvaluation::CandidateIdentityCollision => Ok(PlacementCommitLoad::Stale),
     }
+}
+
+/// Revalidates one complete placement snapshot after the caller has already
+/// locked the full old/new NodeIdentity union in canonical Node ID order.
+///
+/// Keeping identity acquisition outside this helper is intentional: a
+/// cross-Node mutation must hold both coordination locks before it reads the
+/// policy/session/inventory/assigned-set suffix of either Node. Re-locking the
+/// already-held identity inside the A20 helper is harmless and keeps one exact
+/// admission comparison shared by create and successor-Desired commits.
+pub(super) fn revalidate_desired_mutation_placement_after_identity_locks(
+    transaction: &mut Transaction<'_>,
+    planned: &PlacementTargetSnapshot,
+    active_guest_digest: &Sha256Digest,
+) -> AuthorityTxResult<PlacementCommitLoad> {
+    if planned.policy.node_id != planned.admission.node_identity.node_id
+        || planned.policy.capabilities.guest_config_digest != *active_guest_digest
+    {
+        return Ok(PlacementCommitLoad::Stale);
+    }
+
+    let Some(current_policy) =
+        load_policy_unlocked(transaction, &planned.admission.node_identity.node_id)?
+    else {
+        return Err(corrupt(
+            "provisioned NodeIdentity lost its placement policy",
+        ));
+    };
+    if current_policy.node_id != planned.admission.node_identity.node_id {
+        return Err(corrupt("placement policy belongs to another Node"));
+    }
+    let current_assigned = load_assigned_desired_unlocked(
+        transaction,
+        &planned.admission.node_identity.node_id,
+        MAX_ASSIGNED_SPECS.saturating_add(1),
+    )?;
+    validate_current_assigned(&current_policy, &current_assigned)?;
+    let current_event =
+        load_active_event_by_node_unlocked(transaction, &planned.admission.node_identity.node_id)?;
+    if current_policy != planned.policy || current_event != planned.active_host_fence_event {
+        return Ok(PlacementCommitLoad::Stale);
+    }
+
+    let mut checkpoint = |_: &mut Transaction<'_>| Ok(());
+    let current_admission = match lock_placement_admission_for_desired_mutation_checked(
+        transaction,
+        &planned.admission,
+        active_guest_digest,
+        &mut checkpoint,
+    )? {
+        PlacementAdmissionLoad::Accepted(admission) => *admission,
+        PlacementAdmissionLoad::Rejected(_) => return Ok(PlacementCommitLoad::Stale),
+    };
+    if current_admission.assigned_desired_specs != current_assigned {
+        return Err(corrupt(
+            "placement admission current Desired set changed under NodeIdentity lock",
+        ));
+    }
+    Ok(PlacementCommitLoad::Accepted)
+}
+
+/// Recomputes the bounded post-mutation assigned maps from the exact snapshots
+/// that were just revalidated under the complete identity lock union. This is
+/// the commit-side capacity and deterministic network probe; callers cannot
+/// turn a valid old snapshot into an oversized shape or an arbitrary target
+/// network merely by constructing a successor Desired.
+pub(super) fn revalidate_desired_mutation_post_assignment(
+    planned: &[PlacementTargetSnapshot],
+    expected_current: &DesiredRuntimeSpec,
+    desired: &DesiredRuntimeSpec,
+    active_guest_digest: &Sha256Digest,
+) -> AuthorityTxResult<PlacementCommitLoad> {
+    if desired.runtime.guest_config_digest != *active_guest_digest {
+        return Ok(PlacementCommitLoad::Stale);
+    }
+    let source_node = &expected_current.placement.node_id;
+    let target_node = &desired.placement.node_id;
+    let source = planned
+        .iter()
+        .find(|snapshot| snapshot.policy.node_id == *source_node)
+        .ok_or_else(|| corrupt("Desired mutation omitted its source placement snapshot"))?;
+    if !source
+        .admission
+        .assigned_desired_specs
+        .iter()
+        .any(|assigned| assigned == expected_current)
+    {
+        return Ok(PlacementCommitLoad::Stale);
+    }
+
+    let placement_changed = source_node != target_node;
+    let runtime_changed = expected_current.runtime != desired.runtime;
+    let target = planned
+        .iter()
+        .find(|snapshot| snapshot.policy.node_id == *target_node)
+        .ok_or_else(|| corrupt("Desired mutation omitted its target placement snapshot"))?;
+    if placement_changed {
+        // This generic A1 boundary covers planned migration/placement retry.
+        // Host takeover requires the later exact event + per-volume
+        // authorization request and cannot be inferred from a merely active
+        // source fence event.
+        if source.active_host_fence_event.is_some() {
+            return Ok(PlacementCommitLoad::Stale);
+        }
+        let current_target =
+            validate_current_assigned(&target.policy, &target.admission.assigned_desired_specs)?;
+        if target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
+            || target.active_host_fence_event.is_some()
+            || !observation_networks_are_clean(&target.admission, &current_target.desired_networks)
+            || allocate_network(
+                &target.policy,
+                &desired.runtime.network_config.network_id,
+                &current_target.occupied_slots,
+            )? != Some(desired.runtime.network_config.clone())
+        {
+            return Ok(PlacementCommitLoad::Stale);
+        }
+    } else if runtime_changed
+        && (target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
+            || target.active_host_fence_event.is_some())
+    {
+        return Ok(PlacementCommitLoad::Stale);
+    }
+
+    for snapshot in planned {
+        let node_id = &snapshot.policy.node_id;
+        let mut post = snapshot.admission.assigned_desired_specs.clone();
+        if node_id == source_node {
+            post.retain(|assigned| assigned.cat_id != expected_current.cat_id);
+        }
+        if node_id == target_node {
+            if post
+                .iter()
+                .any(|assigned| assigned.cat_id == desired.cat_id)
+            {
+                return Ok(PlacementCommitLoad::Stale);
+            }
+            post.push(desired.clone());
+        }
+        let validated = validate_current_assigned(&snapshot.policy, &post)?;
+        let capacity_relevant = node_id == target_node && (placement_changed || runtime_changed);
+        if post.len() > MAX_ASSIGNED_SPECS
+            || (capacity_relevant
+                && (validated.total_vcpus > u128::from(snapshot.policy.allocatable_vcpus.get())
+                    || validated.total_memory
+                        > u128::from(snapshot.policy.allocatable_memory_bytes.get())))
+        {
+            return Ok(PlacementCommitLoad::Stale);
+        }
+    }
+    Ok(PlacementCommitLoad::Accepted)
 }
 
 fn observation_networks_are_clean(

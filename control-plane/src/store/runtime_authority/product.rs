@@ -5,6 +5,8 @@
 //! the atomic PostgreSQL contract land without a second authority or dual
 //! write to the legacy product tables.
 
+use std::collections::BTreeSet;
+
 use cats_api::chunk::MAX_VOLUME_BYTES;
 use cats_api::error::ApiError;
 use cats_api::persistent_disk::{
@@ -14,9 +16,10 @@ use cats_api::persistent_disk::{
 use cats_api::resources::DiskDurability as PublicDiskDurability;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
-    Durability, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, Hostname,
-    HttpProtocol, Id, Operation, OperationPhase, RandomId128, Revision, RuntimeTarget,
-    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
+    Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, Hostname,
+    HttpProtocol, Id, NodeIdentityState, Operation, OperationPhase, OperationTerminal, RandomId128,
+    Revision, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess,
+    VolumeAcquire, VolumeDisposition,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 use postgres::Transaction;
@@ -26,20 +29,24 @@ use sha2::{Digest, Sha256};
 use super::cat_create_service::CatCreatePlacementMutation;
 use super::covered_commit::CoveredCommitState;
 use super::placement_planner::{
-    lock_cat_create_placement_for_desired_mutation, PlacementCommitLoad, PlacementTargetSnapshot,
+    lock_cat_create_placement_for_desired_mutation,
+    revalidate_desired_mutation_placement_after_identity_locks,
+    revalidate_desired_mutation_post_assignment, PlacementCommitLoad, PlacementTargetSnapshot,
 };
 use super::product_rows::{
-    insert_api_result, insert_cat, insert_desired, insert_disk, insert_endpoint,
-    insert_hostname_lookup, insert_operation, load_any_disk_by_filesystem_uuid_for_update,
-    load_any_disk_by_id_for_update, load_any_disk_by_initialization_token_for_update,
-    load_any_disk_by_name_unlocked, load_api_result_for_update, load_cat_by_id_for_update,
-    load_cat_by_name_unlocked, load_desired_by_network_id_unlocked, load_desired_for_update,
-    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
-    load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
-    load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
-    load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_unlocked,
+    delete_hostname_lookups_by_cat, insert_api_result, insert_cat, insert_desired, insert_disk,
+    insert_endpoint, insert_hostname_lookup, insert_operation,
+    load_any_disk_by_filesystem_uuid_for_update, load_any_disk_by_id_for_update,
+    load_any_disk_by_initialization_token_for_update, load_any_disk_by_name_unlocked,
+    load_api_result_for_update, load_cat_by_id_for_update, load_cat_by_name_unlocked,
+    load_desired_by_network_id_unlocked, load_desired_for_update, load_desired_unlocked,
+    load_disk_by_id_for_update, load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
+    load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
+    load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
+    load_operation_by_cat_revision_for_update, load_operation_by_cat_revision_unlocked,
     load_operation_by_workspace_unlocked, load_operation_for_update,
-    load_root_disk_by_cat_unlocked,
+    load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
+    update_operation,
 };
 use super::rows::{
     database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
@@ -48,6 +55,7 @@ use super::runtime_spine::{
     lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
     PlacementAdmissionSnapshot,
 };
+use crate::store::agent_sessions::load_identity_by_node_for_update;
 use crate::store::transaction::{
     AuthorityExecutionError, AuthorityTransactionError, AuthorityTxResult,
 };
@@ -380,6 +388,62 @@ pub(crate) struct CoveredPersistentDiskCreateRequest {
     pub(crate) idempotency: ApiIdempotencyRequest,
     pub(crate) candidate: PersistentDiskCreateCandidate,
     pub(crate) name_conflict: ExactHttpResponse,
+}
+
+/// One complete successor Desired plus every identity that must be locked
+/// before the current Cat row. Placement/capacity planners and domain-specific
+/// volume/route checks run before constructing this closed commit candidate;
+/// this boundary owns the monotonic revision, placement epoch and Operation
+/// publication CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "A1 freezes the Desired commit boundary before A2/G4 production routes consume it"
+)]
+pub(crate) struct CoveredDesiredMutationRequest {
+    pub(crate) idempotency: ApiIdempotencyRequest,
+    pub(crate) expected_current: DesiredRuntimeSpec,
+    pub(crate) desired: DesiredRuntimeSpec,
+    pub(crate) operation_id: Id,
+    pub(crate) placement_snapshots: Vec<PlacementTargetSnapshot>,
+    pub(crate) active_guest_digest: Sha256Digest,
+    pub(crate) endpoint_records: Vec<EndpointRecordCandidate>,
+    pub(crate) accepted: ExactHttpResponse,
+    pub(crate) converged: ExactHttpResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "A1 freezes the Desired commit boundary before A2/G4 production routes consume it"
+)]
+pub(crate) enum DesiredMutationCommit {
+    Replayed(ApiIdempotencyResult),
+    Converged(ApiIdempotencyResult),
+    Changed(ApiIdempotencyResult),
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "A1 freezes the Desired commit boundary before A2/G4 production routes consume it"
+)]
+pub(crate) enum CoveredDesiredMutationError {
+    CandidateCollision(CandidateCollision),
+    Stale,
+    Store(ApiError),
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+enum DesiredMutationTransactionOutcome {
+    Replayed(ApiIdempotencyResult),
+    Converged(ApiIdempotencyResult),
+    Changed(ApiIdempotencyResult),
+    CandidateCollision(CandidateCollision),
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -769,6 +833,224 @@ impl Store {
             }
         }
     }
+
+    /// Commits one covered current-Desired mutation. The transaction begins
+    /// with the exact API replay key, then locks every affected NodeIdentity in
+    /// canonical order before Cat/Desired/Operation. A stale plan is returned
+    /// without an idempotency result so the service can re-read and re-plan.
+    #[allow(
+        dead_code,
+        reason = "A1 freezes the Desired commit boundary before A2/G4 production routes consume it"
+    )]
+    pub(crate) fn commit_desired_mutation_covered(
+        &self,
+        request: &CoveredDesiredMutationRequest,
+    ) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
+        let outcome = self
+            .authority_transaction(|transaction| commit_desired_mutation_in(transaction, request))
+            .map_err(CoveredDesiredMutationError::Store)?;
+        match outcome {
+            DesiredMutationTransactionOutcome::Replayed(result) => {
+                Ok(DesiredMutationCommit::Replayed(result))
+            }
+            DesiredMutationTransactionOutcome::Converged(result) => {
+                Ok(DesiredMutationCommit::Converged(result))
+            }
+            DesiredMutationTransactionOutcome::Changed(result) => {
+                Ok(DesiredMutationCommit::Changed(result))
+            }
+            DesiredMutationTransactionOutcome::CandidateCollision(kind) => {
+                Err(CoveredDesiredMutationError::CandidateCollision(kind))
+            }
+            DesiredMutationTransactionOutcome::Stale => Err(CoveredDesiredMutationError::Stale),
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn commit_desired_mutation_in(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredDesiredMutationRequest,
+) -> AuthorityTxResult<DesiredMutationTransactionOutcome> {
+    reserve_api_key(transaction, &request.idempotency)?;
+    if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)? {
+        let result = check_replay(result, &request.idempotency.request_fingerprint)?;
+        return Ok(DesiredMutationTransactionOutcome::Replayed(result));
+    }
+    validate_desired_mutation_request(request)?;
+
+    // Acquire the complete old/new identity union before reading the policy,
+    // session, inventory, assigned-set or fence suffix of either Node.
+    for planned in &request.placement_snapshots {
+        let expected = &planned.admission.node_identity;
+        let Some(current) = load_identity_by_node_for_update(transaction, &expected.node_id)?
+        else {
+            return Ok(DesiredMutationTransactionOutcome::Stale);
+        };
+        if current.state != NodeIdentityState::Provisioned || current != *expected {
+            return Ok(DesiredMutationTransactionOutcome::Stale);
+        }
+    }
+    for planned in &request.placement_snapshots {
+        if revalidate_desired_mutation_placement_after_identity_locks(
+            transaction,
+            planned,
+            &request.active_guest_digest,
+        )? == PlacementCommitLoad::Stale
+        {
+            return Ok(DesiredMutationTransactionOutcome::Stale);
+        }
+    }
+    if revalidate_desired_mutation_post_assignment(
+        &request.placement_snapshots,
+        &request.expected_current,
+        &request.desired,
+        &request.active_guest_digest,
+    )? == PlacementCommitLoad::Stale
+    {
+        return Ok(DesiredMutationTransactionOutcome::Stale);
+    }
+
+    if request.expected_current.placement.node_id != request.desired.placement.node_id {
+        let network_id = &request.desired.runtime.network_config.network_id;
+        lock_candidate_id(transaction, "network", network_id)?;
+        if load_desired_by_network_id_unlocked(transaction, network_id)?.is_some() {
+            return Ok(DesiredMutationTransactionOutcome::CandidateCollision(
+                CandidateCollision::NetworkId,
+            ));
+        }
+    }
+
+    let Some(cat) = load_cat_by_id_for_update(transaction, &request.expected_current.cat_id)?
+    else {
+        return Err(stored_corruption(
+            "current Desired has no immutable Cat row",
+        ));
+    };
+    if cat.workspace_id != request.expected_current.workspace_id {
+        return Err(stored_corruption(
+            "current Desired belongs to another Workspace",
+        ));
+    }
+    let Some(current) = load_desired_for_update(transaction, &request.expected_current.cat_id)?
+    else {
+        return Ok(DesiredMutationTransactionOutcome::Stale);
+    };
+    if current != request.expected_current {
+        return Ok(DesiredMutationTransactionOutcome::Stale);
+    }
+
+    validate_existing_endpoints(transaction, &cat, &current, None)?;
+    let converged = desired_semantics_equal(&current, &request.desired)?;
+    if let Some(collision) = validate_mutation_endpoint_candidates(transaction, request, converged)?
+    {
+        return Ok(DesiredMutationTransactionOutcome::CandidateCollision(
+            collision,
+        ));
+    }
+
+    // Operation rows are last in the product lock order. Only after the
+    // complete Endpoint/hostname graph is closed may the current Operation be
+    // interpreted or a successor Operation identity be reserved.
+    let Some(mut current_operation) = load_operation_by_cat_revision_for_update(
+        transaction,
+        &current.cat_id,
+        current.desired_revision,
+    )?
+    else {
+        return Err(stored_corruption("current Desired has no exact Operation"));
+    };
+    validate_operation_binding(&current_operation, &current)?;
+    if current_operation.phase == OperationPhase::Superseded {
+        return Err(stored_corruption(
+            "current Desired is bound to an already-superseded Operation",
+        ));
+    }
+    let pending = load_pending_operation_by_cat_for_update(transaction, &current.cat_id)?;
+    match (&pending, current_operation.phase) {
+        (Some(pending), OperationPhase::Pending) if pending == &current_operation => {}
+        (None, OperationPhase::Succeeded | OperationPhase::Failed) => {}
+        _ => {
+            return Err(stored_corruption(
+                "current Desired has an inconsistent Pending Operation set",
+            ));
+        }
+    }
+
+    if converged {
+        let now = database_now(transaction)?;
+        let result = result_from_envelope(&request.idempotency, &request.converged, now);
+        insert_api_result(transaction, &result)?;
+        return Ok(DesiredMutationTransactionOutcome::Converged(result));
+    }
+
+    lock_candidate_id(transaction, "operation", &request.operation_id)?;
+    if load_operation_for_update(transaction, &request.operation_id)?.is_some() {
+        return Ok(DesiredMutationTransactionOutcome::CandidateCollision(
+            CandidateCollision::OperationId,
+        ));
+    }
+    let now = database_now(transaction)?;
+    if current_operation.phase == OperationPhase::Pending {
+        current_operation.phase = OperationPhase::Superseded;
+        current_operation.terminal = Some(OperationTerminal::Superseded {
+            superseded_by_revision: request.desired.desired_revision,
+            superseded_by_operation_id: request.operation_id.clone(),
+            completed_at_unix_ms: now,
+        });
+        current_operation.updated_at_unix_ms = now;
+        update_operation(transaction, &current_operation)?;
+    }
+
+    insert_missing_mutation_endpoint_records(transaction, request, now)?;
+    let old_lookup_count = u64::try_from(current.endpoints.len()).map_err(|_| {
+        stored_corruption("current Desired endpoint count does not fit PostgreSQL row count")
+    })?;
+    if delete_hostname_lookups_by_cat(transaction, &current.cat_id)? != old_lookup_count {
+        return Err(stored_corruption(
+            "current Desired hostname lookup set changed under its Cat lock",
+        ));
+    }
+    if !replace_desired(transaction, &current, &request.desired)? {
+        return Err(stored_corruption(
+            "locked exact current Desired lost its scalar CAS before replacement",
+        ));
+    }
+    for endpoint in &request.desired.endpoints {
+        insert_hostname_lookup(
+            transaction,
+            &HostnameDesiredLookup {
+                hostname: endpoint.hostname.clone(),
+                workspace_id: request.desired.workspace_id.clone(),
+                cat_id: request.desired.cat_id.clone(),
+                endpoint_id: endpoint.endpoint_id.clone(),
+                desired_revision: request.desired.desired_revision,
+            },
+        )?;
+    }
+    insert_operation(
+        transaction,
+        &Operation {
+            version: ContractVersion::V1,
+            operation_id: request.operation_id.clone(),
+            workspace_id: request.desired.workspace_id.clone(),
+            cat_id: request.desired.cat_id.clone(),
+            desired_revision: request.desired.desired_revision,
+            desired_spec_digest: request.desired.spec_digest.clone(),
+            placement: request.desired.placement.clone(),
+            target: request.desired.target,
+            phase: OperationPhase::Pending,
+            terminal: None,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+        },
+    )?;
+    let result = result_from_envelope(&request.idempotency, &request.accepted, now);
+    insert_api_result(transaction, &result)?;
+    Ok(DesiredMutationTransactionOutcome::Changed(result))
 }
 
 fn create_persistent_disk_in(
@@ -1426,6 +1708,7 @@ fn validate_existing_endpoints(
         ));
     }
 
+    let mut endpoints = Vec::with_capacity(desired.endpoints.len());
     for (binding, peeked_lookup) in desired.endpoints.iter().zip(&lookups) {
         if peeked_lookup.endpoint_id != binding.endpoint_id {
             return Err(stored_corruption(
@@ -1442,9 +1725,23 @@ fn validate_existing_endpoints(
                 "current Desired Endpoint product identity is invalid",
             ));
         }
+        lock_candidate_endpoint_name(transaction, &endpoint.cat_id, &endpoint.name)?;
+        endpoints.push(endpoint);
+    }
 
+    let mut hostnames = lookups
+        .iter()
+        .map(|lookup| lookup.hostname.clone())
+        .collect::<Vec<_>>();
+    hostnames.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for hostname in &hostnames {
         checkpoint_cat_create(transaction, commit_state)?;
-        lock_candidate_hostname(transaction, &peeked_lookup.hostname)?;
+        lock_candidate_hostname(transaction, hostname)?;
+    }
+
+    for ((binding, peeked_lookup), endpoint) in
+        desired.endpoints.iter().zip(&lookups).zip(&endpoints)
+    {
         checkpoint_cat_create(transaction, commit_state)?;
         let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
             .ok_or_else(|| stored_corruption("current Desired hostname lookup disappeared"))?;
@@ -1456,6 +1753,329 @@ fn validate_existing_endpoints(
         validate_endpoint_lookup(&endpoint, &lookup, desired)?;
     }
     Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn validate_desired_mutation_request(request: &CoveredDesiredMutationRequest) -> Result<()> {
+    if request.idempotency.authenticated_workspace_id != request.expected_current.workspace_id
+        || request.desired.workspace_id != request.expected_current.workspace_id
+        || request.desired.cat_id != request.expected_current.cat_id
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "Workspace or Cat binding changed",
+        ));
+    }
+    encode_desired_runtime_spec(&request.expected_current).map_err(|error| {
+        invalid_desired_mutation_bundle(format!("invalid current CAS: {error}"))
+    })?;
+    encode_desired_runtime_spec(&request.desired).map_err(|error| {
+        invalid_desired_mutation_bundle(format!("invalid successor Desired: {error}"))
+    })?;
+    let next_revision = request
+        .expected_current
+        .desired_revision
+        .get()
+        .checked_add(1)
+        .and_then(Revision::new)
+        .ok_or_else(|| invalid_desired_mutation_bundle("Desired revision is exhausted"))?;
+    if request.desired.desired_revision != next_revision {
+        return Err(invalid_desired_mutation_bundle(
+            "successor Desired is not exact current revision plus one",
+        ));
+    }
+
+    let old_placement = &request.expected_current.placement;
+    let new_placement = &request.desired.placement;
+    if old_placement.node_id == new_placement.node_id {
+        if old_placement.placement_epoch != new_placement.placement_epoch
+            || request.expected_current.runtime.network_config
+                != request.desired.runtime.network_config
+        {
+            return Err(invalid_desired_mutation_bundle(
+                "same-Node mutation changed placement epoch or Guest network",
+            ));
+        }
+    } else {
+        let next_epoch = old_placement
+            .placement_epoch
+            .get()
+            .checked_add(1)
+            .and_then(Epoch::new)
+            .ok_or_else(|| invalid_desired_mutation_bundle("placement epoch is exhausted"))?;
+        if new_placement.placement_epoch != next_epoch
+            || request.expected_current.runtime.network_config.network_id
+                == request.desired.runtime.network_config.network_id
+        {
+            return Err(invalid_desired_mutation_bundle(
+                "cross-Node placement lacks exact epoch bump and fresh network identity",
+            ));
+        }
+    }
+    // A1 does not yet carry the exact VolumeRecord/Disk authority snapshots
+    // required by the global lock DAG. Keep every volume mutation closed until
+    // the A2/A3 covered request extends this same transaction with those locks
+    // and validations; accepting a caller-authored intent here would create a
+    // second attachment/ownership authority.
+    if request.desired.volumes != request.expected_current.volumes {
+        return Err(invalid_desired_mutation_bundle(
+            "volume intent changes require covered VolumeRecord and Disk authority",
+        ));
+    }
+
+    let expected_nodes =
+        BTreeSet::from([old_placement.node_id.clone(), new_placement.node_id.clone()]);
+    let supplied_nodes = request
+        .placement_snapshots
+        .iter()
+        .map(|snapshot| snapshot.admission.node_identity.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    if expected_nodes != supplied_nodes
+        || request.placement_snapshots.len() != supplied_nodes.len()
+        || request.placement_snapshots.windows(2).any(|pair| {
+            pair[0].admission.node_identity.node_id >= pair[1].admission.node_identity.node_id
+        })
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "placement snapshot set is not the exact canonical placement union",
+        ));
+    }
+    if request.placement_snapshots.iter().any(|snapshot| {
+        snapshot.admission.node_identity.state != NodeIdentityState::Provisioned
+            || snapshot.policy.node_id != snapshot.admission.node_identity.node_id
+            || snapshot.policy.capabilities.guest_config_digest != request.active_guest_digest
+    }) {
+        return Err(invalid_desired_mutation_bundle(
+            "placement snapshot is not provisioned or active-release bound",
+        ));
+    }
+
+    if request.endpoint_records.len() != request.desired.endpoints.len()
+        || request
+            .endpoint_records
+            .windows(2)
+            .any(|pair| pair[0].endpoint_id >= pair[1].endpoint_id)
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "Endpoint product candidates are not the complete canonical Desired set",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (intent, record) in request
+        .desired
+        .endpoints
+        .iter()
+        .zip(&request.endpoint_records)
+    {
+        if record.endpoint_id != intent.endpoint_id
+            || record.workspace_id != request.desired.workspace_id
+            || record.cat_id != request.desired.cat_id
+            || !names.insert(record.name.clone())
+        {
+            return Err(invalid_desired_mutation_bundle(
+                "Endpoint product candidate does not match the complete Desired set",
+            ));
+        }
+    }
+    validate_desired_mutation_accepted_response(
+        &request.accepted,
+        request.desired.desired_revision,
+        &request.operation_id,
+    )?;
+    if !(200..=299).contains(&request.converged.http_status)
+        || request.converged.content_type != Some(ExactContentType::ApplicationJson)
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "converged response must be a JSON success",
+        ));
+    }
+    let converged: serde_json::Value = serde_json::from_slice(&request.converged.response_body)
+        .map_err(|_| invalid_desired_mutation_bundle("converged response body is not JSON"))?;
+    if converged
+        .get("desired_revision")
+        .and_then(serde_json::Value::as_u64)
+        != Some(request.expected_current.desired_revision.get())
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "converged response does not bind the unchanged current revision",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn validate_desired_mutation_accepted_response(
+    response: &ExactHttpResponse,
+    revision: Revision,
+    operation_id: &Id,
+) -> Result<()> {
+    if response.http_status != 202
+        || response.content_type != Some(ExactContentType::ApplicationJson)
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "changed response must be 202 application/json",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&response.response_body)
+        .map_err(|_| invalid_desired_mutation_bundle("changed response body is not JSON"))?;
+    if value
+        .get("desired_revision")
+        .and_then(serde_json::Value::as_u64)
+        != Some(revision.get())
+        || value
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id.as_str())
+    {
+        return Err(invalid_desired_mutation_bundle(
+            "changed response does not bind its revision and Operation",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn validate_operation_binding(
+    operation: &Operation,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<()> {
+    if operation.workspace_id != desired.workspace_id
+        || operation.cat_id != desired.cat_id
+        || operation.desired_revision != desired.desired_revision
+        || operation.desired_spec_digest != desired.spec_digest
+        || operation.placement != desired.placement
+        || operation.target != desired.target
+    {
+        return Err(stored_corruption(
+            "current Operation is not bound to the current Desired",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn desired_semantics_equal(
+    current: &DesiredRuntimeSpec,
+    candidate: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<bool> {
+    let mut normalized = candidate.clone();
+    normalized.desired_revision = current.desired_revision;
+    normalized.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    normalized.spec_digest = cats_api::runtime_reconciliation::spec_digest(&normalized)
+        .map_err(stored_corruption_from_debug)?;
+    Ok(&normalized == current)
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn validate_mutation_endpoint_candidates(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredDesiredMutationRequest,
+    require_existing: bool,
+) -> AuthorityTxResult<Option<CandidateCollision>> {
+    for candidate in &request.endpoint_records {
+        lock_candidate_id(transaction, "endpoint", &candidate.endpoint_id)?;
+        lock_candidate_endpoint_name(transaction, &candidate.cat_id, &candidate.name)?;
+    }
+    let mut hostnames = request
+        .desired
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.hostname.clone())
+        .collect::<Vec<_>>();
+    hostnames.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for hostname in &hostnames {
+        lock_candidate_hostname(transaction, hostname)?;
+    }
+
+    for (intent, candidate) in request
+        .desired
+        .endpoints
+        .iter()
+        .zip(&request.endpoint_records)
+    {
+        match load_endpoint_by_id_for_update(transaction, &candidate.endpoint_id)? {
+            Some(existing)
+                if existing.endpoint_id == candidate.endpoint_id
+                    && existing.workspace_id == candidate.workspace_id
+                    && existing.cat_id == candidate.cat_id
+                    && existing.name == candidate.name => {}
+            Some(_) => {
+                return Ok(Some(CandidateCollision::EndpointIdOrName));
+            }
+            None if require_existing => {
+                return Err(stored_corruption(
+                    "unchanged Desired Endpoint lost its product record",
+                ));
+            }
+            None => {}
+        }
+        if load_endpoint_by_cat_name_unlocked(transaction, &candidate.cat_id, &candidate.name)?
+            .is_some_and(|existing| existing.endpoint_id != candidate.endpoint_id)
+        {
+            return Ok(Some(CandidateCollision::EndpointIdOrName));
+        }
+
+        if let Some(existing) = load_hostname_lookup_for_update(transaction, &intent.hostname)? {
+            let current_exact_owner = request.expected_current.endpoints.iter().any(|current| {
+                current.endpoint_id == existing.endpoint_id
+                    && current.hostname == existing.hostname
+                    && existing.workspace_id == request.expected_current.workspace_id
+                    && existing.cat_id == request.expected_current.cat_id
+            });
+            if !current_exact_owner || existing.endpoint_id != intent.endpoint_id {
+                return Ok(Some(CandidateCollision::Hostname));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn insert_missing_mutation_endpoint_records(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredDesiredMutationRequest,
+    now: UnixMillis,
+) -> AuthorityTxResult<()> {
+    for candidate in &request.endpoint_records {
+        if load_endpoint_by_id_for_update(transaction, &candidate.endpoint_id)?.is_none() {
+            insert_endpoint(
+                transaction,
+                &EndpointRecord {
+                    endpoint_id: candidate.endpoint_id.clone(),
+                    workspace_id: candidate.workspace_id.clone(),
+                    cat_id: candidate.cat_id.clone(),
+                    name: candidate.name.clone(),
+                    created_at: now,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn stored_corruption_from_debug(_error: impl std::fmt::Debug) -> AuthorityTransactionError {
+    stored_corruption("runtime authority candidate failed canonical validation")
 }
 
 fn validate_candidate(request: &CoveredCatCreateRequest) -> Result<()> {
@@ -1781,6 +2401,17 @@ fn invalid_bundle(message: impl Into<String>) -> ApiError {
 fn invalid_persistent_disk_bundle(message: impl Into<String>) -> ApiError {
     ApiError::internal(format!(
         "covered PersistentDisk create candidate is inconsistent: {}",
+        message.into()
+    ))
+}
+
+#[allow(
+    dead_code,
+    reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
+)]
+fn invalid_desired_mutation_bundle(message: impl Into<String>) -> ApiError {
+    ApiError::internal(format!(
+        "covered Desired mutation candidate is inconsistent: {}",
         message.into()
     ))
 }
