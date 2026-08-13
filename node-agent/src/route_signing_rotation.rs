@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
 use cats_api::route_grant_v2::{
@@ -106,9 +108,11 @@ const PUBLICATION_OWNED: u8 = 2;
 pub struct RouteGrantV2RingInstaller {
     verifier: Arc<RouteGrantV2Verifier>,
     filesystem: RingFilesystem,
-    serialized: Mutex<()>,
+    serialized: Arc<Mutex<()>>,
     #[cfg(test)]
     crash_after_rename: AtomicBool,
+    #[cfg(test)]
+    pre_publication_gate: Mutex<Option<Arc<PrePublicationGate>>>,
 }
 
 impl std::fmt::Debug for RouteGrantV2RingInstaller {
@@ -122,13 +126,18 @@ impl std::fmt::Debug for RouteGrantV2RingInstaller {
 }
 
 impl RouteGrantV2RingInstaller {
-    pub(crate) fn for_production(verifier: Arc<RouteGrantV2Verifier>) -> Self {
+    pub(crate) fn for_production(
+        verifier: Arc<RouteGrantV2Verifier>,
+        serialized: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             verifier,
             filesystem: RingFilesystem::production(),
-            serialized: Mutex::new(()),
+            serialized,
             #[cfg(test)]
             crash_after_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            pre_publication_gate: Mutex::new(None),
         }
     }
 
@@ -147,7 +156,9 @@ impl RouteGrantV2RingInstaller {
             .map_err(|_| RouteGrantV2DurableInstallError::VerifierDiverged)?;
         context.check_active()?;
 
-        let opened = self.filesystem.open()?;
+        let mut opened = self.filesystem.open()?;
+        let _directory_lock = opened.lock_final_directory()?;
+        context.check_active()?;
         let current_file = opened.read_current()?;
         let current = decode_route_grant_v2_public_key_ring(&current_file.exact_bytes)
             .map_err(|_| RouteGrantV2DurableInstallError::InstalledRingUnavailable)?;
@@ -187,6 +198,8 @@ impl RouteGrantV2RingInstaller {
         }
 
         context.check_active()?;
+        #[cfg(test)]
+        self.wait_at_pre_publication_gate();
         opened.publish(&current_file, &candidate, candidate_bytes, context)?;
         #[cfg(test)]
         if self.crash_after_rename.swap(false, Ordering::AcqRel) {
@@ -200,6 +213,15 @@ impl RouteGrantV2RingInstaller {
 
     #[cfg(test)]
     fn for_test(root: &Path, verifier: Arc<RouteGrantV2Verifier>) -> Self {
+        Self::for_test_with_serialized(root, verifier, Arc::new(Mutex::new(())))
+    }
+
+    #[cfg(test)]
+    fn for_test_with_serialized(
+        root: &Path,
+        verifier: Arc<RouteGrantV2Verifier>,
+        serialized: Arc<Mutex<()>>,
+    ) -> Self {
         // SAFETY: geteuid/getegid have no pointer arguments or failure mode.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Self {
@@ -209,14 +231,33 @@ impl RouteGrantV2RingInstaller {
                 components: vec!["route-v2".to_owned()],
                 owner: Owner { uid, gid },
             },
-            serialized: Mutex::new(()),
+            serialized,
             crash_after_rename: AtomicBool::new(false),
+            pre_publication_gate: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     fn inject_crash_after_rename_once(&self) {
         self.crash_after_rename.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn set_pre_publication_gate(&self, gate: Arc<PrePublicationGate>) {
+        *self.pre_publication_gate.lock().unwrap() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn wait_at_pre_publication_gate(&self) {
+        let gate = self.pre_publication_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_process_lock_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.serialized, &other.serialized)
     }
 }
 
@@ -333,6 +374,27 @@ impl OpenedRingDirectory {
             .last()
             .expect("the retained path always contains its root")
             .descriptor
+    }
+
+    fn lock_final_directory(&mut self) -> Result<DirectoryFlock, RouteGrantV2DurableInstallError> {
+        let lock = DirectoryFlock::lock_exclusive(self.final_descriptor())?;
+        let refreshed =
+            StableMetadata::from_metadata(&self.final_descriptor().metadata().map_err(fs_error)?);
+        if !refreshed.safe_directory(self.owner, true)
+            || !refreshed.same_directory_identity(
+                self.retained
+                    .last()
+                    .expect("the retained path always contains its root")
+                    .metadata,
+            )
+        {
+            return Err(RouteGrantV2DurableInstallError::Filesystem);
+        }
+        self.retained
+            .last_mut()
+            .expect("the retained path always contains its root")
+            .metadata = refreshed;
+        Ok(lock)
     }
 
     fn reopen(
@@ -491,6 +553,36 @@ struct PinnedRingFile {
     descriptor: File,
     metadata: StableMetadata,
     exact_bytes: Vec<u8>,
+}
+
+struct DirectoryFlock {
+    descriptor: i32,
+}
+
+impl DirectoryFlock {
+    fn lock_exclusive(descriptor: &File) -> Result<Self, RouteGrantV2DurableInstallError> {
+        loop {
+            // SAFETY: flock operates only on the live directory descriptor.
+            let result = unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                return Ok(Self {
+                    descriptor: descriptor.as_raw_fd(),
+                });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(RouteGrantV2DurableInstallError::Filesystem);
+            }
+        }
+    }
+}
+
+impl Drop for DirectoryFlock {
+    fn drop(&mut self) {
+        // SAFETY: best-effort unlock of the live descriptor; install already
+        // completed or failed closed if this point is reached.
+        let _ = unsafe { libc::flock(self.descriptor, libc::LOCK_UN) };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,6 +777,45 @@ fn fs_error(_error: io::Error) -> RouteGrantV2DurableInstallError {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct PrePublicationGate {
+    state: Mutex<PrePublicationGateState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PrePublicationGateState {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl PrePublicationGate {
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.reached {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -713,6 +844,17 @@ mod tests {
         RouteGrantV2PublicKeyEntry {
             kid: key.kid().clone(),
             public_key_spki: Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(&spki)).unwrap(),
+        }
+    }
+
+    fn distinct_public_entry(
+        existing: &[RouteGrantV2PublicKeyEntry],
+    ) -> RouteGrantV2PublicKeyEntry {
+        loop {
+            let candidate = public_entry();
+            if existing.iter().all(|entry| entry.kid != candidate.kid) {
+                return candidate;
+            }
         }
     }
 
@@ -1056,5 +1198,85 @@ mod tests {
             verifier.current_ring().unwrap().version(),
             second.ring_version
         );
+    }
+
+    #[test]
+    fn conflicting_successors_from_independent_installers_do_not_split_disk_and_live_ring() {
+        let (first, installed_successor) = rings();
+        let mut conflicting_successor = installed_successor.clone();
+        conflicting_successor.keys[0] = distinct_public_entry(&conflicting_successor.keys[1..]);
+        conflicting_successor
+            .keys
+            .sort_by(|left, right| left.kid.cmp(&right.kid));
+        let installed_bytes = encode_route_grant_v2_public_key_ring(&installed_successor).unwrap();
+        let conflicting_bytes =
+            encode_route_grant_v2_public_key_ring(&conflicting_successor).unwrap();
+        let (root, verifier) = fixture(&first);
+        let gate = Arc::new(PrePublicationGate::default());
+        let first_installer = Arc::new(RouteGrantV2RingInstaller::for_test(
+            root.path(),
+            Arc::clone(&verifier),
+        ));
+        first_installer.set_pre_publication_gate(Arc::clone(&gate));
+        let second_installer = Arc::new(RouteGrantV2RingInstaller::for_test(
+            root.path(),
+            Arc::clone(&verifier),
+        ));
+
+        let installed_thread = {
+            let installer = Arc::clone(&first_installer);
+            let bytes = installed_bytes.clone();
+            std::thread::spawn(move || {
+                installer.install(&bytes, &RouteGrantV2RingInstallContext::default())
+            })
+        };
+        gate.wait_until_reached();
+        let conflicting_thread = {
+            let installer = Arc::clone(&second_installer);
+            std::thread::spawn(move || {
+                installer.install(
+                    &conflicting_bytes,
+                    &RouteGrantV2RingInstallContext::default(),
+                )
+            })
+        };
+        gate.release();
+
+        assert_eq!(
+            installed_thread.join().unwrap().unwrap(),
+            RouteGrantV2DurableInstallOutcome::Installed
+        );
+        let conflicting_result = conflicting_thread.join().unwrap();
+        assert!(
+            matches!(
+                conflicting_result,
+                Err(RouteGrantV2DurableInstallError::Conflict)
+            ),
+            "unexpected conflicting successor result: {conflicting_result:?}"
+        );
+        let on_disk = std::fs::read(root.path().join("route-v2").join(RING_BASENAME)).unwrap();
+        assert_eq!(on_disk, installed_bytes);
+        let live = verifier.current_ring().unwrap();
+        let installed_ring = RouteGrantV2KeyRing::from_artifact(&installed_successor).unwrap();
+        assert!(same_ring(live.as_ref(), &installed_ring));
+    }
+
+    #[test]
+    fn directory_flock_serializes_independent_opens() {
+        let (first, _) = rings();
+        let (root, verifier) = fixture(&first);
+        let installer = RouteGrantV2RingInstaller::for_test(root.path(), verifier);
+        let mut first_open = installer.filesystem.open().unwrap();
+        let second_open = installer.filesystem.open().unwrap();
+        let _lock = first_open.lock_final_directory().unwrap();
+        // SAFETY: the descriptor stays live for this non-blocking probe.
+        let result = unsafe {
+            libc::flock(
+                second_open.final_descriptor().as_raw_fd(),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
     }
 }

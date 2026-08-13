@@ -63,6 +63,7 @@ pub struct RouteV2MachineConfig {
     local_node_id: Id,
     tls: Arc<ServerConfig>,
     verifier: Arc<RouteGrantV2Verifier>,
+    ring_install_serialized: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for RouteV2MachineConfig {
@@ -89,6 +90,7 @@ impl RouteV2MachineConfig {
             local_node_id,
             tls,
             verifier: Arc::new(RouteGrantV2Verifier::new(ring)),
+            ring_install_serialized: Arc::new(Mutex::new(())),
         })
     }
 
@@ -99,7 +101,10 @@ impl RouteV2MachineConfig {
     /// Construct the fixed-path successor installer over the exact verifier
     /// used by this listener and by full-inventory ACK observation.
     pub fn ring_installer(&self) -> RouteGrantV2RingInstaller {
-        RouteGrantV2RingInstaller::for_production(Arc::clone(&self.verifier))
+        RouteGrantV2RingInstaller::for_production(
+            Arc::clone(&self.verifier),
+            Arc::clone(&self.ring_install_serialized),
+        )
     }
 
     #[cfg(test)]
@@ -120,6 +125,7 @@ impl RouteV2MachineConfig {
                 server_private_key_pem,
             )?,
             verifier,
+            ring_install_serialized: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -984,6 +990,25 @@ mod tests {
         RouteV2MachineListener::spawn(config, registry)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn ring_installers_from_one_config_share_one_process_lock() {
+        let keys = keys();
+        let ring =
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![keys.public.clone()]).unwrap();
+        let config = RouteV2MachineConfig::for_test(
+            "127.0.0.1:0".to_owned(),
+            Id::new("node-a").unwrap(),
+            CA_CERTIFICATE,
+            SERVER_CERTIFICATE,
+            SERVER_PRIVATE_KEY,
+            Arc::new(RouteGrantV2Verifier::new(ring)),
+        )
+        .unwrap();
+        let first = config.ring_installer();
+        let second = config.ring_installer();
+        assert!(first.shares_process_lock_with(&second));
     }
 
     fn client_tls(client_certificate: &[u8], client_private_key: &[u8]) -> Arc<ClientConfig> {
