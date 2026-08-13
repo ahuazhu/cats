@@ -1,8 +1,8 @@
 # Route v2 Signing Authority v1
 
-- 状态：Frozen target contract；artifact codecs/readers、PG initial/current binding、Control machine
-  resolve current compare、Node installed-ring observation与revision-1初装/部署接线已实现；successor
-  rotation、热加载/ACK rollout及真实production mTLS qualification尚未实现
+- 状态：Frozen target contract；artifact codecs/readers、PG exact lineage/current binding、Control machine
+  resolve current compare、Node durable successor installer及持久rotation/revocation rollout已实现；G3 catalog
+  保留最终authority schema 17，须在E9 schema 15与V3 schema 16之后集成，当前独立分支不改变release stamp
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -93,9 +93,8 @@ atomic rename到fixed path并fsync parent，最后才原子swap进程内整环�
 `ring_version`、`key_ring_digest`和sorted `loaded_kids`。production scanner 现已从固定路径每轮只读一次，
 把artifact构造成完整in-process verifier replacement后投影该exact observation；artifact缺席只投影
 unavailable，存在但partial/corrupt/unsafe/读取不稳定时
-整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。revision-1 installer复用同一
-Rust decoder、closed four-file reader和Node rustls composition，只允许absent初装或exact replay；上述
-successor temp-file/rename、进程内swap与ACK仍属于尚未实现的rotation合同。
+整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。successor installer使用同一
+cancellation/publication CAS；只有fixed file完成temp fsync、rename、parent fsync且in-process verifier原子swap后才返回ACK。
 
 ## 4. Control signer descriptor
 
@@ -142,7 +141,8 @@ exact bytes SHA-256 是
 以`deployment_id + signer_revision + expected_previous`做exact CAS并永久保存每个revision/digest、
 secret-reference/kid lineage；same exact revision replay零写，same revision不同bytes、gap、stale、曾retire
 的reference/kid复用全部fail startup。当前initial-install slice只接受revision 1/null previous或其exact
-零写replay；即使本地artifact是合法successor也不会自动推进PG current。successor/rotation writer仍未实现。
+零写replay；即使本地artifact是合法successor也不会自动推进PG current。后续revision只由typed rotation/
+revocation command在singleton lock内推进；caller不能提供ACK布尔值、private bytes或时间。
 
 每次resolve的单一PG signer snapshot最终还必须比较进程内`deployment_id/signer_revision/reference digest/
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
@@ -198,6 +198,6 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | signer pair | active kid在exact ring；private->SPKI->kid exact；mismatch/wrong algorithm/malformed PEM不构造signer；disabled不读private |
 | separation | A19/A23/V1 keys、shared bearer、header identity均不能构造descriptor、signer或ring ACK |
 | persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
-| rotation（future） | overlap ACK -> switch -> 305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK |
-| revocation（future） | disable先于新签发停止；reachable close/drain、unreachable fence；fresh全量ACK后才resume；existing stream不因删key被伪装终止 |
-| deploy（revision 1 implemented；rotation future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file；Node初装只接受schema-order canonical fixed vector、closed four-file TLS transaction及exact replay |
+| rotation | overlap ACK -> switch -> strict >305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK；并发replica exact replay |
+| revocation | persisted disable先于新签发停止；reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK后才activate；只发nonsecret deletion receipt |
+| deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |

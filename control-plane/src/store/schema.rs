@@ -710,6 +710,13 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_signing_authority",
     "route_v2_signer_revisions",
     "route_v2_signer_key_lineage",
+    // G3 reserves these rotation objects for final authority schema 17. This
+    // isolated branch deliberately leaves the shared release stamp untouched;
+    // formal integration must land E9 v15 and V3 v16 first, then stamp v17.
+    "route_v2_public_key_ring_revisions",
+    "route_v2_signer_retirements",
+    "route_v2_secret_deletion_authorizations",
+    "route_v2_signing_authority_commands",
 ];
 
 type RequiredDeferredForeignKey = (
@@ -857,6 +864,126 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
         "route_v2_signer_key_lineage",
         "route_v2_signer_key_lineage_state_time_ck",
         "CHECK ((((state = 'active'::text) AND (retired_at_unix_ms IS NULL)) OR ((state = 'retired'::text) AND (retired_at_unix_ms IS NOT NULL))))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_version_ck",
+        "CHECK ((ring_version > 0))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_digest_ck",
+        "CHECK ((key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_bytes_ck",
+        "CHECK (((octet_length(exact_bytes) >= 1) AND (octet_length(exact_bytes) <= 16384)))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_previous_version_ck",
+        "CHECK ((expected_previous_ring_version > 0))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_previous_digest_ck",
+        "CHECK ((expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_lineage_ck",
+        "CHECK ((((ring_version = 1) AND (expected_previous_ring_version IS NULL) AND (expected_previous_key_ring_digest IS NULL)) OR ((ring_version > 1) AND (expected_previous_ring_version = (ring_version - 1)) AND (expected_previous_key_ring_digest IS NOT NULL))))",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_published_time_ck",
+        "CHECK ((published_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_kid_ck",
+        "CHECK ((kid ~ '^[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_revision_ck",
+        "CHECK ((retirement_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_time_ck",
+        "CHECK ((last_old_issue_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_source_ck",
+        "CHECK ((source = ANY (ARRAY['normal'::text, 'emergency'::text])))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_state_ck",
+        "CHECK ((state = ANY (ARRAY['pending'::text, 'ring_removed'::text, 'retired'::text])))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_removed_version_ck",
+        "CHECK ((ring_removed_version > 0))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_finished_revision_ck",
+        "CHECK ((retired_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_finished_time_ck",
+        "CHECK ((retired_at_unix_ms >= last_old_issue_at_unix_ms))",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_state_projection_ck",
+        "CHECK ((((state = 'pending'::text) AND (ring_removed_version IS NULL) AND (retired_signer_revision IS NULL) AND (retired_at_unix_ms IS NULL)) OR ((state = 'ring_removed'::text) AND (ring_removed_version IS NOT NULL) AND (retired_signer_revision IS NULL) AND (retired_at_unix_ms IS NULL)) OR ((state = 'retired'::text) AND (ring_removed_version IS NOT NULL) AND (retired_signer_revision IS NOT NULL) AND (retired_at_unix_ms IS NOT NULL))))",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_kid_ck",
+        "CHECK ((kid ~ '^[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_revision_ck",
+        "CHECK ((retired_signer_revision > 0))",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_time_ck",
+        "CHECK ((authorized_at_unix_ms >= 0))",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_digest_ck",
+        "CHECK ((request_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_kind_ck",
+        "CHECK ((kind = ANY (ARRAY['publish_overlap'::text, 'switch_active'::text, 'publish_new_only'::text, 'retire'::text, 'disable'::text, 'activate'::text])))",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_revision_ck",
+        "CHECK ((successor_signer_revision > 0))",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_signer_digest_ck",
+        "CHECK ((successor_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_time_ck",
+        "CHECK ((committed_at_unix_ms >= 0))",
     ),
     (
         "route_v2_gateway_identity_authority",
@@ -1008,6 +1135,26 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
         "kid",
     ),
     (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_key_ring_revisions_pkey",
+        "deployment_id,ring_version",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirements_pkey",
+        "deployment_id,kid",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_authorizations_pkey",
+        "authorization_id",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_authority_commands_pkey",
+        "command_id",
+    ),
+    (
         "route_v2_gateway_identity_authority",
         "route_v2_gateway_identity_authority_pkey",
         "singleton",
@@ -1049,6 +1196,15 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
         "r",
     ),
     (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_previous_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,expected_previous_signer_revision,expected_previous_signer_reference_sha256",
+        "deployment_id,signer_revision,signer_reference_sha256",
+        "r",
+        "r",
+    ),
+    (
         "route_v2_signer_key_lineage",
         "route_v2_signer_key_lineage_first_revision_fkey",
         "route_v2_signer_revisions",
@@ -1063,6 +1219,114 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
         "route_v2_signing_authority",
         "deployment_id",
         "deployment_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_key_fkey",
+        "route_v2_signer_key_lineage",
+        "kid",
+        "kid",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_start_revision_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,retirement_signer_revision",
+        "deployment_id,signer_revision",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_removed_ring_fkey",
+        "route_v2_public_key_ring_revisions",
+        "deployment_id,ring_removed_version",
+        "deployment_id,ring_version",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_finish_revision_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,retired_signer_revision",
+        "deployment_id,signer_revision",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_authority_fkey",
+        "route_v2_signing_authority",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_previous_fkey",
+        "route_v2_public_key_ring_revisions",
+        "deployment_id,expected_previous_ring_version,expected_previous_key_ring_digest",
+        "deployment_id,ring_version,key_ring_digest",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signing_authority",
+        "route_v2_signing_authority_current_ring_fkey",
+        "route_v2_public_key_ring_revisions",
+        "deployment_id,public_key_ring_version,public_key_ring_digest",
+        "deployment_id,ring_version,key_ring_digest",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revision_ring_fkey",
+        "route_v2_public_key_ring_revisions",
+        "deployment_id,public_key_ring_version,public_key_ring_digest",
+        "deployment_id,ring_version,key_ring_digest",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_authority_fkey",
+        "route_v2_signing_authority",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_authority_fkey",
+        "route_v2_signing_authority",
+        "deployment_id",
+        "deployment_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_retirement_fkey",
+        "route_v2_signer_retirements",
+        "deployment_id,kid,secret_reference_id,retired_signer_revision",
+        "deployment_id,kid,secret_reference_id,retired_signer_revision",
+        "r",
+        "r",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_command_revision_fkey",
+        "route_v2_signer_revisions",
+        "deployment_id,successor_signer_revision,successor_signer_reference_sha256",
+        "deployment_id,signer_revision,signer_reference_sha256",
         "r",
         "r",
     ),
@@ -1181,6 +1445,12 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         None,
     ),
     (
+        "route_v2_signer_revisions",
+        "route_v2_signer_revisions_reference_key",
+        "deployment_id,signer_revision,signer_reference_sha256",
+        None,
+    ),
+    (
         "route_v2_signer_key_lineage",
         "route_v2_signer_key_lineage_public_key_spki_key",
         "public_key_spki",
@@ -1190,6 +1460,36 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         "route_v2_signer_key_lineage",
         "route_v2_signer_key_lineage_secret_reference_id_key",
         "secret_reference_id",
+        None,
+    ),
+    (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_key_ring_revisions_exact_key",
+        "deployment_id,ring_version,key_ring_digest",
+        None,
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_authorizations_kid_key",
+        "kid",
+        None,
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_authority_commands_successor_key",
+        "deployment_id,successor_signer_revision",
+        None,
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_one_pending_normal_retirement",
+        "deployment_id",
+        Some("((source = 'normal'::text) AND (state <> 'retired'::text))"),
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirements_completion_key",
+        "deployment_id,kid,secret_reference_id,retired_signer_revision",
         None,
     ),
     (
@@ -1654,6 +1954,41 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "d689c869eaa0b1d0ad50a0b5e9b81be3a093cf63d1b64cbb0057b89cd4b17286",
     ),
     (
+        "route_v2_public_key_ring_revisions",
+        "route_v2_public_ring_revision_is_immutable",
+        "control_route_v2_public_ring_revision_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "b40956e9b07de061ab8df10884916356d00d7c33e6c80214a02627b40fc52674",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_update",
+        "control_route_v2_signer_retirement_update",
+        BEFORE_ROW_UPDATE,
+        "9906634c8a56358d36814abc3f41730283864650b85d12bb19b5f99bdc69b19c",
+    ),
+    (
+        "route_v2_signer_retirements",
+        "route_v2_signer_retirement_cannot_delete",
+        "control_route_v2_signer_retirement_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "56fabcb6c34fc9913bdc1293b3b80c90612749431aef62bb5d2e71fd17406c18",
+    ),
+    (
+        "route_v2_secret_deletion_authorizations",
+        "route_v2_secret_deletion_authorization_is_immutable",
+        "control_route_v2_secret_deletion_authorization_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "06cd90f7b680ce18804bc88b65041936b2bfd470fb6ae7e38db743eccf5c6c62",
+    ),
+    (
+        "route_v2_signing_authority_commands",
+        "route_v2_signing_authority_command_is_immutable",
+        "control_route_v2_signing_authority_command_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "f1718ed60459e08a51c84addf5371fc698e402cdc33f0f4358145f5e7148accc",
+    ),
+    (
         "route_v2_gateway_identity_revisions",
         "route_v2_gateway_revision_is_immutable",
         "control_route_v2_gateway_revision_is_immutable",
@@ -1826,6 +2161,22 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             first_signer_revision, state, first_committed_at_unix_ms,
             retired_at_unix_ms
        FROM route_v2_signer_key_lineage WHERE FALSE",
+    "SELECT deployment_id, ring_version, key_ring_digest, exact_bytes,
+            expected_previous_ring_version, expected_previous_key_ring_digest,
+            published_at_unix_ms
+       FROM route_v2_public_key_ring_revisions WHERE FALSE",
+    "SELECT deployment_id, kid, secret_reference_id,
+            retirement_signer_revision, last_old_issue_at_unix_ms,
+            source, state, ring_removed_version, retired_signer_revision,
+            retired_at_unix_ms
+       FROM route_v2_signer_retirements WHERE FALSE",
+    "SELECT authorization_id, deployment_id, kid, secret_reference_id,
+            retired_signer_revision, authorized_at_unix_ms
+       FROM route_v2_secret_deletion_authorizations WHERE FALSE",
+    "SELECT command_id, request_bytes, request_sha256, kind, deployment_id,
+            successor_signer_revision, successor_signer_reference_sha256,
+            outcome, committed_at_unix_ms
+       FROM route_v2_signing_authority_commands WHERE FALSE",
     "SELECT singleton, authority_id, fleet_id, current_policy_revision,
             current_policy_sha256, first_committed_at_unix_ms
        FROM route_v2_gateway_identity_authority WHERE FALSE",
@@ -2688,6 +3039,8 @@ CREATE TABLE IF NOT EXISTS route_v2_signer_revisions (
         deployment_id, signer_revision, signer_reference_sha256,
         signer_state, active_kid, public_key_ring_version,
         public_key_ring_digest, secret_reference_id),
+    CONSTRAINT route_v2_signer_revisions_reference_key UNIQUE (
+        deployment_id, signer_revision, signer_reference_sha256),
     CONSTRAINT route_v2_signer_revision_lineage_ck CHECK (
         (signer_revision = 1 AND expected_previous_signer_revision IS NULL
             AND expected_previous_signer_reference_sha256 IS NULL) OR
@@ -2702,6 +3055,13 @@ CREATE TABLE IF NOT EXISTS route_v2_signer_revisions (
     CONSTRAINT route_v2_signer_revisions_authority_fkey
         FOREIGN KEY (deployment_id)
         REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_revision_previous_fkey
+        FOREIGN KEY (
+            deployment_id, expected_previous_signer_revision,
+            expected_previous_signer_reference_sha256)
+        REFERENCES route_v2_signer_revisions(
+            deployment_id, signer_revision, signer_reference_sha256)
         ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
 ALTER TABLE route_v2_signing_authority
@@ -2745,6 +3105,178 @@ CREATE TABLE IF NOT EXISTS route_v2_signer_key_lineage (
     CONSTRAINT route_v2_signer_key_lineage_authority_fkey
         FOREIGN KEY (deployment_id)
         REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE IF NOT EXISTS route_v2_public_key_ring_revisions (
+    deployment_id TEXT NOT NULL,
+    ring_version BIGINT NOT NULL
+        CONSTRAINT route_v2_public_ring_version_ck CHECK (ring_version > 0),
+    key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_v2_public_ring_digest_ck
+        CHECK (key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    exact_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_public_ring_bytes_ck
+        CHECK (octet_length(exact_bytes) BETWEEN 1 AND 16384),
+    expected_previous_ring_version BIGINT NULL
+        CONSTRAINT route_v2_public_ring_previous_version_ck
+        CHECK (expected_previous_ring_version > 0),
+    expected_previous_key_ring_digest TEXT NULL
+        CONSTRAINT route_v2_public_ring_previous_digest_ck
+        CHECK (expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    published_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_public_ring_published_time_ck
+        CHECK (published_at_unix_ms >= 0),
+    PRIMARY KEY (deployment_id, ring_version),
+    CONSTRAINT route_v2_public_key_ring_revisions_exact_key
+        UNIQUE (deployment_id, ring_version, key_ring_digest),
+    CONSTRAINT route_v2_public_ring_lineage_ck CHECK (
+        (ring_version = 1 AND expected_previous_ring_version IS NULL
+            AND expected_previous_key_ring_digest IS NULL) OR
+        (ring_version > 1
+            AND expected_previous_ring_version = ring_version - 1
+            AND expected_previous_key_ring_digest IS NOT NULL)
+    ),
+    CONSTRAINT route_v2_public_ring_authority_fkey
+        FOREIGN KEY (deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_public_ring_previous_fkey
+        FOREIGN KEY (
+            deployment_id, expected_previous_ring_version,
+            expected_previous_key_ring_digest)
+        REFERENCES route_v2_public_key_ring_revisions(
+            deployment_id, ring_version, key_ring_digest)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+ALTER TABLE route_v2_signing_authority
+    ADD CONSTRAINT route_v2_signing_authority_current_ring_fkey
+    FOREIGN KEY (
+        deployment_id, public_key_ring_version, public_key_ring_digest)
+    REFERENCES route_v2_public_key_ring_revisions(
+        deployment_id, ring_version, key_ring_digest)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE route_v2_signer_revisions
+    ADD CONSTRAINT route_v2_signer_revision_ring_fkey
+    FOREIGN KEY (
+        deployment_id, public_key_ring_version, public_key_ring_digest)
+    REFERENCES route_v2_public_key_ring_revisions(
+        deployment_id, ring_version, key_ring_digest)
+    ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS route_v2_signer_retirements (
+    deployment_id TEXT NOT NULL,
+    kid TEXT NOT NULL
+        CONSTRAINT route_v2_signer_retirement_kid_ck
+        CHECK (kid ~ '^[0-9a-f]{64}$'),
+    secret_reference_id TEXT NOT NULL,
+    retirement_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_retirement_revision_ck
+        CHECK (retirement_signer_revision > 0),
+    last_old_issue_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signer_retirement_time_ck
+        CHECK (last_old_issue_at_unix_ms >= 0),
+    source TEXT NOT NULL
+        CONSTRAINT route_v2_signer_retirement_source_ck
+        CHECK (source IN ('normal', 'emergency')),
+    state TEXT NOT NULL
+        CONSTRAINT route_v2_signer_retirement_state_ck
+        CHECK (state IN ('pending', 'ring_removed', 'retired')),
+    ring_removed_version BIGINT NULL
+        CONSTRAINT route_v2_signer_retirement_removed_version_ck
+        CHECK (ring_removed_version > 0),
+    retired_signer_revision BIGINT NULL
+        CONSTRAINT route_v2_signer_retirement_finished_revision_ck
+        CHECK (retired_signer_revision > 0),
+    retired_at_unix_ms BIGINT NULL
+        CONSTRAINT route_v2_signer_retirement_finished_time_ck
+        CHECK (retired_at_unix_ms >= last_old_issue_at_unix_ms),
+    PRIMARY KEY (deployment_id, kid),
+    CONSTRAINT route_v2_signer_retirements_completion_key UNIQUE (
+        deployment_id, kid, secret_reference_id, retired_signer_revision),
+    CONSTRAINT route_v2_signer_retirement_state_projection_ck CHECK (
+        (state = 'pending' AND ring_removed_version IS NULL
+            AND retired_signer_revision IS NULL AND retired_at_unix_ms IS NULL) OR
+        (state = 'ring_removed' AND ring_removed_version IS NOT NULL
+            AND retired_signer_revision IS NULL AND retired_at_unix_ms IS NULL) OR
+        (state = 'retired' AND ring_removed_version IS NOT NULL
+            AND retired_signer_revision IS NOT NULL AND retired_at_unix_ms IS NOT NULL)
+    ),
+    CONSTRAINT route_v2_signer_retirement_authority_fkey
+        FOREIGN KEY (deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_retirement_key_fkey
+        FOREIGN KEY (kid)
+        REFERENCES route_v2_signer_key_lineage(kid)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_retirement_start_revision_fkey
+        FOREIGN KEY (deployment_id, retirement_signer_revision)
+        REFERENCES route_v2_signer_revisions(deployment_id, signer_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_retirement_removed_ring_fkey
+        FOREIGN KEY (deployment_id, ring_removed_version)
+        REFERENCES route_v2_public_key_ring_revisions(deployment_id, ring_version)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_signer_retirement_finish_revision_fkey
+        FOREIGN KEY (deployment_id, retired_signer_revision)
+        REFERENCES route_v2_signer_revisions(deployment_id, signer_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+CREATE UNIQUE INDEX route_v2_signer_one_pending_normal_retirement
+    ON route_v2_signer_retirements(deployment_id)
+    WHERE source = 'normal' AND state <> 'retired';
+CREATE TABLE IF NOT EXISTS route_v2_secret_deletion_authorizations (
+    authorization_id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    kid TEXT NOT NULL UNIQUE
+        CONSTRAINT route_v2_secret_deletion_kid_ck
+        CHECK (kid ~ '^[0-9a-f]{64}$'),
+    secret_reference_id TEXT NOT NULL,
+    retired_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_secret_deletion_revision_ck
+        CHECK (retired_signer_revision > 0),
+    authorized_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_secret_deletion_time_ck
+        CHECK (authorized_at_unix_ms >= 0),
+    CONSTRAINT route_v2_secret_deletion_authority_fkey
+        FOREIGN KEY (deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_v2_secret_deletion_retirement_fkey
+        FOREIGN KEY (
+            deployment_id, kid, secret_reference_id, retired_signer_revision)
+        REFERENCES route_v2_signer_retirements(
+            deployment_id, kid, secret_reference_id, retired_signer_revision)
+        ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE IF NOT EXISTS route_v2_signing_authority_commands (
+    command_id TEXT PRIMARY KEY,
+    request_bytes BYTEA NOT NULL CHECK (octet_length(request_bytes) BETWEEN 1 AND 65536),
+    request_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_digest_ck
+        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    kind TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_kind_ck
+        CHECK (kind IN ('publish_overlap', 'switch_active', 'publish_new_only',
+                       'retire', 'disable', 'activate')),
+    deployment_id TEXT NOT NULL,
+    successor_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_command_revision_ck
+        CHECK (successor_signer_revision > 0),
+    successor_signer_reference_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_signer_digest_ck
+        CHECK (successor_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    outcome BYTEA NOT NULL CHECK (octet_length(outcome) BETWEEN 1 AND 65536),
+    committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_command_time_ck
+        CHECK (committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_signing_authority_commands_successor_key
+        UNIQUE (deployment_id, successor_signer_revision),
+    CONSTRAINT route_v2_signing_command_revision_fkey
+        FOREIGN KEY (
+            deployment_id, successor_signer_revision,
+            successor_signer_reference_sha256)
+        REFERENCES route_v2_signer_revisions(
+            deployment_id, signer_revision, signer_reference_sha256)
         ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
@@ -3150,6 +3682,73 @@ CREATE TRIGGER route_v2_signing_authority_update
 CREATE TRIGGER route_v2_signing_authority_cannot_delete
     BEFORE DELETE ON route_v2_signing_authority
     FOR EACH ROW EXECUTE FUNCTION control_route_v2_signing_authority_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_public_ring_revision_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 public ring revision is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_public_ring_revision_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_public_key_ring_revisions
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_public_ring_revision_is_immutable();
+CREATE OR REPLACE FUNCTION control_route_v2_signer_retirement_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+       OR NEW.kid IS DISTINCT FROM OLD.kid
+       OR NEW.secret_reference_id IS DISTINCT FROM OLD.secret_reference_id
+       OR NEW.retirement_signer_revision IS DISTINCT FROM OLD.retirement_signer_revision
+       OR NEW.last_old_issue_at_unix_ms IS DISTINCT FROM OLD.last_old_issue_at_unix_ms
+       OR NEW.source IS DISTINCT FROM OLD.source
+       OR (OLD.state = 'pending' AND NOT (
+            NEW.state = 'ring_removed'
+            AND OLD.ring_removed_version IS NULL
+            AND NEW.ring_removed_version IS NOT NULL
+            AND NEW.retired_signer_revision IS NULL
+            AND NEW.retired_at_unix_ms IS NULL))
+       OR (OLD.state = 'ring_removed' AND NOT (
+            NEW.state = 'retired'
+            AND NEW.ring_removed_version IS NOT DISTINCT FROM OLD.ring_removed_version
+            AND OLD.retired_signer_revision IS NULL
+            AND NEW.retired_signer_revision IS NOT NULL
+            AND OLD.retired_at_unix_ms IS NULL
+            AND NEW.retired_at_unix_ms IS NOT NULL))
+       OR OLD.state = 'retired' THEN
+        RAISE EXCEPTION 'Route v2 signer retirement is not an exact forward transition';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION control_route_v2_signer_retirement_cannot_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 signer retirement cannot be deleted';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_signer_retirement_update
+    BEFORE UPDATE ON route_v2_signer_retirements
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signer_retirement_update();
+CREATE TRIGGER route_v2_signer_retirement_cannot_delete
+    BEFORE DELETE ON route_v2_signer_retirements
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signer_retirement_cannot_delete();
+CREATE OR REPLACE FUNCTION control_route_v2_secret_deletion_authorization_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 secret deletion authorization is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_secret_deletion_authorization_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_secret_deletion_authorizations
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_secret_deletion_authorization_is_immutable();
+CREATE OR REPLACE FUNCTION control_route_v2_signing_authority_command_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 signing authority command is immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_signing_authority_command_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_signing_authority_commands
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_signing_authority_command_is_immutable();
 CREATE OR REPLACE FUNCTION control_route_v2_gateway_revision_is_immutable()
 RETURNS trigger AS $$
 BEGIN

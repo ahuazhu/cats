@@ -21,8 +21,10 @@ use postgres::{Row, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use super::gateway_identity::lock_route_v2_machine_authority_shared;
 use super::pg_codec::PgBigInt;
 use super::product_rows::load_assigned_desired_for_update;
+use super::route_signing_authority::node_acks_current_published_ring_in;
 use super::rows::database_now;
 use crate::store::agent_sessions::{
     insert_node_identity_in, load_current_session_for_update, load_identity_by_node_for_update,
@@ -620,6 +622,10 @@ fn apply_runtime_node_authority_in(
     principal: &FleetPolicyPrincipal,
     apply: &RuntimeNodeAuthorityApply,
 ) -> AuthorityTxResult<RuntimeNodeAuthorityApplyStoreOutcome> {
+    // Every policy/provision mutation enters the Route authority barrier
+    // before touching Node rows. Rotation can therefore consume one exact
+    // current schedulable set without racing an uncordon or new Node phantom.
+    lock_route_v2_machine_authority_shared(transaction)?;
     lock_runtime_node_authority_apply(transaction, apply.apply_id.as_str())?;
     if !revalidate_machine_principal(transaction, principal)? {
         return Ok(RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed);
@@ -666,6 +672,7 @@ fn apply_runtime_node_authority_in(
         } if node_absent
             && credential_fresh
             && host_state_fresh
+            && placement_policy.scheduling_state == RuntimeSchedulingState::Cordoned
             && identity_public_key(node_identity).is_some()
             && valid_state_path_component(&node_identity.state_path_id) =>
         {
@@ -841,6 +848,16 @@ fn valid_policy_update(
         && (current.scheduling_state != RuntimeSchedulingState::Cordoned
             || next.scheduling_state != RuntimeSchedulingState::Cordoned
             || !load_assigned_desired_for_update(transaction, &current.node_id)?.is_empty())
+    {
+        return Ok(false);
+    }
+    if current.scheduling_state != RuntimeSchedulingState::Schedulable
+        && next.scheduling_state == RuntimeSchedulingState::Schedulable
+        && !node_acks_current_published_ring_in(
+            transaction,
+            &current.node_id,
+            &next.capabilities.guest_config_digest,
+        )?
     {
         return Ok(false);
     }

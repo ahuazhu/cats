@@ -4,19 +4,23 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
 use cats_api::runtime_reconciliation::{
-    canonical_ed25519_spki_sha256, runtime_provisioner_active_set_digest, AllocatableMemoryBytes,
-    AllocatableVcpus, Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch,
-    FleetPolicyPrincipal, GuestIpv4Pool, GuestIpv4PoolKind, Id, Ipv4Address, NodeIdentity,
-    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, PublicKeyCredentialBinding,
-    RandomId128, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
-    RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeProvisionerActiveSet, RuntimeProvisionerCredential,
-    RuntimeProvisionerExpectedPrevious, RuntimeProvisionerTrustBundle, RuntimeSchedulingState,
-    Sha256Digest,
+    canonical_ed25519_spki_sha256, guest_config_digest, runtime_provisioner_active_set_digest,
+    AllocatableMemoryBytes, AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion,
+    CredentialBinding, Epoch, FleetPolicyPrincipal, GuestIpv4Pool, GuestIpv4PoolKind,
+    GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeIdentity, NodeIdentityState,
+    NodePlacementPolicy, NodeTransportTarget, PublicKeyCredentialBinding, RandomId128,
+    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
+    RuntimeNodeAuthorityStoredOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
+    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
+    RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
+    RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
 };
 
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
+use super::route_signing_authority_tests::install_initial_signer_for_test;
+use super::runtime_spine_tests::{
+    accept_ring_admission_for_test, refresh_assigned_admission_for_test,
+};
 use crate::store::{AuthorityRequestContext, Store};
 
 const SPKI_A: &str = "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
@@ -32,6 +36,16 @@ fn random(value: u128) -> RandomId128 {
 
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
+}
+
+fn guest_release() -> GuestRuntimeProfileReceipt {
+    GuestRuntimeProfileReceipt {
+        version: ContractVersion::V1,
+        kernel_digest: digest(1),
+        initramfs_digest: Some(digest(2)),
+        kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+        guest_agent_protocol_version: ContractVersion::V1,
+    }
 }
 
 fn credential(name: &str, spki: &str) -> RuntimeProvisionerCredential {
@@ -103,7 +117,7 @@ fn policy(revision: u64, state: RuntimeSchedulingState, memory: u64) -> NodePlac
             guest_network: RuntimePlacementGuestNetwork::IsolatedIpv4,
             guest_transport: RuntimePlacementGuestTransport::Vsock,
             guest_agent_protocol_version: ContractVersion::V1,
-            guest_config_digest: digest(7),
+            guest_config_digest: guest_config_digest(&guest_release()).unwrap(),
         },
         guest_ipv4_pool: GuestIpv4Pool {
             kind: GuestIpv4PoolKind::PrivateIpv4_16,
@@ -346,6 +360,18 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         RuntimeNodeAuthorityApplyStoreOutcome::ApplyIdConflict
     );
 
+    let current_ring = install_initial_signer_for_test(&store);
+    let unacked_enable = update(40, 1, RuntimeSchedulingState::Schedulable, 16 << 30);
+    assert_eq!(
+        stored(
+            store
+                .apply_runtime_node_authority(&actor, &unacked_enable)
+                .unwrap()
+        ),
+        RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+    );
+    let admission = refresh_assigned_admission_for_test(&store, &identity(), &guest_release(), 41);
+    let admission = accept_ring_admission_for_test(&store, &admission, &current_ring, 2, 2);
     let enable = update(2, 1, RuntimeSchedulingState::Schedulable, 16 << 30);
     assert_applied(
         store.apply_runtime_node_authority(&actor, &enable).unwrap(),
@@ -426,6 +452,21 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         ),
         RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
     );
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "DELETE FROM current_agent_sessions
+                      WHERE node_id=$1 AND agent_session_epoch=$2",
+                    &[
+                        &admission.agent_session.node_id.as_str(),
+                        &i64::try_from(admission.agent_session.agent_session_epoch.get()).unwrap(),
+                    ],
+                )
+                .map(|changed| assert_eq!(changed, 1))
+        })
+        .unwrap();
 
     let rotate = RuntimeNodeAuthorityApply {
         version: ContractVersion::V1,
@@ -514,7 +555,7 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
                         &[],
                     )?
                     .get::<_, i64>(0),
-                9
+                10
             );
             Ok(())
         })

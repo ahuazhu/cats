@@ -42,10 +42,11 @@ provisioner key。这三者都拥有不同 principal、签名 domain、轮换和
 当前实现包含 canonical artifact codecs、固定路径/metadata reader、private/public pair check，以及 Node
 production full-inventory 对已安装 public ring 的只读 exact observation。Control 的 signer snapshot 会消费
 该 observation 中的 exact version/digest/sorted kids；artifact 缺席保持 unavailable，存在但无法完整验证时
-不接受该轮 full inventory。PostgreSQL现已保存revision-one immutable exact descriptor、current exact
-projection和permanent key/secret-reference lineage；startup只允许initial install或exact replay，不把合法本地
-successor自动当作rotation authority，且resolve可在共享lock内比较进程内binding与PG current。它仍不实现
-public-ring installer、successor/rotation writer、schedulable全量ACK rollout、Node TLS listener或proxy。
+不接受该轮 full inventory。PostgreSQL保存immutable exact descriptor/ring revision、current exact projection、
+permanent key/secret-reference lineage、retirement与nonsecret deletion receipt；startup只允许initial install或
+exact replay，不把合法本地successor自动当作rotation authority。Node successor installer在durable rename与
+verifier swap后才ACK；typed writer在singleton lock内完成两轮schedulable full ACK、strict retention、uncordon
+current ACK与emergency disable/fresh activation。该G3 catalog保留最终schema 17，必须在E9 v15/V3 v16后集成。
 Control现已用固定CA/server artifact组成独立TLS 1.3/HTTP/1.1 machine listener；每次签发在同一shared-lock
 snapshot内同时重验Gateway principal、hostname-derived Workspace、Route/Desired/ring ACK与本进程signer的PG
 current binding。disabled或stale signer保持503，不能用测试constructor或旧authority补齐。

@@ -8,8 +8,9 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::route_grant_v2::{
     decode_route_resolve_v2_rejection, decode_route_resolve_v2_success,
-    encode_route_resolve_v2_request, RouteResolveV2RejectionCode, RouteResolveV2Request,
-    ROUTE_RESOLVE_V2_PATH, ROUTE_V2_JSON_CONTENT_TYPE,
+    encode_route_resolve_v2_request, RouteGrantV2PublicKeyRingArtifact,
+    RouteResolveV2RejectionCode, RouteResolveV2Request, ROUTE_RESOLVE_V2_PATH,
+    ROUTE_V2_JSON_CONTENT_TYPE,
 };
 use cats_api::runtime_reconciliation::{
     decode_operation, decode_runtime_checkpoint, encode_admission_inventory_attestation,
@@ -819,6 +820,69 @@ pub(super) fn establish_empty_admission_for(
             .unwrap(),
     );
     accept_empty_admission(store, &identity, &authenticated, &policy, &session)
+}
+
+/// Accept a fresh full-inventory ACK for one exact installed Route v2 ring.
+/// This goes through the real Desired-read and observation acceptance path so
+/// rotation and uncordon tests cannot forge an admission projection row.
+pub(super) fn accept_ring_admission_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+    desired_sequence: u64,
+    heartbeat_sequence: u64,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let desired = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&planned.agent_session),
+                    request_sequence: Sequence::new(desired_sequence).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let mut full = planned.full_inventory_observation.clone();
+    full.observation_id = random(20_000 + u128::from(heartbeat_sequence));
+    full.heartbeat_sequence = Sequence::new(heartbeat_sequence).unwrap();
+    full.observed_at_unix_ms = db_now(store);
+    full.inventory_epoch = Epoch::new(
+        planned
+            .inventory_attestation
+            .inventory_epoch
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    full.inventory_read_position = Some(desired.read_position);
+    full.key_ring_version = Some(ring.ring_version);
+    full.key_ring_digest = Some(ring.digest().unwrap());
+    full.loaded_kids = ring.keys.iter().map(|entry| entry.kid.clone()).collect();
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(
+            &planned.node_identity.node_id,
+            &planned.agent_session.guest_config_digest,
+        )
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("ring admission unexpectedly rejected: {rejection:?}")
+        }
+    }
 }
 
 /// Establishes a fresh current session and full admission for whatever
