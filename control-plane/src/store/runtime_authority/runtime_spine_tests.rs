@@ -926,6 +926,41 @@ pub(super) fn replace_agent_session_for_test(
     );
 }
 
+/// Accepts a session-bound partial heartbeat after the full inventory receipt
+/// captured by `planned`. The helper deliberately reports the exact same Cat
+/// membership while omitting the complete-inventory digest/read cursor, so a
+/// product test can prove that source-only mutations neither consume nor
+/// replace the full placement attestation.
+pub(super) fn accept_partial_heartbeat_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+) {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let sequence = planned
+        .full_inventory_observation
+        .heartbeat_sequence
+        .get()
+        .checked_add(1)
+        .expect("test heartbeat sequence has room");
+    let partial = observation(
+        store,
+        &planned.agent_session,
+        sequence,
+        planned.inventory_attestation.inventory_epoch.get(),
+        false,
+        None,
+        planned.full_inventory_observation.runtimes.clone(),
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
+}
+
 fn accept_empty_admission(
     store: &Store,
     identity: &NodeIdentity,

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, Barrier};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
@@ -25,6 +25,7 @@ use postgres::error::SqlState;
 use sha2::{Digest, Sha256};
 
 use super::cat_create_service::CatCreatePlacementMutation;
+use super::covered_commit::CoveredCommitCancellation;
 use super::placement_planner::{allocate_network_for_test, PlacementTargetSnapshot};
 use super::placement_policy::{insert_policy_on_store_for_test, update_policy_for_test};
 use super::product::{
@@ -178,27 +179,6 @@ fn desired_mutation_request(
         RuntimeTarget::Deleted => "deleted",
     };
     let raw_body = format!(r#"{{"target":"{target}"}}"#);
-    let accepted = ExactHttpResponse::new(
-        202,
-        Some(ExactContentType::ApplicationJson),
-        format!(
-            r#"{{"desired_revision":{},"operation_id":"{}"}}"#,
-            desired.desired_revision.get(),
-            operation_id
-        )
-        .into_bytes(),
-    )
-    .unwrap();
-    let converged = ExactHttpResponse::new(
-        200,
-        Some(ExactContentType::ApplicationJson),
-        format!(
-            r#"{{"desired_revision":{},"converged":true}}"#,
-            expected.desired_revision.get()
-        )
-        .into_bytes(),
-    )
-    .unwrap();
     CoveredDesiredMutationRequest {
         idempotency: ApiIdempotencyRequest {
             authenticated_workspace_id: expected.workspace_id.clone(),
@@ -219,9 +199,18 @@ fn desired_mutation_request(
         placement_snapshots,
         active_guest_digest,
         endpoint_records,
-        accepted,
-        converged,
     }
+}
+
+fn commit_desired_mutation(
+    store: &Store,
+    request: &CoveredDesiredMutationRequest,
+) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
+    let (_cancellation, state) = CoveredCommitCancellation::new(
+        "Desired mutation test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    store.commit_desired_mutation_covered(request, &state)
 }
 
 fn mutation_release() -> GuestRuntimeProfileReceipt {
@@ -527,20 +516,18 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
     let active_digest = guest_config_digest(&release).unwrap();
-    let revision_one_target = refresh_mutation_target(&store, &identity, &policy, &release, 101);
-
     let revision_two = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
     let colliding = desired_mutation_request(
         &create.candidate.desired,
         revision_two.clone(),
         create.candidate.operation_id.as_str(),
         "desired-cas-operation-collision",
-        vec![revision_one_target.clone()],
+        Vec::new(),
         active_digest.clone(),
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&colliding),
+        commit_desired_mutation(&store, &colliding),
         Err(CoveredDesiredMutationError::CandidateCollision(
             CandidateCollision::OperationId
         ))
@@ -550,18 +537,22 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
         revision_two.clone(),
         "op_revision_2",
         "desired-cas-2",
-        vec![revision_one_target],
+        Vec::new(),
         active_digest.clone(),
         vec![default_endpoint_record(&create)],
     );
     let DesiredMutationCommit::Changed(second_result) =
-        store.commit_desired_mutation_covered(&second).unwrap()
+        commit_desired_mutation(&store, &second).unwrap()
     else {
         panic!("revision 2 must be a real mutation");
     };
     assert_eq!(second_result.http_status, 202);
+    assert_eq!(
+        second_result.response_body,
+        br#"{"desired_revision":2,"operation_id":"op_revision_2"}"#
+    );
     let DesiredMutationCommit::Replayed(replayed_second) =
-        store.commit_desired_mutation_covered(&second).unwrap()
+        commit_desired_mutation(&store, &second).unwrap()
     else {
         panic!("same API key must replay the exact committed mutation response");
     };
@@ -579,7 +570,7 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&third).unwrap(),
+        commit_desired_mutation(&store, &third).unwrap(),
         DesiredMutationCommit::Changed(_)
     ));
 
@@ -588,14 +579,12 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
         revision_two,
         "op_stale_revision_2",
         "desired-cas-stale",
-        vec![refresh_mutation_target(
-            &store, &identity, &policy, &release, 103,
-        )],
+        Vec::new(),
         active_digest.clone(),
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&stale),
+        commit_desired_mutation(&store, &stale),
         Err(CoveredDesiredMutationError::Stale)
     ));
 
@@ -605,18 +594,20 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
         semantically_identical,
         "op_must_not_exist",
         "desired-cas-no-op",
-        vec![refresh_mutation_target(
-            &store, &identity, &policy, &release, 104,
-        )],
+        Vec::new(),
         active_digest,
         vec![default_endpoint_record(&create)],
     );
     let DesiredMutationCommit::Converged(no_op_result) =
-        store.commit_desired_mutation_covered(&no_op).unwrap()
+        commit_desired_mutation(&store, &no_op).unwrap()
     else {
         panic!("an identical full target must not manufacture revision 4");
     };
     assert_eq!(no_op_result.http_status, 200);
+    assert_eq!(
+        no_op_result.response_body,
+        br#"{"desired_revision":3,"converged":true}"#
+    );
 
     store
         .authority_transaction(|transaction| {
@@ -675,7 +666,7 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
 }
 
 #[test]
-fn desired_mutation_changes_placement_only_with_the_next_epoch() {
+fn desired_mutation_enforces_epoch_and_capacity_but_rejects_uncovered_cross_node_volumes() {
     let (_url, store, _second, workspace) = stores();
     let mut create = request(&workspace, "placement-epoch", 1, "placement-epoch-create");
     let (source, source_policy, release) = prepare_mutation_node(&store, &mut create, 1);
@@ -706,7 +697,7 @@ fn desired_mutation_changes_placement_only_with_the_next_epoch() {
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&invalid_move),
+        commit_desired_mutation(&store, &invalid_move),
         Err(CoveredDesiredMutationError::Store(ref error))
             if error.code == ErrorCode::Internal
     ));
@@ -724,7 +715,7 @@ fn desired_mutation_changes_placement_only_with_the_next_epoch() {
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&invalid_same_node),
+        commit_desired_mutation(&store, &invalid_same_node),
         Err(CoveredDesiredMutationError::Store(ref error))
             if error.code == ErrorCode::Internal
     ));
@@ -763,7 +754,7 @@ fn desired_mutation_changes_placement_only_with_the_next_epoch() {
         active_digest.clone(),
         vec![default_endpoint_record(&create)],
     );
-    assert_stale_mutation_wrote_nothing(&store, &invalid_network_request);
+    assert_cross_node_volume_guard_rejected_without_writes(&store, &invalid_network_request);
 
     let mut moved = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
     moved.placement.node_id = target_node;
@@ -779,37 +770,24 @@ fn desired_mutation_changes_placement_only_with_the_next_epoch() {
         active_digest,
         vec![default_endpoint_record(&create)],
     );
-    assert!(matches!(
-        store.commit_desired_mutation_covered(&request).unwrap(),
-        DesiredMutationCommit::Changed(_)
-    ));
-
-    let current = store
-        .authority_transaction(|transaction| {
-            super::product_rows::load_desired_for_update(transaction, &moved.cat_id)
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.placement, moved.placement);
+    assert_cross_node_volume_guard_rejected_without_writes(&store, &request);
 }
 
 #[test]
 fn two_replicas_racing_from_one_revision_commit_exactly_one_successor() {
     let (url, first, second, workspace) = stores();
     let mut create = request(&workspace, "replica-race", 1, "replica-race-create");
-    let (identity, policy, release) = prepare_mutation_node(&first, &mut create, 1);
+    let (_identity, _policy, release) = prepare_mutation_node(&first, &mut create, 1);
     first
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
     let active_digest = guest_config_digest(&release).unwrap();
-    let target = refresh_mutation_target(&first, &identity, &policy, &release, 301);
-
     let cold = desired_mutation_request(
         &create.candidate.desired,
         advance_target(&create.candidate.desired, RuntimeTarget::Cold),
         "op_race_cold",
         "replica-race-cold",
-        vec![target.clone()],
+        Vec::new(),
         active_digest.clone(),
         vec![default_endpoint_record(&create)],
     );
@@ -818,7 +796,7 @@ fn two_replicas_racing_from_one_revision_commit_exactly_one_successor() {
         advance_target(&create.candidate.desired, RuntimeTarget::Warm),
         "op_race_warm",
         "replica-race-warm",
-        vec![target],
+        Vec::new(),
         active_digest,
         vec![default_endpoint_record(&create)],
     );
@@ -827,11 +805,11 @@ fn two_replicas_racing_from_one_revision_commit_exactly_one_successor() {
     let second_barrier = Arc::clone(&barrier);
     let first_thread = std::thread::spawn(move || {
         first_barrier.wait();
-        first.commit_desired_mutation_covered(&cold)
+        commit_desired_mutation(&first, &cold)
     });
     let second_thread = std::thread::spawn(move || {
         second_barrier.wait();
-        second.commit_desired_mutation_covered(&warm)
+        commit_desired_mutation(&second, &warm)
     });
     barrier.wait();
     let outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
@@ -869,6 +847,137 @@ fn two_replicas_racing_from_one_revision_commit_exactly_one_successor() {
     assert_eq!(result_count, 2, "Cat-create plus the one winning mutation");
 }
 
+fn wait_for_advisory_lock_wait(store: &Store, application_name: &str) {
+    for _ in 0..200 {
+        let waiting = store
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name=$1 AND wait_event_type='Lock'
+                        )",
+                        &[&application_name],
+                    )
+                    .map(|row| row.get::<_, bool>(0))
+            })
+            .unwrap();
+        if waiting {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{application_name} did not reach its calibrated advisory-lock wait");
+}
+
+#[test]
+fn two_cats_exchanging_hostnames_lock_the_old_and_new_union_without_deadlock() {
+    let (url, setup, _unused, workspace) = stores();
+    let mut first_create = request(&workspace, "hostname-swap-a", 1, "hostname-swap-a-create");
+    let (_first_identity, _first_policy, release) =
+        prepare_mutation_node(&setup, &mut first_create, 1);
+    setup
+        .create_cat_covered_without_admission_for_product_test(&first_create)
+        .unwrap();
+    let mut second_create = request(&workspace, "hostname-swap-b", 2, "hostname-swap-b-create");
+    let (_second_identity, _second_policy, _second_release) =
+        prepare_mutation_node(&setup, &mut second_create, 2);
+    setup
+        .create_cat_covered_without_admission_for_product_test(&second_create)
+        .unwrap();
+
+    let mut first_desired = first_create.candidate.desired.clone();
+    first_desired.desired_revision = revision(2);
+    first_desired.endpoints[0].hostname = second_create.candidate.desired.endpoints[0]
+        .hostname
+        .clone();
+    first_desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    first_desired.spec_digest = spec_digest(&first_desired).unwrap();
+    let first_mutation = desired_mutation_request(
+        &first_create.candidate.desired,
+        first_desired,
+        "op_hostname_swap_a",
+        "hostname-swap-a-mutation",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&first_create)],
+    );
+
+    let mut second_desired = second_create.candidate.desired.clone();
+    second_desired.desired_revision = revision(2);
+    second_desired.endpoints[0].hostname =
+        first_create.candidate.desired.endpoints[0].hostname.clone();
+    second_desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    second_desired.spec_digest = spec_digest(&second_desired).unwrap();
+    let second_mutation = desired_mutation_request(
+        &second_create.candidate.desired,
+        second_desired,
+        "op_hostname_swap_b",
+        "hostname-swap-b-mutation",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&second_create)],
+    );
+
+    let first_application = "a1-hostname-swap-first";
+    let second_application = "a1-hostname-swap-second";
+    let first = Store::connect(&with_application_name(&url, first_application), None).unwrap();
+    let second = Store::connect(&with_application_name(&url, second_application), None).unwrap();
+    // A non-canonical old->new cycle would hit the two-second covered lock
+    // timeout before PostgreSQL's deliberately-larger deadlock detector.
+    first
+        .with(|client| client.batch_execute("SET deadlock_timeout='10s'"))
+        .unwrap();
+    second
+        .with(|client| client.batch_execute("SET deadlock_timeout='10s'"))
+        .unwrap();
+    let observer = Store::connect(&url, None).unwrap();
+    let holder = Store::connect(&url, None).unwrap();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_hostname = first_create.candidate.desired.endpoints[0].hostname.clone();
+    let holder_thread = std::thread::spawn(move || {
+        holder
+            .authority_transaction(move |transaction| {
+                transaction.query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(
+                        current_schema() || ':runtime-authority:hostname:' || $1,
+                        0::BIGINT
+                    ))",
+                    &[&first_hostname.as_str()],
+                )?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let first_thread = std::thread::spawn(move || commit_desired_mutation(&first, &first_mutation));
+    wait_for_advisory_lock_wait(&observer, first_application);
+    let second_thread =
+        std::thread::spawn(move || commit_desired_mutation(&second, &second_mutation));
+    wait_for_advisory_lock_wait(&observer, second_application);
+    release_tx.send(()).unwrap();
+
+    let first_outcome = first_thread.join().unwrap();
+    let second_outcome = second_thread.join().unwrap();
+    holder_thread.join().unwrap();
+    assert!(matches!(
+        first_outcome,
+        Err(CoveredDesiredMutationError::CandidateCollision(
+            CandidateCollision::Hostname
+        ))
+    ));
+    assert!(matches!(
+        second_outcome,
+        Err(CoveredDesiredMutationError::CandidateCollision(
+            CandidateCollision::Hostname
+        ))
+    ));
+}
+
 #[test]
 fn desired_mutation_commits_a_same_node_runtime_shape_with_recomputed_capacity() {
     let (_url, store, _unused, workspace) = stores();
@@ -893,7 +1002,7 @@ fn desired_mutation_commits_a_same_node_runtime_shape_with_recomputed_capacity()
         vec![default_endpoint_record(&create)],
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&mutation).unwrap(),
+        commit_desired_mutation(&store, &mutation).unwrap(),
         DesiredMutationCommit::Changed(_)
     ));
     let current = store
@@ -907,8 +1016,68 @@ fn desired_mutation_commits_a_same_node_runtime_shape_with_recomputed_capacity()
 
 fn assert_stale_mutation_wrote_nothing(store: &Store, request: &CoveredDesiredMutationRequest) {
     assert!(matches!(
-        store.commit_desired_mutation_covered(request),
+        commit_desired_mutation(store, request),
         Err(CoveredDesiredMutationError::Stale)
+    ));
+    store
+        .authority_transaction(|transaction| {
+            let current = super::product_rows::load_desired_for_update(
+                transaction,
+                &request.expected_current.cat_id,
+            )?
+            .unwrap();
+            assert_eq!(current, request.expected_current);
+            assert!(super::product_rows::load_operation_for_update(
+                transaction,
+                &request.operation_id,
+            )?
+            .is_none());
+            assert!(super::product_rows::load_api_result_for_update(
+                transaction,
+                &request.idempotency,
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn assert_desired_mutation_artifacts_absent(
+    store: &Store,
+    request: &CoveredDesiredMutationRequest,
+) {
+    store
+        .authority_transaction(|transaction| {
+            let current = super::product_rows::load_desired_for_update(
+                transaction,
+                &request.expected_current.cat_id,
+            )?
+            .unwrap();
+            assert_eq!(current, request.expected_current);
+            assert!(super::product_rows::load_operation_for_update(
+                transaction,
+                &request.operation_id,
+            )?
+            .is_none());
+            assert!(super::product_rows::load_api_result_for_update(
+                transaction,
+                &request.idempotency,
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn assert_cross_node_volume_guard_rejected_without_writes(
+    store: &Store,
+    request: &CoveredDesiredMutationRequest,
+) {
+    let error = commit_desired_mutation(store, request).unwrap_err();
+    assert!(matches!(
+        error,
+        CoveredDesiredMutationError::Store(ref error)
+            if error.message.contains("cross-Node volume authority")
     ));
     store
         .authority_transaction(|transaction| {
@@ -942,9 +1111,13 @@ fn desired_mutation_rejects_policy_change_after_planning_without_any_commit_arti
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
     let target = refresh_mutation_target(&planner, &identity, &policy, &release, 401);
+    let mut resized = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
+    resized.runtime.vcpus = 2;
+    resized.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    resized.spec_digest = spec_digest(&resized).unwrap();
     let mutation = desired_mutation_request(
         &create.candidate.desired,
-        advance_target(&create.candidate.desired, RuntimeTarget::Cold),
+        resized,
         "op_policy_drift",
         "policy-drift-mutation",
         vec![target],
@@ -966,7 +1139,7 @@ fn desired_mutation_rejects_policy_change_after_planning_without_any_commit_arti
 }
 
 #[test]
-fn desired_mutation_rejects_session_change_after_planning_without_any_commit_artifact() {
+fn desired_target_only_does_not_consume_replaced_session_or_full_admission() {
     let (url, planner, _unused, workspace) = stores();
     let mut create = request(&workspace, "session-drift", 1, "session-drift-create");
     let (identity, policy, release) = prepare_mutation_node(&planner, &mut create, 1);
@@ -979,7 +1152,7 @@ fn desired_mutation_rejects_session_change_after_planning_without_any_commit_art
         advance_target(&create.candidate.desired, RuntimeTarget::Cold),
         "op_session_drift",
         "session-drift-mutation",
-        vec![target.clone()],
+        Vec::new(),
         guest_config_digest(&release).unwrap(),
         vec![default_endpoint_record(&create)],
     );
@@ -992,7 +1165,321 @@ fn desired_mutation_rejects_session_change_after_planning_without_any_commit_art
         502,
     );
 
-    assert_stale_mutation_wrote_nothing(&planner, &mutation);
+    assert!(matches!(
+        commit_desired_mutation(&planner, &mutation).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+}
+
+#[test]
+fn desired_stop_survives_a_partial_heartbeat_and_active_release_rotation() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "partial-stop", 1, "partial-stop-create");
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let target = refresh_mutation_target(&store, &identity, &policy, &release, 551);
+    super::runtime_spine_tests::accept_partial_heartbeat_for_test(&store, &target.admission);
+
+    let stopped = advance_target(&create.candidate.desired, RuntimeTarget::Suspended);
+    let mutation = desired_mutation_request(
+        &create.candidate.desired,
+        stopped.clone(),
+        "op_partial_stop",
+        "partial-stop-mutation",
+        Vec::new(),
+        Sha256Digest::from_bytes([0xee; 32]),
+        vec![default_endpoint_record(&create)],
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &mutation).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    let current = store
+        .authority_transaction(|transaction| {
+            super::product_rows::load_desired_for_update(transaction, &stopped.cat_id)
+        })
+        .unwrap();
+    assert_eq!(current, Some(stopped));
+}
+
+#[test]
+fn desired_route_close_survives_an_aged_full_inventory_receipt() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "stale-route-close",
+        1,
+        "stale-route-close-create",
+    );
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    refresh_mutation_target(&store, &identity, &policy, &release, 561);
+    store
+        .authority_transaction(|transaction| {
+            super::runtime_spine::age_volume_mutation_admission_for_test(
+                transaction,
+                &identity.node_id,
+            )
+        })
+        .unwrap();
+
+    let mut closed = create.candidate.desired.clone();
+    closed.desired_revision = revision(2);
+    closed.endpoints.clear();
+    closed.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    closed.spec_digest = spec_digest(&closed).unwrap();
+    let mutation = desired_mutation_request(
+        &create.candidate.desired,
+        closed.clone(),
+        "op_stale_route_close",
+        "stale-route-close-mutation",
+        Vec::new(),
+        Sha256Digest::from_bytes([0xdd; 32]),
+        Vec::new(),
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &mutation).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    assert!(store
+        .locate_hostname_desired(&create.candidate.hostname_lookup.hostname)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn desired_delete_without_volume_intents_does_not_consume_full_admission() {
+    let (url, store, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "source-only-delete",
+        1,
+        "source-only-delete-create",
+    );
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let mut current = create.candidate.desired.clone();
+    current.volumes.clear();
+    current.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    current.spec_digest = spec_digest(&current).unwrap();
+    rewrite_current_desired_and_operation(&store, &current, None);
+    let target = refresh_mutation_target(&store, &identity, &policy, &release, 571);
+    let writer = Store::connect(&url, None).unwrap();
+    super::runtime_spine_tests::replace_agent_session_for_test(
+        &writer,
+        &target.admission,
+        &release,
+        572,
+    );
+
+    let deleted = advance_target(&current, RuntimeTarget::Deleted);
+    let mutation = desired_mutation_request(
+        &current,
+        deleted.clone(),
+        "op_source_only_delete",
+        "source-only-delete-mutation",
+        Vec::new(),
+        Sha256Digest::from_bytes([0xcc; 32]),
+        vec![default_endpoint_record(&create)],
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &mutation).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+}
+
+#[test]
+fn desired_reactivation_still_requires_fresh_full_admission_after_session_replacement() {
+    let (url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "stale-start", 1, "stale-start-create");
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let cold = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
+    let stop = desired_mutation_request(
+        &create.candidate.desired,
+        cold.clone(),
+        "op_stale_start_stop",
+        "stale-start-stop",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &stop).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    let target = refresh_mutation_target(&store, &identity, &policy, &release, 581);
+    let writer = Store::connect(&url, None).unwrap();
+    super::runtime_spine_tests::replace_agent_session_for_test(
+        &writer,
+        &target.admission,
+        &release,
+        582,
+    );
+
+    for (runtime_target, operation_id, key) in [
+        (
+            RuntimeTarget::Suspended,
+            "op_stale_suspended_rebuild",
+            "stale-suspended-rebuild",
+        ),
+        (
+            RuntimeTarget::Running,
+            "op_stale_start",
+            "stale-start-mutation",
+        ),
+    ] {
+        let start = desired_mutation_request(
+            &cold,
+            advance_target(&cold, runtime_target),
+            operation_id,
+            key,
+            vec![target.clone()],
+            guest_config_digest(&release).unwrap(),
+            vec![default_endpoint_record(&create)],
+        );
+        assert_stale_mutation_wrote_nothing(&store, &start);
+    }
+}
+
+#[test]
+fn desired_mutation_pre_commit_cancellation_writes_nothing() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "desired-cancel", 1, "desired-cancel-create");
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let mutation = desired_mutation_request(
+        &create.candidate.desired,
+        advance_target(&create.candidate.desired, RuntimeTarget::Cold),
+        "op_desired_cancelled",
+        "desired-cancelled",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    let (cancellation, state) = CoveredCommitCancellation::new(
+        "Desired mutation cancellation test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert!(cancellation.cancel_before_commit());
+    assert!(matches!(
+        store.commit_desired_mutation_covered(&mutation, &state),
+        Err(CoveredDesiredMutationError::Store(ref error))
+            if error.code == ErrorCode::Unavailable
+    ));
+    assert_desired_mutation_artifacts_absent(&store, &mutation);
+}
+
+#[test]
+fn desired_mutation_lock_wait_is_bounded_before_commit_and_writes_nothing() {
+    let (_url, store, holder, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "desired-lock-wait",
+        1,
+        "desired-lock-wait-create",
+    );
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let mutation = desired_mutation_request(
+        &create.candidate.desired,
+        advance_target(&create.candidate.desired, RuntimeTarget::Cold),
+        "op_desired_lock_wait",
+        "desired-lock-wait",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    let locked = Arc::new(Barrier::new(2));
+    let release_lock = Arc::new(Barrier::new(2));
+    let holder_locked = Arc::clone(&locked);
+    let holder_release = Arc::clone(&release_lock);
+    let node_id = identity.node_id.clone();
+    let holder_thread = std::thread::spawn(move || {
+        holder
+            .authority_transaction(|transaction| {
+                transaction.query_one(
+                    "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE",
+                    &[&node_id.as_str()],
+                )?;
+                holder_locked.wait();
+                holder_release.wait();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked.wait();
+
+    let (_cancellation, state) = CoveredCommitCancellation::new(
+        "Desired mutation lock-wait test",
+        Instant::now() + Duration::from_millis(300),
+    );
+    assert!(matches!(
+        store.commit_desired_mutation_covered(&mutation, &state),
+        Err(CoveredDesiredMutationError::Store(ref error))
+            if error.code == ErrorCode::Unavailable
+    ));
+    assert!(!state.commit_was_sent());
+    release_lock.wait();
+    holder_thread.join().unwrap();
+    assert_desired_mutation_artifacts_absent(&store, &mutation);
+}
+
+#[test]
+fn desired_mutation_commit_response_loss_resolves_and_replays_exact_result() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "desired-response-loss",
+        1,
+        "desired-response-loss-create",
+    );
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let mutation = desired_mutation_request(
+        &create.candidate.desired,
+        advance_target(&create.candidate.desired, RuntimeTarget::Cold),
+        "op_desired_response_loss",
+        "desired-response-loss",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    let (_cancellation, state) = CoveredCommitCancellation::new(
+        "Desired mutation response-loss test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    store.inject_committed_response_loss_once();
+    assert!(matches!(
+        store.commit_desired_mutation_covered(&mutation, &state),
+        Err(CoveredDesiredMutationError::Store(ref error))
+            if error.code == ErrorCode::Unavailable
+    ));
+    assert!(state.commit_was_sent());
+    let resolved = store
+        .covered_api_result_after_commit(&mutation.idempotency)
+        .unwrap()
+        .expect("committed mutation result must resolve behind its API-key lock");
+    let DesiredMutationCommit::Replayed(replayed) =
+        commit_desired_mutation(&store, &mutation).unwrap()
+    else {
+        panic!("same API key must replay after an ambiguous commit response");
+    };
+    assert_eq!(replayed, resolved);
 }
 
 #[test]
@@ -1004,9 +1491,13 @@ fn desired_mutation_rejects_assigned_set_change_after_planning_without_any_commi
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
     let target = refresh_mutation_target(&planner, &identity, &policy, &release, 601);
+    let mut resized = advance_target(&create.candidate.desired, RuntimeTarget::Cold);
+    resized.runtime.memory_bytes += 4096;
+    resized.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    resized.spec_digest = spec_digest(&resized).unwrap();
     let mutation = desired_mutation_request(
         &create.candidate.desired,
-        advance_target(&create.candidate.desired, RuntimeTarget::Cold),
+        resized,
         "op_assigned_drift",
         "assigned-drift-mutation",
         vec![target],
@@ -1044,7 +1535,7 @@ fn assert_volume_guard_rejected_without_writes(
     request: &CoveredDesiredMutationRequest,
     label: &str,
 ) {
-    let error = store.commit_desired_mutation_covered(request).unwrap_err();
+    let error = commit_desired_mutation(store, request).unwrap_err();
     let CoveredDesiredMutationError::Store(error) = error else {
         panic!("{label}: volume mutation did not reach the typed Store guard");
     };
@@ -1311,7 +1802,6 @@ fn advance_current_endpoints(
     let policy = mutation_policy(&identity.node_id, &active_digest, 1);
     store.provision_node_identity(&identity).unwrap();
     insert_policy_on_store_for_test(store, &policy).unwrap();
-    let target = refresh_mutation_target(store, &identity, &policy, &release, 901);
     let endpoints = replacement
         .map(|(endpoint_id, name, _hostname)| {
             vec![EndpointRecordCandidate {
@@ -1327,12 +1817,12 @@ fn advance_current_endpoints(
         desired.clone(),
         operation_id.as_str(),
         &format!("advance-endpoints-{operation_id}"),
-        vec![target],
+        Vec::new(),
         active_digest,
         endpoints,
     );
     assert!(matches!(
-        store.commit_desired_mutation_covered(&mutation).unwrap(),
+        commit_desired_mutation(store, &mutation).unwrap(),
         DesiredMutationCommit::Changed(_)
     ));
     desired

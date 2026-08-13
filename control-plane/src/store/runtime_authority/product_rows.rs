@@ -11,9 +11,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
-    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
-    DiskSnapshotRecord, EndpointRecord, ExactContentType, HostnameDesiredLookup,
-    PersistentDiskInitialization, RuntimeOperationRead,
+    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DesiredMutationRowCapability,
+    DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord, EndpointRecord, ExactContentType,
+    HostnameDesiredLookup, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
@@ -893,6 +893,7 @@ pub(super) fn insert_desired(
 )]
 pub(super) fn replace_desired(
     transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
     expected: &DesiredRuntimeSpec,
     record: &DesiredRuntimeSpec,
 ) -> AuthorityTxResult<bool> {
@@ -1107,6 +1108,7 @@ pub(super) fn load_hostname_lookups_by_cat_unlocked(
 )]
 pub(super) fn delete_hostname_lookups_by_cat(
     transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
     cat_id: &Id,
 ) -> AuthorityTxResult<u64> {
     transaction
@@ -1261,6 +1263,7 @@ pub(super) fn load_operation_by_cat_revision_unlocked(
 )]
 pub(super) fn load_operation_by_cat_revision_for_update(
     transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
     cat_id: &Id,
     revision: Revision,
 ) -> AuthorityTxResult<Option<Operation>> {
