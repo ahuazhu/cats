@@ -1618,13 +1618,13 @@ fn ipv4_addresses(output: &[u8]) -> Result<Vec<HostIpv4Address>> {
 /// Return false only when the exact tap name is absent. A present tap with a
 /// different/missing token is foreign residue and must fail closed.
 fn exact_network_exists(
-    cfg: &ChConfig,
+    ip_bin: &Path,
     network: &ChNetwork,
     context: &IpCommandContext<'_>,
 ) -> Result<bool> {
     let output = run_ip_command(
         context,
-        &cfg.ip_bin,
+        ip_bin,
         &["-d", "link", "show", "dev", &network.tap],
     )
     .with_context(|| format!("inspect Host tap {}", network.tap))?;
@@ -1709,7 +1709,7 @@ pub(crate) fn prepare_network_with_tap_port(
     let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
     let context = IpCommandContext::Desired(effect_context);
 
-    if exact_network_exists(cfg, network, &context)? {
+    if exact_network_exists(&cfg.ip_bin, network, &context)? {
         let addresses = run_ip_command(
             &context,
             &cfg.ip_bin,
@@ -1808,7 +1808,7 @@ pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
     let context = IpCommandContext::Standalone {
         deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
     };
-    if exact_network_exists(cfg, network, &context)? {
+    if exact_network_exists(&cfg.ip_bin, network, &context)? {
         ip_status(
             &context,
             &cfg.ip_bin,
@@ -1818,14 +1818,41 @@ pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_network_bounded(
+    ip_bin: &Path,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+) -> Result<()> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    validate_network_plan(network)?;
+    let context = IpCommandContext::Desired(effect_context);
+    if exact_network_exists(ip_bin, network, &context)? {
+        context.check_active()?;
+        ip_status(&context, ip_bin, &["link", "delete", "dev", &network.tap])?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CH API socket: minimal HTTP/1.1 over a unix stream.
 // ---------------------------------------------------------------------------
 
 pub fn ch_api(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+    ch_api_bounded(sock, method, path, body, Duration::from_secs(60))
+}
+
+fn ch_api_bounded(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, String)> {
+    anyhow::ensure!(!timeout.is_zero(), "CH API timeout is zero");
     let mut stream = UnixStream::connect(sock)
         .with_context(|| format!("connect CH api socket {}", sock.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2719,6 +2746,14 @@ pub(crate) fn wait_api_ready(api_sock: &Path, vmm: &mut ProcHandle) -> Result<()
 
 pub fn pause(api_sock: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.pause", None)
+}
+
+pub(crate) fn pause_bounded(api_sock: &Path, timeout: Duration) -> Result<()> {
+    let (status, payload) = ch_api_bounded(api_sock, "PUT", "/api/v1/vm.pause", None, timeout)?;
+    if !(200..300).contains(&status) {
+        bail!("CH PUT /api/v1/vm.pause -> {status}: {payload}");
+    }
+    Ok(())
 }
 
 pub fn resume(api_sock: &Path) -> Result<()> {

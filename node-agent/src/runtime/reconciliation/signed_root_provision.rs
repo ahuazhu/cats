@@ -60,6 +60,7 @@ use super::signed_running::{
 };
 use super::vmm_process::VmmProcessGlobalPort;
 use super::vmm_start_runtime_effect::{StartRuntimePhysicalEffect, StartRuntimeReservationEffect};
+use super::LifecycleStepEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence,
     AuthorizedBlockdStore, FileCheckpointStore, PersistentFilesystemEffect,
@@ -143,6 +144,7 @@ pub(crate) struct SignedRootProvisionEffect {
 /// earlier state stays with the acquire/stale planner.
 pub(crate) struct SignedRunningEffect {
     running_admission: Option<RunningAdmissionEffect>,
+    lifecycle: Option<LifecycleStepEffect>,
     acquire: SignedRunningAcquireEffect,
     provision: SignedRootProvisionEffect,
     handoff: ServingHandoffEffect,
@@ -259,7 +261,7 @@ impl SignedRunningEffect {
         });
         let prepare_network = Arc::new(PrepareNetworkReservationEffect::new(
             state_directory.clone(),
-            network_ip_binary,
+            network_ip_binary.clone(),
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
@@ -301,6 +303,7 @@ impl SignedRunningEffect {
         )?;
         Ok(Self {
             running_admission: Some(running_admission),
+            lifecycle: Some(LifecycleStepEffect::platform(network_ip_binary)),
             acquire,
             provision: SignedRootProvisionEffect::platform(
                 Arc::clone(&authority),
@@ -340,6 +343,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
                 return Ok(outcome);
             }
             if let Some(outcome) = running_admission.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Some(outcome) = lifecycle.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -2720,6 +2728,7 @@ mod tests {
             .unwrap();
             SignedRunningEffect {
                 running_admission: None,
+                lifecycle: None,
                 acquire,
                 provision: self.effect_with_ports(process, retirement, request),
                 handoff,

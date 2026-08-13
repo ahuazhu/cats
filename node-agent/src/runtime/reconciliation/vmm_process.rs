@@ -595,6 +595,7 @@ impl VmmProcessExpectation {
             vsock_socket_path: self.vsock_socket_path().clone(),
             process_identity_token: self.launch.process_identity_token.clone(),
             runtime_incarnation: self.launch.runtime_incarnation.clone(),
+            state: ProcessState::Running,
             api_peer_process_id: process_id,
             fixed_descriptors_exact: true,
             api_socket_exact: true,
@@ -683,6 +684,7 @@ pub(crate) struct VmmProcessEvidence {
     vsock_socket_path: HostPath,
     process_identity_token: RandomId128,
     runtime_incarnation: RandomId128,
+    state: ProcessState,
     api_peer_process_id: u32,
     fixed_descriptors_exact: bool,
     api_socket_exact: bool,
@@ -708,6 +710,7 @@ impl VmmProcessEvidence {
             && self.vsock_socket_path == *expected.vsock_socket_path()
             && self.process_identity_token == *expected.process_identity_token()
             && self.runtime_incarnation == *expected.runtime_incarnation()
+            && matches!(self.state, ProcessState::Running | ProcessState::Paused)
             && self.api_peer_process_id == self.process_id
             && self.fixed_descriptors_exact
             && self.api_socket_exact
@@ -725,6 +728,14 @@ impl VmmProcessEvidence {
 
     pub(crate) fn api_socket_path(&self) -> &HostPath {
         &self.api_socket_path
+    }
+
+    pub(crate) fn process_start_time_ticks(&self) -> WireU64 {
+        self.process_start_time_ticks
+    }
+
+    pub(crate) fn state(&self) -> ProcessState {
+        self.state
     }
 
     pub(crate) fn vsock_socket_path(&self) -> &HostPath {
@@ -759,7 +770,7 @@ impl VmmProcessEvidence {
             executable_path: self.executable_path,
             scope_id: self.unit_id,
             control_socket_path: self.api_socket_path,
-            state: ProcessState::Running,
+            state: self.state,
             ownership_token: OwnershipTokenEvidence::Valid {
                 ownership_token: self.process_identity_token,
             },
@@ -1031,6 +1042,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                         }
                     }
                     context.check_active()?;
+                    let state = api_authority.process_state();
                     let physical_authority = VmmPhysicalAuthority::Platform {
                         descriptors: descriptor_authority,
                         api: Box::new(api_authority),
@@ -1073,6 +1085,7 @@ impl VmmProcessPort for PlatformSystemdVmmProcessPort {
                         vsock_socket_path: expected.vsock_socket_path().clone(),
                         process_identity_token: expected.process_identity_token().clone(),
                         runtime_incarnation: expected.runtime_incarnation().clone(),
+                        state,
                         api_peer_process_id: identity.process_id(),
                         fixed_descriptors_exact: true,
                         api_socket_exact: true,
