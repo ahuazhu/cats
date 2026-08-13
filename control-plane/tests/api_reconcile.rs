@@ -3395,18 +3395,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let workspace_base = format!("{}/v1/workspaces/{workspace_id}", production.base_url());
     let closed = vec![
         (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats/signed-cutover"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
             reqwest::Method::POST,
             format!("{workspace_base}/cats/signed-cutover/exec"),
             Some(serde_json::json!({"command": ["true"]})),
@@ -3455,45 +3443,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             reqwest::Method::GET,
             format!("{workspace_base}/cats/signed-cutover/work"),
             None,
-            "dev-admin-token",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats/signed-cutover/endpoints"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/disks"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/disks/{legacy_disk_id}"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
-            Some(serde_json::json!({"size_bytes": 16 << 20})),
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/old/actions/mount"),
-            Some(serde_json::json!({
-                "cat_id": "signed-cutover",
-                "mount_at": "/data"
-            })),
-            "dev-admin-token",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/old/actions/unmount"),
-            Some(serde_json::json!({})),
             "dev-admin-token",
         ),
         (
@@ -3622,6 +3571,58 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "legacy runtime entry point stayed reachable: {url}",
+        );
+    }
+
+    // Product reads are part of the cutover authority. They authenticate as
+    // production routes instead of falling through the retired-authority
+    // closure, even when a seeded legacy row shares the requested identity.
+    for url in [
+        format!("{workspace_base}/cats"),
+        format!("{workspace_base}/cats/signed-cutover"),
+        format!("{workspace_base}/disks"),
+        format!("{workspace_base}/disks/{legacy_disk_id}"),
+    ] {
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("invalid-before-cutover-gate")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "production product read did not reach its authentication envelope: {url}",
+        );
+    }
+
+    // Endpoint list and all legacy disk actions left the production method
+    // set. They must not be revived merely to preserve a debug-only handler.
+    assert_eq!(
+        client
+            .get(format!("{workspace_base}/cats/signed-cutover/endpoints"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+    );
+    for url in [
+        format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
+        format!("{workspace_base}/disks/old/actions/mount"),
+        format!("{workspace_base}/disks/old/actions/unmount"),
+    ] {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth("dev-admin-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "retired disk action stayed in the production route set: {url}",
         );
     }
 
