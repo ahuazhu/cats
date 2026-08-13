@@ -3331,13 +3331,13 @@ fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
     u64::try_from(device).ok()
 }
 
-#[cfg(target_os = "linux")]
-fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
-    links
-}
-
-#[cfg(not(target_os = "linux"))]
-fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
+// libc exposes `nlink_t` at different unsigned widths on supported targets.
+// The generic bound keeps the conversion lossless without making an identity
+// conversion visible to Clippy on targets where the alias is already `u64`.
+fn raw_link_count_to_u64<T>(links: T) -> u64
+where
+    u64: From<T>,
+{
     u64::from(links)
 }
 
