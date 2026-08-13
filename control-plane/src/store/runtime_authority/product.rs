@@ -2027,7 +2027,6 @@ fn commit_desired_publication_in(
     )?;
     checkpoint_covered_commit(transaction, commit_state)?;
 
-    let mut potential_system_replay = false;
     match mutation_class {
         DesiredMutationClass::SourceOnly => {
             let nodes = BTreeSet::from([
@@ -2048,12 +2047,6 @@ fn commit_desired_publication_in(
                     ));
                 }
             }
-            if publication.exact_replay && publication.system_request.is_some() {
-                checkpoint_covered_commit(transaction, commit_state)?;
-                potential_system_replay =
-                    load_desired_unlocked(transaction, &publication.expected_current.cat_id)?
-                        .is_some_and(|current| current == *publication.desired);
-            }
         }
         DesiredMutationClass::PlacementRequired => {
             for planned in publication.placement_snapshots {
@@ -2068,57 +2061,48 @@ fn commit_desired_publication_in(
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
             }
-            if publication.exact_replay && publication.system_request.is_some() {
-                checkpoint_covered_commit(transaction, commit_state)?;
-                potential_system_replay =
-                    load_desired_unlocked(transaction, &publication.expected_current.cat_id)?
-                        .is_some_and(|current| current == *publication.desired);
-            }
-            if !potential_system_replay {
-                for planned in publication.placement_snapshots {
-                    let mut checkpoint = |transaction: &mut Transaction<'_>| {
-                        checkpoint_covered_commit(transaction, commit_state)
-                    };
-                    if revalidate_desired_mutation_placement_after_identity_locks(
-                        transaction,
-                        planned,
-                        publication.active_guest_digest,
-                        &mut checkpoint,
-                    )? == PlacementCommitLoad::Stale
-                    {
-                        return Ok(DesiredPublicationOutcome::Stale);
-                    }
-                }
-                checkpoint_covered_commit(transaction, commit_state)?;
-                if revalidate_desired_mutation_post_assignment(
-                    publication.placement_snapshots,
-                    publication.expected_current,
-                    publication.desired,
+            for planned in publication.placement_snapshots {
+                let mut checkpoint = |transaction: &mut Transaction<'_>| {
+                    checkpoint_covered_commit(transaction, commit_state)
+                };
+                if revalidate_desired_mutation_placement_after_identity_locks(
+                    transaction,
+                    planned,
                     publication.active_guest_digest,
+                    &mut checkpoint,
                 )? == PlacementCommitLoad::Stale
                 {
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
             }
+            checkpoint_covered_commit(transaction, commit_state)?;
+            if revalidate_desired_mutation_post_assignment(
+                publication.placement_snapshots,
+                publication.expected_current,
+                publication.desired,
+                publication.active_guest_digest,
+            )? == PlacementCommitLoad::Stale
+            {
+                return Ok(DesiredPublicationOutcome::Stale);
+            }
         }
     }
 
-    // Domain evidence sits after the complete NodeIdentity/placement prefix
-    // and before Volume/Cat/Desired. An exact replay skips transient evidence:
-    // the stable source-derived Operation plus current==desired is its durable
-    // oracle even when a later observation replaced the original Busy fact.
+    // A committed system event already returned from the retained Operation
+    // lookup before entering this suffix. An Operation miss must validate the
+    // exact current source; current==desired alone is never replay authority.
+    // Covered API mutations have no system_request and retain their own
+    // reservation/result protocol.
     if let Some(request) = publication.system_request {
-        if !potential_system_replay {
-            checkpoint_covered_commit(transaction, commit_state)?;
-            let current = load_desired_unlocked(transaction, &request.expected_current.cat_id)?;
-            match current {
-                Some(current) if current == request.expected_current => {
-                    if !validate_system_desired_mutation_source(transaction, request)? {
-                        return Ok(DesiredPublicationOutcome::Stale);
-                    }
+        checkpoint_covered_commit(transaction, commit_state)?;
+        let current = load_desired_unlocked(transaction, &request.expected_current.cat_id)?;
+        match current {
+            Some(current) if current == request.expected_current => {
+                if !validate_system_desired_mutation_source(transaction, request)? {
+                    return Ok(DesiredPublicationOutcome::Stale);
                 }
-                _ => return Ok(DesiredPublicationOutcome::Stale),
             }
+            _ => return Ok(DesiredPublicationOutcome::Stale),
         }
     }
 
@@ -2135,9 +2119,7 @@ fn commit_desired_publication_in(
         }
     }
 
-    if !potential_system_replay
-        && publication.expected_current.placement.node_id != publication.desired.placement.node_id
-    {
+    if publication.expected_current.placement.node_id != publication.desired.placement.node_id {
         let network_id = &publication.desired.runtime.network_config.network_id;
         checkpoint_covered_commit(transaction, commit_state)?;
         lock_candidate_id(transaction, "network", network_id)?;
