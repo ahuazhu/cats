@@ -176,6 +176,9 @@ impl Ed25519RequestSigner {
         let der = decode_pkcs8_pem(private_key_pem)?;
         let key_pair =
             Ed25519KeyPair::from_pkcs8(&der).map_err(|_| RequestSignerError::InvalidPrivateKey)?;
+        if encode_canonical_pkcs8_pem(&der).as_slice() != private_key_pem {
+            return Err(RequestSignerError::InvalidPrivateKeyPem);
+        }
         let public_key = key_pair.public_key().as_ref();
         if public_key.len() != 32 {
             return Err(RequestSignerError::InvalidPrivateKey);
@@ -376,6 +379,18 @@ fn decode_pkcs8_pem(input: &[u8]) -> Result<Vec<u8>, RequestSignerError> {
     Ok(der)
 }
 
+fn encode_canonical_pkcs8_pem(der: &[u8]) -> Vec<u8> {
+    let encoded = STANDARD.encode(der);
+    let mut pem = Vec::with_capacity(encoded.len() + 80);
+    pem.extend_from_slice(b"-----BEGIN PRIVATE KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.extend_from_slice(chunk);
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(b"-----END PRIVATE KEY-----\n");
+    pem
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRegistrationError {
@@ -488,12 +503,16 @@ mod tests {
         .into_bytes()
     }
 
+    fn canonical_pem(der: &[u8]) -> Vec<u8> {
+        encode_canonical_pkcs8_pem(der)
+    }
+
     #[test]
     fn strict_pkcs8_v2_requires_and_checks_the_embedded_public_key() {
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let strict = Ed25519RequestSigner::from_pkcs8_v2_pem(
             Id::new("credential_a").unwrap(),
-            &pem(document.as_ref()),
+            &canonical_pem(document.as_ref()),
         )
         .unwrap();
         assert_eq!(strict.public_key_spki_der().len(), ED25519_SPKI_LEN);
@@ -502,7 +521,7 @@ mod tests {
         *mismatched_public_half.last_mut().unwrap() ^= 1;
         assert!(Ed25519RequestSigner::from_pkcs8_v2_pem(
             Id::new("credential_a").unwrap(),
-            &pem(&mismatched_public_half),
+            &canonical_pem(&mismatched_public_half),
         )
         .is_err());
 
@@ -510,13 +529,45 @@ mod tests {
         v1.extend_from_slice(&hex::decode(SEED).unwrap());
         assert!(Ed25519RequestSigner::from_pkcs8_v2_pem(
             Id::new("credential_a").unwrap(),
-            &pem(&v1),
+            &canonical_pem(&v1),
         )
         .is_err());
         assert!(
             Ed25519RequestSigner::from_pkcs8_pem(Id::new("credential_a").unwrap(), &pem(&v1),)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn strict_pkcs8_v2_requires_the_generator_pem_encoding() {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let canonical = canonical_pem(document.as_ref());
+        let credential_id = || Id::new("credential_a").unwrap();
+        assert!(Ed25519RequestSigner::from_pkcs8_v2_pem(credential_id(), &canonical).is_ok());
+
+        let mut no_final_lf = canonical.clone();
+        assert_eq!(no_final_lf.pop(), Some(b'\n'));
+
+        let encoded = STANDARD.encode(document.as_ref());
+        let reflowed =
+            format!("-----BEGIN PRIVATE KEY-----\n{encoded}\n-----END PRIVATE KEY-----\n")
+                .into_bytes();
+
+        let mut blank_line = canonical.clone();
+        let body_offset = b"-----BEGIN PRIVATE KEY-----\n".len();
+        blank_line.insert(body_offset, b'\n');
+
+        let crlf = String::from_utf8(canonical.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+
+        let mut extra_lf = canonical.clone();
+        extra_lf.push(b'\n');
+
+        for malformed in [no_final_lf, reflowed, blank_line, crlf, extra_lf] {
+            assert!(Ed25519RequestSigner::from_pkcs8_v2_pem(credential_id(), &malformed).is_err());
+        }
     }
 
     #[test]

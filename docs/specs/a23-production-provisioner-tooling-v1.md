@@ -28,8 +28,10 @@ cats --json admin runtime-provisioner trust verify \
   --trust-bundle /approved/provisioning/runtime-provisioner-trust.v1.json
 ```
 
-两个输出路径必须是绝对路径。private key 用系统 CSPRNG 生成唯一 Ed25519 PKCS#8 v2；parser要求内嵌 public
-half 并验证它，不能接受只含 seed 的 PKCS#8 v1、其他算法、裸 key 或自定义 PEM。private key 是 single-link、
+两个输出路径必须是绝对路径。private key 用系统 CSPRNG 生成唯一 Ed25519 PKCS#8 v2；A23 parser要求内嵌 public
+half 并验证它，且只接受 generator 的 canonical PEM bytes：固定 `PRIVATE KEY` header/footer、base64 每行 64 列、
+LF 换行和一个 final LF。它不能接受只含 seed 的 PKCS#8 v1、其他算法、裸 key、自定义 PEM、reflow、blank
+line、CRLF、缺失 final LF 或额外 LF；A19 runtime compatibility parser 不受此收紧影响。private key 是 single-link、
 current-user-owned、exact `0600` regular file；发布使用同目录 exclusive temporary file、file fsync、atomic
 no-replace rename 与 parent fsync。目标已存在时只有 bytes 和 metadata 全部 exact 才是幂等成功，不覆盖或重生。
 
@@ -126,11 +128,10 @@ parent fsync；已存在只接受exact bytes+metadata，因此任一 crash重跑
 
 | 边界 | oracle |
 |---|---|
-| trust | PKCS#8 v2 positive；PKCS#8 v1/错SPKI/非canonical bundle/unknown或LF拒绝；重复generate不换key |
+| trust | generator PKCS#8 v2 positive；PKCS#8 v1/错SPKI/非canonical PEM或bundle/unknown或LF拒绝；重复generate不换key |
 | secret | bundle、receipt、argv/env无private bytes；key exact 0600/single-link/no-follow |
 | recovery | partial closed set可清；unexpected set不删除；complete marker replay不换key；immutable field drift拒绝 |
 | activation | wrong/noncanonical/wrong-node/non-provision result零active写；每个active file窗口可重放；artifact last |
 | filesystem | protected ancestors、root-only identity dir、lock、mode/link/symlink/no-replace、file+directory fsync |
 | composition | worker bundle携同commit `cats`；Node startup继续独立运行same material validator |
 | authority | 只有官方 `cats admin runtime-node provision`发signed request；无SQL/curl/alternate signer |
-

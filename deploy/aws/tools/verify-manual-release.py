@@ -28,6 +28,7 @@ MAX_BOOT_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_WORKER_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_WORKER_MEMBER_BYTES = 512 * 1024 * 1024
 WORKER_STATIC_FILES = {
+    "cats",
     "cats-noded",
     "cats-vmm-launcher",
     "cats-blockd",
@@ -56,6 +57,7 @@ WORKER_DIRECTORIES = {
     "guest-runtime-release.v1/guest",
 }
 WORKER_EXECUTABLE_FILES = {
+    "cats",
     "cats-noded",
     "cats-vmm-launcher",
     "cats-blockd",

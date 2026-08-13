@@ -466,6 +466,44 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     }
 
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let manual_verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    let manual_fixture = read_workspace_file("deploy/aws/tools/manual-release-fixture.py");
+    assert_eq!(
+        dockerfile
+            .matches("COPY --from=builder /out/cats /cats")
+            .count(),
+        1,
+        "worker artifact must publish exactly one Host-local cats provisioner binary"
+    );
+    assert_eq!(
+        installer
+            .matches(
+                "install -m 0755 \"$CATS_REPO/target/release/cats\" \"$CATS_PREFIX/bin/cats\"",
+            )
+            .count(),
+        1,
+        "metal installer must install exactly one Host-local cats provisioner binary"
+    );
+    assert_eq!(
+        deployment
+            .matches("install -D -m 0755 \"$stage_path/cats\" \"${var.install_root}/bin/cats\"",)
+            .count(),
+        1,
+        "Terraform worker transaction must install the bundled cats provisioner binary"
+    );
+    assert_eq!(
+        manual_verifier.matches("    \"cats\",").count(),
+        2,
+        "manual verifier must classify cats as exactly one required executable member"
+    );
+    assert_eq!(
+        manual_fixture.matches("    \"cats\",").count(),
+        2,
+        "manual verifier fixture must mirror cats in its file and executable sets"
+    );
     for executable_copy in [
         "COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh",
         "COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh",
@@ -492,8 +530,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         );
     }
 
-    let deployment =
-        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     let early_idle_guard = deployment
         .find(
             "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",

@@ -15,6 +15,7 @@ import tempfile
 
 
 WORKER_FILES = {
+    "cats",
     "cats-noded",
     "cats-vmm-launcher",
     "cats-blockd",
@@ -152,8 +153,14 @@ def run_verifier(
     return result
 
 
-def package_worker(root: Path, *, add_traversal: bool = False) -> None:
+def package_worker(
+    root: Path,
+    *,
+    worker_files: set[str] | None = None,
+    add_traversal: bool = False,
+) -> None:
     worker = root / "worker"
+    selected_files = WORKER_FILES if worker_files is None else worker_files
     tar_path = root / "worker.tar"
     bundle = root / "cats-worker.tar.zst"
     with tarfile.open(tar_path, mode="w", format=tarfile.USTAR_FORMAT) as archive:
@@ -165,7 +172,7 @@ def package_worker(root: Path, *, add_traversal: bool = False) -> None:
             member.gid = 0
             member.mtime = 0
             archive.addfile(member)
-        for relative in sorted(WORKER_FILES):
+        for relative in sorted(selected_files):
             raw = (worker / relative).read_bytes()
             member = tarfile.TarInfo(relative)
             member.mode = (worker / relative).stat().st_mode & 0o777
@@ -196,6 +203,7 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
     worker_release = root / "worker/guest-runtime-release.v1"
     shutil.copytree(shared, worker_release)
     executable = {
+        "cats",
         "cats-noded",
         "cats-vmm-launcher",
         "cats-blockd",
@@ -264,6 +272,32 @@ def main() -> int:
             root / "control/opt/cats/release/guest-runtime-profile.v1.json",
             members["profile"],
         )
+
+        cats = root / "worker/cats"
+        cats.unlink()
+        package_worker(root, worker_files=WORKER_FILES - {"cats"})
+        missing_cats = run_verifier(verifier, root, output, expect_success=False)
+        assert b"file set differs" in missing_cats.stderr
+        assert b"cats" in missing_cats.stderr
+        assert not output.exists()
+
+        write_member(cats, b"fixture-cats\n", 0o755)
+        unexpected = root / "worker/unexpected-worker-file"
+        write_member(unexpected, b"unexpected\n", 0o644)
+        package_worker(root, worker_files=WORKER_FILES | {"unexpected-worker-file"})
+        extra_member = run_verifier(verifier, root, output, expect_success=False)
+        assert b"file set differs" in extra_member.stderr
+        assert b"unexpected-worker-file" in extra_member.stderr
+        assert not output.exists()
+        unexpected.unlink()
+
+        cats.chmod(0o644)
+        package_worker(root)
+        wrong_cats_mode = run_verifier(verifier, root, output, expect_success=False)
+        assert b"member mode is not 0755: cats" in wrong_cats_mode.stderr
+        assert not output.exists()
+        cats.chmod(0o755)
+
         write_member(root / "worker/guest-runtime-release.v1/guest/vmlinuz", b"corrupt")
         package_worker(root)
         corrupt = run_verifier(verifier, root, output, expect_success=False)
