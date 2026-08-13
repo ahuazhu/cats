@@ -185,7 +185,7 @@ impl Store {
         guard: &SystemDesiredMutationCommitGuard,
     ) -> Result<SystemDesiredMutationCommit> {
         let request = plan.into_system_request()?;
-        self.commit_system_desired_mutation(&request, guard.state())
+        self.commit_system_desired_mutation(&request, &guard.state())
     }
 
     /// Plans one Endpoint-only successor from a complete, repeatable-read
