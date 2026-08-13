@@ -28,6 +28,9 @@ use super::product_identity::ProductIdentitySource;
 use super::product_rows::{
     load_cat_by_id_unlocked, load_desired_unlocked, load_endpoint_by_id_unlocked,
 };
+use super::route_epoch_engine::{
+    EndpointBindingWithoutEpoch, EndpointMutation, RouteEpochMutationPlan,
+};
 use super::rows::{database_now, load_active_event_by_node_unlocked};
 use super::runtime_spine::{load_placement_admission_at_in, PlacementAdmissionLoad};
 use crate::store::{Result, Store};
@@ -425,7 +428,6 @@ pub(crate) struct ProductMutationHttpResult {
 #[derive(Debug)]
 pub(crate) enum ProductMutationServiceError {
     Request(ApiError),
-    NotFound,
     TemporarilyUnavailable,
     Fatal(ApiError),
 }
@@ -449,7 +451,7 @@ impl From<ApiError> for ProductMutationServiceError {
 enum CommitOutcome {
     Committed(ApiIdempotencyResult),
     Stale,
-    OperationCollision,
+    CandidateCollision(CandidateCollision),
 }
 
 pub(crate) struct ProductMutationService {
@@ -507,12 +509,15 @@ impl ProductMutationService {
             (ProductMutation::DeleteDisk { disk_id }, None) => {
                 return self.delete_disk(ingress, disk_id).await;
             }
-            (ProductMutation::BindEndpoint(_), _) | (ProductMutation::UnbindEndpoint { .. }, _) => {
-                return Err(ProductMutationServiceError::Request(
-                    ApiError::failed_precondition(
-                        "this mutation requires its covered route/disk planner",
-                    ),
-                ));
+            (ProductMutation::BindEndpoint(body), Some(cat_id)) => {
+                return self
+                    .mutate_endpoint(ingress, cat_id, Some(body), None)
+                    .await;
+            }
+            (ProductMutation::UnbindEndpoint { endpoint_id }, Some(cat_id)) => {
+                return self
+                    .mutate_endpoint(ingress, cat_id, None, Some(endpoint_id))
+                    .await;
             }
             _ => {
                 return Err(ProductMutationServiceError::Request(ApiError::invalid(
@@ -598,7 +603,13 @@ impl ProductMutationService {
                 .await?
             {
                 CommitOutcome::Committed(result) => return Ok(http_result(result)),
-                CommitOutcome::Stale | CommitOutcome::OperationCollision => continue,
+                CommitOutcome::Stale
+                | CommitOutcome::CandidateCollision(CandidateCollision::OperationId) => continue,
+                CommitOutcome::CandidateCollision(_) => {
+                    return Err(ProductMutationServiceError::Fatal(ApiError::internal(
+                        "lifecycle mutation returned an impossible candidate collision",
+                    )));
+                }
             }
         }
         Err(ProductMutationServiceError::TemporarilyUnavailable)
@@ -663,6 +674,96 @@ impl ProductMutationService {
         outcome
             .map(http_result)
             .map_err(ProductMutationServiceError::from_api)
+    }
+
+    async fn mutate_endpoint(
+        &self,
+        ingress: AuthorizedProductMutationIngress,
+        cat_id: Id,
+        bind: Option<EndpointBindBody>,
+        unbind: Option<Id>,
+    ) -> std::result::Result<ProductMutationHttpResult, ProductMutationServiceError> {
+        let mut shutdown = self.admission.subscribe();
+        for _ in 0..MAX_REPLANS {
+            if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
+                return Err(ProductMutationServiceError::TemporarilyUnavailable);
+            }
+            let endpoint = if let Some(body) = &bind {
+                let endpoint_id = prefixed_id("ep_", self.identities.random_id()?)?;
+                EndpointMutation::Bind {
+                    record: EndpointRecordCandidate {
+                        endpoint_id,
+                        workspace_id: ingress.idempotency.authenticated_workspace_id.clone(),
+                        cat_id: cat_id.clone(),
+                        name: body.name.clone(),
+                    },
+                    intent: EndpointBindingWithoutEpoch::http(
+                        body.hostname.clone(),
+                        body.target_port,
+                    )?,
+                }
+            } else {
+                EndpointMutation::Unbind {
+                    endpoint_id: unbind
+                        .clone()
+                        .ok_or_else(|| ApiError::internal("Endpoint unbind ID is missing"))?,
+                }
+            };
+            let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
+            let plan_cat_id = cat_id.clone();
+            let plan = await_before_deadline(
+                ingress.absolute_deadline,
+                self.store.execute(move |store| {
+                    store.plan_endpoint_route_mutation(&workspace_id, &plan_cat_id, endpoint)
+                }),
+            )
+            .await;
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let (status, body) = match error.code {
+                        ErrorCode::NotFound => (404, NOT_FOUND_BODY),
+                        ErrorCode::Conflict => (409, PRECONDITION_BODY),
+                        ErrorCode::FailedPrecondition => (412, PRECONDITION_BODY),
+                        ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => {
+                            return Err(ProductMutationServiceError::TemporarilyUnavailable);
+                        }
+                        ErrorCode::Internal => {
+                            return Err(ProductMutationServiceError::Fatal(error))
+                        }
+                        _ => return Err(ProductMutationServiceError::Request(error)),
+                    };
+                    return self.fixed_result(ingress, status, body).await;
+                }
+            };
+            if let Some(if_match) = ingress.if_match {
+                if if_match.get() != plan.expected_current.desired_revision.get() {
+                    return self.fixed_result(ingress, 409, IF_MATCH_BODY).await;
+                }
+            }
+            let operation_id = prefixed_id("op_", self.identities.random_id()?)?;
+            let covered = covered_endpoint_request(&ingress, plan, operation_id);
+            match self
+                .commit(covered, ingress.absolute_deadline, &mut shutdown)
+                .await?
+            {
+                CommitOutcome::Committed(result) => return Ok(http_result(result)),
+                CommitOutcome::Stale
+                | CommitOutcome::CandidateCollision(CandidateCollision::OperationId)
+                | CommitOutcome::CandidateCollision(CandidateCollision::EndpointIdOrName) => {
+                    continue;
+                }
+                CommitOutcome::CandidateCollision(CandidateCollision::Hostname) => {
+                    return self.fixed_result(ingress, 409, PRECONDITION_BODY).await;
+                }
+                CommitOutcome::CandidateCollision(_) => {
+                    return Err(ProductMutationServiceError::Fatal(ApiError::internal(
+                        "Endpoint mutation returned an impossible candidate collision",
+                    )));
+                }
+            }
+        }
+        Err(ProductMutationServiceError::TemporarilyUnavailable)
     }
 
     async fn delete_disk(
@@ -759,13 +860,8 @@ impl ProductMutationService {
                     | DesiredMutationCommit::Changed(result),
                 )) => Ok(CommitOutcome::Committed(result)),
                 Ok(Err(CoveredDesiredMutationError::Stale)) => Ok(CommitOutcome::Stale),
-                Ok(Err(CoveredDesiredMutationError::CandidateCollision(
-                    CandidateCollision::OperationId,
-                ))) => Ok(CommitOutcome::OperationCollision),
-                Ok(Err(CoveredDesiredMutationError::CandidateCollision(_))) => {
-                    Err(ApiError::internal(
-                        "lifecycle mutation returned an impossible identity collision",
-                    ))
+                Ok(Err(CoveredDesiredMutationError::CandidateCollision(collision))) => {
+                    Ok(CommitOutcome::CandidateCollision(collision))
                 }
                 Ok(Err(CoveredDesiredMutationError::Store(error))) | Err(error)
                     if observer.commit_was_sent() =>
@@ -890,7 +986,26 @@ fn build_lifecycle_request(
         active_guest_digest,
         endpoint_records: snapshot.endpoint_records,
         volume_mutation,
+        require_idle_open_busy_proof: None,
     })
+}
+
+fn covered_endpoint_request(
+    ingress: &AuthorizedProductMutationIngress,
+    plan: RouteEpochMutationPlan,
+    operation_id: Id,
+) -> CoveredDesiredMutationRequest {
+    CoveredDesiredMutationRequest {
+        idempotency: ingress.idempotency.clone(),
+        expected_current: plan.expected_current,
+        desired: plan.desired,
+        operation_id,
+        placement_snapshots: plan.placement_snapshots,
+        active_guest_digest: plan.active_guest_digest,
+        endpoint_records: plan.endpoint_records,
+        volume_mutation: DesiredVolumeMutation::Preserve,
+        require_idle_open_busy_proof: plan.require_idle_open_busy_proof,
+    }
 }
 
 fn prefixed_id(prefix: &str, random: cats_api::runtime_reconciliation::RandomId128) -> Result<Id> {
