@@ -13,6 +13,7 @@ pub(crate) mod product_identity;
 pub(crate) mod product_mutation_service;
 pub(crate) mod product_reads;
 mod product_rows;
+pub(crate) mod route_epoch_engine;
 pub(crate) mod route_signer;
 pub(crate) mod route_signing_authority;
 pub(super) mod rows;

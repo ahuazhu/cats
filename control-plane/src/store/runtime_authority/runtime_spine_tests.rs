@@ -26,11 +26,11 @@ use cats_api::runtime_reconciliation::{
     ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation, OperationFailure,
     OperationPhase, OperationTerminal, OwnershipTokenEvidence, PlacementRejectionReason,
     PreconditionFailureReason, ProcessEvidence, ProcessRole, ProcessState, QuarantineReason,
-    RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
-    RuntimeConfig, RuntimeLaunch, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
-    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
-    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
-    Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+    RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint, Revision, RouteGateBinding,
+    RouteGateState, RuntimeConfig, RuntimeLaunch, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence,
+    SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
 };
 
 use super::placement_policy::insert_policy_on_store_for_test;
@@ -898,6 +898,150 @@ pub(super) fn refresh_assigned_admission_for_test(
         PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
         PlacementAdmissionLoad::Rejected(rejection) => {
             panic!("assigned admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AcceptedRouteRuntimeKind {
+    Running,
+    RequireIdleBusy { gate_closed: bool },
+}
+
+/// Establishes a fresh session/full inventory whose per-Cat route runtime is
+/// suitable for G4 planning.  Unlike `refresh_assigned_admission_for_test`,
+/// this preserves a real Running incarnation and an exact terminal
+/// RequireIdle checkpoint/Condition when requested.
+pub(super) fn refresh_assigned_route_runtime_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+    kind: AcceptedRouteRuntimeKind,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let runtimes = snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            let mut runtime = route_ready_runtime(desired);
+            let Some(applied) = runtime.applied_desired.as_mut() else {
+                panic!("route-ready fixture has applied Desired");
+            };
+            applied.target = desired.target;
+            if let AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed } = kind {
+                let RuntimeTransition::RequireIdle {
+                    attempt_id,
+                    source_revision,
+                    source_runtime_incarnation,
+                } = &desired.transition
+                else {
+                    panic!("Busy fixture requires a RequireIdle Desired");
+                };
+                assert_eq!(
+                    runtime.runtime_incarnation.as_ref(),
+                    Some(source_runtime_incarnation),
+                    "fixture source incarnation must remain physically present"
+                );
+                let platform_guards = u32::from(!gate_closed);
+                runtime.platform_guards = platform_guards;
+                runtime.lifecycle_admission = if gate_closed {
+                    LifecycleAdmission::Closed
+                } else {
+                    LifecycleAdmission::Open
+                };
+                for route in &mut runtime.routes {
+                    route.gate = if gate_closed {
+                        RouteGateState::Closed
+                    } else {
+                        RouteGateState::Active
+                    };
+                }
+                let busy = RequireIdleCheckpoint::Busy {
+                    attempt_id: attempt_id.clone(),
+                    source_revision: *source_revision,
+                    source_runtime_incarnation: source_runtime_incarnation.clone(),
+                    gate_closed,
+                    platform_guards,
+                    endpoint_guards: Vec::new(),
+                };
+                let CheckpointEvidence::Valid { require_idle, .. } = &mut runtime.checkpoint else {
+                    panic!("route-ready fixture has a valid checkpoint");
+                };
+                *require_idle = Box::new(busy);
+                runtime.conditions = vec![Condition::PreconditionFailed {
+                    reason: PreconditionFailureReason::Busy {
+                        attempt_id: attempt_id.clone(),
+                        gate_closed,
+                        platform_guards,
+                        endpoint_guards: Vec::new(),
+                    },
+                }];
+            }
+            runtime
+        })
+        .collect();
+    let full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        runtimes,
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("route runtime admission unexpectedly rejected: {rejection:?}")
         }
     }
 }

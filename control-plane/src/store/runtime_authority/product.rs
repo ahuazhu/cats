@@ -52,13 +52,14 @@ use super::product_rows::{
     load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
     update_disk, update_operation,
 };
+use super::route_epoch_engine::RequireIdleOpenBusyProof;
 use super::rows::{
     database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
     update_volume, volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
     load_placement_admission_at_in, lock_placement_admission_for_desired_mutation,
-    PlacementAdmissionLoad, PlacementAdmissionSnapshot,
+    validate_require_idle_open_busy_proof_in, PlacementAdmissionLoad, PlacementAdmissionSnapshot,
 };
 use crate::store::agent_sessions::{
     load_identity_by_node_for_update, load_provisioned_node_keys_after,
@@ -428,6 +429,8 @@ pub(crate) struct CoveredDesiredMutationRequest {
     pub(crate) active_guest_digest: Sha256Digest,
     pub(crate) endpoint_records: Vec<EndpointRecordCandidate>,
     pub(crate) volume_mutation: DesiredVolumeMutation,
+    /// The sole old-serving-epoch recovery exception. `None` is conservative.
+    pub(crate) require_idle_open_busy_proof: Option<RequireIdleOpenBusyProof>,
 }
 
 /// The only A2 lifecycle mutation allowed to change a VolumeIntent.  The
@@ -1312,6 +1315,14 @@ fn commit_desired_mutation_in(
             {
                 return Ok(DesiredMutationTransactionOutcome::Stale);
             }
+        }
+    }
+
+    if let Some(proof) = &request.require_idle_open_busy_proof {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        if !validate_require_idle_open_busy_proof_in(transaction, &request.expected_current, proof)?
+        {
+            return Ok(DesiredMutationTransactionOutcome::Stale);
         }
     }
 
@@ -2250,7 +2261,11 @@ fn validate_desired_mutation_request(
         ));
     }
     validate_desired_volume_mutation(request)?;
-    validate_route_epoch_successor(&request.expected_current, &request.desired)?;
+    validate_route_epoch_successor(
+        &request.expected_current,
+        &request.desired,
+        request.require_idle_open_busy_proof.as_ref(),
+    )?;
 
     let mutation_class = if old_placement != new_placement
         || request.expected_current.runtime != request.desired.runtime
@@ -2484,18 +2499,39 @@ fn lock_and_validate_cat_delete_volumes(
 fn validate_route_epoch_successor(
     current: &DesiredRuntimeSpec,
     desired: &DesiredRuntimeSpec,
+    require_idle_open_busy_proof: Option<&RequireIdleOpenBusyProof>,
 ) -> Result<()> {
-    // This A1 boundary carries no G4 RequireIdle Busy/Open proof that a gate
-    // stayed open. Every successor that re-enters Running, or changes another
-    // global Running binding, is therefore a real reopen and burns all
-    // retained Endpoint epochs.
-    let reopens_running =
-        current.target != RuntimeTarget::Running && desired.target == RuntimeTarget::Running;
+    // Every successor that re-enters Running, or changes another global
+    // Running binding, is a real reopen unless G4 carries the one exact
+    // accepted RequireIdle Busy/Open proof and A1 revalidates it under lock.
+    let proven_open_busy_recovery = require_idle_open_busy_proof.is_some_and(|proof| {
+        matches!(
+            &current.transition,
+            RuntimeTransition::RequireIdle {
+                attempt_id,
+                source_revision,
+                source_runtime_incarnation,
+            } if current.target == RuntimeTarget::Suspended
+                && desired.target == RuntimeTarget::Running
+                && desired.transition == RuntimeTransition::CancelAndDrain
+                && proof.attempt_id == *attempt_id
+                && proof.source_revision == *source_revision
+                && proof.source_runtime_incarnation == *source_runtime_incarnation
+        )
+    });
+    if require_idle_open_busy_proof.is_some() && !proven_open_busy_recovery {
+        return Err(invalid_desired_mutation_bundle(
+            "RequireIdle open-Busy proof does not bind this exact recovery",
+        ));
+    }
+    let reopens_running = current.target != RuntimeTarget::Running
+        && desired.target == RuntimeTarget::Running
+        && !proven_open_busy_recovery;
     let rebinds_running_globally = desired.target == RuntimeTarget::Running
         && (current.placement != desired.placement
             || current.runtime != desired.runtime
             || current.volumes != desired.volumes
-            || current.transition != desired.transition);
+            || (current.transition != desired.transition && !proven_open_busy_recovery));
     for successor in &desired.endpoints {
         let Some(predecessor) = current
             .endpoints
@@ -2609,12 +2645,16 @@ fn desired_semantics_equal(
     current: &DesiredRuntimeSpec,
     candidate: &DesiredRuntimeSpec,
 ) -> AuthorityTxResult<bool> {
-    let mut normalized = candidate.clone();
-    normalized.desired_revision = current.desired_revision;
+    // Normalize the older snapshot forward. Normalizing a RequireIdle
+    // successor backward can make its source revision equal to the Desired
+    // revision, which is intrinsically invalid even though the successor is
+    // canonical.
+    let mut normalized = current.clone();
+    normalized.desired_revision = candidate.desired_revision;
     normalized.spec_digest = Sha256Digest::from_bytes([0; 32]);
     normalized.spec_digest = cats_api::runtime_reconciliation::spec_digest(&normalized)
         .map_err(stored_corruption_from_debug)?;
-    Ok(&normalized == current)
+    Ok(&normalized == candidate)
 }
 
 #[allow(

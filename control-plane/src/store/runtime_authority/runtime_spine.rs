@@ -33,6 +33,7 @@ use super::product_rows::{
     load_assigned_desired_for_update, load_assigned_desired_unlocked, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_operation,
 };
+use super::route_epoch_engine::{open_busy_proof_matches, RequireIdleOpenBusyProof};
 use super::rows::{database_now, load_delete_completion_for_update, load_volume_for_update};
 use crate::store::agent_sessions::{
     load_current_session_for_update, load_current_session_unlocked,
@@ -671,13 +672,13 @@ enum ObservationSourceKind {
     Partial,
 }
 
-struct CurrentCatObservation {
-    runtime: ObservedRuntimeStatus,
-    session: SessionBinding,
-    inventory_epoch: Epoch,
-    source_observation_id: RandomId128,
-    heartbeat_sequence: Sequence,
-    accepted_at_unix_ms: UnixMillis,
+pub(super) struct CurrentCatRuntime {
+    pub(super) runtime: ObservedRuntimeStatus,
+    pub(super) session: SessionBinding,
+    pub(super) inventory_epoch: Epoch,
+    pub(super) source_observation_id: RandomId128,
+    pub(super) heartbeat_sequence: Sequence,
+    pub(super) accepted_at_unix_ms: UnixMillis,
     source_kind: ObservationSourceKind,
 }
 
@@ -3164,7 +3165,7 @@ fn load_current_cat_observation(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
     cat_id: &Id,
-) -> AuthorityTxResult<Option<CurrentCatObservation>> {
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
     let Some(row) = transaction.query_opt(
         "SELECT runtime_record::text AS runtime_json, node_id, cat_id,
                 node_boot_id, agent_instance_id, agent_session_epoch,
@@ -3177,6 +3178,10 @@ fn load_current_cat_observation(
     else {
         return Ok(None);
     };
+    decode_current_cat_runtime(&row).map(Some)
+}
+
+fn decode_current_cat_runtime(row: &Row) -> AuthorityTxResult<CurrentCatRuntime> {
     let runtime_json: String = row.try_get("runtime_json")?;
     let runtime: ObservedRuntimeStatus = serde_json::from_str(&runtime_json).map_err(corrupt)?;
     let projected_node_id =
@@ -3207,7 +3212,7 @@ fn load_current_cat_observation(
     if runtime.cat_id != projected_cat_id {
         return Err(corrupt("per-Cat runtime JSON/projection mismatch"));
     }
-    Ok(Some(CurrentCatObservation {
+    Ok(CurrentCatRuntime {
         runtime,
         session,
         inventory_epoch,
@@ -3215,7 +3220,71 @@ fn load_current_cat_observation(
         heartbeat_sequence,
         accepted_at_unix_ms,
         source_kind,
-    }))
+    })
+}
+
+/// Repeatable-read planner projection for G4.  This is not commit authority:
+/// an old-epoch Busy exception is revalidated under the A1 mutation lock
+/// prefix before the successor Desired can commit.
+#[allow(
+    dead_code,
+    reason = "G4 Store planners are composed by the parallel A2/A3 slices"
+)]
+pub(super) fn load_current_cat_runtime_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
+    load_current_cat_observation(transaction, node_id, cat_id)
+}
+
+/// Commit-side G4 proof consumption.  The caller already holds the affected
+/// NodeIdentity union; locking the current session and per-Cat observation
+/// here serializes session replacement and a later accepted observation
+/// before A1 acquires Cat/Desired/product locks.
+pub(super) fn validate_require_idle_open_busy_proof_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    proof: &RequireIdleOpenBusyProof,
+) -> AuthorityTxResult<bool> {
+    if proof.node_id != expected_current.placement.node_id {
+        return Ok(false);
+    }
+    let Some(session) = load_current_session_for_update(transaction, &proof.node_id)? else {
+        return Ok(false);
+    };
+    if session.agent_session_epoch != proof.agent_session_epoch {
+        return Ok(false);
+    }
+    let Some(observed) =
+        load_current_cat_runtime_for_update(transaction, &proof.node_id, &expected_current.cat_id)?
+    else {
+        return Ok(false);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(false);
+    }
+    Ok(open_busy_proof_matches(expected_current, &observed, proof))
+}
+
+fn load_current_cat_runtime_for_update(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
+    let Some(row) = transaction.query_opt(
+        "SELECT runtime_record::text AS runtime_json, node_id, cat_id,
+                node_boot_id, agent_instance_id, agent_session_epoch,
+                inventory_epoch, source_observation_id, heartbeat_sequence,
+                accepted_at_unix_ms, source_kind
+           FROM runtime_current_cat_observations
+          WHERE node_id=$1 AND cat_id=$2 FOR UPDATE",
+        &[&node_id.as_str(), &cat_id.as_str()],
+    )?
+    else {
+        return Ok(None);
+    };
+    decode_current_cat_runtime(&row).map(Some)
 }
 
 pub(super) fn load_product_cat_observation(

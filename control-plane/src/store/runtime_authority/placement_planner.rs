@@ -118,6 +118,70 @@ pub(crate) enum PlacementCommitLoad {
     Stale,
 }
 
+/// G4 re-entry planner for one already-assigned Cat.  It consumes the same
+/// policy/session/full-inventory/fence snapshot that A1 later revalidates;
+/// no caller-authored `placement_ok` shortcut is exposed.
+#[allow(
+    dead_code,
+    reason = "G4 recovery planner is composed by the parallel A3 singleton slice"
+)]
+pub(super) fn load_current_placement_target_in(
+    transaction: &mut Transaction<'_>,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<Option<PlacementTargetSnapshot>> {
+    let now = database_now(transaction)?;
+    let Some(identity) = load_identity_by_node_unlocked(transaction, &desired.placement.node_id)?
+    else {
+        return Ok(None);
+    };
+    if identity.state != cats_api::runtime_reconciliation::NodeIdentityState::Provisioned {
+        return Ok(None);
+    }
+    let Some(policy) = load_policy_unlocked(transaction, &identity.node_id)? else {
+        return Err(corrupt("provisioned NodeIdentity has no placement policy"));
+    };
+    if policy.node_id != identity.node_id {
+        return Err(corrupt("placement policy belongs to another Node"));
+    }
+    let assigned = load_assigned_desired_unlocked(
+        transaction,
+        &identity.node_id,
+        MAX_ASSIGNED_SPECS.saturating_add(1),
+    )?;
+    validate_current_assigned(&policy, &assigned)?;
+    if !assigned.iter().any(|current| current == desired) {
+        return Ok(None);
+    }
+    let active_host_fence_event =
+        load_active_event_by_node_unlocked(transaction, &identity.node_id)?;
+    if active_host_fence_event.is_some()
+        || policy.scheduling_state != RuntimeSchedulingState::Schedulable
+        || policy.capabilities.guest_config_digest != desired.runtime.guest_config_digest
+    {
+        return Ok(None);
+    }
+    let admission = match load_placement_admission_at_in_checked(
+        transaction,
+        &identity.node_id,
+        &desired.runtime.guest_config_digest,
+        now,
+        &mut |_| Ok(()),
+    )? {
+        PlacementAdmissionLoad::Accepted(admission) => *admission,
+        PlacementAdmissionLoad::Rejected(_) => return Ok(None),
+    };
+    if admission.node_identity != identity || admission.assigned_desired_specs != assigned {
+        return Err(corrupt(
+            "placement admission differs from current assigned authority",
+        ));
+    }
+    Ok(Some(PlacementTargetSnapshot {
+        policy,
+        admission,
+        active_host_fence_event,
+    }))
+}
+
 /// Production Cat-create planner adapter. PostgreSQL work stays on the
 /// Control Store's bounded blocking executor rather than the async runtime.
 pub(crate) struct PostgresCatCreatePlacementPlanner {

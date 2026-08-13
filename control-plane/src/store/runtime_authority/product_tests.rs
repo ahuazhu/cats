@@ -48,6 +48,9 @@ use super::product_rows::{
     insert_cat, insert_disk, load_disk_by_id_for_update, load_operation_by_cat_revision_unlocked,
     operation_by_workspace_candidates_sql,
 };
+use super::route_epoch_engine::{
+    EndpointBindingWithoutEpoch, EndpointMutation, RouteEpochMutationPlan,
+};
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
     update_authorization,
@@ -209,6 +212,7 @@ fn desired_mutation_request(
         active_guest_digest,
         endpoint_records,
         volume_mutation: super::product::DesiredVolumeMutation::Preserve,
+        require_idle_open_busy_proof: None,
     }
 }
 
@@ -221,6 +225,24 @@ fn commit_desired_mutation(
         Instant::now() + Duration::from_secs(30),
     );
     store.commit_desired_mutation_covered(request, &state)
+}
+
+fn desired_mutation_from_route_plan(
+    plan: RouteEpochMutationPlan,
+    operation_id: &str,
+    key: &str,
+) -> CoveredDesiredMutationRequest {
+    let mut request = desired_mutation_request(
+        &plan.expected_current,
+        plan.desired,
+        operation_id,
+        key,
+        plan.placement_snapshots,
+        plan.active_guest_digest,
+        plan.endpoint_records,
+    );
+    request.require_idle_open_busy_proof = plan.require_idle_open_busy_proof;
+    request
 }
 
 fn mutation_release() -> GuestRuntimeProfileReceipt {
@@ -1568,6 +1590,326 @@ fn desired_non_running_to_running_burns_the_old_route_epoch() {
         DesiredMutationCommit::Changed(_)
     ));
     assert_eq!(reopened.endpoints[0].route_epoch, epoch(2));
+}
+
+#[test]
+fn g4_endpoint_planner_allocates_revision_and_epoch_and_commits_atomically() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-bind", 1, "g4-bind-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let endpoint_id = id("ep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Bind {
+                record: EndpointRecordCandidate {
+                    endpoint_id: endpoint_id.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: create.candidate.cat_id.clone(),
+                    name: id("metrics"),
+                },
+                intent: EndpointBindingWithoutEpoch::http(
+                    Hostname::new("metrics-g4-bind.cats.run").unwrap(),
+                    9090,
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(plan.expected_current.desired_revision, revision(1));
+    assert_eq!(plan.desired.desired_revision, revision(2));
+    assert_eq!(plan.desired.endpoints[0].route_epoch, epoch(1));
+    assert_eq!(plan.desired.endpoints[1].endpoint_id, endpoint_id);
+    assert_eq!(plan.desired.endpoints[1].route_epoch, epoch(1));
+    assert!(plan.placement_snapshots.is_empty());
+    assert!(plan.require_idle_open_busy_proof.is_none());
+
+    let mutation = desired_mutation_from_route_plan(plan, "op_g4_bind", "g4-bind");
+    assert!(matches!(
+        commit_desired_mutation(&store, &mutation).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    assert_eq!(
+        store
+            .locate_hostname_desired(&Hostname::new("metrics-g4-bind.cats.run").unwrap())
+            .unwrap()
+            .unwrap()
+            .desired_revision,
+        revision(2)
+    );
+}
+
+#[test]
+fn g4_endpoint_planner_is_workspace_scoped_and_unbind_preserves_other_epoch() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-unbind", 1, "g4-unbind-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let error = store
+        .plan_endpoint_route_mutation(
+            &id("workspace_foreign"),
+            &create.candidate.cat_id,
+            EndpointMutation::Unbind {
+                endpoint_id: create.candidate.endpoint.endpoint_id.clone(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+
+    let plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Unbind {
+                endpoint_id: create.candidate.endpoint.endpoint_id.clone(),
+            },
+        )
+        .unwrap();
+    assert!(plan.desired.endpoints.is_empty());
+    assert!(plan.endpoint_records.is_empty());
+    assert_eq!(plan.desired.desired_revision, revision(2));
+}
+
+#[test]
+fn g4_concurrent_endpoint_plans_have_one_revision_winner() {
+    let (url, seed, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-concurrent", 1, "g4-concurrent-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&seed, &mut create, 1);
+    seed.create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let endpoint_id = id("ep_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let mutation = EndpointMutation::Bind {
+        record: EndpointRecordCandidate {
+            endpoint_id,
+            workspace_id: workspace.clone(),
+            cat_id: create.candidate.cat_id.clone(),
+            name: id("admin"),
+        },
+        intent: EndpointBindingWithoutEpoch::http(
+            Hostname::new("admin-g4-concurrent.cats.run").unwrap(),
+            9091,
+        )
+        .unwrap(),
+    };
+    let first_plan = seed
+        .plan_endpoint_route_mutation(&workspace, &create.candidate.cat_id, mutation.clone())
+        .unwrap();
+    let second_plan = seed
+        .plan_endpoint_route_mutation(&workspace, &create.candidate.cat_id, mutation)
+        .unwrap();
+    let first = desired_mutation_from_route_plan(first_plan, "op_g4_concurrent_a", "g4-a");
+    let second = desired_mutation_from_route_plan(second_plan, "op_g4_concurrent_b", "g4-b");
+    let barrier = Arc::new(Barrier::new(3));
+    let spawn = |request: CoveredDesiredMutationRequest, barrier: Arc<Barrier>| {
+        let url = url.clone();
+        std::thread::spawn(move || {
+            let store = Store::connect(&url, None).unwrap();
+            barrier.wait();
+            commit_desired_mutation(&store, &request)
+        })
+    };
+    let first_worker = spawn(first, Arc::clone(&barrier));
+    let second_worker = spawn(second, Arc::clone(&barrier));
+    barrier.wait();
+    let outcomes = [first_worker.join().unwrap(), second_worker.join().unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(DesiredMutationCommit::Changed(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(CoveredDesiredMutationError::Stale)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn g4_cancelled_endpoint_commit_writes_nothing() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-cancel", 1, "g4-cancel-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Unbind {
+                endpoint_id: create.candidate.endpoint.endpoint_id.clone(),
+            },
+        )
+        .unwrap();
+    let mutation = desired_mutation_from_route_plan(plan, "op_g4_cancel", "g4-cancel");
+    let (cancellation, state) = CoveredCommitCancellation::new(
+        "G4 cancellation test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert!(cancellation.cancel_before_commit());
+    let error = store
+        .commit_desired_mutation_covered(&mutation, &state)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CoveredDesiredMutationError::Store(ref error) if error.code == ErrorCode::Unavailable
+    ));
+    assert_desired_mutation_artifacts_absent(&store, &mutation);
+}
+
+#[test]
+fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
+    use super::runtime_spine_tests::{
+        refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
+    };
+
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-idle-open", 1, "g4-idle-open-create");
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        700,
+        AcceptedRouteRuntimeKind::Running,
+    );
+    let suspend_plan = store
+        .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7001))
+        .unwrap();
+    let source_incarnation = match &suspend_plan.desired.transition {
+        RuntimeTransition::RequireIdle {
+            source_runtime_incarnation,
+            ..
+        } => source_runtime_incarnation.clone(),
+        RuntimeTransition::CancelAndDrain => panic!("planner omitted RequireIdle"),
+    };
+    assert_eq!(suspend_plan.desired.target, RuntimeTarget::Suspended);
+    assert_eq!(
+        suspend_plan.desired.endpoints[0].route_epoch,
+        create.candidate.desired.endpoints[0].route_epoch
+    );
+    let suspend = desired_mutation_from_route_plan(suspend_plan, "op_g4_idle", "g4-idle");
+    assert!(matches!(
+        commit_desired_mutation(&store, &suspend).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        701,
+        AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: false },
+    );
+    let recovery_plan = store
+        .plan_require_idle_busy_recovery(&create.candidate.cat_id)
+        .unwrap();
+    assert_eq!(recovery_plan.desired.target, RuntimeTarget::Running);
+    assert_eq!(
+        recovery_plan.desired.endpoints[0].route_epoch,
+        suspend.desired.endpoints[0].route_epoch
+    );
+    let proof = recovery_plan
+        .require_idle_open_busy_proof
+        .as_ref()
+        .expect("never-closed Busy carries a typed proof");
+    assert_eq!(proof.source_runtime_incarnation, source_incarnation);
+    let recovery =
+        desired_mutation_from_route_plan(recovery_plan, "op_g4_idle_recovery", "g4-idle-recovery");
+    assert!(matches!(
+        commit_desired_mutation(&store, &recovery).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    assert!(matches!(
+        commit_desired_mutation(&store, &recovery).unwrap(),
+        DesiredMutationCommit::Replayed(_)
+    ));
+}
+
+#[test]
+fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
+    use super::runtime_spine_tests::{
+        refresh_assigned_route_runtime_for_test, AcceptedRouteRuntimeKind,
+    };
+
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "g4-idle-closed", 1, "g4-idle-closed-create");
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        710,
+        AcceptedRouteRuntimeKind::Running,
+    );
+    let suspend = desired_mutation_from_route_plan(
+        store
+            .plan_require_idle_transition(&create.candidate.cat_id, random_id(0x7101))
+            .unwrap(),
+        "op_g4_closed_idle",
+        "g4-closed-idle",
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &suspend).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        711,
+        AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: false },
+    );
+    let old_plan = store
+        .plan_require_idle_busy_recovery(&create.candidate.cat_id)
+        .unwrap();
+    let old_recovery =
+        desired_mutation_from_route_plan(old_plan, "op_g4_old_session", "g4-old-session");
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        712,
+        AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: false },
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &old_recovery),
+        Err(CoveredDesiredMutationError::Stale)
+    ));
+    assert_desired_mutation_artifacts_absent(&store, &old_recovery);
+
+    refresh_assigned_route_runtime_for_test(
+        &store,
+        &identity,
+        &release,
+        713,
+        AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: true },
+    );
+    let closed_plan = store
+        .plan_require_idle_busy_recovery(&create.candidate.cat_id)
+        .unwrap();
+    assert!(closed_plan.require_idle_open_busy_proof.is_none());
+    assert_eq!(
+        closed_plan.desired.endpoints[0].route_epoch.get(),
+        suspend.desired.endpoints[0].route_epoch.get() + 1
+    );
 }
 
 #[test]
