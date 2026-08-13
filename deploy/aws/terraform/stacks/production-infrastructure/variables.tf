@@ -189,19 +189,34 @@ variable "worker_runtime_secret_data" {
   default     = {}
 }
 
-variable "route_grant_public_key_pem" {
-  description = "Ed25519 public key deployed to every metal worker for Route Grant verification."
+variable "route_v2_node_artifact_secret_arn" {
+  description = "Pre-created Secrets Manager ARN for the exact four-file Node Route v2 artifact set. Terraform receives no artifact bytes."
   type        = string
   default     = ""
 
   validation {
     condition = (
-      var.route_grant_public_key_pem == "" || (
-        startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
-        endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
+      var.route_v2_node_artifact_secret_arn == "" ||
+      (
+        can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:", var.route_v2_node_artifact_secret_arn)) &&
+        strcontains(var.route_v2_node_artifact_secret_arn, "-r1-")
       )
     )
-    error_message = "route_grant_public_key_pem must be empty or a PEM public key."
+    error_message = "route_v2_node_artifact_secret_arn must be empty or a revision-1 Secrets Manager secret ARN containing -r1-."
+  }
+}
+
+variable "route_v2_node_artifact_secret_version_id" {
+  description = "Exact Secrets Manager version ID for the revision-1 Node Route v2 artifact secret."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.route_v2_node_artifact_secret_version_id == "" ||
+      can(regex("^[A-Za-z0-9-]{32,64}$", var.route_v2_node_artifact_secret_version_id))
+    )
+    error_message = "route_v2_node_artifact_secret_version_id must be empty or a 32-64 character Secrets Manager version ID."
   }
 }
 

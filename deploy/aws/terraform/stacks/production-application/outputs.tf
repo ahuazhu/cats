@@ -6,6 +6,14 @@ output "control_plane_service" {
   value = module.cats_kubernetes.control_plane_service
 }
 
+output "control_plane_route_v2_service" {
+  value = module.cats_kubernetes.control_plane_route_v2_service
+}
+
+output "gateway_service" {
+  value = module.cats_kubernetes.gateway_service
+}
+
 output "ingress_name" {
   value = module.cats_kubernetes.ingress_name
 }

@@ -64,7 +64,7 @@ Control additionally requires the provisioner-owned root:root 0644 regular file
 leaves the fixed 30-second A23 commit-resolution join window intact.
 
 Each initial cordoned A23 policy also carries the operator-reviewed canonical
-`node_transport_target` (`https://<lowercase-dns-name>:<explicit-port>`). The deployment provisioner/admin owns
+`node_transport_target` (`https://<lowercase-dns-name>:7444` for the production Route v2 machine listener). The deployment provisioner/admin owns
 that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
 Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
 The matching Control rollout requires exact clean-slate Store authority schema version 14; every earlier version is

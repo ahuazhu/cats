@@ -110,9 +110,11 @@ def run_verifier(
     output: Path,
     *,
     expect_success: bool,
+    gateway_digest: str = "sha256:" + "6" * 64,
 ) -> subprocess.CompletedProcess[bytes]:
     shared = workspace / "shared"
     control = workspace / "control"
+    gateway = workspace / "gateway"
     bundle = workspace / "cats-worker.tar.zst"
     source_input = workspace / "Cargo.lock"
     command = [
@@ -131,6 +133,16 @@ def run_verifier(
         "--control-image-config-digest",
         "sha256:" + "2" * 64,
         "--control-image-registry-verified",
+        "false",
+        "--gateway-image-root",
+        str(gateway),
+        "--gateway-image-reference",
+        "registry.example/cats/gateway:fixture",
+        "--gateway-image-digest",
+        gateway_digest,
+        "--gateway-image-config-digest",
+        "sha256:" + "7" * 64,
+        "--gateway-image-registry-verified",
         "false",
         "--source-commit",
         "3" * 40,
@@ -227,6 +239,7 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
     control_release = root / "control/opt/cats/release"
     write_member(control_release / "guest-runtime-release-manifest.v1.json", members["manifest"])
     write_member(control_release / "guest-runtime-profile.v1.json", members["profile"])
+    write_member(root / "gateway/usr/local/bin/cats-gatewayd", b"fixture-gateway\n", 0o755)
     return members
 
 
@@ -253,6 +266,14 @@ def main() -> int:
             "tree": "4" * 40,
         }
         assert parsed["artifacts"]["control_plane"]["registry_verified"] is False
+        assert parsed["artifacts"]["gateway"] == {
+            "binary_sha256": digest(b"fixture-gateway\n"),
+            "binary_size_bytes": len(b"fixture-gateway\n"),
+            "image_config_digest": "sha256:" + "7" * 64,
+            "image_digest": "sha256:" + "6" * 64,
+            "image_reference": "registry.example/cats/gateway:fixture",
+            "registry_verified": False,
+        }
         assert b"guest_runtime_release_id=" + expected_release_id.encode() in result.stdout
 
         # The verifier never overwrites its canonical receipt.
@@ -272,6 +293,38 @@ def main() -> int:
             root / "control/opt/cats/release/guest-runtime-profile.v1.json",
             members["profile"],
         )
+
+        gateway = root / "gateway/usr/local/bin/cats-gatewayd"
+        gateway.chmod(0o644)
+        wrong_gateway_mode = run_verifier(verifier, root, output, expect_success=False)
+        assert b"mode is not 0755" in wrong_gateway_mode.stderr
+        assert not output.exists()
+        gateway.chmod(0o755)
+
+        gateway.unlink()
+        missing_gateway = run_verifier(verifier, root, output, expect_success=False)
+        assert b"file set differs" in missing_gateway.stderr
+        assert b"cats-gatewayd" in missing_gateway.stderr
+        assert not output.exists()
+        write_member(gateway, b"fixture-gateway\n", 0o755)
+
+        extra_gateway = root / "gateway/usr/local/bin/unexpected"
+        write_member(extra_gateway, b"unexpected\n", 0o755)
+        unexpected_gateway = run_verifier(verifier, root, output, expect_success=False)
+        assert b"file set differs" in unexpected_gateway.stderr
+        assert b"unexpected" in unexpected_gateway.stderr
+        assert not output.exists()
+        extra_gateway.unlink()
+
+        malformed_gateway_digest = run_verifier(
+            verifier,
+            root,
+            output,
+            expect_success=False,
+            gateway_digest="sha256:not-a-digest",
+        )
+        assert b"Gateway OCI digest" in malformed_gateway_digest.stderr
+        assert not output.exists()
 
         cats = root / "worker/cats"
         cats.unlink()

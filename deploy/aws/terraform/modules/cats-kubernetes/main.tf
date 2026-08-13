@@ -12,6 +12,7 @@ locals {
   }
 
   effective_control_plane_replicas = var.maintenance_mode ? 0 : var.control_plane_replicas
+  effective_gateway_replicas       = var.maintenance_mode ? 0 : var.gateway_replicas
   effective_public_ingress         = var.enable_public_ingress && !var.maintenance_mode
 
   runtime_secret_data = merge(
@@ -43,16 +44,23 @@ locals {
 
   rds_ca_pem = "${trimspace(var.rds_ca_pem)}\n"
 
-  # Public Endpoint ingress stays absent until the Route Grant v2 signer,
-  # bounded per-replica cache and Node admission gate are composed. Exposing
-  # the old Gateway here would make a healthy ALB target serve V1 authority.
-  ingress_routes = [
-    for host in var.control_plane_hosts : {
-      host         = host
-      service_name = "cats-controld"
-      service_port = 7300
-    }
-  ]
+  # Control hosts retain their exact API routing. The one wildcard Endpoint
+  # host is admitted only by the terminal Route v2 Gateway; it never reaches a
+  # legacy in-process Gateway or a Control public handler.
+  ingress_routes = concat(
+    [
+      for host in var.control_plane_hosts : {
+        host         = host
+        service_name = "cats-controld"
+        service_port = 7300
+      }
+    ],
+    [{
+      host         = var.endpoint_wildcard_host
+      service_name = "cats-gatewayd"
+      service_port = 8080
+    }],
+  )
 }
 
 check "public_target_drain_fits_termination_grace" {
@@ -117,6 +125,18 @@ resource "kubernetes_service_account_v1" "control_plane" {
     namespace = kubernetes_namespace_v1.cats.metadata[0].name
     labels = merge(local.labels, {
       "app.kubernetes.io/name" = "cats-controld"
+    })
+  }
+
+  automount_service_account_token = false
+}
+
+resource "kubernetes_service_account_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
     })
   }
 
@@ -214,6 +234,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
         annotations = {
           "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
           "cats.run/route-grant-key-sha256"           = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/route-v2-control-artifact-secret" = var.route_v2_control_artifact_secret_name
           "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
           "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
         }
@@ -255,6 +276,56 @@ resource "kubernetes_deployment_v1" "control_plane" {
           }
         }
 
+        # Kubernetes Secret projections expose symlink entries, while the
+        # frozen installed-artifact reader requires one real root-owned 0700
+        # directory with single-link regular files. Copy the closed key set to
+        # an in-memory emptyDir before the main process starts. The projected
+        # source is never mounted into the main container.
+        init_container {
+          name              = "route-v2-artifact-renderer"
+          image             = var.control_plane_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='gateway-workload-authority.v1.json gateway-client-ca-bundle.pem control-machine-server-certificate.pem control-machine-server-private-key.pem signer.v1.json public-key-ring.v1.json signer-private-key.pem'
+            actual_count=$(find -L /var/run/cats/route-v2-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 7
+            install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
+            for name in $expected; do
+              test -f "/var/run/cats/route-v2-source/$name"
+              mode=0644
+              case "$name" in
+                control-machine-server-private-key.pem|signer-private-key.pem) mode=0600 ;;
+              esac
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/route-v2-source/$name" "/etc/cats/route-v2/$name"
+            done
+            sync /etc/cats/route-v2
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifact-source"
+            mount_path = "/var/run/cats/route-v2-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifacts"
+            mount_path = "/etc/cats/route-v2"
+          }
+        }
+
         container {
           name              = "controld"
           image             = var.control_plane_image
@@ -268,6 +339,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
           args = [
             "--listen",
             "0.0.0.0:7300",
+            "--route-v2-machine-listen",
+            "0.0.0.0:7443",
             "--control-store-url-file",
             "/etc/cats/runtime/CATS_POSTGRES_URL",
             "--guest-runtime-profile-receipt-file",
@@ -327,6 +400,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
             container_port = 7300
           }
 
+          port {
+            name           = "route-v2"
+            container_port = 7443
+          }
+
           resources {
             requests = {
               cpu    = "100m"
@@ -374,8 +452,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
           security_context {
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
-            run_as_non_root            = true
-            run_as_user                = 10001
+            run_as_non_root            = false
+            run_as_user                = 0
 
             capabilities {
               drop = ["ALL"]
@@ -400,6 +478,12 @@ resource "kubernetes_deployment_v1" "control_plane" {
           volume_mount {
             name       = "route-grant-signing"
             mount_path = "/etc/cats/route-grant"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifacts"
+            mount_path = "/etc/cats/route-v2"
             read_only  = true
           }
 
@@ -432,6 +516,24 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "route-v2-control-artifact-source"
+
+          secret {
+            secret_name  = var.route_v2_control_artifact_secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "route-v2-control-artifacts"
+
+          empty_dir {
+            medium = "Memory"
           }
         }
 
@@ -483,6 +585,291 @@ resource "kubernetes_service_v1" "control_plane" {
     port {
       name        = "http"
       port        = 7300
+      target_port = "http"
+    }
+  }
+}
+
+# Machine-only mTLS listener. It is intentionally a distinct ClusterIP
+# Service: no public Ingress rule can route to this port.
+resource "kubernetes_service_v1" "control_plane_route_v2" {
+  metadata {
+    name      = "cats-controld-route-v2"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-controld"
+    })
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-controld"
+    }
+
+    port {
+      name        = "route-v2"
+      port        = 7443
+      target_port = "route-v2"
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  spec {
+    replicas = local.effective_gateway_replicas
+
+    strategy {
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-gatewayd"
+      }
+    }
+
+    template {
+      metadata {
+        labels = merge(local.labels, {
+          "app.kubernetes.io/name" = "cats-gatewayd"
+        })
+        annotations = {
+          # The immutable, versioned Secret name is the rollout identity. Its
+          # bytes never enter Terraform state or Pod environment variables.
+          "cats.run/route-v2-gateway-artifact-secret" = var.route_v2_gateway_artifact_secret_name
+        }
+      }
+
+      spec {
+        automount_service_account_token  = false
+        enable_service_links             = false
+        service_account_name             = kubernetes_service_account_v1.gateway.metadata[0].name
+        termination_grace_period_seconds = local.public_target_termination_grace_period_seconds
+
+        node_selector = {
+          "kubernetes.io/arch" = "amd64"
+        }
+
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-gatewayd"
+                }
+              }
+            }
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-gatewayd"
+            }
+          }
+        }
+
+        init_container {
+          name              = "route-v2-artifact-renderer"
+          image             = var.gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='node-server-ca-bundle.pem gateway-machine-client-certificate.pem gateway-machine-client-private-key.pem'
+            actual_count=$(find -L /var/run/cats/route-v2-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 3
+            install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
+            for name in $expected; do
+              test -f "/var/run/cats/route-v2-source/$name"
+              mode=0644
+              test "$name" != gateway-machine-client-private-key.pem || mode=0600
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/route-v2-source/$name" "/etc/cats/route-v2/$name"
+            done
+            sync /etc/cats/route-v2
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifact-source"
+            mount_path = "/var/run/cats/route-v2-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifacts"
+            mount_path = "/etc/cats/route-v2"
+          }
+        }
+
+        container {
+          name              = "gatewayd"
+          image             = var.gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/usr/local/bin/cats-gatewayd"]
+          args = [
+            "--listen",
+            "0.0.0.0:8080",
+            "--control-plane-url",
+            "https://${kubernetes_service_v1.control_plane_route_v2.metadata[0].name}.${var.namespace}.svc.cluster.local:7443",
+          ]
+
+          port {
+            name           = "http"
+            container_port = 8080
+          }
+
+          resources {
+            requests = {
+              cpu    = "100m"
+              memory = "128Mi"
+            }
+            limits = {
+              cpu    = "1"
+              memory = "512Mi"
+            }
+          }
+
+          lifecycle {
+            pre_stop {
+              exec {
+                command = ["/bin/sh", "-c", "sleep ${local.public_target_pre_stop_delay_seconds}"]
+              }
+            }
+          }
+
+          startup_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            failure_threshold = 30
+            period_seconds    = 5
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            period_seconds = 5
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            period_seconds = 15
+          }
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifacts"
+            mount_path = "/etc/cats/route-v2"
+            read_only  = true
+          }
+        }
+
+        volume {
+          name = "route-v2-gateway-artifact-source"
+
+          secret {
+            secret_name  = var.route_v2_gateway_artifact_secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "route-v2-gateway-artifacts"
+
+          empty_dir {
+            medium = "Memory"
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = var.maintenance_mode ? "0" : "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-gatewayd"
+      }
+    }
+  }
+}
+
+resource "kubernetes_service_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    }
+
+    port {
+      name        = "http"
+      port        = 8080
       target_port = "http"
     }
   }
@@ -592,7 +979,10 @@ resource "kubernetes_ingress_v1" "public" {
     }
   }
 
-  depends_on = [kubernetes_deployment_v1.control_plane]
+  depends_on = [
+    kubernetes_deployment_v1.control_plane,
+    kubernetes_deployment_v1.gateway,
+  ]
 }
 
 # In-cluster reconciliation of the database credential (ADR-0029, #77).

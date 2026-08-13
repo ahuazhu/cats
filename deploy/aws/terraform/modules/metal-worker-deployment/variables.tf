@@ -112,18 +112,26 @@ variable "worker_runtime_secret_data" {
   }
 }
 
-variable "route_grant_public_key_pem" {
-  description = "Ed25519 public key installed on every worker for Endpoint Route Grant verification."
+variable "route_v2_node_artifact_secret_arn" {
+  description = "ARN of the pre-created Secrets Manager value containing the exact four base64-encoded Node Route v2 artifacts. Terraform receives only the ARN."
   type        = string
 
   validation {
     condition = (
-      var.route_grant_public_key_pem == "" || (
-        startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
-        endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
-      )
+      can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:", var.route_v2_node_artifact_secret_arn)) &&
+      strcontains(var.route_v2_node_artifact_secret_arn, "-r1-")
     )
-    error_message = "route_grant_public_key_pem must be a PEM public key."
+    error_message = "route_v2_node_artifact_secret_arn must be a revision-1 Secrets Manager secret ARN containing -r1-; rotation is outside the initial G2 deployment contract."
+  }
+}
+
+variable "route_v2_node_artifact_secret_version_id" {
+  description = "Exact immutable Secrets Manager version ID selected for the revision-1 Node Route v2 artifact secret."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9-]{32,64}$", var.route_v2_node_artifact_secret_version_id))
+    error_message = "route_v2_node_artifact_secret_version_id must be a 32-64 character Secrets Manager version ID."
   }
 }
 
@@ -177,9 +185,10 @@ variable "worker_managed_environment" {
         "CATS_METERING_CGROUP_ROOT",
         "CATS_NODE_ID",
         "CATS_NODE_ADVERTISE_URL",
+        "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker and this map is rewritten fleet-wide on every deployment."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
   }
 
   validation {
@@ -248,8 +257,8 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
+      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL", "CATS_ROUTE_V2_MACHINE_LISTEN"]),
     )) == 0
-    error_message = "Node identity is provisioner-owned artifact data; environment and IMDS values are forbidden."
+    error_message = "Node identity is provisioner-owned artifact data and the Route v2 listener is fixed by the production unit; environment and IMDS overrides are forbidden."
   }
 }

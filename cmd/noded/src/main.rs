@@ -20,14 +20,6 @@ struct Args {
     listen: String,
     #[arg(long)]
     control_plane_url: String,
-    /// Retired single-key CLI retained only until the metal unit/install
-    /// transaction moves as one change. These bytes are never opened or used
-    /// as Route v2 authority.
-    #[arg(
-        long = "route-grant-public-key-file",
-        env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
-    )]
-    _retired_route_grant_public_key_file: PathBuf,
     #[arg(
         long,
         env = "CATS_ROUTE_V2_PUBLIC_KEY_RING_FILE",
@@ -333,6 +325,7 @@ mod tests {
             "ch_initramfs",
             "ch_cmdline",
             "ch_network_cidr",
+            "route_grant_public_key_file",
         ] {
             assert!(
                 !ids.contains(&forbidden),

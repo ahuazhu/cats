@@ -19,27 +19,110 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
 # Validate every required operator input before apt, build, installed-file or
 # systemd mutation. Staging closes the validate/use race if the supplied path
 # is replaced while this long-running bootstrap builds the Guest image.
-ROUTE_GRANT_PUBLIC_KEY_SOURCE=${CATS_ROUTE_GRANT_PUBLIC_KEY_FILE:-}
-[[ -n $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
-  echo "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required" >&2
+ROUTE_V2_NODE_ARTIFACT_SOURCE=${CATS_ROUTE_V2_NODE_ARTIFACT_DIR:-}
+[[ -n $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
+  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required" >&2
   exit 1
 }
-[[ -f $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
-  echo "Route Grant public key is not a regular file: $ROUTE_GRANT_PUBLIC_KEY_SOURCE" >&2
+[[ $ROUTE_V2_NODE_ARTIFACT_SOURCE == /* && -d $ROUTE_V2_NODE_ARTIFACT_SOURCE && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
+  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory" >&2
   exit 1
 }
-ROUTE_GRANT_PUBLIC_KEY_STAGE=$(mktemp)
-cleanup_route_grant_key() {
-  rm -f -- "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+for required in cmp find install jq openssl stat wc; do
+  command -v "$required" >/dev/null 2>&1 || {
+    echo "worker deployment needs $required before Route v2 artifact validation" >&2
+    exit 1
+  }
+done
+# Keep transient private material on the boot-scoped tmpfs. The final fixed
+# private key is durable root-only state; staging copies must not survive a
+# Host reboot if the installer is killed before its EXIT trap runs.
+ROUTE_V2_NODE_ARTIFACT_STAGE=$(mktemp -d /run/cats-route-v2-stage.XXXXXX)
+ROUTE_V2_PUBLISH_STAGE=
+chmod 0700 "$ROUTE_V2_NODE_ARTIFACT_STAGE"
+cleanup_route_v2_artifacts() {
+  rm -rf -- "$ROUTE_V2_NODE_ARTIFACT_STAGE"
+  if [[ -n $ROUTE_V2_PUBLISH_STAGE ]]; then
+    rm -rf -- "$ROUTE_V2_PUBLISH_STAGE"
+  fi
 }
-trap cleanup_route_grant_key EXIT
-install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
-"$CATS_REPO/deploy/aws/metal/validate-route-grant-public-key.sh" \
-  "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+trap cleanup_route_v2_artifacts EXIT
+route_v2_expected=(
+  public-key-ring.v1.json
+  gateway-client-ca-bundle.pem
+  node-machine-server-certificate.pem
+  node-machine-server-private-key.pem
+)
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 4 ]] || {
+  echo "Node Route v2 artifact source contains an unexpected entry" >&2
+  exit 1
+}
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 4 ]] || {
+  echo "Node Route v2 artifact source must contain exactly four single-link regular files" >&2
+  exit 1
+}
+for name in "${route_v2_expected[@]}"; do
+  [[ -f $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name ]] || {
+    echo "missing Node Route v2 artifact: $name" >&2
+    exit 1
+  }
+  mode=0644
+  [[ $name != node-machine-server-private-key.pem ]] || mode=0600
+  install -o root -g root -m "$mode" \
+    "$ROUTE_V2_NODE_ARTIFACT_SOURCE/$name" "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name"
+  [[ -s $ROUTE_V2_NODE_ARTIFACT_STAGE/$name ]] || {
+    echo "empty Node Route v2 artifact: $name" >&2
+    exit 1
+  }
+done
+printf '%s' "$(jq -cS . "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json")" \
+  > "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
+cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json" \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
+rm -f -- "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
+jq -e \
+  '.version == 1 and .ring_version == 1 and .expected_previous == null' \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json" >/dev/null
+[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json") -le 16384 ]]
+[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/gateway-client-ca-bundle.pem") -le 65536 ]]
+[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-certificate.pem") -le 65536 ]]
+[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-private-key.pem") -le 16384 ]]
+openssl crl2pkcs7 -nocrl -certfile "$ROUTE_V2_NODE_ARTIFACT_STAGE/gateway-client-ca-bundle.pem" \
+  | openssl pkcs7 -print_certs -noout >/dev/null
+openssl x509 -in "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-certificate.pem" -pubkey -noout \
+  | openssl pkey -pubin -outform DER > "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der"
+openssl pkey -in "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-private-key.pem" -pubout -outform DER \
+  > "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
+cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der" \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
+rm -f -- "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der" \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
+
+verify_installed_route_v2_r1() {
+  [[ -d /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
+  [[ $(stat -c '%U:%G:%a' /etc/cats/route-v2) == root:root:700 ]]
+  [[ $(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 | wc -l) -eq 4 ]]
+  [[ $(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 4 ]]
+  for name in "${route_v2_expected[@]}"; do
+    mode=644
+    [[ $name != node-machine-server-private-key.pem ]] || mode=600
+    [[ $(stat -c '%U:%G:%a:%h' "/etc/cats/route-v2/$name") == "root:root:$mode:1" ]]
+    cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name" "/etc/cats/route-v2/$name"
+  done
+}
+
+# G2 distributes revision 1 only. It may make the first installation or prove
+# an exact idempotent replay, but it must never turn a bootstrap into an
+# implicit ring/certificate rotation.
+ROUTE_V2_ALREADY_INSTALLED=false
+if [[ -e /etc/cats/route-v2 || -L /etc/cats/route-v2 ]]; then
+  verify_installed_route_v2_r1
+  ROUTE_V2_ALREADY_INSTALLED=true
+fi
 
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
-for required in flock stat curl openssl findmnt systemd-run systemd-tmpfiles; do
+for required in flock stat curl openssl cmp wc findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
     exit 1
@@ -80,7 +163,7 @@ deployment_cleanup() {
     cats_stop_node_service cats-worker >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
-  cleanup_route_grant_key
+  cleanup_route_v2_artifacts
   exit "$status"
 }
 trap deployment_cleanup EXIT
@@ -96,6 +179,33 @@ metering_root=$(cats_worker_metering_root cats-worker)
   "$metering_root" "$CATS_PREFIX/bin"
 cats_gate_node_service cats-worker
 cats_worker_deployment_crash_probe after-mask-worker
+
+if [[ $ROUTE_V2_ALREADY_INSTALLED == true ]]; then
+  verify_installed_route_v2_r1
+else
+  [[ ! -e /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
+  if [[ ! -e /etc/cats ]]; then
+    install -d -o root -g root -m 0755 /etc/cats
+  else
+    [[ -d /etc/cats && ! -L /etc/cats ]]
+  fi
+  ROUTE_V2_PUBLISH_STAGE=$(mktemp -d /etc/cats/.route-v2-r1.XXXXXX)
+  chmod 0700 "$ROUTE_V2_PUBLISH_STAGE"
+  for name in "${route_v2_expected[@]}"; do
+    mode=0644
+    [[ $name != node-machine-server-private-key.pem ]] || mode=0600
+    install -o root -g root -m "$mode" \
+      "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name" "$ROUTE_V2_PUBLISH_STAGE/$name"
+    sync -f "$ROUTE_V2_PUBLISH_STAGE/$name"
+  done
+  sync -f "$ROUTE_V2_PUBLISH_STAGE"
+  [[ ! -e /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
+  mv -T -- "$ROUTE_V2_PUBLISH_STAGE" /etc/cats/route-v2
+  ROUTE_V2_PUBLISH_STAGE=
+  sync -f /etc/cats
+  verify_installed_route_v2_r1
+  cats_worker_deployment_crash_probe after-install-route-v2-artifacts
+fi
 
 # Establish the reboot recovery gate before the release journal or any state
 # filesystem mutation. The runtime mask covers this boot; fsynced installed
@@ -177,9 +287,6 @@ install -o root -g root -m 0755 \
   "$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
 "$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
 cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
-install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
-  /etc/cats/route-grant-public.pem
-cats_worker_deployment_crash_probe after-install-route-key
 install -m 0755 "$CATS_REPO/target/release/cats" "$CATS_PREFIX/bin/cats"
 cats_worker_deployment_crash_probe after-install-cats-cli
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"

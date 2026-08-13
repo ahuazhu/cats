@@ -14,6 +14,9 @@ Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # override this after the proxy exists and has passed its connectivity check.
 Environment=CATS_POSTGRES_SESSION_SETUP=client
 EnvironmentFile=/etc/cats/worker.env
+# This production listener is intentionally fixed after EnvironmentFile so an
+# old operator value cannot move it away from the SG/A23 authority on 7444.
+Environment=CATS_ROUTE_V2_MACHINE_LISTEN=0.0.0.0:7444
 ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
 ExecStartPre=/opt/cats/bin/setup-guest-network
@@ -24,7 +27,7 @@ ExecStartPre=/opt/cats/bin/render-postgres-url
 ExecStart=/opt/cats/bin/cats-noded \
   --listen 0.0.0.0:7301 \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
-  --route-grant-public-key-file /etc/cats/route-grant-public.pem \
+  --route-v2-machine-listen $CATS_ROUTE_V2_MACHINE_LISTEN \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \

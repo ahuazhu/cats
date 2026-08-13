@@ -3,8 +3,12 @@ module "cats_kubernetes" {
 
   control_plane_image                   = var.control_plane_image
   control_plane_replicas                = var.control_plane_replicas
+  gateway_image                         = var.gateway_image
+  gateway_replicas                      = var.gateway_replicas
   maintenance_mode                      = var.maintenance_mode
   enable_public_ingress                 = var.enable_public_ingress
+  route_v2_control_artifact_secret_name = var.route_v2_control_artifact_secret_name
+  route_v2_gateway_artifact_secret_name = var.route_v2_gateway_artifact_secret_name
   runtime_secret_data                   = var.runtime_secret_data
   route_grant_private_key_pem           = var.route_grant_private_key_pem
   route_grant_public_key_pem            = var.route_grant_public_key_pem
@@ -39,6 +43,7 @@ module "cats_kubernetes" {
   acm_certificate_arn             = var.acm_certificate_arn
   public_subnet_ids               = var.public_subnet_ids
   control_plane_hosts             = var.control_plane_hosts
+  endpoint_wildcard_host          = var.endpoint_wildcard_host
 }
 
 # Public DNS.
@@ -55,9 +60,7 @@ locals {
   # state avoids an emergency kubectl edit becoming an unrecorded drift path.
   manage_dns = var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode
 
-  # Endpoint wildcard DNS stays absent with the v2 Gateway deployment. A
-  # control-plane-only ALB must not advertise a dead or legacy data-plane path.
-  dns_hosts = toset(var.control_plane_hosts)
+  dns_hosts = setunion(toset(var.control_plane_hosts), toset([var.endpoint_wildcard_host]))
 }
 
 # Located by the tag EKS puts on the load balancer it provisions, because the

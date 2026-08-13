@@ -151,7 +151,8 @@ subscription replacement.
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
-export TF_VAR_route_grant_public_key_pem="$(cat /approved/path/route-grant-public.pem)"
+export TF_VAR_route_v2_node_artifact_secret_arn='arn:aws:secretsmanager:us-east-1:123456789012:secret:cats-route-v2-node-r1-...'
+export TF_VAR_route_v2_node_artifact_secret_version_id='EXACT_32_TO_64_CHARACTER_VERSION_ID'
 cd deploy/aws/terraform/stacks/production-infrastructure
 cp backend.hcl.example backend.hcl
 cp production.tfvars.example production.auto.tfvars
@@ -234,6 +235,10 @@ export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
 export TF_VAR_stripe_secret_key='sk_live_...'
 export TF_VAR_stripe_webhook_secret='whsec_...'
+# Opaque names of pre-created immutable Secrets; their Route v2 bytes never
+# become Terraform inputs or state.
+export TF_VAR_route_v2_control_artifact_secret_name='cats-route-v2-control-r1'
+export TF_VAR_route_v2_gateway_artifact_secret_name='cats-route-v2-gateway-r1'
 
 cd deploy/aws/terraform/stacks/production-application
 cp backend.hcl.example backend.hcl
@@ -245,7 +250,11 @@ terraform apply production.tfplan
 
 Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
-control as production credentials.
+control as production credentials. Route v2 therefore uses only pre-created
+immutable Secret names/ARNs here. The application Secret key sets and the
+worker Secrets Manager JSON shape are documented in
+[`../README.md`](../README.md#route-v2-artifact-delivery); never replace those
+references with PEM/JSON/private-key Terraform variables.
 
 ### First clean-slate maintenance/reset
 
@@ -310,12 +319,13 @@ versioned Terraform state remains restricted infrastructure evidence; it is not 
 as product data and is not deleted by the cutover.
 
 The old regional Route Grant cache and Gateway-only Pod Identity have been
-removed. The production stack does not deploy `cats-gatewayd`, publish Endpoint
-wildcard DNS or route wildcard ingress. ADR-0041, the Node admission core and
-Gateway-to-Node machine tunnel exist in code, but this Terraform stack still
-does not install their signing ring, Gateway/Node mTLS artifacts or public
-proxy; workers remain gate-closed until those artifacts and the qualification
-matrix land together.
+removed. The production stack now deploys the Route v2-only `cats-gatewayd`,
+publishes Endpoint wildcard DNS and routes wildcard ingress to that service.
+It references the immutable revision-1 Control and Gateway artifact Secrets;
+the infrastructure stack references one exact revision-1 Node artifact Secret
+version. Terraform never accepts their private bytes. This is initial
+distribution only: G3 still owns signer/ring rotation, overlap, reload and
+acknowledged rollout.
 
 The first qualified ADR-0040/0041 clean-slate deployment follows the single ordered runbook in
 [Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
@@ -347,15 +357,15 @@ PostgreSQL.
 ### Automatic main deployment
 
 `Deploy production` starts after the `CI` workflow succeeds for a `main`
-commit. It builds and pushes the control-plane image, pins the registry digest,
-creates a saved application plan, applies that exact plan and waits for both
-Deployments to report the same immutable image reference. A failed build,
-plan, apply or rollout records a failed GitHub deployment.
+commit. It builds and pushes separate control-plane and Gateway images, pins
+both registry digests, creates a saved application plan, applies that exact
+plan and verifies each Deployment against its own immutable image reference. A
+failed build, plan, apply or rollout records a failed GitHub deployment.
 
-That workflow updates the Terraform-managed control-plane application; its
-green result is not the missing production-public-spawn PostgreSQL/Linux
-runtime E2E and does not qualify a nonempty worker, public Route v2 ingress or
-the signed full lifecycle.
+That workflow updates the Terraform-managed Control and Gateway applications;
+its green result is not the missing production-public-spawn PostgreSQL/Linux
+runtime E2E and does not qualify a nonempty worker or the signed full
+lifecycle.
 
 Configure these non-secret repository variables:
 
@@ -363,7 +373,12 @@ Configure these non-secret repository variables:
 - `EKS_CLUSTER_NAME`;
 - `TF_STATE_BUCKET` and `TF_STATE_APPLICATION_KEY`;
 - `PRODUCTION_TFVARS_B64`, the Base64 encoding of the private non-secret
-  application tfvars with `kubeconfig_*` and both image inputs omitted.
+  application tfvars with `kubeconfig_*` and all deployment-built image inputs
+  omitted;
+- `ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME` and
+  `ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME`, opaque immutable revision-1 Secret
+  names. Before planning, the workflow verifies their exact key sets without
+  printing or persisting Secret data.
 
 The workflow does not copy production credentials into GitHub. After assuming
 the branch-pinned role, it reads the existing Terraform-managed `cats-runtime`
@@ -386,8 +401,10 @@ The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-Terraform deliberately creates no Gateway Secret, ServiceAccount, Deployment,
-Service, Pod Identity or DynamoDB Route mirror in this release.
+Terraform deliberately creates neither Route v2 private bytes nor a DynamoDB
+Route mirror. It deploys the Gateway ServiceAccount, Deployment and Service,
+while a root-only provisioning channel creates the two immutable Kubernetes
+Secrets before this workflow runs.
 
 ## Metal worker deployment boundary
 

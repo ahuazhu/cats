@@ -251,9 +251,9 @@ resource "aws_iam_role_policy" "github_application_deploy" {
   policy = data.aws_iam_policy_document.github_application_deploy.json
 }
 
-# Bare-metal workers: the network position they occupy. cats-noded listens on
-# 7301 and is reached by cats-controld (and, after cutover, the v2 Gateway) from
-# inside the cluster; nothing else may reach it. The instances themselves are declared
+# Bare-metal workers: the network position they occupy. The signed Runtime
+# listener on 7301 and independent Route v2 mTLS listener on 7444 are reachable
+# only from the cluster security group. The instances themselves are declared
 # further down, and the infrastructure stack installs onto them by id.
 resource "aws_security_group" "metal_worker" {
   name        = "${var.name_prefix}-${var.environment}-metal-worker"
@@ -274,6 +274,18 @@ resource "aws_vpc_security_group_ingress_rule" "metal_worker_node_agent" {
   to_port                      = 7301
   ip_protocol                  = "tcp"
   description                  = "cats-noded from the cluster"
+}
+
+# Route v2 is an independent mTLS listener. Keeping its rule separate from the
+# signed Runtime listener prevents a future port-range edit from silently
+# widening either authority boundary.
+resource "aws_vpc_security_group_ingress_rule" "metal_worker_route_v2" {
+  security_group_id            = aws_security_group.metal_worker.id
+  referenced_security_group_id = module.cluster.cluster_security_group_id
+  from_port                    = 7444
+  to_port                      = 7444
+  ip_protocol                  = "tcp"
+  description                  = "Route v2 Gateway to Node mTLS"
 }
 
 # Workers sit in private subnets with no public address, so the operator path in

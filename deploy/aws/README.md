@@ -14,10 +14,9 @@ Terraform subscription alone is not paging evidence.
 
 Production-shaped split:
 
-- EKS Pods: `cats-controld` (portal, user console, admin console and API).
-  Route Grant v2 and the machine tunnel exist in code, but public Endpoint
-  ingress remains undeployed because this stack does not install the reviewed
-  signing ring, Gateway/Node mTLS artifacts or public proxy.
+- EKS Pods: active-active `cats-controld` plus the separate active-active
+  `cats-gatewayd` Route v2 public proxy. Control's machine-only mTLS listener
+  is exposed through a distinct cluster-local Service on port 7443.
 - EC2 bare metal: only `cats-noded`, `cats-blockd`, Cloud Hypervisor and guest
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
@@ -31,17 +30,73 @@ Production-shaped split:
   webhook endpoint. PostgreSQL stores append-only signup grants, top-ups and
   refund reversals; Stripe is collection infrastructure, not the balance or
   usage truth.
-- One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
-  `ops.cats.run` and the configured control-plane hosts. It does not advertise
-  or route the Endpoint wildcard yet.
+- One EKS Auto Mode ALB: exact configured control-plane hosts route to
+  `cats-controld`; the one configured Endpoint wildcard routes only to
+  `cats-gatewayd`. Both targets expose local `/healthz`.
 
-The Terraform application stack creates the `cats-controld` ServiceAccount,
-`cats-runtime` and `cats-rds-ca`;
+The Terraform application stack creates the `cats-controld` and
+`cats-gatewayd` ServiceAccounts, `cats-runtime` and `cats-rds-ca`;
 secrets are injected by CI and remain protected in remote state. It also
 renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
 EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
-permissions. No Gateway identity or shared Route table is provisioned. Do not
-create or patch these objects manually.
+permissions. Gateway has no ServiceAccount token, Pod Identity, shared Route
+table or Control bearer. Do not create or patch Terraform-owned objects
+manually.
+
+### Route v2 artifact delivery
+
+Private Route v2 bytes never enter Terraform variables, state, plans, process
+arguments, environment variables or logs. Before planning, the approved
+root-only credential workflow creates versioned immutable Kubernetes Secrets
+in namespace `cats` and one scoped Secrets Manager secret for the workers.
+Terraform receives only their opaque names/ARN. The deployment workflow checks
+`.immutable == true` and exact key names without decoding or persisting data.
+
+The Control Secret contains exactly seven keys:
+
+- `gateway-workload-authority.v1.json`
+- `gateway-client-ca-bundle.pem`
+- `control-machine-server-certificate.pem`
+- `control-machine-server-private-key.pem`
+- `signer.v1.json`
+- `public-key-ring.v1.json`
+- `signer-private-key.pem`
+
+The Gateway Secret contains exactly the frozen three keys:
+`node-server-ca-bundle.pem`, `gateway-machine-client-certificate.pem` and
+`gateway-machine-client-private-key.pem`. There is no fourth Gateway artifact
+and no separate Control CA file: `node-server-ca-bundle.pem` must validate both
+the Control server chain for
+`cats-controld-route-v2.cats.svc.cluster.local` and every reviewed Node server
+chain. A root init renderer copies each projected Secret into an in-memory
+emptyDir so the main process sees real, single-link, root-owned files under a
+root:root `0700` `/etc/cats/route-v2`; public material is `0644` and private
+keys are `0600`. Main containers run as uid 0 only because the frozen reader
+requires those exact owners/modes; both have a read-only root filesystem, no
+privilege escalation and all Linux capabilities dropped.
+
+The worker Secrets Manager `SecretString` is a JSON object with exactly four
+non-empty base64 fields:
+`public_key_ring_v1_json_b64`, `gateway_client_ca_bundle_pem_b64`,
+`node_machine_server_certificate_pem_b64` and
+`node_machine_server_private_key_pem_b64`. The instance role can read only that
+ARN (plus its already-scoped runtime/database secrets). Terraform also pins
+the exact Secrets Manager version ID, so a later `AWSCURRENT` change cannot
+alter a fresh Host's revision-1 bytes. The SSM transaction decodes, validates
+and installs the four fixed Node files with the same owner,
+directory and mode contract before starting `cats-noded`; Route v2 listens on
+7444. A23 `node_transport_target` must therefore be the reviewed canonical
+`https://<node-private-dns>:7444`, never the signed Runtime port 7301.
+
+This wiring is initial revision 1 only. Kubernetes Secret names must end in
+`-r1`, and the worker ARN must identify an `-r1-` secret. A fresh Pod renders a
+fresh emptyDir; a worker publishes `/etc/cats/route-v2` only when it is absent.
+An existing worker directory is accepted only when the closed set, ownership,
+modes, link counts and every byte are identical; any difference fails before
+the deployment mutates installed binaries or units. G2 performs no hot reload,
+ring replacement, signer switch, overlap window or loaded-ring ACK rollout;
+all successor revision and emergency rotation behavior remains the separate G3
+contract.
 
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in
@@ -88,20 +143,16 @@ a rolling current-runtime upgrade until the gate below is green.
 The bundle carries the one CI-built, manifest-bound Guest kernel, optional
 initramfs and runtime receipt; a Host-local rebuild is not release input and
 does not qualify as rollback. `metal/install-worker.sh` remains a
-bootstrap/development helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
-Ed25519 public key before it changes packages, installed files or services; for
-example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
-deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
-then installs it as root-owned mode `0644` at
-`/etc/cats/route-grant-public.pem` before enabling `cats-worker`, whether or not
-`worker.env` already exists. Its environment example deliberately contains
-`REPLACE_WITH_UNIQUE_NODE_ID` and `PRIVATE_IPV4`; fill both before rerunning the
-helper. An existing file with either placeholder is rejected before package
-installation or compilation so a second host cannot claim another worker's
-identity. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
-host-wide binary used by another workload. The S3 adapter uses the EC2
-instance role and refreshes its temporary credentials; no long-lived AWS key is
-stored in `worker.env`.
+bootstrap/development helper. It requires
+`CATS_ROUTE_V2_NODE_ARTIFACT_DIR=/approved/root-only/node-route-v2` before it
+changes packages, installed files or services. The source must be one real
+directory containing exactly the fixed four Node artifacts documented above.
+The helper stages and validates the canonical ring, CA sequence and matching
+Node certificate/private key, then installs the closed set at
+`/etc/cats/route-v2` before enabling `cats-worker`. Cloud Hypervisor stays under
+`/opt/cats/bin` so it does not replace a host-wide binary used by another
+workload. The S3 adapter uses the EC2 instance role and refreshes its temporary
+credentials; no long-lived AWS key is stored in `worker.env`.
 
 The release pipeline implements the frozen
 [Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md) plus
@@ -123,18 +174,22 @@ deploy/aws/tools/build-manual-release.sh \
   --source-sha "$(git rev-parse HEAD)" \
   --output /approved/private-output/cats-release \
   --image registry.example/cats/control-plane:exact-tag \
+  --gateway-image registry.example/cats/gateway:exact-tag \
   --push
 ```
 
 It exports and rechecks the exact Git tree, invokes the Guest-image generator
-once, feeds that one closed payload to both Dockerfiles, extracts the receipt
-and manifest from the final Control image and the complete Guest payload from
-the worker artifact, and compares all logical members byte for byte. The
+once, feeds that one closed payload to the Control and worker Dockerfiles,
+builds the separate Gateway image, extracts the receipt/manifest from the final
+Control image, the `cats-gatewayd` executable from the final Gateway image and
+the complete Guest payload from the worker artifact, and verifies every closed
+set. The
 canonical `release-manifest.v1.json` binds source commit/tree/fingerprint,
-build-input fingerprints, Guest release ID, Control OCI/config digests and the
-worker tar SHA-256. Without `--push`, the image remains only in the local
-Docker store and the manifest records `registry_verified=false`; that output
-is useful for dry-run qualification but is not a registry deployment receipt.
+build-input fingerprints, Guest release ID, Control and Gateway OCI/config
+digests, Gateway binary digest and the worker tar SHA-256. Without `--push`,
+both images remain only in the local Docker store and the manifest records both
+registry verifications as false; that output is useful for dry-run
+qualification but is not a registry deployment receipt.
 The builder never invokes Terraform, Kubernetes or a production service.
 
 The application rollout also mounts the central provisioner's canonical public

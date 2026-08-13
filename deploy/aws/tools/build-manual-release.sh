@@ -4,18 +4,19 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--push]
+usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--gateway-image REPOSITORY:TAG] [--push]
 
-Builds the shared Guest runtime once, then the linux/amd64 Control image and
-worker bundle from that same payload. The default image stays in the local
-buildx cache; --push requires an immutable repository:tag reference and verifies
-the reported digest against the registry before writing release-manifest.v1.json.
+Builds the shared Guest runtime once, then the linux/amd64 Control image,
+Route v2 Gateway image and worker bundle. Default images stay local; --push
+requires both explicit repository:tag references and verifies both reported
+digests against the registry before writing release-manifest.v1.json.
 EOF
 }
 
 source_sha=
 output_root=
 image_reference=
+gateway_image_reference=
 push_image=false
 
 while [[ $# -gt 0 ]]; do
@@ -33,6 +34,11 @@ while [[ $# -gt 0 ]]; do
     --image)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       image_reference=$2
+      shift 2
+      ;;
+    --gateway-image)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      gateway_image_reference=$2
       shift 2
       ;;
     --push)
@@ -63,11 +69,22 @@ if [[ $push_image == true ]]; then
     echo "--push requires --image with an explicit repository:tag (not a digest)" >&2
     exit 2
   }
+  [[ -n $gateway_image_reference && $gateway_image_reference != *@* && $gateway_image_reference == */*:* ]] || {
+    echo "--push requires --gateway-image with an explicit repository:tag (not a digest)" >&2
+    exit 2
+  }
 elif [[ -z $image_reference ]]; then
   image_reference="cats-control-plane:manual-${source_sha:0:12}"
 fi
+if [[ -z $gateway_image_reference ]]; then
+  gateway_image_reference="cats-gateway:manual-${source_sha:0:12}"
+fi
 [[ $image_reference != *@* && $image_reference != *[[:space:]]* ]] || {
   echo "--image must be a whitespace-free tag reference without @" >&2
+  exit 2
+}
+[[ $gateway_image_reference != *@* && $gateway_image_reference != *[[:space:]]* ]] || {
+  echo "--gateway-image must be a whitespace-free tag reference without @" >&2
   exit 2
 }
 
@@ -112,11 +129,15 @@ source_fingerprint=$(
 umask 077
 stage_parent=$(mktemp -d "${TMPDIR:-/tmp}/cats-manual-release.XXXXXX")
 control_container=
+gateway_container=
 root_touched_stage=false
 output_incomplete=
 cleanup() {
   if [[ -n $control_container ]]; then
     docker rm -f "$control_container" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $gateway_container ]]; then
+    docker rm -f "$gateway_container" >/dev/null 2>&1 || true
   fi
   if [[ $root_touched_stage == true ]]; then
     sudo -n chown -Rh "$(id -u):$(id -g)" "$stage_parent" 2>/dev/null || true
@@ -183,11 +204,13 @@ sudo env \
 sudo chown -R "$(id -u):$(id -g)" "$guest_output" "$guest_release"
 
 control_metadata="$output_incomplete/control-image-metadata.json"
+gateway_metadata="$output_incomplete/gateway-image-metadata.json"
 worker_metadata="$output_incomplete/worker-image-metadata.json"
 control_root="$output_incomplete/control-root"
+gateway_root="$output_incomplete/gateway-root"
 worker_root="$output_incomplete/worker-root"
 worker_bundle="$output_incomplete/cats-worker.tar.zst"
-mkdir -m 0700 "$control_root" "$worker_root"
+mkdir -m 0700 "$control_root" "$gateway_root" "$worker_root"
 
 build_arguments=(
   --file deploy/aws/Dockerfile.control-plane
@@ -246,6 +269,57 @@ docker rm "$control_container" >/dev/null
 control_container=
 
 docker buildx build \
+  --file deploy/aws/Dockerfile.gateway \
+  --target runtime \
+  --platform linux/amd64 \
+  --provenance=false \
+  --metadata-file "$gateway_metadata" \
+  --tag "$gateway_image_reference" \
+  --load \
+  "$source_root"
+
+gateway_image_digest=$(
+  python3 - "$gateway_metadata" <<'PY'
+import json, re, sys
+with open(sys.argv[1], "rb") as source:
+    metadata = json.load(source)
+digest = metadata.get("containerimage.digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("Gateway buildx metadata lacks a canonical image digest")
+print(digest)
+PY
+)
+gateway_config_digest=$(
+  python3 - "$gateway_metadata" <<'PY'
+import json, re, sys
+with open(sys.argv[1], "rb") as source:
+    metadata = json.load(source)
+digest = metadata.get("containerimage.config.digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("Gateway buildx metadata lacks a canonical image config digest")
+print(digest)
+PY
+)
+gateway_image_id=$(docker image inspect --format '{{.Id}}' "$gateway_image_reference")
+[[ $gateway_image_id == "$gateway_config_digest" ]] || {
+  echo "loaded Gateway image ID differs from the build config digest" >&2
+  exit 1
+}
+[[ $(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$gateway_image_id") == amd64/linux ]] || {
+  echo "loaded Gateway image is not linux/amd64" >&2
+  exit 1
+}
+
+install -d -m 0700 "$gateway_root/usr/local/bin"
+gateway_container=$(docker create --platform linux/amd64 "$gateway_image_id")
+docker cp \
+  "$gateway_container:/usr/local/bin/cats-gatewayd" \
+  "$gateway_root/usr/local/bin/cats-gatewayd"
+docker rm "$gateway_container" >/dev/null
+gateway_container=
+chmod 0755 "$gateway_root/usr/local/bin/cats-gatewayd"
+
+docker buildx build \
   --file deploy/aws/Dockerfile.worker-artifact \
   --target artifact \
   --platform linux/amd64 \
@@ -263,16 +337,21 @@ tar --zstd -tvf "$worker_bundle" \
 verifier_arguments=(
   --shared-guest-runtime "$guest_release"
   --control-root "$control_root"
+  --gateway-image-root "$gateway_root"
   --worker-bundle "$worker_bundle"
   --control-image-reference "$image_reference"
   --control-image-digest "$control_image_digest"
   --control-image-config-digest "$control_config_digest"
+  --gateway-image-reference "$gateway_image_reference"
+  --gateway-image-digest "$gateway_image_digest"
+  --gateway-image-config-digest "$gateway_config_digest"
   --source-commit "$source_sha"
   --source-tree "$source_tree"
   --source-fingerprint "$source_fingerprint"
   --input-file "cargo_lock=$source_root/Cargo.lock"
   --input-file "rust_toolchain=$source_root/rust-toolchain.toml"
   --input-file "control_dockerfile=$source_root/deploy/aws/Dockerfile.control-plane"
+  --input-file "gateway_dockerfile=$source_root/deploy/aws/Dockerfile.gateway"
   --input-file "worker_dockerfile=$source_root/deploy/aws/Dockerfile.worker-artifact"
   --input-file "guest_builder=$source_root/deploy/metal/build-guest-image.sh"
   --input-file "guest_host_kernel=$guest_kernel"
@@ -289,18 +368,26 @@ preflight_manifest="$output_incomplete/release-manifest.preflight.v1.json"
 python3 deploy/aws/tools/verify-manual-release.py \
   "${verifier_arguments[@]}" \
   --control-image-registry-verified false \
+  --gateway-image-registry-verified false \
   --output "$preflight_manifest"
 
 if [[ $push_image == true ]]; then
   docker push "$image_reference"
-  registry_digest=$(docker buildx imagetools inspect --raw "$image_reference" | sha256sum | awk '{print "sha256:" $1}')
-  [[ $registry_digest == "$control_image_digest" ]] || {
+  control_registry_digest=$(docker buildx imagetools inspect --raw "$image_reference" | sha256sum | awk '{print "sha256:" $1}')
+  [[ $control_registry_digest == "$control_image_digest" ]] || {
     echo "registry Control digest differs from the verified local digest" >&2
+    exit 1
+  }
+  docker push "$gateway_image_reference"
+  gateway_registry_digest=$(docker buildx imagetools inspect --raw "$gateway_image_reference" | sha256sum | awk '{print "sha256:" $1}')
+  [[ $gateway_registry_digest == "$gateway_image_digest" ]] || {
+    echo "registry Gateway digest differs from the verified local digest" >&2
     exit 1
   }
   python3 deploy/aws/tools/verify-manual-release.py \
     "${verifier_arguments[@]}" \
     --control-image-registry-verified true \
+    --gateway-image-registry-verified true \
     --output "$output_incomplete/release-manifest.v1.json"
   rm -f -- "$preflight_manifest"
 else
@@ -309,8 +396,8 @@ fi
 
 # The final handoff deliberately contains only immutable deployment inputs and
 # their canonical manifest, not mutable build caches or extraction scratch.
-rm -rf -- "$control_root" "$worker_root" "$guest_output"
-rm -f -- "$control_metadata" "$worker_metadata"
+rm -rf -- "$control_root" "$gateway_root" "$worker_root" "$guest_output"
+rm -f -- "$control_metadata" "$gateway_metadata" "$worker_metadata"
 cp -R "$guest_release" "$output_incomplete/guest-runtime-release.v1"
 chmod -R a-w "$output_incomplete/guest-runtime-release.v1"
 chmod a-w "$output_incomplete/cats-worker.tar.zst" "$output_incomplete/release-manifest.v1.json"

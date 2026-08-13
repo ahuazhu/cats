@@ -1,9 +1,8 @@
 data "aws_partition" "current" {}
 
 locals {
-  resource_name                 = "${var.name_prefix}-${var.environment}-worker"
-  artifact_key                  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
-  route_grant_public_key_base64 = base64encode(var.route_grant_public_key_pem)
+  resource_name = "${var.name_prefix}-${var.environment}-worker"
+  artifact_key  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
   tags = merge(var.tags, {
     Component   = "metal-worker-deployment"
     Environment = var.environment
@@ -71,7 +70,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat systemd-run; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl cmp wc flock stat systemd-run; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -84,8 +83,9 @@ locals {
     runtime_overlay=""
     environment_temp=""
     seed_temp=""
-    route_grant_key_temp=""
-    route_grant_key_fingerprint=""
+    route_v2_secret=""
+    route_v2_stage=""
+    route_v2_publish=""
     archive_entries=""
     release_transaction_active=0
     release_installer=""
@@ -99,11 +99,17 @@ locals {
       fi
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp" "$archive_entries"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_v2_secret" "$archive_entries"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
       done
+      if [ -n "$route_v2_stage" ]; then
+        rm -rf -- "$route_v2_stage"
+      fi
+      if [ -n "$route_v2_publish" ]; then
+        rm -rf -- "$route_v2_publish"
+      fi
       exit "$status"
     }
     trap cleanup EXIT
@@ -157,20 +163,86 @@ locals {
     # target node is already drained and cordoned.
     "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
 
-    # Validate verification material before changing any installed binary.
-    # The public half is intentionally separate from worker.env: PEM is
-    # multiline, non-secret, and must never be confused with the shared
-    # service token. Terraform rewrites it on every drained deployment.
-    route_grant_key_temp="$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)"
-    printf '%s' '${local.route_grant_public_key_base64}' | base64 --decode > "$route_grant_key_temp"
-    openssl pkey -pubin -in "$route_grant_key_temp" -text_pub -noout \
-      | grep -q '^ED25519 Public-Key:'
-    route_grant_key_fingerprint="$(
-      openssl pkey -pubin -in "$route_grant_key_temp" -outform DER \
-        | sha256sum \
-        | awk '{print $1}'
-    )"
-    printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
+    # Fetch the closed Node Route v2 artifact set before the first Cats
+    # installed-file mutation. Terraform and the SSM command carry only the
+    # opaque secret ARN; private bytes remain in root-only files and pipes,
+    # never argv, env or logs. The explicit IAM statement below grants this
+    # revision-1 secret and no other Route v2 secret.
+    route_v2_secret="$(mktemp /run/cats-route-v2-secret.XXXXXX)"
+    route_v2_stage="$(mktemp -d /run/cats-route-v2-stage.XXXXXX)"
+    chmod 0600 "$route_v2_secret"
+    chmod 0700 "$route_v2_stage"
+    aws secretsmanager get-secret-value \
+      --secret-id "${var.route_v2_node_artifact_secret_arn}" \
+      --version-id "${var.route_v2_node_artifact_secret_version_id}" \
+      --query SecretString \
+      --output text > "$route_v2_secret"
+    jq -e '
+      type == "object" and
+      keys == [
+        "gateway_client_ca_bundle_pem_b64",
+        "node_machine_server_certificate_pem_b64",
+        "node_machine_server_private_key_pem_b64",
+        "public_key_ring_v1_json_b64"
+      ] and
+      all(.[]; type == "string" and length > 0)
+    ' "$route_v2_secret" >/dev/null
+
+    decode_route_v2_artifact() {
+      field=$1
+      destination=$2
+      mode=$3
+      jq -er --arg field "$field" '.[$field]' "$route_v2_secret" \
+        | base64 --decode > "$destination"
+      test -s "$destination"
+      chmod "$mode" "$destination"
+    }
+    decode_route_v2_artifact public_key_ring_v1_json_b64 "$route_v2_stage/public-key-ring.v1.json" 0644
+    decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
+    decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
+    decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600
+
+    printf '%s' "$(jq -cS . "$route_v2_stage/public-key-ring.v1.json")" > "$route_v2_stage/public-key-ring.canonical"
+    cmp "$route_v2_stage/public-key-ring.v1.json" "$route_v2_stage/public-key-ring.canonical"
+    rm -f -- "$route_v2_stage/public-key-ring.canonical"
+    jq -e '.version == 1 and .ring_version == 1 and .expected_previous == null' \
+      "$route_v2_stage/public-key-ring.v1.json" >/dev/null
+    test "$(wc -c < "$route_v2_stage/public-key-ring.v1.json")" -le 16384
+    test "$(wc -c < "$route_v2_stage/gateway-client-ca-bundle.pem")" -le 65536
+    test "$(wc -c < "$route_v2_stage/node-machine-server-certificate.pem")" -le 65536
+    test "$(wc -c < "$route_v2_stage/node-machine-server-private-key.pem")" -le 16384
+    openssl crl2pkcs7 -nocrl -certfile "$route_v2_stage/gateway-client-ca-bundle.pem" \
+      | openssl pkcs7 -print_certs -noout >/dev/null
+    openssl x509 -in "$route_v2_stage/node-machine-server-certificate.pem" -pubkey -noout \
+      | openssl pkey -pubin -outform DER > "$route_v2_stage/certificate-public.der"
+    openssl pkey -in "$route_v2_stage/node-machine-server-private-key.pem" -pubout -outform DER \
+      > "$route_v2_stage/private-key-public.der"
+    cmp "$route_v2_stage/certificate-public.der" "$route_v2_stage/private-key-public.der"
+    rm -f -- "$route_v2_stage/certificate-public.der" "$route_v2_stage/private-key-public.der"
+
+    route_v2_names='public-key-ring.v1.json gateway-client-ca-bundle.pem node-machine-server-certificate.pem node-machine-server-private-key.pem'
+    verify_installed_route_v2_r1() {
+      test -d /etc/cats/route-v2
+      test ! -L /etc/cats/route-v2
+      test "$(stat -c '%U:%G:%a' /etc/cats/route-v2)" = root:root:700
+      test "$(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 | wc -l)" -eq 4
+      test "$(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l)" -eq 4
+      for name in $route_v2_names; do
+        mode=644
+        test "$name" != node-machine-server-private-key.pem || mode=600
+        test "$(stat -c '%U:%G:%a:%h' "/etc/cats/route-v2/$name")" = "root:root:$mode:1"
+        cmp "$route_v2_stage/$name" "/etc/cats/route-v2/$name"
+      done
+    }
+
+    # G2 is initial revision-1 delivery, not G3 rotation. An already-installed
+    # set is accepted only when every byte and metadata field is identical.
+    # Any conflict fails before the deployment mutates binaries or units.
+    route_v2_already_installed=false
+    if [ -e /etc/cats/route-v2 ] || [ -L /etc/cats/route-v2 ]; then
+      verify_installed_route_v2_r1
+      route_v2_already_installed=true
+    fi
 
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
@@ -188,6 +260,34 @@ locals {
     "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
+
+    if [ "$route_v2_already_installed" = true ]; then
+      verify_installed_route_v2_r1
+    else
+      test ! -e /etc/cats/route-v2
+      test ! -L /etc/cats/route-v2
+      if [ ! -e /etc/cats ]; then
+        install -d -o root -g root -m 0755 /etc/cats
+      else
+        test -d /etc/cats
+        test ! -L /etc/cats
+      fi
+      route_v2_publish="$(mktemp -d /etc/cats/.route-v2-r1.XXXXXX)"
+      chmod 0700 "$route_v2_publish"
+      for name in $route_v2_names; do
+        mode=0644
+        test "$name" != node-machine-server-private-key.pem || mode=0600
+        install -o root -g root -m "$mode" "$route_v2_stage/$name" "$route_v2_publish/$name"
+        sync -f "$route_v2_publish/$name"
+      done
+      sync -f "$route_v2_publish"
+      test ! -e /etc/cats/route-v2
+      mv -T -- "$route_v2_publish" /etc/cats/route-v2
+      route_v2_publish=""
+      sync -f /etc/cats
+      verify_installed_route_v2_r1
+      cats_worker_deployment_crash_probe after-install-route-v2-artifacts
+    fi
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
     cats_worker_deployment_crash_probe after-install-release-installer
     install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
@@ -231,14 +331,6 @@ locals {
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
     cats_worker_deployment_crash_probe after-install-postgres-timer
 
-    install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
-    cats_worker_deployment_crash_probe after-install-route-key
-    installed_route_grant_key_fingerprint="$(
-      openssl pkey -pubin -in /etc/cats/route-grant-public.pem -outform DER \
-        | sha256sum \
-        | awk '{print $1}'
-    )"
-    test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
     aws secretsmanager get-secret-value \
@@ -357,7 +449,7 @@ CATS_BASE_ENVIRONMENT
     cats_commit_candidate "$release_installer"
     release_transaction_active=0
     cats_worker_deployment_crash_probe after-release-commit
-    echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
+    echo "Route v2 Node artifact set installed from the scoped secret reference"
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
   SCRIPT
@@ -509,6 +601,12 @@ data "aws_iam_policy_document" "artifact_reader" {
     sid       = "ReadWorkerRuntimeSecret"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.worker_runtime.arn]
+  }
+
+  statement {
+    sid       = "ReadRouteV2NodeArtifactSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [var.route_v2_node_artifact_secret_arn]
   }
 
   # render-postgres-url reads the database password from the one place that

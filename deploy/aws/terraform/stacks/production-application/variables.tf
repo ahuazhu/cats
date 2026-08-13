@@ -13,6 +13,11 @@ variable "control_plane_image" {
   type        = string
 }
 
+variable "gateway_image" {
+  description = "Immutable ECR cats-gatewayd image with sha256 digest."
+  type        = string
+}
+
 variable "control_plane_replicas" {
   description = "Active-active cats-controld API replica count."
   type        = number
@@ -22,6 +27,27 @@ variable "control_plane_replicas" {
     condition     = var.control_plane_replicas >= 2 && floor(var.control_plane_replicas) == var.control_plane_replicas
     error_message = "control_plane_replicas must be an integer of at least 2."
   }
+}
+
+variable "gateway_replicas" {
+  description = "Active-active cats-gatewayd replica count."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
+    error_message = "gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "route_v2_control_artifact_secret_name" {
+  description = "Pre-created immutable Kubernetes Secret name for the closed seven-file Control Route v2 artifact set."
+  type        = string
+}
+
+variable "route_v2_gateway_artifact_secret_name" {
+  description = "Pre-created immutable Kubernetes Secret name for exactly the three fixed Gateway Route v2 artifacts."
+  type        = string
 }
 
 variable "maintenance_mode" {
@@ -187,6 +213,12 @@ variable "control_plane_hosts" {
   description = "Hosts routed to cats-controld."
   type        = list(string)
   default     = ["cats.run", "app.cats.run", "admin.cats.run", "ops.cats.run"]
+}
+
+variable "endpoint_wildcard_host" {
+  description = "Wildcard Endpoint host routed only to cats-gatewayd."
+  type        = string
+  default     = "*.cats.run"
 }
 
 variable "auto_warm_after_seconds" {

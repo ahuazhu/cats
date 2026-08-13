@@ -19,6 +19,16 @@ variable "control_plane_image" {
   }
 }
 
+variable "gateway_image" {
+  description = "Immutable cats-gatewayd container image, including its sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
+    error_message = "gateway_image must be pinned by sha256 digest."
+  }
+}
+
 variable "control_plane_replicas" {
   description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
   type        = number
@@ -27,6 +37,43 @@ variable "control_plane_replicas" {
   validation {
     condition     = var.control_plane_replicas >= 2 && floor(var.control_plane_replicas) == var.control_plane_replicas
     error_message = "control_plane_replicas must be an integer of at least 2."
+  }
+}
+
+variable "gateway_replicas" {
+  description = "Number of active-active public Route v2 Gateway replicas."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
+    error_message = "gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "route_v2_control_artifact_secret_name" {
+  description = "Name of a pre-created immutable Kubernetes Secret containing the exact seven-file Control Route v2 artifact set. Terraform never receives its bytes."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_control_artifact_secret_name)) &&
+      endswith(var.route_v2_control_artifact_secret_name, "-r1")
+    )
+    error_message = "route_v2_control_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in -r1; rotation is outside the initial G2 deployment contract."
+  }
+}
+
+variable "route_v2_gateway_artifact_secret_name" {
+  description = "Name of a pre-created immutable Kubernetes Secret containing exactly the fixed three Gateway Route v2 artifacts. Its one server CA bundle must validate both Control and Node chains."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_gateway_artifact_secret_name)) &&
+      endswith(var.route_v2_gateway_artifact_secret_name, "-r1")
+    )
+    error_message = "route_v2_gateway_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in -r1; rotation is outside the initial G2 deployment contract."
   }
 }
 
@@ -421,6 +468,21 @@ variable "control_plane_hosts" {
   validation {
     condition     = length(var.control_plane_hosts) == length(toset(var.control_plane_hosts))
     error_message = "control_plane_hosts must not contain duplicates."
+  }
+}
+
+variable "endpoint_wildcard_host" {
+  description = "Wildcard public hostname routed only to cats-gatewayd."
+  type        = string
+  default     = "*.cats.run"
+
+  validation {
+    condition = (
+      startswith(var.endpoint_wildcard_host, "*.") &&
+      length(trimprefix(var.endpoint_wildcard_host, "*.")) > 0 &&
+      !contains(var.control_plane_hosts, var.endpoint_wildcard_host)
+    )
+    error_message = "endpoint_wildcard_host must be a wildcard hostname distinct from control_plane_hosts."
   }
 }
 

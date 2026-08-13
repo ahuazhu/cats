@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+# The public Gateway has its own minimal image. Route v2 credentials are never
+# part of the build context or image layers; the deployment renders the fixed
+# three-file set from a pre-created immutable Secret at Pod start.
+FROM lukemathwalker/cargo-chef:0.1.77-rust-1.97-bookworm@sha256:1689f62cfaa6603480356923cb5966544b2dd6ea523e30486bee4f149965d5bc AS chef
+
+WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+    -p cats-network
+
+COPY . .
+RUN cargo build --locked --release -p cats-network \
+    && strip target/release/cats-gatewayd \
+    && install -D -m 0755 target/release/cats-gatewayd /out/cats-gatewayd
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
+
+COPY --from=builder /out/cats-gatewayd /usr/local/bin/cats-gatewayd
+
+# The frozen installed-artifact reader requires a root:root 0700 directory and
+# a root:root 0600 client private key. Kubernetes still drops every capability,
+# forbids privilege escalation and gives the process a read-only rootfs.
+USER 0:0
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/cats-gatewayd"]

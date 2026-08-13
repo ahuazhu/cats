@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the two production artifacts and write one canonical release receipt."""
+"""Verify the three production artifacts and write one canonical release receipt."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ MAX_PROFILE_BYTES = 4096
 MAX_BOOT_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_WORKER_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_WORKER_MEMBER_BYTES = 512 * 1024 * 1024
+MAX_GATEWAY_BINARY_BYTES = 256 * 1024 * 1024
 WORKER_STATIC_FILES = {
     "cats",
     "cats-noded",
@@ -536,11 +537,16 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shared-guest-runtime", required=True, type=Path)
     parser.add_argument("--control-root", required=True, type=Path)
+    parser.add_argument("--gateway-image-root", required=True, type=Path)
     parser.add_argument("--worker-bundle", required=True, type=Path)
     parser.add_argument("--control-image-reference", required=True)
     parser.add_argument("--control-image-digest", required=True)
     parser.add_argument("--control-image-config-digest", required=True)
     parser.add_argument("--control-image-registry-verified", choices=("true", "false"), required=True)
+    parser.add_argument("--gateway-image-reference", required=True)
+    parser.add_argument("--gateway-image-digest", required=True)
+    parser.add_argument("--gateway-image-config-digest", required=True)
+    parser.add_argument("--gateway-image-registry-verified", choices=("true", "false"), required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--source-tree", required=True)
     parser.add_argument("--source-fingerprint", required=True)
@@ -561,6 +567,8 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
     require_sha256(arguments.source_fingerprint, name="source fingerprint")
     require_sha256(arguments.control_image_digest, name="Control OCI digest")
     require_sha256(arguments.control_image_config_digest, name="Control image config digest")
+    require_sha256(arguments.gateway_image_digest, name="Gateway OCI digest")
+    require_sha256(arguments.gateway_image_config_digest, name="Gateway image config digest")
     if (
         not arguments.control_image_reference
         or len(arguments.control_image_reference) > 1024
@@ -568,6 +576,16 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
         or any(character.isspace() or ord(character) < 0x20 for character in arguments.control_image_reference)
     ):
         raise VerificationError("Control image reference must be a bounded tag reference without @")
+    if (
+        not arguments.gateway_image_reference
+        or len(arguments.gateway_image_reference) > 1024
+        or "@" in arguments.gateway_image_reference
+        or any(
+            character.isspace() or ord(character) < 0x20
+            for character in arguments.gateway_image_reference
+        )
+    ):
+        raise VerificationError("Gateway image reference must be a bounded tag reference without @")
     if arguments.platform != "linux/amd64":
         raise VerificationError("the production artifact platform must be linux/amd64")
     if arguments.guest_target != "x86_64-unknown-linux-musl":
@@ -614,6 +632,46 @@ def atomic_write_new(path: Path, raw: bytes) -> None:
             pass
 
 
+def verify_gateway_image_root(root: Path) -> tuple[str, int]:
+    expected_directories = {".", "usr", "usr/local", "usr/local/bin"}
+    expected_files = {"usr/local/bin/cats-gatewayd"}
+    actual_directories: set[str] = {"."}
+    actual_files: set[str] = set()
+    root_metadata = root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise VerificationError("Gateway image root is not a real directory")
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in names:
+            path = directory_path / name
+            metadata = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise VerificationError(f"Gateway image root contains a non-directory: {relative}")
+            actual_directories.add(relative)
+        for name in filenames:
+            path = directory_path / name
+            metadata = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise VerificationError(f"Gateway image root contains a non-file: {relative}")
+            actual_files.add(relative)
+    if actual_directories != expected_directories:
+        raise VerificationError(
+            f"Gateway image directory set differs: {sorted(actual_directories ^ expected_directories)}"
+        )
+    if actual_files != expected_files:
+        raise VerificationError(
+            f"Gateway image file set differs: {sorted(actual_files ^ expected_files)}"
+        )
+    binary = read_regular(
+        root / "usr/local/bin/cats-gatewayd",
+        cap=MAX_GATEWAY_BINARY_BYTES,
+        mode=0o755,
+    )
+    return sha256_bytes(binary), len(binary)
+
+
 def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     validate_identifier_arguments(arguments)
     shared = verify_guest_release(arguments.shared_guest_runtime)
@@ -650,6 +708,9 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
         control_release_root / "guest-runtime-profile.v1.json",
         shared["profile_raw"],
         label="Control Guest runtime profile",
+    )
+    gateway_binary_sha, gateway_binary_size = verify_gateway_image_root(
+        arguments.gateway_image_root
     )
 
     worker_bundle_sha, worker_bundle_size = hash_regular(
@@ -691,6 +752,14 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                 "image_digest": arguments.control_image_digest,
                 "image_reference": arguments.control_image_reference,
                 "registry_verified": arguments.control_image_registry_verified == "true",
+            },
+            "gateway": {
+                "binary_sha256": gateway_binary_sha,
+                "binary_size_bytes": gateway_binary_size,
+                "image_config_digest": arguments.gateway_image_config_digest,
+                "image_digest": arguments.gateway_image_digest,
+                "image_reference": arguments.gateway_image_reference,
+                "registry_verified": arguments.gateway_image_registry_verified == "true",
             },
             "worker": {
                 "bundle_name": arguments.worker_bundle.name,
@@ -737,6 +806,11 @@ def main() -> int:
         "control_image="
         f"{release_manifest['artifacts']['control_plane']['image_reference']}@"
         f"{release_manifest['artifacts']['control_plane']['image_digest']}"
+    )
+    print(
+        "gateway_image="
+        f"{release_manifest['artifacts']['gateway']['image_reference']}@"
+        f"{release_manifest['artifacts']['gateway']['image_digest']}"
     )
     print(f"worker_bundle_sha256={release_manifest['artifacts']['worker']['bundle_sha256']}")
     return 0
