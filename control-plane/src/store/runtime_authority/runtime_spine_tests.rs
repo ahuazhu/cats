@@ -22,15 +22,16 @@ use cats_api::runtime_reconciliation::{
     GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id,
     InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress,
     NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    NodePlacementPolicy, NodeTransportTarget, ObservationInventoryAcceptance, ObservedNetwork,
-    ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation, OperationFailure,
-    OperationPhase, OperationTerminal, OwnershipTokenEvidence, PlacementRejectionReason,
-    PreconditionFailureReason, ProcessEvidence, ProcessRole, ProcessState, QuarantineReason,
-    RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint, Revision, RouteGateBinding,
-    RouteGateState, RuntimeConfig, RuntimeLaunch, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence,
-    SessionBinding, Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+    NodePlacementPolicy, NodeResidue, NodeTransportTarget, ObservationInventoryAcceptance,
+    ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation,
+    OperationFailure, OperationPhase, OperationTerminal, OwnershipTokenEvidence,
+    PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence, ProcessRole,
+    ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
+    Revision, RouteGateBinding, RouteGateState, RuntimeConfig, RuntimeLaunch,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
+    RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState, UnixMillis,
+    WarmSnapshotEvidence, WireU64,
 };
 
 use super::placement_policy::insert_policy_on_store_for_test;
@@ -821,6 +822,16 @@ pub(super) fn refresh_assigned_admission_for_test(
     release: &GuestRuntimeProfileReceipt,
     number: u128,
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    refresh_assigned_admission_with_residue_for_test(store, identity, release, number, Vec::new())
+}
+
+pub(super) fn refresh_assigned_admission_with_residue_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+    residue: Vec<NodeResidue>,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
     let authenticated = AuthenticatedNodeCredential::new(
         identity.credential_id.clone(),
         identity.credential_binding.clone(),
@@ -877,7 +888,7 @@ pub(super) fn refresh_assigned_admission_for_test(
             runtime
         })
         .collect();
-    let full = observation(
+    let mut full = observation(
         store,
         &session,
         1,
@@ -886,6 +897,8 @@ pub(super) fn refresh_assigned_admission_for_test(
         Some(snapshot.read_position),
         runtimes,
     );
+    full.residue = residue;
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
     accepted(
         store
             .runtime_accept_observation(&authenticated, &full)

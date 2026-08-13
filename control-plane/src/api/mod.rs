@@ -527,14 +527,6 @@ pub fn router(state: AppState) -> Router {
     #[cfg(not(debug_assertions))]
     let cat_item_route = get(runtime_product_reads::get_runtime_cat).delete(delete_cat_v2);
     #[cfg(debug_assertions)]
-    let cat_action_route = if state.retired_product_authority_for_tests() {
-        post(cat_action)
-    } else {
-        post(cat_lifecycle_v2)
-    };
-    #[cfg(not(debug_assertions))]
-    let cat_action_route = post(cat_lifecycle_v2);
-    #[cfg(debug_assertions)]
     let endpoint_collection_route = if state.retired_product_authority_for_tests() {
         post(create_endpoint).get(list_endpoints)
     } else {
@@ -554,16 +546,61 @@ pub fn router(state: AppState) -> Router {
     let product_mutations_v2 = if state.retired_product_authority_for_tests() {
         Router::new()
     } else {
-        Router::new().route(
-            "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
-            axum::routing::delete(unbind_endpoint_v2),
-        )
+        Router::new()
+            .route(
+                "/v1/workspaces/{workspace}/cats/{cat}/actions/stop",
+                post(stop_cat_v2),
+            )
+            .route(
+                "/v1/workspaces/{workspace}/cats/{cat}/actions/suspend",
+                post(suspend_cat_v2),
+            )
+            .route(
+                "/v1/workspaces/{workspace}/cats/{cat}/actions/warm",
+                post(warm_cat_v2),
+            )
+            .route(
+                "/v1/workspaces/{workspace}/cats/{cat}/actions/resume",
+                post(resume_cat_v2),
+            )
+            .route(
+                "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
+                axum::routing::delete(unbind_endpoint_v2),
+            )
     };
     #[cfg(not(debug_assertions))]
-    let product_mutations_v2 = Router::new().route(
-        "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
-        axum::routing::delete(unbind_endpoint_v2),
-    );
+    let product_mutations_v2 = Router::new()
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/stop",
+            post(stop_cat_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/suspend",
+            post(suspend_cat_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/warm",
+            post(warm_cat_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/resume",
+            post(resume_cat_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
+            axum::routing::delete(unbind_endpoint_v2),
+        );
+    #[cfg(debug_assertions)]
+    let retired_cat_action = if state.retired_product_authority_for_tests() {
+        Router::new().route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
+            post(cat_action),
+        )
+    } else {
+        Router::new()
+    };
+    #[cfg(not(debug_assertions))]
+    let retired_cat_action = Router::<AppState>::new();
     // These handlers read or mutate the retired Cat/Operation/Node authority.
     // Keep them reachable only from the explicit pre-cutover test composition.
     // The production middleware runs before authentication, body extraction,
@@ -686,10 +723,6 @@ pub fn router(state: AppState) -> Router {
     );
     let runtime_product_read = Router::new()
         .route("/v1/workspaces/{workspace}/cats/{cat}", cat_item_route)
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
-            cat_action_route,
-        )
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
             endpoint_collection_route,
@@ -826,6 +859,7 @@ pub fn router(state: AppState) -> Router {
         .merge(route_resolve_v2)
         .merge(product_mutations_v2)
         .merge(retired_product_support)
+        .merge(retired_cat_action)
         .merge(retired_product_authority)
         .fallback(crate::ui::not_found)
         .with_state(state)
@@ -913,7 +947,6 @@ mod tests {
         routes.push("POST /v1/workspaces/{workspace}/disks".to_string());
         assert!(
             router.contains("cat_item_route")
-                && router.contains("cat_action_route")
                 && router.contains("endpoint_collection_route")
                 && router.contains("disk_item_route")
                 && router.contains("product_mutations_v2"),

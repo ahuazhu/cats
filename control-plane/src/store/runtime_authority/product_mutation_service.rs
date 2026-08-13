@@ -21,8 +21,8 @@ use super::placement_policy::load_policy_unlocked;
 use super::product::{
     api_request_fingerprint, ApiIdempotencyRequest, ApiIdempotencyResult, CandidateCollision,
     CoveredDesiredMutationError, CoveredDesiredMutationRequest, CoveredDiskDeleteRequest,
-    DesiredMutationCommit, DesiredVolumeMutation, EndpointRecordCandidate, ExactContentType,
-    IfMatchFingerprint,
+    CoveredProductMutationPreflight, CoveredProductMutationTarget, DesiredMutationCommit,
+    DesiredVolumeMutation, EndpointRecordCandidate, ExactContentType, IfMatchFingerprint,
 };
 use super::product_identity::ProductIdentitySource;
 use super::product_rows::{
@@ -75,16 +75,6 @@ pub(crate) enum CatLifecycleAction {
 }
 
 impl CatLifecycleAction {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "stop" => Some(Self::Stop),
-            "suspend" => Some(Self::Suspend),
-            "warm" => Some(Self::Warm),
-            "resume" => Some(Self::Resume),
-            _ => None,
-        }
-    }
-
     const fn target(self) -> RuntimeTarget {
         match self {
             Self::Stop => RuntimeTarget::Cold,
@@ -577,6 +567,24 @@ impl ProductMutationService {
             if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
                 return Err(ProductMutationServiceError::TemporarilyUnavailable);
             }
+            let preflight_request = ingress.idempotency.clone();
+            let preflight_cat_id = cat_id.clone();
+            let preflight = await_before_deadline(
+                ingress.absolute_deadline,
+                self.store.execute(move |store| {
+                    store.preflight_product_mutation_covered(
+                        &preflight_request,
+                        &CoveredProductMutationTarget::Cat {
+                            cat_id: preflight_cat_id,
+                        },
+                    )
+                }),
+            )
+            .await
+            .map_err(ProductMutationServiceError::from_api)?;
+            if let CoveredProductMutationPreflight::Replayed(result) = preflight {
+                return Ok(http_result(result));
+            }
             let placement_required = false;
             let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
             let plan_cat_id = cat_id.clone();
@@ -596,11 +604,10 @@ impl ProductMutationService {
             .map_err(ProductMutationServiceError::from_api)?;
             let mut snapshot = match snapshot {
                 Some(snapshot) => snapshot,
-                None => {
-                    return Err(ProductMutationServiceError::Request(ApiError::not_found(
-                        "Cat",
-                    )))
-                }
+                // Only the covered preflight above may reveal NotFound. A Cat
+                // removed between that transaction and this snapshot is a
+                // stale plan and must re-enter the reservation barrier.
+                None => continue,
             };
             if action == Some(CatLifecycleAction::Resume)
                 && snapshot.current.target != RuntimeTarget::Running
@@ -734,6 +741,27 @@ impl ProductMutationService {
             if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
                 return Err(ProductMutationServiceError::TemporarilyUnavailable);
             }
+            let preflight_request = ingress.idempotency.clone();
+            let preflight_target = match &unbind {
+                Some(endpoint_id) => CoveredProductMutationTarget::Endpoint {
+                    cat_id: cat_id.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                },
+                None => CoveredProductMutationTarget::Cat {
+                    cat_id: cat_id.clone(),
+                },
+            };
+            let preflight = await_before_deadline(
+                ingress.absolute_deadline,
+                self.store.execute(move |store| {
+                    store.preflight_product_mutation_covered(&preflight_request, &preflight_target)
+                }),
+            )
+            .await
+            .map_err(ProductMutationServiceError::from_api)?;
+            if let CoveredProductMutationPreflight::Replayed(result) = preflight {
+                return Ok(http_result(result));
+            }
             let endpoint = if let Some(body) = &bind {
                 let endpoint_id = prefixed_id("ep_", self.identities.random_id()?)?;
                 EndpointMutation::Bind {
@@ -772,9 +800,7 @@ impl ProductMutationService {
                         // Workspace's resource without checking ownership. The
                         // frozen covered contract therefore rolls the key
                         // reservation back and persists nothing for NotFound.
-                        ErrorCode::NotFound => {
-                            return Err(ProductMutationServiceError::Request(error))
-                        }
+                        ErrorCode::NotFound => continue,
                         ErrorCode::Conflict => (409, ENDPOINT_CONFLICT_BODY),
                         ErrorCode::FailedPrecondition => (412, ENDPOINT_PRECONDITION_BODY),
                         ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => {

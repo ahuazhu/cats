@@ -12,11 +12,11 @@ use cats_api::runtime_reconciliation::{
     Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, GuestDeviceIdentity,
     GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Hostname, HttpProtocol, Id,
     Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeIdentity, NodeIdentityState,
-    NodePlacementPolicy, NodeTransportTarget, OperationPhase, OperationTerminal, RandomId128,
-    Revision, RuntimeConfig, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
-    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
-    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis,
-    VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
+    NodePlacementPolicy, NodeResidue, NodeTransportTarget, OperationPhase, OperationTerminal,
+    OwnershipTokenEvidence, RandomId128, Revision, RuntimeConfig, RuntimePlacementBlockFrontend,
+    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
+    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
     begin_delete, complete_disposable_root_delete, complete_normal_delete,
@@ -39,10 +39,10 @@ use super::product::{
     persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
     CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
-    CoveredDiskDeleteRequest, DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState,
-    DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
-    ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
-    PersistentDiskInitialization, RuntimeOperationRead,
+    CoveredDiskDeleteRequest, CoveredProductMutationTarget, DesiredMutationCommit,
+    DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
@@ -150,6 +150,15 @@ pub(super) fn bootstrap_workspace(store: &Store, slug: &str) -> Id {
         })
         .unwrap();
     id(workspace)
+}
+
+pub(crate) fn seed_a2_http_cat(store: &Store, workspace: &Id) -> Id {
+    let mut create = request(workspace, "a2-http", 0xa2_500, "a2-http-create");
+    let _ = prepare_mutation_node(store, &mut create, 99);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    create.candidate.cat_id
 }
 
 fn stores() -> (String, Store, Store, Id) {
@@ -936,6 +945,190 @@ fn a2_persistent_disk_delete_is_workspace_hidden_atomic_and_exactly_replayable()
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn a2_persistent_disk_delete_rejects_every_top_level_inventory_residue() {
+    let residues = [
+        NodeResidue::KernelNbd {
+            volume_id_hint: Some(id("volume_wrong_other_hint")),
+            guest_device: None,
+            device_path: cats_api::runtime_reconciliation::HostPath::new("/dev/nbd7").unwrap(),
+            ownership_token: OwnershipTokenEvidence::Missing,
+        },
+        NodeResidue::Process {
+            process_id: 991,
+            process_start_time_ticks: cats_api::runtime_reconciliation::WireU64::new(1).unwrap(),
+            executable_path: cats_api::runtime_reconciliation::HostPath::new("/usr/bin/unknown")
+                .unwrap(),
+            scope_id: None,
+            control_socket_path: None,
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+            control_handshake:
+                cats_api::runtime_reconciliation::ControlHandshakeEvidence::Unavailable,
+        },
+    ];
+
+    for (index, residue) in residues.into_iter().enumerate() {
+        let (_url, store, _unused, workspace) = stores();
+        let sequence = 800 + u64::try_from(index).unwrap();
+        let mut create = request(
+            &workspace,
+            &format!("residue-owner-{index}"),
+            sequence,
+            &format!("residue-owner-create-{index}"),
+        );
+        let (identity, _policy, release) =
+            prepare_mutation_node(&store, &mut create, u8::try_from(index + 31).unwrap());
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+
+        let volume = blank_volume(&format!("volume_residue_delete_{index}"));
+        let disk = persistent_disk(
+            &workspace,
+            &format!("disk_residue_delete_{index}"),
+            &format!("residue-delete-{index}"),
+            &volume,
+            PersistentDiskInitialization::Uninitialized {
+                initialization_token: random_id(0xa2e0 + index as u128 * 2),
+                filesystem_uuid: random_id(0xa2e1 + index as u128 * 2),
+                expected_blank_head: volume.head.clone(),
+            },
+        );
+        store
+            .authority_transaction(|transaction| {
+                insert_volume(transaction, &volume)?;
+                insert_disk(transaction, &disk)
+            })
+            .unwrap();
+        super::runtime_spine_tests::refresh_assigned_admission_with_residue_for_test(
+            &store,
+            &identity,
+            &release,
+            900 + index as u128,
+            vec![residue],
+        );
+
+        let delete = disk_delete_request(
+            &workspace,
+            &disk.disk_id,
+            &format!("residue-delete-key-{index}"),
+            &format!("delete_residue_{index}"),
+        );
+        let rejected = begin_disk_delete(&store, &delete).unwrap();
+        assert_eq!(rejected.http_status, 412);
+        store
+            .authority_transaction(|transaction| {
+                assert_eq!(
+                    load_disk_by_id_for_update(transaction, &disk.disk_id)?
+                        .unwrap()
+                        .admin_state,
+                    DiskAdminState::Active
+                );
+                assert_eq!(
+                    super::rows::load_volume_for_update(transaction, &volume.volume_id)?
+                        .unwrap()
+                        .admin_state,
+                    VolumeAdminState::Active
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a2_preflight_serializes_result_before_target_visibility_and_rolls_back_not_found() {
+    let (_url, store, holder, workspace) = stores();
+    let route = AsciiText::new(super::product_mutation_service::CAT_ACTION_ROUTE).unwrap();
+    let first_request = ApiIdempotencyRequest {
+        authenticated_workspace_id: workspace.clone(),
+        canonical_route: route.clone(),
+        idempotency_key: AsciiText::new("a2-preflight-barrier").unwrap(),
+        request_fingerprint: Sha256Digest::from_bytes([0xa1; 32]),
+    };
+    let conflicting_request = ApiIdempotencyRequest {
+        request_fingerprint: Sha256Digest::from_bytes([0xb2; 32]),
+        ..first_request.clone()
+    };
+    let committed = super::product::ApiIdempotencyResult {
+        authenticated_workspace_id: workspace.clone(),
+        canonical_route: route,
+        idempotency_key: first_request.idempotency_key.clone(),
+        request_fingerprint: first_request.request_fingerprint.clone(),
+        http_status: 202,
+        content_type: Some(ExactContentType::ApplicationJson),
+        response_body: br#"{"operation_id":"op_preflight"}"#.to_vec(),
+        created_at: unix_millis(1),
+    };
+    let locked = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let holder_locked = Arc::clone(&locked);
+    let holder_release = Arc::clone(&release);
+    let held_request = first_request.clone();
+    let held_result = committed.clone();
+    let holder_thread = std::thread::spawn(move || {
+        holder
+            .authority_transaction(|transaction| {
+                transaction.query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(
+                        current_schema() || ':api-result:' || $1 || ':' || $2 || ':' || $3,
+                        0::BIGINT
+                     ))",
+                    &[
+                        &held_request.authenticated_workspace_id.as_str(),
+                        &held_request.canonical_route.as_str(),
+                        &held_request.idempotency_key.as_str(),
+                    ],
+                )?;
+                holder_locked.wait();
+                holder_release.wait();
+                super::product_rows::insert_api_result(transaction, &held_result)
+            })
+            .unwrap();
+    });
+    locked.wait();
+
+    let target = CoveredProductMutationTarget::Cat {
+        // Deliberately absent: a conflict must be resolved without reading it.
+        cat_id: id("cat_absent_behind_conflict"),
+    };
+    let worker = std::thread::spawn(move || {
+        store.preflight_product_mutation_covered(&conflicting_request, &target)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !worker.is_finished(),
+        "second session bypassed the API-key barrier"
+    );
+    release.wait();
+    holder_thread.join().unwrap();
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+
+    let (_url, store, _unused, workspace) = stores();
+    let missing_request = ApiIdempotencyRequest {
+        authenticated_workspace_id: workspace,
+        canonical_route: AsciiText::new(super::product_mutation_service::CAT_ACTION_ROUTE).unwrap(),
+        idempotency_key: AsciiText::new("a2-preflight-not-found").unwrap(),
+        request_fingerprint: Sha256Digest::from_bytes([0xc3; 32]),
+    };
+    let missing = CoveredProductMutationTarget::Cat {
+        cat_id: id("cat_missing_preflight"),
+    };
+    assert_eq!(
+        store
+            .preflight_product_mutation_covered(&missing_request, &missing)
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert!(store
+        .covered_api_result_fast_lookup(&missing_request)
+        .unwrap()
+        .is_none());
 }
 
 #[test]

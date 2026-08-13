@@ -19,10 +19,44 @@ use crate::store::runtime_authority::product_mutation_service::{
 };
 
 const BODY_READ_LIMIT: usize = PRODUCT_MUTATION_MAX_BODY_BYTES + 1;
-pub(crate) async fn cat_lifecycle_v2(
+pub(crate) async fn stop_cat_v2(
     State(state): State<AppState>,
-    Path((workspace, cat, verb)): Path<(String, String, String)>,
+    Path((workspace, cat)): Path<(String, String)>,
     request: Request<Body>,
+) -> ApiResult<Response> {
+    cat_lifecycle_v2(state, workspace, cat, request, CatLifecycleAction::Stop).await
+}
+
+pub(crate) async fn suspend_cat_v2(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    cat_lifecycle_v2(state, workspace, cat, request, CatLifecycleAction::Suspend).await
+}
+
+pub(crate) async fn warm_cat_v2(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    cat_lifecycle_v2(state, workspace, cat, request, CatLifecycleAction::Warm).await
+}
+
+pub(crate) async fn resume_cat_v2(
+    State(state): State<AppState>,
+    Path((workspace, cat)): Path<(String, String)>,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    cat_lifecycle_v2(state, workspace, cat, request, CatLifecycleAction::Resume).await
+}
+
+async fn cat_lifecycle_v2(
+    state: AppState,
+    workspace: String,
+    cat: String,
+    request: Request<Body>,
+    action: CatLifecycleAction,
 ) -> ApiResult<Response> {
     let received_at = Instant::now();
     let deadline = product_mutation_absolute_deadline(received_at)?;
@@ -32,8 +66,6 @@ pub(crate) async fn cat_lifecycle_v2(
     )
     .await??;
     let workspace_id = authenticated_workspace_id(&scope.workspace.id)?;
-    let action =
-        CatLifecycleAction::parse(&verb).ok_or_else(|| ApiError::not_found("lifecycle action"))?;
     let ingress = authorized_after_auth(
         &workspace_id,
         Some(&cat),
@@ -304,6 +336,12 @@ async fn timeout_at<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use cats_api::runtime_reconciliation::Id;
+    use cats_metering::SqliteUsageStore;
+    use cats_storage::MetadataStore;
+
     use super::*;
 
     #[tokio::test]
@@ -320,5 +358,140 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_lifecycle_route_enforces_auth_envelope_and_exact_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
+        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
+            cats_metadata_store_sqlite::SqliteMetadataStore::open(&dir.path().join("storage.db"))
+                .unwrap(),
+        );
+        let handle = crate::server::spawn(crate::server::Config {
+            listen: "127.0.0.1:0".into(),
+            control_store_dsn: crate::store::DsnSource::Literal(
+                crate::testsupport::isolated_control_store_url(),
+            ),
+            control_store_ca_file: None,
+            usage_store: usage.clone(),
+            credit_store: usage,
+            storage_meta,
+            image_blob: crate::testsupport::unavailable_image_blob(),
+            guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
+            runtime_provisioner_trust_bundle:
+                crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            auth_token: "service-token".into(),
+            route_grant_signer: crate::testsupport::route_grant_signer(),
+            admin_token: "admin-token".into(),
+            workos: None,
+            stripe: None,
+            billing_enforcement_enabled: false,
+            node_lease_timeout_ms: 30_000,
+            reconcile_interval_ms: 60_000,
+            auto_tier_policy: Default::default(),
+            oci_deploy_sync_wait_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let workspace = tokio::task::block_in_place(|| {
+            Id::new(
+                handle
+                    .state
+                    .store
+                    .list_all_workspace_views()
+                    .unwrap()
+                    .into_iter()
+                    .find(|workspace| workspace.is_default)
+                    .unwrap()
+                    .id,
+            )
+            .unwrap()
+        });
+        let cat_id = tokio::task::block_in_place(|| {
+            crate::store::runtime_authority::product_tests::seed_a2_http_cat(
+                handle.state.store.as_ref(),
+                &workspace,
+            )
+        });
+        let url = format!(
+            "{}/v1/workspaces/{workspace}/cats/{cat_id}/actions/stop",
+            handle.base_url()
+        );
+        let client = reqwest::Client::new();
+
+        // Authentication precedes body/envelope parsing on the legal V2
+        // route, including for a deliberately malformed non-empty body.
+        let unauthenticated = client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let wrong_principal = client
+            .post(&url)
+            .bearer_auth("service-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_principal.status(), StatusCode::FORBIDDEN);
+
+        let malformed_envelope = client
+            .post(&url)
+            .bearer_auth("admin-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", "a2-http-malformed")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed_envelope.status(), StatusCode::BAD_REQUEST);
+
+        let send = || {
+            client
+                .post(&url)
+                .bearer_auth("admin-token")
+                .header("Idempotency-Key", "a2-http-exact-replay")
+                .send()
+        };
+        let first = send().await.unwrap();
+        let first_status = first.status();
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-store");
+        let first_body = first.bytes().await.unwrap();
+        assert_eq!(
+            first_status,
+            StatusCode::ACCEPTED,
+            "unexpected lifecycle response: {}",
+            String::from_utf8_lossy(&first_body)
+        );
+        let replay = send().await.unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(replay.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(replay.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(replay.bytes().await.unwrap(), first_body);
+
+        let malformed_rows: i64 = tokio::task::block_in_place(|| {
+            handle
+                .state
+                .store
+                .with(|client| {
+                    client
+                        .query_one(
+                            "SELECT count(*) FROM api_idempotency_results
+                              WHERE authenticated_workspace_id=$1
+                                AND idempotency_key='a2-http-malformed'",
+                            &[&workspace.as_str()],
+                        )
+                        .map(|row| row.get(0))
+                })
+                .unwrap()
+        });
+        assert_eq!(malformed_rows, 0);
+        handle.shutdown().await.unwrap();
     }
 }

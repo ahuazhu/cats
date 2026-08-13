@@ -516,6 +516,18 @@ pub(crate) struct ApiIdempotencyResult {
     pub(crate) created_at: UnixMillis,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CoveredProductMutationTarget {
+    Cat { cat_id: Id },
+    Endpoint { cat_id: Id, endpoint_id: Id },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CoveredProductMutationPreflight {
+    Replayed(ApiIdempotencyResult),
+    Proceed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CandidateCollision {
     CatId,
@@ -710,6 +722,56 @@ impl Store {
                 .map(|result| check_replay(result, &request.request_fingerprint))
                 .transpose()
                 .map_err(AuthorityTransactionError::from)
+        })
+    }
+
+    /// Serializes a result miss with the same covered API-key transaction
+    /// family before revealing whether a Cat or Endpoint exists. A stored
+    /// result (including a fingerprint conflict) is resolved before any
+    /// product row is read. NotFound returns an error so both the advisory
+    /// reservation and every transaction effect are rolled back.
+    pub(super) fn preflight_product_mutation_covered(
+        &self,
+        request: &ApiIdempotencyRequest,
+        target: &CoveredProductMutationTarget,
+    ) -> Result<CoveredProductMutationPreflight> {
+        self.authority_transaction(|transaction| {
+            reserve_api_key(transaction, request)?;
+            if let Some(result) = load_api_result_for_update(transaction, request)? {
+                return check_replay(result, &request.request_fingerprint)
+                    .map(CoveredProductMutationPreflight::Replayed)
+                    .map_err(AuthorityTransactionError::from);
+            }
+
+            let cat_id = match target {
+                CoveredProductMutationTarget::Cat { cat_id }
+                | CoveredProductMutationTarget::Endpoint { cat_id, .. } => cat_id,
+            };
+            let cat = load_cat_by_id_for_update(transaction, cat_id)?
+                .filter(|cat| cat.workspace_id == request.authenticated_workspace_id)
+                .ok_or_else(|| ApiError::not_found("Cat"))?;
+            if cat.cat_id != *cat_id {
+                return Err(ApiError::internal("Cat ID projection is corrupt").into());
+            }
+
+            if let CoveredProductMutationTarget::Endpoint { endpoint_id, .. } = target {
+                let desired = load_desired_for_update(transaction, cat_id)?
+                    .ok_or_else(|| ApiError::internal("Cat has no current Desired"))?;
+                let endpoint = load_endpoint_by_id_for_update(transaction, endpoint_id)?
+                    .filter(|endpoint| {
+                        endpoint.workspace_id == request.authenticated_workspace_id
+                            && endpoint.cat_id == *cat_id
+                    })
+                    .ok_or_else(|| ApiError::not_found("Endpoint"))?;
+                if !desired
+                    .endpoints
+                    .iter()
+                    .any(|intent| intent.endpoint_id == endpoint.endpoint_id)
+                {
+                    return Err(ApiError::not_found("Endpoint").into());
+                }
+            }
+            Ok(CoveredProductMutationPreflight::Proceed)
         })
     }
 

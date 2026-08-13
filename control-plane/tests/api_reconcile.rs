@@ -3407,18 +3407,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "invalid-before-cutover-gate",
         ),
         (
-            reqwest::Method::DELETE,
-            format!("{workspace_base}/cats/signed-cutover"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/actions/stop"),
-            Some(serde_json::json!({})),
-            "invalid-before-cutover-gate",
-        ),
-        (
             reqwest::Method::POST,
             format!("{workspace_base}/cats/signed-cutover/exec"),
             Some(serde_json::json!({"command": ["true"]})),
@@ -3438,12 +3426,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
             None,
             "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/actions/sync"),
-            None,
-            "dev-admin-token",
         ),
         (
             reqwest::Method::GET,
@@ -3476,12 +3458,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "dev-admin-token",
         ),
         (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/endpoints"),
-            Some(serde_json::json!({"name": "web"})),
-            "invalid-before-cutover-gate",
-        ),
-        (
             reqwest::Method::GET,
             format!("{workspace_base}/cats/signed-cutover/endpoints"),
             None,
@@ -3495,12 +3471,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         ),
         (
             reqwest::Method::GET,
-            format!("{workspace_base}/disks/{legacy_disk_id}"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::DELETE,
             format!("{workspace_base}/disks/{legacy_disk_id}"),
             None,
             "invalid-before-cutover-gate",
@@ -3654,6 +3624,19 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "legacy runtime entry point stayed reachable: {url}",
         );
     }
+
+    // Production enumerates the four frozen lifecycle methods. A retired or
+    // invented action must not be captured by a wildcard V2 handler.
+    assert_eq!(
+        client
+            .post(format!("{workspace_base}/cats/signed-cutover/actions/sync"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
 
     let strict_disk_create = client
         .post(format!("{workspace_base}/disks"))

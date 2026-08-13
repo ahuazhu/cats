@@ -223,11 +223,7 @@ fn validate_absent_from_current_desired_and_inventory(
                         )
                     })
             })
-            || admission
-                .full_inventory_observation
-                .residue
-                .iter()
-                .any(|residue| residue_may_name_volume(residue, volume_id))
+            || !admission.full_inventory_observation.residue.is_empty()
         {
             return Err(AuthorityError::AdminBusy.into());
         }
@@ -268,34 +264,4 @@ fn lock_and_revalidate_desired_set(
         }
     }
     Ok(())
-}
-
-fn residue_may_name_volume(
-    residue: &cats_api::runtime_reconciliation::NodeResidue,
-    volume_id: &Id,
-) -> bool {
-    use cats_api::runtime_reconciliation::{NodeResidue, ProcessRole};
-    match residue {
-        NodeResidue::Process {
-            role_hint:
-                Some(ProcessRole::Blockd {
-                    volume_id: current, ..
-                }),
-            ..
-        }
-        | NodeResidue::ControlSocket {
-            role_hint:
-                Some(ProcessRole::Blockd {
-                    volume_id: current, ..
-                }),
-            ..
-        } => current == volume_id,
-        NodeResidue::KernelNbd { volume_id_hint, .. }
-        | NodeResidue::VhostUserBlk { volume_id_hint, .. }
-        | NodeResidue::DataDirectory { volume_id_hint, .. }
-        | NodeResidue::Mount { volume_id_hint, .. } => volume_id_hint
-            .as_ref()
-            .is_none_or(|current| current == volume_id),
-        _ => false,
-    }
 }
