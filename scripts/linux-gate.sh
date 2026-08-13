@@ -576,12 +576,14 @@ trap 'linux_gate_signal 143' TERM
 main() {
   local attempt
   local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test"
+  local expected_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.expected"
   local image_inspection=""
   local iidfile_expected=""
   local iidfile_expected_lf=""
   local listed_test=""
   local listed_test_count=0
   local listed_test_mismatch=false
+  local observed_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.observed"
   local observed=""
   local status=0
   local systemd_ready=false
@@ -744,6 +746,50 @@ main() {
         test -x "$target_binary"
         test ! -L "$target_binary"
         cmp -s "$source_binary" "$target_binary"' sh "$LINUX_TARGET_DIRECTORY"; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    # These real-binary tests intentionally exercise the installed
+    # /run/cats/blockd-v1 namespace. The native qualification builder and the
+    # workspace-wide Linux container are unprivileged, so keep the tests
+    # ignored there and run their exact closed inventory only inside this one
+    # owner-labeled PID-1 container. Calibrate Cargo's zero-test-success
+    # behavior before trusting the privileged run.
+    printf '%s\n' \
+      'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
+      'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
+      'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
+      'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
+      'stalled_connection_times_out_without_starving_the_next_request: test' \
+      >"$expected_root_control_inventory"
+    if docker_cli capture 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        -- --ignored --list; then
+      : >"$observed_root_control_inventory"
+      while IFS= read -r listed_test; do
+        case "$listed_test" in
+          *": test") printf '%s\n' "$listed_test" >>"$observed_root_control_inventory" ;;
+        esac
+      done <"$LINUX_DOCKER_STDOUT"
+      if ! cmp -s "$expected_root_control_inventory" "$observed_root_control_inventory"; then
+        echo "privileged blockd root-control test inventory was not the exact known positive" >&2
+        status=1
+      fi
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        -- --ignored --test-threads=1 --nocapture; then
       :
     else
       status=$?

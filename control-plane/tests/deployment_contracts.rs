@@ -765,6 +765,18 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         .join(" ");
     assert!(
         focused_command.contains(
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --list"
+        ),
+        "the privileged blockd inventory must be bounded and known-positive"
+    );
+    assert!(
+        focused_command.contains(
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --test-threads=1 --nocapture"
+        ),
+        "the installed-namespace blockd tests must run only in the privileged gate"
+    );
+    assert!(
+        focused_command.contains(
             "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --list"
         ),
         "the focused test inventory must bound both Docker and its in-container Cargo process"
@@ -1085,6 +1097,20 @@ case "${1:-} ${2:-}" in
       *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
       *" systemctl is-system-running --quiet") ;;
       *" sh -ceu "*) : >"$state/blockd-installed" ;;
+      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --list")
+        : >"$state/root-control-test-list-ran"
+        if [[ "$mode" != zero-root-control-tests ]]; then
+          printf '%s\n' \
+            'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
+            'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
+            'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
+            'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
+            'stalled_connection_times_out_without_starving_the_next_request: test'
+        fi
+        ;;
+      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --test-threads=1 --nocapture")
+        : >"$state/root-control-tests-ran"
+        ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --exact --list")
         : >"$state/focused-systemd-test-list-ran"
         if [[ "$mode" == timeout-systemd-test-list ]]; then
@@ -1367,6 +1393,8 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         "response-loss-late-marker",
         "late-workspace-removed",
         "blockd-installed",
+        "root-control-test-list-ran",
+        "root-control-tests-ran",
         "focused-systemd-test-ran",
         "systemd-removed",
     ] {
@@ -1432,6 +1460,54 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
             && trace.contains(&format!("rm --force --volumes {systemd_id}")),
         "focused systemd container was not gracefully and exactly cleaned:\n{trace}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_rejects_an_empty_privileged_root_control_inventory() {
+    let fixture = tempfile::tempdir().expect("Linux gate empty root-control fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "zero-root-control-tests")
+        .output()
+        .expect("run Linux gate empty root-control regression");
+    assert!(
+        !output.status.success(),
+        "an empty privileged root-control test inventory incorrectly passed the Linux gate"
+    );
+    assert!(
+        state.join("root-control-test-list-ran").exists(),
+        "the zero-test regression did not exercise the root-control inventory probe"
+    );
+    assert!(
+        !state.join("root-control-tests-ran").exists(),
+        "the privileged root-control tests ran after their inventory probe returned zero"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the Runtime E2E ran after the earlier root-control inventory failed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "privileged blockd root-control test inventory was not the exact known positive"
+        ),
+        "the empty root-control inventory was not diagnosed:\n{stderr}"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after empty root-control inventory: {resource}"
+        );
+    }
 }
 
 #[cfg(unix)]

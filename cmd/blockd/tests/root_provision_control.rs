@@ -532,6 +532,7 @@ fn assert_ok(response: &[u8], request: &ProvisionRootImageRequest) {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
     let env = Env::new();
     let rejected = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
@@ -621,6 +622,7 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -662,6 +664,7 @@ fn first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -692,6 +695,7 @@ fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail(
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn stalled_connection_times_out_without_starving_the_next_request() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -741,6 +745,7 @@ fn stalled_connection_times_out_without_starving_the_next_request() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn every_provision_publication_crash_window_recovers_by_authority_or_exact_replay() {
     for point in [
         "after_provision_leaf_put",
