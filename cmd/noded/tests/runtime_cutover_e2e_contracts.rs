@@ -271,7 +271,11 @@ fn runtime_cutover_runner_redacts_and_bounds_diagnostics() {
     ] {
         assert!(!journal.contains(secret), "journal retained {secret}");
     }
-    assert!(journal.contains("[REDACTED]"));
+    assert!(
+        journal.contains("[REDACTED]"),
+        "journal did not record a redaction marker: {journal}"
+    );
+    assert!(journal.contains("[TRUNCATED:"));
     assert!(journal.len() <= 8 * 16_384);
 }
 

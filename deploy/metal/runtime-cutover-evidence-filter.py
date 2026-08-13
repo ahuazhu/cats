@@ -95,15 +95,15 @@ def filter_text(stream: BinaryIO, maximum: int) -> int:
                 oversized = False
             continue
         if not complete and len(raw) == 4097:
-            output.add("[REDACTED oversized line]\n")
+            output.add("[REDACTED]\n")
             oversized = True
             continue
         if PRIVATE_KEY_BEGIN.search(text):
-            output.add("[REDACTED private key block]\n")
+            output.add("[REDACTED]\n")
             private_key = not bool(PRIVATE_KEY_END.search(text))
             continue
         if sensitive_name(text):
-            output.add("[REDACTED sensitive line]\n")
+            output.add("[REDACTED]\n")
             continue
         text = BEARER.sub("[REDACTED]", text)
         text = URL_CREDENTIALS.sub(r"\1[REDACTED]@", text)

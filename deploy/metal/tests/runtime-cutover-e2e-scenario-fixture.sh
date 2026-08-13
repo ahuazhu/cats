@@ -20,7 +20,7 @@ case "$action" in
     if [[ ${CATS_E3_FIXTURE_SECRETS:-false} == true ]]; then
       printf 'Authorization: Bearer fixture-token-must-not-survive\n'
       printf 'password=fixture-password-must-not-survive\n'
-      printf '%04096d\n' 0
+      printf '%040960d\n' 0
     fi
     if [[ ${CATS_E3_FIXTURE_FAIL_CASE:-} == "$case_id" ]]; then
       exit 23
