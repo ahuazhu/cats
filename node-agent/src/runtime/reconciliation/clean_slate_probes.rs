@@ -30,8 +30,8 @@ use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_desired_runtime_spec,
     DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource, ObservedDiskKind, ObservedVolume,
     ProcessState, ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess,
-    VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
-    WireU64, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeIntent, WireU64,
+    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
 use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
@@ -6018,9 +6018,12 @@ fn supported_desired_volumes(
 ) -> anyhow::Result<Option<BTreeMap<Id, (&DesiredRuntimeSpec, &VolumeIntent)>>> {
     let mut volumes = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
-        if desired.target != cats_api::runtime_reconciliation::RuntimeTarget::Running
-            || encode_desired_runtime_spec(desired).is_err()
-        {
+        // The frozen Desired wire already closes lifecycle target/disposition
+        // compatibility: non-Deleted retains every volume, while Deleted
+        // permits only explicit detach/delete dispositions and restricts
+        // disposable delete to Root. Inventory is observation-only, so the
+        // same complete authority read is valid for every lifecycle target.
+        if encode_desired_runtime_spec(desired).is_err() {
             return Ok(None);
         }
         if desired.volumes.is_empty() || desired.volumes.len() > 64 {
@@ -6029,7 +6032,6 @@ fn supported_desired_volumes(
         for (index, intent) in desired.volumes.iter().enumerate() {
             let shape_is_exact = usize::from(intent.guest_device.slot) == index
                 && intent.access == VolumeAccess::ReadWriteOnce
-                && matches!(intent.disposition, VolumeDisposition::Retain)
                 && match index {
                     0 => intent.disk_kind == DiskKind::Root && intent.mount.is_none(),
                     _ => intent.disk_kind == DiskKind::Persistent && intent.mount.is_some(),
@@ -8626,6 +8628,31 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ExactSetMetadataAuthorityReader {
+        records: BTreeMap<Id, VolumeRecord>,
+    }
+
+    impl metadata_authority_reader_sealed::Sealed for ExactSetMetadataAuthorityReader {}
+
+    impl MetadataAuthorityAbsenceReader for ExactSetMetadataAuthorityReader {
+        fn read_candidates(
+            &self,
+            _node_id: &Id,
+            candidate_volume_ids: &BTreeSet<Id>,
+            deadline: Instant,
+            context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<MetadataAuthorityCandidateInventory> {
+            assert_eq!(deadline, context.deadline());
+            context.check_active()?;
+            Ok(if self.records.keys().eq(candidate_volume_ids.iter()) {
+                MetadataAuthorityCandidateInventory::Records(self.records.clone())
+            } else {
+                MetadataAuthorityCandidateInventory::Unavailable
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct ScriptedMetadataAuthorityInventoryPort {
         reads: Mutex<VecDeque<MetadataAuthorityPageRead>>,
         calls: Arc<Mutex<Vec<MetadataAuthorityPageRequest>>>,
@@ -9369,6 +9396,51 @@ mod tests {
             .with_vmms(vmm_expected, vmm_exact)?
             .with_stop_receipt_sockets(stop_receipt_sockets)?;
             Ok(RootProcessInventoryBridgeOutcome::Complete(admission))
+        }
+    }
+
+    struct PreservedNegativeUnavailableProcessBridge {
+        inner: ExactRunningProcessBridge,
+        exact_running_negative_cats: BTreeSet<Id>,
+    }
+
+    impl root_process_inventory_bridge_sealed::Sealed for PreservedNegativeUnavailableProcessBridge {}
+
+    impl RootProcessInventoryBridge for PreservedNegativeUnavailableProcessBridge {
+        fn executable_path(&self) -> &HostPath {
+            self.inner.executable_path()
+        }
+
+        fn serving_expectation(
+            &self,
+            checkpoint: &RuntimeCheckpoint,
+            physical_desired: &DesiredRuntimeSpec,
+            gate_desired: &DesiredRuntimeSpec,
+            prepared: &PreparedDeviceInput,
+            blockd: &AuthorizedBlockdInventoryEvidence,
+            authority: &VolumeRecord,
+        ) -> anyhow::Result<ServingBlockdExpectation> {
+            self.inner.serving_expectation(
+                checkpoint,
+                physical_desired,
+                gate_desired,
+                prepared,
+                blockd,
+                authority,
+            )
+        }
+
+        fn inspect_all(
+            &self,
+            _root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+            _serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+            _vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
+            _stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+            Ok(RootProcessInventoryBridgeOutcome::Unavailable {
+                exact_running_negative_cats: self.exact_running_negative_cats.clone(),
+            })
         }
     }
 
@@ -11987,35 +12059,66 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_target_persistent_or_multi_volume_remains_outside_the_first_slice() {
-        for make_unsupported in ["cold", "persistent", "multi"] {
+    fn full_scanner_covers_every_lifecycle_target_and_complete_volume_disposition_set() {
+        for target in [
+            RuntimeTarget::Running,
+            RuntimeTarget::Suspended,
+            RuntimeTarget::Warm,
+            RuntimeTarget::Cold,
+            RuntimeTarget::Deleted,
+        ] {
             let environment = TestEnvironment::new();
-            let (reader, calls) =
-                recording_metadata_reader(MetadataReaderBehavior::AuthoritativeEmpty);
-            let mut scan_context = assigned_context(true);
+            let mut scan_context = assigned_context_with_root_and_persistent();
             let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
-            match make_unsupported {
-                "cold" => desired.target = RuntimeTarget::Cold,
-                "persistent" => desired.volumes[0].disk_kind = DiskKind::Persistent,
-                "multi" => {
-                    desired.volumes.push(desired.volumes[0].clone());
-                    desired.volumes[1].volume_intent_id = Id::new("vint_second").unwrap();
-                    desired.volumes[1].disk_id = Id::new("disk_second").unwrap();
-                    desired.volumes[1].volume_id = Id::new("vol_second").unwrap();
-                    desired.volumes[1].attachment_id = Id::new("att_second").unwrap();
-                }
-                _ => unreachable!("closed test cases"),
+            desired.target = target;
+            if target == RuntimeTarget::Deleted {
+                desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: Id::new("delete_root_lifecycle").unwrap(),
+                };
+                desired.volumes[1].disposition = VolumeDisposition::DetachRetained;
             }
+            desired.spec_digest = spec_digest(desired).unwrap();
+            let records = desired
+                .volumes
+                .iter()
+                .map(|intent| {
+                    (
+                        intent.volume_id.clone(),
+                        unowned_record(intent.volume_id.as_str(), intent.size_bytes),
+                    )
+                })
+                .collect();
+            let scanner = scanner_with_metadata_authority(
+                environment.config(),
+                Arc::new(ExactSetMetadataAuthorityReader { records }),
+            )
+            .unwrap();
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                scanner.scan_complete(scan_context).unwrap()
+            else {
+                panic!("{target:?} complete multi-volume authority must form a full inventory")
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("{target:?} must project exactly one Runtime")
+            };
+            assert_eq!(runtime.volumes.len(), 2, "{target:?}");
+            assert!(runtime
+                .volumes
+                .iter()
+                .all(|volume| matches!(volume.authority, VolumeAuthorityEvidence::Unowned { .. })));
             assert_eq!(
-                metadata_probe(&environment, reader)
-                    .prove_absent(&scan_context)
-                    .unwrap(),
-                InventoryAbsence::Unavailable,
-                "{make_unsupported}"
-            );
-            assert!(
-                calls.lock().unwrap().is_empty(),
-                "unsupported intent must fail before authority I/O"
+                runtime
+                    .volumes
+                    .iter()
+                    .map(|volume| volume.volume_id.clone())
+                    .collect::<BTreeSet<_>>(),
+                [
+                    Id::new("vol_root").unwrap(),
+                    Id::new("vol_persistent").unwrap()
+                ]
+                .into_iter()
+                .collect(),
+                "{target:?}"
             );
         }
     }
@@ -15063,6 +15166,71 @@ mod tests {
                 }),
             )
         };
+
+        if let Some(client) = &kernel_nbd_client {
+            let allocation_lock = environment.state.join("kernel-nbd-allocation.lock");
+            let allocation_lock_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&allocation_lock)
+                .unwrap();
+            // SAFETY: the fixture owns this descriptor and releases the
+            // advisory lock below before dropping it.
+            let lock_result =
+                unsafe { libc::flock(allocation_lock_file.as_raw_fd(), libc::LOCK_EX) };
+            assert_eq!(lock_result, 0);
+            let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
+                records: records.lock().unwrap().clone(),
+            });
+            let mut config = environment.config();
+            config.kernel_nbd_inventory_port = Some(KernelNbdInventoryPort::new(
+                KernelNbdInventoryConfig::fixture(
+                    state_directory.clone(),
+                    environment.block_root.clone(),
+                    environment.proc_root.clone(),
+                    client.clone(),
+                    u32::try_from(desired.volumes.len()).unwrap(),
+                ),
+            ));
+            let scanner = scanner_with_metadata_authority_and_blob(
+                config,
+                Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
+                None,
+            )
+            .unwrap()
+            .with_root_process_bridge_for_test(Arc::new(
+                PreservedNegativeUnavailableProcessBridge {
+                    inner: ExactRunningProcessBridge {
+                        state_directory: state_directory.clone(),
+                        systemd: test_root_provision_systemd(&environment.blockd_binary),
+                        executable_path: HostPath::new(
+                            environment.blockd_binary.to_string_lossy().into_owned(),
+                        )
+                        .unwrap(),
+                        exact_vmm_state: None,
+                    },
+                    exact_running_negative_cats: BTreeSet::from([desired.cat_id.clone()]),
+                },
+            ))
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge));
+            let RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                exact_physical_negative_cats,
+            } = scanner.scan_complete(scan_context.clone()).unwrap()
+            else {
+                panic!("missing process admission must skip the locked kernel-NBD pool")
+            };
+            assert!(unavailable_sources.contains(&InventorySource::Process));
+            assert!(unavailable_sources.contains(&InventorySource::BlockFrontend));
+            assert_eq!(
+                exact_physical_negative_cats,
+                BTreeSet::from([desired.cat_id.clone()])
+            );
+            // SAFETY: this unlock matches the successful fixture flock above.
+            let unlock_result =
+                unsafe { libc::flock(allocation_lock_file.as_raw_fd(), libc::LOCK_UN) };
+            assert_eq!(unlock_result, 0);
+        }
 
         let RuntimeInventoryScanOutcome::Complete(mut early_inventory) =
             build_scanner(RunningGuestReadyFault::Exact, true)
