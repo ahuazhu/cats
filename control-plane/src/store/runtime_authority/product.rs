@@ -15,13 +15,16 @@ use cats_api::persistent_disk::{
 };
 use cats_api::resources::DiskDurability as PublicDiskDurability;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, AsciiText, ContractVersion, DesiredRuntimeSpec, DiskKind,
-    Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, Hostname,
-    HttpProtocol, Id, NodeIdentityState, Operation, OperationPhase, OperationTerminal, RandomId128,
-    Revision, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess,
-    VolumeAcquire, VolumeDisposition,
+    encode_desired_runtime_spec, AsciiText, BeginDeleteRequest, ContractVersion,
+    DesiredRuntimeSpec, DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch,
+    FilesystemInitialization, Generation, Hostname, HttpProtocol, Id, NodeIdentityState,
+    NodeResidue, Operation, OperationPhase, OperationTerminal, RandomId128, Revision,
+    RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
+    VolumeDisposition,
 };
-use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
+use cats_storage::authority::{
+    begin_delete, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
+};
 use postgres::Transaction;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,24 +41,29 @@ use super::product_rows::{
     insert_endpoint, insert_hostname_lookup, insert_operation,
     load_any_disk_by_filesystem_uuid_for_update, load_any_disk_by_id_for_update,
     load_any_disk_by_initialization_token_for_update, load_any_disk_by_name_unlocked,
-    load_api_result_for_update, load_cat_by_id_for_update, load_cat_by_name_unlocked,
-    load_desired_by_network_id_unlocked, load_desired_for_update, load_desired_unlocked,
-    load_disk_by_id_for_update, load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
+    load_any_disk_snapshot_for_update, load_api_result_for_update, load_cat_by_id_for_update,
+    load_cat_by_name_unlocked, load_desired_by_network_id_unlocked, load_desired_for_update,
+    load_desired_referencing_disk_unlocked, load_desired_unlocked, load_disk_by_id_for_update,
+    load_disk_by_id_unlocked, load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
     load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
     load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
     load_operation_by_cat_revision_for_update, load_operation_by_cat_revision_unlocked,
     load_operation_by_workspace_unlocked, load_operation_for_update,
     load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
-    update_operation,
+    update_disk, update_operation,
 };
 use super::rows::{
     database_now, insert_volume, load_any_volume_by_id_for_update, load_volume_for_update,
+    update_volume, volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
-    lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
-    PlacementAdmissionSnapshot,
+    load_placement_admission_at_in, lock_placement_admission_for_desired_mutation,
+    PlacementAdmissionLoad, PlacementAdmissionSnapshot,
 };
-use crate::store::agent_sessions::load_identity_by_node_for_update;
+use crate::store::agent_sessions::{
+    load_identity_by_node_for_update, load_provisioned_node_keys_after,
+    PROVISIONED_NODE_ID_PAGE_SIZE,
+};
 use crate::store::transaction::{
     AuthorityExecutionError, AuthorityTransactionError, AuthorityTxResult,
 };
@@ -64,6 +72,9 @@ use crate::store::{internal, Result, Store};
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 const CAT_NAME_CONFLICT_BODY: &[u8] =
     br#"{"code":"already_exists","message":"cat name already exists"}"#;
+const DISK_NOT_FOUND_BODY: &[u8] = br#"{"code":"not_found","message":"disk not found"}"#;
+const DISK_DELETE_PRECONDITION_BODY: &[u8] =
+    br#"{"code":"failed_precondition","message":"disk is not safe to delete"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,6 +401,14 @@ pub(crate) struct CoveredPersistentDiskCreateRequest {
     pub(crate) name_conflict: ExactHttpResponse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoveredDiskDeleteRequest {
+    pub(crate) idempotency: ApiIdempotencyRequest,
+    pub(crate) disk_id: Id,
+    pub(crate) delete_id: Id,
+    pub(crate) active_guest_digest: Sha256Digest,
+}
+
 /// One complete successor Desired plus every identity that must be locked
 /// before the current Cat row. Placement/capacity planners and domain-specific
 /// volume/route checks run before constructing this closed commit candidate;
@@ -408,6 +427,16 @@ pub(crate) struct CoveredDesiredMutationRequest {
     pub(crate) placement_snapshots: Vec<PlacementTargetSnapshot>,
     pub(crate) active_guest_digest: Sha256Digest,
     pub(crate) endpoint_records: Vec<EndpointRecordCandidate>,
+    pub(crate) volume_mutation: DesiredVolumeMutation,
+}
+
+/// The only A2 lifecycle mutation allowed to change a VolumeIntent.  The
+/// closed value is re-derived against locked Volume/Disk rows; it is not an
+/// authorization to mutate ownership or the Volume authority itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DesiredVolumeMutation {
+    Preserve,
+    DeleteCat { delete_id: Id },
 }
 
 #[derive(Serialize)]
@@ -686,6 +715,48 @@ impl Store {
         })
     }
 
+    /// Atomically records one deterministic covered HTTP outcome that has no
+    /// business-row mutation (for example an authenticated NotFound or a
+    /// lifecycle precondition failure). The API-key reservation remains the
+    /// first transaction action and replay never re-reads the resource.
+    pub(super) fn commit_fixed_api_result_covered(
+        &self,
+        request: &ApiIdempotencyRequest,
+        response: &ExactHttpResponse,
+        commit_state: &CoveredCommitState,
+    ) -> Result<ApiIdempotencyResult> {
+        match self.authority_transaction_outcome_with_definite_retry(
+            |transaction| {
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                reserve_api_key(transaction, request)?;
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                let result = if let Some(result) = load_api_result_for_update(transaction, request)?
+                {
+                    check_replay(result, &request.request_fingerprint)
+                        .map_err(AuthorityTransactionError::from)?
+                } else {
+                    let now = database_now(transaction)?;
+                    let result = result_from_envelope(request, response, now);
+                    insert_api_result(transaction, &result)?;
+                    result
+                };
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                commit_state.begin_commit(transaction)?;
+                Ok(result)
+            },
+            || commit_state.reset_after_definite_retry(),
+        ) {
+            Ok(result) => Ok(result),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(ApiError::internal(
+                "fixed API result returned an impossible candidate collision",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(ApiError::internal(
+                "fixed API result returned an impossible placement marker",
+            )),
+        }
+    }
+
     /// Locate the current Desired revision for a hostname without returning a
     /// copied route binding. Every hit is closed against the immutable
     /// Endpoint product record and the current complete Desired in one
@@ -816,6 +887,32 @@ impl Store {
         self.create_persistent_disk_covered_inner(request, Some(commit_state))
     }
 
+    pub(super) fn begin_disk_delete_covered(
+        &self,
+        request: &CoveredDiskDeleteRequest,
+        commit_state: &CoveredCommitState,
+    ) -> Result<ApiIdempotencyResult> {
+        match self.authority_transaction_outcome_with_definite_retry(
+            |transaction| {
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                let result = begin_disk_delete_in(transaction, request, Some(commit_state))?;
+                checkpoint_covered_commit(transaction, Some(commit_state))?;
+                commit_state.begin_commit(transaction)?;
+                Ok(result)
+            },
+            || commit_state.reset_after_definite_retry(),
+        ) {
+            Ok(result) => Ok(result),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(ApiError::internal(
+                "Disk begin-delete returned an impossible candidate collision",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(ApiError::internal(
+                "Disk begin-delete returned an impossible placement marker",
+            )),
+        }
+    }
+
     fn create_persistent_disk_covered_inner(
         &self,
         request: &CoveredPersistentDiskCreateRequest,
@@ -935,6 +1032,206 @@ impl Store {
     }
 }
 
+fn begin_disk_delete_in(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredDiskDeleteRequest,
+    commit_state: Option<&CoveredCommitState>,
+) -> AuthorityTxResult<ApiIdempotencyResult> {
+    checkpoint_covered_commit(transaction, commit_state)?;
+    reserve_api_key(transaction, &request.idempotency)?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)? {
+        return check_replay(result, &request.idempotency.request_fingerprint)
+            .map_err(AuthorityTransactionError::from);
+    }
+    let Some(peeked_disk) = load_disk_by_id_unlocked(transaction, &request.disk_id)? else {
+        return store_fixed_disk_delete_result(
+            transaction,
+            &request.idempotency,
+            404,
+            DISK_NOT_FOUND_BODY,
+        );
+    };
+    if peeked_disk.workspace_id != request.idempotency.authenticated_workspace_id {
+        return store_fixed_disk_delete_result(
+            transaction,
+            &request.idempotency,
+            404,
+            DISK_NOT_FOUND_BODY,
+        );
+    }
+    checkpoint_covered_commit(transaction, commit_state)?;
+    let volume = load_volume_for_update(transaction, &peeked_disk.volume_id)?
+        .ok_or_else(|| stored_corruption("Disk Volume disappeared"))?;
+    checkpoint_covered_commit(transaction, commit_state)?;
+    let disk = load_disk_by_id_for_update(transaction, &peeked_disk.disk_id)?
+        .ok_or_else(|| stored_corruption("Disk disappeared after its Volume lock"))?;
+    if disk != peeked_disk
+        || disk.volume_id != volume.volume_id
+        || disk.size_bytes != volume.size_bytes
+        || disk.durability != volume.durability
+    {
+        return Err(stored_corruption("Disk/Volume binding is corrupt"));
+    }
+    if !matches!(disk.role, DiskRole::Persistent { .. })
+        || !matches!(disk.admin_state, DiskAdminState::Active)
+        || !matches!(volume.admin_state, VolumeAdminState::Active)
+        || volume.lease_owner.is_some()
+        || volume.lease_expires_at.is_some()
+    {
+        return store_fixed_disk_delete_result(
+            transaction,
+            &request.idempotency,
+            412,
+            DISK_DELETE_PRECONDITION_BODY,
+        );
+    }
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if load_desired_referencing_disk_unlocked(transaction, &disk.disk_id)?.is_some()
+        || load_any_disk_snapshot_for_update(
+            transaction,
+            &disk.disk_id,
+            &disk.volume_id,
+            disk.size_bytes,
+        )?
+        .is_some()
+    {
+        return store_fixed_disk_delete_result(
+            transaction,
+            &request.idempotency,
+            412,
+            DISK_DELETE_PRECONDITION_BODY,
+        );
+    }
+    if !complete_inventory_proves_volume_absent(
+        transaction,
+        &request.active_guest_digest,
+        &disk.volume_id,
+        commit_state,
+    )? {
+        return store_fixed_disk_delete_result(
+            transaction,
+            &request.idempotency,
+            412,
+            DISK_DELETE_PRECONDITION_BODY,
+        );
+    }
+    let begin_request = BeginDeleteRequest {
+        delete_id: request.delete_id.clone(),
+        disk_id: disk.disk_id.clone(),
+        volume_id: volume.volume_id.clone(),
+        expected_unowned_epoch: volume.lease_epoch,
+        expected_head: volume.head.clone(),
+    };
+    let (updated_volume, result) = begin_delete(&volume, &begin_request)?;
+    let mut updated_disk = disk;
+    updated_disk.admin_state = DiskAdminState::Deleting {
+        delete_id: request.delete_id.clone(),
+    };
+    checkpoint_covered_commit(transaction, commit_state)?;
+    update_volume(transaction, &updated_volume)?;
+    update_disk(transaction, &updated_disk)?;
+    let body = serde_json::to_vec(&result).map_err(stored_corruption_from_debug)?;
+    let now = database_now(transaction)?;
+    let response = ExactHttpResponse::new(202, Some(ExactContentType::ApplicationJson), body)
+        .map_err(AuthorityTransactionError::from)?;
+    let result = result_from_envelope(&request.idempotency, &response, now);
+    insert_api_result(transaction, &result)?;
+    Ok(result)
+}
+
+fn store_fixed_disk_delete_result(
+    transaction: &mut Transaction<'_>,
+    request: &ApiIdempotencyRequest,
+    status: u16,
+    body: &[u8],
+) -> AuthorityTxResult<ApiIdempotencyResult> {
+    let now = database_now(transaction)?;
+    let response = ExactHttpResponse::new(
+        status,
+        Some(ExactContentType::ApplicationJson),
+        body.to_vec(),
+    )
+    .map_err(AuthorityTransactionError::from)?;
+    let result = result_from_envelope(request, &response, now);
+    insert_api_result(transaction, &result)?;
+    Ok(result)
+}
+
+fn complete_inventory_proves_volume_absent(
+    transaction: &mut Transaction<'_>,
+    active_guest_digest: &Sha256Digest,
+    volume_id: &Id,
+    commit_state: Option<&CoveredCommitState>,
+) -> AuthorityTxResult<bool> {
+    let now = database_now(transaction)?;
+    let mut after = None;
+    loop {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        let node_keys = load_provisioned_node_keys_after(transaction, after.as_ref())?;
+        let has_more = node_keys.len() == PROVISIONED_NODE_ID_PAGE_SIZE;
+        for key in &node_keys {
+            let node_id = Id::new(key.clone())
+                .ok_or_else(|| stored_corruption("provisioned Node ID is invalid"))?;
+            checkpoint_covered_commit(transaction, commit_state)?;
+            let admission = match load_placement_admission_at_in(
+                transaction,
+                &node_id,
+                active_guest_digest,
+                now,
+            )? {
+                PlacementAdmissionLoad::Accepted(admission) => admission,
+                PlacementAdmissionLoad::Rejected(_) => return Ok(false),
+            };
+            if admission
+                .full_inventory_observation
+                .runtimes
+                .iter()
+                .any(|runtime| {
+                    runtime
+                        .volumes
+                        .iter()
+                        .any(|volume| volume.volume_id == *volume_id)
+                        || runtime
+                            .mounts
+                            .iter()
+                            .any(|mount| mount.volume_id == *volume_id)
+                })
+                || admission
+                    .full_inventory_observation
+                    .residue
+                    .iter()
+                    .any(|residue| residue_names_volume(residue, volume_id))
+            {
+                return Ok(false);
+            }
+        }
+        if !has_more {
+            return Ok(true);
+        }
+        after = node_keys.last().and_then(|key| Id::new(key.clone()));
+        if after.is_none() {
+            return Err(stored_corruption("provisioned Node page has no cursor"));
+        }
+    }
+}
+
+fn residue_names_volume(residue: &NodeResidue, volume_id: &Id) -> bool {
+    match residue {
+        NodeResidue::KernelNbd { volume_id_hint, .. }
+        | NodeResidue::VhostUserBlk { volume_id_hint, .. }
+        | NodeResidue::DataDirectory { volume_id_hint, .. }
+        | NodeResidue::Mount { volume_id_hint, .. } => volume_id_hint.as_ref() == Some(volume_id),
+        NodeResidue::Process { .. }
+        | NodeResidue::SystemdScope { .. }
+        | NodeResidue::ControlSocket { .. }
+        | NodeResidue::CheckpointFile { .. }
+        | NodeResidue::NetworkTap { .. }
+        | NodeResidue::WarmSnapshot { .. }
+        | NodeResidue::RouteGate { .. } => false,
+    }
+}
+
 #[allow(
     dead_code,
     reason = "reachable with the A1 boundary when A2/G4 production routes are composed"
@@ -1029,6 +1326,13 @@ fn commit_desired_mutation_in(
         }
     }
 
+    checkpoint_covered_commit(transaction, commit_state)?;
+    if matches!(
+        request.volume_mutation,
+        DesiredVolumeMutation::DeleteCat { .. }
+    ) {
+        lock_and_validate_cat_delete_volumes(transaction, request, commit_state)?;
+    }
     checkpoint_covered_commit(transaction, commit_state)?;
     let Some(cat) = load_cat_by_id_for_update(transaction, &request.expected_current.cat_id)?
     else {
@@ -1936,11 +2240,8 @@ fn validate_desired_mutation_request(
             ));
         }
     }
-    // A1 does not yet carry the exact VolumeRecord/Disk authority snapshots
-    // required by the global lock DAG. Keep every volume mutation closed until
-    // the A2/A3 covered request extends this same transaction with those locks
-    // and validations; accepting a caller-authored intent here would create a
-    // second attachment/ownership authority.
+    // Cross-Node volume movement remains closed. It needs exact settled-Cold
+    // release/acquire authority and is not part of the lifecycle API slice.
     if old_placement.node_id != new_placement.node_id
         && (!request.expected_current.volumes.is_empty() || !request.desired.volumes.is_empty())
     {
@@ -1948,11 +2249,7 @@ fn validate_desired_mutation_request(
             "cross-Node volume authority requires exact Cold settlement, released Volume/Disk locks and fresh acquire tuples",
         ));
     }
-    if request.desired.volumes != request.expected_current.volumes {
-        return Err(invalid_desired_mutation_bundle(
-            "volume intent changes require covered VolumeRecord and Disk authority",
-        ));
-    }
+    validate_desired_volume_mutation(request)?;
     validate_route_epoch_successor(&request.expected_current, &request.desired)?;
 
     let mutation_class = if old_placement != new_placement
@@ -2035,6 +2332,149 @@ fn validate_desired_mutation_request(
         }
     }
     Ok(mutation_class)
+}
+
+fn validate_desired_volume_mutation(request: &CoveredDesiredMutationRequest) -> Result<()> {
+    match &request.volume_mutation {
+        DesiredVolumeMutation::Preserve => {
+            if request.desired.volumes != request.expected_current.volumes {
+                return Err(invalid_desired_mutation_bundle(
+                    "volume intent changes require a closed covered mutation",
+                ));
+            }
+        }
+        DesiredVolumeMutation::DeleteCat { delete_id } => {
+            if request.desired.target != RuntimeTarget::Deleted
+                || request.expected_current.volumes.len() != request.desired.volumes.len()
+            {
+                return Err(invalid_desired_mutation_bundle(
+                    "Cat delete must preserve the complete VolumeIntent set",
+                ));
+            }
+            let mut roots = 0_u8;
+            for (current, successor) in request
+                .expected_current
+                .volumes
+                .iter()
+                .zip(&request.desired.volumes)
+            {
+                let mut normalized = successor.clone();
+                normalized.disposition = current.disposition.clone();
+                if normalized != *current {
+                    return Err(invalid_desired_mutation_bundle(
+                        "Cat delete changed VolumeIntent authority outside disposition",
+                    ));
+                }
+                match current.disk_kind {
+                    DiskKind::Root => {
+                        roots = roots.saturating_add(1);
+                        if successor.disposition
+                            != (VolumeDisposition::DeleteDisposableRoot {
+                                delete_id: delete_id.clone(),
+                            })
+                        {
+                            return Err(invalid_desired_mutation_bundle(
+                                "Cat delete Root disposition has another delete lineage",
+                            ));
+                        }
+                    }
+                    DiskKind::Persistent => {
+                        if successor.disposition != VolumeDisposition::DetachRetained {
+                            return Err(invalid_desired_mutation_bundle(
+                                "Cat delete must retain PersistentDisk data",
+                            ));
+                        }
+                    }
+                }
+            }
+            if roots != 1 {
+                return Err(invalid_desired_mutation_bundle(
+                    "Cat delete requires exactly one Root VolumeIntent",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extend A1's lock graph for the one closed VolumeIntent mutation.  This
+/// deliberately does not change Volume/Disk rows: the Node later performs an
+/// exact normal release or consumes the V2 disposable-root authorization.
+fn lock_and_validate_cat_delete_volumes(
+    transaction: &mut Transaction<'_>,
+    request: &CoveredDesiredMutationRequest,
+    commit_state: Option<&CoveredCommitState>,
+) -> AuthorityTxResult<()> {
+    let DesiredVolumeMutation::DeleteCat { delete_id } = &request.volume_mutation else {
+        return Ok(());
+    };
+    let mut intents = request.expected_current.volumes.iter().collect::<Vec<_>>();
+    intents.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+    let mut locked = Vec::with_capacity(intents.len());
+    for intent in &intents {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        let volume = load_volume_for_update(transaction, &intent.volume_id)?
+            .ok_or_else(|| stored_corruption("current Desired Volume disappeared"))?;
+        if volume.volume_id != intent.volume_id
+            || volume.size_bytes != intent.size_bytes
+            || !matches!(volume.admin_state, VolumeAdminState::Active)
+        {
+            return Err(stored_corruption(
+                "current Desired Volume authority does not match its intent",
+            ));
+        }
+        let durability = match volume.durability {
+            VolumeDurability::Strict => Durability::Strict,
+            VolumeDurability::Relaxed => Durability::Relaxed,
+        };
+        if durability != intent.durability {
+            return Err(stored_corruption(
+                "current Desired Volume durability changed",
+            ));
+        }
+        locked.push((intent, volume));
+    }
+    locked.sort_by(|(left, _), (right, _)| left.disk_id.cmp(&right.disk_id));
+    for (intent, _) in &locked {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        let disk = load_disk_by_id_for_update(transaction, &intent.disk_id)?
+            .ok_or_else(|| stored_corruption("current Desired Disk disappeared"))?;
+        if disk.workspace_id != request.expected_current.workspace_id
+            || disk.disk_id != intent.disk_id
+            || disk.volume_id != intent.volume_id
+            || disk.size_bytes != intent.size_bytes
+            || !matches!(disk.admin_state, DiskAdminState::Active)
+        {
+            return Err(stored_corruption(
+                "current Desired Disk authority does not match its intent",
+            ));
+        }
+        match (&intent.disk_kind, &disk.role) {
+            (DiskKind::Root, DiskRole::Root { cat_id })
+                if cat_id == &request.expected_current.cat_id =>
+            {
+                // No authorization may predate the exact Deleted revision.
+                if volume_has_disposable_root_authorization_for_delete(
+                    transaction,
+                    &intent.volume_id,
+                    delete_id,
+                    request.desired.desired_revision,
+                    request.desired.placement.placement_epoch,
+                )? {
+                    return Err(stored_corruption(
+                        "disposable Root authorization predates its Deleted Desired",
+                    ));
+                }
+            }
+            (DiskKind::Persistent, DiskRole::Persistent { .. }) => {}
+            _ => {
+                return Err(stored_corruption(
+                    "current Desired Disk role does not match its intent",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Closes the per-Endpoint serving lineage inside the same transaction that

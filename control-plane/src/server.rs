@@ -512,6 +512,8 @@ pub struct AppState {
     pub(crate) persistent_disk_create: Arc<
         crate::store::runtime_authority::persistent_disk_create_service::PersistentDiskCreateService,
     >,
+    pub(crate) product_mutations:
+        Arc<crate::store::runtime_authority::product_mutation_service::ProductMutationService>,
     pub(crate) readiness: Arc<ReadinessLatch>,
     pub notify: Arc<tokio::sync::Notify>,
     pub controller: Arc<Controller>,
@@ -586,6 +588,7 @@ impl Handle {
         }
         self.state.cat_create.begin_shutdown();
         self.state.persistent_disk_create.begin_shutdown();
+        self.state.product_mutations.begin_shutdown();
         self.state
             .runtime_volume_transition_service
             .begin_shutdown();
@@ -622,6 +625,8 @@ impl Handle {
             .state
             .persistent_disk_create
             .shutdown_commit_resolutions();
+        let product_mutation_commit_resolutions =
+            self.state.product_mutations.shutdown_commit_resolutions();
         let node_authority_resolutions = self
             .state
             .runtime_node_authority
@@ -640,6 +645,7 @@ impl Handle {
             route_result,
             commit_result,
             persistent_disk_commit_result,
+            product_mutation_commit_result,
             node_authority_result,
             manifest_result,
             gateway_machine_result,
@@ -649,6 +655,7 @@ impl Handle {
             route_resolutions,
             commit_resolutions,
             persistent_disk_commit_resolutions,
+            product_mutation_commit_resolutions,
             node_authority_resolutions,
             manifest_reads,
             gateway_machine
@@ -664,6 +671,7 @@ impl Handle {
         gateway_machine_result?;
         commit_result.map_err(anyhow::Error::from)?;
         persistent_disk_commit_result.map_err(anyhow::Error::from)?;
+        product_mutation_commit_result.map_err(anyhow::Error::from)?;
         node_authority_result.map_err(anyhow::Error::from)
     }
 }
@@ -1040,7 +1048,16 @@ async fn spawn_inner(
     let persistent_disk_create = Arc::new(
         crate::store::runtime_authority::persistent_disk_create_service::PersistentDiskCreateService::new(
             store.clone(),
+            Arc::clone(&product_identities),
+        ),
+    );
+    let product_mutations = Arc::new(
+        crate::store::runtime_authority::product_mutation_service::ProductMutationService::new(
+            store.clone(),
             product_identities,
+            agent_session_registration_policy
+                .approved_guest_config_digest()
+                .clone(),
         ),
     );
     let readiness = Arc::new(ReadinessLatch::new());
@@ -1075,6 +1092,7 @@ async fn spawn_inner(
         retired_storage_meta_for_tests: retired_storage_meta,
         cat_create,
         persistent_disk_create,
+        product_mutations,
         readiness,
         notify,
         controller: controller.clone(),

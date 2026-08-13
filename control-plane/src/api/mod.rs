@@ -69,6 +69,7 @@ mod nodes;
 #[cfg(debug_assertions)]
 mod operations;
 mod persistent_disk_create_v1;
+mod product_mutations_v2;
 pub(crate) mod route_resolve_v2;
 #[cfg(debug_assertions)]
 mod routes;
@@ -95,6 +96,7 @@ use nodes::*;
 #[cfg(debug_assertions)]
 use operations::*;
 use persistent_disk_create_v1::*;
+use product_mutations_v2::*;
 #[cfg(debug_assertions)]
 use routes::*;
 #[cfg(debug_assertions)]
@@ -516,20 +518,58 @@ pub fn router(state: AppState) -> Router {
     #[cfg(not(debug_assertions))]
     let disk_collection_route =
         post(create_persistent_disk_v1).get(runtime_product_reads::list_runtime_disks);
+    #[cfg(debug_assertions)]
+    let cat_item_route = if state.retired_product_authority_for_tests() {
+        get(get_cat).delete(delete_cat)
+    } else {
+        get(runtime_product_reads::get_runtime_cat).delete(delete_cat_v2)
+    };
+    #[cfg(not(debug_assertions))]
+    let cat_item_route = get(runtime_product_reads::get_runtime_cat).delete(delete_cat_v2);
+    #[cfg(debug_assertions)]
+    let cat_action_route = if state.retired_product_authority_for_tests() {
+        post(cat_action)
+    } else {
+        post(cat_lifecycle_v2)
+    };
+    #[cfg(not(debug_assertions))]
+    let cat_action_route = post(cat_lifecycle_v2);
+    #[cfg(debug_assertions)]
+    let endpoint_collection_route = if state.retired_product_authority_for_tests() {
+        post(create_endpoint).get(list_endpoints)
+    } else {
+        post(bind_endpoint_v2)
+    };
+    #[cfg(not(debug_assertions))]
+    let endpoint_collection_route = post(bind_endpoint_v2);
+    #[cfg(debug_assertions)]
+    let disk_item_route = if state.retired_product_authority_for_tests() {
+        get(get_disk).delete(delete_disk)
+    } else {
+        get(runtime_product_reads::get_runtime_disk).delete(delete_disk_v2)
+    };
+    #[cfg(not(debug_assertions))]
+    let disk_item_route = get(runtime_product_reads::get_runtime_disk).delete(delete_disk_v2);
+    #[cfg(debug_assertions)]
+    let product_mutations_v2 = if state.retired_product_authority_for_tests() {
+        Router::new()
+    } else {
+        Router::new().route(
+            "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
+            axum::routing::delete(unbind_endpoint_v2),
+        )
+    };
+    #[cfg(not(debug_assertions))]
+    let product_mutations_v2 = Router::new().route(
+        "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
+        axum::routing::delete(unbind_endpoint_v2),
+    );
     // These handlers read or mutate the retired Cat/Operation/Node authority.
     // Keep them reachable only from the explicit pre-cutover test composition.
     // The production middleware runs before authentication, body extraction,
     // PostgreSQL access, idempotency writes, and outbound Node calls.
     #[cfg(debug_assertions)]
     let retired_product_authority = Router::new()
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}",
-            axum::routing::delete(delete_cat),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
-            post(cat_action),
-        )
         .route("/v1/workspaces/{workspace}/cats/{cat}/exec", post(exec_cat))
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
@@ -552,12 +592,8 @@ pub fn router(state: AppState) -> Router {
             get(get_cat_work),
         )
         .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
-            post(create_endpoint).get(list_endpoints),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}",
-            axum::routing::delete(delete_disk),
+            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
+            post(disk_action),
         )
         .route(
             "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
@@ -648,25 +684,17 @@ pub fn router(state: AppState) -> Router {
         "/v1/workspaces/{workspace}/operations/{operation}",
         get(runtime_operations::get_runtime_operation),
     );
-    #[cfg(debug_assertions)]
-    let cat_item_read = if state.retired_product_authority_for_tests() {
-        get(get_cat)
-    } else {
-        get(runtime_product_reads::get_runtime_cat)
-    };
-    #[cfg(not(debug_assertions))]
-    let cat_item_read = get(runtime_product_reads::get_runtime_cat);
-    #[cfg(debug_assertions)]
-    let disk_item_read = if state.retired_product_authority_for_tests() {
-        get(get_disk)
-    } else {
-        get(runtime_product_reads::get_runtime_disk)
-    };
-    #[cfg(not(debug_assertions))]
-    let disk_item_read = get(runtime_product_reads::get_runtime_disk);
     let runtime_product_read = Router::new()
-        .route("/v1/workspaces/{workspace}/cats/{cat}", cat_item_read)
-        .route("/v1/workspaces/{workspace}/disks/{disk}", disk_item_read);
+        .route("/v1/workspaces/{workspace}/cats/{cat}", cat_item_route)
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
+            cat_action_route,
+        )
+        .route(
+            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
+            endpoint_collection_route,
+        )
+        .route("/v1/workspaces/{workspace}/disks/{disk}", disk_item_route);
     let route_resolve_v2 = Router::<AppState>::new()
         .route(
             "/v1/internal/routes/resolve",
@@ -796,6 +824,7 @@ pub fn router(state: AppState) -> Router {
         .merge(runtime_product_read)
         .merge(runtime_volume_authority)
         .merge(route_resolve_v2)
+        .merge(product_mutations_v2)
         .merge(retired_product_support)
         .merge(retired_product_authority)
         .fallback(crate::ui::not_found)
@@ -882,13 +911,24 @@ mod tests {
         );
         routes.push("GET /v1/workspaces/{workspace}/disks".to_string());
         routes.push("POST /v1/workspaces/{workspace}/disks".to_string());
+        assert!(
+            router.contains("cat_item_route")
+                && router.contains("cat_action_route")
+                && router.contains("endpoint_collection_route")
+                && router.contains("disk_item_route")
+                && router.contains("product_mutations_v2"),
+            "conditional retired/new mutation routers are missing",
+        );
         routes.push("GET /v1/workspaces/{workspace}/cats/{cat}".to_string());
+        routes.push("GET /v1/workspaces/{workspace}/cats/{cat}/endpoints".to_string());
         routes.push("GET /v1/workspaces/{workspace}/disks/{disk}".to_string());
         routes.sort();
+        routes.dedup();
 
         let expected = r#"DELETE /v1/accounts/{account}/members/{membership}
 DELETE /v1/admin/nodes/{id}
 DELETE /v1/workspaces/{workspace}/cats/{cat}
+DELETE /v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}
 DELETE /v1/workspaces/{workspace}/disks/{disk}
 DELETE /v1/workspaces/{workspace}/tokens/{token}
 GET /

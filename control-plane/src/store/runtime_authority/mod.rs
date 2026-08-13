@@ -10,6 +10,7 @@ pub(crate) mod placement_planner;
 pub(crate) mod placement_policy;
 mod product;
 pub(crate) mod product_identity;
+pub(crate) mod product_mutation_service;
 pub(crate) mod product_reads;
 mod product_rows;
 pub(crate) mod route_signer;

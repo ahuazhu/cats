@@ -466,6 +466,17 @@ pub(super) fn load_cat_by_id_for_update(
         .transpose()
 }
 
+pub(super) fn load_cat_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CatRecord>> {
+    let sql = format!("SELECT {CAT_COLUMNS} FROM cat_records WHERE cat_id=$1");
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str()])?
+        .map(|row| decode_cat(&row))
+        .transpose()
+}
+
 pub(super) fn load_cat_by_name_unlocked(
     transaction: &mut Transaction<'_>,
     workspace_id: &Id,
@@ -624,6 +635,17 @@ pub(super) fn load_disk_by_id_for_update(
     disk_id: &Id,
 ) -> AuthorityTxResult<Option<DiskRecord>> {
     let sql = format!("SELECT {DISK_COLUMNS} FROM disk_records WHERE disk_id=$1 FOR UPDATE");
+    transaction
+        .query_opt(&sql, &[&disk_id.as_str()])?
+        .map(|row| decode_disk(&row))
+        .transpose()
+}
+
+pub(super) fn load_disk_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!("SELECT {DISK_COLUMNS} FROM disk_records WHERE disk_id=$1");
     transaction
         .query_opt(&sql, &[&disk_id.as_str()])?
         .map(|row| decode_disk(&row))
@@ -990,6 +1012,31 @@ pub(super) fn load_desired_by_network_id_unlocked(
         .as_ref()
         .is_some_and(|desired| desired.runtime.network_config.network_id != *network_id)
     {
+        return Err(corrupt(()));
+    }
+    Ok(desired)
+}
+
+pub(super) fn load_desired_referencing_disk_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE record->'volumes' @> jsonb_build_array(jsonb_build_object('disk_id', $1::TEXT))
+          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt(()));
+    }
+    let desired = rows.first().map(decode_desired).transpose()?;
+    if desired.as_ref().is_some_and(|desired| {
+        !desired
+            .volumes
+            .iter()
+            .any(|volume| volume.disk_id == *disk_id)
+    }) {
         return Err(corrupt(()));
     }
     Ok(desired)

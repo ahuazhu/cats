@@ -208,6 +208,7 @@ fn desired_mutation_request(
         placement_snapshots,
         active_guest_digest,
         endpoint_records,
+        volume_mutation: super::product::DesiredVolumeMutation::Preserve,
     }
 }
 
