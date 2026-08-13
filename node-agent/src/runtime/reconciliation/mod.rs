@@ -47,6 +47,7 @@ mod inventory;
     )
 )]
 mod kernel_nbd;
+mod lifecycle_steps;
 mod network;
 mod normal_acquire;
 mod persistent_filesystem;
@@ -184,6 +185,7 @@ pub(crate) use kernel_nbd::{
     KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, KernelNbdPoolAdmission,
     KernelNbdPoolScanAdmission,
 };
+pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 pub use normal_acquire::{
     recover_normal_acquire_from_authority, recover_normal_release_from_authority,
