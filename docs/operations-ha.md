@@ -293,11 +293,14 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
 5. Node 以所有 gate Closed 注册新 `AgentSession`，提交 complete empty inventory attestation 和
    key-ring ACK；随后启动 Gateway。
 6. 在cordoned且mutation Closed状态运行第6节全部qualification和故障oracle。fresh Kubernetes rollout
-   必须以至少两个fully available Control replica、matching Running/Ready Pods及唯一受Terraform管理的public
-   Ingress/IngressClass组成，但route/admission仍保持Closed，不能创建产品资源。全绿后生成绑定exact release、
+   必须以至少两个fully available Control replica、matching Running/Ready Pods、`cats.run/ingress=disabled`及零
+   public Ingress/IngressClass组成；`maintenance_mode=false`只启动fresh Control，独立且default-false的
+   `enable_public_ingress`仍保持false，不能用Terraform资源存在性虚构route/mutation Closed证明。全绿后生成绑定exact release、
    fresh targets、唯一reset ID、qualification manifest与全部旧writer stopped-or-isolated证明的post-green evidence。
    evidence在首次destructive start时必须不晚于当前时间且age不超过900秒；其中`old_writers`只是closed declaration，
-   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13尚未产出并被独立验证时生产execute保持Blocked。
+   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13 canonical格式尚未accepted；
+   E9 signed final usage epoch/barrier receipt与跨组件Closed-admission proof也尚未accepted。本版reset binary对三项分别机械
+   Blocked且在任何AWS/PostgreSQL调用前拒绝production execute；随机digest或operator字符串不能绕过。
 7. post-green后才执行旧namespace的exact destructive retirement。仓库内的
    [`production-clean-slate-reset.py`](../deploy/aws/production-clean-slate-reset.py)是其中Control/Usage/ChunkStore
    边界的两阶段执行器：reviewed `plan`与省略`--execute`的`apply`均只读；只有exact plan SHA、reset ID和
@@ -309,7 +312,8 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    read/list/delete/abort的expected bucket owner。不能把fresh空schema、旧schema缺表或retention等待当成零引用proof。完整合同见
    [production clean-slate reset](../deploy/aws/production-clean-slate-reset.md)。其他旧Cat/Disk/Snapshot/Operation、
    route/cache、Node runtime state和credential必须由各自批准的exact retirement继续处理，不能扩大本工具范围。
-   `reset-started`后若进程或effect响应丢失，只能以同一plan/reset/release/targets/evidence digest重进：逐stage验证
+   receipt以canonical JSON为唯一authority，SHA sidecar只从exact JSON no-replace补齐；sidecar无JSON或digest漂移fail closed。
+   `reset-started`后若进程或effect响应丢失，只能以同一plan/reset/release commit/artifact SHA256/targets/evidence digest重进：逐stage验证
    canonical receipt/SHA与predecessor链，对缺receipt的stage先做authoritative live discovery，只执行尚未完成的effect；
    已absent的exact stream/table/schema与空prefix只结算receipt，complete replay零mutation。receipt gap/drift、live
    postcondition矛盾或另一plan/evidence一律fail closed。

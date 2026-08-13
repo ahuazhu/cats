@@ -232,7 +232,10 @@ zero without creating kubectl drift. After the old writers are positively
 stopped or isolated, review a second plan that points the terminal release at
 disjoint fresh control/usage schemas, ChunkStore prefix or bucket, Kinesis
 stream, DynamoDB checkpoint table and immutable usage archive. Set
-`maintenance_mode = false` only in that reviewed fresh-target plan.
+`maintenance_mode = false` only in that reviewed fresh-target plan, while
+keeping the separate `enable_public_ingress = false`. Both ingress inputs
+default Closed. Starting fresh Control replicas does not itself open public or
+mutation admission.
 
 The destructive reset is a post-green retirement, not a prerequisite for
 starting the fresh release. The separate fail-closed executor requires the
@@ -255,6 +258,12 @@ themselves, and production execute remains Blocked until that manifest is
 independently verified. After `reset-started`, repeat the same reviewed
 `apply --execute` to forward-resume the immutable stage chain; another plan,
 evidence digest or target set fails closed.
+This exact reset binary still mechanically blocks production execute before any
+AWS/PostgreSQL call because E13 positive-stop, E9 signed final usage
+epoch/barrier and cross-component Closed-admission proof formats have not been
+accepted. Terraform does not satisfy or bypass those proofs. Canonical JSON is
+the immutable receipt authority; a missing derived SHA sidecar is repaired from
+exact JSON without repeating an effect.
 The executor never runs as part of Terraform apply or normal release CI.
 
 ### Route admission

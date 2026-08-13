@@ -40,22 +40,29 @@ deployment. Do not substitute `kubectl delete ingress` or an unrecorded scale
 operation. After the independent positive stop/fence proof, update the reviewed
 production inputs to the **fresh** resource names and exact release, then set
 `maintenance_mode = false` in another saved plan to start only that fresh
-deployment. Do not point new components at the old schemas, prefixes, stream or
-checkpoint table.
+deployment. Keep the independent `enable_public_ingress = false`; both the
+module and production stack default it to false. Starting Control replicas must
+not publish ingress or manufacture route/mutation admission. Do not point new
+components at the old schemas, prefixes, stream or checkpoint table.
 
 The reset executor runs only after the fresh deployment is green. It compares
 the kubeconfig context server with the named EKS cluster and requires at least
 two fully available `cats-controld` replicas, exactly that many Running/Ready
-Pods, and exactly one Cats public Ingress and IngressClass. Thus a maintenance
-configuration still at zero replicas cannot authorize destructive retirement.
+Pods, the namespace label `cats.run/ingress=disabled`, and zero Cats public
+Ingress or IngressClass resources. Thus neither a maintenance configuration
+still at zero replicas nor a prematurely public rollout can authorize even the
+read-only reset preflight. The cross-component route/mutation Closed verifier is
+not defined by E2; production execute remains mechanically blocked until its
+canonical proof is accepted.
 
 ## Post-green evidence
 
 The independent maintenance actor supplies a small, non-secret JSON document
 after the fresh release passes qualification. It binds the exact fresh targets,
-release and positive old-writer stop/isolation proof to an external evidence
-manifest; it does not embed logs, tokens, object keys, headers, private keys or
-database URLs.
+Git commit, independent artifact digest and a placeholder old-writer declaration
+to an external evidence manifest; it does not embed logs, tokens, object keys,
+headers, private keys or database URLs. Until E13's canonical parser lands,
+neither the declaration nor its digest authorizes production execution.
 
 ```json
 {
@@ -63,7 +70,8 @@ database URLs.
   "version": 1,
   "reset_id": "REPLACE_WITH_UNIQUE_RESET_ID",
   "observed_at": "2026-08-13T00:00:00Z",
-  "qualified_release_sha": "REPLACE_WITH_64_LOWERCASE_HEX",
+  "qualified_release_commit": "REPLACE_WITH_40_LOWERCASE_HEX_GIT_COMMIT",
+  "qualified_artifact_sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
   "aws_account_id": "123456789012",
   "aws_region": "us-east-1",
   "eks_cluster_name": "REPLACE_WITH_EXACT_CLUSTER",
@@ -94,14 +102,14 @@ database URLs.
 old. A plan outside that closed window requires newly observed evidence and a
 new review; a different reset can never reuse the document.
 
-The manifest digest must resolve to a retained, access-controlled, parseable
-qualification manifest. Its old-writer section must contain E13's positive
-systemd/process-tree stop results and, for an unreachable Host, the external
-isolation receipt. The `old_writers` strings above are only a closed declaration
-bound into that manifest digest; this executor does not turn them into shutdown
-authority. Production `--execute` therefore remains Blocked until E13 produces
-and an independent reviewer verifies that manifest. A self-written boolean
-document or this repository's offline fixture is not positive shutdown evidence.
+No accepted canonical E13 proof format exists yet. The `old_writers` strings
+and arbitrary manifest digest above are only closed declarations; this executor
+does not turn them into shutdown authority. This exact binary mechanically
+blocks every production `--execute` before any AWS or PostgreSQL call. A future
+reviewed change may remove that block only after E13 defines a canonical,
+parseable positive systemd/process-tree stop result and external isolation
+receipt. A self-written document or this repository's offline fixture is not
+positive shutdown evidence.
 
 ## Database and credential boundary
 
@@ -112,8 +120,9 @@ service file and selected by its non-secret path; the URL is never placed in
 argv, stdout, stderr, an environment variable, or a receipt.
 
 All old/fresh targets must be dedicated lowercase `cats_*` schemas, must be
-pairwise distinct, must be owned by the reset actor, and must carry their
-canonical marker:
+pairwise distinct and must carry their canonical marker. The destructive actor
+must own the two old schemas. Fresh credentials are read-only inventory
+credentials and are not required to own either fresh schema:
 
 - control: `control_schema_version`;
 - usage/billing: `schema_migrations`.
@@ -134,10 +143,13 @@ they share a bucket. It independently verifies both old and fresh resource
 identities and inventories; the fresh control schema must be terminal schema
 version 14.
 
-Only after that proof does `--execute` delete the old Kinesis stream and old
-DynamoDB checkpoint table. The fresh stream/table remain live, so old retained
-records cannot replay into the fresh usage schema. Both immutable Object-Locked
-usage archives remain retained evidence; neither archive is a deletion target.
+Deleting the old Kinesis stream/table additionally requires a signed final
+usage epoch/barrier receipt from E9. No accepted canonical format exists yet,
+so this exact binary mechanically blocks production `--execute` before any
+destructive stage. It does not infer a final epoch from an empty stream, table,
+schema, digest or operator string. Once a later reviewed implementation accepts
+that authority, the fresh stream/table remain live and both immutable
+Object-Locked usage archives remain retained evidence.
 
 ## Read-only plan and dry-run
 
@@ -147,7 +159,8 @@ reviewed exact values:
 ```sh
 python3 deploy/aws/production-clean-slate-reset.py plan \
   --reset-id REPLACE_WITH_UNIQUE_RESET_ID \
-  --release-sha REPLACE_WITH_64_LOWERCASE_HEX \
+  --release-commit REPLACE_WITH_40_LOWERCASE_HEX_GIT_COMMIT \
+  --artifact-sha256 REPLACE_WITH_64_LOWERCASE_HEX \
   --aws-account-id REPLACE_WITH_12_DIGITS \
   --aws-region us-east-1 \
   --eks-cluster-name REPLACE_WITH_EXACT_CLUSTER \
@@ -180,8 +193,9 @@ The command writes canonical `<reset-id>.plan.json` and its SHA-256 sidecar.
 Independently review the exact targets, inventory counts/digests, schema
 versions, post-green evidence digest, retained resources and destructive
 actions. The plan, `reset-started`, every stage receipt and `reset-complete`
-all carry the same exact reset ID, plan digest, stable-preflight digest, release,
-targets and post-green evidence digest.
+all carry the same exact reset ID, plan digest, stable-preflight digest,
+40-hex Git commit, independent artifact SHA-256, targets and post-green evidence
+digest.
 
 Run `apply` with the same common arguments plus the plan path, its independently
 read SHA-256 and the reset ID. Omitting `--execute` performs a second read-only
@@ -200,6 +214,14 @@ schema/S3/usage inventory, or post-green evidence invalidates the plan. Generate
 and review a new plan; never edit a receipt.
 
 ## Execute and receipts
+
+Production execution is intentionally unavailable in this binary. E13 positive
+stop/isolation, E9 signed final usage epoch/barrier and the cross-component
+Closed route/mutation admission proof have no accepted canonical formats. Each
+is a separate mechanical pre-start block, evaluated before AWS or PostgreSQL
+access. `plan`, dry-run and the offline fake fixture remain available; no digest
+or declaration bypasses these blocks. Removing a block belongs to the branch
+that lands its accepted proof parser and calibrated negative fixtures.
 
 Only the independent maintenance actor has the narrow delete/drop permissions.
 Add `--execute` to the already reviewed `apply` invocation. Before the first
@@ -224,9 +246,12 @@ The executor then:
    its separate stage receipt; and
 8. publishes the canonical `reset-complete` receipt and SHA-256 sidecar.
 
-Every stage is an immutable canonical JSON/SHA pair; a rerun cannot overwrite
-or silently bridge a missing/drifted pair. Receipts contain counts, hashes and
-non-secret identities, never object keys or DSNs.
+Each canonical JSON file is the single immutable receipt authority. Its
+`.sha256` is derived, not a second authority: if publication crashes after the
+JSON no-replace link/fsync, replay verifies the exact canonical JSON bytes and
+atomically creates only the missing sidecar. A sidecar without JSON, a mismatched
+sidecar or different JSON bytes fails closed. Receipts contain counts, hashes
+and non-secret identities, never object keys or DSNs.
 Publish them through the existing append-only evidence boundary after
 independent verification. The qualified fresh components remain running; only
 after the final receipt is verified may a separately reviewed change retire old

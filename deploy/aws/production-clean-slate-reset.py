@@ -6,6 +6,12 @@ account, region, cluster, namespace, PostgreSQL schema, bucket, and prefix is
 an explicit input.  ``plan`` is read-only.  ``apply`` is also read-only unless
 ``--execute`` and two independent plan confirmations are present.
 
+Production execution is mechanically blocked in this revision because the
+canonical E13 positive-stop, E9 signed final usage barrier, and cross-component
+Closed-admission proof formats have not yet been accepted.  The destructive
+path remains executable only through constructor flags used by this module's
+offline fake fixture; no CLI option exposes them.
+
 The reset is a post-cutover retirement tool.  It proves that a disjoint fresh
 schema/object/stream/checkpoint/archive namespace is already qualified and
 healthy before deleting the explicitly named old namespace.  Immutable usage
@@ -26,7 +32,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 
@@ -39,6 +45,7 @@ AWS_ACCOUNT = re.compile(r"^[0-9]{12}$")
 AWS_REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+$")
 BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 RESET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 COMPONENTS = ("gateway", "controller", "node_agent", "vmm", "blockd")
 MAX_JSON_BYTES = 64 * 1024
@@ -110,7 +117,8 @@ class CommandRunner:
 @dataclasses.dataclass(frozen=True)
 class Config:
     reset_id: str
-    release_sha: str
+    release_commit: str
+    artifact_sha256: str
     aws_account_id: str
     aws_region: str
     eks_cluster_name: str
@@ -321,7 +329,7 @@ def read_small_file(path: Path, context: str, maximum: int) -> bytes:
 def read_stage_receipt(
     directory: Path, reset_id: str, stage: str
 ) -> tuple[Path, dict[str, Any], str] | None:
-    """Load one immutable canonical receipt pair, or report that both files are absent."""
+    """Load canonical JSON authority and verify or repair its derived checksum."""
 
     path = directory / f"{reset_id}.{stage}.json"
     checksum = directory / f"{reset_id}.{stage}.sha256"
@@ -329,17 +337,26 @@ def read_stage_receipt(
     checksum_exists = checksum.exists() or checksum.is_symlink()
     if not path_exists and not checksum_exists:
         return None
-    if path_exists != checksum_exists:
-        raise ResetError(f"receipt pair for {stage} is incomplete")
+    if not path_exists:
+        raise ResetError(f"receipt checksum for {stage} exists without JSON authority")
     value, digest = read_json_file(path, f"{stage} receipt", canonical=True)
     expected_checksum = f"{digest}  {path.name}\n".encode("ascii")
-    if read_small_file(checksum, f"{stage} receipt checksum", 256) != expected_checksum:
-        raise ResetError(f"receipt checksum for {stage} does not match its canonical bytes")
+    if checksum_exists:
+        if read_small_file(checksum, f"{stage} receipt checksum", 256) != expected_checksum:
+            raise ResetError(f"receipt checksum for {stage} does not match its canonical bytes")
+    else:
+        atomic_write_new(checksum, expected_checksum, accept_exact_existing=True)
     return path, value, digest
 
 
-def atomic_write_new(path: Path, payload: bytes) -> str:
-    """Publish one immutable file by same-directory link, never overwrite."""
+def atomic_write_new(
+    path: Path,
+    payload: bytes,
+    *,
+    accept_exact_existing: bool = False,
+    publication_hook: Callable[[str, Path], None] | None = None,
+) -> str:
+    """Publish one immutable file, optionally accepting only exact prior bytes."""
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.parent.is_symlink() or not path.parent.is_dir():
@@ -356,12 +373,21 @@ def atomic_write_new(path: Path, payload: bytes) -> str:
         try:
             os.link(temporary, path)
         except FileExistsError as error:
-            raise ResetError(f"refusing to overwrite receipt {path.name}") from error
+            if not accept_exact_existing:
+                raise ResetError(f"refusing to overwrite receipt {path.name}") from error
+            existing = read_small_file(path, f"existing receipt file {path.name}", len(payload))
+            if existing != payload:
+                raise ResetError(f"existing receipt file {path.name} has different bytes") from error
+        else:
+            if publication_hook is not None:
+                publication_hook("after_link", path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        if publication_hook is not None:
+            publication_hook("after_directory_fsync", path)
     finally:
         try:
             temporary.unlink()
@@ -370,19 +396,37 @@ def atomic_write_new(path: Path, payload: bytes) -> str:
     return digest
 
 
-def write_receipt(directory: Path, reset_id: str, stage: str, value: dict[str, Any]) -> tuple[Path, str]:
+def write_receipt(
+    directory: Path,
+    reset_id: str,
+    stage: str,
+    value: dict[str, Any],
+    *,
+    publication_hook: Callable[[str, Path], None] | None = None,
+) -> tuple[Path, str]:
     path = directory / f"{reset_id}.{stage}.json"
     payload = canonical_bytes(value)
-    digest = atomic_write_new(path, payload)
+    digest = atomic_write_new(
+        path,
+        payload,
+        accept_exact_existing=True,
+        publication_hook=publication_hook,
+    )
     checksum = directory / f"{reset_id}.{stage}.sha256"
-    atomic_write_new(checksum, f"{digest}  {path.name}\n".encode("ascii"))
+    atomic_write_new(
+        checksum,
+        f"{digest}  {path.name}\n".encode("ascii"),
+        accept_exact_existing=True,
+        publication_hook=publication_hook,
+    )
     return path, digest
 
 
 def validate_config(config: Config) -> None:
     checks = [
         (RESET_ID, config.reset_id, "reset_id"),
-        (HEX_SHA256, config.release_sha, "release_sha"),
+        (GIT_COMMIT, config.release_commit, "release_commit"),
+        (HEX_SHA256, config.artifact_sha256, "artifact_sha256"),
         (AWS_ACCOUNT, config.aws_account_id, "aws_account_id"),
         (AWS_REGION, config.aws_region, "aws_region"),
         (DNS_LABEL, config.eks_cluster_name, "eks_cluster_name"),
@@ -570,12 +614,26 @@ class ResetExecutor:
         runner: CommandRunner,
         *,
         now: dt.datetime | None = None,
+        allow_unaccepted_e13_proof_for_fixture: bool = False,
+        allow_unaccepted_e9_barrier_for_fixture: bool = False,
+        allow_unaccepted_closed_admission_for_fixture: bool = False,
+        receipt_publication_hook: Callable[[str, Path], None] | None = None,
     ) -> None:
         validate_config(config)
         self.config = config
         self.runner = runner
         self.now = (now or utc_now()).astimezone(dt.timezone.utc)
         self._fixed_now = now is not None
+        self._allow_unaccepted_e13_proof_for_fixture = (
+            allow_unaccepted_e13_proof_for_fixture
+        )
+        self._allow_unaccepted_e9_barrier_for_fixture = (
+            allow_unaccepted_e9_barrier_for_fixture
+        )
+        self._allow_unaccepted_closed_admission_for_fixture = (
+            allow_unaccepted_closed_admission_for_fixture
+        )
+        self._receipt_publication_hook = receipt_publication_hook
         self.control_dsn = read_secret_file(
             config.control_postgres_url_file, "control PostgreSQL URL file"
         )
@@ -591,6 +649,38 @@ class ResetExecutor:
 
     def _current_time(self) -> dt.datetime:
         return self.now if self._fixed_now else utc_now()
+
+    def _write_receipt(
+        self, stage: str, value: dict[str, Any]
+    ) -> tuple[Path, str]:
+        if self._receipt_publication_hook is None:
+            return write_receipt(
+                self.config.receipt_directory, self.config.reset_id, stage, value
+            )
+        return write_receipt(
+            self.config.receipt_directory,
+            self.config.reset_id,
+            stage,
+            value,
+            publication_hook=self._receipt_publication_hook,
+        )
+
+    def _require_accepted_execute_prerequisites(self) -> None:
+        if not self._allow_unaccepted_e13_proof_for_fixture:
+            raise ResetError(
+                "production --execute is mechanically blocked until the canonical E13 "
+                "positive-stop/isolation proof format is accepted and verified"
+            )
+        if not self._allow_unaccepted_e9_barrier_for_fixture:
+            raise ResetError(
+                "production --execute is mechanically blocked until the canonical E9 "
+                "signed final usage epoch/barrier receipt is accepted and verified"
+            )
+        if not self._allow_unaccepted_closed_admission_for_fixture:
+            raise ResetError(
+                "production --execute is mechanically blocked until the canonical "
+                "Closed route/mutation admission proof is accepted and verified"
+            )
 
     def _run(self, argv: Sequence[str], *, env: Mapping[str, str] | None = None) -> str:
         result = self.runner.run(argv, env=env)
@@ -753,7 +843,8 @@ class ResetExecutor:
                 "version",
                 "reset_id",
                 "observed_at",
-                "qualified_release_sha",
+                "qualified_release_commit",
+                "qualified_artifact_sha256",
                 "aws_account_id",
                 "aws_region",
                 "eks_cluster_name",
@@ -769,7 +860,8 @@ class ResetExecutor:
             raise ResetError("unsupported post-green evidence kind/version")
         expected = {
             "reset_id": self.config.reset_id,
-            "qualified_release_sha": self.config.release_sha,
+            "qualified_release_commit": self.config.release_commit,
+            "qualified_artifact_sha256": self.config.artifact_sha256,
             "aws_account_id": self.config.aws_account_id,
             "aws_region": self.config.aws_region,
             "eks_cluster_name": self.config.eks_cluster_name,
@@ -851,6 +943,9 @@ class ResetExecutor:
         namespace_uid = metadata.get("uid")
         if not isinstance(namespace_uid, str) or not namespace_uid:
             raise ResetError("Kubernetes namespace has no UID")
+        labels = metadata.get("labels")
+        if not isinstance(labels, dict) or labels.get("cats.run/ingress") != "disabled":
+            raise ResetError("fresh namespace public ingress is not explicitly Closed")
 
         deployments = self._kubectl_json(
             "get",
@@ -904,24 +999,25 @@ class ResetExecutor:
             "--selector",
             "app.kubernetes.io/part-of=cats",
         ).get("items")
-        if not isinstance(ingresses, list) or len(ingresses) != 1:
-            raise ResetError("fresh Cats public Ingress is not uniquely present")
+        if not isinstance(ingresses, list) or ingresses:
+            raise ResetError("fresh Cats public Ingress must remain absent during reset")
         ingress_classes = self._kubectl_json(
             "get",
             "ingressclasses",
             "--selector",
             "app.kubernetes.io/part-of=cats",
         ).get("items")
-        if not isinstance(ingress_classes, list) or len(ingress_classes) != 1:
-            raise ResetError("fresh Cats public IngressClass is not uniquely present")
+        if not isinstance(ingress_classes, list) or ingress_classes:
+            raise ResetError("fresh Cats public IngressClass must remain absent during reset")
         return {
             "namespace_uid": namespace_uid,
             "control_deployment_uid": dep_metadata.get("uid"),
             "control_deployment_generation": generation,
             "control_replicas": desired,
             "ready_control_pods": desired,
-            "cats_ingresses": 1,
-            "cats_ingress_classes": 1,
+            "public_ingress_state": "closed",
+            "cats_ingresses": 0,
+            "cats_ingress_classes": 0,
         }
 
     def _bucket_region(self, bucket: str) -> str:
@@ -1181,7 +1277,14 @@ class ResetExecutor:
         }
         return summary, objects, uploads
 
-    def _database_schema(self, dsn: str, schema: str, marker: str) -> dict[str, Any]:
+    def _database_schema(
+        self,
+        dsn: str,
+        schema: str,
+        marker: str,
+        *,
+        require_owner: bool,
+    ) -> dict[str, Any]:
         quoted_schema = f'"{schema}"'
         quoted_marker = f'"{marker}"'
         sql = f"""
@@ -1208,7 +1311,7 @@ SELECT json_build_object(
             raise ResetError("PostgreSQL schema inventory is malformed")
         if catalog.get("schema_exists") is not True or catalog.get("marker_exists") is not True:
             raise ResetError(f"{schema} is not an existing Cats schema with marker {marker}")
-        if catalog.get("schema_owner") != catalog.get("current_user"):
+        if require_owner and catalog.get("schema_owner") != catalog.get("current_user"):
             raise ResetError(f"reset actor is not the owner of schema {schema}")
         relations = catalog.get("relations")
         if not isinstance(relations, list) or not relations:
@@ -1304,26 +1407,37 @@ FROM outside;
             self.config.new_chunkstore_bucket, self.config.new_object_prefix
         )
         old_control = self._database_schema(
-            self.control_dsn, self.config.control_schema, "control_schema_version"
+            self.control_dsn,
+            self.config.control_schema,
+            "control_schema_version",
+            require_owner=True,
         )
         old_usage = self._database_schema(
-            self.usage_dsn, self.config.usage_schema, "schema_migrations"
+            self.usage_dsn,
+            self.config.usage_schema,
+            "schema_migrations",
+            require_owner=True,
         )
         fresh_control = self._database_schema(
             self.new_control_dsn,
             self.config.new_control_schema,
             "control_schema_version",
+            require_owner=False,
         )
         if fresh_control["schema_version"] != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION:
             raise ResetError(
                 "fresh control schema is not the required terminal schema version 14"
             )
         fresh_usage = self._database_schema(
-            self.new_usage_dsn, self.config.new_usage_schema, "schema_migrations"
+            self.new_usage_dsn,
+            self.config.new_usage_schema,
+            "schema_migrations",
+            require_owner=False,
         )
         stable = {
             "targets": self.config.targets(),
-            "release_sha": self.config.release_sha,
+            "release_commit": self.config.release_commit,
+            "artifact_sha256": self.config.artifact_sha256,
             "post_green_evidence_sha256": green_digest,
             "qualification_manifest_sha256": green["qualification_manifest_sha256"],
             "cloud": cloud,
@@ -1620,7 +1734,9 @@ COMMIT;
         self, dsn: str, schema: str, marker: str, expected: Mapping[str, Any]
     ) -> dict[str, Any]:
         if self._schema_exists(dsn, schema):
-            current = self._database_schema(dsn, schema, marker)
+            current = self._database_schema(
+                dsn, schema, marker, require_owner=True
+            )
             if current != expected:
                 raise ResetError(f"{schema} changed before its exact DROP")
             self._drop_schema(dsn, expected)
@@ -1659,7 +1775,8 @@ COMMIT;
             stable,
             {
                 "targets",
-                "release_sha",
+                "release_commit",
+                "artifact_sha256",
                 "post_green_evidence_sha256",
                 "qualification_manifest_sha256",
                 "cloud",
@@ -1673,8 +1790,11 @@ COMMIT;
         )
         if stable.get("targets") != self.config.targets():
             raise ResetError("plan receipt destructive targets do not match this invocation")
-        if stable.get("release_sha") != self.config.release_sha:
-            raise ResetError("plan receipt release does not match this invocation")
+        if (
+            stable.get("release_commit") != self.config.release_commit
+            or stable.get("artifact_sha256") != self.config.artifact_sha256
+        ):
+            raise ResetError("plan receipt release/artifact does not match this invocation")
         stable_digest = plan["stable_preflight_sha256"]
         if not isinstance(stable_digest, str) or not HEX_SHA256.fullmatch(stable_digest):
             raise ResetError("plan receipt stable preflight digest is malformed")
@@ -1735,7 +1855,8 @@ COMMIT;
             "kind": KIND_RECEIPT,
             "version": 1,
             "reset_id": self.config.reset_id,
-            "release_sha": self.config.release_sha,
+            "release_commit": self.config.release_commit,
+            "artifact_sha256": self.config.artifact_sha256,
             "targets": self.config.targets(),
             "plan_receipt_sha256": plan_digest,
             "stable_preflight_sha256": stable_digest,
@@ -1985,9 +2106,13 @@ COMMIT;
             self.new_control_dsn,
             self.config.new_control_schema,
             "control_schema_version",
+            require_owner=False,
         )
         fresh_usage_schema = self._database_schema(
-            self.new_usage_dsn, self.config.new_usage_schema, "schema_migrations"
+            self.new_usage_dsn,
+            self.config.new_usage_schema,
+            "schema_migrations",
+            require_owner=False,
         )
         if (
             fresh_control != databases.get("fresh_control")
@@ -2045,6 +2170,7 @@ COMMIT;
                     self.control_dsn,
                     self.config.control_schema,
                     "control_schema_version",
+                    require_owner=True,
                 )
                 != databases["old_control"]
             ):
@@ -2054,7 +2180,10 @@ COMMIT;
                 raise ResetError("old usage schema advanced ahead of the receipt chain")
             if (
                 self._database_schema(
-                    self.usage_dsn, self.config.usage_schema, "schema_migrations"
+                    self.usage_dsn,
+                    self.config.usage_schema,
+                    "schema_migrations",
+                    require_owner=True,
                 )
                 != databases["old_usage"]
             ):
@@ -2086,9 +2215,7 @@ COMMIT;
             ],
             "rollback_boundary": "before execute: retain old namespace; after execute starts: fresh namespace forward-fix only",
         }
-        return write_receipt(
-            self.config.receipt_directory, self.config.reset_id, "plan", receipt
-        )
+        return self._write_receipt("plan", receipt)
 
     def apply(
         self,
@@ -2103,9 +2230,25 @@ COMMIT;
         plan, actual_plan_digest = read_json_file(plan_path, "plan receipt", canonical=True)
         if actual_plan_digest != supplied_plan_sha256:
             raise ResetError("plan receipt SHA-256 does not match --plan-sha256")
+        plan_checksum = plan_path.with_suffix(".sha256")
+        expected_plan_checksum = (
+            f"{actual_plan_digest}  {plan_path.name}\n".encode("ascii")
+        )
+        if plan_checksum.exists() or plan_checksum.is_symlink():
+            if (
+                read_small_file(plan_checksum, "plan receipt checksum", 256)
+                != expected_plan_checksum
+            ):
+                raise ResetError("plan receipt checksum does not match its canonical bytes")
+        else:
+            atomic_write_new(
+                plan_checksum, expected_plan_checksum, accept_exact_existing=True
+            )
         if confirmation != self.config.reset_id:
             raise ResetError("--confirm-reset-id does not match the explicit reset target")
         planned_stable = self._validate_plan_receipt(plan)
+        if execute:
+            self._require_accepted_execute_prerequisites()
         stable_digest = plan["stable_preflight_sha256"]
         evidence_digest = plan["post_green_evidence_sha256"]
         common = self._receipt_common(actual_plan_digest, stable_digest, evidence_digest)
@@ -2161,9 +2304,7 @@ COMMIT;
                 "mutations_executed": False,
                 "rollback_boundary": "not crossed",
             }
-            return write_receipt(
-                self.config.receipt_directory, self.config.reset_id, "dry-run", dry_run
-            )
+            return self._write_receipt("dry-run", dry_run)
         if "reset-started" not in existing:
             started_at = self._current_time()
             _green, start_evidence_digest = self._post_green_evidence(
@@ -2178,9 +2319,7 @@ COMMIT;
                 "mutations_executed": True,
                 "operator_rule": "from this receipt onward assume the boundary was crossed; forward-fix only",
             }
-            started_path, started_digest = write_receipt(
-                self.config.receipt_directory, self.config.reset_id, "reset-started", started
-            )
+            started_path, started_digest = self._write_receipt("reset-started", started)
 
         old_chunkstore = planned_stable["chunkstore"]["old"]
         retired_inventory = {
@@ -2206,9 +2345,7 @@ COMMIT;
                 "authoritative_empty_proof": s3_empty,
                 "created_at": format_time(utc_now()),
             }
-            _s3_path, s3_digest = write_receipt(
-                self.config.receipt_directory, self.config.reset_id, "s3-empty", s3_stage
-            )
+            _s3_path, s3_digest = self._write_receipt("s3-empty", s3_stage)
 
         if "usage-transport-empty" in existing:
             _transport_path, transport_value, transport_digest = existing[
@@ -2225,11 +2362,8 @@ COMMIT;
                 "authoritative_empty_proof": usage_transport_empty,
                 "created_at": format_time(utc_now()),
             }
-            _transport_path, transport_digest = write_receipt(
-                self.config.receipt_directory,
-                self.config.reset_id,
-                "usage-transport-empty",
-                transport_stage,
+            _transport_path, transport_digest = self._write_receipt(
+                "usage-transport-empty", transport_stage
             )
 
         databases = planned_stable["databases"]
@@ -2253,11 +2387,8 @@ COMMIT;
                 "authoritative_empty_proof": control_empty,
                 "created_at": format_time(utc_now()),
             }
-            _control_path, control_digest = write_receipt(
-                self.config.receipt_directory,
-                self.config.reset_id,
-                "control-schema-empty",
-                control_stage,
+            _control_path, control_digest = self._write_receipt(
+                "control-schema-empty", control_stage
             )
 
         if "usage-schema-empty" in existing:
@@ -2278,11 +2409,8 @@ COMMIT;
                 "authoritative_empty_proof": usage_empty,
                 "created_at": format_time(utc_now()),
             }
-            _usage_path, usage_digest = write_receipt(
-                self.config.receipt_directory,
-                self.config.reset_id,
-                "usage-schema-empty",
-                usage_stage,
+            _usage_path, usage_digest = self._write_receipt(
+                "usage-schema-empty", usage_stage
             )
 
         complete = {
@@ -2310,14 +2438,13 @@ COMMIT;
             "rollback_boundary": "crossed; forward-fix only",
             "next_gate": "independently verify this old-namespace retirement receipt",
         }
-        return write_receipt(
-            self.config.receipt_directory, self.config.reset_id, "reset-complete", complete
-        )
+        return self._write_receipt("reset-complete", complete)
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reset-id", required=True)
-    parser.add_argument("--release-sha", required=True)
+    parser.add_argument("--release-commit", required=True)
+    parser.add_argument("--artifact-sha256", required=True)
     parser.add_argument("--aws-account-id", required=True)
     parser.add_argument("--aws-region", required=True)
     parser.add_argument("--eks-cluster-name", required=True)
@@ -2349,7 +2476,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def config_from_args(args: argparse.Namespace) -> Config:
     return Config(
         reset_id=args.reset_id,
-        release_sha=args.release_sha,
+        release_commit=args.release_commit,
+        artifact_sha256=args.artifact_sha256,
         aws_account_id=args.aws_account_id,
         aws_region=args.aws_region,
         eks_cluster_name=args.eks_cluster_name,

@@ -348,7 +348,7 @@ variable "auto_cold_after_seconds" {
 variable "enable_public_ingress" {
   description = "Create the EKS Auto Mode ALB ingress resources."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "ingress_class_name" {

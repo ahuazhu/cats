@@ -4,7 +4,7 @@ module "cats_kubernetes" {
   control_plane_image                   = var.control_plane_image
   control_plane_replicas                = var.control_plane_replicas
   maintenance_mode                      = var.maintenance_mode
-  enable_public_ingress                 = !var.maintenance_mode
+  enable_public_ingress                 = var.enable_public_ingress
   runtime_secret_data                   = var.runtime_secret_data
   route_grant_private_key_pem           = var.route_grant_private_key_pem
   route_grant_public_key_pem            = var.route_grant_public_key_pem
@@ -53,7 +53,7 @@ locals {
   # Maintenance is a reviewed Terraform transition: the same saved plan that
   # removes the public Ingress also removes its DNS aliases.  Keeping this in
   # state avoids an emergency kubectl edit becoming an unrecorded drift path.
-  manage_dns = var.route53_zone_id != null && !var.maintenance_mode
+  manage_dns = var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode
 
   # Endpoint wildcard DNS stays absent with the v2 Gateway deployment. A
   # control-plane-only ALB must not advertise a dead or legacy data-plane path.

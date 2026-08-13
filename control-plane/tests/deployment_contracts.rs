@@ -85,6 +85,8 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
     let stack_variables =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/variables.tf");
     let module_main = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let module_variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
     let example = read_workspace_file(
         "deploy/aws/terraform/stacks/production-application/production.tfvars.example",
     );
@@ -95,10 +97,22 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
         .map(|(section, _)| section)
         .expect("production maintenance_mode variable");
     assert!(maintenance.contains("default     = false"));
+    let public_ingress = stack_variables
+        .split_once("variable \"enable_public_ingress\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("production enable_public_ingress variable");
+    assert!(public_ingress.contains("default     = false"));
+    let module_public_ingress = module_variables
+        .split_once("variable \"enable_public_ingress\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("Kubernetes module enable_public_ingress variable");
+    assert!(module_public_ingress.contains("default     = false"));
     for expected in [
         "maintenance_mode                      = var.maintenance_mode",
-        "enable_public_ingress                 = !var.maintenance_mode",
-        "var.route53_zone_id != null && !var.maintenance_mode",
+        "enable_public_ingress                 = var.enable_public_ingress",
+        "var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode",
     ] {
         assert!(
             stack_main.contains(expected),
@@ -120,6 +134,7 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
         );
     }
     assert!(example.contains("maintenance_mode = false"));
+    assert!(example.contains("enable_public_ingress = false"));
 }
 
 #[test]
@@ -140,7 +155,11 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
     assert!(stdout.contains("post-green blocker passed"));
     assert!(stdout.contains("closed forward-resume"));
     assert!(stdout.contains("crash replay"));
+    assert!(stdout.contains("mechanical prerequisite blocks"));
+    assert!(stdout.contains("recoverable receipt publication"));
     assert!(stdout.contains("S3 expected-owner gates passed"));
+    assert!(stdout.contains("fresh DB read-only"));
+    assert!(stdout.contains("ingress Closed"));
 }
 
 #[test]
