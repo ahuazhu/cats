@@ -48,6 +48,7 @@ pub struct AutoTierPolicy {
 
 pub struct Controller {
     pub store: Arc<Store>,
+    #[cfg(debug_assertions)]
     retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     pub http: reqwest::Client,
     pub notify: Arc<tokio::sync::Notify>,
@@ -85,7 +86,7 @@ const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 impl Controller {
     pub(crate) fn new_with_liveness_authority(
         store: Arc<Store>,
-        retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
+        #[cfg(debug_assertions)] retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
         notify: Arc<tokio::sync::Notify>,
         node_lease_timeout_ms: i64,
         auth_token: String,
@@ -94,6 +95,7 @@ impl Controller {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
+            #[cfg(debug_assertions)]
             retired_storage_meta_for_tests,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -112,9 +114,18 @@ impl Controller {
     }
 
     fn retired_storage_meta(&self) -> anyhow::Result<&dyn MetadataStore> {
-        self.retired_storage_meta_for_tests
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("legacy storage authority is not composed"))
+        #[cfg(debug_assertions)]
+        {
+            self.retired_storage_meta_for_tests
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("legacy storage authority is not composed"))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Err(anyhow::anyhow!(
+                "legacy storage authority is absent from release builds"
+            ))
+        }
     }
 
     pub async fn run(self: Arc<Self>, interval: Duration) {
@@ -313,6 +324,7 @@ impl Controller {
     /// Complete a lost-Host handoff after an external actor has proved that
     /// the old Host is stopped or isolated. The API owns that explicit safety
     /// confirmation; this method performs the idempotent state transition.
+    #[cfg(debug_assertions)]
     pub(crate) async fn confirm_node_fenced(&self, node_id: &str) -> anyhow::Result<()> {
         let node_id = node_id.to_string();
         let converge_node_id = node_id.clone();

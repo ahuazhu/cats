@@ -36,6 +36,7 @@ impl MetricsContext {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
+            #[cfg(debug_assertions)]
             retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.to_string(),

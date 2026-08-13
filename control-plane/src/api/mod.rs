@@ -6,15 +6,22 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
+#[cfg(debug_assertions)]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+#[cfg(debug_assertions)]
+use axum::extract::DefaultBodyLimit;
+#[cfg(debug_assertions)]
+use axum::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+#[cfg(debug_assertions)]
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(debug_assertions)]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::auth::{
@@ -23,56 +30,79 @@ use cats_api::auth::{
 };
 use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutResponse};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
+#[cfg(debug_assertions)]
+use cats_api::metering::MAX_USAGE_INGEST_BODY_BYTES;
+#[cfg(debug_assertions)]
 use cats_api::metering::{
     CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
     RejectedCheckpoint, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine,
-    UsageTimeBucket, MAX_USAGE_INGEST_BODY_BYTES,
+    UsageTimeBucket,
 };
+#[cfg(debug_assertions)]
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::*;
 use cats_api::resources::*;
+#[cfg(debug_assertions)]
 use cats_metering::{
-    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
-    IngestOutcome, RateCard, UsageAttribution, UsageInterval, UsageQuery as MeterUsageQuery,
-    UsageView,
+    AttributedCheckpoint, IngestOutcome, UsageAttribution, UsageInterval, UsageView,
+};
+use cats_metering::{
+    CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, RateCard,
+    UsageQuery as MeterUsageQuery,
 };
 
 use crate::server::AppState;
+#[cfg(debug_assertions)]
 use crate::store::OciDeploymentClaim;
 
 mod accounts;
 mod agent_registration;
 mod billing;
 mod cat_create_v2;
+#[cfg(debug_assertions)]
 mod cats;
+#[cfg(debug_assertions)]
 mod disks;
+#[cfg(debug_assertions)]
 mod endpoints;
 mod nodes;
+#[cfg(debug_assertions)]
 mod operations;
 mod persistent_disk_create_v1;
 pub(crate) mod route_resolve_v2;
+#[cfg(debug_assertions)]
 mod routes;
 pub(crate) mod runtime_node_authority;
 mod runtime_operations;
 mod runtime_spine;
 mod runtime_volume_transitions;
+#[cfg(debug_assertions)]
 mod sessions;
+#[cfg(debug_assertions)]
 mod usage;
 
 use accounts::*;
 use billing::*;
 use cat_create_v2::*;
+#[cfg(debug_assertions)]
 use cats::*;
+#[cfg(debug_assertions)]
 use disks::*;
+#[cfg(debug_assertions)]
 use endpoints::*;
 use nodes::*;
+#[cfg(debug_assertions)]
 use operations::*;
 use persistent_disk_create_v1::*;
+#[cfg(debug_assertions)]
 use routes::*;
+#[cfg(debug_assertions)]
 use sessions::*;
+#[cfg(debug_assertions)]
 use usage::*;
 
 pub(crate) use billing::enforce_exhausted_billing_accounts;
+#[cfg(debug_assertions)]
 pub use cats::ensure_running;
 
 #[derive(Debug)]
@@ -107,8 +137,9 @@ type ApiResult<T> = std::result::Result<T, Failure>;
 /// or calls the retired Node HTTP runtime. This check must be the first handler
 /// action so production cannot authenticate, write an idempotency/work row, or
 /// emit an outbound call before failing closed.
+#[cfg(debug_assertions)]
 fn require_retired_product_authority_for_tests(state: &AppState) -> ApiResult<()> {
-    if state.retired_product_authority_for_tests {
+    if state.retired_product_authority_for_tests() {
         Ok(())
     } else {
         Err(
@@ -196,6 +227,7 @@ fn auth_failure(authenticated: bool) -> Failure {
     }
 }
 
+#[cfg(debug_assertions)]
 async fn check_authenticated(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     if bearer_principal(state, headers).await?.is_some()
         || crate::auth::has_any_web_session(state, headers).await
@@ -315,6 +347,7 @@ async fn check_metrics_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<
     Err(auth_failure(false))
 }
 
+#[cfg(debug_assertions)]
 async fn check_service_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let principal = bearer_principal(state, headers).await?;
     if matches!(
@@ -389,6 +422,7 @@ async fn require_account_manager(
     Ok((account, user_id))
 }
 
+#[cfg(debug_assertions)]
 async fn cordon_registered_node(state: &AppState, id: &str) -> ApiResult<()> {
     let id = id.to_string();
     state
@@ -413,6 +447,7 @@ fn idem_key(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[cfg(debug_assertions)]
 fn if_match(headers: &HeaderMap) -> Option<i64> {
     headers
         .get("if-match")
@@ -440,6 +475,7 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
     }
 }
 
+#[cfg(debug_assertions)]
 async fn reject_retired_product_authority(
     _request: axum::extract::Request,
     _next: axum::middleware::Next,
@@ -457,6 +493,7 @@ async fn reject_retired_product_get() -> Response {
     .into_response()
 }
 
+#[cfg(debug_assertions)]
 fn retired_product_support_router(enabled: bool) -> Router<AppState> {
     if enabled {
         Router::new()
@@ -468,20 +505,27 @@ fn retired_product_support_router(enabled: bool) -> Router<AppState> {
 }
 
 pub fn router(state: AppState) -> Router {
-    let cat_create_route = if state.retired_product_authority_for_tests {
+    #[cfg(debug_assertions)]
+    let cat_create_route = if state.retired_product_authority_for_tests() {
         post(create_cat_legacy_for_tests)
     } else {
         post(create_cat_v2)
     };
-    let disk_collection_route = if state.retired_product_authority_for_tests {
+    #[cfg(not(debug_assertions))]
+    let cat_create_route = post(create_cat_v2);
+    #[cfg(debug_assertions)]
+    let disk_collection_route = if state.retired_product_authority_for_tests() {
         post(create_disk).get(list_disks)
     } else {
         post(create_persistent_disk_v1).get(reject_retired_product_get)
     };
+    #[cfg(not(debug_assertions))]
+    let disk_collection_route = post(create_persistent_disk_v1).get(reject_retired_product_get);
     // These handlers read or mutate the retired Cat/Operation/Node authority.
     // Keep them reachable only from the explicit pre-cutover test composition.
     // The production middleware runs before authentication, body extraction,
     // PostgreSQL access, idempotency writes, and outbound Node calls.
+    #[cfg(debug_assertions)]
     let retired_product_authority = Router::new()
         .route("/v1/workspaces/{workspace}/cats", get(list_cats))
         .route(
@@ -554,15 +598,22 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/monitoring", get(admin_monitoring))
         .route("/v1/routes/resolve", get(resolve_route))
         .route("/v1/routes/wake", post(wake_route_handler));
-    let retired_product_authority = if state.retired_product_authority_for_tests {
+    #[cfg(debug_assertions)]
+    let retired_product_authority = if state.retired_product_authority_for_tests() {
         retired_product_authority
     } else {
         retired_product_authority
             .route_layer(axum::middleware::from_fn(reject_retired_product_authority))
     };
+    #[cfg(not(debug_assertions))]
+    let retired_product_authority = Router::<AppState>::new();
+    #[cfg(debug_assertions)]
     let retired_product_support =
-        retired_product_support_router(state.retired_product_authority_for_tests);
-    let runtime_volume_authority = if state.retired_product_authority_for_tests {
+        retired_product_support_router(state.retired_product_authority_for_tests());
+    #[cfg(not(debug_assertions))]
+    let retired_product_support = Router::<AppState>::new();
+    #[cfg(debug_assertions)]
+    let runtime_volume_authority = if state.retired_product_authority_for_tests() {
         Router::new()
     } else {
         Router::new()
@@ -577,7 +628,20 @@ pub fn router(state: AppState) -> Router {
                     .fallback(runtime_volume_transitions::evidence),
             )
     };
-    let runtime_operation_read = if state.retired_product_authority_for_tests {
+    #[cfg(not(debug_assertions))]
+    let runtime_volume_authority = Router::new()
+        .route(
+            "/v1/internal/runtime/volume-transitions",
+            post(runtime_volume_transitions::mutation)
+                .fallback(runtime_volume_transitions::mutation),
+        )
+        .route(
+            "/v1/internal/runtime/volume-transition-evidence",
+            post(runtime_volume_transitions::evidence)
+                .fallback(runtime_volume_transitions::evidence),
+        );
+    #[cfg(debug_assertions)]
+    let runtime_operation_read = if state.retired_product_authority_for_tests() {
         Router::new()
     } else {
         Router::new().route(
@@ -585,6 +649,11 @@ pub fn router(state: AppState) -> Router {
             get(runtime_operations::get_runtime_operation),
         )
     };
+    #[cfg(not(debug_assertions))]
+    let runtime_operation_read = Router::new().route(
+        "/v1/workspaces/{workspace}/operations/{operation}",
+        get(runtime_operations::get_runtime_operation),
+    );
     let route_resolve_v2 = Router::<AppState>::new()
         .route(
             "/v1/internal/routes/resolve",

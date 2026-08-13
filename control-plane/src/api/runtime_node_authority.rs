@@ -983,6 +983,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
+            #[cfg(debug_assertions)]
             retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             auth_token: "runtime-node-authority-unit-service-token".into(),

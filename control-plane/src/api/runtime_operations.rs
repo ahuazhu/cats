@@ -128,6 +128,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
+            #[cfg(debug_assertions)]
             retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),

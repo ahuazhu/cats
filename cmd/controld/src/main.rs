@@ -571,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
+        #[cfg(debug_assertions)]
         retired_storage_meta_for_tests: None,
         image_blob,
         auth_token: args.auth_token,

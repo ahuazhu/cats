@@ -13,7 +13,9 @@ use cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority;
 use cats_api::runtime_artifacts::{InstalledGatewayMachineArtifacts, InstalledRouteGrantV2Signer};
 use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
 use cats_metering::{CreditStore, UsageStore};
-use cats_storage::{BlobStore, MetadataStore};
+use cats_storage::BlobStore;
+#[cfg(debug_assertions)]
+use cats_storage::MetadataStore;
 
 use crate::controller::{AutoTierPolicy, Controller, NodeLivenessAuthority};
 use crate::store::{
@@ -400,10 +402,9 @@ pub struct Config {
     /// Append-only prepaid credit ledger. It may share the same physical
     /// database as the usage projection while remaining a separate port.
     pub credit_store: Arc<dyn CreditStore>,
-    /// Legacy storage fixture for the explicit retired-product test
-    /// composition. Production must leave this absent; Volume transitions use
-    /// the Control Store's target authority transaction path.
-    #[doc(hidden)]
+    /// Legacy storage fixture for the debug-only retired-product test
+    /// composition. This field does not exist in release builds.
+    #[cfg(debug_assertions)]
     pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     /// Read-only access to the immutable golden-image namespace. The A21
     /// resolver applies its own exact key, byte cap and concurrency boundary.
@@ -504,7 +505,7 @@ pub struct AppState {
     pub(crate) observation_store: Arc<ObservationStoreLane>,
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
-    #[doc(hidden)]
+    #[cfg(debug_assertions)]
     pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     pub(crate) cat_create:
         Arc<crate::store::runtime_authority::cat_create_service::CatCreateService>,
@@ -524,10 +525,22 @@ pub struct AppState {
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     pub(crate) runtime_node_authority:
         Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
-    /// The retired product authority exists only while its historical
-    /// controller tests are being replaced. It never adds a Node HTTP route:
-    /// every composition uses the production A19/A20 ingress map.
+    /// The retired product authority exists only in debug test compositions.
+    #[cfg(debug_assertions)]
     pub(crate) retired_product_authority_for_tests: bool,
+}
+
+impl AppState {
+    pub(crate) const fn retired_product_authority_for_tests(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.retired_product_authority_for_tests
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
 }
 
 pub struct Handle {
@@ -863,7 +876,7 @@ pub async fn spawn_with_gateway_machine(
 /// Retired product/controller harness. It uses the exact production Node
 /// ingress map; in particular it cannot install heartbeat, inventory,
 /// registration, or work-status compatibility routes.
-#[doc(hidden)]
+#[cfg(debug_assertions)]
 pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
     spawn_inner(cfg, true, false, None).await
 }
@@ -882,6 +895,11 @@ async fn spawn_inner(
     runtime_billing_for_tests: bool,
     gateway_machine: Option<GatewayMachineConfig>,
 ) -> anyhow::Result<Handle> {
+    #[cfg(not(debug_assertions))]
+    anyhow::ensure!(
+        !retired_product_authority_for_tests,
+        "retired product authority is absent from release builds"
+    );
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -991,10 +1009,12 @@ async fn spawn_inner(
     }
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();
+    #[cfg(debug_assertions)]
     anyhow::ensure!(
         retired_product_authority_for_tests || cfg.retired_storage_meta_for_tests.is_none(),
         "legacy storage metadata is only valid in the retired product test composition"
     );
+    #[cfg(debug_assertions)]
     let retired_storage_meta = cfg.retired_storage_meta_for_tests.clone();
     let image_manifests = Arc::new(
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver::new(
@@ -1027,6 +1047,7 @@ async fn spawn_inner(
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new_with_liveness_authority(
         store.clone(),
+        #[cfg(debug_assertions)]
         retired_storage_meta.clone(),
         notify.clone(),
         cfg.node_lease_timeout_ms,
@@ -1050,6 +1071,7 @@ async fn spawn_inner(
         observation_store,
         usage,
         credits,
+        #[cfg(debug_assertions)]
         retired_storage_meta_for_tests: retired_storage_meta,
         cat_create,
         persistent_disk_create,
@@ -1066,6 +1088,7 @@ async fn spawn_inner(
         ),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
+        #[cfg(debug_assertions)]
         retired_product_authority_for_tests,
     };
 

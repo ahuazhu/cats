@@ -261,6 +261,7 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: credits.clone(),
+            #[cfg(debug_assertions)]
             retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),

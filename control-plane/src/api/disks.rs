@@ -1,10 +1,18 @@
 use super::*;
 
 fn retired_storage_meta(state: &AppState) -> ApiResult<&dyn cats_storage::MetadataStore> {
-    state
-        .retired_storage_meta_for_tests
-        .as_deref()
-        .ok_or_else(|| ApiError::unavailable("legacy storage authority is not composed").into())
+    #[cfg(debug_assertions)]
+    {
+        state
+            .retired_storage_meta_for_tests
+            .as_deref()
+            .ok_or_else(|| ApiError::unavailable("legacy storage authority is not composed").into())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = state;
+        Err(ApiError::unavailable("legacy storage authority is absent from release builds").into())
+    }
 }
 
 pub(super) async fn create_disk(
