@@ -252,6 +252,68 @@ pub async fn control_store_backend_pid(store: &Arc<crate::store::Store>) -> i32 
         .expect("read test control Store backend PID")
 }
 
+/// Compose the real isolated Control Route v2 listener with the shared r1
+/// signer and mTLS fixtures. This test-only feature avoids adding any
+/// caller-selected artifact path or credential input to production startup.
+#[cfg(feature = "test-support")]
+pub fn route_v2_gateway_machine_config(
+    listen: impl Into<String>,
+) -> anyhow::Result<crate::server::GatewayMachineConfig> {
+    use cats_api::gateway_workload_identity::{
+        GatewayWorkloadCredentialPolicy, GatewayWorkloadCredentialScope,
+        GatewayWorkloadIdentityAuthority,
+    };
+    use cats_api::route_grant_v2::{
+        decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
+    };
+    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Epoch, Id};
+
+    const SIGNER_REFERENCE: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+    const PUBLIC_KEY_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+
+    let signer_reference = decode_route_grant_v2_signer_reference(SIGNER_REFERENCE)?;
+    let public_key_ring = decode_route_grant_v2_public_key_ring(PUBLIC_KEY_RING)?;
+    let gateway_authority = GatewayWorkloadIdentityAuthority {
+        version: ContractVersion::V1,
+        authority_id: Id::new("gateway_authority_route_e2e")
+            .expect("test Gateway authority ID is valid"),
+        fleet_id: Id::new("fleet_route_e2e").expect("test Gateway fleet ID is valid"),
+        policy_revision: Epoch::new(1).expect("test Gateway policy revision is positive"),
+        expected_previous: None,
+        credentials: vec![GatewayWorkloadCredentialPolicy {
+            credential_id: Id::new("gateway_credential_route_e2e")
+                .expect("test Gateway credential ID is valid"),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEAFqokynUVEeIXMF7pBwDCDQn6N97Q4hJUz7DUbPlbJu8",
+            )
+            .expect("test Gateway credential SPKI is canonical"),
+            scope: GatewayWorkloadCredentialScope::Fleet,
+        }],
+    };
+    let tls_config = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
+        include_bytes!("../tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!("../tests/fixtures/gateway_machine_server_certificate.pem"),
+        include_bytes!("../tests/fixtures/gateway_machine_server_private_key.pem"),
+    )?;
+    let signing_authority = Arc::new(
+        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &signer_reference,
+            SIGNER_REFERENCE,
+            &public_key_ring,
+            Some(include_bytes!(
+                "../../tests/fixtures/route_grant_v2_private_ed25519.pem"
+            )),
+            120,
+        )?,
+    );
+    crate::server::GatewayMachineConfig::from_test_composition(
+        listen,
+        gateway_authority,
+        tls_config,
+        signing_authority,
+    )
+}
+
 /// Base DSN of the disposable test server.
 ///
 /// Panics with instructions when unset: silently skipping the store tests

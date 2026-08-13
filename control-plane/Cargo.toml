@@ -11,6 +11,9 @@ proposed-node-residue-reclamation = [
     "cats-api/proposed-node-residue-reclamation",
     "cats-storage/proposed-node-residue-reclamation",
 ]
+# Explicitly opt-in fixture composition for cross-crate E2E tests. Release
+# binaries do not enable this feature.
+test-support = []
 
 [dependencies]
 cats-api = { workspace = true }

@@ -61,8 +61,8 @@ impl GatewayNodeRouteV2Client {
         Ok(Self { tls })
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_pem_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn from_pem_for_test(
         server_ca_bundle_pem: &[u8],
         client_certificate_pem: &[u8],
         client_private_key_pem: &[u8],

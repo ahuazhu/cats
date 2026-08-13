@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Explicitly opt-in test fixture composition for cross-crate E2E tests. The
+# shipped Gateway binary never enables this feature.
+test-support = []
 # The V1 resolve/wake/Node-proxy implementation is retained only so the
 # historical process E2E can keep exercising pre-cutover behavior. The shipped
 # binary never enables or calls it.

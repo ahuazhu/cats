@@ -96,7 +96,7 @@ impl RouteV2MachineConfig {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         listen: String,
         local_node_id: Id,
         client_ca_bundle_pem: &[u8],
@@ -418,8 +418,11 @@ async fn serve_connection(
         handle_tunnel_request(request, Arc::clone(&request_service), principal.clone())
     });
     let mut http = http1::Builder::new();
-    http.keep_alive(false)
-        .header_read_timeout(REQUEST_HEADER_DEADLINE)
+    // Every non-upgrade response explicitly closes the connection. Setting
+    // Hyper's connection-wide keep-alive switch to false would also rewrite
+    // the successful 101 response to `Connection: close`, making the real
+    // Gateway reject the admitted tunnel before any Guest bytes.
+    http.header_read_timeout(REQUEST_HEADER_DEADLINE)
         .timer(TokioTimer::new());
     let connection = http
         .serve_connection(TokioIo::new(tls), http_service)

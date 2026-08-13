@@ -33,23 +33,30 @@ use cats_api::runtime_node_authority::{
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
 use cats_api::runtime_reconciliation::{
-    decode_agent_session, decode_runtime_node_authority_apply_result,
-    encode_runtime_node_authority_apply, guest_config_digest, AgentRegistrationAttempt,
-    AgentSession, AllocatableMemoryBytes, AllocatableVcpus, AppliedDesiredEvidence,
-    CheckpointEvidence, Condition, ContractVersion, CredentialBinding, DesiredReadSnapshot,
+    decode_agent_session, decode_runtime_checkpoint, decode_runtime_node_authority_apply_result,
+    encode_runtime_node_authority_apply, guest_config_digest, key_ring_digest,
+    AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes, AllocatableVcpus,
+    AppliedDesiredEvidence, CheckpointEvidence, CheckpointRouteGate, Condition, ContractVersion,
+    CredentialBinding, DesiredReadSnapshot,
     DesiredRuntimeSpec, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, GuestTransportEvidence, HostPath,
-    Id, InventorySource, Ipv4Address, LifecycleAdmission, NodeBootId, NodeIdentity,
-    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, ObservedRuntimeStatus,
-    ProgressingReason, RandomId128, ReconcileStep, RuntimeNodeAuthorityApply,
+    HttpProtocol, Id, InventorySource, Ipv4Address, KeyId, LifecycleAdmission, NodeBootId,
+    NodeIdentity, NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, ObservedRouteGate,
+    ObservedRuntimeStatus, ProgressingReason, RandomId128, ReadyReason, ReconcileStep, Revision,
+    RouteGateBinding, RouteGateState, RuntimeLaunch, RuntimeNodeAuthorityApply,
     RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend,
     RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, Sequence, Sha256Digest, UnixMillis,
-    WarmSnapshotEvidence,
+    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, Sequence, Sha256Digest,
+    StableState, UnixMillis, WarmSnapshotEvidence,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{spawn, spawn_with_gateway_machine, Config, Handle};
 use cats_control_plane::store::DsnSource;
 use cats_metering::SqliteUsageStore;
+use cats_network::route_v2::{
+    gateway_machine_clients_for_test, BoxedGatewayTunnel, ControlMachineTarget, GatewayIngress,
+    GatewayIngressConfig, GatewayNodeRouteV2Error, RouteCache, RouteCacheConfig, TunnelConnector,
+    TunnelFuture,
+};
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
     LowerHexSha256, IMAGE_MANIFEST_MAX_BYTES,
@@ -87,16 +94,22 @@ use std::process::Command;
 use crate::agent_registration::AgentRegistrationConfig;
 #[cfg(target_os = "linux")]
 use crate::ch::{BlockPath, ChConfig, ChNetwork};
+use crate::route_grant_v2::{RouteGrantV2KeyRing, RouteGrantV2Verifier};
+use crate::route_v2_machine::{RouteV2MachineConfig, RouteV2MachineListener};
 #[cfg(target_os = "linux")]
 use crate::runtime::reconciliation::{
     current_kernel_node_boot_id, installed_clean_slate_scanner,
     installed_root_process_effect_ports, retire_absent_serving_socket_owner_for_test,
-    runtime_checkpoint_path, AdmissionCellRegistry, AuthorizedBlockdLaunchConfig,
+    runtime_checkpoint_path, AuthorizedBlockdLaunchConfig,
     BlockdSocketIntentStore, InstalledCleanSlateProbeConfig, ManagedBlockdSocketOwnerRetirement,
-    NodeGlobalManagedProcessAdmission, RetainedManagedBlockdSocketRoot,
-    RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RootProvisionSystemdConfig,
-    VmmSocketReceiptStore, AUTHORIZED_SERVING_FILE, BLOCKD_SOCKET_INTENT_NAMESPACE, IDENTITY_FILE,
-    INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
+    NodeGlobalManagedProcessAdmission,
+    RetainedManagedBlockdSocketRoot, RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot,
+    RootProvisionSystemdConfig, VmmSocketReceiptStore, AUTHORIZED_SERVING_FILE,
+    BLOCKD_SOCKET_INTENT_NAMESPACE, IDENTITY_FILE, INSTALLED_VMM_SOCKET_ROOT,
+    VMM_LAUNCH_FILE_NAMESPACE,
+};
+use crate::runtime::reconciliation::{
+    AdmissionCell, AdmissionCellRegistry, AdmissionGatePort as _, AdmissionSnapshot,
 };
 #[cfg(target_os = "linux")]
 use crate::runtime_spine::RuntimeSpineFullScan;
@@ -134,6 +147,8 @@ const AWS_PREFIX: &str = "runtime-cutover-hermetic";
 const CAT_CREATE_BODY: &[u8] = br#"{"name":"runtime-spine-app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":2,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"strict"}"#;
 #[cfg(target_os = "linux")]
 const RELAXED_CAT_CREATE_BODY: &[u8] = br#"{"name":"runtime-spine-app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":2,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"relaxed"}"#;
+const ROUTE_V2_KID: &str = "2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99";
+const ROUTE_RUNTIME_INCARNATION: &str = "00000000000000000000000000005151";
 const RFC8032_TEST_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
@@ -212,6 +227,14 @@ struct ControlContext {
 
 impl ControlContext {
     async fn spawn() -> Self {
+        Self::spawn_inner(false).await
+    }
+
+    async fn spawn_route_v2() -> Self {
+        Self::spawn_inner(true).await
+    }
+
+    async fn spawn_inner(route_v2: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
         let usage = Arc::new(SqliteUsageStore::open(&directory.path().join("usage.db")).unwrap());
@@ -228,7 +251,7 @@ impl ControlContext {
             body: encode_image_manifest(&manifest).unwrap(),
             reads: AtomicUsize::new(0),
         });
-        let server = spawn(Config {
+        let config = Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: DsnSource::Literal(control_store_url.clone()),
             control_store_ca_file: None,
@@ -249,9 +272,18 @@ impl ControlContext {
             reconcile_interval_ms: 60_000,
             auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
-        })
-        .await
-        .unwrap();
+        };
+        let server = if route_v2 {
+            spawn_with_gateway_machine(
+                config,
+                cats_control_plane::testsupport::route_v2_gateway_machine_config("127.0.0.1:0")
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        } else {
+            spawn(config).await.unwrap()
+        };
         Self {
             _directory: directory,
             server,
@@ -324,6 +356,154 @@ impl RuntimeInventoryScanner for CompleteAssignedScanner {
             ),
         ))
     }
+}
+
+#[derive(Default)]
+struct RouteReadyScanner {
+    records: Mutex<Vec<ScanRecord>>,
+}
+
+impl crate::runtime_spine::inventory_scanner_sealed::Sealed for RouteReadyScanner {}
+
+impl RuntimeInventoryScanner for RouteReadyScanner {
+    fn scan_complete(
+        &self,
+        context: RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+        context.check_active()?;
+        let coordinates = context.coordinates().clone();
+        self.records.lock().unwrap().push(ScanRecord {
+            desired: coordinates.desired.clone(),
+            inventory_epoch: coordinates.inventory_epoch,
+        });
+
+        let mut coverage = InventoryCoverageAggregator::new();
+        for source in [
+            InventorySource::Checkpoint,
+            InventorySource::Systemd,
+            InventorySource::Process,
+            InventorySource::ControlSocket,
+            InventorySource::BlockFrontend,
+            InventorySource::Network,
+            InventorySource::DataDirectory,
+            InventorySource::PendingPack,
+            InventorySource::WarmSnapshot,
+            InventorySource::MetadataStore,
+            InventorySource::GuestMount,
+        ] {
+            coverage.record(source)?;
+        }
+        let kid = KeyId::new(ROUTE_V2_KID).context("Route v2 fixture kid is invalid")?;
+        let ring_version = Epoch::new(1).context("Route v2 fixture ring version is invalid")?;
+        let ring_digest = key_ring_digest(ring_version, std::slice::from_ref(&kid))?;
+        let runtimes = coordinates
+            .desired
+            .desired_specs
+            .iter()
+            .map(route_ready_runtime)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(RuntimeInventoryScanOutcome::Complete(
+            CompleteRuntimeInventory::from_validated_coverage(
+                coverage.finish()?,
+                UnixMillis::new(1_900_000_006_000).unwrap(),
+                RuntimeInventoryKeyRing::Loaded {
+                    version: ring_version,
+                    digest: ring_digest,
+                    kids: vec![kid],
+                },
+                runtimes,
+                Vec::new(),
+            ),
+        ))
+    }
+}
+
+fn route_runtime_launch(runtime_incarnation: &RandomId128) -> RuntimeLaunch {
+    let mut launch = decode_runtime_checkpoint(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+    )))
+    .unwrap()
+    .runtime_launch;
+    let RuntimeLaunch::Present(identity) = &mut launch else {
+        unreachable!("fixed StartRuntime checkpoint retains its launch identity")
+    };
+    identity.runtime_incarnation = runtime_incarnation.clone();
+    identity.scope_id =
+        Id::new(format!("cats-vmm-{}.service", runtime_incarnation.as_str())).unwrap();
+    launch
+}
+
+fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> anyhow::Result<ObservedRuntimeStatus> {
+    let endpoint = desired
+        .endpoints
+        .first()
+        .context("Route v2 fixture Desired lacks its default Endpoint")?;
+    let incarnation = random(ROUTE_RUNTIME_INCARNATION);
+    let step = ReconcileStep::Stable {
+        state: StableState::Running,
+    };
+    Ok(ObservedRuntimeStatus {
+        cat_id: desired.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: RuntimeTarget::Running,
+        }),
+        runtime_incarnation: Some(incarnation.clone()),
+        stable_state: Some(StableState::Running),
+        step: step.clone(),
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat-route-e2e.json")
+                .expect("test checkpoint path is valid"),
+            content_digest: Sha256Digest::from_bytes([0x51; 32]),
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            runtime_incarnation: Some(incarnation.clone()),
+            runtime_launch: Box::new(route_runtime_launch(&incarnation)),
+            stable_state: Some(StableState::Running),
+            step: Box::new(step),
+            require_idle: Box::new(
+                cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+            ),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+        },
+        processes: Vec::new(),
+        volumes: Vec::new(),
+        mounts: Vec::new(),
+        networks: Vec::new(),
+        guest_transport: GuestTransportEvidence::Unavailable,
+        warm_snapshot: WarmSnapshotEvidence::Absent,
+        lifecycle_admission: LifecycleAdmission::Open,
+        routes: vec![ObservedRouteGate {
+            binding: RouteGateBinding {
+                workspace_id: desired.workspace_id.clone(),
+                endpoint_id: endpoint.endpoint_id.clone(),
+                hostname: endpoint.hostname.clone(),
+                cat_id: desired.cat_id.clone(),
+                node_id: desired.placement.node_id.clone(),
+                runtime_incarnation: incarnation,
+                route_epoch: endpoint.route_epoch,
+                protocol: endpoint.protocol,
+                target_port: endpoint.target_port,
+            },
+            gate: RouteGateState::Active,
+            active_guards: 0,
+            cancellation_pending: false,
+            instance_count: 1,
+        }],
+        platform_guards: 0,
+        conditions: vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Running,
+            },
+        }],
+    })
 }
 
 fn observed_missing_runtime(
@@ -534,6 +714,49 @@ async fn next_step(runner: &mut RuntimeSpineRunner) -> RuntimeSpineRunStep {
     .await
     .expect("Runtime spine step exceeded its test deadline")
     .unwrap()
+}
+
+async fn route_v2_public_http_request(
+    address: std::net::SocketAddr,
+    hostname: &str,
+    path: &str,
+) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("public Gateway HTTP response exceeded its test deadline")
+        .unwrap();
+    response
+}
+
+async fn route_v2_read_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "connection closed before its HTTP head");
+            bytes.extend_from_slice(&chunk[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return bytes;
+            }
+            assert!(bytes.len() <= 32 * 1024, "HTTP head exceeded test bound");
+        }
+    })
+    .await
+    .expect("HTTP head exceeded its test deadline")
 }
 
 #[cfg(target_os = "linux")]
@@ -4692,6 +4915,403 @@ async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_
     drop(successor);
     drop(authority);
     context.server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_stale_epoch() {
+    use cats_api::route_grant_v2::{RouteAdmissionV2Reason, RouteGrantV2PublicKey};
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let guest = tokio::net::TcpListener::bind("127.0.0.1:8080")
+        .await
+        .expect("bind the Cat-create v2 fixed target port");
+    let guest_accepts = Arc::new(AtomicUsize::new(0));
+    let guest_accepts_task = Arc::clone(&guest_accepts);
+    let (guest_shutdown, mut guest_shutdown_rx) = tokio::sync::oneshot::channel();
+    let guest_task = tokio::spawn(async move {
+        let (mut http, _) = guest.accept().await.unwrap();
+        guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+        let head = route_v2_read_http_head(&mut http).await;
+        assert!(std::str::from_utf8(&head)
+            .unwrap()
+            .starts_with("GET /http HTTP/1.1\r\n"));
+        http.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong")
+            .await
+            .unwrap();
+        drop(http);
+
+        let (websocket, _) = guest.accept().await.unwrap();
+        guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+        let mut websocket = tokio_tungstenite::accept_async(websocket).await.unwrap();
+        let payload = websocket.next().await.unwrap().unwrap();
+        assert_eq!(payload, Message::Text("ws-payload".into()));
+        websocket.send(payload).await.unwrap();
+        let _ = websocket.next().await;
+        drop(websocket);
+
+        tokio::select! {
+            _ = &mut guest_shutdown_rx => {}
+            accepted = guest.accept() => {
+                let _ = accepted.unwrap();
+                guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+                panic!("closed or stale-epoch request reached the Guest listener");
+            }
+        }
+    });
+
+    let route_public_key = RouteGrantV2PublicKey::from_public_key_pem(include_bytes!(
+        "../../../tests/fixtures/route_grant_v2_public_ed25519.pem"
+    ))
+    .unwrap();
+    assert_eq!(route_public_key.kid().as_str(), ROUTE_V2_KID);
+    let route_ring =
+        RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![route_public_key]).unwrap();
+    let node_directory = tempfile::tempdir().unwrap();
+    let registry = AdmissionCellRegistry::new(node_directory.path().join("checkpoints"));
+    let node_config = RouteV2MachineConfig::for_test(
+        "127.0.0.1:0".to_owned(),
+        id("node_cross_component_a"),
+        include_bytes!("../../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_certificate.pem"
+        ),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_private_key.pem"
+        ),
+        Arc::new(RouteGrantV2Verifier::new(route_ring)),
+    )
+    .unwrap();
+    let mut node_listener = RouteV2MachineListener::spawn(node_config, Arc::clone(&registry))
+        .await
+        .unwrap();
+
+    let context = ControlContext::spawn_route_v2().await;
+    let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
+    let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
+        id("credential_cross_component_a"),
+        include_bytes!("../../../tests/fixtures/route_grant_private_ed25519.pem"),
+    )
+    .unwrap();
+    let identity = node_identity(&node_signer);
+    let state_parent = tempfile::tempdir().unwrap();
+    let registration = AgentRegistrationConfig::for_loopback_test(
+        identity.clone(),
+        node_signer,
+        state_parent.path().join("node-state"),
+        NodeBootId::new("22222222222222222222222222222222").unwrap(),
+        &context.release,
+    )
+    .unwrap();
+    let node_transport_target =
+        NodeTransportTarget::new(format!("https://localhost:{}", node_listener.addr().port()))
+            .unwrap();
+    let mut cordoned_policy =
+        placement_policy(&context.release, 1, RuntimeSchedulingState::Cordoned);
+    cordoned_policy.node_transport_target = node_transport_target.clone();
+    let provision = RuntimeNodeAuthorityApply {
+        version: ContractVersion::V1,
+        apply_id: random("cccccccccccccccccccccccccccccccc"),
+        node_id: identity.node_id.clone(),
+        mutation: RuntimeNodeAuthorityMutation::Provision {
+            node_identity: Box::new(identity.clone()),
+            placement_policy: Box::new(cordoned_policy),
+        },
+    };
+    assert_eq!(
+        apply_node_authority(&context, &provisioner, &provision).await,
+        RuntimeNodeAuthorityOutcome::Provisioned
+    );
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        registration.register_until_session(&context.server.base_url()),
+    )
+    .await
+    .expect("A19 registration did not complete")
+    .unwrap();
+
+    let scanner = Arc::new(RouteReadyScanner::default());
+    let effect = Arc::new(RecordingRefreshEffect::default());
+    let client = RuntimeSpineHttpClient::for_loopback_test(
+        &context.server.base_url(),
+        registration.runtime_request_signer(),
+    )
+    .unwrap();
+    let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        registration.runtime_state_directory(),
+        session.clone(),
+        client.clone(),
+        scanner.clone(),
+        effect.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        next_step(&mut runner).await,
+        RuntimeSpineRunStep::DesiredAccepted
+    ));
+    let ready_observation = next_step(&mut runner).await;
+    assert!(
+        matches!(
+            ready_observation,
+            RuntimeSpineRunStep::ObservationAccepted { .. }
+        ),
+        "unexpected ready-observation step: {ready_observation:?}"
+    );
+    assert!(scanner.records.lock().unwrap()[0]
+        .desired
+        .desired_specs
+        .is_empty());
+
+    let mut schedulable_policy =
+        placement_policy(&context.release, 2, RuntimeSchedulingState::Schedulable);
+    schedulable_policy.node_transport_target = node_transport_target;
+    let uncordon = RuntimeNodeAuthorityApply {
+        version: ContractVersion::V1,
+        apply_id: random("dddddddddddddddddddddddddddddddd"),
+        node_id: identity.node_id.clone(),
+        mutation: RuntimeNodeAuthorityMutation::UpdatePolicy {
+            expected_policy_revision: Epoch::new(1).unwrap(),
+            placement_policy: Box::new(schedulable_policy),
+        },
+    };
+    assert_eq!(
+        apply_node_authority(&context, &provisioner, &uncordon).await,
+        RuntimeNodeAuthorityOutcome::PolicyUpdated
+    );
+
+    let workspaces = context
+        .http
+        .get(format!("{}/v1/admin/workspaces", context.server.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(workspaces.status(), StatusCode::OK);
+    let workspaces: ListResponse<cats_api::auth::Workspace> =
+        serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
+    let workspace = workspaces
+        .items
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("bootstrap account has one default Workspace");
+    let create = context
+        .http
+        .post(format!(
+            "{}/v1/workspaces/{}/cats",
+            context.server.base_url(),
+            workspace.id
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+        .header("Idempotency-Key", "route-v2-cross-component-create")
+        .body(CAT_CREATE_BODY.to_vec())
+        .send()
+        .await
+        .unwrap();
+    let created =
+        decode_cat_create_v2_accepted_response(&json_body(create, StatusCode::ACCEPTED).await)
+            .unwrap();
+
+    assert!(matches!(
+        next_step(&mut runner).await,
+        RuntimeSpineRunStep::DesiredAccepted
+    ));
+    runner.shutdown().await.unwrap();
+    let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        registration.runtime_state_directory(),
+        session,
+        client,
+        scanner.clone(),
+        effect,
+    )
+    .unwrap();
+    let ready_observation = next_step(&mut runner).await;
+    assert!(
+        matches!(
+            ready_observation,
+            RuntimeSpineRunStep::ObservationAccepted { .. }
+        ),
+        "unexpected ready-observation step: {ready_observation:?}"
+    );
+    let desired = {
+        let records = scanner.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].desired.desired_specs.len(), 1);
+        records[1].desired.desired_specs[0].clone()
+    };
+    assert_eq!(desired.cat_id, created.cat_id);
+    let endpoint = desired.endpoints.first().unwrap().clone();
+    assert_eq!(endpoint.protocol, HttpProtocol::Http);
+    assert_eq!(endpoint.target_port, 8080);
+
+    let incarnation = random(ROUTE_RUNTIME_INCARNATION);
+    let active_route = CheckpointRouteGate {
+        binding: RouteGateBinding {
+            workspace_id: desired.workspace_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            hostname: endpoint.hostname.clone(),
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            runtime_incarnation: incarnation.clone(),
+            route_epoch: endpoint.route_epoch,
+            protocol: endpoint.protocol,
+            target_port: endpoint.target_port,
+        },
+        gate: RouteGateState::Active,
+    };
+    let active_snapshot = AdmissionSnapshot::new(
+        desired.desired_revision,
+        desired.spec_digest.clone(),
+        desired.placement.clone(),
+        Some(incarnation),
+        LifecycleAdmission::Open,
+        vec![active_route],
+    )
+    .with_guest_ipv4(Ipv4Address::new("127.0.0.1").unwrap());
+    let admission_cell = AdmissionCell::new(active_snapshot).unwrap();
+    registry
+        .insert_cell_for_machine_test(desired.cat_id.clone(), Arc::clone(&admission_cell))
+        .unwrap();
+
+    let control_machine_addr = context
+        .server
+        .gateway_machine_addr
+        .expect("Route v2 Control machine listener is running");
+    let control_target =
+        ControlMachineTarget::new(format!("https://localhost:{}", control_machine_addr.port()))
+            .unwrap();
+    let (resolver, node_client) = gateway_machine_clients_for_test(control_target).unwrap();
+    let node_errors = Arc::new(Mutex::new(Vec::<GatewayNodeRouteV2Error>::new()));
+    let connector_errors = Arc::clone(&node_errors);
+    let connector: TunnelConnector = Arc::new(move |route| {
+        let client = node_client.clone();
+        let errors = Arc::clone(&connector_errors);
+        Box::pin(async move {
+            let outcome = client.open_tunnel(&route).await;
+            if let Err(error) = &outcome {
+                errors.lock().unwrap().push(error.clone());
+            }
+            outcome.map(|tunnel| Box::new(tunnel) as BoxedGatewayTunnel)
+        }) as TunnelFuture
+    });
+    let cache = RouteCache::new(RouteCacheConfig::default(), resolver).unwrap();
+    let gateway = GatewayIngress::new(GatewayIngressConfig::default(), cache, connector).unwrap();
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = gateway_listener.local_addr().unwrap();
+    let (gateway_shutdown, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
+    let gateway_task = tokio::spawn(async move {
+        gateway
+            .serve(gateway_listener, async move {
+                let _ = gateway_shutdown_rx.await;
+            })
+            .await
+    });
+
+    let hostname = endpoint.hostname.as_str().to_owned();
+    let http = route_v2_public_http_request(gateway_addr, &hostname, "/http").await;
+    assert!(
+        http.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "unexpected public HTTP response {:?}; Node errors: {:?}",
+        String::from_utf8_lossy(&http),
+        node_errors.lock().unwrap()
+    );
+    assert!(http.ends_with(b"\r\n\r\npong"));
+
+    let websocket_request = format!("ws://{hostname}/ws").into_client_request().unwrap();
+    let websocket_tcp = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let (mut websocket, websocket_response) =
+        tokio_tungstenite::client_async(websocket_request, websocket_tcp)
+            .await
+            .unwrap();
+    assert_eq!(websocket_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(admission_cell.active_guards(&endpoint.endpoint_id), Some(1));
+    websocket
+        .send(Message::Text("ws-payload".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        websocket.next().await.unwrap().unwrap(),
+        Message::Text("ws-payload".into())
+    );
+    websocket.close(None).await.unwrap();
+    drop(websocket);
+    let guard_deadline = Instant::now() + Duration::from_secs(3);
+    while admission_cell.active_guards(&endpoint.endpoint_id) != Some(0) {
+        assert!(
+            Instant::now() < guard_deadline,
+            "WebSocket tunnel retained its admission guard after public close"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(guest_accepts.load(Ordering::SeqCst), 2);
+
+    let expected = admission_cell.snapshot();
+    let mut closed_route = expected.endpoints()[0].clone();
+    closed_route.gate = RouteGateState::Closed;
+    let closed = AdmissionSnapshot::new(
+        expected.applied_desired_revision(),
+        expected.spec_digest().clone(),
+        expected.placement().clone(),
+        expected.runtime_incarnation().cloned(),
+        expected.lifecycle_admission(),
+        vec![closed_route],
+    )
+    .with_guest_ipv4(expected.guest_ipv4().cloned().unwrap());
+    admission_cell
+        .port()
+        .close_gate(&expected, &closed, &endpoint.endpoint_id)
+        .unwrap();
+    let gate_closed = route_v2_public_http_request(gateway_addr, &hostname, "/closed").await;
+    assert!(gate_closed.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(node_errors.lock().unwrap().iter().any(|error| matches!(
+        error,
+        GatewayNodeRouteV2Error::Admission(failure)
+            if failure.reason == RouteAdmissionV2Reason::GateClosed && !failure.guard_acquired
+    )));
+    assert_eq!(guest_accepts.load(Ordering::SeqCst), 2);
+
+    let mut successor_route = closed.endpoints()[0].clone();
+    successor_route.binding.route_epoch =
+        Epoch::new(successor_route.binding.route_epoch.get() + 1).unwrap();
+    successor_route.gate = RouteGateState::Active;
+    let successor = AdmissionSnapshot::new(
+        Revision::new(closed.applied_desired_revision().get() + 1).unwrap(),
+        Sha256Digest::from_bytes([0x77; 32]),
+        closed.placement().clone(),
+        closed.runtime_incarnation().cloned(),
+        LifecycleAdmission::Open,
+        vec![successor_route],
+    )
+    .with_guest_ipv4(closed.guest_ipv4().cloned().unwrap());
+    admission_cell
+        .port()
+        .install_gate(&closed, &successor, &endpoint.endpoint_id)
+        .unwrap();
+    let stale_epoch = route_v2_public_http_request(gateway_addr, &hostname, "/stale").await;
+    assert!(stale_epoch.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(node_errors.lock().unwrap().iter().any(|error| matches!(
+        error,
+        GatewayNodeRouteV2Error::Admission(failure)
+            if failure.reason == RouteAdmissionV2Reason::BindingMismatch
+                && !failure.guard_acquired
+    )));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        guest_accepts.load(Ordering::SeqCst),
+        2,
+        "closed and stale-epoch requests must be rejected before Guest connect"
+    );
+
+    let _ = gateway_shutdown.send(());
+    gateway_task.await.unwrap().unwrap();
+    node_listener.shutdown().await.unwrap();
+    runner.shutdown().await.unwrap();
+    context.server.shutdown().await.unwrap();
+    let _ = guest_shutdown.send(());
+    guest_task.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

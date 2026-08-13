@@ -602,6 +602,26 @@ impl GatewayMachineConfig {
             signing_authority,
         })
     }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_test_composition(
+        listen: impl Into<String>,
+        gateway_authority: GatewayWorkloadIdentityAuthority,
+        tls_config: crate::gateway_machine::GatewayMachineTlsConfig,
+        signing_authority: Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
+    ) -> anyhow::Result<Self> {
+        let listen = listen.into();
+        anyhow::ensure!(
+            !listen.is_empty(),
+            "Gateway machine test listen address is empty"
+        );
+        Ok(Self {
+            listen,
+            gateway_authority,
+            tls_config,
+            signing_authority,
+        })
+    }
 }
 
 /// Default synchronous wait for an OCI deploy.

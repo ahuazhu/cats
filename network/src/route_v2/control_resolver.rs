@@ -99,8 +99,8 @@ impl ControlRouteResolver {
         Ok(Self { target, tls })
     }
 
-    #[cfg(test)]
-    fn from_pem_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn from_pem_for_test(
         target: ControlMachineTarget,
         server_ca_bundle_pem: &[u8],
         client_certificate_pem: &[u8],
