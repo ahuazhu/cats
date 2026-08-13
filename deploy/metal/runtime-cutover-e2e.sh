@@ -321,10 +321,14 @@ run_filtered() {
 }
 
 append_summary() {
-  local case_id=$1 phase=$2 source=$3
+  local case_id=$1 phase=$2 source=$3 bounded
   printf '=== %s %s ===\n' "$case_id" "$phase" >>"$journal_work"
   cat "$source" >>"$journal_work"
   printf '\n' >>"$journal_work"
+  bounded=$scratch/component-journal-summary.bounded
+  "$filter" --mode text --max-bytes 131072 <"$journal_work" >"$bounded" || \
+    printf '%s\n' '[evidence filter failed closed]' >"$bounded"
+  mv -f "$bounded" "$journal_work"
   atomic_copy "$journal_work" component-journal-summary.txt
 }
 
