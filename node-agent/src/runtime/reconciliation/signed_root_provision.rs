@@ -303,7 +303,11 @@ impl SignedRunningEffect {
         )?;
         Ok(Self {
             running_admission: Some(running_admission),
-            lifecycle: Some(LifecycleStepEffect::platform(network_ip_binary)),
+            lifecycle: Some(LifecycleStepEffect::platform(
+                network_ip_binary,
+                acquire.lifecycle_volume_port(),
+                Arc::clone(&authority),
+            )),
             acquire,
             provision: SignedRootProvisionEffect::platform(
                 Arc::clone(&authority),

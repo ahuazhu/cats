@@ -16,17 +16,18 @@ use cats_api::agent_registration::{
 use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
     encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
-    AgentSession, CleanupRelease, CleanupTarget, ContractErrorDetail, ContractName, DiskKind,
-    FilesystemInitialization, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult,
-    PersistentFilesystemBinding, PersistentInitializationReceipt, ReleaseRequest, ReleaseResult,
-    RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection,
-    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition, RuntimeVolumeTransitionError,
-    RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionOutcome,
-    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, SessionBinding,
-    VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeDisposition,
-    VolumeIntent, VolumeLeaseGrant, VolumeRecord, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY,
-    RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS, RUNTIME_SPINE_METHOD,
-    RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+    AgentSession, BeginDisposableDeleteConsumedReceipt, CleanupRelease, CleanupTarget,
+    ContractErrorDetail, ContractName, DiskKind, FilesystemInitialization, LastVolumeTransition,
+    NormalAcquireRequest, NormalAcquireResult, PersistentFilesystemBinding,
+    PersistentInitializationReceipt, ReleaseRequest, ReleaseResult, RemoteHead,
+    RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
+    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
+    RuntimeVolumeTransitionRequest, SessionBinding, VolumeAccess, VolumeAcquire,
+    VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeLeaseGrant,
+    VolumeRecord, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+    RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
+    RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
     RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
 };
@@ -134,6 +135,20 @@ pub enum NormalReleaseAttempt {
     /// caller must durably bind the typed problem to the exact request and
     /// checkpoint before allowing another full inventory scan.
     DefiniteCleanupConflict(RuntimeVolumeTransitionPreconditionProblem),
+    StopForLocalContract,
+    StopForDeploymentMismatch,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisposableRootDeleteAttempt {
+    Deleting(Box<BeginDisposableDeleteConsumedReceipt>),
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    SessionReplacementRequired,
+    IdentityRepairRequired,
+    AuthorizationRejected(RuntimeVolumeAuthorizationRejection),
     StopForLocalContract,
     StopForDeploymentMismatch,
     Ambiguous,
@@ -339,6 +354,125 @@ where
         }
     }
 
+    /// Signed release for the post-Running lifecycle suffix. Unlike the
+    /// pre-launch stale-Root repair above, this admits every frozen Volume
+    /// shape and acquisition origin; the exact CleanupRelease and current
+    /// A20 context remain the only mutation authority.
+    pub fn lifecycle_release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let cleanup = validate_local_lifecycle_release_request(request, volume, expected_head)?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(NormalReleaseAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                let Some(release) = exact_release_success(request, cleanup, expected_head, success)
+                else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(NormalReleaseAttempt::Released(release))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(map_closed_release_error(
+                    status, &error, request, volume, accepted,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(NormalReleaseAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(NormalReleaseAttempt::Ambiguous),
+        }
+    }
+
+    /// Consume one already-issued disposable-Root authorization.  This only
+    /// moves the signed A22 authority to `Deleting`; it does not authorize the
+    /// caller to remove any local lineage without a separate exact cleanup
+    /// permit and postcondition scanner.
+    pub fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let authorization_id = validate_local_disposable_root_delete_request(
+            request,
+            volume,
+            expected_epoch,
+            expected_head,
+        )?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(DisposableRootDeleteAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(DisposableRootDeleteAttempt::Ambiguous);
+                };
+                Ok(exact_disposable_root_delete_success(
+                    request,
+                    volume,
+                    authorization_id,
+                    expected_epoch,
+                    expected_head,
+                    success,
+                )
+                .map(Box::new)
+                .map(DisposableRootDeleteAttempt::Deleting)
+                .unwrap_or(DisposableRootDeleteAttempt::Ambiguous))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(DisposableRootDeleteAttempt::Ambiguous);
+                };
+                Ok(map_closed_disposable_root_delete_error(
+                    status,
+                    &error,
+                    request,
+                    volume,
+                    accepted,
+                    authorization_id,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(DisposableRootDeleteAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(DisposableRootDeleteAttempt::Ambiguous),
+        }
+    }
+
     pub fn commit_initialized(
         &self,
         request: &RuntimeVolumeTransitionRequest,
@@ -396,6 +530,28 @@ pub fn recover_normal_release_from_authority(
     record: &VolumeRecord,
 ) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     let cleanup = validate_local_release_request(request, volume, expected_head)?;
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+}
+
+/// Lifecycle counterpart to [`recover_normal_release_from_authority`]. It
+/// accepts the full frozen Volume set while preserving the same exact
+/// immutable release-marker oracle.
+pub fn recover_lifecycle_release_from_authority(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+    record: &VolumeRecord,
+) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
+    let cleanup = validate_local_lifecycle_release_request(request, volume, expected_head)?;
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+}
+
+fn recover_validated_release_from_authority(
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+    record: &VolumeRecord,
+    cleanup: &CleanupRelease,
+) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     if validate_volume_record(record).is_err()
         || record.volume_id != volume.volume_id
         || record.size_bytes != volume.size_bytes
@@ -670,6 +826,71 @@ fn validate_local_release_request<'a>(
     Ok(cleanup)
 }
 
+fn validate_local_lifecycle_release_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+) -> Result<&'a CleanupRelease, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::Release { cleanup } = &request.transition else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let shape_is_exact = match volume.disk_kind {
+        DiskKind::Root => volume.mount.is_none(),
+        DiskKind::Persistent => volume.mount.is_some(),
+    };
+    if request.placement.node_id != request.session.node_id
+        || cleanup.inventory_session != request.session
+        || cleanup.desired_read_position < cleanup.inventory_read_position
+        || volume_id != &volume.volume_id
+        || attachment_id != &volume.attachment_id
+        || replay.generation != expected_head.generation
+        || replay.disposition != volume.disposition
+        || volume.size_bytes == 0
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || !shape_is_exact
+        || attachment_epoch.get() == u64::MAX
+    {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    }
+    Ok(cleanup)
+}
+
+fn validate_local_disposable_root_delete_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    _expected_head: &RemoteHead,
+) -> Result<&'a cats_api::runtime_reconciliation::Id, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::DeleteDisposableRoot { authorization_id } = &request.transition
+    else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let VolumeDisposition::DeleteDisposableRoot { .. } = &volume.disposition else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    if request.placement.node_id != request.session.node_id
+        || volume.disk_kind != DiskKind::Root
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || volume.mount.is_some()
+        || volume.size_bytes == 0
+        || expected_epoch.get() == u64::MAX
+    {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    }
+    Ok(authorization_id)
+}
+
 fn validate_local_commit_initialized<'a>(
     request: &'a RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
@@ -901,6 +1122,41 @@ fn exact_release_success(
         .then_some(release)
 }
 
+fn exact_disposable_root_delete_success(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+    expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    expected_head: &RemoteHead,
+    success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
+) -> Option<BeginDisposableDeleteConsumedReceipt> {
+    if success.version != request.version
+        || success.session != request.session
+        || success.cat_id != request.cat_id
+        || success.desired_revision != request.desired_revision
+        || success.spec_digest != request.spec_digest
+        || success.placement != request.placement
+    {
+        return None;
+    }
+    let RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } = success.outcome else {
+        return None;
+    };
+    let VolumeDisposition::DeleteDisposableRoot { delete_id } = &volume.disposition else {
+        return None;
+    };
+    let resulting_epoch = expected_epoch.get().checked_add(1)?;
+    (receipt.authorization_id == *authorization_id
+        && receipt.volume_id == volume.volume_id
+        && receipt.disk_id == volume.disk_id
+        && receipt.cat_id == request.cat_id
+        && receipt.delete_id == *delete_id
+        && receipt.prior_attachment_id == volume.attachment_id
+        && receipt.resulting_epoch.get() == resulting_epoch
+        && receipt.resulting_head == *expected_head)
+        .then_some(receipt)
+}
+
 fn exact_commit_initialized_success(
     request: &RuntimeVolumeTransitionRequest,
     filesystem: &PersistentFilesystemBinding,
@@ -1050,6 +1306,50 @@ fn map_closed_takeover_error(
             TakeoverAcquireAttempt::StopForDeploymentMismatch
         }
         NormalAcquireAttempt::Ambiguous => TakeoverAcquireAttempt::Ambiguous,
+    }
+}
+
+fn map_closed_disposable_root_delete_error(
+    status: u16,
+    error: &RuntimeVolumeTransitionError,
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+) -> DisposableRootDeleteAttempt {
+    if let (
+        409,
+        RuntimeVolumeTransitionErrorDetail::VolumeAuthorizationRejected {
+            authorization_id: rejected,
+            reason,
+        },
+    ) = (status, error.error.as_ref())
+    {
+        return if rejected == authorization_id {
+            DisposableRootDeleteAttempt::AuthorizationRejected(*reason)
+        } else {
+            DisposableRootDeleteAttempt::Ambiguous
+        };
+    }
+    match map_closed_error(status, error, request, volume, accepted) {
+        NormalAcquireAttempt::RetryExact => DisposableRootDeleteAttempt::RetryExact,
+        NormalAcquireAttempt::RefreshInventory => DisposableRootDeleteAttempt::RefreshInventory,
+        NormalAcquireAttempt::ReplanDesired => DisposableRootDeleteAttempt::ReplanDesired,
+        NormalAcquireAttempt::SessionReplacementRequired => {
+            DisposableRootDeleteAttempt::SessionReplacementRequired
+        }
+        NormalAcquireAttempt::IdentityRepairRequired => {
+            DisposableRootDeleteAttempt::IdentityRepairRequired
+        }
+        NormalAcquireAttempt::StopForLocalContract => {
+            DisposableRootDeleteAttempt::StopForLocalContract
+        }
+        NormalAcquireAttempt::StopForDeploymentMismatch => {
+            DisposableRootDeleteAttempt::StopForDeploymentMismatch
+        }
+        NormalAcquireAttempt::Granted(_)
+        | NormalAcquireAttempt::AuthorityRejected(_)
+        | NormalAcquireAttempt::Ambiguous => DisposableRootDeleteAttempt::Ambiguous,
     }
 }
 
@@ -1873,6 +2173,140 @@ mod tests {
         };
         cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&success)
             .unwrap()
+    }
+
+    fn lifecycle_release_request(volume: &VolumeIntent) -> RuntimeVolumeTransitionRequest {
+        let mut request = request();
+        request.transition = RuntimeVolumeTransition::Release {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: volume.volume_id.clone(),
+                    attachment_id: volume.attachment_id.clone(),
+                    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(1).unwrap(),
+                },
+                inventory_session: request.session.clone(),
+                inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(4).unwrap(),
+                inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(12)
+                    .unwrap(),
+                desired_read_position: cats_api::runtime_reconciliation::Sequence::new(12).unwrap(),
+                volume_release: Some(cats_api::runtime_reconciliation::VolumeReleaseReplay {
+                    release_transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                        "66666666666666666666666666666666",
+                    )
+                    .unwrap(),
+                    generation: Generation::new(0).unwrap(),
+                    disposition: volume.disposition.clone(),
+                }),
+            },
+        };
+        request
+    }
+
+    #[test]
+    fn lifecycle_release_is_a_separate_full_volume_contract() {
+        let mut persistent = volume();
+        persistent.disk_kind = DiskKind::Persistent;
+        persistent.acquire = VolumeAcquire::Takeover {
+            authorization_id: Id::new("takeover-release-auth").unwrap(),
+        };
+        persistent.disposition = VolumeDisposition::DetachRetained;
+        persistent.mount = Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+            filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new(
+                "77777777777777777777777777777777",
+            )
+            .unwrap(),
+            mount_path: cats_api::runtime_reconciliation::HostPath::new("/data".to_owned())
+                .unwrap(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        let request = lifecycle_release_request(&persistent);
+        let head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+
+        assert!(validate_local_lifecycle_release_request(&request, &persistent, &head).is_ok());
+        assert!(matches!(
+            validate_local_release_request(&request, &persistent, &head),
+            Err(NormalAcquireClientError::InvalidReleaseBinding)
+        ));
+    }
+
+    #[test]
+    fn disposable_root_delete_accepts_only_the_exact_signed_receipt() {
+        let mut volume = volume();
+        volume.disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_root_01").unwrap(),
+        };
+        let authorization_id = Id::new("delete_auth_01").unwrap();
+        let mut request = request();
+        request.transition = RuntimeVolumeTransition::DeleteDisposableRoot {
+            authorization_id: authorization_id.clone(),
+        };
+        let expected_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(1).unwrap();
+        let expected_head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        let mut success = decode_runtime_volume_transition_success(SUCCESS).unwrap();
+        success.outcome = RuntimeVolumeTransitionOutcome::DisposableRootDeleting {
+            receipt: BeginDisposableDeleteConsumedReceipt {
+                authorization_id: authorization_id.clone(),
+                volume_id: volume.volume_id.clone(),
+                disk_id: volume.disk_id.clone(),
+                cat_id: request.cat_id.clone(),
+                delete_id: Id::new("delete_root_01").unwrap(),
+                prior_attachment_id: volume.attachment_id.clone(),
+                resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(2).unwrap(),
+                resulting_head: expected_head.clone(),
+                consumed_at: UnixMillis::new(1_720_000_000_100).unwrap(),
+            },
+        };
+        let exact =
+            cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&success)
+                .unwrap();
+        assert!(matches!(
+            ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(exact),
+            ))
+            .delete_disposable_root(
+                &request,
+                &volume,
+                expected_epoch,
+                &expected_head,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            DisposableRootDeleteAttempt::Deleting(_)
+        ));
+
+        let mut wrong = success;
+        let RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } = &mut wrong.outcome
+        else {
+            unreachable!()
+        };
+        receipt.authorization_id = Id::new("delete_auth_other").unwrap();
+        let wrong =
+            cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&wrong)
+                .unwrap();
+        assert_eq!(
+            ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(wrong),
+            ))
+            .delete_disposable_root(
+                &request,
+                &volume,
+                expected_epoch,
+                &expected_head,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            DisposableRootDeleteAttempt::Ambiguous
+        );
     }
 
     #[test]

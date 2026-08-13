@@ -188,8 +188,9 @@ pub(crate) use kernel_nbd::{
 pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 pub use normal_acquire::{
-    recover_normal_acquire_from_authority, recover_normal_release_from_authority,
-    A19SignedVolumeTransitionTransport, CommitInitializedAttempt, ControlSignedNormalAcquireClient,
+    recover_lifecycle_release_from_authority, recover_normal_acquire_from_authority,
+    recover_normal_release_from_authority, A19SignedVolumeTransitionTransport,
+    CommitInitializedAttempt, ControlSignedNormalAcquireClient, DisposableRootDeleteAttempt,
     NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
     NormalAcquireClientError, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse, TakeoverAcquireAttempt,

@@ -49,6 +49,7 @@ use super::clean_slate_probes::{
     runtime_checkpoint_recovery_set, InstalledStaleBootVmmRecoveryPorts,
 };
 use super::serving_handoff::ServingHandoffStore;
+use super::DisposableRootDeleteAttempt;
 #[cfg(test)]
 use super::RootProvisionProcessRetirementPort;
 use super::{
@@ -94,6 +95,29 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
         deadline: Instant,
     ) -> Result<NormalReleaseAttempt, NormalAcquireClientError>;
 
+    fn lifecycle_release(
+        &self,
+        _request: &RuntimeVolumeTransitionRequest,
+        _volume: &VolumeIntent,
+        _expected_head: &RemoteHead,
+        _accepted: &NormalAcquireAcceptedContext,
+        _deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        Ok(NormalReleaseAttempt::StopForLocalContract)
+    }
+
+    fn delete_disposable_root(
+        &self,
+        _request: &RuntimeVolumeTransitionRequest,
+        _volume: &VolumeIntent,
+        _expected_epoch: FenceEpoch,
+        _expected_head: &RemoteHead,
+        _accepted: &NormalAcquireAcceptedContext,
+        _deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        Ok(DisposableRootDeleteAttempt::StopForLocalContract)
+    }
+
     fn commit_initialized(
         &self,
         request: &RuntimeVolumeTransitionRequest,
@@ -103,6 +127,66 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
     ) -> Result<super::CommitInitializedAttempt, NormalAcquireClientError> {
         let _ = (request, volume, accepted, deadline);
         Err(NormalAcquireClientError::InvalidVolumeBinding)
+    }
+}
+
+/// Lifecycle-only signed A22 surface.  The lifecycle dispatcher cannot call
+/// Running acquire/takeover/provision methods through this capability.
+pub(crate) trait SignedLifecycleVolumePort: Send + Sync + 'static {
+    fn release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError>;
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError>;
+}
+
+struct SignedLifecycleVolumeAdapter {
+    inner: Arc<dyn SignedNormalAcquirePort>,
+}
+
+impl SignedLifecycleVolumePort for SignedLifecycleVolumeAdapter {
+    fn release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        self.inner
+            .lifecycle_release(request, volume, expected_head, accepted, deadline)
+    }
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        self.inner.delete_disposable_root(
+            request,
+            volume,
+            expected_epoch,
+            expected_head,
+            accepted,
+            deadline,
+        )
     }
 }
 
@@ -142,6 +226,44 @@ where
             self,
             request,
             volume,
+            expected_head,
+            accepted,
+            deadline,
+        )
+    }
+
+    fn lifecycle_release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::lifecycle_release(
+            self,
+            request,
+            volume,
+            expected_head,
+            accepted,
+            deadline,
+        )
+    }
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::delete_disposable_root(
+            self,
+            request,
+            volume,
+            expected_epoch,
             expected_head,
             accepted,
             deadline,
@@ -748,6 +870,12 @@ impl SignedRunningAcquireEffect {
 
     pub(crate) fn volume_transition_port(&self) -> Arc<dyn SignedNormalAcquirePort> {
         Arc::clone(&self.volume_transition)
+    }
+
+    pub(crate) fn lifecycle_volume_port(&self) -> Arc<dyn SignedLifecycleVolumePort> {
+        Arc::new(SignedLifecycleVolumeAdapter {
+            inner: Arc::clone(&self.volume_transition),
+        })
     }
 
     #[cfg(test)]
