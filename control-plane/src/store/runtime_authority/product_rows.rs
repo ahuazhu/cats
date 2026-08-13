@@ -1252,6 +1252,17 @@ pub(super) fn load_operation_for_update(
         .transpose()
 }
 
+pub(super) fn load_operation_unlocked(
+    transaction: &mut Transaction<'_>,
+    operation_id: &Id,
+) -> AuthorityTxResult<Option<Operation>> {
+    let sql = format!("SELECT {OPERATION_COLUMNS} FROM runtime_operations WHERE operation_id=$1");
+    transaction
+        .query_opt(&sql, &[&operation_id.as_str()])?
+        .map(|row| decode_operation_row(&row))
+        .transpose()
+}
+
 pub(super) fn load_operation_by_workspace_unlocked(
     store: &Store,
     workspace_id: &Id,

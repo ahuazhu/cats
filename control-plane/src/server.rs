@@ -703,6 +703,21 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    spawn_singleton_task_with_system_resolutions(store, role, move |_| make_task())
+}
+
+pub(crate) fn spawn_singleton_task_with_system_resolutions<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         'election: loop {
             let session_store = store.clone();
@@ -747,8 +762,16 @@ where
 
             tracing::info!(role = role.name(), "acquired singleton leadership");
             let (cancel, cancelled) = tokio::sync::oneshot::channel();
-            let supervisor =
-                tokio::spawn(run_elected_singleton(session, role, make_task(), cancelled));
+            let resolutions =
+                crate::store::runtime_authority::SystemDesiredMutationResolutionOwner::default();
+            let task = make_task(resolutions.clone());
+            let supervisor = tokio::spawn(run_elected_singleton(
+                session,
+                role,
+                task,
+                cancelled,
+                resolutions,
+            ));
             // Declared after the JoinHandle so task cancellation sends the
             // signal before detaching the supervisor. The supervisor retains
             // the advisory lock until its role has actually stopped.
@@ -771,6 +794,7 @@ async fn run_elected_singleton<Fut>(
     role: SingletonRole,
     task: Fut,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    resolutions: crate::store::runtime_authority::SystemDesiredMutationResolutionOwner,
 ) where
     Fut: Future<Output = ()> + Send + 'static,
 {
@@ -815,8 +839,12 @@ async fn run_elected_singleton<Fut>(
             }
         }
     }
-    // `task.await` above proves its future has been dropped before this owner
-    // releases the PostgreSQL session and makes leadership acquirable again.
+    // Dropping the role cancels PRE_COMMIT work. A Store closure may already
+    // have been claimed by its blocking executor, or COMMIT may have been sent
+    // with an ambiguous response, so retain leadership through its physical
+    // rollback/commit and exact Operation resolution.
+    resolutions.close();
+    resolutions.wait_empty().await;
     if let Some(session) = session {
         let _ = crate::store::execute_leadership(move || {
             drop(session);
@@ -1197,10 +1225,10 @@ async fn spawn_inner(
     });
     let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
         let enforcement_state = state.clone();
-        spawn_singleton_task(
+        spawn_singleton_task_with_system_resolutions(
             state.store.clone(),
             SingletonRole::BillingEnforcer,
-            move || {
+            move |resolution_owner| {
                 let enforcement_state = enforcement_state.clone();
                 async move {
                     let mut cursor = None;
@@ -1211,6 +1239,7 @@ async fn spawn_inner(
                         if let Err(error) = crate::api::enforce_exhausted_billing_accounts(
                             &enforcement_state,
                             &mut cursor,
+                            &resolution_owner,
                         )
                         .await
                         {

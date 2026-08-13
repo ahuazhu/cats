@@ -1591,9 +1591,9 @@ async fn cat_exact_replay_precedes_mutable_funding_admission() {
 
     let mut billed_config = context.config.clone();
     billed_config.billing_enforcement_enabled = true;
-    let billed = spawn_runtime_authority_with_billing_for_tests(billed_config)
-        .await
-        .unwrap();
+    // Exercise the exact production BillingEnforcer composition; the old
+    // test-only spawn path would bypass the singleton authority being gated.
+    let billed = spawn(billed_config).await.unwrap();
     let workspaces = context
         .http
         .get(format!("{}/v1/admin/workspaces", billed.base_url()))

@@ -102,6 +102,7 @@ pub(super) async fn require_funded(state: &AppState, workspace: &str) -> ApiResu
 pub(crate) async fn enforce_exhausted_billing_accounts(
     state: &AppState,
     cursor: &mut Option<cats_api::runtime_reconciliation::Id>,
+    resolution_owner: &crate::store::runtime_authority::SystemDesiredMutationResolutionOwner,
 ) -> ApiResult<()> {
     const PAGE_SIZE: usize = 128;
     let after = cursor.clone();
@@ -151,7 +152,7 @@ pub(crate) async fn enforce_exhausted_billing_accounts(
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             match state
                 .store
-                .commit_billing_exhaustion(candidate, decision.clone(), deadline)
+                .commit_billing_exhaustion(candidate, decision.clone(), deadline, resolution_owner)
                 .await
             {
                 Ok(crate::store::runtime_authority::SystemDesiredMutationCommit::Changed) => {

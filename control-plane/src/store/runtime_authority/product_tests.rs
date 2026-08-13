@@ -1,6 +1,7 @@
 //! Real PostgreSQL acceptance tests for covered Cat create.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,7 @@ use super::product::{
     ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
     PersistentDiskInitialization, RuntimeOperationRead,
     SystemDesiredMutationCommit, SystemDesiredMutationCommitGuard, SystemDesiredMutationRequest,
+    SystemDesiredMutationResolutionOwner,
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
@@ -64,7 +66,7 @@ use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
     update_authorization,
 };
-use crate::store::{internal, DsnSource, Store};
+use crate::store::{internal, DsnSource, SingletonRole, Store};
 
 const ROUTE: &str = "POST /v1/workspaces/{workspace}/cats";
 
@@ -824,6 +826,7 @@ async fn billing_enforcer_publishes_one_covered_downward_desired_without_api_res
     };
     let decision = billing_decision(&store, &workspace);
     let store = Arc::new(store);
+    let resolutions = SystemDesiredMutationResolutionOwner::default();
 
     assert_eq!(
         store
@@ -831,6 +834,7 @@ async fn billing_enforcer_publishes_one_covered_downward_desired_without_api_res
                 candidate.clone(),
                 decision.clone(),
                 Instant::now() + Duration::from_secs(5),
+                &resolutions,
             )
             .await
             .unwrap(),
@@ -842,6 +846,7 @@ async fn billing_enforcer_publishes_one_covered_downward_desired_without_api_res
                 candidate.clone(),
                 decision,
                 Instant::now() + Duration::from_secs(5),
+                &resolutions,
             )
             .await
             .unwrap(),
@@ -920,7 +925,7 @@ fn concurrent_billing_replicas_publish_at_most_one_successor_effect() {
 }
 
 #[test]
-fn billing_commit_response_loss_replays_the_stable_system_event() {
+fn billing_system_replay_survives_supersede_and_transient_authority_cleanup() {
     let (_url, store, _second, workspace) = stores();
     let mut create = request(
         &workspace,
@@ -928,7 +933,7 @@ fn billing_commit_response_loss_replays_the_stable_system_event() {
         84,
         "billing-response-create",
     );
-    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 84);
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 84);
     store
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
@@ -949,11 +954,98 @@ fn billing_commit_response_loss_replays_the_stable_system_event() {
     let lost = store.commit_system_desired_mutation(&request, &state);
     assert!(matches!(lost, Err(ref error) if error.code == ErrorCode::Unavailable));
     assert!(guard.commit_was_sent());
+
+    let successor = advance_target(request.desired_for_test(), RuntimeTarget::Running);
+    let placement = refresh_mutation_target(&store, &identity, &policy, &release, 840);
+    let successor_request = desired_mutation_request(
+        request.desired_for_test(),
+        successor,
+        "op_after_billing_response_loss",
+        "after-billing-response-loss",
+        vec![placement],
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &successor_request).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+
+    let artifact_counts = store
+        .authority_transaction(|transaction| {
+            let row = transaction.query_one(
+                "SELECT
+                    (SELECT count(*) FROM runtime_operations WHERE cat_id=$1),
+                    (SELECT count(*) FROM api_idempotency_results)",
+                &[&create.candidate.cat_id.as_str()],
+            )?;
+            Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+        })
+        .unwrap();
     assert_eq!(
         store
             .commit_system_desired_mutation(&request, &state)
             .unwrap(),
         SystemDesiredMutationCommit::Replayed
+    );
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                let row = transaction.query_one(
+                    "SELECT
+                        (SELECT count(*) FROM runtime_operations WHERE cat_id=$1),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[&create.candidate.cat_id.as_str()],
+                )?;
+                Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+            })
+            .unwrap(),
+        artifact_counts,
+        "N+2 replay must create no Operation or API replay artifact"
+    );
+
+    let forged_desired = advance_target(request.desired_for_test(), RuntimeTarget::Running);
+    let forged = request.clone().with_desired_for_test(forged_desired);
+    let forged_result = store.commit_system_desired_mutation(&forged, &state);
+    assert!(matches!(
+        forged_result,
+        Err(ref error) if error.code == ErrorCode::Conflict
+    ));
+
+    store
+        .retire_node_identity(&create.candidate.desired.placement.node_id)
+        .unwrap();
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM hostname_desired_lookups WHERE cat_id=$1",
+                &[&create.candidate.cat_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM desired_runtime_specs WHERE cat_id=$1",
+                &[&create.candidate.cat_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM endpoint_records WHERE cat_id=$1",
+                &[&create.candidate.cat_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM disk_records WHERE root_cat_id=$1",
+                &[&create.candidate.cat_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM volume_records WHERE volume_id=$1",
+                &[&create.candidate.volume.volume_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_system_desired_mutation(&request, &state)
+            .unwrap(),
+        SystemDesiredMutationCommit::Replayed,
+        "retained Operation replay must not consume retired Node or cleaned Endpoint/Volume facts"
     );
     store
         .authority_transaction(|transaction| {
@@ -964,13 +1056,13 @@ fn billing_commit_response_loss_replays_the_stable_system_event() {
                         &[&create.candidate.cat_id.as_str()],
                     )?
                     .get::<_, i64>(0),
-                2
+                3
             );
             assert_eq!(
                 transaction
                     .query_one("SELECT count(*) FROM api_idempotency_results", &[])?
                     .get::<_, i64>(0),
-                1
+                2
             );
             Ok(())
         })
@@ -1020,6 +1112,244 @@ fn billing_commit_cancellation_before_postgres_commit_writes_nothing() {
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_rolls_back() {
+    const LEADER_APPLICATION: &str = "a3_claimed_system_commit";
+
+    let (url, setup, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "billing-claimed-cancel",
+        86,
+        "billing-claimed-create",
+    );
+    let (_identity, _policy, _release) = prepare_mutation_node(&setup, &mut create, 86);
+    setup
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let candidate = BillingDesiredCandidate {
+        cat_id: create.candidate.cat_id.clone(),
+        workspace_id: workspace.clone(),
+        desired_revision: revision(1),
+    };
+    let decision = billing_decision(&setup, &workspace);
+    let node_id = create.candidate.desired.placement.node_id.clone();
+
+    let holder = Store::connect(&url, None).unwrap();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder_thread = std::thread::spawn(move || {
+        holder
+            .with(move |client| {
+                let mut transaction = client.transaction()?;
+                transaction.query_one(
+                    "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE",
+                    &[&node_id.as_str()],
+                )?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                transaction.rollback()
+            })
+            .unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let leader =
+        Arc::new(Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap());
+    let observer = Store::connect(&url, None).unwrap();
+    let standby = Arc::new(Store::connect(&url, None).unwrap());
+    let leader_starts = Arc::new(AtomicUsize::new(0));
+    let standby_starts = Arc::new(AtomicUsize::new(0));
+
+    let leader_task = crate::server::spawn_singleton_task_with_system_resolutions(
+        leader.clone(),
+        SingletonRole::BillingEnforcer,
+        {
+            let leader = leader.clone();
+            let leader_starts = leader_starts.clone();
+            let candidate = candidate.clone();
+            let decision = decision.clone();
+            move |resolutions| {
+                let leader = leader.clone();
+                let leader_starts = leader_starts.clone();
+                let candidate = candidate.clone();
+                let decision = decision.clone();
+                async move {
+                    leader_starts.fetch_add(1, Ordering::SeqCst);
+                    let _ = leader
+                        .commit_billing_exhaustion(
+                            candidate,
+                            decision,
+                            Instant::now() + Duration::from_secs(30),
+                            &resolutions,
+                        )
+                        .await;
+                    std::future::pending::<()>().await;
+                }
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while leader_starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("leader should start its Billing commit");
+    wait_for_advisory_lock_wait(&observer, LEADER_APPLICATION);
+
+    let standby_task =
+        crate::server::spawn_singleton_task(standby, SingletonRole::BillingEnforcer, {
+            let standby_starts = standby_starts.clone();
+            move || {
+                let standby_starts = standby_starts.clone();
+                async move {
+                    standby_starts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+    leader_task.abort();
+    let _ = leader_task.await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        standby_starts.load(Ordering::SeqCst),
+        0,
+        "standby must not acquire while the cancelled leader still owns a claimed Store closure"
+    );
+
+    release_tx.send(()).unwrap();
+    holder_thread.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while standby_starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("standby should acquire only after the claimed closure reaches rollback");
+    assert!(
+        setup
+            .authority_transaction(|transaction| {
+                load_operation_by_cat_revision_unlocked(
+                    transaction,
+                    &create.candidate.cat_id,
+                    revision(2),
+                )
+            })
+            .unwrap()
+            .is_none(),
+        "pre-COMMIT cancellation must not publish the system successor"
+    );
+    standby_task.abort();
+    let _ = standby_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn singleton_response_loss_retains_leadership_through_exact_system_resolution() {
+    let (url, setup, _unused, workspace) = stores();
+    let mut create = request(&workspace, "billing-commit-loss", 87, "billing-loss-create");
+    let (_identity, _policy, release) = prepare_mutation_node(&setup, &mut create, 87);
+    setup
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let system_request = SystemDesiredMutationRequest::billing_exhaustion(
+        create.candidate.desired.clone(),
+        billing_decision(&setup, &workspace),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    )
+    .unwrap();
+    let leader = Arc::new(Store::connect(&url, None).unwrap());
+    leader.inject_committed_response_loss_once_after(Duration::from_millis(1_500));
+    let standby = Arc::new(Store::connect(&url, None).unwrap());
+    let standby_starts = Arc::new(AtomicUsize::new(0));
+
+    let leader_task = crate::server::spawn_singleton_task_with_system_resolutions(
+        leader.clone(),
+        SingletonRole::BillingEnforcer,
+        {
+            let leader = leader.clone();
+            move |resolutions| {
+                let leader = leader.clone();
+                let system_request = system_request.clone();
+                async move {
+                    let _ = leader
+                        .resolve_system_desired_mutation_for_test(
+                            system_request,
+                            Instant::now() + Duration::from_secs(30),
+                            &resolutions,
+                        )
+                        .await;
+                    std::future::pending::<()>().await;
+                }
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let revision = setup
+                .with(|client| {
+                    client
+                        .query_one(
+                            "SELECT desired_revision FROM desired_runtime_specs WHERE cat_id=$1",
+                            &[&create.candidate.cat_id.as_str()],
+                        )
+                        .map(|row| row.get::<_, i64>(0))
+                })
+                .unwrap();
+            if revision == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the system commit should reach PostgreSQL before its response is lost");
+
+    let standby_task =
+        crate::server::spawn_singleton_task(standby, SingletonRole::BillingEnforcer, {
+            let standby_starts = standby_starts.clone();
+            move || {
+                let standby_starts = standby_starts.clone();
+                async move {
+                    standby_starts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+    leader_task.abort();
+    let _ = leader_task.await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        standby_starts.load(Ordering::SeqCst),
+        0,
+        "leader must retain its advisory session while COMMIT response is still ambiguous"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while standby_starts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("standby should acquire after exact retained-Operation resolution");
+    assert_eq!(
+        setup
+            .authority_transaction(|transaction| {
+                load_operation_by_cat_revision_unlocked(
+                    transaction,
+                    &create.candidate.cat_id,
+                    revision(2),
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .phase,
+        OperationPhase::Pending
+    );
+    standby_task.abort();
+    let _ = standby_task.await;
 }
 
 #[test]

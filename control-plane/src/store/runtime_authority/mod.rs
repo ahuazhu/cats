@@ -30,6 +30,7 @@ pub(crate) mod volume_transition_auth;
 
 pub(crate) use product::{
     BillingExhaustionDecision, RuntimeOperationRead, SystemDesiredMutationCommit,
+    SystemDesiredMutationResolutionOwner,
 };
 #[allow(
     dead_code,

@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::cat_create_service::CatCreatePlacementMutation;
-use super::covered_commit::{CoveredCommitCancellation, CoveredCommitState};
+use super::covered_commit::{
+    CommitResolutionRegistry, CoveredCommitCancellation, CoveredCommitState,
+};
 use super::normal_delete::{begin_persistent_disk_delete_in, PersistentDiskDeleteContext};
 use super::placement_planner::{
     lock_cat_create_placement_for_desired_mutation,
@@ -48,7 +50,7 @@ use super::product_rows::{
     load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
     load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
     load_operation_by_cat_revision_for_update, load_operation_by_cat_revision_unlocked,
-    load_operation_by_workspace_unlocked, load_operation_for_update,
+    load_operation_by_workspace_unlocked, load_operation_for_update, load_operation_unlocked,
     load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
     update_operation,
 };
@@ -605,6 +607,17 @@ impl SystemDesiredMutationRequest {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn with_desired_for_test(mut self, desired: DesiredRuntimeSpec) -> Self {
+        self.desired = desired;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn desired_for_test(&self) -> &DesiredRuntimeSpec {
+        &self.desired
+    }
+
     /// G4 adds its exact accepted-evidence validator before this constructor
     /// becomes reachable. Keeping the source typed here prevents a competing
     /// Desired publication suffix from appearing in that module.
@@ -655,6 +668,25 @@ pub(crate) struct SystemDesiredMutationCommitGuard {
     state: CoveredCommitState,
 }
 
+/// Role-lifetime owner for system Desired commits that may outlive the async
+/// scan iteration which submitted them. Singleton leadership must remain held
+/// until every registered owner has either rolled back a pre-COMMIT
+/// cancellation or resolved a COMMIT-sent result by exact Operation replay.
+#[derive(Clone, Default)]
+pub(crate) struct SystemDesiredMutationResolutionOwner {
+    resolutions: std::sync::Arc<CommitResolutionRegistry>,
+}
+
+impl SystemDesiredMutationResolutionOwner {
+    pub(crate) fn close(&self) {
+        self.resolutions.close();
+    }
+
+    pub(crate) async fn wait_empty(&self) {
+        self.resolutions.wait_empty().await;
+    }
+}
+
 impl SystemDesiredMutationCommitGuard {
     pub(crate) fn new(operation_name: &'static str, absolute_deadline: Instant) -> Self {
         let (cancellation, state) =
@@ -669,6 +701,7 @@ impl SystemDesiredMutationCommitGuard {
         self.state.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_was_sent(&self) -> bool {
         self.state.commit_was_sent()
     }
@@ -1434,6 +1467,14 @@ impl Store {
         let result = self.authority_transaction_outcome_with_definite_retry(
             |transaction| {
                 checkpoint_covered_commit(transaction, Some(commit_state))?;
+                // A retained Operation is the durable system-domain replay
+                // oracle. Resolve it before consulting current Desired or any
+                // transient Node/Volume/Endpoint/source evidence: those facts
+                // may legitimately have moved or been cleaned after N+2.
+                if let Some(operation) = load_operation_unlocked(transaction, &operation_id)? {
+                    validate_system_operation_replay(&operation, &operation_id, request)?;
+                    return Ok(DesiredPublicationOutcome::Replayed);
+                }
                 let publication = DesiredMutationPublication {
                     expected_current: &request.expected_current,
                     desired: &request.desired,
@@ -1479,13 +1520,14 @@ impl Store {
 
     /// Resolve one Billing domain decision through the system mutation's
     /// stable Operation identity. A COMMIT response loss is retried as an
-    /// exact read of current Desired+Operation; no ApiIdempotencyResult is
+    /// exact read of the retained Operation; no ApiIdempotencyResult is
     /// fabricated for this non-HTTP domain.
     pub(crate) async fn commit_billing_exhaustion(
         self: &std::sync::Arc<Self>,
         candidate: BillingDesiredCandidate,
         decision: BillingExhaustionDecision,
         absolute_deadline: Instant,
+        resolution_owner: &SystemDesiredMutationResolutionOwner,
     ) -> Result<SystemDesiredMutationCommit> {
         let planned_candidate = candidate.clone();
         let request = self
@@ -1494,29 +1536,87 @@ impl Store {
         let Some(request) = request else {
             return Ok(SystemDesiredMutationCommit::Stale);
         };
-        let request = std::sync::Arc::new(request);
-        let guard = SystemDesiredMutationCommitGuard::new(
+        self.resolve_system_desired_mutation(
+            request,
             "Billing system Desired mutation",
             absolute_deadline,
-        );
-        loop {
-            let commit_request = std::sync::Arc::clone(&request);
-            let state = guard.state();
-            match self
+            resolution_owner,
+        )
+        .await
+    }
+
+    async fn resolve_system_desired_mutation(
+        self: &std::sync::Arc<Self>,
+        request: SystemDesiredMutationRequest,
+        operation_name: &'static str,
+        absolute_deadline: Instant,
+        resolution_owner: &SystemDesiredMutationResolutionOwner,
+    ) -> Result<SystemDesiredMutationCommit> {
+        let request = std::sync::Arc::new(request);
+        let guard = SystemDesiredMutationCommitGuard::new(operation_name, absolute_deadline);
+        let Some(active) = resolution_owner.resolutions.begin() else {
+            return Err(ApiError::unavailable(
+                "Billing system Desired mutation role is stopping",
+            ));
+        };
+        let store = std::sync::Arc::clone(self);
+        let commit_request = std::sync::Arc::clone(&request);
+        let state = guard.state();
+        let observer = state.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Always await the Store execution after it has been admitted. If
+            // the role future is cancelled, dropping its guard marks PRE_COMMIT
+            // work cancelled; an already-claimed closure must still reach a
+            // physical rollback/commit result before this owner is released.
+            let execution_store = std::sync::Arc::clone(&store);
+            let mut outcome = execution_store
                 .execute(move |store| store.commit_system_desired_mutation(&commit_request, &state))
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(error) if guard.commit_was_sent() => {
-                    tracing::warn!(
-                        %error,
-                        "resolving ambiguous Billing system Desired commit by exact replay"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                .await;
+            while let Err(error) = &outcome {
+                if !observer.commit_was_sent() {
+                    break;
                 }
-                Err(error) => return Err(error),
+                tracing::warn!(
+                    %error,
+                    "resolving ambiguous Billing system Desired commit by exact replay"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let replay_request = std::sync::Arc::clone(&request);
+                let replay_state = observer.clone();
+                outcome = store
+                    .execute(move |store| {
+                        store.commit_system_desired_mutation(&replay_request, &replay_state)
+                    })
+                    .await;
             }
-        }
+            let _ = result_tx.send(outcome);
+            drop(active);
+        });
+        // This guard is intentionally held by the scan iteration. Dropping the
+        // iteration can cancel only PRE_COMMIT; the registered owner above
+        // remains in the singleton role lifetime until exact resolution.
+        let result = result_rx.await.map_err(|_| {
+            ApiError::internal("Billing system Desired commit owner stopped without a result")
+        })?;
+        drop(guard);
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) async fn resolve_system_desired_mutation_for_test(
+        self: &std::sync::Arc<Self>,
+        request: SystemDesiredMutationRequest,
+        absolute_deadline: Instant,
+        resolution_owner: &SystemDesiredMutationResolutionOwner,
+    ) -> Result<SystemDesiredMutationCommit> {
+        self.resolve_system_desired_mutation(
+            request,
+            "system Desired resolution test",
+            absolute_deadline,
+            resolution_owner,
+        )
+        .await
     }
 
     fn prepare_billing_exhaustion(
@@ -3304,6 +3404,36 @@ fn validate_operation_binding(
         return Err(stored_corruption(
             "current Operation is not bound to the current Desired",
         ));
+    }
+    Ok(())
+}
+
+fn validate_system_operation_replay(
+    operation: &Operation,
+    operation_id: &Id,
+    request: &SystemDesiredMutationRequest,
+) -> AuthorityTxResult<()> {
+    let mut canonical = request.desired.clone();
+    canonical.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    let digest = cats_api::runtime_reconciliation::spec_digest(&canonical)
+        .map_err(|_| ApiError::invalid("system replay Desired is invalid"))?;
+    if digest != request.desired.spec_digest {
+        return Err(
+            ApiError::conflict("system replay Desired digest does not match its body").into(),
+        );
+    }
+    if operation.operation_id != *operation_id
+        || operation.workspace_id != request.desired.workspace_id
+        || operation.cat_id != request.desired.cat_id
+        || operation.desired_revision != request.desired.desired_revision
+        || operation.desired_spec_digest != request.desired.spec_digest
+        || operation.placement != request.desired.placement
+        || operation.target != request.desired.target
+    {
+        return Err(ApiError::conflict(
+            "system replay request does not match the retained Operation",
+        )
+        .into());
     }
     Ok(())
 }
