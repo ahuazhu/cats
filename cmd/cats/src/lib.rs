@@ -414,6 +414,12 @@ pub enum RuntimeProvisionerCommand {
         #[command(subcommand)]
         cmd: RuntimeProvisionerNodeIdentityCommand,
     },
+    /// Generate or verify the closed initial Route v2 credential transaction.
+    #[command(name = "route-v2-r1")]
+    RouteV2R1 {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerRouteV2R1Command,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -459,6 +465,49 @@ pub enum RuntimeProvisionerNodeIdentityCommand {
     Activate {
         #[arg(long)]
         apply_result: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerRouteV2R1Command {
+    /// Generate one root-only revision-1 candidate and provider input set.
+    Generate {
+        /// Absolute absent or exact-replay output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Every reviewed Node machine-listener DNS name (repeatable).
+        #[arg(long = "node-server-dns", required = true)]
+        node_server_dns: Vec<String>,
+        /// Immutable Control Secret name ending in `-r1`.
+        #[arg(long)]
+        control_secret_name: String,
+        /// Immutable Gateway Secret name ending in `-r1`.
+        #[arg(long)]
+        gateway_secret_name: String,
+        /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
+        #[arg(long)]
+        node_secret_name: String,
+        /// Absolute trusted OpenSSL executable used only by this offline operator.
+        #[arg(long, default_value = "/usr/bin/openssl")]
+        openssl: std::path::PathBuf,
+    },
+    /// Revalidate an existing root-only revision-1 candidate offline.
+    Verify {
+        /// Absolute root-only candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Every reviewed Node machine-listener DNS name (repeatable).
+        #[arg(long = "node-server-dns", required = true)]
+        node_server_dns: Vec<String>,
+        /// Immutable Control Secret name ending in `-r1`.
+        #[arg(long)]
+        control_secret_name: String,
+        /// Immutable Gateway Secret name ending in `-r1`.
+        #[arg(long)]
+        gateway_secret_name: String,
+        /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
+        #[arg(long)]
+        node_secret_name: String,
     },
 }
 
@@ -2577,6 +2626,32 @@ mod tests {
             "policy.json",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn cli_exposes_the_closed_route_v2_revision_one_credential_workflow() {
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "generate",
+            "--output",
+            "/approved/route-v2-r1",
+            "--node-server-dns",
+            "metal-1.internal",
+            "--control-secret-name",
+            "cats-route-v2-control-r1",
+            "--gateway-secret-name",
+            "cats-route-v2-gateway-r1",
+            "--node-secret-name",
+            "cats-production-route-v2-node-r1",
+            "--openssl",
+            "/usr/bin/openssl",
+        ])
+        .is_ok());
     }
 
     fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {

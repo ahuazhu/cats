@@ -102,6 +102,62 @@ ring replacement, signer switch, overlap window or loaded-ring ACK rollout;
 all successor revision and emergency rotation behavior remains the separate G3
 contract.
 
+The approved initial credential workflow is the offline, root-only command in
+the exact release `cats` binary. Supply every reviewed private-DNS name that
+will appear in an A23 `node_transport_target`; one Node certificate binds that
+closed set. The default `/usr/bin/openssl` is used only here to issue X.509
+certificates and is never invoked by Control, Gateway or Node at runtime.
+
+```sh
+sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 generate \
+  --output /approved/credentials/route-v2-r1 \
+  --node-server-dns "$metal_1_private_dns" \
+  --node-server-dns "$metal_2_private_dns" \
+  --control-secret-name cats-route-v2-control-r1 \
+  --gateway-secret-name cats-route-v2-gateway-r1 \
+  --node-secret-name cats-production-route-v2-node-r1 \
+  --openssl /usr/bin/openssl
+
+sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 verify \
+  --input /approved/credentials/route-v2-r1 \
+  --node-server-dns "$metal_1_private_dns" \
+  --node-server-dns "$metal_2_private_dns" \
+  --control-secret-name cats-route-v2-control-r1 \
+  --gateway-secret-name cats-route-v2-gateway-r1 \
+  --node-secret-name cats-production-route-v2-node-r1
+
+sudo /approved/staged-worker/cats-route-v2-node-r1-validator \
+  --directory /approved/credentials/route-v2-r1/node
+```
+
+Generation creates no cloud resource. It writes five exact root-owned `0700`
+directories: the retained CA pair, Control seven-file set, Gateway three-file
+set, Node four-file set, and three provider inputs. Before returning it
+reopens every file, checks the canonical signer/ring and Gateway policy, proves
+the CA/key pairs, passes the Node set through the production candidate reader,
+completes TLS 1.3 mutual-auth handshakes for Control and every Node DNS name,
+and byte-compares the provider inputs with those validated role files. The
+separate validator command above reuses the Node daemon's ring/rustls
+composition before any provider input is submitted. Standard output contains
+identifiers and SHA-256 receipts only.
+
+Create the two immutable Kubernetes Secrets and the one versioned Secrets
+Manager value directly from the root-only provider inputs; do not transcribe or
+decode them:
+
+```sh
+kubectl create --filename /approved/credentials/route-v2-r1/provider/control-secret.v1.json
+kubectl create --filename /approved/credentials/route-v2-r1/provider/gateway-secret.v1.json
+aws secretsmanager create-secret \
+  --cli-input-json file:///approved/credentials/route-v2-r1/provider/node-secret.v1.json
+```
+
+Record the returned worker Secret ARN and exact version ID in the infrastructure
+stack inputs. The retained `authority/route-v2-ca-private-key.pem` and all three
+provider JSON files contain secret material; keep the whole output directory on
+the approved root-only credential channel and never add it to a release bundle,
+Terraform input, shell environment or log.
+
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in
 `worker_managed_environment`, and `render-postgres-url` composes

@@ -5,6 +5,8 @@
 //! dialect. The official `cats admin runtime-node provision` state machine is
 //! the only component allowed to perform the signed Control apply.
 
+mod route_v2_r1;
+
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
@@ -42,7 +44,7 @@ use crate::stable_unix_fs::{
 };
 use crate::{
     Cli, RuntimeProvisionerCommand, RuntimeProvisionerNodeIdentityCommand,
-    RuntimeProvisionerTrustCommand,
+    RuntimeProvisionerRouteV2R1Command, RuntimeProvisionerTrustCommand,
 };
 
 const PRIVATE_KEY_MAX_BYTES: usize = 16_384;
@@ -114,6 +116,13 @@ pub(crate) fn run(cli: &Cli, command: &RuntimeProvisionerCommand) -> Result<()> 
                 "Host NodeIdentity provisioning must run as root"
             );
             run_node_identity(cli, cmd, Path::new("/"), 0)
+        }
+        RuntimeProvisionerCommand::RouteV2R1 { cmd } => {
+            anyhow::ensure!(
+                effective_uid() == 0,
+                "Route v2 credential provisioning must run as root"
+            );
+            route_v2_r1::run(cli, cmd)
         }
     }
 }
