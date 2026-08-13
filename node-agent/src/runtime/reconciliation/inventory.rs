@@ -175,7 +175,12 @@ pub(crate) mod root_process_inventory_bridge_sealed {
 #[derive(Debug)]
 pub(crate) enum RootProcessInventoryBridgeOutcome {
     Complete(NodeGlobalManagedProcessScanAdmission),
-    Unavailable,
+    Unavailable {
+        /// Per-Cat exact Running negatives learned before a later member of
+        /// the closed process scan became unavailable. These are safe only
+        /// for fail-closing local admission; they never complete inventory.
+        exact_running_negative_cats: BTreeSet<Id>,
+    },
 }
 
 /// Joint Systemd/process/control-socket inspection. It consumes expectations
@@ -592,7 +597,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     serving_status_by_cat = admission.serving_status_projections();
                     node_global_process_admission = Some(admission);
                 }
-                RootProcessInventoryBridgeOutcome::Unavailable => {
+                RootProcessInventoryBridgeOutcome::Unavailable {
+                    exact_running_negative_cats,
+                } => {
+                    exact_physical_negative_cats = exact_running_negative_cats;
                     aggregate.unavailable_sources.extend([
                         InventorySource::Systemd,
                         InventorySource::Process,
@@ -600,9 +608,17 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     ]);
                 }
             }
-            context
-                .remaining()
-                .context("root-process inventory bridge deadline expired after inspection")?;
+            if context.remaining().is_err() {
+                aggregate.unavailable_sources.extend([
+                    InventorySource::Systemd,
+                    InventorySource::Process,
+                    InventorySource::ControlSocket,
+                ]);
+                return Ok(RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources: aggregate.unavailable_sources,
+                    exact_physical_negative_cats,
+                });
+            }
             if let Some(kernel_nbd) = &self.kernel_nbd_port {
                 let managed_processes = node_global_process_admission.as_ref().context(
                     "kernel-NBD pool scan lacks its same-pass managed-process admission",

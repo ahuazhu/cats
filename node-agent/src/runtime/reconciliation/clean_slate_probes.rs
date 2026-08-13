@@ -29,9 +29,9 @@ use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_desired_runtime_spec,
     DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource, ObservedDiskKind, ObservedVolume,
-    ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess, VolumeAcquire,
-    VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WireU64,
-    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    ProcessState, ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess,
+    VolumeAcquire, VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+    WireU64, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
 use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
@@ -4638,6 +4638,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         mut stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        let unavailable =
+            |exact_running_negative_cats| RootProcessInventoryBridgeOutcome::Unavailable {
+                exact_running_negative_cats,
+            };
         let managed_blockd = match (
             self.managed_blockd_socket_root.as_ref(),
             self.blockd_socket_intents.as_ref(),
@@ -4654,7 +4658,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 Some((Arc::clone(root), Arc::clone(intents), expected, before))
             }
             (None, None) if !self.process_paths.supported => {
-                return Ok(RootProcessInventoryBridgeOutcome::Unavailable)
+                return Ok(unavailable(BTreeSet::new()))
             }
             #[cfg(test)]
             (None, None) => None,
@@ -4670,18 +4674,31 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
         let Some(serving_first) =
             inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
         let Some(vmm_first) =
             inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
+        let exact_running_negative_cats = vmm_first
+            .iter()
+            .filter_map(|(cat_id, inspection)| match inspection {
+                VmmProcessInspection::Absent => Some(cat_id.clone()),
+                VmmProcessInspection::Exact(evidence)
+                    if evidence.state() != ProcessState::Running =>
+                {
+                    Some(cat_id.clone())
+                }
+                VmmProcessInspection::Exact(_) => None,
+                _ => unreachable!("inspection set contains only exact or absent"),
+            })
+            .collect::<BTreeSet<_>>();
 
         let mut allowed_units = root_first
             .values()
@@ -4786,17 +4803,26 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             );
         }
 
-        match self.sweep_node_global_inventory(
+        let sweep = match self.sweep_node_global_inventory(
             &allowed_units,
             &allowed_pids,
             &allowed_sockets,
             &vmm_expected,
             context,
-        )? {
+        ) {
+            Ok(sweep) => sweep,
+            Err(_problem) if context.check_active().is_err() => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            Err(problem) => return Err(problem),
+        };
+        match sweep {
             ProbeFact::Present => {
                 bail!("managed-process inventory found foreign or duplicate managed residue")
             }
-            ProbeFact::Unavailable => return Ok(RootProcessInventoryBridgeOutcome::Unavailable),
+            ProbeFact::Unavailable => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
             ProbeFact::Empty => {}
         }
 
@@ -4808,21 +4834,36 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             );
         }
 
-        let Some(root_second) =
-            inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+        let root_second =
+            match inspect_root_process_set(self.port.as_ref(), &root_expected, context) {
+                Ok(Some(inspected)) => inspected,
+                Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+                Err(_problem) if context.check_active().is_err() => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(problem) => return Err(problem),
+            };
+        let serving_second = match inspect_serving_process_set(
+            self.serving_port.as_ref(),
+            &serving_expected,
+            context,
+        ) {
+            Ok(Some(inspected)) => inspected,
+            Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+            Err(_problem) if context.check_active().is_err() => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            Err(problem) => return Err(problem),
         };
-        let Some(serving_second) =
-            inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
-        };
-        let Some(vmm_second) =
-            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
-        };
+        let vmm_second =
+            match inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context) {
+                Ok(Some(inspected)) => inspected,
+                Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+                Err(_problem) if context.check_active().is_err() => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(problem) => return Err(problem),
+            };
         anyhow::ensure!(
             root_first == root_second && serving_first == serving_second && vmm_first == vmm_second,
             "managed-process identity changed across the global inventory sweep"
@@ -7966,7 +8007,7 @@ mod tests {
             .unwrap();
         match outcome {
             // Non-Linux builds cannot perform the production VMM inspection.
-            RootProcessInventoryBridgeOutcome::Unavailable => {}
+            RootProcessInventoryBridgeOutcome::Unavailable { .. } => {}
             // Linux can prove the exact unit absent. Absence is sealed in the
             // private admission but must never become a public VMM process.
             RootProcessInventoryBridgeOutcome::Complete(admission) => {
@@ -9332,6 +9373,19 @@ mod tests {
         process_ids: Mutex<VecDeque<Option<u32>>>,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ScriptedVmmInspection {
+        Absent,
+        Exact(ProcessState),
+        Unavailable,
+    }
+
+    struct ScriptedVmmProcessPort {
+        inspections: Mutex<VecDeque<ScriptedVmmInspection>>,
+        cancel_after_first: Option<RuntimeInventoryScanContext>,
+        calls: AtomicUsize,
+    }
+
     impl super::super::vmm_process::VmmProcessPortSealedForTest for FakeVmmProcessPort {}
 
     impl VmmProcessPort for FakeVmmProcessPort {
@@ -9354,6 +9408,44 @@ mod tests {
                     None => VmmProcessInspection::Absent,
                 },
             )
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::vmm_process::CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessStart> {
+            unreachable!("inventory fake is read-only")
+        }
+    }
+
+    impl super::super::vmm_process::VmmProcessPortSealedForTest for ScriptedVmmProcessPort {}
+
+    impl VmmProcessPort for ScriptedVmmProcessPort {
+        fn inspect(
+            &self,
+            expected: &VmmProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<VmmProcessInspection> {
+            let inspection = match self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted VMM inspection exhausted")
+            {
+                ScriptedVmmInspection::Absent => VmmProcessInspection::Absent,
+                ScriptedVmmInspection::Exact(state) => VmmProcessInspection::Exact(Box::new(
+                    expected.exact_evidence_with_state_for_test(101, state),
+                )),
+                ScriptedVmmInspection::Unavailable => VmmProcessInspection::Unavailable,
+            };
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some(context) = &self.cancel_after_first {
+                    context.cancel_for_test();
+                }
+            }
+            Ok(inspection)
         }
 
         fn start_checkpointed(
@@ -14543,6 +14635,86 @@ mod tests {
             exact_physical_negative_cats,
             BTreeSet::from([desired.cat_id.clone()])
         );
+
+        for (initial, label) in [
+            (ScriptedVmmInspection::Exact(ProcessState::Paused), "paused"),
+            (ScriptedVmmInspection::Absent, "absent"),
+        ] {
+            for later_unavailable in [
+                "node-global-sweep",
+                "node-global-cancellation",
+                "second-vmm-sample",
+            ] {
+                let platform_scan_context = RuntimeInventoryScanContext::for_test(
+                    fixture.scan_context.coordinates().clone(),
+                    Instant::now() + Duration::from_secs(5),
+                );
+                let vmm_inspections = match later_unavailable {
+                    "node-global-sweep" | "node-global-cancellation" => VecDeque::from([initial]),
+                    "second-vmm-sample" => {
+                        VecDeque::from([initial, ScriptedVmmInspection::Unavailable])
+                    }
+                    _ => unreachable!(),
+                };
+                let root_process = live.old_process.clone();
+                let mut platform_bridge = root_process_bridge_with_all_ports(
+                    &environment,
+                    Arc::new(FakeRootProcessPort {
+                        inspections: Mutex::new(VecDeque::from([
+                            RootProvisionProcessInspection::Exact(Box::new(root_process.clone())),
+                            RootProvisionProcessInspection::Exact(Box::new(root_process)),
+                        ])),
+                    }),
+                    Arc::new(FakeServingProcessPort {
+                        process_ids: Mutex::new(VecDeque::from([Some(81), Some(81)])),
+                    }),
+                    Arc::new(ScriptedVmmProcessPort {
+                        inspections: Mutex::new(vmm_inspections),
+                        cancel_after_first: (later_unavailable == "node-global-cancellation")
+                            .then(|| platform_scan_context.clone()),
+                        calls: AtomicUsize::new(0),
+                    }),
+                );
+                let empty_os = TempDir::new().unwrap();
+                platform_bridge.systemd_root = empty_os.path().join("systemd");
+                platform_bridge.process_paths.root = empty_os.path().join("proc");
+                platform_bridge.legacy_socket_root = empty_os.path().join("legacy-sockets");
+                for path in [
+                    &platform_bridge.systemd_root,
+                    &platform_bridge.process_paths.root,
+                    &platform_bridge.legacy_socket_root,
+                ] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                if later_unavailable == "node-global-sweep" {
+                    let unavailable_sweep_root = environment.state.parent().unwrap().join(format!(
+                        "managed-vmm-unavailable-{label}-{later_unavailable}"
+                    ));
+                    platform_bridge.managed_vmm_socket_root = Some(Arc::new(
+                        RetainedManagedVmmSocketRoot::provision_for_test(&unavailable_sweep_root)
+                            .unwrap(),
+                    ));
+                }
+                let platform_scanner = full_root_scanner(&fixture, [])
+                    .with_root_process_bridge_for_test(Arc::new(platform_bridge))
+                    .with_network_bridge(Arc::new(ExactRunningNetworkBridge));
+                let RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    exact_physical_negative_cats,
+                } = platform_scanner
+                    .scan_complete(platform_scan_context)
+                    .unwrap()
+                else {
+                    panic!("production scanner lost {label} negative before {later_unavailable}")
+                };
+                assert!(unavailable_sources.contains(&InventorySource::Process));
+                assert_eq!(
+                    exact_physical_negative_cats,
+                    BTreeSet::from([desired.cat_id.clone()]),
+                    "production scanner lost {label} negative before {later_unavailable}"
+                );
+            }
+        }
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
             observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
@@ -16747,7 +16919,7 @@ mod tests {
                     &assigned_context(true),
                 )
                 .unwrap(),
-            RootProcessInventoryBridgeOutcome::Unavailable
+            RootProcessInventoryBridgeOutcome::Unavailable { .. }
         ));
     }
 
