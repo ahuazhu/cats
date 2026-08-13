@@ -15,12 +15,15 @@ use cats_api::agent_registration::{
 };
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    decode_runtime_volume_transition_evidence_request, decode_runtime_volume_transition_request,
+    decode_runtime_residue_authority_request, decode_runtime_volume_transition_evidence_request,
+    decode_runtime_volume_transition_request, encode_runtime_residue_authority_success,
     encode_runtime_volume_transition_error, encode_runtime_volume_transition_evidence_success,
     encode_runtime_volume_transition_success, ContractError, ContractErrorDetail, ContractName,
-    ContractVersion, JsonPointer, LimitKind, RuntimeVolumeTransitionError,
+    ContractVersion, JsonPointer, LimitKind, RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess, RuntimeVolumeTransitionError,
     RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionHttpProblem, RuntimeVolumeTransitionRequest, WireU64,
+    RUNTIME_RESIDUE_AUTHORITY_PATH, RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
     RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
@@ -44,6 +47,7 @@ const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-int
 enum Route {
     Mutation,
     Evidence,
+    ResidueAuthority,
 }
 
 impl Route {
@@ -51,6 +55,7 @@ impl Route {
         match self {
             Self::Mutation => RUNTIME_VOLUME_TRANSITION_PATH,
             Self::Evidence => RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+            Self::ResidueAuthority => RUNTIME_RESIDUE_AUTHORITY_PATH,
         }
     }
 
@@ -58,6 +63,7 @@ impl Route {
         match self {
             Self::Mutation => RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES,
             Self::Evidence => RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES,
+            Self::ResidueAuthority => RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
         }
     }
 
@@ -65,13 +71,14 @@ impl Route {
         match self {
             Self::Mutation => ContractName::RuntimeVolumeTransitionRequest,
             Self::Evidence => ContractName::RuntimeVolumeTransitionEvidenceRequest,
+            Self::ResidueAuthority => ContractName::RuntimeResidueAuthorityRequest,
         }
     }
 
     fn deadline(self) -> Duration {
         match self {
             Self::Mutation => MUTATION_DEADLINE,
-            Self::Evidence => EVIDENCE_DEADLINE,
+            Self::Evidence | Self::ResidueAuthority => EVIDENCE_DEADLINE,
         }
     }
 }
@@ -79,6 +86,7 @@ impl Route {
 enum DecodedRequest {
     Mutation(Box<RuntimeVolumeTransitionRequest>),
     Evidence(RuntimeVolumeTransitionEvidenceRequest),
+    ResidueAuthority(Box<RuntimeResidueAuthorityRequest>),
 }
 
 enum ExecutionOutcome {
@@ -90,6 +98,7 @@ enum ExecutionOutcome {
         >,
     ),
     Evidence(VolumeTransitionStoreOutcome<VolumeTransitionEvidenceLoad>),
+    ResidueAuthority(VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>),
 }
 
 enum OwnedExecutionResult {
@@ -114,6 +123,13 @@ pub(super) async fn mutation(State(state): State<AppState>, request: Request<Bod
 
 pub(super) async fn evidence(State(state): State<AppState>, request: Request<Body>) -> Response {
     handle(state, request, Route::Evidence).await
+}
+
+pub(super) async fn residue_authority(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    handle(state, request, Route::ResidueAuthority).await
 }
 
 async fn handle(state: AppState, request: Request<Body>, route: Route) -> Response {
@@ -259,6 +275,10 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
             Ok(request) => DecodedRequest::Evidence(request),
             Err(error) => return contract_error_response(decode_status(&error), error),
         },
+        Route::ResidueAuthority => match decode_runtime_residue_authority_request(&body) {
+            Ok(request) => DecodedRequest::ResidueAuthority(Box::new(request)),
+            Err(error) => return contract_error_response(decode_status(&error), error),
+        },
     };
 
     let operation_context = request_context.clone();
@@ -311,6 +331,14 @@ async fn handle(state: AppState, request: Request<Body>, route: Route) -> Respon
                                         &store_context,
                                     )
                                     .map(ExecutionOutcome::Evidence),
+                                DecodedRequest::ResidueAuthority(request) => store
+                                    .runtime_residue_authority_with_context(
+                                        &authenticated,
+                                        &request,
+                                        &active_guest_digest,
+                                        &store_context,
+                                    )
+                                    .map(ExecutionOutcome::ResidueAuthority),
                             })
                             .await,
                     )
@@ -392,6 +420,15 @@ fn owned_execution_response(
             &[],
         ),
         OwnedExecutionResult::Executed(Ok(ExecutionOutcome::Evidence(
+            VolumeTransitionStoreOutcome::Rejected(rejection),
+        ))) => rejection_response(rejection),
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::ResidueAuthority(
+            VolumeTransitionStoreOutcome::Accepted(success),
+        ))) => match encode_runtime_residue_authority_success(&success) {
+            Ok(body) => success_response(body),
+            Err(_) => internal_response(),
+        },
+        OwnedExecutionResult::Executed(Ok(ExecutionOutcome::ResidueAuthority(
             VolumeTransitionStoreOutcome::Rejected(rejection),
         ))) => rejection_response(rejection),
         OwnedExecutionResult::Executed(Err(_)) if response_context.commit_was_attempted() => {
@@ -639,14 +676,16 @@ mod tests {
 
     use cats_api::agent_registration::{Ed25519RequestSigner, REGISTRATION_PATH};
     use cats_api::runtime_reconciliation::{
-        decode_agent_session, decode_runtime_volume_transition_error,
-        decode_runtime_volume_transition_evidence_success,
+        decode_agent_session, decode_runtime_residue_authority_success,
+        decode_runtime_volume_transition_error, decode_runtime_volume_transition_evidence_success,
         decode_runtime_volume_transition_success, encode_agent_registration_attempt,
+        encode_runtime_residue_authority_request,
         encode_runtime_volume_transition_evidence_request,
         encode_runtime_volume_transition_request, guest_config_digest, AgentRegistrationAttempt,
         ContractVersion, CredentialBinding, Id, NodeBootId, NodeIdentity, NodeIdentityState,
         RandomId128, RuntimeVolumeTransition, RuntimeVolumeTransitionErrorDetail,
         RuntimeVolumeTransitionEvidenceRequest, SessionBinding, VolumeAcquireRequest,
+        RUNTIME_RESIDUE_AUTHORITY_PATH,
     };
     use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
@@ -1213,6 +1252,60 @@ mod tests {
             RuntimeVolumeTransitionErrorDetail::AuthorizationEvidenceUnavailable {
                 authorization_id
             } if authorization_id == &wrong_request.authorization_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn residue_authority_http_replays_the_same_closed_release_proof() {
+        let context = Context::new().await;
+        let node = context.register("residue", '7').await;
+        let authenticated = node.authenticated();
+        let session = node.binding();
+        let digest = context.active_guest_config_digest.clone();
+        let request = context
+            .server
+            .state
+            .store
+            .execute(move |store| {
+                Ok(
+                    crate::store::runtime_authority::tests::prepare_residue_authority_http_fixture(
+                        store,
+                        authenticated,
+                        session,
+                        digest,
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+        let body = encode_runtime_residue_authority_request(&request).unwrap();
+
+        let first = context
+            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first =
+            decode_runtime_residue_authority_success(&first.bytes().await.unwrap()).unwrap();
+
+        let replay = context
+            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay =
+            decode_runtime_residue_authority_success(&replay.bytes().await.unwrap()).unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(replay.session, request.session);
+        assert_eq!(replay.lineage, request.lineage);
+        assert!(matches!(
+            replay.outcome,
+            cats_api::runtime_reconciliation::RuntimeResidueAuthorityOutcome::Reclaimable {
+                proof
+            }
+                if matches!(proof.as_ref(), cats_api::runtime_reconciliation::ResidueReclaimProof::OrdinaryRelease { .. })
         ));
     }
 

@@ -33,6 +33,7 @@ pub(crate) use product::{
     BillingExhaustionDecision, RuntimeOperationRead, SystemDesiredMutationCommit,
     SystemDesiredMutationResolutionOwner,
 };
+pub(crate) mod residue_authority;
 #[allow(
     dead_code,
     reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"

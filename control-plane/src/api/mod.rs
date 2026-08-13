@@ -732,6 +732,11 @@ pub fn router(state: AppState) -> Router {
                 post(runtime_volume_transitions::evidence)
                     .fallback(runtime_volume_transitions::evidence),
             )
+            .route(
+                "/v1/internal/runtime/residue-authority",
+                post(runtime_volume_transitions::residue_authority)
+                    .fallback(runtime_volume_transitions::residue_authority),
+            )
     };
     #[cfg(not(debug_assertions))]
     let runtime_volume_authority = Router::new()
@@ -1092,6 +1097,7 @@ POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
 POST /v1/internal/runtime/observations
+POST /v1/internal/runtime/residue-authority
 POST /v1/internal/runtime/volume-transition-evidence
 POST /v1/internal/runtime/volume-transitions
 POST /v1/internal/usage/checkpoints

@@ -8,18 +8,19 @@
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_volume_transition_evidence_request, encode_runtime_volume_transition_request,
-    AcquireOrigin, AgentSession, AssignedPlacement, CleanupRelease, CleanupTarget, ContractError,
-    ContractErrorDetail, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind,
-    FilesystemInitialization, Id, LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue,
-    ObservedDiskKind, ObservedRuntimeStatus, PersistentFilesystemBinding,
-    PersistentInitializationReceipt, ProcessRole, Revision, RuntimeTarget,
-    RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
-    RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
-    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest,
-    RuntimeVolumeTransitionSuccess, SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire,
-    VolumeAcquireRequest, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
-    VolumeLeaseGrant,
+    encode_runtime_residue_authority_request, encode_runtime_volume_transition_evidence_request,
+    encode_runtime_volume_transition_request, AcquireOrigin, AgentSession, AssignedPlacement,
+    CleanupRelease, CleanupTarget, ContractError, ContractErrorDetail, ContractVersion,
+    CredentialBinding, DesiredRuntimeSpec, DiskKind, FilesystemInitialization, Id,
+    LocalLineageState, NodeIdentity, NodeIdentityState, NodeResidue, ObservedDiskKind,
+    ObservedRuntimeStatus, PersistentFilesystemBinding, PersistentInitializationReceipt,
+    ProcessRole, Revision, RuntimeResidueAuthorityRequest, RuntimeResidueAuthoritySuccess,
+    RuntimeTarget, RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
+    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
+    RuntimeVolumeTransitionRequest, RuntimeVolumeTransitionSuccess, SessionBinding, Sha256Digest,
+    UnixMillis, VolumeAcquire, VolumeAcquireRequest, VolumeAuthorityEvidence, VolumeDisposition,
+    VolumeIntent, VolumeLeaseGrant,
 };
 use cats_storage::authority::{
     consume_disposable_root_delete, consume_takeover, normal_acquire, release,
@@ -37,6 +38,7 @@ use super::product_rows::{
     load_any_disk_snapshot_for_update, load_cat_by_id_for_update, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_disk,
 };
+use super::residue_authority::load_runtime_residue_authority_in;
 use super::rows::{
     database_now, load_authorization_for_update, load_event_for_update,
     load_stored_volume_for_update, load_takeover_authorization_for_intent_update,
@@ -253,6 +255,61 @@ impl Store {
                 }
             };
             load_volume_transition_evidence_in(context, request)
+                .map(VolumeTransitionStoreOutcome::Accepted)
+        })
+    }
+
+    /// Qualifies one exact retained local lineage under the current signed
+    /// AgentSession and one repeatable-read PostgreSQL snapshot.
+    pub(crate) fn runtime_residue_authority(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request: &RuntimeResidueAuthorityRequest,
+        active_guest_config_digest: &Sha256Digest,
+    ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if let Err(error) = encode_runtime_residue_authority_request(request) {
+            return Ok(contract_rejected(error));
+        }
+        self.authority_locking_read_snapshot(|transaction| {
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                &request.session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    return Ok(VolumeTransitionStoreOutcome::Rejected(rejection));
+                }
+            };
+            load_runtime_residue_authority_in(context, request)
+                .map(VolumeTransitionStoreOutcome::Accepted)
+        })
+    }
+
+    pub(crate) fn runtime_residue_authority_with_context(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request: &RuntimeResidueAuthorityRequest,
+        active_guest_config_digest: &Sha256Digest,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if let Err(error) = encode_runtime_residue_authority_request(request) {
+            return Ok(contract_rejected(error));
+        }
+        self.authority_request_locking_read_snapshot(request_context, |transaction| {
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                &request.session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    return Ok(VolumeTransitionStoreOutcome::Rejected(rejection));
+                }
+            };
+            load_runtime_residue_authority_in(context, request)
                 .map(VolumeTransitionStoreOutcome::Accepted)
         })
     }

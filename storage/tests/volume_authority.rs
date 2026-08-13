@@ -111,6 +111,27 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
     )
 }
 
+fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
+    ResidueDataDirectoryLineage {
+        cat_id: id("cat-1"),
+        disk_id: id("disk-1"),
+        disk_kind: DiskKind::Root,
+        volume_id: id("volume-1"),
+        attachment_id: id("attachment-old"),
+        attachment_epoch: fence_epoch(8),
+        acquire_origin: AcquireOrigin::Normal {
+            transition_id: random_id(1),
+        },
+        node_id: id("node-old"),
+        placement_epoch: epoch(3),
+        local_durable_generation: generation(local),
+        remote_durable_generation: generation(remote),
+        remote_head: head(remote),
+        pending_pack_count: WireU64::new(local.saturating_sub(remote)).unwrap(),
+        fenced: true,
+    }
+}
+
 #[test]
 fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() {
     let (attachment, record) = authorized_serving_attachment();
@@ -1089,6 +1110,136 @@ fn disposable_completion_reconnects_to_the_unique_consumed_receipt() {
             deleting_epoch: direct.resulting_epoch,
             deleting_head: direct.resulting_head,
             completed_at: time(40_000),
+        }
+    );
+}
+
+#[test]
+fn residue_reclaim_accepts_only_exact_direct_ordinary_release() {
+    let owned = acquired_volume();
+    let (released, _) = release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: fence_epoch(8),
+        },
+    )
+    .unwrap();
+    let lineage = residue_lineage(4, 4);
+    let expected = RuntimeResidueAuthorityOutcome::Reclaimable {
+        proof: Box::new(ResidueReclaimProof::OrdinaryRelease {
+            current_volume: released.clone(),
+        }),
+    };
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&released), None, None).unwrap(),
+        expected
+    );
+    // Response loss and Agent restart repeat the same pure decision.
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&released), None, None).unwrap(),
+        expected
+    );
+
+    let mut stale = lineage.clone();
+    stale.attachment_epoch = fence_epoch(7);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&stale, Some(&released), None, None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+
+    let mut successor_request = acquire_request(2);
+    successor_request.expected_unowned_epoch = released.lease_epoch;
+    successor_request.attachment_id = id("attachment-new");
+    let (successor, _) = normal_acquire(&released, &successor_request, time(20_000)).unwrap();
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&successor), None, None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::CurrentOrNewerOwner,
+        }
+    );
+}
+
+#[test]
+fn residue_reclaim_accepts_exact_normal_delete_completion_only_at_r_equals_l() {
+    let owned = acquired_volume();
+    let (released, _) = release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: fence_epoch(8),
+        },
+    )
+    .unwrap();
+    let request = BeginDeleteRequest {
+        delete_id: id("delete-1"),
+        disk_id: id("disk-1"),
+        volume_id: released.volume_id.clone(),
+        expected_unowned_epoch: released.lease_epoch,
+        expected_head: released.head.clone(),
+    };
+    let deleting = begin_delete(&released, &request).unwrap().0;
+    let completion = complete_normal_delete(&deleting, time(40_000)).unwrap();
+    let lineage = residue_lineage(4, 4);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::NormalDeleteCompletion { .. })
+    ));
+
+    let local_tail = residue_lineage(5, 4);
+    assert_eq!(
+        classify_residue_reclaim_authority(&local_tail, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::UniqueLocalTail,
+        }
+    );
+}
+
+#[test]
+fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = disposable_authorization(
+        &owned,
+        DisposableDeleteIsolationBasis::HostFenceEvent {
+            event_id: event.event_id.clone(),
+        },
+    );
+    let (deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        Some(&event),
+        &authorization,
+        &id("delete-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    let completion = complete_disposable_root_delete(&deleting, &consumed, time(40_000)).unwrap();
+    let lineage = residue_lineage(6, 4);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::DisposableRootDeleteCompletion { .. })
+    ));
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::DeleteIncomplete,
+        }
+    );
+
+    let mut persistent = lineage.clone();
+    persistent.disk_kind = DiskKind::Persistent;
+    assert_eq!(
+        classify_residue_reclaim_authority(&persistent, None, Some(&completion), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::UnsupportedDiskKind,
         }
     );
 }

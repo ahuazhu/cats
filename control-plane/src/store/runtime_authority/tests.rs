@@ -6,7 +6,7 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, encode_desired_runtime_spec, guest_config_digest, inventory_digest,
-    spec_digest, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
+    spec_digest, AcquireOrigin, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
     AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
     CleanupRelease, CleanupTarget, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
     CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent,
@@ -16,7 +16,9 @@ use cats_api::runtime_reconciliation::{
     NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDevice,
     ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
     OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding, ProcessEvidence,
-    ProcessRole, ProcessState, ReconcileStep, RuntimeCheckpoint, RuntimeConfig, RuntimeTarget,
+    ProcessRole, ProcessState, ReconcileStep, ResidueAuthorityRetentionReason,
+    ResidueDataDirectoryLineage, ResidueReclaimProof, RuntimeCheckpoint, RuntimeConfig,
+    RuntimeResidueAuthorityOutcome, RuntimeResidueAuthorityRequest, RuntimeTarget,
     RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
     RuntimeVolumeTransitionEvidenceRequest, RuntimeVolumeTransitionOutcome,
     RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, Sequence,
@@ -42,6 +44,7 @@ use super::product_rows::{
     insert_cat, insert_desired, insert_disk, insert_disk_snapshot, insert_operation,
     load_desired_for_update, load_disk_by_id_for_update,
 };
+use super::residue_authority::load_runtime_residue_authority_in;
 use super::rows::{
     database_now, disposable_root_authorization_candidates_sql, insert_authorization,
     insert_delete_completion, insert_event, insert_volume, load_active_event_by_node_unlocked,
@@ -1767,6 +1770,34 @@ pub(crate) fn prepare_a22_http_takeover_fixture(
     )
 }
 
+pub(crate) fn prepare_residue_authority_http_fixture(
+    store: &Store,
+    authenticated: AuthenticatedNodeCredential,
+    session: SessionBinding,
+    active_guest_config_digest: Sha256Digest,
+) -> RuntimeResidueAuthorityRequest {
+    let node = TransitionNode {
+        authenticated,
+        session,
+        active_guest_config_digest,
+    };
+    let owned = acquire_owned_volume(store);
+    let (released, _) = cats_storage::authority::release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: owned.lease_epoch,
+        },
+    )
+    .unwrap();
+    store
+        .authority_transaction(|transaction| update_volume_owner(transaction, &released, None))
+        .unwrap();
+    residue_authority_request(&node, 4, 4)
+}
+
 fn evidence_request(node_id: &str) -> RuntimeVolumeTransitionEvidenceRequest {
     evidence_request_for(node_id, "takeover-auth-1")
 }
@@ -1784,6 +1815,36 @@ fn evidence_request_for(
             agent_session_epoch: epoch(1),
         },
         authorization_id: id(authorization_id),
+    }
+}
+
+fn residue_authority_request(
+    node: &TransitionNode,
+    local_generation: u64,
+    remote_generation: u64,
+) -> RuntimeResidueAuthorityRequest {
+    RuntimeResidueAuthorityRequest {
+        version: ContractVersion::V1,
+        session: node.session.clone(),
+        lineage: ResidueDataDirectoryLineage {
+            cat_id: id("cat-1"),
+            disk_id: id("disk-1"),
+            disk_kind: DiskKind::Root,
+            volume_id: id("volume-1"),
+            attachment_id: id("attachment-old"),
+            attachment_epoch: fence_epoch(8),
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: random_id(1),
+            },
+            node_id: node.session.node_id.clone(),
+            placement_epoch: epoch(3),
+            local_durable_generation: generation(local_generation),
+            remote_durable_generation: generation(remote_generation),
+            remote_head: head(remote_generation),
+            pending_pack_count: WireU64::new(local_generation.saturating_sub(remote_generation))
+                .unwrap(),
+            fenced: true,
+        },
     }
 }
 
@@ -2223,6 +2284,28 @@ fn load_evidence_public(
             panic!("evidence Store entrypoint was rejected: {rejection:?}")
         }
     }
+}
+
+fn load_residue_authority(
+    transaction: &mut postgres::Transaction<'_>,
+    node: &TransitionNode,
+    request: &RuntimeResidueAuthorityRequest,
+) -> Result<
+    Box<cats_api::runtime_reconciliation::RuntimeResidueAuthoritySuccess>,
+    AuthorityTransactionError,
+> {
+    let context = match authenticate_evidence_context_in(
+        transaction,
+        &node.authenticated,
+        &request.session,
+        &node.active_guest_config_digest,
+    )? {
+        VolumeTransitionStoreOutcome::Accepted(context) => context,
+        VolumeTransitionStoreOutcome::Rejected(rejection) => {
+            panic!("residue authority authentication prefix was rejected: {rejection:?}")
+        }
+    };
+    load_runtime_residue_authority_in(context, request)
 }
 
 #[test]
@@ -5019,6 +5102,132 @@ fn evidence_snapshot_returns_disposable_completion_after_rows_are_gone() {
     assert_eq!(success.delete_completion, Some(completion));
     assert_eq!(success.authorization, consumed);
     assert_eq!(success.direct_successor_authorization, None);
+}
+
+#[test]
+fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let node = transition_node(&store, "node-new");
+    let (released, _) = cats_storage::authority::release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: owned.lease_epoch,
+        },
+    )
+    .unwrap();
+    store
+        .authority_transaction(|transaction| update_volume_owner(transaction, &released, None))
+        .unwrap();
+
+    let request = residue_authority_request(&node, 4, 4);
+    let response = match store
+        .runtime_residue_authority(
+            &node.authenticated,
+            &request,
+            &node.active_guest_config_digest,
+        )
+        .unwrap()
+    {
+        VolumeTransitionStoreOutcome::Accepted(response) => response,
+        VolumeTransitionStoreOutcome::Rejected(rejection) => {
+            panic!("exact residue authority request was rejected: {rejection:?}")
+        }
+    };
+    assert_eq!(response.session, request.session);
+    assert_eq!(response.lineage, request.lineage);
+    assert_eq!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Reclaimable {
+            proof: Box::new(ResidueReclaimProof::OrdinaryRelease {
+                current_volume: released,
+            }),
+        }
+    );
+
+    let mut stale = request;
+    stale.lineage.attachment_epoch = fence_epoch(7);
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &stale)
+        })
+        .unwrap();
+    assert_eq!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::ReleaseNotRecorded,
+        }
+    );
+}
+
+#[test]
+fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let original = disposable_authorization(&owned);
+    store
+        .authority_transaction(|transaction| insert_authorization(transaction, &original))
+        .unwrap();
+    let (deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        None,
+        &original,
+        &id("delete-auth-1"),
+        unix_millis(20_000),
+    )
+    .unwrap();
+    let completion =
+        complete_disposable_root_delete(&deleting, &consumed, unix_millis(40_000)).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            update_volume_owner(transaction, &deleting, None)?;
+            update_authorization(transaction, &original, &consumed)?;
+            insert_delete_completion(transaction, &completion)?;
+            transaction.execute(
+                "DELETE FROM volume_records WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let node = transition_node(&store, "node-new");
+    let mut request = residue_authority_request(&node, 6, 4);
+    request.lineage.placement_epoch = epoch(4);
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::DisposableRootDeleteCompletion { .. })
+    ));
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "DELETE FROM volume_authorizations WHERE authorization_id=$1",
+                    &[&"delete-auth-1"],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert_eq!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::DeleteIncomplete,
+        }
+    );
 }
 
 #[test]

@@ -9,12 +9,13 @@ use std::collections::BTreeSet;
 pub use cats_api::runtime_reconciliation::{
     AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
     AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
-    BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
-    DisposableRootDeleteAuthorization, Epoch, FenceEpoch, Generation, Id, LastVolumeTransition,
-    NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
-    ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt, UnixMillis,
-    VolumeAcquireRequest, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
-    VolumeTakeoverAuthorization,
+    BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DiskKind,
+    DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
+    Generation, Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest, NormalAcquireResult,
+    RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, ResidueAuthorityRetentionReason,
+    ResidueDataDirectoryLineage, ResidueReclaimProof, Revision, RuntimeResidueAuthorityOutcome,
+    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAcquireRequest, VolumeAdminState,
+    VolumeAuthorization, VolumeDurability, VolumeRecord, VolumeTakeoverAuthorization, WireU64,
 };
 use serde::{Deserialize, Serialize};
 
@@ -724,6 +725,99 @@ pub fn validate_volume_transition_evidence_bundle(
     )
     .then_some(())
     .ok_or(AuthorityError::BackendUnknown)
+}
+
+/// Classifies one exact local lineage against one repeatable-read authority
+/// snapshot.  A retained outcome is diagnostic and never authorizes I/O; the
+/// three reclaimable arms are independently closed by the public wire codec.
+pub fn classify_residue_reclaim_authority(
+    lineage: &ResidueDataDirectoryLineage,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+    consumed_authorization: Option<&AuthorizationRecord>,
+) -> Result<RuntimeResidueAuthorityOutcome> {
+    if current_volume.is_some_and(|record| validate_volume_record(record).is_err())
+        || delete_completion
+            .is_some_and(|receipt| validate_delete_completion_receipt(receipt).is_err())
+        || consumed_authorization
+            .is_some_and(|record| validate_authorization_record(record).is_err())
+        || (current_volume.is_some() && delete_completion.is_some())
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    if current_volume.is_some_and(|record| record.volume_id != lineage.volume_id)
+        || delete_completion.is_some_and(|receipt| match receipt {
+            DeleteCompletionReceipt::Normal { request, .. } => {
+                request.volume_id != lineage.volume_id
+            }
+            DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => {
+                volume_id != &lineage.volume_id
+            }
+        })
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+
+    let proof = match (current_volume, delete_completion) {
+        (Some(record), None) => Some(ResidueReclaimProof::OrdinaryRelease {
+            current_volume: record.clone(),
+        }),
+        (None, Some(completion @ DeleteCompletionReceipt::Normal { .. })) => {
+            if consumed_authorization.is_some() {
+                return Err(AuthorityError::BackendUnknown);
+            }
+            Some(ResidueReclaimProof::NormalDeleteCompletion {
+                completion: completion.clone(),
+            })
+        }
+        (None, Some(completion @ DeleteCompletionReceipt::DisposableRoot { .. })) => {
+            consumed_authorization.map(|authorization| {
+                ResidueReclaimProof::DisposableRootDeleteCompletion {
+                    completion: completion.clone(),
+                    consumed_authorization: authorization.clone(),
+                }
+            })
+        }
+        (None, None) => {
+            if consumed_authorization.is_some() {
+                return Err(AuthorityError::BackendUnknown);
+            }
+            None
+        }
+        (Some(_), Some(_)) => unreachable!("conflicting snapshot rejected above"),
+    };
+    if let Some(proof) = proof {
+        if cats_api::runtime_reconciliation::residue_reclaim_proof_is_closed(lineage, &proof) {
+            return Ok(RuntimeResidueAuthorityOutcome::Reclaimable {
+                proof: Box::new(proof),
+            });
+        }
+    }
+
+    let disposable_completion = matches!(
+        delete_completion,
+        Some(DeleteCompletionReceipt::DisposableRoot { .. })
+    );
+    let reason = if disposable_completion && lineage.disk_kind != DiskKind::Root {
+        ResidueAuthorityRetentionReason::UnsupportedDiskKind
+    } else if disposable_completion && consumed_authorization.is_none() {
+        ResidueAuthorityRetentionReason::DeleteIncomplete
+    } else if lineage.local_durable_generation > lineage.remote_durable_generation {
+        ResidueAuthorityRetentionReason::UniqueLocalTail
+    } else if current_volume.is_some_and(|record| record.lease_owner.is_some()) {
+        ResidueAuthorityRetentionReason::CurrentOrNewerOwner
+    } else if current_volume
+        .is_some_and(|record| matches!(record.admin_state, VolumeAdminState::Deleting { .. }))
+    {
+        ResidueAuthorityRetentionReason::DeleteIncomplete
+    } else if current_volume.is_some() {
+        ResidueAuthorityRetentionReason::ReleaseNotRecorded
+    } else if delete_completion.is_some() {
+        ResidueAuthorityRetentionReason::LineageMismatch
+    } else {
+        ResidueAuthorityRetentionReason::NoAuthorityRecord
+    };
+    Ok(RuntimeResidueAuthorityOutcome::Retained { reason })
 }
 
 pub fn validate_host_fence_event(event: &HostFenceEvent) -> Result<()> {

@@ -12,12 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition,
-    DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource,
-    LastVolumeTransition, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
-    ObservedDevice, ObservedRuntimeStatus, ObservedVolume, ProcessEvidence, ProgressingReason,
-    ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeTarget, UnixMillis,
-    VolumeAdminState, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
+    checkpoint_content_digest, sort_node_residue_canonically, AppliedDesiredEvidence,
+    CheckpointEvidence, Condition, DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id,
+    InventorySource, LastVolumeTransition, LifecycleAdmission, LocalLineageState,
+    LocalVolumeLineage, NodeResidue, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
+    ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
+    RuntimeTarget, UnixMillis, VolumeAdminState, VolumeAuthorityEvidence, WarmSnapshotEvidence,
+    WireU64,
 };
 use cats_storage::{
     authority::{
@@ -81,8 +82,20 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAbsence {
     Empty,
+    /// A complete source enumeration containing physical resources which do
+    /// not belong to an accepted runtime.  Residue is observation, not an
+    /// absence proof and never authorizes scanner-side cleanup.
+    Residue(Vec<NodeResidue>),
     RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpointInventoryEvidence>),
+    RuntimeCheckpointsWithResidue {
+        checkpoints: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        residue: Vec<NodeResidue>,
+    },
     AuthorizedBlockd(BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>),
+    AuthorizedBlockdWithResidue {
+        blockds: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+        residue: Vec<NodeResidue>,
+    },
     /// The metadata source contains exactly the Desired-bound volume facts
     /// supplied here and no discovered local-only candidate. These are not
     /// physical residue: a newly assigned Cat must be able to report its
@@ -424,6 +437,7 @@ struct InventoryProbeAggregation {
     volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
     blockd_by_cat: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    residue: Vec<NodeResidue>,
     coverage: InventoryCoverageAggregator,
 }
 
@@ -434,6 +448,7 @@ impl InventoryProbeAggregation {
             volumes_by_cat: BTreeMap::new(),
             checkpoints_by_cat: BTreeMap::new(),
             blockd_by_cat: BTreeMap::new(),
+            residue: Vec::new(),
             coverage: InventoryCoverageAggregator::new(),
         }
     }
@@ -452,6 +467,7 @@ fn inspect_inventory_probe(
         .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
     {
         InventoryAbsence::Empty => {}
+        InventoryAbsence::Residue(mut residue) => aggregate.residue.append(&mut residue),
         InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
             anyhow::ensure!(
                 probe.source() == InventorySource::Checkpoint,
@@ -466,6 +482,25 @@ fn inspect_inventory_probe(
                     "checkpoint inventory duplicated one Cat"
                 );
             }
+        }
+        InventoryAbsence::RuntimeCheckpointsWithResidue {
+            checkpoints,
+            mut residue,
+        } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::Checkpoint,
+                "only the checkpoint source may report Runtime checkpoints"
+            );
+            for (cat_id, checkpoint) in checkpoints {
+                anyhow::ensure!(
+                    aggregate
+                        .checkpoints_by_cat
+                        .insert(cat_id, checkpoint)
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            aggregate.residue.append(&mut residue);
         }
         InventoryAbsence::AuthorizedBlockd(blockds) => {
             anyhow::ensure!(
@@ -486,6 +521,30 @@ fn inspect_inventory_probe(
                     );
                 }
             }
+        }
+        InventoryAbsence::AuthorizedBlockdWithResidue {
+            blockds,
+            mut residue,
+        } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::DataDirectory,
+                "only the data-directory source may report authorized blockd lineage"
+            );
+            for (cat_id, by_volume) in blockds {
+                let target = aggregate.blockd_by_cat.entry(cat_id.clone()).or_default();
+                for (volume_id, blockd) in by_volume {
+                    anyhow::ensure!(
+                        blockd.checkpoint.desired.cat_id == cat_id
+                            && blockd.checkpoint.attachment.identity.volume_id == volume_id,
+                        "data-directory inventory is indexed by another Cat or Volume"
+                    );
+                    anyhow::ensure!(
+                        target.insert(volume_id, blockd).is_none(),
+                        "data-directory inventory duplicated one Cat/Volume"
+                    );
+                }
+            }
+            aggregate.residue.append(&mut residue);
         }
         InventoryAbsence::DesiredVolumes(observed) => {
             anyhow::ensure!(
@@ -1038,6 +1097,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .and_then(UnixMillis::new)
             .context("system time does not fit UnixMillis")?;
         let coverage = aggregate.coverage.finish()?;
+        canonicalize_residue(&mut aggregate.residue)?;
         let inventory_epoch = context.coordinates().inventory_epoch;
         let projection = InventoryProjectionContext {
             checkpoint_directory: &self.checkpoint_directory,
@@ -1098,7 +1158,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 observed_at_unix_ms,
                 key_ring,
                 runtimes,
-                Vec::new(),
+                aggregate.residue,
             )
             .with_node_global_process_admission(node_global_process_admission)
             .with_node_global_network_admission(node_global_network_admission)
@@ -1106,6 +1166,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .with_running_tail_admission(running_tail_admission),
         ))
     }
+}
+
+fn canonicalize_residue(residue: &mut [NodeResidue]) -> anyhow::Result<()> {
+    sort_node_residue_canonically(residue);
+    anyhow::ensure!(
+        residue.windows(2).all(|pair| pair[0] != pair[1]),
+        "inventory duplicated one Node residue"
+    );
+    Ok(())
 }
 
 pub(super) fn vmm_process_expectations(
@@ -3326,6 +3395,46 @@ mod tests {
                 ..
             }
                 if unavailable_sources == [InventorySource::MetadataStore]
+        ));
+    }
+
+    #[test]
+    fn complete_residue_is_reported_canonically_without_becoming_absence() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut all = probes(None, &calls);
+        let process = all
+            .iter_mut()
+            .find(|probe| probe.source() == InventorySource::ControlSocket)
+            .unwrap();
+        *process = Arc::new(Probe {
+            source: InventorySource::ControlSocket,
+            result: InventoryAbsence::Residue(vec![
+                NodeResidue::ControlSocket {
+                    socket_path: HostPath::new("/run/cats/z.sock").unwrap(),
+                    role_hint: None,
+                    ownership_token:
+                        cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+                },
+                NodeResidue::ControlSocket {
+                    socket_path: HostPath::new("/run/cats/a.sock").unwrap(),
+                    role_hint: None,
+                    ownership_token:
+                        cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+                },
+            ]),
+            calls: Arc::clone(&calls),
+        });
+        let scanner = CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), all).unwrap();
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(context()).unwrap()
+        else {
+            panic!("a completely enumerated residue source must remain a complete scan")
+        };
+        assert_eq!(inventory.residue().len(), 2);
+        assert!(matches!(
+            &inventory.residue()[0],
+            NodeResidue::ControlSocket { socket_path, .. }
+                if socket_path.as_str() == "/run/cats/a.sock"
         ));
     }
 

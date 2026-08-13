@@ -1846,6 +1846,87 @@ pub struct RuntimeVolumeTransitionEvidenceSuccess {
     pub direct_successor_authorization: Option<AuthorizationRecord>,
 }
 
+/// One exact local block-data lineage presented for read-only reclaim
+/// qualification.  This is physical evidence, not ownership authority.  The
+/// Control Plane must bind it to the current PostgreSQL authority snapshot and
+/// return one of the closed proofs below before the Node may delete any byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidueDataDirectoryLineage {
+    pub cat_id: Id,
+    pub disk_id: Id,
+    pub disk_kind: DiskKind,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub acquire_origin: AcquireOrigin,
+    pub node_id: Id,
+    pub placement_epoch: Epoch,
+    pub local_durable_generation: Generation,
+    pub remote_durable_generation: Generation,
+    pub remote_head: RemoteHead,
+    pub pending_pack_count: WireU64,
+    pub fenced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResidueAuthorityRequest {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub lineage: ResidueDataDirectoryLineage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResidueAuthoritySuccess {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub lineage: ResidueDataDirectoryLineage,
+    pub outcome: RuntimeResidueAuthorityOutcome,
+}
+
+/// A read-only Control decision from one repeatable-read authority snapshot.
+/// `Retained` is diagnostic only.  `Reclaimable` contains the complete proof
+/// that a Node must independently validate against its retained descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeResidueAuthorityOutcome {
+    Retained {
+        reason: ResidueAuthorityRetentionReason,
+    },
+    Reclaimable {
+        proof: Box<ResidueReclaimProof>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidueAuthorityRetentionReason {
+    NoAuthorityRecord,
+    CurrentOrNewerOwner,
+    ReleaseNotRecorded,
+    DeleteIncomplete,
+    LineageMismatch,
+    UniqueLocalTail,
+    UnsupportedDiskKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResidueReclaimProof {
+    OrdinaryRelease {
+        current_volume: VolumeRecord,
+    },
+    NormalDeleteCompletion {
+        completion: DeleteCompletionReceipt,
+    },
+    DisposableRootDeleteCompletion {
+        completion: DeleteCompletionReceipt,
+        consumed_authorization: AuthorizationRecord,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeVolumeTransitionError {
@@ -2276,8 +2357,12 @@ pub enum NodeResidue {
         ownership_token: OwnershipTokenEvidence,
     },
     DataDirectory {
+        cat_id_hint: Option<Id>,
+        disk_id_hint: Option<Id>,
         volume_id_hint: Option<Id>,
         data_directory: HostPath,
+        allocated_bytes: WireU64,
+        retention_reason: DataDirectoryRetentionReason,
         ownership_token: OwnershipTokenEvidence,
         lineage: ResidueLineageEvidence,
     },
@@ -2307,13 +2392,26 @@ pub enum NodeResidue {
 pub enum ResidueLineageEvidence {
     Unreadable,
     Readable {
-        attachment_id_hint: Option<Id>,
-        attachment_epoch_hint: Option<FenceEpoch>,
-        local_durable_generation: Generation,
-        remote_durable_generation: Generation,
-        pending_pack_count: WireU64,
-        fenced: bool,
+        lineage: Box<ResidueDataDirectoryLineage>,
     },
+}
+
+/// Scanner/reconciler explanation for keeping one directory.  This field is
+/// observation-only and is deliberately absent from every reclaim proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataDirectoryRetentionReason {
+    CurrentDesiredAttachment,
+    SupersededDesiredAttachment,
+    UnassignedCat,
+    UnreadableIdentity,
+    IncompletePhysicalInventory,
+    AuthorityProofPending,
+    AuthorityDoesNotAuthorizeReclaim,
+    UniqueLocalTail,
+    PersistentDiskRetained,
+    RootDiskRetained,
+    ExactReclaimPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3026,6 +3124,8 @@ pub enum ContractName {
     RuntimeVolumeTransitionSuccess,
     RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionEvidenceSuccess,
+    RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess,
     RuntimeVolumeTransitionError,
     Operation,
     ContractError,
