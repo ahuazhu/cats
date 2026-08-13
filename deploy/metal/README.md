@@ -110,13 +110,21 @@ Running-only completion claim does not supply an in-place lifecycle drain; if
 the Node is not already empty, stop and use a separately qualified migration
 or replacement procedure.
 
-The signed cutover launches VMM and blockd processes in independently owned
-per-Cat systemd units and reconstructs them under the Host lock, checkpoint and
-complete-inventory contracts. That mechanism is implemented, but no current
-clean SHA has yet passed the combined systemd 255 + KVM/Cloud Hypervisor
-qualification. Until it does, this runbook keeps the conservative empty-Node
-rule; the agent unit's own `KillMode=control-group` is not evidence that a
-particular release safely preserves or adopts every child.
+The signed cutover launches VMM and blockd processes as PID-1-owned sibling
+transient services in `system.slice`, not as processes in the `cats-noded`
+service cgroup. The Agent units therefore explicitly retain
+`KillMode=control-group`: a hard Agent stop reaps any Agent-cgroup helpers,
+while the independently owned per-Cat services remain available for Host-lock,
+checkpoint and complete-inventory adoption. Every per-Cat unit independently
+uses `KillMode=control-group`, so an exact lifecycle stop reaps that Cat's
+whole process group rather than leaving a helper behind. This systemd topology
+only preserves the physical candidate; adoption still requires the exact
+checkpoint, grant/epoch/attachment lineage and provider-private process proof.
+
+No current clean SHA has yet passed the combined systemd 255 + KVM/Cloud
+Hypervisor qualification. Until it does, this runbook keeps the conservative
+empty-Node rule; `KillMode` alone is not evidence that a particular release
+safely preserves or adopts a runtime or its pending data.
 
 ## Cluster configuration
 

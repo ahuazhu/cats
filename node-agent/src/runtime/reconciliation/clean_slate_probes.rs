@@ -7227,7 +7227,15 @@ fn is_cats_unit(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
+    is_reserved_runtime_unit(name) && !is_static_agent_unit(name)
+}
+
+fn is_reserved_runtime_unit(name: &str) -> bool {
     name.starts_with("cats-") && (name.ends_with(".scope") || name.ends_with(".service"))
+}
+
+fn is_static_agent_unit(name: &str) -> bool {
+    matches!(name, "cats-noded.service" | "cats-worker.service")
 }
 
 fn scan_processes(
@@ -16924,7 +16932,7 @@ mod tests {
         }
         let unknown_runtime = environment
             .systemd_root
-            .join("cats-unknown-runtime.service");
+            .join("cats-serving-22222222222222222222222222222222.service");
         std::fs::create_dir(&unknown_runtime).unwrap();
 
         // Calibrate the same reserved-namespace probe against a known residue
