@@ -230,7 +230,26 @@ async fn handle_connection(
             }
             LocalHealthDisposition::NotHealth => {}
         }
-        let route = match cache.lookup(parsed.hostname.as_str()).await {
+        let pre_forward_pending_limit =
+            match header_end.checked_add(config.max_public_request_head_bytes) {
+                Some(limit) => limit,
+                None => return,
+            };
+        if pending.len() > pre_forward_pending_limit {
+            return;
+        }
+        let lookup = match await_while_public_open(
+            cache.lookup(parsed.hostname.as_str()),
+            &mut public_reader,
+            &mut pending,
+            pre_forward_pending_limit,
+        )
+        .await
+        {
+            Ok(lookup) => lookup,
+            Err(()) => return,
+        };
+        let route = match lookup {
             Ok(CacheLookup::Positive(route)) => route,
             Ok(CacheLookup::Negative(NegativeRoute::NotFound)) => {
                 write_public_error(&mut public_writer, PublicError::NotFound).await;
@@ -246,19 +265,38 @@ async fn handle_connection(
             }
         };
 
-        let mut tunnel = match connector(Arc::clone(&route)).await {
+        let connected = match await_while_public_open(
+            connector(Arc::clone(&route)),
+            &mut public_reader,
+            &mut pending,
+            pre_forward_pending_limit,
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(()) => return,
+        };
+        let mut tunnel = match connected {
             Ok(tunnel) => tunnel,
             Err(GatewayNodeRouteV2Error::Admission(failure)) => {
                 if !failure.guard_acquired {
                     if let Some(rejection) = refreshable_rejection(failure.reason) {
-                        let _ = cache
-                            .refresh_for_later(
+                        if await_while_public_open(
+                            cache.refresh_for_later(
                                 parsed.request_kind,
                                 parsed.hostname.as_str(),
                                 route.grant_digest(),
                                 rejection,
-                            )
-                            .await;
+                            ),
+                            &mut public_reader,
+                            &mut pending,
+                            pre_forward_pending_limit,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 let response = if failure.guard_acquired
@@ -290,7 +328,17 @@ async fn handle_connection(
             return;
         }
 
-        if tunnel.write_all(&pending[..header_end]).await.is_err() {
+        let request_head = pending[..header_end].to_vec();
+        if write_tunnel_while_public_open(
+            &mut tunnel,
+            &request_head,
+            &mut public_reader,
+            &mut pending,
+            pre_forward_pending_limit,
+        )
+        .await
+        .is_err()
+        {
             return;
         }
         pending.drain(..header_end);
@@ -301,6 +349,7 @@ async fn handle_connection(
                     &mut tunnel,
                     &mut pending,
                     content_length,
+                    config.max_public_request_head_bytes,
                 )
                 .await
                 .is_err()
@@ -317,7 +366,15 @@ async fn handle_connection(
                 }
             }
         }
-        if tunnel.shutdown().await.is_err() {
+        if shutdown_tunnel_while_public_open(
+            &mut tunnel,
+            &mut public_reader,
+            &mut pending,
+            config.max_public_request_head_bytes,
+        )
+        .await
+        .is_err()
+        {
             return;
         }
         match proxy_http_response(
@@ -535,25 +592,81 @@ fn parse_request_head(bytes: &[u8], header_end: usize) -> Option<ParsedInitialRe
     })
 }
 
+async fn await_while_public_open<F, T>(
+    future: F,
+    public: &mut OwnedReadHalf,
+    pending: &mut Vec<u8>,
+    max_pending: usize,
+) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        let capacity = max_pending.saturating_sub(pending.len());
+        let mut public_chunk = [0_u8; 4 * 1024];
+        let read_limit = capacity.min(public_chunk.len()).max(1);
+        tokio::select! {
+            // The stage future and peer watcher have the same task lifetime.
+            // Dropping this select on close/error/overflow therefore cancels
+            // the stage without a detached observer or lingering authority.
+            output = &mut future => return Ok(output),
+            public_read = public.read(&mut public_chunk[..read_limit]) => {
+                let read = public_read.map_err(|_| ())?;
+                if read == 0 || capacity == 0 {
+                    return Err(());
+                }
+                pending.extend_from_slice(&public_chunk[..read]);
+            }
+        }
+    }
+}
+
+async fn write_tunnel_while_public_open<W>(
+    tunnel: &mut W,
+    bytes: &[u8],
+    public: &mut OwnedReadHalf,
+    pending: &mut Vec<u8>,
+    max_pending: usize,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    await_while_public_open(tunnel.write_all(bytes), public, pending, max_pending)
+        .await?
+        .map_err(|_| ())
+}
+
+async fn shutdown_tunnel_while_public_open<W>(
+    tunnel: &mut W,
+    public: &mut OwnedReadHalf,
+    pending: &mut Vec<u8>,
+    max_pending: usize,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    await_while_public_open(tunnel.shutdown(), public, pending, max_pending)
+        .await?
+        .map_err(|_| ())
+}
+
 async fn forward_fixed_body(
     public: &mut OwnedReadHalf,
     tunnel: &mut BoxedGatewayTunnel,
     pending: &mut Vec<u8>,
     content_length: usize,
+    max_pending: usize,
 ) -> Result<(), ()> {
-    let buffered = pending.len().min(content_length);
-    tunnel
-        .write_all(&pending[..buffered])
-        .await
-        .map_err(|_| ())?;
-    pending.drain(..buffered);
-    let remaining = content_length - buffered;
-    if remaining != 0 {
-        let mut body = public.take(remaining as u64);
-        let copied = tokio::io::copy(&mut body, tunnel).await.map_err(|_| ())?;
-        if copied != remaining as u64 {
-            return Err(());
+    let mut remaining = content_length;
+    while remaining != 0 {
+        if pending.is_empty() {
+            read_more(public, pending, max_pending).await?;
         }
+        let forwarded = remaining.min(pending.len());
+        let bytes: Vec<_> = pending.drain(..forwarded).collect();
+        write_tunnel_while_public_open(tunnel, &bytes, public, pending, max_pending).await?;
+        remaining -= forwarded;
     }
     Ok(())
 }
@@ -572,7 +685,14 @@ async fn forward_chunked_body(
         )
         .await?;
         let chunk_size = parse_chunk_size(&line).ok_or(())?;
-        tunnel.write_all(&line).await.map_err(|_| ())?;
+        write_tunnel_while_public_open(
+            tunnel,
+            &line,
+            public,
+            pending,
+            config.max_public_request_head_bytes,
+        )
+        .await?;
         if chunk_size == 0 {
             let mut trailer_bytes = 0_usize;
             loop {
@@ -585,19 +705,40 @@ async fn forward_chunked_body(
                 if trailer != b"\r\n" && !valid_trailer_line(&trailer) {
                     return Err(());
                 }
-                tunnel.write_all(&trailer).await.map_err(|_| ())?;
+                write_tunnel_while_public_open(
+                    tunnel,
+                    &trailer,
+                    public,
+                    pending,
+                    config.max_public_request_head_bytes,
+                )
+                .await?;
                 if trailer == b"\r\n" {
                     return Ok(());
                 }
             }
         }
-        forward_exact_bytes(public, tunnel, pending, chunk_size).await?;
-        ensure_pending(public, pending, 2).await?;
+        forward_exact_bytes(
+            public,
+            tunnel,
+            pending,
+            chunk_size,
+            config.max_public_request_head_bytes,
+        )
+        .await?;
+        ensure_pending(public, pending, 2, config.max_public_request_head_bytes).await?;
         if pending.get(..2) != Some(b"\r\n") {
             return Err(());
         }
-        tunnel.write_all(&pending[..2]).await.map_err(|_| ())?;
-        pending.drain(..2);
+        let chunk_end: Vec<_> = pending.drain(..2).collect();
+        write_tunnel_while_public_open(
+            tunnel,
+            &chunk_end,
+            public,
+            pending,
+            config.max_public_request_head_bytes,
+        )
+        .await?;
     }
 }
 
@@ -606,23 +747,18 @@ async fn forward_exact_bytes(
     tunnel: &mut BoxedGatewayTunnel,
     pending: &mut Vec<u8>,
     length: u64,
+    max_pending: usize,
 ) -> Result<(), ()> {
-    let buffered = u64::try_from(pending.len())
-        .ok()
-        .map_or(length, |available| available.min(length));
-    let buffered = usize::try_from(buffered).map_err(|_| ())?;
-    tunnel
-        .write_all(&pending[..buffered])
-        .await
-        .map_err(|_| ())?;
-    pending.drain(..buffered);
-    let remaining = length - buffered as u64;
-    if remaining != 0 {
-        let mut body = public.take(remaining);
-        let copied = tokio::io::copy(&mut body, tunnel).await.map_err(|_| ())?;
-        if copied != remaining {
-            return Err(());
+    let mut remaining = length;
+    while remaining != 0 {
+        if pending.is_empty() {
+            read_more(public, pending, max_pending).await?;
         }
+        let available = u64::try_from(pending.len()).map_err(|_| ())?;
+        let forwarded = usize::try_from(remaining.min(available)).map_err(|_| ())?;
+        let bytes: Vec<_> = pending.drain(..forwarded).collect();
+        write_tunnel_while_public_open(tunnel, &bytes, public, pending, max_pending).await?;
+        remaining -= u64::try_from(forwarded).map_err(|_| ())?;
     }
     Ok(())
 }
@@ -643,7 +779,7 @@ async fn take_crlf_line(
         if pending.len() >= max_bytes {
             return Err(());
         }
-        read_more(public, pending).await?;
+        read_more(public, pending, max_bytes).await?;
     }
 }
 
@@ -651,16 +787,29 @@ async fn ensure_pending(
     public: &mut OwnedReadHalf,
     pending: &mut Vec<u8>,
     required: usize,
+    max_pending: usize,
 ) -> Result<(), ()> {
     while pending.len() < required {
-        read_more(public, pending).await?;
+        read_more(public, pending, max_pending).await?;
     }
     Ok(())
 }
 
-async fn read_more(public: &mut OwnedReadHalf, pending: &mut Vec<u8>) -> Result<(), ()> {
+async fn read_more(
+    public: &mut OwnedReadHalf,
+    pending: &mut Vec<u8>,
+    max_pending: usize,
+) -> Result<(), ()> {
+    let capacity = max_pending
+        .checked_sub(pending.len())
+        .filter(|cap| *cap != 0)
+        .ok_or(())?;
     let mut chunk = [0_u8; 4 * 1024];
-    let read = public.read(&mut chunk).await.map_err(|_| ())?;
+    let read_limit = capacity.min(chunk.len());
+    let read = public
+        .read(&mut chunk[..read_limit])
+        .await
+        .map_err(|_| ())?;
     if read == 0 {
         return Err(());
     }
@@ -756,13 +905,24 @@ async fn proxy_websocket(
     request_head_end: usize,
     config: GatewayIngressConfig,
 ) {
-    if public_pending.len() > config.max_public_request_head_bytes {
+    let Some(pre_forward_pending_limit) =
+        request_head_end.checked_add(config.max_public_request_head_bytes)
+    else {
+        return;
+    };
+    if public_pending.len() > pre_forward_pending_limit {
         return;
     }
-    if tunnel
-        .write_all(&public_pending[..request_head_end])
-        .await
-        .is_err()
+    let request_head = public_pending[..request_head_end].to_vec();
+    if write_tunnel_while_public_open(
+        &mut tunnel,
+        &request_head,
+        &mut public_reader,
+        &mut public_pending,
+        pre_forward_pending_limit,
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -792,23 +952,45 @@ async fn proxy_websocket(
     }
     upstream_pending.drain(..response_head_end);
 
-    // Client bytes read past the Upgrade head are not application data until
-    // the Guest has returned an exact valid 101 response.
-    if tunnel.write_all(&public_pending).await.is_err() {
-        return;
-    }
     if public_writer.write_all(&upstream_pending).await.is_err() {
         return;
     }
 
     let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
-    let client_to_guest = tokio::io::copy(&mut public_reader, &mut tunnel_writer);
+    // Client bytes read past the Upgrade head are not application data until
+    // the Guest has returned an exact valid 101 response. After validation,
+    // keep reads independent of a blocked tunnel write so a disconnect still
+    // owns and cancels that write in this connection task.
+    let client_to_guest = forward_websocket_client(
+        &mut public_reader,
+        &mut tunnel_writer,
+        &mut public_pending,
+        config.max_public_request_head_bytes,
+    );
     let guest_to_client = tokio::io::copy(&mut tunnel_reader, &mut public_writer);
     tokio::pin!(client_to_guest);
     tokio::pin!(guest_to_client);
     tokio::select! {
         _ = &mut client_to_guest => {}
         _ = &mut guest_to_client => {}
+    }
+}
+
+async fn forward_websocket_client<W>(
+    public: &mut OwnedReadHalf,
+    tunnel: &mut W,
+    pending: &mut Vec<u8>,
+    max_pending: usize,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    loop {
+        if pending.is_empty() {
+            read_more(public, pending, max_pending).await?;
+        }
+        let bytes = std::mem::take(pending);
+        write_tunnel_while_public_open(tunnel, &bytes, public, pending, max_pending).await?;
     }
 }
 

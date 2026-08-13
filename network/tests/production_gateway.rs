@@ -84,6 +84,88 @@ struct SilentTunnel {
     dropped: Option<oneshot::Sender<()>>,
 }
 
+struct DropSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockStage {
+    HeadWrite,
+    BodyWrite,
+    Shutdown,
+}
+
+struct BlockingStageTunnel {
+    stage: BlockStage,
+    written: Arc<Mutex<Vec<u8>>>,
+    blocked: Option<oneshot::Sender<()>>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for BlockingStageTunnel {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+impl AsyncRead for BlockingStageTunnel {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        _buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for BlockingStageTunnel {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let block = self.stage == BlockStage::HeadWrite
+            || (self.stage == BlockStage::BodyWrite && !self.written.lock().unwrap().is_empty());
+        if block {
+            if let Some(blocked) = self.blocked.take() {
+                let _ = blocked.send(());
+            }
+            return Poll::Pending;
+        }
+        self.written.lock().unwrap().extend_from_slice(buffer);
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if self.stage == BlockStage::Shutdown {
+            if let Some(blocked) = self.blocked.take() {
+                let _ = blocked.send(());
+            }
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
 impl Drop for SilentTunnel {
     fn drop(&mut self) {
         if let Some(dropped) = self.dropped.take() {
@@ -165,7 +247,6 @@ async fn exact_local_health_is_the_only_request_that_bypasses_route_authority() 
     ] {
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(request).await.unwrap();
-        client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
@@ -180,7 +261,6 @@ async fn exact_local_health_is_the_only_request_that_bypasses_route_authority() 
     ] {
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(request).await.unwrap();
-        client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
@@ -442,17 +522,24 @@ async fn ambiguous_transfer_framing_is_rejected_before_route_authority() {
 
 #[tokio::test]
 async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
+    const REQUEST_HEAD: &[u8] =
+        b"POST / HTTP/1.1\r\nHost: app.cats.run\r\nTransfer-Encoding: chunked\r\n\r\n";
     let resolver: RouteResolver = Arc::new(move |hostname| {
         let route = route(hostname, b"malformed-chunk-grant");
         Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
     });
     let cache = RouteCache::new(cache_config(), resolver).unwrap();
     let (captured_sender, mut captured_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (head_forwarded_sender, mut head_forwarded_receiver) =
+        tokio::sync::mpsc::unbounded_channel();
     let connector: TunnelConnector = Arc::new(move |_| {
         let captured_sender = captured_sender.clone();
+        let head_forwarded_sender = head_forwarded_sender.clone();
         let (gateway_side, mut node_side) = tokio::io::duplex(128 * 1024);
         tokio::spawn(async move {
-            let mut request = Vec::new();
+            let mut request = vec![0_u8; REQUEST_HEAD.len()];
+            node_side.read_exact(&mut request).await.unwrap();
+            head_forwarded_sender.send(()).unwrap();
             node_side.read_to_end(&mut request).await.unwrap();
             captured_sender.send(request).unwrap();
         });
@@ -460,7 +547,6 @@ async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
     });
     let (address, shutdown, server) = spawn_gateway(cache, connector).await;
 
-    let common = b"POST / HTTP/1.1\r\nHost: app.cats.run\r\nTransfer-Encoding: chunked\r\n\r\n";
     let oversized_trailer = format!(
         "0\r\nX-Large: {}\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n",
         "x".repeat(33 * 1024)
@@ -473,17 +559,23 @@ async fn malformed_chunk_framing_never_forwards_smuggled_request_bytes() {
         b"0\r\nHost: other.cats.run\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n".to_vec(),
         oversized_trailer.into_bytes(),
     ] {
-        let mut request = common.to_vec();
+        let truncated = malformed == b"0\r\n";
+        let mut request = REQUEST_HEAD.to_vec();
         request.extend_from_slice(&malformed);
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(&request).await.unwrap();
-        client.shutdown().await.unwrap();
+        head_forwarded_receiver.recv().await.unwrap();
+        if truncated {
+            client.shutdown().await.unwrap();
+        }
         let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        if let Err(error) = client.read_to_end(&mut response).await {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         assert!(response.is_empty());
 
         let captured = captured_receiver.recv().await.unwrap();
-        assert!(captured.starts_with(common));
+        assert!(captured.starts_with(REQUEST_HEAD));
         assert!(!captured
             .windows(b"GET /smuggled".len())
             .any(|window| window == b"GET /smuggled"));
@@ -525,7 +617,6 @@ async fn authenticated_stale_rejection_refreshes_only_for_a_later_request() {
         .write_all(b"GET / HTTP/1.1\r\nHost: app.cats.run\r\n\r\n")
         .await
         .unwrap();
-    client.shutdown().await.unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).await.unwrap();
 
@@ -636,7 +727,6 @@ async fn rejected_websocket_discards_buffered_bytes_before_the_guest() {
         .write_all(b"GET /socket HTTP/1.1\r\nHost: app.cats.run\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: other.cats.run\r\n\r\n")
         .await
         .unwrap();
-    client.shutdown().await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
         Duration::from_millis(250),
@@ -700,7 +790,6 @@ async fn malformed_websocket_101_never_commits_raw_mode() {
         .write_all(b"GET /socket HTTP/1.1\r\nHost: app.cats.run\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nframe1")
         .await
         .unwrap();
-    client.shutdown().await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
         Duration::from_millis(250),
@@ -941,6 +1030,287 @@ async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot() {
 }
 
 #[tokio::test]
+async fn public_disconnect_cancels_a_blocked_cache_waiter_before_tunnel_authority() {
+    let (started_sender, started_receiver) = oneshot::channel();
+    let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+    let resolver: RouteResolver = Arc::new(move |_| {
+        let started = started_sender.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let _ = started.send(());
+            std::future::pending().await
+        }) as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let connector_calls = Arc::new(AtomicUsize::new(0));
+    let connector_calls_for_closure = Arc::clone(&connector_calls);
+    let connector: TunnelConnector = Arc::new(move |_| {
+        connector_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+        let (gateway_side, _) = tokio::io::duplex(64);
+        Box::pin(async move { Ok(Box::new(gateway_side) as BoxedGatewayTunnel) }) as TunnelFuture
+    });
+    let config = GatewayIngressConfig {
+        max_public_connections: 1,
+        shutdown_drain_deadline: Duration::from_millis(250),
+        ..GatewayIngressConfig::default()
+    };
+    let (address, shutdown, server) = spawn_gateway_with_config(cache, connector, config).await;
+
+    let mut abandoned = TcpStream::connect(address).await.unwrap();
+    abandoned
+        .write_all(b"POST /mutate HTTP/1.1\r\nHost: one.cats.run\r\nContent-Length: 4\r\n\r\ndata")
+        .await
+        .unwrap();
+    started_receiver.await.unwrap();
+    drop(abandoned);
+    assert_health_gets_released_permit(address).await;
+    assert_eq!(connector_calls.load(Ordering::SeqCst), 0);
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn public_disconnect_cancels_a_blocked_connector_before_tunnel_authority() {
+    let resolver: RouteResolver = Arc::new(move |hostname| {
+        let route = route(hostname, b"blocked-connector-grant");
+        Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let (started_sender, started_receiver) = oneshot::channel();
+    let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+    let (dropped_sender, dropped_receiver) = oneshot::channel();
+    let dropped_sender = Arc::new(Mutex::new(Some(dropped_sender)));
+    let connector: TunnelConnector = Arc::new(move |_| {
+        let _ = started_sender.lock().unwrap().take().unwrap().send(());
+        let dropped = dropped_sender.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let _drop_signal = DropSignal(Some(dropped));
+            std::future::pending::<Result<BoxedGatewayTunnel, GatewayNodeRouteV2Error>>().await
+        }) as TunnelFuture
+    });
+    let config = GatewayIngressConfig {
+        max_public_connections: 1,
+        shutdown_drain_deadline: Duration::from_millis(250),
+        ..GatewayIngressConfig::default()
+    };
+    let (address, shutdown, server) = spawn_gateway_with_config(cache, connector, config).await;
+
+    let mut abandoned = TcpStream::connect(address).await.unwrap();
+    abandoned
+        .write_all(b"POST /mutate HTTP/1.1\r\nHost: one.cats.run\r\nContent-Length: 4\r\n\r\ndata")
+        .await
+        .unwrap();
+    started_receiver.await.unwrap();
+    drop(abandoned);
+    tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+        .await
+        .expect("public disconnect did not cancel the connector future")
+        .unwrap();
+    assert_health_gets_released_permit(address).await;
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_slot() {
+    let resolver: RouteResolver = Arc::new(move |hostname| {
+        let route = route(hostname, b"overflow-connector-grant");
+        Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let (started_sender, started_receiver) = oneshot::channel();
+    let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+    let (dropped_sender, dropped_receiver) = oneshot::channel();
+    let dropped_sender = Arc::new(Mutex::new(Some(dropped_sender)));
+    let connector: TunnelConnector = Arc::new(move |_| {
+        let _ = started_sender.lock().unwrap().take().unwrap().send(());
+        let dropped = dropped_sender.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            let _drop_signal = DropSignal(Some(dropped));
+            std::future::pending::<Result<BoxedGatewayTunnel, GatewayNodeRouteV2Error>>().await
+        }) as TunnelFuture
+    });
+    let config = GatewayIngressConfig {
+        max_public_connections: 1,
+        max_public_request_head_bytes: 128,
+        shutdown_drain_deadline: Duration::from_millis(250),
+        ..GatewayIngressConfig::default()
+    };
+    let (address, shutdown, server) = spawn_gateway_with_config(cache, connector, config).await;
+
+    let mut attacker = TcpStream::connect(address).await.unwrap();
+    attacker
+        .write_all(b"POST /mutate HTTP/1.1\r\nHost: one.cats.run\r\nContent-Length: 129\r\n\r\n")
+        .await
+        .unwrap();
+    started_receiver.await.unwrap();
+    attacker.write_all(&[b'x'; 129]).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+        .await
+        .expect("bounded public overflow did not cancel the connector future")
+        .unwrap();
+    assert_health_gets_released_permit(address).await;
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn public_disconnect_cancels_each_blocked_tunnel_write_stage() {
+    const REQUEST_HEAD: &[u8] =
+        b"POST /mutate HTTP/1.1\r\nHost: one.cats.run\r\nContent-Length: 4\r\n\r\n";
+    for stage in [
+        BlockStage::HeadWrite,
+        BlockStage::BodyWrite,
+        BlockStage::Shutdown,
+    ] {
+        let resolver: RouteResolver = Arc::new(move |hostname| {
+            let route = route(hostname, b"blocked-write-grant");
+            Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+        });
+        let cache = RouteCache::new(cache_config(), resolver).unwrap();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let written_call = Arc::clone(&written);
+        let (blocked_sender, blocked_receiver) = oneshot::channel();
+        let blocked_sender = Arc::new(Mutex::new(Some(blocked_sender)));
+        let (dropped_sender, dropped_receiver) = oneshot::channel();
+        let dropped_sender = Arc::new(Mutex::new(Some(dropped_sender)));
+        let connector: TunnelConnector = Arc::new(move |_| {
+            let tunnel = BlockingStageTunnel {
+                stage,
+                written: Arc::clone(&written_call),
+                blocked: blocked_sender.lock().unwrap().take(),
+                dropped: dropped_sender.lock().unwrap().take(),
+            };
+            Box::pin(async move { Ok(Box::new(tunnel) as BoxedGatewayTunnel) }) as TunnelFuture
+        });
+        let config = GatewayIngressConfig {
+            max_public_connections: 1,
+            shutdown_drain_deadline: Duration::from_millis(250),
+            ..GatewayIngressConfig::default()
+        };
+        let (address, shutdown, server) = spawn_gateway_with_config(cache, connector, config).await;
+
+        let mut abandoned = TcpStream::connect(address).await.unwrap();
+        let mut request = REQUEST_HEAD.to_vec();
+        request.extend_from_slice(b"data");
+        abandoned.write_all(&request).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), blocked_receiver)
+            .await
+            .expect("Gateway did not reach the selected blocked tunnel stage")
+            .unwrap();
+        drop(abandoned);
+        tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+            .await
+            .expect("public disconnect did not drop the blocked tunnel")
+            .unwrap();
+
+        let expected: &[u8] = match stage {
+            BlockStage::HeadWrite => b"",
+            BlockStage::BodyWrite => REQUEST_HEAD,
+            BlockStage::Shutdown => &request,
+        };
+        assert_eq!(*written.lock().unwrap(), expected);
+        assert_health_gets_released_permit(address).await;
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+}
+
+async fn assert_health_gets_released_permit(address: std::net::SocketAddr) {
+    let mut next = TcpStream::connect(address).await.unwrap();
+    next.write_all(b"GET /healthz HTTP/1.1\r\nHost: alb.internal\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_millis(250), next.read_to_end(&mut response))
+        .await
+        .expect("released connection slot did not admit health probe")
+        .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+}
+
+#[tokio::test]
+async fn response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed() {
+    struct Case {
+        request: &'static [u8],
+        upstream: &'static [u8],
+        expected: &'static [u8],
+    }
+    for case in [
+        Case {
+            request: b"HEAD / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n",
+            expected: b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n",
+            expected: b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n",
+            expected: b"HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            expected: b"",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            expected: b"",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            expected: b"",
+        },
+        Case {
+            request: b"GET / HTTP/1.1\r\nHost: app.cats.run\r\nConnection: close\r\n\r\n",
+            upstream: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            expected: b"",
+        },
+    ] {
+        let request_bytes = case.request;
+        let upstream_bytes = case.upstream;
+        let expected_bytes = case.expected;
+        let resolver: RouteResolver = Arc::new(move |hostname| {
+            let route = route(hostname, b"response-matrix-grant");
+            Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+        });
+        let cache = RouteCache::new(cache_config(), resolver).unwrap();
+        let connector: TunnelConnector = Arc::new(move |_| {
+            let (gateway_side, mut node_side) = tokio::io::duplex(16 * 1024);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                node_side.read_to_end(&mut request).await.unwrap();
+                node_side.write_all(upstream_bytes).await.ok();
+                node_side.shutdown().await.ok();
+            });
+            Box::pin(async move { Ok(Box::new(gateway_side) as BoxedGatewayTunnel) }) as TunnelFuture
+        });
+        let (address, shutdown, server) = spawn_gateway(cache, connector).await;
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(request_bytes).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_millis(250), client.read_to_end(&mut response))
+            .await
+            .expect("response matrix connection did not close")
+            .unwrap();
+        assert_eq!(response, expected_bytes);
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn guard_acquired_failure_never_refreshes_the_route() {
     let resolve_calls = Arc::new(AtomicUsize::new(0));
     let resolve_calls_call = Arc::clone(&resolve_calls);
@@ -964,7 +1334,6 @@ async fn guard_acquired_failure_never_refreshes_the_route() {
         .write_all(b"POST /mutate HTTP/1.1\r\nHost: app.cats.run\r\nContent-Length: 0\r\n\r\n")
         .await
         .unwrap();
-    client.shutdown().await.unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).await.unwrap();
 

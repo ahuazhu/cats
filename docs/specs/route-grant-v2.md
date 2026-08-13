@@ -164,9 +164,11 @@ HEAD、204/205、304、fixed Content-Length与single canonical chunked分别按�
 closed；request `Expect`也被拒绝，因此不会破坏普通non-interim路径。WebSocket只先转发upgrade head；只有
 Guest返回exact HTTP/1.1 101、`Connection: Upgrade`与`Upgrade: websocket`后，才转发已缓冲及后续raw bytes。
 非101或畸形upgrade response关闭双方连接并丢弃client pipeline。
-等待Guest response、转发response body与WebSocket raw stream期间都持续观察public peer EOF/error；命中即
-立即drop当前tunnel并释放Node guard与Gateway connection permit。为下一request预读的public bytes只进入同一
-有硬上限的pipeline buffer，不由detached watcher消费；超限fail closed。
+从cache lookup、Node connector/open、request head/body tunnel write、tunnel request half-close，到等待Guest
+response、转发response body与WebSocket raw stream，全阶段都在同一connection task内持续观察public peer
+EOF/error与有界pipeline overflow；命中即取消当前阶段future、drop当前tunnel并释放Node guard与Gateway
+connection permit，且不得继续发送Guest mutation bytes。为下一request预读的public bytes只进入同一有硬上限
+的pipeline buffer，不由detached watcher消费；超限fail closed。
 
 Gateway -> Control Plane resolve 和 Gateway -> Node hop 必须使用独立的 workload machine identity
 并全程加密；Node 同时要求可信 Gateway identity 和有效 Grant。Grant 放在保留的内部字段，进入
@@ -498,7 +500,9 @@ observation revision，不能把desired revision塞回Grant vector。
 - same-incarnation AdmissionSnapshot的open、install、close、remove、global close、try-close与RequireIdle Busy
   source逐项拒绝Guest IPv4-only drift；两个Active Endpoint下close A不能改变B取得的target；
 - Gateway到Node每个current request最多一次TCP/TLS/HTTP attempt；TLS/HTTP/Guest失败和typed rejection均不
-  自动重放。`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把guard/permit归零；
+  自动重放。阻塞cache waiter、connector、request head/body write或request half-close时public disconnect必须
+  立即drop同栈future且不再产生Guest bytes；`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把
+  guard/permit归零；
 - pre-admission stale rejection与新resolve竞争时，旧 digest不能删除新entry；当前POST和WebSocket
   upgrade都不重放；
 - per-replica LRU、negative backoff、singleflight、waiter和resolve semaphore在高基数hostname与慢
