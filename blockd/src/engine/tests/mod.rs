@@ -17,6 +17,7 @@ struct Env {
     blob: Arc<dyn BlobStore>,
     meta: Arc<SqliteMetadataStore>,
     data_dir: PathBuf,
+    initial_epoch: i64,
 }
 
 const VOL: &str = "vol_test";
@@ -27,13 +28,14 @@ fn env() -> Env {
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let initial_epoch = install_test_grant(meta.as_ref(), "attA");
     let data_dir = dir.path().join("data");
     Env {
         _dir: dir,
         blob,
         meta,
         data_dir,
+        initial_epoch,
     }
 }
 
@@ -318,9 +320,10 @@ fn write_serving_identity(fixture: &ServingFixture) {
 }
 
 fn attach(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
-    install_test_grant(env.meta.as_ref(), attachment);
-    ChunkEngine::attach_granted(
+    let epoch = install_test_grant(env.meta.as_ref(), attachment);
+    ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &env.data_dir, attachment),
+        epoch,
         env.blob.clone(),
         env.meta.clone(),
     )
@@ -329,13 +332,31 @@ fn attach(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
 
 /// Attach on a different "host" (fresh data dir).
 fn attach_at(env: &Env, attachment: &str, dir: &str) -> Arc<ChunkEngine> {
-    install_test_grant(env.meta.as_ref(), attachment);
-    ChunkEngine::attach_granted(
+    let epoch = install_test_grant(env.meta.as_ref(), attachment);
+    ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, env.data_dir.parent().unwrap().join(dir), attachment),
+        epoch,
         env.blob.clone(),
         env.meta.clone(),
     )
     .unwrap()
+}
+
+#[test]
+fn stale_caller_cannot_adopt_a_newer_epoch_for_the_same_attachment_id() {
+    let env = env();
+    let stale_epoch = env.initial_epoch;
+    let current_epoch = install_test_grant(env.meta.as_ref(), "attA");
+    assert!(current_epoch > stale_epoch, "positive epoch calibration");
+
+    let result = ChunkEngine::attach_granted_epoch(
+        EngineConfig::new(VOL, &env.data_dir, "attA"),
+        stale_epoch,
+        env.blob.clone(),
+        env.meta.clone(),
+    );
+
+    assert!(matches!(result, Err(EngineError::Meta(MetaError::Fenced))));
 }
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -630,12 +651,12 @@ fn flush_commits_and_survives_full_cache_wipe() {
 const NO_TIMER: u64 = 0;
 
 fn attach_relaxed(env: &Env, attachment: &str) -> Arc<ChunkEngine> {
-    install_test_grant(env.meta.as_ref(), attachment);
+    let epoch = install_test_grant(env.meta.as_ref(), attachment);
     let mut cfg = EngineConfig::new(VOL, &env.data_dir, attachment);
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).unwrap()
+    ChunkEngine::attach_granted_epoch(cfg, epoch, env.blob.clone(), env.meta.clone()).unwrap()
 }
 
 #[test]
@@ -646,12 +667,12 @@ fn relaxed_flush_acks_locally_and_the_drain_publishes() {
     )));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, counting.clone(), meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, counting.clone(), meta).unwrap();
 
     e.write(0, &pattern(4096, 7)).unwrap();
     let acked = e.flush().unwrap();
@@ -693,12 +714,12 @@ fn one_large_barrier_is_split_into_bounded_contiguous_packs() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
     let first = pattern(DENSE_BYTES, 61);
     let second = pattern(DENSE_BYTES, 62);
     e.write(0, &first).unwrap();
@@ -737,9 +758,10 @@ fn one_large_barrier_is_split_into_bounded_contiguous_packs() {
     );
     e.detach().unwrap();
 
-    install_test_grant_at(dir.path().join("meta.db"), "attB");
-    let restored = ChunkEngine::attach_granted(
+    let restored_epoch = install_test_grant_at(dir.path().join("meta.db"), "attB");
+    let restored = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        restored_epoch,
         blob,
         meta,
     )
@@ -766,9 +788,10 @@ fn strict_flush_waits_for_every_bounded_pack_in_one_barrier() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob,
         meta.clone(),
     )
@@ -797,13 +820,13 @@ fn failed_multi_pack_stage_queues_its_durable_prefix_and_restores_the_tail() {
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let data_dir = dir.path().join("data");
     let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
     let first = pattern(DENSE_BYTES, 71);
     let second = pattern(DENSE_BYTES, 72);
     let third = pattern(DENSE_BYTES, 73);
@@ -830,9 +853,10 @@ fn failed_multi_pack_stage_queues_its_durable_prefix_and_restores_the_tail() {
     assert_eq!(e.drain_staged().unwrap(), 3);
     e.detach().unwrap();
 
-    install_test_grant(meta.as_ref(), "attB");
-    let restored = ChunkEngine::attach_granted(
+    let restored_epoch = install_test_grant(meta.as_ref(), "attB");
+    let restored = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        restored_epoch,
         blob,
         meta,
     )
@@ -857,7 +881,7 @@ fn restart_scans_a_durable_split_prefix_without_breaking_the_watermark() {
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let data_dir = dir.path().join("data");
     let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
     cfg.durability = DurabilityMode::Relaxed {
@@ -866,7 +890,7 @@ fn restart_scans_a_durable_split_prefix_without_breaking_the_watermark() {
     let first = pattern(DENSE_BYTES, 74);
     let second = pattern(DENSE_BYTES, 75);
     {
-        let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+        let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
         e.write(0, &first).unwrap();
         e.write(CHUNK_SIZE as u64, &second).unwrap();
         let error = {
@@ -879,10 +903,15 @@ fn restart_scans_a_durable_split_prefix_without_breaking_the_watermark() {
         // the renamed pack prefix and persistent dirty bitmap/cache.
     }
     release_current_test_grant(meta.as_ref());
-    install_test_grant(meta.as_ref(), "attB");
+    let recovered_epoch = install_test_grant(meta.as_ref(), "attB");
 
-    let recovered =
-        ChunkEngine::attach_granted(EngineConfig::new(VOL, &data_dir, "attB"), blob, meta).unwrap();
+    let recovered = ChunkEngine::attach_granted_epoch(
+        EngineConfig::new(VOL, &data_dir, "attB"),
+        recovered_epoch,
+        blob,
+        meta,
+    )
+    .unwrap();
     assert_eq!(
         recovered.generation(),
         1,
@@ -914,13 +943,13 @@ fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let data_dir = dir.path().join("data");
     let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
     let mut expected = vec![0u8; CHUNK_SIZE as usize];
 
     for generation in 0..3usize {
@@ -979,9 +1008,10 @@ fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
     );
     e.detach().unwrap();
 
-    install_test_grant(meta.as_ref(), "attB");
-    let restored = ChunkEngine::attach_granted(
+    let restored_epoch = install_test_grant(meta.as_ref(), "attB");
+    let restored = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        restored_epoch,
         blob,
         meta,
     )
@@ -1003,7 +1033,7 @@ fn relaxed_restart_rebuilds_the_local_watermark_without_remote_writes() {
     let faulty = Arc::new(FaultyBlobStore::new(healthy.clone()));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let data_dir = dir.path().join("data");
 
     {
@@ -1011,7 +1041,8 @@ fn relaxed_restart_rebuilds_the_local_watermark_without_remote_writes() {
         cfg.durability = DurabilityMode::Relaxed {
             drain_interval_ms: NO_TIMER,
         };
-        let e = ChunkEngine::attach_granted(cfg, healthy.clone(), meta.clone()).unwrap();
+        let e =
+            ChunkEngine::attach_granted_epoch(cfg, epoch, healthy.clone(), meta.clone()).unwrap();
         e.write(100, &pattern(4096, 1)).unwrap();
         assert_eq!(e.flush().unwrap(), 1);
         // Overwrite the same pages in a second staged pack: replay order
@@ -1028,7 +1059,7 @@ fn relaxed_restart_rebuilds_the_local_watermark_without_remote_writes() {
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, faulty.clone(), meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, faulty.clone(), meta).unwrap();
     assert_eq!(
         faulty.fail_puts.load(Ordering::SeqCst),
         10,
@@ -1064,12 +1095,12 @@ fn remote_outage_is_observable_but_does_not_fail_relaxed_flush() {
     faulty.fail_puts.store(u64::MAX, Ordering::SeqCst);
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 50,
     };
-    let e = ChunkEngine::attach_granted(cfg, faulty, meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, faulty, meta).unwrap();
 
     e.write(0, &pattern(4096, 9)).unwrap();
     assert_eq!(
@@ -1104,11 +1135,12 @@ fn relaxed_cold_cache_write_and_flush_issue_no_remote_read() {
         Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "seed");
+    let seed_epoch = install_test_grant(meta.as_ref(), "seed");
     let original = pattern(CHUNK_SIZE as usize, 71);
     {
-        let e = ChunkEngine::attach_granted(
+        let e = ChunkEngine::attach_granted_epoch(
             EngineConfig::new(VOL, dir.path().join("seed"), "seed"),
+            seed_epoch,
             healthy.clone(),
             meta.clone(),
         )
@@ -1118,13 +1150,13 @@ fn relaxed_cold_cache_write_and_flush_issue_no_remote_read() {
         e.detach().unwrap();
     }
 
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let switched = Arc::new(SwitchableFailureBlob::new(healthy.clone()));
     let mut cfg = EngineConfig::new(VOL, dir.path().join("relaxed"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, switched.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, switched.clone(), meta.clone()).unwrap();
     let before = switched.get_count();
     switched.set_fail_gets(true);
     let update = pattern(4096, 99);
@@ -1147,9 +1179,10 @@ fn relaxed_cold_cache_write_and_flush_issue_no_remote_read() {
     );
     e.drain_staged().unwrap();
     e.detach().unwrap();
-    install_test_grant(meta.as_ref(), "attB");
-    let restored = ChunkEngine::attach_granted(
+    let restored_epoch = install_test_grant(meta.as_ref(), "attB");
+    let restored = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("restored"), "attB"),
+        restored_epoch,
         healthy,
         meta,
     )
@@ -1170,11 +1203,12 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "seed");
+    let seed_epoch = install_test_grant(meta.as_ref(), "seed");
     let original = pattern(CHUNK_SIZE as usize, 81);
     {
-        let seed = ChunkEngine::attach_granted(
+        let seed = ChunkEngine::attach_granted_epoch(
             EngineConfig::new(VOL, dir.path().join("seed"), "seed"),
+            seed_epoch,
             blob.clone(),
             meta.clone(),
         )
@@ -1184,7 +1218,7 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
         seed.detach().unwrap();
     }
 
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("relaxed"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
@@ -1193,7 +1227,7 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
     // so it may enter only after the first pack drains; that holds it
     // deterministically in the freeze-to-journal interval.
     cfg.max_staged_bytes = 1 << 20;
-    let e = ChunkEngine::attach_granted(cfg, blob, meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob, meta).unwrap();
     assert!(
         !e.state.lock().unwrap().map[0].is_hole(),
         "the committed seed chunk must be present before the relaxed writes"
@@ -1278,7 +1312,13 @@ fn local_quota_evicts_clean_chunks_but_preserves_committed_reads() {
     // One dense chunk plus one same-sized pending pack fits; retaining two
     // dense clean chunks while staging the second does not.
     cfg.max_local_bytes = 9 << 20;
-    let e = ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(
+        cfg,
+        env.initial_epoch,
+        env.blob.clone(),
+        env.meta.clone(),
+    )
+    .unwrap();
     let first = pattern(CHUNK_SIZE as usize, 31);
     let second = pattern(CHUNK_SIZE as usize, 47);
 
@@ -1312,7 +1352,13 @@ fn relaxed_dirty_cache_reserves_pack_space_and_cannot_deadlock_the_quota() {
     // chunks do not, so the second WRITE must first stage the first one and
     // let the background publisher reclaim its reservation.
     cfg.max_local_bytes = 10 << 20;
-    let e = ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(
+        cfg,
+        env.initial_epoch,
+        env.blob.clone(),
+        env.meta.clone(),
+    )
+    .unwrap();
     let first = pattern(CHUNK_SIZE as usize, 61);
     let second = pattern(CHUNK_SIZE as usize, 73);
     e.write(0, &first).unwrap();
@@ -1374,20 +1420,21 @@ fn failed_detach_keeps_the_journal_and_lease_for_retry() {
     let faulty = Arc::new(FaultyBlobStore::new(healthy.clone()));
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data-a"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, faulty.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, faulty.clone(), meta.clone()).unwrap();
     e.write(0, &pattern(4096, 4)).unwrap();
     e.flush().unwrap();
 
     faulty.fail_puts.store(u64::MAX, Ordering::SeqCst);
     assert!(e.detach().is_err(), "the mandatory drain must fail closed");
     assert_eq!(e.durability_status().unpublished_generations, 1);
-    let competitor = ChunkEngine::attach_granted(
+    let competitor = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        epoch,
         healthy.clone(),
         meta.clone(),
     );
@@ -1398,9 +1445,10 @@ fn failed_detach_keeps_the_journal_and_lease_for_retry() {
 
     faulty.fail_puts.store(0, Ordering::SeqCst);
     e.detach().unwrap();
-    install_test_grant(meta.as_ref(), "attB");
-    let next = ChunkEngine::attach_granted(
+    let next_epoch = install_test_grant(meta.as_ref(), "attB");
+    let next = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        next_epoch,
         healthy,
         meta,
     )
@@ -1635,12 +1683,12 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
 
     for i in 0..5u8 {
         e.write(i as u64 * CHUNK_SIZE as u64, &pattern(4096, i + 1))
@@ -1659,10 +1707,10 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
     e.detach().unwrap();
 
     // A fresh host sees every pack's content: the batch really committed.
-    install_test_grant_at(dir.path().join("meta.db"), "attB");
+    let restored_epoch = install_test_grant_at(dir.path().join("meta.db"), "attB");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data-b"), "attB");
     cfg.durability = DurabilityMode::Strict;
-    let e = ChunkEngine::attach_granted(cfg, blob, meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, restored_epoch, blob, meta).unwrap();
     assert_eq!(e.generation(), 5);
     for i in 0..5u8 {
         let mut back = vec![0u8; 4096];
@@ -1676,13 +1724,13 @@ fn batched_drain_publishes_the_whole_queue_in_one_cas() {
 fn final_batch_record_is_byte_stable_when_recovery_uses_smaller_prefixes() {
     let dir = tempfile::tempdir().unwrap();
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::BackendBeforeCas);
+    let (meta, epoch) = fault_meta(&dir, CasFault::BackendBeforeCas);
     let data_dir = dir.path().join("data");
     let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
     e.write(0, &pattern(4096, 31)).unwrap();
     assert_eq!(e.flush().unwrap(), 1);
     e.write(CHUNK_SIZE as u64, &pattern(4096, 32)).unwrap();
@@ -1712,9 +1760,10 @@ fn final_batch_record_is_byte_stable_when_recovery_uses_smaller_prefixes() {
     // batch prefix but not the identity or bytes of B's final record.
     drop(e);
     release_current_test_grant(meta.as_ref());
-    install_test_grant_at(dir.path().join("meta.db"), "attB");
-    let recovered = ChunkEngine::attach_granted(
+    let recovered_epoch = install_test_grant_at(dir.path().join("meta.db"), "attB");
+    let recovered = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &data_dir, "attB"),
+        recovered_epoch,
         blob.clone(),
         meta.clone(),
     )
@@ -1743,13 +1792,13 @@ fn strict_recovery_cleans_every_pack_covered_by_a_final_record_only_batch() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
     let data_dir = dir.path().join("data");
     let mut cfg = EngineConfig::new(VOL, &data_dir, "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: NO_TIMER,
     };
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta.clone()).unwrap();
     e.write(0, &pattern(4096, 41)).unwrap();
     e.flush().unwrap();
     e.write(CHUNK_SIZE as u64, &pattern(4096, 42)).unwrap();
@@ -1792,9 +1841,10 @@ fn strict_recovery_cleans_every_pack_covered_by_a_final_record_only_batch() {
     // intermediate record that the batching model never writes.
     drop(e);
     release_current_test_grant(meta.as_ref());
-    install_test_grant_at(dir.path().join("meta.db"), "attB");
-    let recovered = ChunkEngine::attach_granted(
+    let recovered_epoch = install_test_grant_at(dir.path().join("meta.db"), "attB");
+    let recovered = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &data_dir, "attB"),
+        recovered_epoch,
         blob,
         meta.clone(),
     )
@@ -1826,9 +1876,10 @@ fn generation_exhaustion_rejects_a_batch_before_any_remote_write() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob.clone(),
         meta.clone(),
     )
@@ -1900,9 +1951,10 @@ fn malformed_batch_lineage_is_rejected_before_any_remote_write() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob.clone(),
         meta.clone(),
     )
@@ -1988,9 +2040,10 @@ fn malformed_pack_entries_fail_before_any_remote_write_or_indexing() {
         forced_head_epoch: None,
     });
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant_at(dir.path().join("meta.db"), "attA");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob.clone(),
         meta.clone(),
     )
@@ -2142,8 +2195,9 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
         cas_calls: AtomicU64::new(0),
     });
     let data_dir = dir.path().join("data-a");
-    let e = ChunkEngine::attach_granted(
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &data_dir, "attA"),
+        1,
         blob.clone(),
         meta.clone(),
     )
@@ -2163,9 +2217,10 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
         .is_none());
     e.detach().unwrap();
 
-    install_test_grant_at(dir.path().join("meta.db"), "attB");
-    let restored = ChunkEngine::attach_granted(
+    let restored_epoch = install_test_grant_at(dir.path().join("meta.db"), "attB");
+    let restored = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data-b"), "attB"),
+        restored_epoch,
         blob,
         meta,
     )
@@ -2181,9 +2236,10 @@ fn committed_cas_with_a_lost_response_is_reconciled_without_fencing() {
 /// passes its own `byte` so a failure names the test that wrote the data.
 fn dirty_engine_with_fault(dir: &tempfile::TempDir, fault: CasFault, byte: u8) -> Arc<ChunkEngine> {
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(dir, fault);
-    let engine = ChunkEngine::attach_granted(
+    let (meta, epoch) = fault_meta(dir, fault);
+    let engine = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob,
         meta,
     )
@@ -2192,18 +2248,19 @@ fn dirty_engine_with_fault(dir: &tempfile::TempDir, fault: CasFault, byte: u8) -
     engine
 }
 
-fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> Arc<LostCasResponseMeta> {
+fn fault_meta(dir: &tempfile::TempDir, fault: CasFault) -> (Arc<LostCasResponseMeta>, i64) {
     let sqlite = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     sqlite.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(sqlite.as_ref(), "attA");
+    let epoch = install_test_grant(sqlite.as_ref(), "attA");
     let inner: Arc<dyn MetadataStore> = sqlite;
-    Arc::new(LostCasResponseMeta {
+    let meta = Arc::new(LostCasResponseMeta {
         inner,
         fault: Mutex::new(Some(fault)),
         fail_next_load: AtomicBool::new(false),
         forced_head_size: AtomicU64::new(0),
         cas_calls: AtomicU64::new(0),
-    })
+    });
+    (meta, epoch)
 }
 
 #[test]
@@ -2253,9 +2310,10 @@ fn an_authoritative_generation_beyond_the_target_fences() {
 fn a_target_head_with_a_different_size_cannot_reconcile_a_lost_response() {
     let dir = tempfile::tempdir().unwrap();
     let blob: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let meta = fault_meta(&dir, CasFault::ResponseLostThenSizeChanged);
-    let e = ChunkEngine::attach_granted(
+    let (meta, epoch) = fault_meta(&dir, CasFault::ResponseLostThenSizeChanged);
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, dir.path().join("data"), "attA"),
+        epoch,
         blob,
         meta.clone(),
     )
@@ -2313,7 +2371,13 @@ fn eager_committer_drains_a_burst_without_the_timer() {
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 3_600_000,
     };
-    let e = ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(
+        cfg,
+        env.initial_epoch,
+        env.blob.clone(),
+        env.meta.clone(),
+    )
+    .unwrap();
     for i in 0..8u8 {
         e.write(i as u64 * CHUNK_SIZE as u64, &pattern(4096, i + 1))
             .unwrap();
@@ -2507,7 +2571,7 @@ fn a_slow_store_burst_publishes_only_on_the_background_committer() {
     });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 3_600_000,
@@ -2520,7 +2584,7 @@ fn a_slow_store_burst_publishes_only_on_the_background_committer() {
         cfg.max_staged_bytes, DEFAULT_MAX_STAGED_BYTES,
         "the burst must exercise the production-default byte cap"
     );
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta).unwrap();
 
     std::thread::scope(|scope| {
         // If any assertion below unwinds, release the remote call before the
@@ -2639,13 +2703,13 @@ fn backpressure_waits_for_the_background_publisher() {
     });
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     meta.create_volume(VOL, SIZE).unwrap();
-    install_test_grant(meta.as_ref(), "attA");
+    let epoch = install_test_grant(meta.as_ref(), "attA");
     let mut cfg = EngineConfig::new(VOL, dir.path().join("data"), "attA");
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 50,
     };
     cfg.max_staged_packs = 1;
-    let e = ChunkEngine::attach_granted(cfg, blob.clone(), meta).unwrap();
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, blob.clone(), meta).unwrap();
     // Must outlive every blocking operation but drop before the engine, so a
     // panic cannot strand the committer while ChunkEngine joins it.
     let _release = put_gate.release_on_drop();
@@ -2747,8 +2811,8 @@ fn attach_slower_than_the_lease_ttl_does_not_self_fence() {
     );
     let mut cfg = EngineConfig::new(VOL, &env.data_dir, "attB");
     cfg.lease_ttl_ms = 100;
-    install_test_grant(env.meta.as_ref(), "attB");
-    let e = ChunkEngine::attach_granted(cfg, slow, env.meta.clone()).unwrap();
+    let epoch = install_test_grant(env.meta.as_ref(), "attB");
+    let e = ChunkEngine::attach_granted_epoch(cfg, epoch, slow, env.meta.clone()).unwrap();
     // Outlive several renewal intervals to prove the thread keeps the
     // lease alive rather than the attach merely squeaking through.
     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -2765,9 +2829,10 @@ fn sizing_env() -> (Env, Arc<SizingBlob>) {
 }
 
 fn attach_with(env: &Env, blob: Arc<dyn BlobStore>, attachment: &str) -> Arc<ChunkEngine> {
-    install_test_grant(env.meta.as_ref(), attachment);
-    ChunkEngine::attach_granted(
+    let epoch = install_test_grant(env.meta.as_ref(), attachment);
+    ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &env.data_dir, attachment),
+        epoch,
         blob,
         env.meta.clone(),
     )
@@ -3384,9 +3449,10 @@ fn hole_reads_do_not_touch_the_blobstore() {
     }
     fs::remove_dir_all(&env.data_dir).unwrap();
     let counting = Arc::new(CountingBlob::new(env.blob.clone()));
-    install_test_grant(env.meta.as_ref(), "attB");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant(env.meta.as_ref(), "attB");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig::new(VOL, &env.data_dir, "attB"),
+        epoch,
         counting.clone(),
         env.meta.clone(),
     )
@@ -3435,8 +3501,9 @@ fn failed_upload_leaves_pack_and_recovery_replays_it() {
     let faulty = Arc::new(FaultyBlobStore::new(env.blob.clone()));
     let data = pattern(2048, 7);
     {
-        let e = ChunkEngine::attach_granted(
+        let e = ChunkEngine::attach_granted_epoch(
             EngineConfig::new(VOL, &env.data_dir, "attA"),
+            env.initial_epoch,
             faulty.clone(),
             env.meta.clone(),
         )
@@ -3497,8 +3564,8 @@ fn detaching_does_not_wait_out_the_lease_renewal_interval() {
     // is sleeping out ttl/3 put that whole interval on the critical path of
     // every one of them, per volume.
     let env = env();
-    install_test_grant(env.meta.as_ref(), "attDetach");
-    let e = ChunkEngine::attach_granted(
+    let epoch = install_test_grant(env.meta.as_ref(), "attDetach");
+    let e = ChunkEngine::attach_granted_epoch(
         EngineConfig {
             volume_id: VOL.into(),
             data_dir: env.data_dir.clone(),
@@ -3509,6 +3576,7 @@ fn detaching_does_not_wait_out_the_lease_renewal_interval() {
             max_staged_packs: DEFAULT_MAX_STAGED_PACKS,
             max_local_bytes: DEFAULT_MAX_LOCAL_BYTES,
         },
+        epoch,
         env.blob.clone(),
         env.meta.clone(),
     )

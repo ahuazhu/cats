@@ -64,8 +64,9 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
 
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     {
-        let engine = ChunkEngine::attach_granted(
+        let engine = ChunkEngine::attach_granted_epoch(
             EngineConfig::new("vol_live", dir.path().join("data-a"), "att_a"),
+            1,
             blob.clone(),
             meta.clone(),
         )
@@ -77,8 +78,9 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
     // Fresh "host", empty cache: everything must come back from S3.
     meta.install_grant_for_tests("vol_live", "att_b", 2)
         .unwrap();
-    let engine = ChunkEngine::attach_granted(
+    let engine = ChunkEngine::attach_granted_epoch(
         EngineConfig::new("vol_live", dir.path().join("data-b"), "att_b"),
+        2,
         blob,
         meta,
     )

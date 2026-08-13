@@ -106,7 +106,8 @@ impl Env {
             .unwrap();
         let mut cfg = EngineConfig::new("vol_commit", self.data_dir(), attachment);
         cfg.lease_ttl_ms = bench_lease_ttl_ms();
-        ChunkEngine::attach_granted(cfg, self.blob.clone(), self.meta.clone()).expect("reattach")
+        ChunkEngine::attach_granted_epoch(cfg, epoch, self.blob.clone(), self.meta.clone())
+            .expect("reattach")
     }
 }
 
@@ -121,7 +122,8 @@ fn env(chunks: u64, run: &str) -> Env {
     let meta_for_reattach = meta.clone();
     let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    let engine = ChunkEngine::attach_granted(cfg, published.clone(), meta).expect("attach");
+    let engine =
+        ChunkEngine::attach_granted_epoch(cfg, 1, published.clone(), meta).expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -148,7 +150,8 @@ fn relaxed_env(chunks: u64, run: &str) -> Env {
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 0,
     };
-    let engine = ChunkEngine::attach_granted(cfg, published.clone(), meta).expect("attach");
+    let engine =
+        ChunkEngine::attach_granted_epoch(cfg, 1, published.clone(), meta).expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,

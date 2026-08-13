@@ -52,8 +52,9 @@ impl Harness {
         meta.create_volume(VOLUME_ID, VOLUME_SIZE).expect("volume");
         meta.install_grant_for_tests(VOLUME_ID, "att-vhu", 1)
             .expect("external grant");
-        let engine = ChunkEngine::attach_granted(
+        let engine = ChunkEngine::attach_granted_epoch(
             EngineConfig::new(VOLUME_ID, dir.path().join("data"), "att-vhu"),
+            1,
             blob,
             meta.clone(),
         )

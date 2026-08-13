@@ -3910,12 +3910,17 @@ while True:
         metadata
             .create_volume("vol_listener_probe", 16 * 1024 * 1024)
             .unwrap();
-        let engine = ChunkEngine::attach(
+        let epoch = 1;
+        metadata
+            .install_grant_for_tests("vol_listener_probe", "att_listener_probe", epoch)
+            .unwrap();
+        let engine = ChunkEngine::attach_granted_epoch(
             EngineConfig::new(
                 "vol_listener_probe",
                 directory.path().join("data"),
                 "att_listener_probe",
             ),
+            epoch,
             blob,
             metadata,
         )

@@ -170,7 +170,8 @@ fn attach(env: &Env, volume: &str, size: u64) -> Arc<ChunkEngine> {
     // remote store; the 5 s default lease would expire under the copy path and
     // fail the CAS, which is a property of the benchmark, not of the code.
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).expect("attach")
+    ChunkEngine::attach_granted_epoch(cfg, epoch, env.blob.clone(), env.meta.clone())
+        .expect("attach")
 }
 
 /// The old path: write the image through the engine and commit it.

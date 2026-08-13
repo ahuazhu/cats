@@ -709,23 +709,6 @@ impl ChunkEngine {
         }
     }
 
-    /// Adopt an exact lease grant already recorded by an external authority.
-    ///
-    /// This compatibility data-plane entry point never creates ownership and
-    /// never increments an epoch. Production Runtime uses
-    /// [`Self::attach_authorized_serving`], whose grant also carries the full
-    /// immutable lineage. This narrower form remains for data-plane contract
-    /// fixtures backed by the legacy metadata projection.
-    #[doc(hidden)]
-    pub fn attach_granted(
-        cfg: EngineConfig,
-        blob: Arc<dyn BlobStore>,
-        meta: Arc<dyn MetadataStore>,
-    ) -> Result<Arc<Self>> {
-        let head = meta.load_head(&cfg.volume_id)?;
-        Self::attach_granted_epoch(cfg, head.lease_epoch, blob, meta)
-    }
-
     /// Adopt the caller's exact externally granted owner/epoch tuple through
     /// the compatibility metadata data plane. Unlike the retired attach path,
     /// this performs no acquire, expiry takeover, or epoch mutation.
