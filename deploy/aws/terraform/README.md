@@ -81,7 +81,43 @@ that still says `one_nat_gateway_per_az = false`, then review the refresh-only
 and normal saved plans and stop if either proposes any NAT gateway or
 private-route change.
 
-Four things about this stack are easy to get wrong.
+The following platform transitions require exact review.
+
+**Worker identity is a stable map, not a slot.** The production state was
+imported with `aws_instance.metal_worker[0]` = `metal-2` and
+`aws_instance.metal_worker[1]` = `metal-1`. The checked-in `moved` blocks
+preserve exactly that mapping. Before the first apply with this configuration,
+replace the old private count/list inputs with the exact `metal_workers` map in
+`platform.tfvars.example`, keeping `metal-2.root_volume_encrypted = false` and
+`metal-1.root_volume_encrypted = true`. Save and review the ordinary plan: it
+must contain neither worker replacement nor worker deletion. Apply that same
+saved plan to record the stable addresses, then export the deployment input:
+
+```sh
+terraform output -json metal_worker_instance_ids
+```
+
+Copy the resulting exact two-entry map, without renaming keys, to the
+production-infrastructure stack's `metal_worker_instances`. Its next saved plan
+must contain one SSM association for each of `metal-2` and `metal-1`.
+
+`metal-2` has the one known unencrypted legacy root. Terraform deliberately
+does not ignore that attribute and cannot make `prevent_destroy` conditional.
+Do not change it during the address migration above. In the approved
+maintenance window, first stop or isolate the empty Host and arrange its fresh
+A23 NodeIdentity/Route credentials, then change only
+`metal-2.root_volume_encrypted` from `false` to `true` and create the explicit
+saved plan:
+
+```sh
+terraform plan -out=metal-2-root-encryption.tfplan
+terraform show metal-2-root-encryption.tfplan
+```
+
+Independent review must find exactly one replacement,
+`aws_instance.metal_worker["metal-2"]`, and no change to
+`aws_instance.metal_worker["metal-1"]`. Apply only that exact saved plan. Keep
+the value `true` afterward; reverting it would request another replacement.
 
 **The certificate cannot validate before the registrar moves.** A Route 53
 hosted zone cannot be transferred between accounts, so this stack creates a new

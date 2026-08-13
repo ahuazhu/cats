@@ -33,13 +33,22 @@ alert_email_recipients = {
   primary_oncall = "REPLACE_WITH_OPERATOR_ALERT_EMAIL"
 }
 
-# Worker capacity. Two stable identities across private subnets let Cats cold
-# restore onto the surviving host after one bare-metal worker is lost. The
-# imported live cats-metal-2 occupies Terraform index 0; keep it first so the
-# next apply does not relabel it. The new cats-metal-1 is appended at index 1,
-# joins cordoned, and must pass the operator checks before scheduling.
-metal_worker_instance_count = 2
-metal_worker_names          = ["cats-metal-2", "cats-metal-1"]
+# Worker capacity. Stable keys replace positional identities. These subnet
+# indices match the imported production Hosts exactly: legacy metal-2 is in the
+# first private subnet and metal-1 is in the second. false records metal-2's
+# current unencrypted root so an ordinary plan does not replace it. In the
+# approved maintenance window, change only that value to true and retain the
+# exact reviewed replacement plan; never set metal-1 back to false.
+metal_workers = {
+  "metal-2" = {
+    subnet_index          = 0
+    root_volume_encrypted = false
+  }
+  "metal-1" = {
+    subnet_index          = 1
+    root_volume_encrypted = true
+  }
+}
 
 # DNS. Leave wait_for_certificate_validation false until the registrar points
 # at this zone's name servers; ACM cannot validate before that and the apply

@@ -519,11 +519,11 @@ resource "aws_iam_role_policy" "metal_worker_chunkstore" {
 # install-worker.sh mounts it at /var/lib/cats; it is ephemeral cache in front
 # of the S3 ChunkStore, so a stop/start losing it is by design.
 resource "aws_instance" "metal_worker" {
-  count = var.metal_worker_instance_count
+  for_each = var.metal_workers
 
   ami                    = var.metal_worker_ami
   instance_type          = var.metal_worker_instance_type
-  subnet_id              = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]
+  subnet_id              = module.network.private_subnet_ids[each.value.subnet_index]
   vpc_security_group_ids = [aws_security_group.metal_worker.id]
   iam_instance_profile   = aws_iam_instance_profile.metal_worker.name
 
@@ -532,7 +532,7 @@ resource "aws_instance" "metal_worker" {
   root_block_device {
     volume_size           = var.metal_worker_root_volume_gib
     volume_type           = "gp3"
-    encrypted             = true
+    encrypted             = each.value.root_volume_encrypted
     delete_on_termination = true
   }
 
@@ -543,7 +543,7 @@ resource "aws_instance" "metal_worker" {
   }
 
   tags = merge(var.tags, {
-    Name    = try(var.metal_worker_names[count.index], "cats-metal-${count.index + 1}")
+    Name    = "cats-${each.key}"
     Project = "Cats"
   })
 
@@ -552,18 +552,31 @@ resource "aws_instance" "metal_worker" {
     # worker that is serving Cats. The AMI is pinned rather than tracked, for
     # the same reason: a new Canonical publication must not recycle the fleet.
     #
-    # root_block_device is ignored because the imported cats-metal-2 was
-    # launched by hand with an unencrypted root, and the only reconciliation
-    # Terraform can offer is replacing the live worker (#111). Remove the
-    # entry once every fleet root is encrypted again, so the config resumes
-    # enforcing it.
-    ignore_changes = [user_data, user_data_base64, ami, root_block_device]
+    # Root encryption is intentionally not ignored. The normal production map
+    # records metal-2's legacy unencrypted root, so it produces no replacement;
+    # changing that one value to true makes the maintenance-window replacement
+    # visible in the exact reviewed saved plan. prevent_destroy cannot be
+    # conditional in Terraform, so ADR-0012's saved-plan review is the gate.
+    ignore_changes = [user_data, user_data_base64, ami]
 
-    # A plan that wants to recycle a worker must fail loudly instead of
-    # executing; a worker is destroyed through drain and deliberate
-    # decommission, never as a side effect of an attribute diff.
-    prevent_destroy = true
+    precondition {
+      condition     = each.value.subnet_index < length(module.network.private_subnet_ids)
+      error_message = "metal worker subnet_index must select a configured private subnet."
+    }
   }
+}
+
+# Preserve the exact imported production identities while replacing positional
+# count addresses with stable names. Remote state has index 0 = cats-metal-2
+# and index 1 = cats-metal-1; reversing these moves would target the wrong Host.
+moved {
+  from = aws_instance.metal_worker[0]
+  to   = aws_instance.metal_worker["metal-2"]
+}
+
+moved {
+  from = aws_instance.metal_worker[1]
+  to   = aws_instance.metal_worker["metal-1"]
 }
 
 # Operator access to a worker that has no public address.

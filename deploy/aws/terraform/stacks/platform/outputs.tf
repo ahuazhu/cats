@@ -118,11 +118,16 @@ output "metal_worker_instance_profile" {
 }
 
 output "metal_worker_instance_ids" {
-  value = aws_instance.metal_worker[*].id
+  description = "Copy this exact stable-name map into production-infrastructure metal_worker_instances."
+  value = {
+    for name, worker in aws_instance.metal_worker : name => worker.id
+  }
 }
 
 output "metal_worker_private_ips" {
-  value = aws_instance.metal_worker[*].private_ip
+  value = {
+    for name, worker in aws_instance.metal_worker : name => worker.private_ip
+  }
 }
 
 output "instance_connect_endpoint_id" {
