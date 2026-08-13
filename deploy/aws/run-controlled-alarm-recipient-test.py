@@ -467,7 +467,7 @@ def run_controlled_test(
                 # state discovery below. Only the observed postcondition wins.
                 pass
     try:
-        after_raw = require_dict(
+        restored_raw = require_dict(
             call(
                 "cloudwatch",
                 "describe-alarms",
@@ -475,24 +475,14 @@ def run_controlled_test(
                 target.alarm_name,
                 restore_budget=True,
             ),
-            "after alarm read",
+            "post-restore alarm read",
         )
-        after_alarm = validate_alarm(after_raw, target, "OK")
+        validate_alarm(restored_raw, target, "OK")
     except ControlledTestError as error:
         raise ControlledTestError(
             "ALARM was attempted but restoration to exact OK is unproven; "
             "treat this as a live incident"
         ) from error
-    write_exclusive(
-        paths["after"],
-        {
-            "alarm": after_alarm,
-            "approval_id": approval_id,
-            "captured_at": checked_at(now),
-            "kind": "cats.alarm-recipient-controlled-test.after.v1",
-            "restoration": "proved-ok",
-        },
-    )
     while True:
         final_history_raw = require_dict(
             call(
@@ -523,6 +513,23 @@ def run_controlled_test(
                 "history does not prove both test and restoration transitions before the deadline"
             )
         time.sleep(min(0.25, remaining))
+    try:
+        after_raw = require_dict(
+            call(
+                "cloudwatch",
+                "describe-alarms",
+                "--alarm-names",
+                target.alarm_name,
+                restore_budget=True,
+            ),
+            "final alarm read",
+        )
+        after_alarm = validate_alarm(after_raw, target, "OK")
+    except ControlledTestError as error:
+        raise ControlledTestError(
+            "ALARM was attempted but restoration to exact OK is unproven; "
+            "treat this as a live incident"
+        ) from error
     write_exclusive(
         paths["history"],
         {
@@ -531,6 +538,16 @@ def run_controlled_test(
             "captured_at": checked_at(now),
             "items": observed_history,
             "kind": "cats.alarm-recipient-controlled-test.history.v1",
+        },
+    )
+    write_exclusive(
+        paths["after"],
+        {
+            "alarm": after_alarm,
+            "approval_id": approval_id,
+            "captured_at": checked_at(now),
+            "kind": "cats.alarm-recipient-controlled-test.after.v1",
+            "restoration": "proved-ok",
         },
     )
     return paths

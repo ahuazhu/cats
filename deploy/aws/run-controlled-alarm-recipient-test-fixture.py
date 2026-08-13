@@ -47,6 +47,7 @@ class FakeAws:
         self.wrong_alarm_arn: str | None = None
         self.fail_set_states: set[str] = set()
         self.hide_history = False
+        self.flip_to_alarm_on_history = False
 
     def alarm(self) -> dict[str, Any]:
         return {
@@ -131,6 +132,8 @@ class FakeAws:
                 or not expect_json
             ):
                 raise AssertionError("history read was not exact and bounded")
+            if self.flip_to_alarm_on_history:
+                self.state = "ALARM"
             return {"AlarmHistoryItems": [] if self.hide_history else list(self.history)}
         raise AssertionError(f"unexpected or real AWS call: {service} {operation}")
 
@@ -181,6 +184,22 @@ def main() -> int:
         ]
         if mutations != ["ALARM", "OK"]:
             raise AssertionError(f"unexpected mutation sequence: {mutations!r}")
+        operation_sequence = [
+            (service, operation)
+            for service, operation, _arguments, _deadline, _expect_json in fake.calls
+        ]
+        if operation_sequence != [
+            ("sts", "get-caller-identity"),
+            ("cloudwatch", "describe-alarms"),
+            ("cloudwatch", "set-alarm-state"),
+            ("cloudwatch", "set-alarm-state"),
+            ("cloudwatch", "describe-alarms"),
+            ("cloudwatch", "describe-alarm-history"),
+            ("cloudwatch", "describe-alarms"),
+        ]:
+            raise AssertionError(
+                f"final alarm read did not follow history proof: {operation_sequence!r}"
+            )
         deadlines = [deadline for *_prefix, deadline, _expect_json in fake.calls]
         if max(deadlines) - min(deadlines) != 10.0:
             raise AssertionError(f"restoration budget was not reserved: {deadlines!r}")
@@ -207,6 +226,23 @@ def main() -> int:
         if fake.state != "OK":
             raise AssertionError("ambiguous responses defeated postcondition discovery")
 
+        flips_after_restore = root / "flips-after-restore"
+        flips_after_restore.mkdir()
+        fake = FakeAws()
+        fake.flip_to_alarm_on_history = True
+        try:
+            invoke(fake, flips_after_restore)
+        except controlled.ControlledTestError as error:
+            if "restoration to exact OK is unproven" not in str(error):
+                raise
+        else:
+            raise AssertionError("alarm flipped during history polling but test passed")
+        for stage in ("history", "after"):
+            if (flips_after_restore / f"e5-controlled-alarm-{stage}.json").exists():
+                raise AssertionError(
+                    f"alarm flip left stale {stage} success evidence"
+                )
+
         deadline = root / "deadline"
         deadline.mkdir()
         fake = FakeAws()
@@ -224,10 +260,13 @@ def main() -> int:
                 raise
         else:
             raise AssertionError("missing history escaped the absolute deadline")
-        if fake.state != "OK" or not (
-            deadline / "e5-controlled-alarm-after.json"
-        ).is_file():
-            raise AssertionError("deadline failure did not retain exact OK restoration evidence")
+        if fake.state != "OK":
+            raise AssertionError("deadline failure did not restore exact OK")
+        for stage in ("history", "after"):
+            if (deadline / f"e5-controlled-alarm-{stage}.json").exists():
+                raise AssertionError(
+                    f"history deadline left stale {stage} success evidence"
+                )
 
         for label, overrides, configure in (
             ("missing execute", {"execute": False}, lambda fake: None),
