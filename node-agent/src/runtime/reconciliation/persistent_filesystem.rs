@@ -126,7 +126,7 @@ impl PersistentFilesystemGuestPort for PlatformPersistentFilesystemGuestPort {
 }
 
 #[derive(Debug, Default)]
-struct PlatformPersistentBlockdControlPort;
+pub(super) struct PlatformPersistentBlockdControlPort;
 
 impl PersistentBlockdControlPort for PlatformPersistentBlockdControlPort {
     fn status(
@@ -865,7 +865,10 @@ fn current_attachment_matches(
 /// the pre-drain head, so it is only a lower bound here: the independent
 /// post-drain authority read and exact blockd status must agree on the new
 /// head while every non-head authority field remains closed.
-fn post_drain_authority_is_same_attachment(before: &VolumeRecord, after: &VolumeRecord) -> bool {
+pub(super) fn post_drain_authority_is_same_attachment(
+    before: &VolumeRecord,
+    after: &VolumeRecord,
+) -> bool {
     validate_volume_record(before).is_ok()
         && validate_volume_record(after).is_ok()
         && before.volume_id == after.volume_id
@@ -1020,7 +1023,7 @@ fn filesystem_request(
     Ok(request)
 }
 
-fn status_generation(value: i64) -> anyhow::Result<Generation> {
+pub(super) fn status_generation(value: i64) -> anyhow::Result<Generation> {
     let value = u64::try_from(value).context("blockd reported a negative generation")?;
     Generation::new(value).context("blockd generation exceeds the wire range")
 }

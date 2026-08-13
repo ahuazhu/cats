@@ -7,29 +7,34 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use cats_api::guest::GUEST_HOST_CONTROL_VSOCK_PORT_V1;
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, AuthorizationConsumedReceipt, AuthorizationState,
     CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion, DesiredRuntimeSpec,
-    GuestTransportEvidence, HostPath, Id, LastVolumeTransition, LifecycleAdmission, NodeResidue,
-    ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
-    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
-    RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
+    FenceEpoch, Generation, GuestTransportEvidence, HostPath, Id, LastVolumeTransition,
+    LifecycleAdmission, NodeResidue, ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence,
+    ProcessEvidence, ProcessRole, RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch,
+    RuntimeTarget, RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionRequest, SessionBinding, StableState, VolumeAcquire, VolumeAdminState,
-    VolumeAuthorityEvidence, VolumeAuthorization, VolumeDisposition, VolumeHeadEvidence,
-    VolumeReleaseReplay, WarmSnapshotEvidence,
+    VolumeAuthorityEvidence, VolumeAuthorization, VolumeDisposition, VolumeReleaseReplay,
+    WarmSnapshotEvidence,
 };
-use cats_storage::authority::VolumeDataAuthority;
+use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
 
+use crate::guest_client::GuestClient;
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
 };
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{KernelNbdDetachPort, KernelNbdDetachResult};
+use super::persistent_filesystem::{
+    post_drain_authority_is_same_attachment, status_generation, PersistentBlockdControlPort,
+    PlatformPersistentBlockdControlPort,
+};
 use super::prepare_device_retirement::unique_runtime;
 use super::serving_blockd_process::{
     ServingBlockdProcessGlobalPort, ServingBlockdProcessInspection,
@@ -42,7 +47,7 @@ use super::{
     StoredCheckpoint, VolumeEvidenceRecovery, VolumeEvidenceRecoveryDecision,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LifecyclePhysicalAttempt {
     /// One bounded effect may have reached the external target.  Response
     /// loss and cancellation intentionally share this result: only a fresh
@@ -57,6 +62,23 @@ pub(crate) enum LifecyclePhysicalAttempt {
     Unavailable,
     /// The physical identity is no longer the one named by the checkpoint.
     Conflict,
+    /// Guest quiesce and the exact attachment's remote drain both completed
+    /// under the retained checkpoint, and an independent authority read plus
+    /// exact serving status proved the final durable generation.
+    VerifiedDrain(DrainPublishReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrainPublishReceipt {
+    volumes: Vec<DrainedVolumeReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainedVolumeReceipt {
+    volume_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +133,17 @@ struct PlatformLifecyclePhysicalPort {
     serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
     vmm_process: Arc<dyn VmmProcessGlobalPort>,
     kernel_nbd_detach: Option<Arc<dyn KernelNbdDetachPort>>,
+    blockd: PlatformPersistentBlockdControlPort,
+    volume_authority: Arc<dyn VolumeDataAuthority>,
+}
+
+struct ExactDrainVolume<'a> {
+    volume_id: Id,
+    attachment_epoch: FenceEpoch,
+    local_generation: Generation,
+    remote_generation: Generation,
+    serving: &'a super::serving_blockd_process::ExactServingBlockdProcessProof,
+    authority: VolumeRecord,
 }
 
 impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
@@ -137,6 +170,22 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
                 target => classify_unadapted_cleanup(context, &permit, target),
             };
         }
+        if let ReconcileStep::DrainPublish {
+            volume_id,
+            attachment_epoch,
+            local_generation,
+            remote_generation,
+        } = &permit.checkpoint().step
+        {
+            return self.drain_exact_volume(
+                context,
+                &permit,
+                volume_id,
+                *attachment_epoch,
+                *local_generation,
+                *remote_generation,
+            );
+        }
         let (runtime_incarnation, process_start_time_ticks, stop_scope) =
             match &permit.checkpoint().step {
                 ReconcileStep::PauseRuntime {
@@ -152,10 +201,9 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
                     *process_start_time_ticks,
                     Some(scope_id),
                 ),
-                // Drain requires a replayable Guest-quiesce receipt and a
-                // canonical all-volume cursor. Snapshot requires its own
-                // descriptor-retained durable publication owner. Neither is
-                // approximated by an unjournaled request here.
+                // Snapshot requires its own descriptor-retained durable
+                // publication owner and is not approximated by an
+                // unjournaled request here.
                 _ => return Ok(LifecyclePhysicalAttempt::Unavailable),
             };
         let accepted = context.accepted_full()?;
@@ -213,6 +261,216 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
 }
 
 impl PlatformLifecyclePhysicalPort {
+    #[allow(clippy::too_many_arguments)]
+    fn drain_exact_volume(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        permit: &LifecycleEffectPermit<'_>,
+        volume_id: &Id,
+        attachment_epoch: FenceEpoch,
+        local_generation: Generation,
+        remote_generation: Generation,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        let accepted = context.accepted_full()?;
+        let processes = context.node_global_process()?;
+        if !processes.matches_observation(accepted.observation()) {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        };
+        if permit.checkpoint().runtime_incarnation.as_ref() != Some(&launch.runtime_incarnation)
+            || permit.runtime().runtime_incarnation.as_ref() != Some(&launch.runtime_incarnation)
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+
+        let mut ordered = permit.desired().volumes.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|intent| intent.guest_device.slot);
+        if ordered.first().map(|intent| &intent.volume_id) != Some(volume_id)
+            || ordered.len() != permit.runtime().volumes.len()
+            || ordered
+                .windows(2)
+                .any(|pair| pair[0].guest_device.slot == pair[1].guest_device.slot)
+            || processes.serving_blockd_count(&permit.desired().cat_id) != ordered.len()
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let mut drains = Vec::with_capacity(ordered.len());
+        for (index, intent) in ordered.iter().enumerate() {
+            let mut observed = permit
+                .runtime()
+                .volumes
+                .iter()
+                .filter(|volume| volume.volume_id == intent.volume_id);
+            let Some(volume) = observed.next() else {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            };
+            if observed.next().is_some()
+                || volume.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
+                || volume.disk_id.as_ref() != Some(&intent.disk_id)
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            let VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch: observed_epoch,
+                head,
+            } = &volume.authority
+            else {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            };
+            if attachment_id != &intent.attachment_id
+                || (index == 0 && *observed_epoch != attachment_epoch)
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            let mut lineages = volume.local_lineages.iter().filter(|lineage| {
+                lineage.attachment_id == *attachment_id
+                    && lineage.attachment_epoch == *observed_epoch
+                    && lineage.node_id == permit.desired().placement.node_id
+                    && lineage.placement_epoch == permit.desired().placement.placement_epoch
+            });
+            let Some(lineage) = lineages.next() else {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            };
+            if lineages.next().is_some()
+                || lineage.local_durable_generation < lineage.remote_durable_generation
+                || lineage.remote_durable_generation != head.generation
+                || (index == 0
+                    && (lineage.local_durable_generation < local_generation
+                        || lineage.remote_durable_generation < remote_generation))
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            let Some((serving_expectation, Some(serving))) =
+                processes.serving_blockd(&permit.desired().cat_id, &intent.volume_id)
+            else {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            };
+            if serving.expectation() != serving_expectation
+                || permit
+                    .runtime()
+                    .processes
+                    .iter()
+                    .filter(|process| serving.matches_public_process(process))
+                    .count()
+                    != 1
+                || serving.assert_listener_current(context).is_err()
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            let authority = match self.volume_authority.load_volume(&intent.volume_id) {
+                Ok(authority) => authority,
+                Err(_) => return Ok(LifecyclePhysicalAttempt::Unavailable),
+            };
+            if !serving_expectation.matches_current_authority(&authority)
+                || authority.lease_epoch != *observed_epoch
+                || authority.head != *head
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            drains.push(ExactDrainVolume {
+                volume_id: intent.volume_id.clone(),
+                attachment_epoch: *observed_epoch,
+                local_generation: lineage.local_durable_generation,
+                remote_generation: lineage.remote_durable_generation,
+                serving,
+                authority,
+            });
+        }
+
+        let Some((vmm_expectation, admitted_vmm)) = processes.vmm(&permit.desired().cat_id) else {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        };
+        if vmm_expectation.checkpoint() != permit.checkpoint()
+            || vmm_expectation.runtime_incarnation() != &launch.runtime_incarnation
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let guest = if let Some(vmm) = admitted_vmm {
+            let Ok(public_vmm) = exact_vmm_process(permit.runtime()) else {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            };
+            if vmm.clone().into_process_evidence() != *public_vmm
+                || vmm.evidence().state() != cats_api::runtime_reconciliation::ProcessState::Running
+                || permit.runtime().guest_transport != permit.checkpoint().guest_transport
+                || !guest_transport_matches_launch(permit.runtime(), launch)
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+            match ExactGuestQuiesce::prepare(context, launch, vmm) {
+                Ok(guest) => Some(guest),
+                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            }
+        } else if permit
+            .runtime()
+            .processes
+            .iter()
+            .any(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+            || !matches!(
+                permit.runtime().guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        } else {
+            None
+        };
+
+        let mut receipts = Vec::with_capacity(drains.len());
+        for drain in drains {
+            if drain.serving.assert_listener_current(context).is_err() {
+                return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+            }
+            let status = match self.blockd.drain(context, drain.serving) {
+                Ok(status) => status,
+                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            };
+            context.check_active()?;
+            let after = match self.volume_authority.load_volume(&drain.volume_id) {
+                Ok(authority) => authority,
+                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            };
+            if !post_drain_authority_is_same_attachment(&drain.authority, &after)
+                || !drain
+                    .serving
+                    .validates_fully_drained_status_at_head(&status, &after.head)
+            {
+                return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+            }
+            let drained_local = match status_generation(status.local_durable_generation) {
+                Ok(generation) => generation,
+                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            };
+            let drained_remote = match status_generation(status.remote_durable_generation) {
+                Ok(generation) => generation,
+                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            };
+            if drained_local != drained_remote
+                || drained_remote != after.head.generation
+                || drained_local < drain.local_generation
+                || drained_remote < drain.remote_generation
+            {
+                return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+            }
+            receipts.push(DrainedVolumeReceipt {
+                volume_id: drain.volume_id,
+                attachment_epoch: drain.attachment_epoch,
+                local_generation: drained_local,
+                remote_generation: drained_remote,
+            });
+        }
+        if guest.is_some_and(|guest| guest.revalidate(context, admitted_vmm.unwrap()).is_err())
+            || admitted_vmm.is_some_and(|vmm| vmm.assert_current(context).is_err())
+        {
+            return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+        }
+        Ok(LifecyclePhysicalAttempt::VerifiedDrain(
+            DrainPublishReceipt { volumes: receipts },
+        ))
+    }
+
     fn detach_exact_device(
         &self,
         context: &RuntimeDesiredEffectContext,
@@ -386,6 +644,152 @@ impl PlatformLifecyclePhysicalPort {
                     | ServingBlockdProcessInspection::Conflict(_) => {
                         Ok(LifecyclePhysicalAttempt::Conflict)
                     }
+                }
+            }
+        }
+    }
+}
+
+fn guest_transport_matches_launch(
+    runtime: &ObservedRuntimeStatus,
+    launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+) -> bool {
+    matches!(
+        &runtime.guest_transport,
+        GuestTransportEvidence::VsockReady {
+            runtime_incarnation,
+            guest_cid,
+            guest_port,
+            guest_agent_protocol_version: ContractVersion::V1,
+            ..
+        } if runtime_incarnation == &launch.runtime_incarnation
+            && *guest_cid == launch.guest_cid
+            && u32::from(*guest_port) == GUEST_HOST_CONTROL_VSOCK_PORT_V1
+    )
+}
+
+struct ExactGuestQuiesce {
+    client: GuestClient,
+    source_epoch: String,
+    lease_sequence: u64,
+}
+
+impl ExactGuestQuiesce {
+    fn prepare(
+        context: &RuntimeDesiredEffectContext,
+        launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+        vmm: &super::vmm_process::ExactVmmProcessProof,
+    ) -> anyhow::Result<Self> {
+        context.check_active()?;
+        anyhow::ensure!(
+            vmm.expectation().launch_identity() == launch,
+            "Guest quiesce VMM differs from retained launch"
+        );
+        vmm.assert_current(context)?;
+        let remaining = context
+            .deadline()
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("Guest quiesce deadline expired")?;
+        let mut client = GuestClient::connect_hybrid_vsock_bounded(
+            Path::new(launch.vsock_socket_path.as_str()),
+            GUEST_HOST_CONTROL_VSOCK_PORT_V1,
+            remaining,
+        )?;
+        let shutdown = client.try_clone_transport()?;
+        let guard = std::thread::scope(|scope| -> anyhow::Result<Self> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let result = (|| -> anyhow::Result<Self> {
+                    let before = client
+                        .work_status(None, 0)
+                        .context("read Guest work fence before quiesce")?;
+                    let (source_epoch, lease_sequence) = client
+                        .prepare_suspend(before.lease_sequence)
+                        .context("close Guest work gate")?;
+                    anyhow::ensure!(
+                        source_epoch == before.source_epoch
+                            && lease_sequence == before.lease_sequence
+                            && before.leases.is_empty(),
+                        "Guest quiesce response changed the accepted work fence"
+                    );
+                    client.syncfs().context("flush Guest filesystems")?;
+                    let after = client
+                        .work_status(None, 0)
+                        .context("revalidate Guest work fence after syncfs")?;
+                    anyhow::ensure!(
+                        after.source_epoch == source_epoch
+                            && after.lease_sequence == lease_sequence
+                            && after.quiescing
+                            && after.leases.is_empty(),
+                        "Guest work changed across quiesce and syncfs"
+                    );
+                    Ok(Self {
+                        client,
+                        source_epoch,
+                        lease_sequence,
+                    })
+                })();
+                let _ = sender.send(result);
+            });
+            receive_guest_result(context, &shutdown, receiver)
+        })?;
+        context.check_active()?;
+        vmm.assert_current(context)?;
+        Ok(guard)
+    }
+
+    fn revalidate(
+        mut self,
+        context: &RuntimeDesiredEffectContext,
+        vmm: &super::vmm_process::ExactVmmProcessProof,
+    ) -> anyhow::Result<()> {
+        context.check_active()?;
+        vmm.assert_current(context)?;
+        let shutdown = self.client.try_clone_transport()?;
+        let source_epoch = self.source_epoch;
+        let lease_sequence = self.lease_sequence;
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    let status = self
+                        .client
+                        .work_status(None, 0)
+                        .context("revalidate Guest work fence after all Volume drains")?;
+                    anyhow::ensure!(
+                        status.source_epoch == source_epoch
+                            && status.lease_sequence == lease_sequence
+                            && status.quiescing
+                            && status.leases.is_empty(),
+                        "Guest work fence changed across all Volume drains"
+                    );
+                    Ok(())
+                })();
+                let _ = sender.send(result);
+            });
+            receive_guest_result(context, &shutdown, receiver)
+        })?;
+        context.check_active()?;
+        vmm.assert_current(context)
+    }
+}
+
+fn receive_guest_result<T>(
+    context: &RuntimeDesiredEffectContext,
+    shutdown: &std::os::unix::net::UnixStream,
+    receiver: std::sync::mpsc::Receiver<anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("Guest control worker exited without a result")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = context.check_active() {
+                    let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                    return Err(error);
                 }
             }
         }
@@ -720,12 +1124,15 @@ impl LifecycleStepEffect {
         vmm_process: Arc<dyn VmmProcessGlobalPort>,
         kernel_nbd_detach: Option<Arc<dyn KernelNbdDetachPort>>,
     ) -> Self {
+        let physical_volume_authority = Arc::clone(&volume_authority);
         Self {
             physical: Arc::new(PlatformLifecyclePhysicalPort {
                 network_ip_binary,
                 serving_process,
                 vmm_process,
                 kernel_nbd_detach,
+                blockd: PlatformPersistentBlockdControlPort,
+                volume_authority: physical_volume_authority,
             }),
             volume_transition,
             volume_authority,
@@ -874,7 +1281,24 @@ impl LifecycleStepEffect {
         store
             .revalidate_current(&stored, &current)
             .context("revalidate lifecycle checkpoint after physical effect")?;
-        if attempt == LifecyclePhysicalAttempt::ExactPostcondition {
+        if let Some(successor) = drain_attempt_successor(
+            desired,
+            runtime,
+            stored.checkpoint(),
+            &attempt,
+            accepted.attestation().accepted_at_unix_ms,
+        )? {
+            encode_runtime_checkpoint(&successor)
+                .context("validate verified drain successor checkpoint")?;
+            persist_lifecycle_successor(
+                context,
+                &store,
+                &stored,
+                &successor,
+                &current,
+                "settle checkpoint-guarded Guest and Volume drain",
+            )?;
+        } else if attempt == LifecyclePhysicalAttempt::ExactPostcondition {
             let successor = match &stored.checkpoint().step {
                 ReconcileStep::CleanupRelease { .. } => cleanup_postcondition_successor(
                     accepted,
@@ -908,6 +1332,7 @@ impl LifecycleStepEffect {
         Ok(Some(match attempt {
             LifecyclePhysicalAttempt::SubmittedOrAmbiguous
             | LifecyclePhysicalAttempt::ExactPostcondition
+            | LifecyclePhysicalAttempt::VerifiedDrain(_)
             | LifecyclePhysicalAttempt::Unavailable => {
                 RuntimeDesiredEffectOutcome::RefreshInventory
             }
@@ -2259,16 +2684,14 @@ fn canonical_remaining_cleanup(
         });
     }
 
-    if desired.target != RuntimeTarget::Warm {
-        if let WarmSnapshotEvidence::Present { snapshot_id, .. } = &runtime.warm_snapshot {
-            plans.push(PlannedCleanup {
-                order: format!("3-warm-snapshot-{snapshot_id}"),
-                target: CleanupTarget::WarmSnapshot {
-                    snapshot_id: snapshot_id.clone(),
-                },
-                volume_release: None,
-            });
-        }
+    if let WarmSnapshotEvidence::Present { snapshot_id, .. } = &runtime.warm_snapshot {
+        plans.push(PlannedCleanup {
+            order: format!("3-warm-snapshot-{snapshot_id}"),
+            target: CleanupTarget::WarmSnapshot {
+                snapshot_id: snapshot_id.clone(),
+            },
+            volume_release: None,
+        });
     }
 
     for entry in residue {
@@ -2324,7 +2747,10 @@ fn canonical_remaining_cleanup(
         }
     }
 
-    if matches!(desired.target, RuntimeTarget::Cold | RuntimeTarget::Deleted) {
+    if matches!(
+        desired.target,
+        RuntimeTarget::Warm | RuntimeTarget::Cold | RuntimeTarget::Deleted
+    ) {
         for intent in &desired.volumes {
             let volume = runtime
                 .volumes
@@ -2496,25 +2922,14 @@ fn settle_cleanup_target(
         "cleanup target cannot settle while runtime residue remains"
     );
     let state = match desired.target {
-        RuntimeTarget::Warm => {
-            anyhow::ensure!(
-                matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Present { .. })
-                    && runtime.volumes.iter().all(|volume| matches!(
-                        volume.authority,
-                        VolumeAuthorityEvidence::Owned { .. }
-                    )),
-                "Warm cleanup successor lacks its durable snapshot"
-            );
-            StableState::Warm
-        }
-        RuntimeTarget::Cold => {
+        RuntimeTarget::Warm | RuntimeTarget::Cold => {
             anyhow::ensure!(
                 matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
                     && runtime.volumes.iter().all(|volume| matches!(
                         volume.authority,
                         VolumeAuthorityEvidence::Unowned { .. }
                     )),
-                "Cold cleanup successor retains a Warm snapshot"
+                "Cold convergence retains a Warm snapshot or owned Volume"
             );
             StableState::Cold
         }
@@ -2553,8 +2968,124 @@ fn settle_cleanup_target(
     Ok(())
 }
 
+fn drain_attempt_successor(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    attempt: &LifecyclePhysicalAttempt,
+    observed_at: cats_api::runtime_reconciliation::UnixMillis,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let LifecyclePhysicalAttempt::VerifiedDrain(receipt) = attempt else {
+        return Ok(None);
+    };
+    let ReconcileStep::DrainPublish {
+        volume_id,
+        attachment_epoch,
+        local_generation,
+        remote_generation,
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("verified Drain receipt belongs to another lifecycle step")
+    };
+    let mut ordered = desired.volumes.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|intent| intent.guest_device.slot);
+    anyhow::ensure!(
+        desired.target != RuntimeTarget::Running
+            && !ordered.is_empty()
+            && ordered.len() == runtime.volumes.len()
+            && ordered.len() == receipt.volumes.len()
+            && ordered
+                .windows(2)
+                .all(|pair| pair[0].guest_device.slot != pair[1].guest_device.slot),
+        "verified Drain successor lacks one canonical Desired volume set"
+    );
+    for (index, (intent, drained)) in ordered.iter().zip(&receipt.volumes).enumerate() {
+        let ReconcileStep::DrainPublish {
+            volume_id: accepted_volume_id,
+            attachment_epoch: accepted_epoch,
+            local_generation: accepted_local,
+            remote_generation: accepted_remote,
+        } = drain_step_for_intent(desired, runtime, intent)?
+        else {
+            unreachable!()
+        };
+        anyhow::ensure!(
+            drained.volume_id == accepted_volume_id
+                && drained.attachment_epoch == accepted_epoch
+                && drained.local_generation == drained.remote_generation
+                && drained.local_generation >= accepted_local
+                && drained.remote_generation >= accepted_remote
+                && (index != 0
+                    || (accepted_volume_id == *volume_id
+                        && accepted_epoch == *attachment_epoch
+                        && accepted_local >= *local_generation
+                        && accepted_remote >= *remote_generation)),
+            "verified Drain receipt is incomplete, stale, or belongs to another checkpoint token"
+        );
+    }
+
+    let mut successor = checkpoint.clone();
+    successor.processes = runtime.processes.clone();
+    successor.volumes = runtime.volumes.clone();
+    successor.mounts = runtime.mounts.clone();
+    successor.networks = runtime.networks.clone();
+    successor.guest_transport = runtime.guest_transport.clone();
+    successor.warm_snapshot = runtime.warm_snapshot.clone();
+    successor.stable_state = None;
+    successor.updated_at_unix_ms = observed_at;
+
+    let runtime_incarnation = checkpoint
+        .runtime_incarnation
+        .as_ref()
+        .context("verified final Drain lost its runtime incarnation")?;
+    if let Ok(process) = exact_vmm_process(runtime) {
+        anyhow::ensure!(
+            matches!(
+                process.state,
+                cats_api::runtime_reconciliation::ProcessState::Running
+            ),
+            "verified final Drain cannot advance a non-Running live VMM"
+        );
+        successor.step = ReconcileStep::PauseRuntime {
+            runtime_incarnation: runtime_incarnation.clone(),
+            process_start_time_ticks: process.process_start_time_ticks,
+        };
+        return Ok(Some(successor));
+    }
+    anyhow::ensure!(
+        matches!(
+            desired.target,
+            RuntimeTarget::Warm | RuntimeTarget::Cold | RuntimeTarget::Deleted
+        ) && !runtime
+            .processes
+            .iter()
+            .any(|process| matches!(process.role, ProcessRole::Vmm { .. })),
+        "verified final Drain cannot settle a missing Suspended VMM"
+    );
+    let mut retained = checkpoint.processes.iter().filter(|process| {
+        matches!(
+            &process.role,
+            ProcessRole::Vmm { runtime_incarnation: retained }
+                if retained == runtime_incarnation
+        )
+    });
+    let process = retained
+        .next()
+        .context("verified final Drain lacks its retained VMM identity")?;
+    anyhow::ensure!(
+        retained.next().is_none(),
+        "verified final Drain retained duplicate VMM identities"
+    );
+    successor.step = ReconcileStep::StopRuntime {
+        runtime_incarnation: runtime_incarnation.clone(),
+        process_start_time_ticks: process.process_start_time_ticks,
+        scope_id: process.scope_id.clone(),
+    };
+    Ok(Some(successor))
+}
+
 fn exact_postcondition_successor(
-    state_directory: &Path,
+    _state_directory: &Path,
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
@@ -2588,69 +3119,18 @@ fn exact_postcondition_successor(
                 state: StableState::Suspended,
             }
         }
-        RuntimeTarget::Warm => {
-            let snapshot_id = Id::new(format!("warm-{runtime_incarnation}"))
-                .context("derive Warm snapshot identity")?;
-            let temporary_path = HostPath::new(
-                state_directory
-                    .join("warm-snapshots")
-                    .join(format!(".{snapshot_id}.tmp"))
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .context("derive Warm snapshot temporary path")?;
-            ReconcileStep::SnapshotWarmRuntime {
+        RuntimeTarget::Warm | RuntimeTarget::Cold | RuntimeTarget::Deleted => {
+            ReconcileStep::StopRuntime {
                 runtime_incarnation: runtime_incarnation.clone(),
-                snapshot_id,
-                temporary_path,
-                source_heads: fully_drained_source_heads(desired, runtime)?,
+                process_start_time_ticks: *process_start_time_ticks,
+                scope_id: process.scope_id.clone(),
             }
         }
-        RuntimeTarget::Cold | RuntimeTarget::Deleted => ReconcileStep::StopRuntime {
-            runtime_incarnation: runtime_incarnation.clone(),
-            process_start_time_ticks: *process_start_time_ticks,
-            scope_id: process.scope_id.clone(),
-        },
         RuntimeTarget::Running => {
             anyhow::bail!("current Running Desired cannot settle PauseRuntime")
         }
     };
     Ok(Some(successor))
-}
-
-fn fully_drained_source_heads(
-    desired: &DesiredRuntimeSpec,
-    runtime: &ObservedRuntimeStatus,
-) -> anyhow::Result<Vec<VolumeHeadEvidence>> {
-    let mut heads = Vec::with_capacity(runtime.volumes.len());
-    for volume in &runtime.volumes {
-        let VolumeAuthorityEvidence::Owned {
-            attachment_epoch,
-            head,
-            ..
-        } = &volume.authority
-        else {
-            anyhow::bail!("Warm snapshot source is not exact Owned authority")
-        };
-        let exact = volume.local_lineages.iter().filter(|lineage| {
-            lineage.attachment_epoch == *attachment_epoch
-                && lineage.node_id == desired.placement.node_id
-                && lineage.placement_epoch == desired.placement.placement_epoch
-                && lineage.local_durable_generation == head.generation
-                && lineage.remote_durable_generation == head.generation
-        });
-        anyhow::ensure!(
-            exact.count() == 1,
-            "Warm snapshot source is not one exact fully drained lineage"
-        );
-        heads.push(VolumeHeadEvidence {
-            volume_id: volume.volume_id.clone(),
-            attachment_epoch: *attachment_epoch,
-            head: head.clone(),
-        });
-    }
-    heads.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
-    Ok(heads)
 }
 
 fn persist_lifecycle_successor(
@@ -2738,18 +3218,26 @@ fn first_lifecycle_step(
         .iter()
         .min_by_key(|volume| volume.guest_device.slot)
         .context("lifecycle drain planner lacks a canonical first volume")?;
+    Ok(Some(drain_step_for_intent(desired, runtime, first)?))
+}
+
+fn drain_step_for_intent(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+) -> anyhow::Result<ReconcileStep> {
     let mut observed = runtime
         .volumes
         .iter()
-        .filter(|observed| observed.volume_id == first.volume_id);
+        .filter(|observed| observed.volume_id == intent.volume_id);
     let volume = observed
         .next()
-        .context("lifecycle drain planner lacks the first Desired volume")?;
+        .context("lifecycle drain planner lacks the selected Desired volume")?;
     anyhow::ensure!(
         observed.next().is_none()
-            && volume.volume_intent_id.as_ref() == Some(&first.volume_intent_id)
-            && volume.disk_id.as_ref() == Some(&first.disk_id),
-        "lifecycle drain planner found an ambiguous first Desired volume"
+            && volume.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+            && volume.disk_id.as_ref() == Some(&intent.disk_id),
+        "lifecycle drain planner found an ambiguous selected Desired volume"
     );
     let VolumeAuthorityEvidence::Owned {
         attachment_id,
@@ -2760,7 +3248,7 @@ fn first_lifecycle_step(
         anyhow::bail!("lifecycle drain planner found a non-Owned retained volume")
     };
     anyhow::ensure!(
-        attachment_id == &first.attachment_id,
+        attachment_id == &intent.attachment_id,
         "lifecycle drain planner found another attachment owner"
     );
     let mut lineages = volume.local_lineages.iter().filter(|lineage| {
@@ -2777,12 +3265,12 @@ fn first_lifecycle_step(
             && lineage.local_durable_generation >= lineage.remote_durable_generation,
         "lifecycle drain planner found duplicate or regressed current lineage"
     );
-    Ok(Some(ReconcileStep::DrainPublish {
+    Ok(ReconcileStep::DrainPublish {
         volume_id: volume.volume_id.clone(),
         attachment_epoch: *attachment_epoch,
         local_generation: lineage.local_durable_generation,
         remote_generation: lineage.remote_durable_generation,
-    }))
+    })
 }
 
 fn exact_vmm_process(runtime: &ObservedRuntimeStatus) -> anyhow::Result<&ProcessEvidence> {
@@ -2902,6 +3390,67 @@ mod tests {
             conditions: Vec::new(),
         };
         (desired, checkpoint, runtime)
+    }
+
+    fn add_second_drain_volume(
+        desired: &mut DesiredRuntimeSpec,
+        checkpoint: &mut RuntimeCheckpoint,
+        runtime: &mut ObservedRuntimeStatus,
+    ) {
+        let mut intent = desired.volumes[0].clone();
+        intent.volume_intent_id = Id::new("vint_data").unwrap();
+        intent.disk_id = Id::new("disk_data").unwrap();
+        intent.volume_id = Id::new("vol_data").unwrap();
+        intent.attachment_id = Id::new("att_data").unwrap();
+        intent.disk_kind = cats_api::runtime_reconciliation::DiskKind::Persistent;
+        intent.guest_device.serial = Id::new("cats-data").unwrap();
+        intent.guest_device.slot = 1;
+        if let VolumeAcquire::Normal { transition_id, .. } = &mut intent.acquire {
+            *transition_id = RandomId128::new("99999999999999999999999999999999").unwrap();
+        }
+        let mut volume = runtime.volumes[0].clone();
+        volume.volume_intent_id = Some(intent.volume_intent_id.clone());
+        volume.disk_id = Some(intent.disk_id.clone());
+        volume.volume_id = intent.volume_id.clone();
+        volume.disk_kind = cats_api::runtime_reconciliation::ObservedDiskKind::Persistent;
+        let VolumeAuthorityEvidence::Owned { attachment_id, .. } = &mut volume.authority else {
+            unreachable!()
+        };
+        *attachment_id = intent.attachment_id.clone();
+        volume.local_lineages[0].attachment_id = intent.attachment_id.clone();
+        desired.volumes.push(intent);
+        runtime.volumes.push(volume);
+        checkpoint.volumes = runtime.volumes.clone();
+    }
+
+    fn exact_drain_receipt(
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+    ) -> DrainPublishReceipt {
+        let mut ordered = desired.volumes.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|intent| intent.guest_device.slot);
+        DrainPublishReceipt {
+            volumes: ordered
+                .into_iter()
+                .map(|intent| {
+                    let ReconcileStep::DrainPublish {
+                        volume_id,
+                        attachment_epoch,
+                        local_generation,
+                        ..
+                    } = drain_step_for_intent(desired, runtime, intent).unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    DrainedVolumeReceipt {
+                        volume_id,
+                        attachment_epoch,
+                        local_generation,
+                        remote_generation: local_generation,
+                    }
+                })
+                .collect(),
+        }
     }
 
     fn disposable_evidence_fixture() -> (
@@ -3340,6 +3889,133 @@ mod tests {
                 && local_generation.get() == 2
                 && remote_generation.get() == 1
         ));
+    }
+
+    #[test]
+    fn verified_drain_advances_to_pause_and_warm_uses_the_cold_stop_path() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Warm);
+        add_second_drain_volume(&mut desired, &mut checkpoint, &mut runtime);
+        checkpoint.stable_state = None;
+        checkpoint.step = first_lifecycle_step(&desired, &runtime)
+            .unwrap()
+            .expect("Warm departure starts with one exact drain token");
+        runtime.stable_state = None;
+        runtime.step = checkpoint.step.clone();
+        let receipt = exact_drain_receipt(&desired, &runtime);
+        assert_eq!(receipt.volumes.len(), 2);
+        let drained = drain_attempt_successor(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &LifecyclePhysicalAttempt::VerifiedDrain(receipt),
+            checkpoint.updated_at_unix_ms,
+        )
+        .unwrap()
+        .expect("verified final drain must publish PauseRuntime");
+        assert!(matches!(drained.step, ReconcileStep::PauseRuntime { .. }));
+
+        let mut paused = runtime;
+        paused.step = drained.step.clone();
+        paused.processes[0].state = ProcessState::Paused;
+        let stopped = exact_postcondition_successor(
+            Path::new("/unused-after-Warm-cold-fallback"),
+            &desired,
+            &paused,
+            &drained,
+        )
+        .unwrap()
+        .expect("Warm is deliberately converged through the Cold stop path");
+        assert!(matches!(stopped.step, ReconcileStep::StopRuntime { .. }));
+
+        let mut cleaned = paused;
+        cleaned.processes.clear();
+        cleaned.networks.clear();
+        cleaned.guest_transport = GuestTransportEvidence::Unavailable;
+        cleaned.warm_snapshot = WarmSnapshotEvidence::Absent;
+        for volume in &mut cleaned.volumes {
+            volume.devices.clear();
+            let VolumeAuthorityEvidence::Owned {
+                attachment_epoch,
+                head,
+                ..
+            } = &volume.authority
+            else {
+                unreachable!()
+            };
+            volume.authority = VolumeAuthorityEvidence::Unowned {
+                attachment_epoch: *attachment_epoch,
+                head: head.clone(),
+            };
+        }
+        let mut settled = stopped;
+        settle_cleanup_target(&desired, &cleaned, &mut settled).unwrap();
+        assert_eq!(settled.stable_state, Some(StableState::Cold));
+        assert!(matches!(
+            settled.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        ));
+    }
+
+    #[test]
+    fn ambiguous_or_stale_drain_proof_never_advances_the_checkpoint() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        add_second_drain_volume(&mut desired, &mut checkpoint, &mut runtime);
+        checkpoint.stable_state = None;
+        checkpoint.step = first_lifecycle_step(&desired, &runtime)
+            .unwrap()
+            .expect("Cold departure starts with one exact drain token");
+        runtime.stable_state = None;
+        runtime.step = checkpoint.step.clone();
+        assert!(
+            drain_attempt_successor(
+                &desired,
+                &runtime,
+                &checkpoint,
+                &LifecyclePhysicalAttempt::SubmittedOrAmbiguous,
+                checkpoint.updated_at_unix_ms,
+            )
+            .unwrap()
+            .is_none(),
+            "response loss must retain the exact DrainPublish token"
+        );
+
+        let ReconcileStep::DrainPublish {
+            remote_generation, ..
+        } = &checkpoint.step
+        else {
+            unreachable!()
+        };
+        let exact = exact_drain_receipt(&desired, &runtime);
+        assert_eq!(exact.volumes.len(), 2);
+        let mut incomplete = exact.clone();
+        incomplete.volumes.pop();
+        assert!(drain_attempt_successor(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &LifecyclePhysicalAttempt::VerifiedDrain(incomplete),
+            checkpoint.updated_at_unix_ms,
+        )
+        .is_err());
+        let later =
+            cats_api::runtime_reconciliation::Generation::new(remote_generation.get() + 1).unwrap();
+        if let ReconcileStep::DrainPublish {
+            local_generation, ..
+        } = &mut checkpoint.step
+        {
+            *local_generation = later;
+        }
+        runtime.step = checkpoint.step.clone();
+        assert!(drain_attempt_successor(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &LifecyclePhysicalAttempt::VerifiedDrain(exact),
+            checkpoint.updated_at_unix_ms,
+        )
+        .is_err());
     }
 
     #[test]
