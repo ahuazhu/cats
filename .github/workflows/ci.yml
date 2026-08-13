@@ -126,3 +126,10 @@ jobs:
             terraform -chdir="deploy/aws/terraform/$dir" validate
             echo "::endgroup::"
           done
+
+      - name: Alarm recipient contracts
+        run: |
+          terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
+          terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
+          terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+          python3 deploy/aws/preflight-alarm-recipients-fixture.py

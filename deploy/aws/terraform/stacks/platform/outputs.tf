@@ -68,7 +68,7 @@ output "database_proxy_pool_saturation_alarm_name" {
 }
 
 output "alert_sns_topic_arn" {
-  description = "Feed to the infrastructure stack's alarm_sns_topic_arns, which is currently empty, so its usage-pipeline alarms notify nobody."
+  description = "Copy this exact ARN into the infrastructure stack's platform_alert_sns_topic_arn input."
   value       = aws_sns_topic.alerts.arn
 }
 

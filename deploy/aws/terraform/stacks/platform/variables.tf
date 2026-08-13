@@ -121,7 +121,17 @@ variable "database_log_retention_days" {
 variable "alert_email_addresses" {
   type        = list(string)
   description = "Addresses subscribed to the platform alert topic. Each recipient must confirm the AWS subscription mail before the topic reaches them."
-  default     = []
+
+  validation {
+    condition = (
+      length(var.alert_email_addresses) > 0 &&
+      alltrue([
+        for address in var.alert_email_addresses :
+        address == trimspace(address) && can(regex("^[^@[:space:]]+@[^@[:space:]]+$", address))
+      ])
+    )
+    error_message = "alert_email_addresses must contain at least one non-empty operator email address without surrounding whitespace. Terraform cannot prove confirmation; run the alarm-recipient preflight after the recipient clicks the AWS email."
+  }
 }
 
 # DNS -----------------------------------------------------------------------

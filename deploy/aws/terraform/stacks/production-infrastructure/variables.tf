@@ -55,10 +55,20 @@ variable "usage_consumer_lag_alarm_threshold_ms" {
   default     = 60000
 }
 
-variable "alarm_sns_topic_arns" {
-  description = "SNS topics notified by usage-pipeline CloudWatch alarms."
-  type        = list(string)
-  default     = []
+variable "platform_alert_sns_topic_arn" {
+  description = "Exact alert_sns_topic_arn output from the reviewed platform Terraform state. Every usage-pipeline alarm uses this topic."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex(
+        "^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$",
+        var.platform_alert_sns_topic_arn,
+      )) &&
+      try(split(":", var.platform_alert_sns_topic_arn)[3] == var.aws_region, false)
+    )
+    error_message = "platform_alert_sns_topic_arn must be one exact SNS topic ARN in aws_region, copied from the platform stack's alert_sns_topic_arn output."
+  }
 }
 
 variable "worker_artifact_bucket_name" {

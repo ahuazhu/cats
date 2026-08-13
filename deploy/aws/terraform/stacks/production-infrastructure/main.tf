@@ -11,7 +11,7 @@ module "usage_infrastructure" {
   kinesis_shard_count             = var.usage_kinesis_shard_count
   kinesis_retention_hours         = var.usage_kinesis_retention_hours
   consumer_lag_alarm_threshold_ms = var.usage_consumer_lag_alarm_threshold_ms
-  alarm_action_arns               = var.alarm_sns_topic_arns
+  alarm_action_arns               = [var.platform_alert_sns_topic_arn]
   tags                            = var.tags
 }
 

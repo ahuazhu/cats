@@ -7,6 +7,11 @@ from their exact live configuration and imported before Terraform changes
 them. See
 [`terraform/README.md`](terraform/README.md) and ADR-0012.
 
+The platform-to-usage SNS destination, confirmed recipient preflight and
+controlled delivery evidence are operated through the
+[production alarm recipient runbook](alarm-recipients-runbook.md). A created
+Terraform subscription alone is not paging evidence.
+
 Production-shaped split:
 
 - EKS Pods: `cats-controld` (portal, user console, admin console and API).

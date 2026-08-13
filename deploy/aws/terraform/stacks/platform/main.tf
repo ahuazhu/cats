@@ -40,10 +40,10 @@ module "cluster" {
   tags = var.tags
 }
 
-# Alarms in this account had no destination: production-infrastructure passes
-# `alarm_sns_topic_arns = []`, so the usage-pipeline alarms have been firing
-# into a console nobody watches. A detector that notifies nobody is not a
-# detector, so the topic is created here alongside the resources it reports on.
+# The platform owns one alert topic and exposes its exact ARN to the separate
+# production-infrastructure state. That stack accepts the ARN through one
+# explicit variable rather than duplicating the topic or silently using an
+# empty action list.
 #
 # Not encrypted: the alarm text carries no secret, and the AWS-managed SNS key
 # cannot be used, because CloudWatch cannot be granted access to it.

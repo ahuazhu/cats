@@ -108,9 +108,19 @@ variable "consumer_lag_alarm_threshold_ms" {
 }
 
 variable "alarm_action_arns" {
-  description = "SNS topic ARNs notified when provisioned Kinesis capacity throttles."
+  description = "SNS topic ARNs notified by every usage-pipeline alarm. Required: an alarm without an action is not a detector."
   type        = list(string)
-  default     = []
+
+  validation {
+    condition = (
+      length(var.alarm_action_arns) > 0 &&
+      alltrue([
+        for arn in var.alarm_action_arns :
+        can(regex("^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$", arn))
+      ])
+    )
+    error_message = "alarm_action_arns must name at least one exact SNS topic ARN; usage alarms with no actions notify nobody. A configured topic is not enough: confirm its recipient subscription and run the alarm-recipient preflight before cutover."
+  }
 }
 
 variable "eks_cluster_name" {

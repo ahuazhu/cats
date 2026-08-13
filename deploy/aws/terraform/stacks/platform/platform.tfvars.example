@@ -23,6 +23,10 @@ database_backup_retention_days = 7
 database_deletion_protection   = true
 database_skip_final_snapshot   = false
 
+# Actual recipients belong only in the ignored operator tfvars. Every address
+# must click the AWS confirmation email before the alarm preflight can pass.
+alert_email_addresses = ["REPLACE_WITH_OPERATOR_ALERT_EMAIL"]
+
 # Worker capacity. Two stable identities across private subnets let Cats cold
 # restore onto the surviving host after one bare-metal worker is lost. The
 # imported live cats-metal-2 occupies Terraform index 0; keep it first so the

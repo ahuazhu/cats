@@ -12,7 +12,10 @@ usage_kinesis_retention_hours  = 24
 usage_consumer_lag_alarm_threshold_ms = 60000
 usage_archive_object_lock_days = 2555
 
-alarm_sns_topic_arns = []
+# Copy this exact value from the reviewed platform state with:
+# terraform -chdir=../platform output -raw alert_sns_topic_arn
+# Keep the real account-specific ARN in the ignored operator tfvars, not here.
+platform_alert_sns_topic_arn = "arn:aws:sns:us-east-1:REPLACE_WITH_ACCOUNT_ID:REPLACE_WITH_PLATFORM_ALERT_TOPIC"
 
 worker_artifact_bucket_name    = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_WORKER_ARTIFACT_BUCKET"
 worker_bundle_path             = "/absolute/path/to/dist/worker/cats-worker.tar.zst"

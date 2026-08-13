@@ -136,6 +136,12 @@ cluster through an explicit EKS access entry.
 
 ## Usage infrastructure
 
+Before the cutover window, complete the tracked SNS output/input seam, confirm
+the recipient out of band, run the fail-closed live preflight and retain one
+controlled delivery test as described in the
+[alarm recipient runbook](../alarm-recipients-runbook.md). Terraform cannot
+infer subscription confirmation from a created subscription resource.
+
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
@@ -463,4 +469,8 @@ terraform -chdir=deploy/aws/terraform/stacks/production-payments init -backend=f
 terraform -chdir=deploy/aws/terraform/stacks/production-payments validate
 terraform -chdir=deploy/aws/terraform/stacks/production-application init -backend=false
 terraform -chdir=deploy/aws/terraform/stacks/production-application validate
+terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
+terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
+terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+python3 deploy/aws/preflight-alarm-recipients-fixture.py
 ```
