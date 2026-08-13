@@ -1739,9 +1739,7 @@ fn validate_existing_endpoints(
         lock_candidate_hostname(transaction, hostname)?;
     }
 
-    for ((binding, peeked_lookup), endpoint) in
-        desired.endpoints.iter().zip(&lookups).zip(&endpoints)
-    {
+    for (peeked_lookup, endpoint) in lookups.iter().zip(&endpoints) {
         checkpoint_cat_create(transaction, commit_state)?;
         let lookup = load_hostname_lookup_for_update(transaction, &peeked_lookup.hostname)?
             .ok_or_else(|| stored_corruption("current Desired hostname lookup disappeared"))?;
@@ -1750,7 +1748,7 @@ fn validate_existing_endpoints(
                 "current Desired hostname lookup changed while closing the graph",
             ));
         }
-        validate_endpoint_lookup(&endpoint, &lookup, desired)?;
+        validate_endpoint_lookup(endpoint, &lookup, desired)?;
     }
     Ok(())
 }
