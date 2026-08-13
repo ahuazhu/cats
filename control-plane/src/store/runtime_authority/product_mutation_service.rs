@@ -49,10 +49,12 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
 const IDENTITY_CONTENT_ENCODING: &[u8] = b"identity";
 const MAX_REPLANS: usize = 32;
-const NOT_FOUND_BODY: &[u8] = br#"{"code":"not_found","message":"resource not found"}"#;
 const IF_MATCH_BODY: &[u8] =
     br#"{"code":"conflict","message":"If-Match does not name the current Desired revision"}"#;
 const PRECONDITION_BODY: &[u8] = br#"{"code":"failed_precondition","message":"lifecycle action is not valid from the current target"}"#;
+const ENDPOINT_CONFLICT_BODY: &[u8] =
+    br#"{"code":"conflict","message":"endpoint mutation conflicts with current authority"}"#;
+const ENDPOINT_PRECONDITION_BODY: &[u8] = br#"{"code":"failed_precondition","message":"endpoint mutation is not valid for the current Cat"}"#;
 const RETIRED_BODY: &[u8] =
     br#"{"code":"failed_precondition","message":"a Deleted Cat cannot be revived"}"#;
 
@@ -246,6 +248,46 @@ pub(crate) fn parse_authorized_product_mutation(
         if_match,
         absolute_deadline,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_authorized_endpoint_bind(
+    authenticated_workspace_id: &Id,
+    cat_id: &str,
+    received_at: Instant,
+    raw_path_and_query: &[u8],
+    fields: &ProductMutationHttpFields,
+    raw_body: &[u8],
+) -> Result<AuthorizedProductMutationIngress> {
+    // Validate the complete media/header/path/idempotency envelope before
+    // parsing any JSON field. The placeholder never escapes this function and
+    // contributes no bytes to the fingerprint.
+    let placeholder = EndpointBindBody {
+        name: Id::new("placeholder").expect("static placeholder ID is valid"),
+        hostname: Hostname::new("placeholder.cats.invalid")
+            .expect("static placeholder hostname is valid"),
+        target_port: 1,
+    };
+    let mut ingress = parse_authorized_product_mutation(
+        authenticated_workspace_id,
+        Some(cat_id),
+        received_at,
+        raw_path_and_query,
+        fields,
+        raw_body,
+        ProductMutation::BindEndpoint(placeholder),
+    )?;
+    let mut decoder = serde_json::Deserializer::from_slice(raw_body);
+    let body = EndpointBindBody::deserialize(&mut decoder)
+        .map_err(|_| ApiError::invalid("Endpoint bind body is malformed"))?;
+    decoder
+        .end()
+        .map_err(|_| ApiError::invalid("Endpoint bind body has a non-whitespace tail"))?;
+    if body.target_port == 0 {
+        return Err(ApiError::invalid("Endpoint target_port must be non-zero"));
+    }
+    ingress.mutation = ProductMutation::BindEndpoint(body);
+    Ok(ingress)
 }
 
 fn validate_canonical_path(
@@ -554,7 +596,11 @@ impl ProductMutationService {
             .map_err(ProductMutationServiceError::from_api)?;
             let mut snapshot = match snapshot {
                 Some(snapshot) => snapshot,
-                None => return self.fixed_result(ingress, 404, NOT_FOUND_BODY).await,
+                None => {
+                    return Err(ProductMutationServiceError::Request(ApiError::not_found(
+                        "Cat",
+                    )))
+                }
             };
             if action == Some(CatLifecycleAction::Resume)
                 && snapshot.current.target != RuntimeTarget::Running
@@ -722,9 +768,15 @@ impl ProductMutationService {
                 Ok(plan) => plan,
                 Err(error) => {
                     let (status, body) = match error.code {
-                        ErrorCode::NotFound => (404, NOT_FOUND_BODY),
-                        ErrorCode::Conflict => (409, PRECONDITION_BODY),
-                        ErrorCode::FailedPrecondition => (412, PRECONDITION_BODY),
+                        // A result miss cannot distinguish absent from another
+                        // Workspace's resource without checking ownership. The
+                        // frozen covered contract therefore rolls the key
+                        // reservation back and persists nothing for NotFound.
+                        ErrorCode::NotFound => {
+                            return Err(ProductMutationServiceError::Request(error))
+                        }
+                        ErrorCode::Conflict => (409, ENDPOINT_CONFLICT_BODY),
+                        ErrorCode::FailedPrecondition => (412, ENDPOINT_PRECONDITION_BODY),
                         ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => {
                             return Err(ProductMutationServiceError::TemporarilyUnavailable);
                         }
@@ -741,6 +793,11 @@ impl ProductMutationService {
                     return self.fixed_result(ingress, 409, IF_MATCH_BODY).await;
                 }
             }
+            if plan.expected_current.target == RuntimeTarget::Deleted {
+                return self
+                    .fixed_result(ingress, 412, ENDPOINT_PRECONDITION_BODY)
+                    .await;
+            }
             let operation_id = prefixed_id("op_", self.identities.random_id()?)?;
             let covered = covered_endpoint_request(&ingress, plan, operation_id);
             match self
@@ -754,7 +811,9 @@ impl ProductMutationService {
                     continue;
                 }
                 CommitOutcome::CandidateCollision(CandidateCollision::Hostname) => {
-                    return self.fixed_result(ingress, 409, PRECONDITION_BODY).await;
+                    return self
+                        .fixed_result(ingress, 409, ENDPOINT_CONFLICT_BODY)
+                        .await;
                 }
                 CommitOutcome::CandidateCollision(_) => {
                     return Err(ProductMutationServiceError::Fatal(ApiError::internal(
@@ -1138,6 +1197,47 @@ mod tests {
             vec![b"7".to_vec(), b"8".to_vec()],
         ] {
             assert!(parse_if_match(&values).is_err());
+        }
+    }
+
+    #[test]
+    fn endpoint_bind_parser_fingerprints_exact_json_and_rejects_schema_drift() {
+        let workspace = id("ws_endpoint");
+        let mut endpoint_fields = fields(&[]);
+        endpoint_fields.content_type = vec![b"application/json".to_vec()];
+        let path = b"/v1/workspaces/ws_endpoint/cats/cat_endpoint/endpoints";
+        let raw = br#"{"name":"web","hostname":"web.example.com","target_port":8080}"#;
+        let parsed = parse_authorized_endpoint_bind(
+            &workspace,
+            "cat_endpoint",
+            Instant::now(),
+            path,
+            &endpoint_fields,
+            raw,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.mutation,
+            ProductMutation::BindEndpoint(EndpointBindBody {
+                target_port: 8080,
+                ..
+            })
+        ));
+        for malformed in [
+            br#"{"name":"web","hostname":"web.example.com","target_port":0}"#.as_slice(),
+            br#"{"name":"web","hostname":"web.example.com","target_port":8080,"protocol":"http"}"#
+                .as_slice(),
+            br#"{"name":"web","hostname":"web.example.com","target_port":8080}x"#.as_slice(),
+        ] {
+            assert!(parse_authorized_endpoint_bind(
+                &workspace,
+                "cat_endpoint",
+                Instant::now(),
+                path,
+                &endpoint_fields,
+                malformed,
+            )
+            .is_err());
         }
     }
 

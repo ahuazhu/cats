@@ -1008,7 +1008,7 @@ pub(super) fn refresh_assigned_route_runtime_for_test(
                 let CheckpointEvidence::Valid { require_idle, .. } = &mut runtime.checkpoint else {
                     panic!("route-ready fixture has a valid checkpoint");
                 };
-                *require_idle = Box::new(busy);
+                **require_idle = busy;
                 runtime.conditions = vec![Condition::PreconditionFailed {
                     reason: PreconditionFailureReason::Busy {
                         attempt_id: attempt_id.clone(),

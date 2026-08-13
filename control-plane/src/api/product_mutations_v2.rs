@@ -6,18 +6,16 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::Response;
-use serde::Deserialize;
-
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::Id;
 
 use super::{check_workspace_auth, require_funded, ApiResult, Failure};
 use crate::server::AppState;
 use crate::store::runtime_authority::product_mutation_service::{
-    parse_authorized_product_mutation, product_mutation_absolute_deadline,
-    AuthorizedProductMutationIngress, CatLifecycleAction, EndpointBindBody, ProductMutation,
-    ProductMutationHttpFields, ProductMutationHttpResult, ProductMutationServiceError,
-    PRODUCT_MUTATION_MAX_BODY_BYTES,
+    parse_authorized_endpoint_bind, parse_authorized_product_mutation,
+    product_mutation_absolute_deadline, AuthorizedProductMutationIngress, CatLifecycleAction,
+    ProductMutation, ProductMutationHttpFields, ProductMutationHttpResult,
+    ProductMutationServiceError, PRODUCT_MUTATION_MAX_BODY_BYTES,
 };
 
 const BODY_READ_LIMIT: usize = PRODUCT_MUTATION_MAX_BODY_BYTES + 1;
@@ -95,15 +93,13 @@ pub(crate) async fn bind_endpoint_v2(
     let raw_path = raw_path_and_query(request.uri());
     let fields = http_fields(request.headers());
     let body = timeout_at(deadline, read_body(request.into_body())).await??;
-    let endpoint = decode_endpoint_body(&body)?;
-    let ingress = parse_authorized_product_mutation(
+    let ingress = parse_authorized_endpoint_bind(
         &workspace_id,
-        Some(&cat),
+        &cat,
         received_at,
         &raw_path,
         &fields,
         &body,
-        ProductMutation::BindEndpoint(endpoint),
     )?;
     execute(&state, ingress).await
 }
@@ -228,7 +224,6 @@ async fn execute(
 fn map_service_error(state: &AppState, error: ProductMutationServiceError) -> Failure {
     match error {
         ProductMutationServiceError::Request(error) => Failure(error),
-        ProductMutationServiceError::NotFound => Failure(ApiError::not_found("cat")),
         ProductMutationServiceError::TemporarilyUnavailable => Failure(ApiError::unavailable(
             "product authority is temporarily unavailable",
         )),
@@ -243,19 +238,6 @@ fn map_service_error(state: &AppState, error: ProductMutationServiceError) -> Fa
 fn authenticated_workspace_id(value: &str) -> ApiResult<Id> {
     Id::new(value.to_owned())
         .ok_or_else(|| ApiError::internal("authenticated Workspace ID is invalid").into())
-}
-
-fn decode_endpoint_body(body: &[u8]) -> ApiResult<EndpointBindBody> {
-    let mut decoder = serde_json::Deserializer::from_slice(body);
-    let value = EndpointBindBody::deserialize(&mut decoder)
-        .map_err(|_| ApiError::invalid("Endpoint bind body is malformed"))?;
-    decoder
-        .end()
-        .map_err(|_| ApiError::invalid("Endpoint bind body has a non-whitespace tail"))?;
-    if value.target_port == 0 {
-        return Err(ApiError::invalid("Endpoint target_port must be non-zero").into());
-    }
-    Ok(value)
 }
 
 fn raw_path_and_query(uri: &axum::http::Uri) -> Vec<u8> {

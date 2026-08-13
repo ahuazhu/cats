@@ -39,9 +39,16 @@ use super::product::{
     persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
     CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
-    DesiredMutationCommit, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
-    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
+    CoveredDiskDeleteRequest, DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState,
+    DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
+    ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
+    PersistentDiskInitialization, RuntimeOperationRead,
+};
+use super::product_identity::UuidProductIdentitySource;
+use super::product_mutation_service::{
+    parse_authorized_endpoint_bind, parse_authorized_product_mutation, CatLifecycleAction,
+    ProductMutation, ProductMutationHttpFields, ProductMutationService,
+    ProductMutationServiceError,
 };
 use super::product_reads::{ProductPageRead, ProductRead};
 use super::product_rows::{
@@ -225,6 +232,45 @@ fn commit_desired_mutation(
         Instant::now() + Duration::from_secs(30),
     );
     store.commit_desired_mutation_covered(request, &state)
+}
+
+fn disk_delete_request(
+    workspace_id: &Id,
+    disk_id: &Id,
+    key: &str,
+    delete_id: &str,
+) -> CoveredDiskDeleteRequest {
+    let route = AsciiText::new("DELETE /v1/workspaces/{workspace}/disks/{disk}").unwrap();
+    let raw_path = format!("/v1/workspaces/{workspace_id}/disks/{disk_id}");
+    CoveredDiskDeleteRequest {
+        idempotency: ApiIdempotencyRequest {
+            authenticated_workspace_id: workspace_id.clone(),
+            canonical_route: route.clone(),
+            idempotency_key: AsciiText::new(key).unwrap(),
+            request_fingerprint: api_request_fingerprint(
+                workspace_id,
+                &route,
+                raw_path.as_bytes(),
+                IfMatchFingerprint::Absent,
+                b"",
+            )
+            .unwrap(),
+        },
+        disk_id: disk_id.clone(),
+        delete_id: id(delete_id),
+        active_guest_digest: Sha256Digest::from_bytes([0x5d; 32]),
+    }
+}
+
+fn begin_disk_delete(
+    store: &Store,
+    request: &CoveredDiskDeleteRequest,
+) -> crate::store::Result<super::product::ApiIdempotencyResult> {
+    let (_cancellation, state) = CoveredCommitCancellation::new(
+        "Disk delete test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    store.begin_disk_delete_covered(request, &state)
 }
 
 fn desired_mutation_from_route_plan(
@@ -726,6 +772,257 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn a2_cat_delete_requires_the_closed_volume_mode_and_replays_exact_bytes() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "a2-cat-delete", 72, "a2-cat-delete-create");
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 72);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let delete_id = id("delete_a2_cat_exact");
+    let mut deleted = create.candidate.desired.clone();
+    deleted.desired_revision = revision(2);
+    deleted.target = RuntimeTarget::Deleted;
+    deleted.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+        delete_id: delete_id.clone(),
+    };
+    deleted.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    deleted.spec_digest = spec_digest(&deleted).unwrap();
+
+    let uncovered = desired_mutation_request(
+        &create.candidate.desired,
+        deleted.clone(),
+        "op_a2_cat_uncovered",
+        "a2-cat-delete-uncovered",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    let error = commit_desired_mutation(&store, &uncovered).unwrap_err();
+    assert!(matches!(
+        error,
+        CoveredDesiredMutationError::Store(ref error)
+            if error.message.contains("volume intent changes require a closed covered mutation")
+    ));
+    assert_desired_mutation_artifacts_absent(&store, &uncovered);
+
+    let mut covered = desired_mutation_request(
+        &create.candidate.desired,
+        deleted.clone(),
+        "op_a2_cat_delete",
+        "a2-cat-delete-covered",
+        Vec::new(),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    );
+    covered.volume_mutation = DesiredVolumeMutation::DeleteCat {
+        delete_id: delete_id.clone(),
+    };
+    let DesiredMutationCommit::Changed(first) = commit_desired_mutation(&store, &covered).unwrap()
+    else {
+        panic!("the exact covered Cat delete must commit a successor");
+    };
+    let DesiredMutationCommit::Replayed(replayed) =
+        commit_desired_mutation(&store, &covered).unwrap()
+    else {
+        panic!("the exact Cat delete retry must replay");
+    };
+    assert_eq!(replayed, first);
+
+    store
+        .authority_transaction(|transaction| {
+            let current = super::product_rows::load_desired_for_update(
+                transaction,
+                &create.candidate.cat_id,
+            )?
+            .unwrap();
+            let volume = super::rows::load_volume_for_update(
+                transaction,
+                &create.candidate.volume.volume_id,
+            )?
+            .unwrap();
+            let disk = super::product_rows::load_disk_by_id_for_update(
+                transaction,
+                &create.candidate.root_disk.disk_id,
+            )?
+            .unwrap();
+            assert_eq!(current, deleted);
+            assert_eq!(volume.admin_state, VolumeAdminState::Active);
+            assert_eq!(disk.admin_state, DiskAdminState::Active);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a2_persistent_disk_delete_is_workspace_hidden_atomic_and_exactly_replayable() {
+    let (_url, store, _unused, workspace) = stores();
+    let volume = blank_volume("volume_a2_delete");
+    let disk = persistent_disk(
+        &workspace,
+        "disk_a2_delete",
+        "a2-delete",
+        &volume,
+        PersistentDiskInitialization::Uninitialized {
+            initialization_token: random_id(0xa2d1),
+            filesystem_uuid: random_id(0xa2d2),
+            expected_blank_head: volume.head.clone(),
+        },
+    );
+    store
+        .authority_transaction(|transaction| {
+            insert_volume(transaction, &volume)?;
+            insert_disk(transaction, &disk)
+        })
+        .unwrap();
+
+    let foreign = bootstrap_workspace(&store, "f2b");
+    let hidden = disk_delete_request(
+        &foreign,
+        &disk.disk_id,
+        "a2-disk-delete-foreign",
+        "delete_a2_hidden",
+    );
+    let hidden_error = begin_disk_delete(&store, &hidden).unwrap_err();
+    assert_eq!(hidden_error.code, ErrorCode::NotFound);
+    store
+        .authority_transaction(|transaction| {
+            assert!(super::product_rows::load_api_result_for_update(
+                transaction,
+                &hidden.idempotency,
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+
+    let request = disk_delete_request(
+        &workspace,
+        &disk.disk_id,
+        "a2-disk-delete",
+        "delete_a2_persistent",
+    );
+    let first = begin_disk_delete(&store, &request).unwrap();
+    assert_eq!(first.http_status, 202);
+    assert_eq!(begin_disk_delete(&store, &request).unwrap(), first);
+
+    store
+        .authority_transaction(|transaction| {
+            let current_volume =
+                super::rows::load_volume_for_update(transaction, &volume.volume_id)?.unwrap();
+            let current_disk =
+                super::product_rows::load_disk_by_id_for_update(transaction, &disk.disk_id)?
+                    .unwrap();
+            assert!(matches!(
+                current_volume.admin_state,
+                VolumeAdminState::Deleting { ref delete_id }
+                    if delete_id == &request.delete_id
+            ));
+            assert!(matches!(
+                current_disk.admin_state,
+                DiskAdminState::Deleting { ref delete_id }
+                    if delete_id == &request.delete_id
+            ));
+            assert!(matches!(
+                current_volume.last_transition,
+                Some(LastVolumeTransition::BeginDelete {
+                    request: ref transition_request,
+                    ..
+                }) if transition_request.delete_id == request.delete_id
+            ));
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a2_cat_and_endpoint_cross_workspace_misses_persist_nothing() {
+    let (_url, store, _unused, owner_workspace) = stores();
+    let caller_workspace = bootstrap_workspace(&store, "f2c");
+    let create = request(
+        &owner_workspace,
+        "a2-cross-workspace",
+        73,
+        "a2-cross-workspace-create",
+    );
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let store = Arc::new(store);
+    let service = ProductMutationService::new(
+        Arc::clone(&store),
+        Arc::new(UuidProductIdentitySource),
+        Sha256Digest::from_bytes([0x73; 32]),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let fields = ProductMutationHttpFields {
+        idempotency_key: vec![b"a2-cross-cat".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let cat_path = format!(
+        "/v1/workspaces/{caller_workspace}/cats/{}/actions/stop",
+        create.candidate.cat_id
+    );
+    let cat_ingress = parse_authorized_product_mutation(
+        &caller_workspace,
+        Some(create.candidate.cat_id.as_str()),
+        Instant::now(),
+        cat_path.as_bytes(),
+        &fields,
+        b"",
+        ProductMutation::Lifecycle(CatLifecycleAction::Stop),
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime.block_on(service.mutate(cat_ingress)),
+        Err(ProductMutationServiceError::Request(ref error))
+            if error.code == ErrorCode::NotFound
+    ));
+
+    let endpoint_fields = ProductMutationHttpFields {
+        content_type: vec![b"application/json".to_vec()],
+        idempotency_key: vec![b"a2-cross-endpoint".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let endpoint_path = format!(
+        "/v1/workspaces/{caller_workspace}/cats/{}/endpoints",
+        create.candidate.cat_id
+    );
+    let endpoint_ingress = parse_authorized_endpoint_bind(
+        &caller_workspace,
+        create.candidate.cat_id.as_str(),
+        Instant::now(),
+        endpoint_path.as_bytes(),
+        &endpoint_fields,
+        br#"{"name":"cross","hostname":"cross.example.com","target_port":8080}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime.block_on(service.mutate(endpoint_ingress)),
+        Err(ProductMutationServiceError::Request(ref error))
+            if error.code == ErrorCode::NotFound
+    ));
+
+    let result_count: i64 = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT count(*) FROM api_idempotency_results
+                      WHERE authenticated_workspace_id=$1
+                        AND idempotency_key IN ('a2-cross-cat', 'a2-cross-endpoint')",
+                    &[&caller_workspace.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(result_count, 0);
 }
 
 #[test]
