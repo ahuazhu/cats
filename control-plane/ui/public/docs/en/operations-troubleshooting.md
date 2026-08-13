@@ -20,22 +20,20 @@ An Operation moves from `pending` to exactly one of `succeeded`, `failed`, or `s
 | `stale_epoch` | Old disk or route owner attempted work | Treat as fenced; rebuild from the current assignment. |
 | `unavailable` | Temporary dependency failure | Retry with bounded backoff and inspect the Operation. |
 
-## Cat does not become Ready
+## Cat does not become Ready after create
 
-1.  Run `cats get NAME --json` and note desired/observed state and node.
+1.  Run `cats get CAT_ID --json` and note desired/observed state and node.
 2.  Inspect the accepted Operation by ID and its terminal result or error.
 3.  Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.
 4.  If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.
 
-## Disk cannot mount, resize, or delete
+## A Disk mutation is unavailable
 
-Run `cats disk get NAME`. A PersistentDisk can have only one active read-write Attachment. Unmount it cleanly before moving or deleting it, and follow the current runtime precondition for resize. Never bypass a fencing conflict.
+Run `cats disk get DISK_ID` to inspect the current projection. Attachment, snapshot, capacity change, and deletion are outside the release product surface. Do not probe a legacy route or bypass an authority/fencing conflict.
 
-## Auto-suspend does not trigger
+## A lifecycle command is unavailable
 
-    cats sleep status dev
-
-Check active platform/Guest leases, Guest signal freshness, and the printed reason. A stale signal intentionally fails awake. Confirm that long-running applications release expired work and that no shell, exec, deploy, or gateway activation lease remains.
+Lifecycle and Guest-command clients are intentionally absent during the signed runtime cutover. Preserve the accepted create Operation ID and current Cat projection; do not substitute an old command or route.
 
 ## Control plane is unreachable
 

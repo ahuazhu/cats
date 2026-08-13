@@ -1,52 +1,5 @@
-<h2 id="default-url">Default URL</h2>
-<pre><code>cats create dev
-cats endpoint ls dev
-curl https://dev-&lt;cat-suffix&gt;.cats.run/</code></pre>
-<p>Every Cat receives a stable HTTPS Endpoint named <code>web</code>. It forwards to Guest port <code>8080</code> and uses <code>wake_on_request</code>; no <code>cats expose</code> step is required. The URL is tied to the Cat resource, not a host, and is also printed by <code>cats create</code> and <code>cats get</code>.</p>
-<p>The application must listen on <code>0.0.0.0:8080</code> (or <code>:::8080</code>). A service bound only to Guest loopback cannot be reached through the tap network.</p>
-
-<h2 id="additional-ports">Additional ports</h2>
-<pre><code># Repoint the default URL to port 3000
-cats expose dev 3000
-
-# Or add a second URL
-cats expose dev 3000 --name preview --protocol http
-cats endpoint ls dev</code></pre>
-<p>Without <code>--name</code>, <code>cats expose</code> reconfigures the default <code>web</code> Endpoint. Use a different name to add a second URL. V1 Endpoints are publicly addressable; do not expose an unauthenticated administration or secrets interface.</p>
-
-<h2 id="wake-policy">Wake policy</h2>
-<pre><code>cats expose dev 3000 --name internal-preview --no-wake</code></pre>
-<ul>
-  <li><strong>wake on request:</strong> the gateway singleflights concurrent activation attempts for a sleeping Cat, waits for readiness, and then routes to the new activation epoch.</li>
-  <li><strong>no wake:</strong> a request does not start the Cat; use this for workloads that should serve only while explicitly Running.</li>
-</ul>
-<p>A client should tolerate <code>503</code> with retry guidance during activation and reconnect after lifecycle or host changes. Stable hostname does not mean stable long-lived connections.</p>
-
-<h2 id="protocols">Protocols and routing safety</h2>
-<p>The implemented path supports HTTP/1.1 and WebSocket Upgrade with TLS termination at the regional edge. HTTP preserves method, path/query, application headers, response status, and request/response bodies. WebSocket preserves application headers and relays text, binary, ping, pong, and close frames while holding a work lease for the connection. The owning node revalidates Cat ownership and Running state; an old cached route fails closed instead of reaching a different Guest.</p>
-
-<h2 id="response-size">Response size</h2>
-<p>An HTTP response crosses the hop to the Guest as one piece, and a response of 16 MiB or more is refused: the caller gets <code>502</code> with <code>node hop status 502 Bad Gateway</code>, immediately and regardless of how healthy the Guest is. A <code>HEAD</code> whose <code>Content-Length</code> declares that much is refused on the declaration alone, so the size of a large object cannot be probed that way either.</p>
-<p>Serve anything larger with range requests. A one-byte range reports the total in <code>Content-Range</code>, and chunks below the limit transfer normally:</p>
-<pre><code>curl -sS -r 0-0 -D - -o /dev/null "$URL"   # Content-Range: bytes 0-0/92326622
-curl -sS -r 0-8388607 "$URL" &gt;&gt; part       # 8 MiB at a time</code></pre>
-<p>WebSocket messages are framed the same way and carry the same per-message ceiling. For objects that are routinely large, prefer a signed object-storage URL over serving them through an Endpoint.</p>
-
-<h2 id="availability">Where this stands today</h2>
-<p>HTTP and WebSocket ingress work: Endpoint addresses, route binding, wake-on-request, and connection-length work leases are in place.</p>
-<p>Not yet available: <strong>private Guest-to-Guest networking across nodes</strong>.</p></div>
-
-<h2 id="guest-service">Prepare the Guest service</h2>
-<ol>
-  <li>Listen on <code>0.0.0.0:8080</code> for the default URL, or on the selected additional Endpoint port.</li>
-  <li>Return readiness only after dependencies and disk state are usable.</li>
-  <li>Do not expect Cats to preserve application TCP state across sleep.</li>
-  <li>If background work must keep the Cat Running, acquire a <a href="/docs/runtime-api/">work lease</a>.</li>
-</ol>
-
-<h2 id="troubleshoot">Troubleshoot an Endpoint</h2>
-<pre><code>cats get dev
-cats endpoint ls dev
-cats operation get OPERATION_ID
-cats exec dev -- sh -lc 'ss -lnt'</code></pre>
-<p>Verify the Cat is healthy, the Endpoint targets the expected port, the accepted activation Operation succeeded, and the Guest service is actually listening. Operation list is unavailable, so retain the ID returned by the mutation. Operators should also check route epoch mismatch and gateway/node connectivity metrics.</p>
+<h2 id="boundary">Current release boundary</h2>
+<p>Endpoint collection and mutation routes are not part of the release product router during the signed runtime cutover. The shipped CLI and browser console do not expose Endpoint controls and fail locally instead of probing legacy paths.</p>
+<h2 id="target">Target admission model</h2>
+<p>Route Grant v2 binds a runtime incarnation and one per-Endpoint serving epoch. Node-installed admission must be closed before leaving Running, and it can reopen only after a fresh Desired state raises that Endpoint epoch. A route TTL or heartbeat timeout is not a Host fence.</p>
+<p>This architecture remains the target contract, not permission for a user client to construct an Endpoint mutation while the production route is absent.</p>

@@ -113,3 +113,106 @@ fn release_surface_cannot_compose_the_debug_retired_authority() {
         "official control-plane image must compile the release-only authority surface"
     );
 }
+
+#[test]
+fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))
+        .expect("read production router");
+    let cli =
+        std::fs::read_to_string(workspace.join("cmd/cats/src/lib.rs")).expect("read shipped CLI");
+    let user_script = std::fs::read_to_string(workspace.join("control-plane/ui/user.js"))
+        .expect("read user console script");
+    let user_markup = std::fs::read_to_string(workspace.join("control-plane/ui/user.html"))
+        .expect("read user console markup");
+
+    for route in [
+        ".route(\"/v1/workspaces/{workspace}/cats\", cat_collection_route)",
+        ".route(\"/v1/workspaces/{workspace}/disks\", disk_collection_route)",
+        ".route(\"/v1/workspaces/{workspace}/cats/{cat}\", cat_item_read)",
+        ".route(\"/v1/workspaces/{workspace}/disks/{disk}\", disk_item_read)",
+        "get(runtime_operations::get_runtime_operation)",
+    ] {
+        assert!(router.contains(route), "release router lost {route:?}");
+    }
+    assert!(
+        cli.contains("#[command(hide = true)]\n    Delete {")
+            && cli.contains("PersistentDiskCreateV1Request")
+            && cli.contains("CatCreateV2Request"),
+        "shipped CLI no longer hides Disk delete or shares the closed create DTOs"
+    );
+
+    for retired in [
+        "data-cat-action",
+        "data-disk-action",
+        "/actions/",
+        "#exec-form",
+    ] {
+        assert!(
+            !user_script.contains(retired),
+            "release user script retained mutation surface {retired:?}"
+        );
+    }
+    assert!(
+        user_script.contains("buildPersistentDiskCreateV1Request")
+            && user_script.contains("sendDurablePersistentDiskCreateV1")
+            && user_markup.contains("name=\"durability\" type=\"hidden\" value=\"strict\"")
+            && !user_markup.contains("id=\"exec-dialog\""),
+        "release console lost the closed PersistentDisk create or regained retired controls"
+    );
+
+    for locale in ["en", "zh-CN"] {
+        let api = std::fs::read_to_string(workspace.join(format!(
+            "control-plane/ui/public/docs/{locale}/api-reference.md"
+        )))
+        .expect("read API reference");
+        let cli_reference = std::fs::read_to_string(workspace.join(format!(
+            "control-plane/ui/public/docs/{locale}/cli-reference.md"
+        )))
+        .expect("read CLI reference");
+        for current in [
+            "POST /v1/workspaces/{workspace_id}/cats",
+            "GET  /v1/workspaces/{workspace_id}/cats",
+            "POST /v1/workspaces/{workspace_id}/disks",
+            "GET  /v1/workspaces/{workspace_id}/disks",
+            "GET /v1/workspaces/{workspace_id}/operations/{operation_id}",
+        ] {
+            assert!(api.contains(current), "{locale} API docs lost {current:?}");
+        }
+        for retired in [
+            "DELETE /v1/workspaces/{workspace_id}/cats",
+            "DELETE /v1/workspaces/{workspace_id}/disks",
+            "/actions/{verb}",
+            "/snapshots",
+        ] {
+            assert!(
+                !api.contains(retired),
+                "{locale} API docs advertise retired route {retired:?}"
+            );
+        }
+        for current in [
+            "cats create NAME --boot-image-digest",
+            "cats disk create NAME --size SIZE",
+            "cats operation get OPERATION_ID",
+        ] {
+            assert!(
+                cli_reference.contains(current),
+                "{locale} CLI docs lost {current:?}"
+            );
+        }
+        for retired in [
+            "cats disk delete",
+            "cats disk snapshot",
+            "cats mount",
+            "cats unmount",
+            "cats expose",
+            "cats start",
+            "cats destroy",
+        ] {
+            assert!(
+                !cli_reference.contains(retired),
+                "{locale} CLI docs advertise retired command {retired:?}"
+            );
+        }
+    }
+}

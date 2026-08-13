@@ -1,143 +1,52 @@
 ## Conventions
 
-The external API is JSON over HTTP. User resources are scoped by the immutable workspace ID in `/v1/workspaces/{workspace_id}/…`; a mutable slug never appears in a resource route. A verified WorkOS identity may access Workspaces owned by its active Account membership, and changing a URL cannot create that membership.
+The external API is JSON over HTTP. Product resources are scoped by the immutable Workspace ID in `/v1/workspaces/{workspace_id}/…`; mutable slugs are not resource keys. Browser requests use the HttpOnly WorkOS session. CLI and automation requests use the corresponding WorkOS or Workspace credential.
 
-    Authorization: Bearer <short-lived-workos-access-token>
-    Accept: application/json
-    Content-Type: application/json
-    Idempotency-Key: <unique-request-id>   # mutations
-    If-Match: "<generation>"                # guarded state changes
+The two create collections require exact `Content-Type: application/json`, exactly one printable `Idempotency-Key`, a canonical Workspace path with no query, and the closed request body shown below. A retry after an ambiguous response must replay the same path, body, and key.
 
-`cats login` obtains and refreshes the user token through WorkOS Device Authorization without writing it to the normal config file. Other user clients must use an approved WorkOS flow and the same verified JWT contract; static user tokens are not accepted. Browser consoles use their HttpOnly WorkOS session instead of exposing a Bearer token to JavaScript. A Workspace manager may issue a revocable `cats_wst_…` machine credential for CI; it authorizes only the immutable Workspace that issued it and cannot mint another token. Service and administrator machine identities have separate scopes.
+## Current Cat surface
 
-## Identity and Workspaces
-
-    GET  /auth/config       # public WorkOS client/base-URL configuration
-    GET  /v1/me             # user profile and available Workspaces
-    GET  /v1/workspaces     # refresh the available Workspace list
-    POST /v1/accounts/{account}/workspaces
-    PATCH /v1/workspaces/{workspace}
-    GET|POST /v1/workspaces/{workspace}/tokens
-    DELETE /v1/workspaces/{workspace}/tokens/{token}
-    GET|POST /v1/accounts/{account}/invitations
-    POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
-    GET /v1/accounts/{account}/members
-    PATCH|DELETE /v1/accounts/{account}/members/{membership}
-    POST /v1/auth/logout    # revoke the CLI WorkOS session
-
-Workspace enumeration returns Personal and Organization Accounts from active WorkOS Organization memberships. Creating or renaming a Workspace requires account-management permission; a rename does not change its immutable ID, so every resource route keeps resolving. Invitation/member mutations require `cats:members:manage`, are rejected for Personal Accounts, and are performed through WorkOS. Creating an invitation also requires `Idempotency-Key`; Cats forwards it to WorkOS so a network retry returns the same invitation. User access-token signature, issuer, client ID, expiry, subject, Organization scope, active membership, Account ID, and Workspace ownership are checked before authorization.
-
-Token creation returns `{ "access_token": {…metadata…}, "token": "cats_wst_…" }`; the plaintext `token` is returned once and only its SHA-256 digest is stored. List responses never include the secret. Revocation takes effect on the next request.
-
-## Cats
-
-    POST   /v1/workspaces/{workspace_id}/cats
-    GET    /v1/workspaces/{workspace_id}/cats
-    GET    /v1/workspaces/{workspace_id}/cats/{cat}
-    DELETE /v1/workspaces/{workspace_id}/cats/{cat}
-    POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
-    POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
-    POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
-    GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
-    GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-    GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
-    PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
-
-Lifecycle verbs are `start`, `stop`, `suspend`, `resume`, and `warm`. `auto_suspend` defaults to `true` when omitted from create. Cat create/lifecycle/delete returns an asynchronous Operation response; poll the Operation URL instead of repeating a timed-out mutation with a new intent.
-
-Cat, Disk, and Operation responses include the immutable `workspace_id`, which is the only ownership key.
-
-Cat and Disk collection reads accept only `limit` (default 50, maximum 100) and an opaque `cursor`. They use stable immutable-ID byte order and return `{ "items": […], "next_cursor": <string-or-null> }`. A client must return `next_cursor` unchanged; cursors are canonical base64url without padding and bind their version and resource type, so a Cat cursor is invalid for Disks and vice versa. Malformed, noncanonical, duplicate, unknown, or out-of-range query fields are rejected. Cat and Disk item paths accept immutable `cat_…` / `disk_…` IDs only, never names or a name-or-ID guess.
-
-Cat reads compose the current Cat record, current `DesiredRuntimeSpec`, and the current observation summary in one read snapshot. Disk reads compose the current Disk record and any current Desired binding. `Deleted` Cats and `Deleting` Disks remain visible while their authority rows exist; completed deletion is absence. These product projections do not copy or expose lifecycle, volume-ownership, attachment, initialization, checkpoint, or physical-inventory authority.
-
-`exec` accepts `command`, optional `timeout_ms`, an optional string map `env`, and optional byte array `stdin`. `env` is passed only to the child process and is not stored in the Cats registry. The response contains `exit_code`, `stdout`, and `stderr`.
-
-`oci-deployments` accepts a stable `app`, a digest-pinned `image`, optional argv override `command`, persistent non-secret `env`, and optional one-pull `registry_auth`. Cats does not store Registry credentials. The Guest verifies and flattens the OCI layers and returns the requested image digest, selected platform-manifest digest, systemd service name, and active state.
-
-    {
-      "app": "server",
-      "image": "ghcr.io/acme/server@sha256:0123...cdef",
-      "env": { "PORT": "8080" }
-    }
-
-The image must use a full 64-hex-character `sha256` digest; mutable tags are rejected. `env` is written into the service unit on the RootDisk so it survives Cold boot and therefore must not contain secrets.
-
-    POST /v1/workspaces/ws_01J8QK.../cats
-    Idempotency-Key: request-7f12
+    POST /v1/workspaces/{workspace_id}/cats
+    GET  /v1/workspaces/{workspace_id}/cats
+    GET  /v1/workspaces/{workspace_id}/cats/{cat_id}
 
     {
       "name": "dev",
-      "image": "ubuntu-24.04",
-      "cpus": 2,
-      "memory_mib": 2048,
-      "root_size_bytes": 8589934592
+      "boot_image_digest": "sha256:<64-lowercase-hex>",
+      "vcpus": 2,
+      "memory_bytes": 2147483648,
+      "root_size_bytes": 1073741824,
+      "durability": "strict"
     }
 
-## Disks and snapshots
+Create returns exact `202 application/json` with `{"cat_id":"…","operation_id":"…"}`. Collection reads accept only bounded `limit` and opaque `cursor` fields. Item reads accept immutable `cat_…` IDs only.
 
-    POST   /v1/workspaces/{workspace_id}/disks
-    GET    /v1/workspaces/{workspace_id}/disks
-    GET    /v1/workspaces/{workspace_id}/disks/{disk}
-    DELETE /v1/workspaces/{workspace_id}/disks/{disk}
-    POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
-    POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
-    GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
+Lifecycle, exec, deployment, Endpoint, expiry, work-policy, and delete routes are not part of the release router during the signed runtime cutover. Clients must fail locally instead of probing those paths.
 
-Disk action verbs are `mount`, `unmount`, and `resize`. Mount bodies identify the Cat and Guest path. The service enforces RWO and rejects stale or conflicting attachment state.
+## Current PersistentDisk surface
 
-## Endpoints
-
-    POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
-    GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
+    POST /v1/workspaces/{workspace_id}/disks
+    GET  /v1/workspaces/{workspace_id}/disks
+    GET  /v1/workspaces/{workspace_id}/disks/{disk_id}
 
     {
-      "name": "web",
-      "target_port": 3000,
-      "protocol": "http",
-      "wake_policy": "wake_on_request"
+      "durability": "strict",
+      "name": "project-data",
+      "size_bytes": 21474836480
     }
 
-## Usage and billing
-
-    GET /v1/workspaces/{workspace_id}/billing/usage
-        ?from_ms=<inclusive-unix-milliseconds>
-        &to_ms=<exclusive-unix-milliseconds>
-        [&cat=<active-cat-name> | &cat_id=<immutable-cat-id>]
-        [&bucket_ms=<milliseconds>]
-        [&detail=true]
-
-The response is a `provisional` estimate for the open period. It includes range totals, totals by meter, totals by Cat, the immutable rate-card ID, and the latest visible interval end. `cat_id` remains queryable after a Cat is deleted. `bucket_ms` returns server-side time buckets for charts and bounded period detail; it must be at least 60 seconds and produce no more than 512 buckets. `detail=true` returns raw ledger intervals and should be reserved for controlled reconciliation queries rather than long browser ranges.
-
-CPU is rated at `$0.07 / CPU-hour` and memory at `$0.045 / GiB-hour` by the current rate card. Decimal quantities and nanodollar amounts are JSON strings so clients do not lose integer precision. The range total is rated once after aggregation; bucket amounts are display estimates and are not a finalized invoice.
-
-    GET  /v1/workspaces/{workspace_id}/billing/balance
-    POST /v1/workspaces/{workspace_id}/billing/checkout
-    Idempotency-Key: <unique-key>
-    {"amount_cents": 1000}
-
-A new user receives one non-renewing `$10` signup credit on the user's Personal Billing Account. Organization Accounts, extra Workspaces, and invitations do not mint signup credit. The balance response subtracts all-time provisional usage from append-only grants and top-ups. Checkout accepts only the published fixed top-up amounts and returns a Stripe-hosted URL. Returning from Checkout does not add credit: Cats credits the account only after a signed Stripe webhook reports the session as paid.
-
-When available credit is exhausted, paid compute admission returns HTTP `402` with code `payment_required`. Stopping, suspending, and deleting resources remain available.
+Create returns the exact created Disk projection with `201 application/json`. Capacity and durability are immutable in this release. Item reads require immutable `disk_…` IDs. Attachment, snapshot, capacity-change, and delete mutations are unavailable.
 
 ## Operations
 
-    GET /v1/workspaces/{workspace_id}/operations/{operation}
+    GET /v1/workspaces/{workspace_id}/operations/{operation_id}
 
-This exact lookup returns the canonical Runtime Reconciliation Operation: its immutable Workspace/Cat/revision/spec/placement binding, target, timestamps, and `pending`, `succeeded`, `failed`, or `superseded` settlement. A successful response is `application/json` with `Cache-Control: no-store`.
-
-Authorization is checked before the opaque Operation ID is looked up. An ID owned by another Workspace and an absent ID both return the same `not_found` response. The former global `GET /v1/operations/{operation}` and the Workspace Operation collection/list route are retired; no unbounded list contract is exposed.
+Only exact Operation lookup is exposed. Authorization precedes lookup, and another Workspace's opaque ID is indistinguishable from an absent ID. No Operation collection or global Operation URL is available.
 
 ## Errors
 
-    {
-      "code": "failed_precondition",
-      "message": "disk must be available before deletion"
-    }
-
-Clients should branch on the stable code and show the message for context. Important codes include `invalid_argument`, `unauthenticated`, `permission_denied`, `not_found`, `already_exists`, `failed_precondition`, `payment_required`, `conflict`, `stale_epoch`, `deadline_exceeded`, `unavailable`, and `internal`.
+Errors use a stable JSON `code` plus a human-readable `message`. Clients should branch on the code. A missing route is not permission to fall back to a legacy body or mutation path.
 
 **Version authority**
 
-This page documents the current V1 Rust router. For generated clients, derive a reviewed OpenAPI description from the same request/resource types before release; do not infer undocumented fields from architecture examples.
+This page documents the release product router. Account, session, billing, and internal signed-authority routes are separate surfaces; they do not reopen Cat or Disk lifecycle mutations.

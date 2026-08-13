@@ -1,43 +1,21 @@
-<h2 id="disk-types">磁盘类型</h2>
+<h2 id="types">磁盘类型</h2>
 <table><thead><tr><th></th><th>RootDisk</th><th>PersistentDisk</th></tr></thead><tbody>
-  <tr><td>创建</td><td>随每个 Cat 自动创建</td><td>显式创建，或通过 <code>cats create --disk</code></td></tr>
-  <tr><td>生命周期</td><td>随 Cat 删除</td><td>独立存在，直到显式删除</td></tr>
-  <tr><td>Guest 设备</td><td>系统盘</td><td>挂载到指定路径的额外块设备</td></tr>
-  <tr><td>访问</td><td>归所属 Cat 使用</td><td>RWO：V1 只有一个活跃写者</td></tr>
+<tr><td>创建</td><td>精确 Cat Create</td><td>精确 PersistentDisk Create</td></tr>
+<tr><td>Ownership</td><td>跟随所属 Cat</td><td>独立 Workspace Resource</td></tr>
+<tr><td>访问模型</td><td>一个 Cat</td><td>RWO：一个已授权 Writer Epoch</td></tr>
+<tr><td>Release 容量</td><td>不可变</td><td>不可变</td></tr>
 </tbody></table>
 
 <h2 id="create">创建并查看 PersistentDisk</h2>
-<pre><code>cats disk create project-data --size 20GiB
+<pre><code>cats disk create project-data --size 20GiB --durability strict
 cats disk ls
-cats disk get project-data</code></pre>
-<p>也可以同时创建 Cat 与独立磁盘：</p>
-<pre><code>cats create dev \
-  --disk project-data \
-  --disk-size 20GiB \
-  --mount-at /data</code></pre>
+cats disk get disk_…</code></pre>
+<p>Create Body 明确包含 <code>durability</code>、<code>name</code> 与 <code>size_bytes</code>。浏览器控制台使用 closed Strict default。浏览器与 CLI 都会在发送前持久化精确 Request 与 Idempotency-Key，因此响应不明确时执行 exact replay，而不是发起第二次 Create。</p>
+<p>Disk Item Lookup 要求 Create 或 List 返回的不可变 <code>disk_…</code> ID；Item Path 不接受名称。</p>
 
-<h2 id="mount">挂载与卸载</h2>
-<pre><code>cats mount project-data --cat dev --at /data
-cats unmount project-data</code></pre>
-<p>挂载会创建带单调递增 fencing epoch 的运行时 Attachment。卸载会先同步并 detach，再让磁盘回到 Available。即使两个写者修改不同逻辑块，V1 也会拒绝第二个读写 Attachment，因为 ext4 文件系统本身仍是单写者。</p>
+<h2 id="boundary">当前 Lifecycle 边界</h2>
+<p>Release Product Router 和发布版 CLI 不暴露 PersistentDisk Attachment、Snapshot、容量变更或删除。容量不可变。Provider-neutral Storage Engine 与 Signed Volume Authority 仍强制执行 RWO、Fencing、Durable Root 与 Stale Writer 拒绝；这些 Data-plane 保证不会授权 Product Mutation Endpoint。</p>
 
-<h2 id="resize">扩容磁盘</h2>
-<p>V1 只支持增大容量。如果当前运行路径要求磁盘处于 Available，请按 API 的前置条件先卸载。绝不能在 ext4 下方缩小卷。</p>
-
-<h2 id="snapshot">创建快照</h2>
-<pre><code>cats disk snapshot project-data</code></pre>
-<p>控制面先建立 durable barrier，再记录不可变 Root 与 generation。CLI 会创建并打印 Snapshot 响应；列出与恢复快照的便捷命令尚未提供，目前需要走 HTTP API。</p>
-
-<h2 id="durability">持久性与缓存语义</h2>
-<p>Guest 只看到标准 virtio 块设备。普通写入可以完成于受控本地缓存，但 FLUSH/FUA 成功必须等待不可变对象持久化并完成权威 Root CAS。此后本地 NVMe 只是可删除缓存。</p>
-<ul>
-  <li>少量 dirty 工作集不会上传完整稀疏磁盘。</li>
-  <li>空缓存恢复只会按 ext4 读取请求懒加载逻辑 Chunk。</li>
-  <li>过期 Attachment epoch 无法发布新 Root。</li>
-  <li>未 FLUSH 的 Guest Page Cache 或普通写在 Host 永久损坏时允许丢失。</li>
-</ul>
-
-<h2 id="delete">安全删除</h2>
-<pre><code>cats unmount project-data
-cats disk delete project-data</code></pre>
-<div class="callout warning"><strong>永久操作</strong><p>磁盘必须处于 Available。删除会撤销访问并调度远端对象清理；如需保留，请先创建快照或导出数据。</p></div>
+<h2 id="durability">Durability</h2>
+<p>Guest 看到标准 virtio Block Device。Strict 表示成功的 FLUSH/FUA 已远程持久，永久丢失 Host 后仍可恢复。Relaxed 可能在 Remote Root 落后时确认 Local Commit；这段 Local Tail 是唯一数据，不能当作 Cache 丢弃。</p>
+<p>过期 Attachment Epoch 无法发布新 Root。Lifecycle Coordination 与 Takeover 必须走 Typed External Authority；Product Client 不能自行 Acquire 或 Revoke Epoch。</p>

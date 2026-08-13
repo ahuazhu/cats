@@ -1,84 +1,17 @@
-<h2 id="first-cat">Start with a Cat — nothing to install</h2>
+<h2 id="console">Create with the console</h2>
 <ol>
-  <li>Open the <a href="/user/">console</a> and sign in with WorkOS. A new user's Personal Account receives a one-time $10 credit.</li>
-  <li>Click <strong>Create Cat</strong>, pick a shape, confirm. It comes up with a persistent RootDisk attached.</li>
-  <li>Use <strong>Exec</strong> on the Cat's page to run a command — <code>uname -a</code>, or <code>apt install -y ripgrep</code>.</li>
+  <li>Sign in at <a href="/user/">the user console</a>.</li>
+  <li>Choose the Workspace that will own the resource.</li>
+  <li>Create a Cat with a lowercase name, exact <code>sha256:</code> boot-image digest, CPU, memory, RootDisk size, and durability.</li>
+  <li>Keep the returned Cat and Operation IDs. The console can list and inspect the current projection.</li>
 </ol>
-<p>That Cat is long-lived from this point on: it suspends itself when idle, wakes when something reaches it, and keeps its disk and its name throughout.</p>
+<p>Cat create is browser-persistent. If the server commits but the response is lost, reload or refresh replays the exact path, canonical body, and Idempotency-Key.</p>
+<p>The console also creates PersistentDisks. Its closed durability default is Strict, and the request explicitly contains <code>durability</code>, <code>name</code>, and <code>size_bytes</code>.</p>
 
-<h2 id="install-cli">Install the CLI (optional)</h2>
-<p>The console is good for creating machines and running one-off commands. Day-to-day work, the <code>cats shell</code> interactive terminal and scripting are easier with the CLI.</p>
-<div class="callout"><strong>The CLI is built from source today</strong><p>Prebuilt binaries are coming. Building needs Rust 1.88 or newer, and does not need KVM.</p></div>
-<pre><code>git clone &lt;your-cats-repository&gt;
-cd cats
-cargo install --path cmd/cats
-cats --help</code></pre>
-<p>Working inside the repository, you can also replace <code>cats</code> in every example with <code>cargo run -p cats-cli --bin cats --</code>.</p>
-
-<h2 id="configure-access">Configure access</h2>
-<p>Users sign in with WorkOS. The CLI uses Device Authorization, opens the verification page in a browser, and stores its short-lived access token and rotating refresh credential only in the operating-system credential store. Cats no longer accepts static user tokens for normal users.</p>
-<pre><code>export CATS_API_URL='https://cats.run'
-cats login
-cats whoami
-cats workspace list
-cats workspace use acme-dev
-cats ls</code></pre>
-<p><code>cats login</code> saves the selected control plane and public workspace metadata in a <code>0600</code> config file, but never writes tokens there. Use <code>--workspace acme-prod</code> or <code>CATS_WORKSPACE=acme-prod</code> to override the saved workspace for one command.</p>
-<div class="callout warning"><strong>Do not substitute machine credentials</strong><p><code>CATS_TOKEN</code> is reserved for administrator/break-glass machine identities. Never use service, object-store, metadata-store, node, or administrator credentials as a normal user login or place them inside a Guest.</p></div>
-
-<h2 id="create">Create your first Cat</h2>
-<pre><code>cats create dev \
-  --image ubuntu-24.04 \
-  --cpus 2 \
-  --memory 2GiB \
-  --root-size 8GiB
-
-cats get dev</code></pre>
-<p>Creation also creates the RootDisk and enables work-driven auto-suspend by default. Add <code>--no-auto-suspend</code> for an always-on background workload that does not use work leases. The CLI waits for the asynchronous Operation by default and prints the resulting Cat; <code>--no-wait</code> returns after acceptance, and <code>--json</code> selects machine-readable output.</p>
-
-<h2 id="run-command">Run a command</h2>
-<pre><code>cats exec dev -- uname -a
-cats exec dev -- sh -lc 'printf "hello\n" &gt; /tmp/hello'</code></pre>
-<p><code>exec</code> wakes a Suspended, Warm, or Cold Cat when necessary. Arguments after <code>--</code> become the Guest command argv; shell syntax only works when you explicitly invoke a shell as in the second example.</p>
-
-<h2 id="deploy-oci">Deploy an OCI application</h2>
-<p>Use Cats' native Bundle Deploy when CI already publishes an OCI image:</p>
-<pre><code>cats deploy dev server \
-  --image ghcr.io/acme/server@sha256:&lt;64-hex-digest&gt;</code></pre>
-<p>For a private Registry, keep the pull token out of argv:</p>
-<pre><code>printf '%s\n' "$REGISTRY_TOKEN" | \
-  cats deploy dev server \
-    --image ghcr.io/acme/server@sha256:&lt;64-hex-digest&gt; \
-    --registry-username "$REGISTRY_USER" \
-    --registry-password-stdin</code></pre>
-<p>Cats verifies the manifest/config/layer digests, flattens the image onto the persistent RootDisk, and enables a systemd service. It does not run Docker or require OverlayFS. Multiple apps in one Cat share its network namespace, so they reach each other over <code>127.0.0.1</code>; an app listening on the endpoint port is directly reachable.</p>
-<p><code>--env-file</code> on <code>deploy</code> is persistent application configuration stored in the RootDisk's systemd unit. Do not put secrets there. Registry pull credentials are transient; general Secret injection is a separate, not-yet-implemented resource.</p>
-
-<h2 id="guest-kernel">What the Guest kernel provides</h2>
-<p>The Guest runs a purpose-built minimal kernel: virtio block, network and vsock, ext4 — and no loadable modules (<code>/lib/modules</code> is empty, there is no <code>modprobe</code>). Two absences surprise ordinary Linux software:</p>
-<ul>
-  <li><strong>no overlayfs</strong> — container runtimes cannot use their default <code>overlay2</code>/<code>fuse-overlayfs</code> storage driver;</li>
-  <li><strong>no nf_tables</strong> — <code>iptables</code> fails with <code>Failed to initialize nft: Protocol not supported</code>, so nothing can create NAT or filter chains.</li>
-</ul>
-<p>Prefer <code>cats deploy</code> for OCI application delivery. If you specifically need a container runtime inside the Cat, it works only when it stops relying on either missing feature:</p>
-<pre><code>dockerd --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none
-docker run --network host ...</code></pre>
-<p>With host networking the containers share the Cat's own network namespace: they reach each other over <code>127.0.0.1</code> instead of the runtime's DNS, and a container listening on <code>0.0.0.0:8080</code> is served by the Cat's endpoint with no port publishing. <code>vfs</code> copies each image layer instead of stacking it, so size the RootDisk for the images you load.</p>
-<p>Loopback itself is configured: <code>lo</code> is up with <code>127.0.0.1/8</code>, so localhost between processes works normally.</p>
-
-<h2 id="auto-suspend">Manage work-driven auto-suspend</h2>
-<pre><code>cats sleep on dev
-cats sleep status dev
-cats sleep off dev</code></pre>
-<p>New Cats start with auto-suspend on. It does not guess from CPU or process lists: the Cat becomes eligible when platform work and fresh Guest work leases are both empty. Applications with continuing background work must use the <a href="/docs/runtime-api/">Guest Runtime API</a> or run <code>cats sleep off dev</code>.</p>
-
-<h2 id="stop-start">Stop and start</h2>
-<pre><code>cats suspend dev    # host-bound, preserve process state
-cats resume dev
-cats stop dev       # Cold: release compute and host affinity
-cats start dev      # boot from the durable RootDisk</code></pre>
-
-<h2 id="clean-up">Clean up</h2>
-<pre><code>cats destroy dev</code></pre>
-<p>Destroy deletes the Cat and its RootDisk after the operation completes. Independent PersistentDisks survive and require their own <code>cats disk delete</code>.</p>
-<div class="callout warning"><strong>Destructive</strong><p>Snapshot or copy anything you need before destroy. There is no undelete command in the V1 CLI.</p></div>
+<h2 id="cli">Create with the CLI</h2>
+<pre><code>cats login
+cats create dev +  --boot-image-digest sha256:&lt;64-lowercase-hex&gt; +  --cpus 2 +  --memory 2GiB +  --root-size 1GiB +  --durability strict
+cats ls
+cats get cat_…
+cats operation wait op_…</code></pre>
+<p>Use immutable IDs for item reads. During the signed runtime cutover, lifecycle, Guest command, deployment, Endpoint, and delete mutations are not shipped. Do not substitute examples from an older client.</p>

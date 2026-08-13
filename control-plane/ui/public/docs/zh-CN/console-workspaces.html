@@ -25,12 +25,13 @@
 <h2 id="user-console">用户控制台</h2>
 <p>控制台提供：</p>
 <ul>
-  <li>当前工作区的 Cats、休眠状态、磁盘与活跃 Operation 概览。</li>
-  <li>Cat 的创建、启动、Suspend、Warm、Stop、Exec、Expose 与 Destroy。</li>
-  <li>磁盘的创建、Snapshot、Mount、Unmount、Resize 与 Delete。</li>
+  <li>Workspace-scoped Cat 与 PersistentDisk Create，以及当前 Product Read。</li>
+  <li>Create 响应不明确时，对精确 Request 与 Idempotency-Key 执行浏览器持久化重放。</li>
+  <li>Cat Create 接受后返回精确 Operation Identity；没有 Operation Collection。</li>
   <li>按 Meter 与 Cat 展示准实时预估账单，并可查看指定 Cat 的范围总额、分项汇总、费用随时间变化曲线与有界时段详单。</li>
   <li>结构化状态/错误展示与自动 Session Refresh。</li>
 </ul>
+<p>Signed Runtime Cutover 期间不展示 Lifecycle 或其他 Cat/Disk Mutation Control。浏览器会在本地拒绝这些路径，也不提供 Legacy Fallback。</p>
 
 <h2 id="language">语言切换</h2>
 <p>用户与管理员控制台均支持英语和简体中文。默认读取 <code>navigator.languages</code>/<code>navigator.language</code>。手动选择会保存在当前站点的本地存储，并更新静态文案、动态状态/操作、表单标签、错误、日期、数字格式、文档标题与 <code>html lang</code>。</p>

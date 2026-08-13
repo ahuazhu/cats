@@ -1,83 +1,42 @@
 <h2 id="global-options">Global options</h2>
-<table><thead><tr><th>Option / environment</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
-  <tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>saved login target, otherwise <code>https://cats.run</code></td><td>Control-plane base URL</td></tr>
-  <tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>saved Workspace</td><td>Override one command without changing the default; accepts <code>workspace</code>, <code>account/workspace</code>, or a workspace ID</td></tr>
-  <tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>none</td><td>Machine/administrator Bearer credential only; normal users run <code>cats login</code></td></tr>
-  <tr><td><code>--no-wait</code></td><td>off</td><td>Return after an Operation is accepted</td></tr>
-  <tr><td><code>--json</code></td><td>off</td><td>Print machine-readable JSON where supported</td></tr>
+<table><thead><tr><th>Option / environment</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>Control-plane base URL</td></tr>
+<tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>Select one immutable Workspace for this command</td></tr>
+<tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>Machine or administrator credential</td></tr>
+<tr><td><code>--json</code></td><td>Print machine-readable output where supported</td></tr>
 </tbody></table>
-<p>Global options may appear before or after the subcommand. Use <code>cats --help</code> and <code>cats &lt;command&gt; --help</code> as the version-authoritative reference.</p>
+<p><code>cats --help</code> and <code>cats &lt;command&gt; --help</code> are version-authoritative.</p>
 
-<h2 id="identity-commands">Identity and Workspace commands</h2>
+<h2 id="identity">Identity and Workspace</h2>
 <pre><code>cats login
+cats logout
 cats whoami
 cats workspace list
 cats workspace create SLUG [--display-name NAME]
 cats workspace use ACCOUNT/WORKSPACE
-cats --workspace ACCOUNT/WORKSPACE ls
-cats logout</code></pre>
-<p><code>login</code> uses WorkOS Device Authorization and stores access/refresh material only in the operating-system credential store. Active WorkOS Organization memberships expose Personal and Organization Accounts and their Workspaces. <code>workspace create</code> adds an isolated Workspace to the selected Account and requires account-management permission. <code>workspace use</code> changes the saved default; <code>--workspace</code> affects one command only. A same-Account switch is local, while a cross-Account switch rotates the WorkOS refresh token under a cross-process credential lock. <code>logout</code> attempts remote revocation and always removes the local credential.</p>
-
-<h2 id="automation-tokens">Automation tokens</h2>
-<pre><code>cats token create LABEL
+cats token create LABEL
 cats token list
 cats token revoke ID</code></pre>
-<p>A Workspace token is a revocable machine credential for CI. It can manage resources only in the Workspace that issued it, cannot enumerate another Workspace, and cannot create or revoke tokens. The secret is shown once; store it in the CI secret manager and pass it as <code>CATS_TOKEN</code> together with the immutable Workspace ID in <code>CATS_WORKSPACE</code>.</p>
 
-<h2 id="cat-commands">Cat commands</h2>
-<pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
-                 [--root-size SIZE] [--disk NAME]
-                 [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
-                 [--expires-in SECONDS]
+<h2 id="cats">Current Cat commands</h2>
+<pre><code>cats create NAME --boot-image-digest sha256:DIGEST
+                 [--cpus N] [--memory SIZE]
+                 [--root-size SIZE]
+                 [--durability strict|relaxed]
 cats ls
-cats get NAME
-cats start NAME
-cats stop NAME
-cats suspend NAME
-cats resume NAME
-cats warm NAME
-cats destroy NAME
-cats expiry NAME [--in SECONDS | --at UNIX | --never]
-cats exec NAME [--timeout SECONDS] [--env-file PATH]
-               [--stdin-file PATH] -- COMMAND [ARG...]
-cats deploy CAT APP --image REGISTRY/REPOSITORY@sha256:DIGEST
-                [--env-file PATH]
-                [--registry-username USER --registry-password-stdin]
-                [-- COMMAND [ARG...]]</code></pre>
-<p><code>create</code> defaults to image <code>ubuntu-24.04</code>, 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and auto-suspend enabled. Sizes accept <code>KiB</code>, <code>MiB</code>, <code>GiB</code>, or raw bytes.</p>
-<p><code>exec --env-file</code> accepts newline-delimited <code>NAME=VALUE</code> entries and adds them only to the Guest child process. <code>--stdin-file</code> sends arbitrary file bytes to standard input. These options let automation transfer a bootstrap script and runtime credentials without putting either in the command line; do not print secret-bearing files or command environments.</p>
-<p><code>deploy</code> pulls OCI/Docker manifests and layers inside the Cat, verifies every <code>sha256</code> descriptor, flattens the layers onto the RootDisk, and runs the image under systemd. It uses neither Docker nor OverlayFS. The image must be digest-pinned; tags are rejected. Registry passwords are read from stdin and are not persisted. <code>deploy --env-file</code> is different from <code>exec --env-file</code>: it becomes persistent systemd configuration on the RootDisk so the service survives Cold boot, and must not contain secrets.</p>
+cats get CAT_ID</code></pre>
+<p><code>create</code> requires one digest-pinned boot image. It defaults to 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and Strict durability. List follows bounded cursors; item lookup accepts only immutable <code>cat_…</code> IDs.</p>
 
-<h2 id="sleep-commands">Auto-suspend commands</h2>
-<pre><code>cats sleep on NAME
-cats sleep off NAME
-cats sleep status NAME</code></pre>
-<p>Status reports platform and Guest work leases, signal freshness, eligibility, and the current reason.</p>
-
-<h2 id="disk-commands">Disk commands</h2>
-<pre><code>cats disk create NAME --size SIZE
+<h2 id="disks">Current PersistentDisk commands</h2>
+<pre><code>cats disk create NAME --size SIZE [--durability strict|relaxed]
 cats disk ls
-cats disk get NAME
-cats disk snapshot NAME
-cats disk delete NAME
-cats mount DISK --cat CAT [--at /data]
-cats unmount DISK</code></pre>
+cats disk get DISK_ID</code></pre>
+<p>The create request is persisted before transport. An ambiguous retry of the same command reuses the exact path, body, and Idempotency-Key. Capacity is immutable in this release. Disk item lookup accepts only immutable <code>disk_…</code> IDs.</p>
 
-<h2 id="endpoint-commands">Endpoint commands</h2>
-<pre><code>cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
-cats endpoint ls CAT</code></pre>
-<p>Every Cat already has a <code>web</code> Endpoint for port 8080. <code>cats expose CAT PORT</code> reconfigures it; use another <code>--name</code> to add a URL.</p>
+<h2 id="operations">Operation commands</h2>
+<pre><code>cats operation get OPERATION_ID
+cats operation wait OPERATION_ID</code></pre>
+<p>Cat create returns an Operation ID. Both commands use the exact Workspace-scoped Operation lookup; there is no Operation list.</p>
 
-<h2 id="operation-commands">Operation commands</h2>
-<pre><code>cats operation get ID
-cats operation wait ID</code></pre>
-<p>Cat create returns an accepted Operation ID. <code>operation get</code> reads that exact Operation in the selected Workspace; <code>operation wait</code> polls it for up to 120 seconds and exits unsuccessfully for <code>failed</code> or <code>superseded</code>. Both commands use the strict Runtime Reconciliation decoder.</p>
-<p><code>operation ls</code> remains unavailable and sends no HTTP request: the runtime authority deliberately exposes no unbounded Operation list. The old global Operation URL is retired.</p>
-
-<h2 id="automation">Automation guidance</h2>
-<ul>
-  <li>Use <code>--json</code> instead of scraping aligned human output.</li>
-  <li>Treat non-zero exit status as failure. <code>exec</code> also fails when the Guest command exits non-zero.</li>
-  <li>Do not parse resource IDs, work lease IDs, or Operation IDs for meaning.</li>
-  <li>Use WorkOS login for users and a Workspace token for CI. Do not log token values or substitute service/administrator credentials for either scope.</li>
-</ul>
+<h2 id="cutover">Cutover boundary</h2>
+<p>Lifecycle, Guest command, deployment, Endpoint, Cat delete, and PersistentDisk mutation commands are absent from shipped help. Compatibility parsing, where retained, fails before constructing an HTTP client and never probes a legacy route.</p>

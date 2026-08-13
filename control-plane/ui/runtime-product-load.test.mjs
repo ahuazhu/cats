@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   loadAll,
-  runtimeProductActionAllowed,
   setRuntimeProductLoadingShell,
 } from "./runtime-product-load.mjs";
 
-test("workspace switch removes stale Cat actions while the next Workspace pages are paused", async () => {
-  const catsTable = { innerHTML: '<button data-cat-action="start" data-workspace-id="ws_A">start</button>' };
-  const disksTable = { innerHTML: '<button data-disk-action="delete" data-workspace-id="ws_A">delete</button>' };
+test("workspace switch removes stale rows while the next Workspace pages are paused", async () => {
+  const catsTable = { innerHTML: "<tr><td>Cat A</td></tr>" };
+  const disksTable = { innerHTML: "<tr><td>Disk A</td></tr>" };
   const shell = {
     attributes: new Map(),
     setAttribute(name, value) { this.attributes.set(name, value); },
@@ -46,17 +46,6 @@ test("workspace switch removes stale Cat actions while the next Workspace pages 
   assert.equal(disksTable.innerHTML, "");
   assert.equal(shell.attributes.get("aria-busy"), "true");
   assert.ok(controls.every((control) => control.disabled));
-
-  let mutationRequests = 0;
-  const staleAButton = { dataset: { workspaceId: "ws_A" } };
-  if (runtimeProductActionAllowed({
-    button: staleAButton,
-    activeWorkspaceId: "ws_B",
-    loadingWorkspaceId: "ws_B",
-  })) {
-    mutationRequests += 1;
-  }
-  assert.equal(mutationRequests, 0, "a detached A action must not issue a request under B");
 
   releaseB();
   await loadB;
@@ -121,4 +110,25 @@ test("aborting workspace A prevents its delayed pagination from completing after
     cats: [{ id: "from_B" }],
     disks: [{ id: "from_B" }],
   });
+});
+
+test("release user console exposes create and read controls without retired mutations", async () => {
+  const [script, markup] = await Promise.all([
+    readFile(new URL("./user.js", import.meta.url), "utf8"),
+    readFile(new URL("./user.html", import.meta.url), "utf8"),
+  ]);
+  for (const retired of [
+    "data-cat-action",
+    "data-disk-action",
+    "/actions/",
+    "#exec-form",
+  ]) {
+    assert.equal(script.includes(retired), false, `release script retains ${retired}`);
+  }
+  assert.match(markup, /id="create-cat-button"/);
+  assert.match(markup, /id="create-disk-button"/);
+  assert.match(markup, /data-view="cats">/);
+  assert.match(markup, /data-view="disks">/);
+  assert.doesNotMatch(markup, /<dialog id="create-disk-dialog"[^>]* hidden/);
+  assert.doesNotMatch(markup, /id="exec-dialog"/);
 });

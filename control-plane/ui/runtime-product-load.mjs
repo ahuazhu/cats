@@ -11,8 +11,6 @@ const runtimeProductControls = [
   "#create-cat-button",
   "[data-create-cat]",
   "#create-disk-button",
-  "[data-cat-action]",
-  "[data-disk-action]",
 ].join(", ");
 
 export function setRuntimeProductLoadingShell(root, loading) {
@@ -35,17 +33,6 @@ export function setRuntimeProductLoadingShell(root, loading) {
       priorDisabled.delete(control);
     }
   });
-}
-
-export function runtimeProductActionAllowed({
-  button,
-  activeWorkspaceId,
-  loadingWorkspaceId,
-}) {
-  return !loadingWorkspaceId
-    && typeof activeWorkspaceId === "string"
-    && activeWorkspaceId !== ""
-    && button?.dataset?.workspaceId === activeWorkspaceId;
 }
 
 function validatePage(page) {

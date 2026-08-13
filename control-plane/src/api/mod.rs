@@ -715,6 +715,10 @@ pub fn router(state: AppState) -> Router {
             get(crate::ui::cat_create_v2_script),
         )
         .route(
+            "/ui/persistent-disk-create-v1.mjs",
+            get(crate::ui::persistent_disk_create_v1_script),
+        )
+        .route(
             "/ui/runtime-product-load.mjs",
             get(crate::ui::runtime_product_load_script),
         )
@@ -913,6 +917,7 @@ GET /ui/admin.js
 GET /ui/cat-create-v2.mjs
 GET /ui/common.js
 GET /ui/i18n.js
+GET /ui/persistent-disk-create-v1.mjs
 GET /ui/styles.css
 GET /ui/user.js
 GET /user

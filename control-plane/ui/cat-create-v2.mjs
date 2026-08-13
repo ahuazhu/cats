@@ -150,7 +150,8 @@ export function parseCatCreateV2AcceptedResponseBody(body) {
 export function assertRuntimeCutoverClientRequestSupported(path, method = "GET") {
   const normalizedMethod = String(method).toUpperCase();
   const catCollection = /^\/v1\/workspaces\/[^/?]+\/cats$/;
-  if (catCollection.test(path) && normalizedMethod === "POST") return;
+  const diskCollection = /^\/v1\/workspaces\/[^/?]+\/disks$/;
+  if (normalizedMethod === "POST" && (catCollection.test(path) || diskCollection.test(path))) return;
   const catRead = /^\/v1\/workspaces\/[^/?]+\/cats(?:$|\?[^#]*$|\/cat_[^/?]+$)/;
   const diskRead = /^\/v1\/workspaces\/[^/?]+\/disks(?:$|\?[^#]*$|\/disk_[^/?]+$)/;
   const exactOperationRead = /^\/v1\/workspaces\/[^/?]+\/operations\/op_[^/?]+$/;
@@ -173,10 +174,6 @@ function pendingStorageKey(workspaceId, name) {
 
 function pendingLockName(workspaceId, name) {
   return `cats-cat-create-v2:${encodeURIComponent(workspaceId)}:${encodeURIComponent(name)}`;
-}
-
-function pendingWorkspacePrefix(workspaceId) {
-  return `${PENDING_PREFIX}${encodeURIComponent(workspaceId)}:`;
 }
 
 function validateIdempotencyKey(value) {
@@ -263,7 +260,7 @@ function transactionCompletion(transaction, context) {
   });
 }
 
-function strictReadwriteTransaction(database) {
+function strictReadwriteTransaction(database, operationLabel) {
   let transaction;
   try {
     transaction = database.transaction(
@@ -273,22 +270,29 @@ function strictReadwriteTransaction(database) {
     );
   } catch (error) {
     throw new Error(
-      `strict browser durability is unavailable: ${error.message}; no Cat-create request was sent`,
+      `strict browser durability is unavailable: ${error.message}; no ${operationLabel} request was sent`,
     );
   }
   if (transaction.durability !== "strict") {
     transaction.abort();
     throw new Error(
-      "strict browser durability is unavailable; no Cat-create request was sent",
+      `strict browser durability is unavailable; no ${operationLabel} request was sent`,
     );
   }
   return transaction;
 }
 
-class IndexedDbPendingStore {
-  constructor(indexedDb, keyRange) {
+export class IndexedDbPendingStore {
+  constructor(indexedDb, keyRange, {
+    databaseName = PENDING_DATABASE,
+    pendingPrefix = PENDING_PREFIX,
+    operationLabel = "Cat-create",
+  } = {}) {
     this.indexedDb = indexedDb;
     this.keyRange = keyRange;
+    this.databaseName = databaseName;
+    this.pendingPrefix = pendingPrefix;
+    this.operationLabel = operationLabel;
     this.opening = null;
   }
 
@@ -296,7 +300,7 @@ class IndexedDbPendingStore {
     if (this.opening) return this.opening;
     this.opening = new Promise((resolve, reject) => {
       let settled = false;
-      const request = this.indexedDb.open(PENDING_DATABASE, 1);
+      const request = this.indexedDb.open(this.databaseName, 1);
       request.addEventListener("upgradeneeded", () => {
         if (!request.result.objectStoreNames.contains(PENDING_STORE)) {
           request.result.createObjectStore(PENDING_STORE);
@@ -306,7 +310,7 @@ class IndexedDbPendingStore {
         if (!settled) {
           settled = true;
           reject(new Error(
-            "browser durable storage upgrade is blocked; no Cat-create request was sent",
+            `browser durable storage upgrade is blocked; no ${this.operationLabel} request was sent`,
           ));
         }
       });
@@ -314,7 +318,7 @@ class IndexedDbPendingStore {
         if (!settled) {
           settled = true;
           reject(new Error(
-            `browser durable storage is unavailable: ${request.error?.message || "open failed"}; no Cat-create request was sent`,
+            `browser durable storage is unavailable: ${request.error?.message || "open failed"}; no ${this.operationLabel} request was sent`,
           ));
         }
       });
@@ -328,7 +332,7 @@ class IndexedDbPendingStore {
           settled = true;
           database.close();
           reject(new Error(
-            "browser durable storage schema is invalid; no Cat-create request was sent",
+            `browser durable storage schema is invalid; no ${this.operationLabel} request was sent`,
           ));
           return;
         }
@@ -341,7 +345,7 @@ class IndexedDbPendingStore {
   }
 
   workspaceRange(workspaceId) {
-    const prefix = pendingWorkspacePrefix(workspaceId);
+    const prefix = `${this.pendingPrefix}${encodeURIComponent(workspaceId)}:`;
     return this.keyRange.bound(prefix, `${prefix}\uffff`);
   }
 
@@ -363,7 +367,7 @@ class IndexedDbPendingStore {
 
   async insertWithinWorkspaceLimit({ workspaceId, key, raw, maximum }) {
     const database = await this.database();
-    const transaction = strictReadwriteTransaction(database);
+    const transaction = strictReadwriteTransaction(database, this.operationLabel);
     const complete = transactionCompletion(
       transaction,
       "persist pending Cat-create state",
@@ -406,7 +410,7 @@ class IndexedDbPendingStore {
 
   async deleteIfExact(key, expectedRaw) {
     const database = await this.database();
-    const transaction = strictReadwriteTransaction(database);
+    const transaction = strictReadwriteTransaction(database, this.operationLabel);
     const complete = transactionCompletion(
       transaction,
       "clear terminal Cat-create recovery state",
@@ -467,7 +471,7 @@ function defaultPendingStore() {
   return defaultStore;
 }
 
-function validatePendingStore(store) {
+export function validatePendingStore(store) {
   for (const method of [
     "load",
     "insertWithinWorkspaceLimit",

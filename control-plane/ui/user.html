@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#14231b">
   <meta name="robots" content="noindex, nofollow, noarchive">
-  <meta name="description" content="Manage Cats Linux cloud workspaces, disks, endpoints, and operations." data-i18n-content="user.meta.description">
+  <meta name="description" content="Create and inspect Cats and PersistentDisks during the signed runtime cutover." data-i18n-content="user.meta.description">
   <title data-i18n="user.meta.title">Cats · User Console</title>
   <link rel="icon" href="/assets/cats-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/ui/styles.css">
@@ -31,7 +31,7 @@
       <div class="login-copy">
         <div class="eyebrow" data-i18n="user.login.eyebrow">WELCOME BACK</div>
         <h1 data-i18n="user.login.title">Continue to your cloud workspace</h1>
-        <p id="login-description" data-i18n="user.login.description">Sign in to create, start, and manage your Cats.</p>
+        <p id="login-description" data-i18n="user.login.description">Sign in to create and inspect Cats and PersistentDisks.</p>
       </div>
       <div class="login-form">
         <button class="button button-primary button-wide is-hidden" id="workos-login-button" type="button">
@@ -61,8 +61,8 @@
       </div>
       <nav class="nav-list" data-i18n-aria-label="user.nav.aria" aria-label="User console navigation">
         <button class="nav-item is-active" data-view="overview"><span>⌂</span><b data-i18n="user.nav.overview">Overview</b></button>
-        <button class="nav-item" data-view="cats" hidden><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
-        <button class="nav-item" data-view="disks" hidden><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
+        <button class="nav-item" data-view="cats"><span>◇</span><b data-i18n="user.nav.cats">Cats</b></button>
+        <button class="nav-item" data-view="disks"><span>▱</span><b data-i18n="user.nav.disks">Disks</b></button>
         <button class="nav-item" data-view="billing"><span>$</span><b data-i18n="user.nav.billing">Billing</b></button>
         <button class="nav-item" data-view="operations" hidden><span>↻</span><b data-i18n="user.nav.operations">Operations</b></button>
       </nav>
@@ -97,7 +97,7 @@
       <div class="content">
         <section class="view is-active" id="view-overview">
           <section class="panel">
-            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cutover.title">Signed runtime creation</h2><p data-i18n="user.cutover.description">Create is available now. Resource lists and lifecycle actions remain unavailable while the signed runtime cutover is completed.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
+            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cutover.title">Signed runtime creation</h2><p data-i18n="user.cutover.description">Create and read are available. Lifecycle mutations remain unavailable during the signed runtime cutover.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
           </section>
           <div class="metric-grid" id="user-metrics" hidden></div>
           <div class="dashboard-grid" hidden>
@@ -112,18 +112,18 @@
           </div>
         </section>
 
-        <section class="view" id="view-cats" hidden>
+        <section class="view" id="view-cats">
           <section class="panel">
-            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cats.title">My Cats</h2><p data-i18n="user.cats.description">Start, suspend, or manage your cloud workspaces.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
-            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.status">Status</th><th data-i18n="user.cats.spec">Size</th><th data-i18n="common.node">Node</th><th data-i18n="common.created">Created</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="cats-table"></tbody></table></div>
+            <header class="panel-header"><div><small data-i18n="section.compute">COMPUTE</small><h2 data-i18n="user.cats.title">My Cats</h2><p data-i18n="user.cats.description">Create Cats and inspect their current runtime projection.</p></div><button class="button button-primary" data-create-cat>＋ <span data-i18n="user.createCat">Create Cat</span></button></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.status">Status</th><th data-i18n="user.cats.spec">Size</th><th data-i18n="common.node">Node</th><th data-i18n="common.created">Created</th></tr></thead><tbody id="cats-table"></tbody></table></div>
             <div class="empty-state is-hidden" id="cats-empty"><span>◇</span><h3 data-i18n="user.cats.emptyTitle">No Cats yet</h3><p data-i18n="user.cats.emptyDescription">Create your first cloud workspace.</p><button class="button button-primary" data-create-cat data-i18n="user.createCat">Create Cat</button></div>
           </section>
         </section>
 
-        <section class="view" id="view-disks" hidden>
+        <section class="view" id="view-disks">
           <section class="panel">
             <header class="panel-header"><div><small data-i18n="section.storage">STORAGE</small><h2 data-i18n="user.disks.title">Persistent Disks</h2><p data-i18n="user.disks.description">RWO persistent disks with a lifecycle independent from Cats.</p></div><button class="button button-primary" id="create-disk-button">＋ <span data-i18n="user.disks.create">Create disk</span></button></header>
-            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.type">Type</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="common.status">Status</th><th data-i18n="user.disks.boundCat">Attached Cat</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="disks-table"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.type">Type</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="common.status">Status</th><th data-i18n="user.disks.boundCat">Attached Cat</th></tr></thead><tbody id="disks-table"></tbody></table></div>
             <div class="empty-state is-hidden" id="disks-empty"><span>▱</span><h3 data-i18n="user.disks.emptyTitle">No independent disks</h3><p data-i18n="user.disks.emptyDescription">RootDisk is created with each Cat; extra PersistentDisks appear here.</p></div>
           </section>
         </section>
@@ -199,10 +199,10 @@
     </form>
   </dialog>
 
-  <dialog id="create-disk-dialog" class="modal" hidden>
+  <dialog id="create-disk-dialog" class="modal">
     <form method="dialog" id="create-disk-form">
       <header><div><small data-i18n="user.diskDialog.eyebrow">NEW STORAGE</small><h2 data-i18n="user.diskDialog.title">Create PersistentDisk</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
-      <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
+      <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label><input name="durability" type="hidden" value="strict"></div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.diskDialog.submit">Create disk</button></footer>
     </form>
@@ -238,15 +238,6 @@
         </div>
       </div>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button></footer>
-    </form>
-  </dialog>
-
-  <dialog id="exec-dialog" class="modal modal-wide" hidden>
-    <form method="dialog" id="exec-form">
-      <header><div><small data-i18n="user.execDialog.eyebrow">GUEST EXEC</small><h2><span data-i18n="user.execDialog.title">Run in</span> <span id="exec-cat-name"></span></h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
-      <label><span data-i18n="user.execDialog.command">Command</span><input name="command" value="uname -a" required><small data-i18n="user.execDialog.hint">Split into argv on spaces; this development console does not perform shell expansion.</small></label>
-      <pre class="terminal-output" id="exec-output" data-i18n="user.execDialog.waiting" aria-live="polite">Waiting to run…</pre>
-      <footer><button class="button button-quiet" value="cancel" data-i18n="common.close">Close</button><button class="button button-primary" value="default" data-i18n="user.execDialog.run">Run</button></footer>
     </form>
   </dialog>
 

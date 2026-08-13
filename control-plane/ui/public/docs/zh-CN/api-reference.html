@@ -1,108 +1,37 @@
 <h2 id="conventions">约定</h2>
-<p>外部 API 使用 HTTP + JSON。用户资源通过不可变 Workspace ID 确定作用域（<code>/v1/workspaces/{workspace_id}/…</code>），可改的 slug 不会出现在资源路由里。已验证 WorkOS 身份只能访问 active Account membership 所拥有的 Workspace；修改 URL 不能凭空产生 membership。</p>
-<pre><code>Authorization: Bearer &lt;short-lived-workos-access-token&gt;
-Accept: application/json
-Content-Type: application/json
-Idempotency-Key: &lt;unique-request-id&gt;   # 变更请求
-If-Match: "&lt;generation&gt;"                # 带并发保护的状态变更</code></pre>
-<p><code>cats login</code> 通过 WorkOS Device Authorization 获取并刷新用户 Token，不会把它写入普通配置文件。其他用户客户端必须采用批准的 WorkOS Flow 与相同的已验证 JWT 契约；服务端不接受静态用户 Token。浏览器控制台使用 HttpOnly WorkOS Session，不会向 JavaScript 暴露 Bearer Token。Workspace Manager 可以为 CI 签发可撤销的 <code>cats_wst_…</code> 机器凭据；它只授权签发它的不可变 Workspace，且不能继续签发 Token。Service 与 Administrator 机器身份拥有独立权限。</p>
+<p>外部 API 使用 HTTP JSON。产品资源由 <code>/v1/workspaces/{workspace_id}/…</code> 中不可变的 Workspace ID 隔离；可变 slug 不是资源键。浏览器请求使用 HttpOnly WorkOS Session，CLI 与自动化请求使用对应的 WorkOS 或 Workspace Credential。</p>
+<p>两个 Create Collection 都要求精确的 <code>Content-Type: application/json</code>、且仅出现一次的可打印 <code>Idempotency-Key</code>、无 Query 的 canonical Workspace Path，以及下方 closed request body。响应不明确时只能重放完全相同的 Path、Body 与 Key。</p>
 
-<h2 id="identity">身份与 Workspace</h2>
-<pre><code>GET  /auth/config       # 公开 WorkOS Client/Base URL 配置
-GET  /v1/me             # 用户资料与可用 Workspace
-GET  /v1/workspaces     # 刷新可用 Workspace 列表
-POST /v1/accounts/{account}/workspaces
-PATCH /v1/workspaces/{workspace}
-GET|POST /v1/workspaces/{workspace}/tokens
-DELETE /v1/workspaces/{workspace}/tokens/{token}
-GET|POST /v1/accounts/{account}/invitations
-POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
-GET /v1/accounts/{account}/members
-PATCH|DELETE /v1/accounts/{account}/members/{membership}
-POST /v1/auth/logout    # 撤销 CLI WorkOS Session</code></pre>
-<p>Workspace 枚举根据 Active WorkOS Organization Membership 返回 Personal/Organization Account。创建或修改 Workspace 需要 Account 管理权限；修改 slug 不会改变不可变 ID，因此所有资源路由继续解析到同一个 Workspace。邀请与成员变更要求 <code>cats:members:manage</code>、拒绝 Personal Account，并通过 WorkOS 执行。创建邀请还要求 <code>Idempotency-Key</code>，Cats 将其透传给 WorkOS，使网络重试返回同一个 invitation。授权前会校验 Access Token 签名、Issuer、Client ID、过期时间、Subject、Organization Scope、active membership、Account ID 与 Workspace 归属。</p>
-<p>创建 Token 返回 <code>{ "access_token": {…元数据…}, "token": "cats_wst_…" }</code>；明文 <code>token</code> 只返回一次，Cats 只保存其 SHA-256 Digest。List 永远不包含 Secret；撤销会从下一次请求开始生效。</p>
-
-<h2 id="cats">Cats</h2>
-<pre><code>POST   /v1/workspaces/{workspace_id}/cats
-GET    /v1/workspaces/{workspace_id}/cats
-GET    /v1/workspaces/{workspace_id}/cats/{cat}
-DELETE /v1/workspaces/{workspace_id}/cats/{cat}
-POST   /v1/workspaces/{workspace_id}/cats/{cat}/actions/{verb}
-POST   /v1/workspaces/{workspace_id}/cats/{cat}/exec
-POST   /v1/workspaces/{workspace_id}/cats/{cat}/oci-deployments
-GET    /v1/workspaces/{workspace_id}/cats/{cat}/work
-GET    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-PUT    /v1/workspaces/{workspace_id}/cats/{cat}/auto-suspend
-GET    /v1/workspaces/{workspace_id}/cats/{cat}/expiry
-PUT    /v1/workspaces/{workspace_id}/cats/{cat}/expiry</code></pre>
-<p>Lifecycle Verb 包括 <code>start</code>、<code>stop</code>、<code>suspend</code>、<code>resume</code> 与 <code>warm</code>。Create 省略 <code>auto_suspend</code> 时默认为 <code>true</code>。Cat 的 Create/Lifecycle/Delete 返回异步 Operation；请求超时后应查询 Operation，而不是用新意图重复变更。</p>
-<p>Cat、Disk 和 Operation 响应都包含不可变 <code>workspace_id</code>，它是唯一的资源归属键。</p>
-<p><code>exec</code> 接受 <code>command</code>、可选 <code>timeout_ms</code>、可选字符串 Map <code>env</code> 与可选字节数组 <code>stdin</code>。<code>env</code> 只传给子进程，不写入 Cats Registry。响应包含 <code>exit_code</code>、<code>stdout</code> 与 <code>stderr</code>。</p>
-<p><code>oci-deployments</code> 接受稳定的 <code>app</code>、固定到 digest 的 <code>image</code>、可选 argv 覆盖 <code>command</code>、持久非 Secret <code>env</code>，以及仅用于一次拉取的可选 <code>registry_auth</code>。Cats 不保存 Registry Credential。Guest 校验并扁平化 OCI layer，返回请求 image digest、选中的平台 manifest digest、systemd service 名和 active 状态。</p>
+<h2 id="cats">当前 Cat Surface</h2>
+<pre><code>POST /v1/workspaces/{workspace_id}/cats
+GET  /v1/workspaces/{workspace_id}/cats
+GET  /v1/workspaces/{workspace_id}/cats/{cat_id}</code></pre>
 <pre><code>{
-  "app": "server",
-  "image": "ghcr.io/acme/server@sha256:0123...cdef",
-  "env": { "PORT": "8080" }
-}</code></pre>
-<p>镜像必须使用完整 64 位十六进制 <code>sha256</code> digest；mutable tag 会被拒绝。<code>env</code> 会写入 RootDisk 上的 service unit，以便 Cold boot 后继续启动，因此不能包含 Secret。</p>
-<pre><code>POST /v1/workspaces/ws_01J8QK.../cats
-Idempotency-Key: request-7f12
-
-{
   "name": "dev",
-  "image": "ubuntu-24.04",
-  "cpus": 2,
-  "memory_mib": 2048,
-  "root_size_bytes": 8589934592
+  "boot_image_digest": "sha256:&lt;64-lowercase-hex&gt;",
+  "vcpus": 2,
+  "memory_bytes": 2147483648,
+  "root_size_bytes": 1073741824,
+  "durability": "strict"
 }</code></pre>
+<p>Create 精确返回 <code>202 application/json</code> 和 <code>{"cat_id":"…","operation_id":"…"}</code>。Collection Read 只接受有界 <code>limit</code> 与 opaque <code>cursor</code>；Item Read 只接受不可变 <code>cat_…</code> ID。</p>
+<p>Signed Runtime Cutover 期间，Lifecycle、Exec、Deployment、Endpoint、Expiry、Work Policy 与 Delete Route 不属于 release router。客户端必须在本地失败，不能探测这些路径。</p>
 
-<h2 id="disks">磁盘与快照</h2>
-<pre><code>POST   /v1/workspaces/{workspace_id}/disks
-GET    /v1/workspaces/{workspace_id}/disks
-GET    /v1/workspaces/{workspace_id}/disks/{disk}
-DELETE /v1/workspaces/{workspace_id}/disks/{disk}
-POST   /v1/workspaces/{workspace_id}/disks/{disk}/actions/{verb}
-POST   /v1/workspaces/{workspace_id}/disks/{disk}/snapshots
-GET    /v1/workspaces/{workspace_id}/disks/{disk}/snapshots</code></pre>
-<p>Disk Action Verb 为 <code>mount</code>、<code>unmount</code> 与 <code>resize</code>。Mount Body 指定 Cat 与 Guest 路径。服务会强制执行 RWO，并拒绝过期或冲突的 Attachment 状态。</p>
-
-<h2 id="endpoints">Endpoint</h2>
-<pre><code>POST /v1/workspaces/{workspace_id}/cats/{cat}/endpoints
-GET  /v1/workspaces/{workspace_id}/cats/{cat}/endpoints</code></pre>
+<h2 id="disks">当前 PersistentDisk Surface</h2>
+<pre><code>POST /v1/workspaces/{workspace_id}/disks
+GET  /v1/workspaces/{workspace_id}/disks
+GET  /v1/workspaces/{workspace_id}/disks/{disk_id}</code></pre>
 <pre><code>{
-  "name": "web",
-  "target_port": 3000,
-  "protocol": "http",
-  "wake_policy": "wake_on_request"
+  "durability": "strict",
+  "name": "project-data",
+  "size_bytes": 21474836480
 }</code></pre>
-
-<h2 id="usage-billing">用量与账单</h2>
-<pre><code>GET /v1/workspaces/{workspace_id}/billing/usage
-    ?from_ms=&lt;包含的-unix-毫秒&gt;
-    &amp;to_ms=&lt;不包含的-unix-毫秒&gt;
-    [&amp;cat=&lt;活跃-cat-名称&gt; | &amp;cat_id=&lt;不可变-cat-id&gt;]
-    [&amp;bucket_ms=&lt;毫秒&gt;]
-    [&amp;detail=true]</code></pre>
-<p>开放账期的响应是 <code>provisional</code> 预估，包含范围总额、按 Meter 汇总、按 Cat 汇总、不可变 Rate Card ID 与当前最新可见 Interval End。Cat 删除后仍可通过 <code>cat_id</code> 查询。<code>bucket_ms</code> 返回服务端时间桶，用于曲线和有界时段详单；不得小于 60 秒，且最多产生 512 个时间桶。<code>detail=true</code> 返回原始 Ledger Interval，应只用于受控对账查询，避免浏览器直接查询很长范围。</p>
-<p>当前 Rate Card 的 CPU 单价为 <code>$0.07 / CPU-hour</code>，内存为 <code>$0.045 / GiB-hour</code>。十进制 Quantity 与纳美元金额使用 JSON String，防止客户端丢失整数精度。范围总额在聚合后只计价一次；时间桶金额只用于展示预估，不是最终账单。</p>
-<pre><code>GET  /v1/workspaces/{workspace_id}/billing/balance
-POST /v1/workspaces/{workspace_id}/billing/checkout
-Idempotency-Key: &lt;唯一键&gt;
-{"amount_cents": 1000}</code></pre>
-<p>新用户只在自己的 Personal Billing Account 获得一次性、不续期的 <code>$10</code> 注册赠金；Organization Account、额外 Workspace 和邀请不会产生赠金。余额响应使用 append-only 赠金与充值总额减去全部准实时暂估用量。Checkout 只接受官网公布的固定充值档位，并返回 Stripe 托管支付地址。仅从 Checkout 返回不会入账；Cats 只在收到签名正确且状态为 paid 的 Stripe Webhook 后增加余额。</p>
-<p>可用额度耗尽时，付费计算 Admission 返回 HTTP <code>402</code> 和 <code>payment_required</code> Code；停止、休眠和删除资源仍然可用。</p>
+<p>Create 以精确的 <code>201 application/json</code> 返回已创建 Disk Projection。这个 release 中容量和 Durability 不可变；Item Read 要求不可变 <code>disk_…</code> ID。Attachment、Snapshot、容量变更与 Delete Mutation 均不可用。</p>
 
 <h2 id="operations">Operation</h2>
-<pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation}</code></pre>
-<p>这个精确查询返回 canonical Runtime Reconciliation Operation：不可变的 Workspace/Cat/Revision/Spec/Placement 绑定、Target、时间戳，以及 <code>pending</code>、<code>succeeded</code>、<code>failed</code> 或 <code>superseded</code> 结算状态。成功响应使用 <code>application/json</code>，并携带 <code>Cache-Control: no-store</code>。</p>
-<p>服务端先完成 Workspace 鉴权，再查询 opaque Operation ID。属于其他 Workspace 的 ID 与不存在的 ID 返回完全相同的 <code>not_found</code>。旧的全局 <code>GET /v1/operations/{operation}</code> 和 Workspace Operation Collection/List 路由均已退役；当前不提供无界 List 合同。</p>
+<pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation_id}</code></pre>
+<p>只提供精确 Operation Lookup。鉴权先于查找，其他 Workspace 的 opaque ID 与不存在的 ID 表现相同。没有 Operation Collection，也没有全局 Operation URL。</p>
 
-<h2 id="errors">错误</h2>
-<pre><code>{
-  "code": "failed_precondition",
-  "message": "disk must be available before deletion"
-}</code></pre>
-<p>客户端应基于稳定 Code 分支，并把 Message 用作上下文。重要 Code 包括 <code>invalid_argument</code>、<code>unauthenticated</code>、<code>permission_denied</code>、<code>not_found</code>、<code>already_exists</code>、<code>failed_precondition</code>、<code>payment_required</code>、<code>conflict</code>、<code>stale_epoch</code>、<code>deadline_exceeded</code>、<code>unavailable</code> 与 <code>internal</code>。</p>
-
-<div class="callout"><strong>版本权威</strong><p>本页描述当前 V1 Rust Router。发布自动生成客户端前，应从相同 Request/Resource 类型生成并评审 OpenAPI；不要从架构示例猜测未记录字段。</p></div>
+<h2 id="errors">Error</h2>
+<p>Error 使用稳定 JSON <code>code</code> 与便于阅读的 <code>message</code>。客户端应按 code 分支。Route 不存在不代表可以退回 Legacy Body 或 Mutation Path。</p>
+<div class="callout"><strong>版本权威</strong><p>本页描述 release 产品 Router。Account、Session、Billing 与内部 Signed Authority Route 是独立 Surface，不会重新打开 Cat/Disk Lifecycle Mutation。</p></div>

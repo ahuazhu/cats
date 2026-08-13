@@ -1,7 +1,6 @@
-//! `cats` CLI: the command-line user surface. Commands express intent against
-//! the same versioned API as the web consoles; mutations return operations
-//! that the CLI waits on by default (`--no-wait` to skip). No storage/node
-//! internals ever appear here.
+//! `cats` CLI: the command-line user surface. The release exposes the same
+//! exact Cat/PersistentDisk creates and bounded reads as the web console, plus
+//! exact Operation lookup. No storage/node internals appear here.
 
 mod auth;
 #[cfg(unix)]
@@ -315,6 +314,7 @@ pub enum DiskCommand {
         /// Immutable Disk ID.
         id: String,
     },
+    #[command(hide = true)]
     Delete {
         name: String,
     },

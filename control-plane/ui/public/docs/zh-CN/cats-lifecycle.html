@@ -1,55 +1,12 @@
-<h2 id="states">四种状态</h2>
-<table><thead><tr><th>状态</th><th>进程内存</th><th>绑定 Host</th><th>返回 Running</th></tr></thead><tbody>
-  <tr><td><strong>Running</strong></td><td>按需驻留</td><td>是</td><td>已经活跃</td></tr>
-  <tr><td><strong>Suspended</strong></td><td>保留；内存页可换出到本地 NVMe</td><td>是</td><td>Resume 并按需缺页读回</td></tr>
-  <tr><td><strong>Warm</strong></td><td>保留在本地 VM 快照；VMM 退出</td><td>是</td><td>重建运行时并 Restore</td></tr>
-  <tr><td><strong>Cold</strong></td><td>不保留</td><td>否</td><td>从持久磁盘全新启动</td></tr>
+<h2 id="model">Lifecycle Model</h2>
+<p>Running、Suspended、Warm 与 Cold 仍是不同 Runtime State：</p>
+<table><thead><tr><th>State</th><th>Process Memory</th><th>Host-bound</th></tr></thead><tbody>
+<tr><td>Running</td><td>Active</td><td>否</td></tr>
+<tr><td>Suspended</td><td>保留；Page 可移到 Local NVMe</td><td>是</td></tr>
+<tr><td>Warm</td><td>保留在 Local VM Snapshot；VMM 退出</td><td>是</td></tr>
+<tr><td>Cold</td><td>丢弃；从 Durable Disk Boot</td><td>否</td></tr>
 </tbody></table>
-<p>Suspended 与 Warm 有意保持为两种状态。两者都保留进程状态并依赖原 Host；Cold 解除该依赖，启动新的 Kernel 与用户进程。</p>
-
-<h2 id="commands">生命周期命令</h2>
-<pre><code>cats start dev
-cats suspend dev
-cats warm dev
-cats resume dev
-cats stop dev
-cats get dev</code></pre>
-<ul>
-  <li><code>start</code> 启动或唤醒 Cat。</li>
-  <li><code>suspend</code> 在持久磁盘门禁通过后暂停 Guest，并把可回收 Guest 内存页换出到 Host 本地状态文件系统。</li>
-  <li><code>warm</code> 创建 Host 本地快照并退出 VMM/Backend。</li>
-  <li><code>resume</code> 可恢复 Suspended 或 Warm。</li>
-  <li><code>stop</code> 进入 Cold 并释放运行时 Attachment Lease。</li>
-</ul>
-
-<h2 id="durable-gate">持久性门禁</h2>
-<p>进入 Suspended、Warm 或 Cold 前，Cats 会停止新工作、要求 Guest 同步文件系统，并等待所需的块设备 FLUSH 发布 durable generation。FLUSH 失败时，平台不能宣称已经进入安全休眠状态。</p>
-<div class="callout"><strong>Host 丢失后保留什么？</strong><p>成功 durable FLUSH 的数据会保留。Suspended/Warm 进程内存不会：原 Host 永久丢失后，Cats 会 fence 旧 Attachment，并在其他 Host 上执行 Cold Recovery。</p></div>
-
-<h2 id="fallback">快速恢复回退</h2>
-<p>Backing file 缺失、快照损坏、版本不匹配、VMM 错误或 Guest readiness 超时，都不能让 Cat 卡在恢复中间态。平台会丢弃不安全的本地状态，在需要时获取更高磁盘 fencing epoch，并收敛到 Cold 启动。</p>
-
-<h2 id="auto-suspend">工作驱动自动休眠</h2>
-<p>新建 Cat 默认开启。可以查看状态、为常驻任务关闭，或再次开启：</p>
-<pre><code>cats create dev
-cats sleep status dev
-cats sleep off dev
-cats sleep on dev</code></pre>
-<p>状态输出包括分布式工作数量、Guest 信号是否新鲜、当前是否符合条件及原因。信号链过期或不确定时，安全行为是 fail-awake。后台任务必须持有 Guest Work Lease，或者显式关闭自动休眠。</p>
-<p>同一策略还会让稳定 Suspended 的 Cat 在 10 分钟后进入 Warm，再让稳定 Warm 的 Cat 在 24 小时后进入 Cold。计时从 observed state 提交时开始，控制面重启不会重置；每次转换前都会重新检查活跃工作。运维可通过 <code>CATS_AUTO_WARM_AFTER_SECONDS</code> / <code>CATS_AUTO_COLD_AFTER_SECONDS</code> 调整阈值，设为 <code>0</code> 可关闭对应边界。</p>
-
-<h2 id="expiry">绝对到期时间</h2>
-<p>Cat 可以携带一个绝对到期时间：时间一到，控制面就按 <code>cats destroy</code> 的语义删除它。RootDisk 随之删除，PersistentDisk 存续。回收发生在控制面内部，不需要外部 sweeper 记账。</p>
-<pre><code>cats create scratch --expires-in 28800
-cats expiry scratch                 # 查看
-cats expiry scratch --in 28800      # 续期：从现在起再 8 小时
-cats expiry scratch --at 1790000000
-cats expiry scratch --never         # 永久保留</code></pre>
-<p><code>cats ls</code> 每一行都会显示 <code>expires=</code>，值是剩余时间、<code>never</code> 或 <code>overdue</code>。</p>
-<p>续期就是写一个新的绝对时间（<code>PUT /cats/{cat}/expiry</code>），重试与重放无需额外规则。没有到期时间的 Cat 永不过期。</p>
-
-<h2 id="connections">连接与时间</h2>
-<p>保留 Guest 内存并不承诺旧 TCP 或 WebSocket 连接仍然存在。Edge、NAT 与远端对端可能在休眠期间超时。客户端应通过稳定 Endpoint 重新连接。Guest 时间在 pause/resume 后不能倒退。</p>
-
-<h2 id="delete">删除</h2>
-<p><code>cats destroy dev</code> 会停止新工作、完成生命周期 Operation、删除 Cat，并级联删除 RootDisk。它会安全卸载，但不会删除独立 PersistentDisk。</p>
+<p>Suspended 与 Warm 不能合并。两者都保护 Host-local State；Cold 启动新 Kernel 与 Process。离开 Running 时，系统会先关闭 Route Admission 并 Drain Guard，再执行 Guest、VMM、blockd 或 Attachment Effect。</p>
+<h2 id="boundary">当前 Release 边界</h2>
+<p>Signed Runtime Cutover 暴露 Cat Create 与 Read Projection，但不提供用户 Lifecycle Mutation。Per-Cat Reconciler 是唯一 Physical-effect Executor，<code>DesiredRuntimeSpec</code> 是唯一 Lifecycle Intent。浏览器或 CLI 不能制造 Transition、抢占 Attachment，也不能因缺少 Local Evidence 猜测 Cold。</p>
+<p>Checkpoint/Inventory Evidence 缺失或损坏时，Reconcile 必须 Block 或 Quarantine。非计划 Cross-Node Recovery 还要求可信 Host-fence 与精确 Volume Takeover Authority。</p>

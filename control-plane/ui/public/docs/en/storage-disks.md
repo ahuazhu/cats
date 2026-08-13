@@ -2,56 +2,27 @@
 
 |  | RootDisk | PersistentDisk |
 |----|----|----|
-| Creation | Automatic with every Cat | Explicit or via `cats create --disk` |
-| Lifecycle | Deleted with the Cat | Independent until explicitly deleted |
-| Guest device | System disk | Additional block device mounted at a selected path |
-| Access | Owned by its Cat | RWO: one active writer in V1 |
+| Creation | Exact Cat create | Exact PersistentDisk create |
+| Ownership | Follows its Cat | Independent Workspace resource |
+| Access model | One Cat | RWO: one authorized writer epoch |
+| Release capacity | Immutable | Immutable |
 
 ## Create and inspect a PersistentDisk
 
-    cats disk create project-data --size 20GiB
+    cats disk create project-data --size 20GiB --durability strict
     cats disk ls
-    cats disk get project-data
+    cats disk get disk_…
 
-Create a Cat and an independent disk together:
+The create body explicitly carries `durability`, `name`, and `size_bytes`. The browser console uses the closed Strict default. Both browser and CLI persist the exact request and Idempotency-Key before transport, so an ambiguous response is recovered by exact replay rather than a second create.
 
-    cats create dev \
-      --disk project-data \
-      --disk-size 20GiB \
-      --mount-at /data
+Disk item lookup requires the immutable `disk_…` ID returned by create or list. Names are not accepted on item paths.
 
-## Mount and unmount
+## Current lifecycle boundary
 
-    cats mount project-data --cat dev --at /data
-    cats unmount project-data
+PersistentDisk attachment, snapshot, capacity change, and deletion are not exposed by the release product router or shipped CLI. Capacity is immutable. The provider-neutral storage engine and signed Volume Authority still enforce RWO, fencing, durable roots, and stale-writer rejection; those data-plane guarantees do not authorize a product mutation endpoint.
 
-A mount creates a runtime Attachment with a monotonically increasing fencing epoch. Unmount syncs and detaches before returning the disk to Available. V1 rejects a second read-write attachment even when it targets different logical blocks—the ext4 filesystem itself is single-writer.
+## Durability
 
-## Grow a disk
+The Guest sees a standard virtio block device. Strict durability means a successful FLUSH/FUA is remotely durable and survives permanent Host loss. Relaxed durability may acknowledge a local commit while the remote root trails; that local tail is unique data and cannot be discarded as cache.
 
-
-V1 supports growth only. Follow the API error if the disk must be Available before resizing in the selected runtime path. Never shrink the backing volume under ext4.
-
-## Create a snapshot
-
-    cats disk snapshot project-data
-
-The control plane first establishes a durable barrier, then records an immutable root and generation. The CLI creates and prints the snapshot response; convenience commands to list and restore snapshots are not exposed yet — use the HTTP API for those.
-
-## Durability and cache semantics
-
-The Guest sees standard virtio block devices. Normal writes may complete in managed local cache, but FLUSH/FUA success requires immutable objects to be durable and the authoritative root CAS to succeed. After that point local NVMe is only a deletable cache.
-
-- A small dirty working set does not upload the full sparse disk.
-- Empty-cache recovery lazily downloads only the logical chunks read by ext4.
-- A stale attachment epoch cannot publish a new root.
-- Unflushed Guest page cache or ordinary writes may be lost on permanent host failure.
-
-## Delete safely
-
-    cats unmount project-data
-    cats disk delete project-data
-
-**Permanent operation**
-
-The disk must be Available. Deletion revokes access and schedules remote object cleanup; take a snapshot or export data first if retention matters.
+A stale attachment epoch cannot publish a new root. Lifecycle coordination and takeover require the typed external authority path; a product client cannot self-acquire or revoke an epoch.
