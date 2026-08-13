@@ -12,7 +12,9 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cats_api::route_grant_v2::{
@@ -63,22 +65,43 @@ pub enum RouteGrantV2DurableInstallError {
 /// (or be recovered by the exact disk-ahead branch after process restart).
 #[derive(Debug, Clone, Default)]
 pub struct RouteGrantV2RingInstallContext {
-    cancelled: Arc<AtomicBool>,
+    publication: Arc<AtomicU8>,
 }
 
 impl RouteGrantV2RingInstallContext {
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let _ = self.publication.compare_exchange(
+            PUBLICATION_ACTIVE,
+            PUBLICATION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn check_active(&self) -> Result<(), RouteGrantV2DurableInstallError> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(RouteGrantV2DurableInstallError::Cancelled)
-        } else {
+        if self.publication.load(Ordering::Acquire) == PUBLICATION_ACTIVE {
             Ok(())
+        } else {
+            Err(RouteGrantV2DurableInstallError::Cancelled)
         }
     }
+
+    fn begin_publication(&self) -> Result<(), RouteGrantV2DurableInstallError> {
+        self.publication
+            .compare_exchange(
+                PUBLICATION_ACTIVE,
+                PUBLICATION_OWNED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| RouteGrantV2DurableInstallError::Cancelled)
+    }
 }
+
+const PUBLICATION_ACTIVE: u8 = 0;
+const PUBLICATION_CANCELLED: u8 = 1;
+const PUBLICATION_OWNED: u8 = 2;
 
 pub struct RouteGrantV2RingInstaller {
     verifier: Arc<RouteGrantV2Verifier>,
@@ -137,9 +160,11 @@ impl RouteGrantV2RingInstaller {
 
         if current_file.exact_bytes == candidate_bytes {
             if same_ring(&verifier, &candidate_ring) {
+                context.begin_publication()?;
                 return Ok(RouteGrantV2DurableInstallOutcome::Replay);
             }
             if !same_ring(&verifier, &current_ring) && exact_predecessor(&candidate, &verifier) {
+                context.begin_publication()?;
                 self.verifier
                     .replace_artifact(&candidate)
                     .map_err(map_verifier_error)?;
@@ -310,13 +335,21 @@ impl OpenedRingDirectory {
             .descriptor
     }
 
-    fn reopen(&self) -> Result<File, RouteGrantV2DurableInstallError> {
+    fn reopen(
+        &self,
+        final_directory_mutated: bool,
+    ) -> Result<File, RouteGrantV2DurableInstallError> {
         let mut current = open_directory_path(&self.canonical_root)?;
-        let metadata = StableMetadata::from_metadata(&current.metadata().map_err(fs_error)?);
-        if !metadata.same_directory_identity(self.retained[0].metadata) {
+        let retained_metadata = StableMetadata::from_metadata(
+            &self.retained[0].descriptor.metadata().map_err(fs_error)?,
+        );
+        let fresh_metadata = StableMetadata::from_metadata(&current.metadata().map_err(fs_error)?);
+        if retained_metadata != self.retained[0].metadata
+            || fresh_metadata != self.retained[0].metadata
+        {
             return Err(RouteGrantV2DurableInstallError::Filesystem);
         }
-        for retained in self.retained.iter().skip(1) {
+        for (index, retained) in self.retained.iter().enumerate().skip(1) {
             current = open_directory_at(
                 &current,
                 retained
@@ -324,8 +357,17 @@ impl OpenedRingDirectory {
                     .as_deref()
                     .expect("only the root has no basename"),
             )?;
-            let metadata = StableMetadata::from_metadata(&current.metadata().map_err(fs_error)?);
-            if !metadata.same_directory_identity(retained.metadata) {
+            let retained_metadata =
+                StableMetadata::from_metadata(&retained.descriptor.metadata().map_err(fs_error)?);
+            let fresh_metadata =
+                StableMetadata::from_metadata(&current.metadata().map_err(fs_error)?);
+            let final_directory = index + 1 == self.retained.len();
+            if retained_metadata != fresh_metadata
+                || !fresh_metadata.same_directory_identity(retained.metadata)
+                || !fresh_metadata.safe_directory(self.owner, final_directory)
+                || ((!final_directory || !final_directory_mutated)
+                    && fresh_metadata != retained.metadata)
+            {
                 return Err(RouteGrantV2DurableInstallError::Filesystem);
             }
         }
@@ -335,7 +377,7 @@ impl OpenedRingDirectory {
     fn read_current(&self) -> Result<PinnedRingFile, RouteGrantV2DurableInstallError> {
         let descriptor = open_file_at(self.final_descriptor(), RING_BASENAME, libc::O_RDONLY)?;
         let (metadata, exact_bytes) = read_stable_ring(&descriptor, self.owner)?;
-        let fresh = self.reopen()?;
+        let fresh = self.reopen(false)?;
         let fresh_descriptor = open_file_at(&fresh, RING_BASENAME, libc::O_RDONLY)?;
         let (fresh_metadata, fresh_bytes) = read_stable_ring(&fresh_descriptor, self.owner)?;
         if fresh_metadata != metadata || fresh_bytes != exact_bytes {
@@ -356,7 +398,7 @@ impl OpenedRingDirectory {
         context: &RouteGrantV2RingInstallContext,
     ) -> Result<(), RouteGrantV2DurableInstallError> {
         context.check_active()?;
-        self.revalidate_current(current)?;
+        self.revalidate_current(current, false)?;
         let temp_basename = format!(
             ".public-key-ring.v1.{}.{}.tmp",
             candidate.ring_version.get(),
@@ -374,29 +416,31 @@ impl OpenedRingDirectory {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         ) {
             Ok(file) => {
+                // SAFETY: `file` owns a live descriptor; fchmod neither
+                // retains the descriptor nor dereferences Rust memory.
                 if unsafe { libc::fchmod(file.as_raw_fd(), 0o644) } != 0 {
                     return Err(RouteGrantV2DurableInstallError::Filesystem);
                 }
                 file
             }
             Err(RouteGrantV2DurableInstallError::Filesystem) => {
-                let file = open_file_at(self.final_descriptor(), &temp_basename, libc::O_RDWR)?;
-                let (_, existing) = read_stable_ring(&file, self.owner)?;
-                if existing != candidate_bytes {
-                    return Err(RouteGrantV2DurableInstallError::Filesystem);
-                }
-                file
+                open_file_at(self.final_descriptor(), &temp_basename, libc::O_RDWR)?
             }
             Err(error) => return Err(error),
         };
         let metadata = StableMetadata::from_metadata(&temporary.metadata().map_err(fs_error)?);
-        if metadata.len == 0 {
+        if !metadata.safe_ring(self.owner) {
+            return Err(RouteGrantV2DurableInstallError::Filesystem);
+        }
+        let (_, existing) = read_stable_ring(&temporary, self.owner)?;
+        if existing != candidate_bytes {
+            // A crash while writing this candidate can leave its deterministic
+            // temporary file empty or partial. It is safe to repair only this
+            // exact, validated candidate basename after proving the inode is a
+            // single-link regular file owned by the installer.
+            context.check_active()?;
+            temporary.set_len(0).map_err(fs_error)?;
             temporary.write_all(candidate_bytes).map_err(fs_error)?;
-        } else {
-            let (_, existing) = read_stable_ring(&temporary, self.owner)?;
-            if existing != candidate_bytes {
-                return Err(RouteGrantV2DurableInstallError::Filesystem);
-            }
         }
         temporary.sync_all().map_err(fs_error)?;
         let (_, stable_temp) = read_stable_ring(&temporary, self.owner)?;
@@ -404,9 +448,15 @@ impl OpenedRingDirectory {
             return Err(RouteGrantV2DurableInstallError::Filesystem);
         }
         context.check_active()?;
-        self.revalidate_current(current)?;
-        let fresh = self.reopen()?;
-        rename_at(&fresh, &temp_name, &fresh, &c_string(RING_BASENAME)?)?;
+        self.revalidate_current(current, true)?;
+        let fresh = self.reopen(true)?;
+        let ring_name = c_string(RING_BASENAME)?;
+        // This CAS is the cancellation/publication linearization point. A
+        // cancellation that wins leaves the current artifact untouched; once
+        // publication wins, cancellation cannot interrupt rename, directory
+        // fsync, verification, or the caller-visible ACK.
+        context.begin_publication()?;
+        rename_at(&fresh, &temp_name, &fresh, &ring_name)?;
         fresh.sync_all().map_err(fs_error)?;
         let published = open_file_at(&fresh, RING_BASENAME, libc::O_RDONLY)?;
         let (_, published_bytes) = read_stable_ring(&published, self.owner)?;
@@ -419,10 +469,11 @@ impl OpenedRingDirectory {
     fn revalidate_current(
         &self,
         current: &PinnedRingFile,
+        final_directory_mutated: bool,
     ) -> Result<(), RouteGrantV2DurableInstallError> {
         let (retained_metadata, retained_bytes) =
             read_stable_ring(&current.descriptor, self.owner)?;
-        let fresh = self.reopen()?;
+        let fresh = self.reopen(final_directory_mutated)?;
         let descriptor = open_file_at(&fresh, RING_BASENAME, libc::O_RDONLY)?;
         let (fresh_metadata, fresh_bytes) = read_stable_ring(&descriptor, self.owner)?;
         if retained_metadata != current.metadata
@@ -826,5 +877,184 @@ mod tests {
             Err(RouteGrantV2DurableInstallError::InstalledRingUnavailable)
                 | Err(RouteGrantV2DurableInstallError::Filesystem)
         ));
+    }
+
+    #[test]
+    fn crash_partial_temporary_file_is_repaired_but_unsafe_temp_is_rejected() {
+        let (first, second) = rings();
+        let bytes = encode_route_grant_v2_public_key_ring(&second).unwrap();
+        let temp_basename = format!(
+            ".public-key-ring.v1.{}.{}.tmp",
+            second.ring_version.get(),
+            second
+                .digest()
+                .unwrap()
+                .as_str()
+                .strip_prefix("sha256:")
+                .unwrap()
+        );
+
+        let (root, verifier) = fixture(&first);
+        let temp = root.path().join("route-v2").join(&temp_basename);
+        std::fs::write(&temp, &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let installer = RouteGrantV2RingInstaller::for_test(root.path(), Arc::clone(&verifier));
+        assert_eq!(
+            installer
+                .install(&bytes, &RouteGrantV2RingInstallContext::default())
+                .unwrap(),
+            RouteGrantV2DurableInstallOutcome::Installed
+        );
+        assert_eq!(
+            verifier.current_ring().unwrap().version(),
+            second.ring_version
+        );
+
+        let (root, verifier) = fixture(&first);
+        let temp = root.path().join("route-v2").join(&temp_basename);
+        std::fs::write(&temp, &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let installer = RouteGrantV2RingInstaller::for_test(root.path(), Arc::clone(&verifier));
+        assert!(installer
+            .install(&bytes, &RouteGrantV2RingInstallContext::default())
+            .is_err());
+        assert_eq!(
+            verifier.current_ring().unwrap().version(),
+            first.ring_version
+        );
+    }
+
+    #[test]
+    fn cancellation_and_publication_share_one_linearization_cas() {
+        let cancelled = RouteGrantV2RingInstallContext::default();
+        cancelled.cancel();
+        assert!(matches!(
+            cancelled.begin_publication(),
+            Err(RouteGrantV2DurableInstallError::Cancelled)
+        ));
+
+        let owned = RouteGrantV2RingInstallContext::default();
+        owned.begin_publication().unwrap();
+        owned.cancel();
+        assert_eq!(owned.publication.load(Ordering::Acquire), PUBLICATION_OWNED);
+    }
+
+    #[test]
+    fn maximum_eight_key_successor_installs_atomically() {
+        let first_entry = public_entry();
+        let first = RouteGrantV2PublicKeyRingArtifact {
+            version: ContractVersion::V1,
+            ring_version: Epoch::new(1).unwrap(),
+            expected_previous: None,
+            keys: vec![first_entry.clone()],
+        };
+        let mut keys = vec![first_entry];
+        keys.extend((1..8).map(|_| public_entry()));
+        keys.sort_by(|left, right| left.kid.cmp(&right.kid));
+        let successor = RouteGrantV2PublicKeyRingArtifact {
+            version: ContractVersion::V1,
+            ring_version: Epoch::new(2).unwrap(),
+            expected_previous: Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+                ring_version: first.ring_version,
+                key_ring_digest: first.digest().unwrap(),
+            }),
+            keys,
+        };
+        let (root, verifier) = fixture(&first);
+        let installer = RouteGrantV2RingInstaller::for_test(root.path(), Arc::clone(&verifier));
+        assert_eq!(
+            installer
+                .install(
+                    &encode_route_grant_v2_public_key_ring(&successor).unwrap(),
+                    &RouteGrantV2RingInstallContext::default(),
+                )
+                .unwrap(),
+            RouteGrantV2DurableInstallOutcome::Installed
+        );
+        assert_eq!(verifier.current_ring().unwrap().loaded_kids().len(), 8);
+    }
+
+    #[test]
+    fn symlink_and_hardlink_current_artifacts_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let (first, second) = rings();
+        let (hardlink_root, verifier) = fixture(&first);
+        let hardlink_path = hardlink_root.path().join("route-v2").join(RING_BASENAME);
+        std::fs::hard_link(
+            &hardlink_path,
+            hardlink_root.path().join("route-v2").join("ring-copy"),
+        )
+        .unwrap();
+        let installer = RouteGrantV2RingInstaller::for_test(hardlink_root.path(), verifier);
+        assert!(installer
+            .install(
+                &encode_route_grant_v2_public_key_ring(&second).unwrap(),
+                &RouteGrantV2RingInstallContext::default(),
+            )
+            .is_err());
+
+        let (symlink_root, verifier) = fixture(&first);
+        let symlink_path = symlink_root.path().join("route-v2").join(RING_BASENAME);
+        let target = symlink_root.path().join("route-v2").join("ring-target");
+        std::fs::rename(&symlink_path, &target).unwrap();
+        symlink(&target, &symlink_path).unwrap();
+        let installer = RouteGrantV2RingInstaller::for_test(symlink_root.path(), verifier);
+        assert!(installer
+            .install(
+                &encode_route_grant_v2_public_key_ring(&second).unwrap(),
+                &RouteGrantV2RingInstallContext::default(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_exact_installs_have_one_publication_and_one_zero_write_replay() {
+        use std::sync::Barrier;
+
+        let (first, second) = rings();
+        let (root, verifier) = fixture(&first);
+        let installer = Arc::new(RouteGrantV2RingInstaller::for_test(
+            root.path(),
+            Arc::clone(&verifier),
+        ));
+        let bytes = Arc::new(encode_route_grant_v2_public_key_ring(&second).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let installer = Arc::clone(&installer);
+                let bytes = Arc::clone(&bytes);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    installer
+                        .install(&bytes, &RouteGrantV2RingInstallContext::default())
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RouteGrantV2DurableInstallOutcome::Installed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RouteGrantV2DurableInstallOutcome::Replay)
+                .count(),
+            1
+        );
+        assert_eq!(
+            verifier.current_ring().unwrap().version(),
+            second.ring_version
+        );
     }
 }

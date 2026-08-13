@@ -270,6 +270,7 @@ impl RouteGrantV2Verifier {
             .map_err(|_| RouteGrantV2RingInstallError::Unavailable)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_ring(
         &self,
         replacement: RouteGrantV2KeyRing,
