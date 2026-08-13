@@ -196,12 +196,13 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
     let variables = variables.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        variables.contains("metal_worker_instance_count = 2"),
+        variables.contains("metal_workers = {"),
         "the production example must retain worker capacity after one bare-metal host is lost"
     );
     assert!(
-        variables.contains("metal_worker_names = [\"cats-metal-2\", \"cats-metal-1\"]"),
-        "the imported cats-metal-2 must stay at index 0 while the second stable identity is appended"
+        variables.contains("\"metal-2\" = { subnet_index = 0")
+            && variables.contains("\"metal-1\" = { subnet_index = 1"),
+        "the imported workers must retain their exact stable subnet identities"
     );
 
     let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf")
@@ -209,9 +210,7 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        platform.contains(
-            "subnet_id = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]"
-        ),
+        platform.contains("subnet_id = module.network.private_subnet_ids[each.value.subnet_index]"),
         "bare-metal workers must be distributed across the configured private subnets"
     );
 

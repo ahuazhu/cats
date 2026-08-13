@@ -30,6 +30,78 @@ fn read_workspace_file(path: &str) -> String {
 }
 
 #[test]
+fn production_metal_fleet_keeps_stable_addresses_and_one_explicit_root_cutover() {
+    let main = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf");
+    let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
+    let outputs = read_workspace_file("deploy/aws/terraform/stacks/platform/outputs.tf");
+    let platform_example =
+        read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
+    let infrastructure_example = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-infrastructure/production.tfvars.example",
+    );
+    let runbook = read_workspace_file("deploy/aws/terraform/README.md");
+
+    for contract in [
+        "for_each = var.metal_workers",
+        "from = aws_instance.metal_worker[0]",
+        "to   = aws_instance.metal_worker[\"metal-2\"]",
+        "from = aws_instance.metal_worker[1]",
+        "to   = aws_instance.metal_worker[\"metal-1\"]",
+        "encrypted             = each.value.root_volume_encrypted",
+    ] {
+        assert!(
+            main.contains(contract),
+            "missing metal fleet contract: {contract}"
+        );
+    }
+    assert!(
+        !main.contains("root_block_device]"),
+        "root encryption drift must be visible to the reviewed maintenance plan",
+    );
+    assert!(
+        variables.contains("variable \"metal_workers\"")
+            && variables.contains("root_volume_encrypted = bool")
+            && variables.contains("worker.root_volume_encrypted || name == \"metal-2\""),
+        "workers need stable keys and an explicit per-worker root encryption target",
+    );
+    let worker_resource = main
+        .split_once("resource \"aws_instance\" \"metal_worker\"")
+        .and_then(|(_, source)| source.split_once("# Preserve the exact imported"))
+        .map(|(source, _)| source)
+        .expect("metal worker resource and address migration boundary");
+    assert!(
+        !worker_resource.contains("prevent_destroy = true"),
+        "an unconditional prevent_destroy would hide the reviewed root replacement plan",
+    );
+    assert!(
+        outputs.contains("for name, worker in aws_instance.metal_worker : name => worker.id"),
+        "platform must emit the exact stable-name to instance-ID deployment input",
+    );
+
+    for source in [&platform_example, &infrastructure_example] {
+        assert!(
+            source.contains("\"metal-2\"") && source.contains("\"metal-1\""),
+            "both production workers must be present in every fleet handoff example",
+        );
+    }
+    assert!(
+        platform_example.contains("root_volume_encrypted = false")
+            && platform_example.contains("root_volume_encrypted = true"),
+        "the ordinary plan must match legacy metal-2 while keeping metal-1 encrypted",
+    );
+    for contract in [
+        "metal-2-root-encryption.tfplan",
+        "aws_instance.metal_worker[\"metal-2\"]",
+        "aws_instance.metal_worker[\"metal-1\"]",
+    ] {
+        assert!(
+            runbook.contains(contract),
+            "the reviewed saved-plan runbook is missing: {contract}",
+        );
+    }
+}
+
+#[test]
 fn production_platform_defaults_to_independent_az_dependencies() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let example =

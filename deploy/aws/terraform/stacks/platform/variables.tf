@@ -310,34 +310,46 @@ variable "metal_worker_ssh_from_instance_connect" {
   default     = true
 }
 
-variable "metal_worker_instance_count" {
-  description = "Bare-metal workers managed by this stack."
-  type        = number
-  default     = 1
-
-  validation {
-    condition     = var.metal_worker_instance_count >= 1 && floor(var.metal_worker_instance_count) == var.metal_worker_instance_count
-    error_message = "metal_worker_instance_count must be a positive integer."
-  }
-}
-
-variable "metal_worker_names" {
+variable "metal_workers" {
   description = <<-EOT
-    Name tags for the workers, by index; indices past the end of the list fall
-    back to cats-metal-<index+1>. Exists because worker names follow node
-    identity, not slot position: the imported cats-metal-2 occupies index 0
-    after metal-1 was decommissioned, and a positional name would silently
-    relabel it on the next apply.
+    Bare-metal workers keyed by their stable Node name. subnet_index pins the
+    existing Host to one private subnet without making list position an
+    identity. root_volume_encrypted records the live root contract: only the
+    legacy metal-2 may temporarily be false, and changing it to true is the
+    explicit forward-only replacement requested for the maintenance window.
   EOT
-  type        = list(string)
-  default     = []
+  type = map(object({
+    subnet_index          = number
+    root_volume_encrypted = bool
+  }))
+  default = {
+    metal-1 = {
+      subnet_index          = 0
+      root_volume_encrypted = true
+    }
+  }
 
   validation {
-    condition = (
-      length(var.metal_worker_names) == length(distinct(var.metal_worker_names)) &&
-      alltrue([for name in var.metal_worker_names : length(trimspace(name)) > 0])
-    )
-    error_message = "metal_worker_names must contain only non-empty, unique names."
+    condition     = length(var.metal_workers) > 0
+    error_message = "metal_workers must contain at least one worker."
+  }
+
+  validation {
+    condition = alltrue([
+      for name, worker in var.metal_workers :
+      can(regex("^metal-[1-9][0-9]*$", name)) &&
+      worker.subnet_index >= 0 &&
+      floor(worker.subnet_index) == worker.subnet_index
+    ])
+    error_message = "metal_workers keys must be stable metal-<positive integer> names with non-negative integer subnet_index values."
+  }
+
+  validation {
+    condition = alltrue([
+      for name, worker in var.metal_workers :
+      worker.root_volume_encrypted || name == "metal-2"
+    ])
+    error_message = "Only the known legacy metal-2 root may temporarily remain unencrypted."
   }
 }
 
