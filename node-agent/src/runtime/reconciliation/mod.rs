@@ -154,6 +154,8 @@ pub use authorized_blockd::{
     AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
     PreparedAuthorizedBlockd,
 };
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use authorized_blockd::{AUTHORIZED_SERVING_FILE, IDENTITY_FILE};
 pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
 };
@@ -245,6 +247,8 @@ pub(crate) use vmm_socket_namespace::{
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use clean_slate_probes::retire_absent_serving_socket_owner_for_test;
 #[allow(unused_imports)]
 pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint,

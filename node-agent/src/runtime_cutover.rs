@@ -15,6 +15,8 @@
 //! This path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
 //! destructive residue/device sweep.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,6 +83,26 @@ pub struct SignedRuntimeCutoverConfig {
 pub(crate) struct RuntimeObservationBarrierForTest {
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     resume: tokio::sync::mpsc::UnboundedReceiver<()>,
+    effect_steps: Option<tokio::sync::mpsc::UnboundedSender<RuntimeEffectStepForTest>>,
+    effect_dispatch_count: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeEffectStepForTest {
+    ServingAdopted {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
+    RefreshInventory {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
+    Stopped {
+        cat_id: cats_api::runtime_reconciliation::Id,
+        reason: crate::runtime_spine::RuntimeDesiredEffectStopReason,
+    },
+    SessionReplacementRequired {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
 }
 
 #[cfg(test)]
@@ -96,10 +118,66 @@ impl RuntimeObservationBarrierForTest {
             Self {
                 reached,
                 resume: resume_rx,
+                effect_steps: None,
+                effect_dispatch_count: None,
             },
             reached_rx,
             resume,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn channel_with_effect_steps() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::sync::mpsc::UnboundedReceiver<RuntimeEffectStepForTest>,
+        Arc<AtomicUsize>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (effect_steps, effect_steps_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_dispatch_count = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                reached,
+                resume: resume_rx,
+                effect_steps: Some(effect_steps),
+                effect_dispatch_count: Some(Arc::clone(&effect_dispatch_count)),
+            },
+            reached_rx,
+            resume,
+            effect_steps_rx,
+            effect_dispatch_count,
+        )
+    }
+
+    fn observe_effect_step(&self, step: &RuntimeSpineRunStep) -> anyhow::Result<()> {
+        let event = match step {
+            RuntimeSpineRunStep::EffectRefreshInventory { cat_id } => {
+                Some(RuntimeEffectStepForTest::RefreshInventory {
+                    cat_id: cat_id.clone(),
+                })
+            }
+            RuntimeSpineRunStep::EffectStopped { cat_id, reason } => {
+                Some(RuntimeEffectStepForTest::Stopped {
+                    cat_id: cat_id.clone(),
+                    reason: reason.clone(),
+                })
+            }
+            RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id } => {
+                Some(RuntimeEffectStepForTest::SessionReplacementRequired {
+                    cat_id: cat_id.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let (Some(sender), Some(event)) = (&self.effect_steps, event) {
+            sender
+                .send(event)
+                .map_err(|_| anyhow::anyhow!("test effect-step receiver dropped"))?;
+        }
+        Ok(())
     }
 
     async fn wait_after_observation(&mut self) -> anyhow::Result<()> {
@@ -460,6 +538,16 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let runner_effect_resource_owner = resource_owner_override.unwrap_or_else(|| {
         Arc::clone(&kernel_nbd_cleanup_owner) as Arc<dyn RuntimeEffectResourceOwner>
     });
+    #[cfg(test)]
+    let effect_dispatch_count_for_test = config
+        .observation_barrier_for_test
+        .as_ref()
+        .and_then(|barrier| barrier.effect_dispatch_count.clone());
+    #[cfg(test)]
+    let serving_adoption_steps_for_test = config
+        .observation_barrier_for_test
+        .as_ref()
+        .and_then(|barrier| barrier.effect_steps.clone());
     let runner = tokio::task::spawn_blocking(move || {
         #[cfg(not(test))]
         let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
@@ -495,7 +583,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         macro_rules! compose_platform_effect {
             ($process_ports:expr) => {{
                 let process_ports = $process_ports;
-                SignedRunningEffect::platform(
+                let effect = SignedRunningEffect::platform(
                     acquire,
                     Arc::clone(&effect_volume_authority),
                     effect_blob_store,
@@ -517,7 +605,23 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     effect_prepare_frontend,
                     Arc::clone(&effect_admission_registry),
                 )
-                .context("compose signed Running root provision prefix")
+                .context("compose signed Running root provision prefix")?;
+                #[cfg(test)]
+                let effect = match serving_adoption_steps_for_test.clone() {
+                    Some(sender) => {
+                        effect.with_serving_adoption_observer_for_test(Arc::new(move |cat_id| {
+                            sender
+                                .send(RuntimeEffectStepForTest::ServingAdopted {
+                                    cat_id: cat_id.clone(),
+                                })
+                                .map_err(|_| {
+                                    anyhow::anyhow!("test serving-adoption observer dropped")
+                                })
+                        }))
+                    }
+                    None => effect,
+                };
+                Ok::<_, anyhow::Error>(effect)
             }};
         }
         #[cfg(not(test))]
@@ -562,7 +666,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             }
         }
         .with_volume_evidence(volume_evidence);
-        RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
+        let runner = RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,
             client,
@@ -572,7 +676,18 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             effect,
             runner_effect_resource_owner,
         )
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from)?;
+        #[cfg(test)]
+        let runner = {
+            let mut runner = runner;
+            if let Some(dispatch_count) = effect_dispatch_count_for_test {
+                runner
+                    .set_effect_dispatch_count_for_test(dispatch_count)
+                    .map_err(anyhow::Error::from)?;
+            }
+            runner
+        };
+        Ok::<_, anyhow::Error>(runner)
     })
     .await
     .context("join signed Runtime runner construction")??;
@@ -659,6 +774,10 @@ async fn run_signed_spine(
         let step = runner.run_once_with_deadlines(deadlines).await?;
         #[cfg(test)]
         let observation_accepted = matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. });
+        #[cfg(test)]
+        if let Some(barrier) = observation_barrier_for_test.as_ref() {
+            barrier.observe_effect_step(&step)?;
+        }
         match apply_readiness_policy(step, readiness)? {
             RuntimeLoopAction::Continue => {
                 #[cfg(test)]

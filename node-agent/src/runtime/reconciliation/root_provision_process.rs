@@ -23,8 +23,8 @@ use cats_blockd::target_control::{
     ProvisionRootAuthorizationContextDigest,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, validate_volume_record, AttachmentLineageIdentity,
-    AuthorizedServingAttachment, VolumeAdminState, VolumeRecord,
+    remote_head_is_same_or_later, validate_authorized_serving_attachment, validate_volume_record,
+    AttachmentLineageIdentity, AuthorizedServingAttachment, VolumeAdminState, VolumeRecord,
 };
 
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
@@ -441,8 +441,11 @@ impl RootProvisionProcessExpectation {
                 && attempt.attachment.identity.attachment_id == device.attachment_id
                 && attempt.attachment.identity.attachment_epoch == device.attachment_epoch
                 && attempt.attachment.identity.acquire_origin == device.acquire_origin
-                && attempt.expected_provisioned_head == device.expected_head
-                && attempt.attachment.head == device.expected_head
+                && attempt.expected_provisioned_head == attempt.attachment.head
+                && remote_head_is_same_or_later(
+                    &device.expected_head,
+                    &attempt.expected_provisioned_head,
+                )
                 && attempt.attachment.size_bytes == device.size_bytes
                 && attempt.attachment.durability == device.durability,
             "retained Root process attempt conflicts with current PrepareDevice authority"

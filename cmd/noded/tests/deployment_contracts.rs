@@ -148,6 +148,16 @@ fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
 }
 
 #[test]
+fn linux_gate_names_the_serving_pending_pack_restart_adoption_case() {
+    const TEST_NAME: &str = "postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart";
+    let gate = read_workspace_file("scripts/linux-gate.sh");
+    assert!(
+        gate.contains(TEST_NAME),
+        "quality.sh linux does not name the serving/pending-pack restart characterization"
+    );
+}
+
+#[test]
 fn production_aws_worker_does_not_write_legacy_schedulability_state() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(

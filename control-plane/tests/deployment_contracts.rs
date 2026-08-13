@@ -1170,13 +1170,13 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
     );
     assert!(
         focused_command.contains(
-            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --list"
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --list"
         ),
         "the focused test inventory must bound both Docker and its in-container Cargo process"
     );
     assert!(
         focused_command.contains(
-            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --nocapture"
         ),
         "the privileged gate must run only the exact ignored Node E2E"
     );
@@ -1511,7 +1511,7 @@ case "${1:-} ${2:-}" in
         fi
         if [[ "$mode" != zero-systemd-test ]]; then
           printf '%s\n' \
-            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test'
+            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test'
         fi
         ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*)

@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1143,6 +1145,15 @@ impl CompleteRuntimeInventory {
         &self.runtimes
     }
 
+    /// Fault-injection seam for signed-cycle acceptance tests. The runner
+    /// still owns observation coordinates and recomputes the inventory digest
+    /// after this scanner output returns; provider-private admissions remain
+    /// attached and independently constrain the subsequent production effect.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn runtimes_mut_for_test(&mut self) -> &mut [ObservedRuntimeStatus] {
+        &mut self.runtimes
+    }
+
     #[cfg(test)]
     pub(crate) fn residue(&self) -> &[NodeResidue] {
         &self.residue
@@ -2116,6 +2127,8 @@ struct CatEffectWorkers {
     completion_receiver: tokio::sync::mpsc::UnboundedReceiver<CatEffectCompletion>,
     active: BTreeMap<Id, CatEffectWorker>,
     limit: usize,
+    #[cfg(test)]
+    dispatch_count_for_test: Option<Arc<AtomicUsize>>,
 }
 
 impl CatEffectWorkers {
@@ -2135,7 +2148,14 @@ impl CatEffectWorkers {
             completion_receiver,
             active: BTreeMap::new(),
             limit,
+            #[cfg(test)]
+            dispatch_count_for_test: None,
         })
+    }
+
+    #[cfg(test)]
+    fn set_dispatch_count_for_test(&mut self, dispatch_count: Arc<AtomicUsize>) {
+        self.dispatch_count_for_test = Some(dispatch_count);
     }
 
     fn has_active(&self) -> bool {
@@ -2235,6 +2255,14 @@ impl CatEffectWorkers {
             return Err(RuntimeSpineRunError::WorkerStopped(
                 "per-Cat Desired effect startup".to_owned(),
             ));
+        }
+        #[cfg(test)]
+        if let Some(dispatch_count) = &self.dispatch_count_for_test {
+            // This is the runner's exact successful mailbox-dispatch boundary:
+            // the worker accepted the sole command and may now enter the
+            // physical effect. Tests use it to prove that an earlier session
+            // rejection did not merely happen to leave local state unchanged.
+            dispatch_count.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -2650,6 +2678,20 @@ impl RuntimeSpineRunner {
             Some(recovery),
             Some(resource_owner),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_effect_dispatch_count_for_test(
+        &mut self,
+        dispatch_count: Arc<AtomicUsize>,
+    ) -> Result<(), RuntimeSpineRunError> {
+        self.cat_effect_workers
+            .as_mut()
+            .ok_or(RuntimeSpineRunError::InvalidComposition(
+                "test dispatch observer requires the Desired effect lane",
+            ))?
+            .set_dispatch_count_for_test(dispatch_count);
+        Ok(())
     }
 
     #[allow(
@@ -5680,6 +5722,8 @@ mod tests {
             max_active: AtomicUsize::new(0),
         });
         let mut workers = CatEffectWorkers::new(effect.clone(), 2).unwrap();
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        workers.set_dispatch_count_for_test(Arc::clone(&dispatch_count));
         let gate = Arc::new(NodeGlobalEffectGate::default());
         let open = Arc::new(AtomicBool::new(true));
         let first = desired_with_network_for_cat("cat_one");
@@ -5696,6 +5740,7 @@ mod tests {
                 deadline,
             )
             .unwrap();
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
         assert!(matches!(
             workers.dispatch(
                 StateDirectory::unanchored(root.path().to_path_buf()),
@@ -5707,6 +5752,7 @@ mod tests {
             ),
             Err(RuntimeSpineRunError::InvalidComposition(_))
         ));
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
         workers
             .dispatch(
                 StateDirectory::unanchored(root.path().to_path_buf()),
@@ -5717,6 +5763,7 @@ mod tests {
                 deadline,
             )
             .unwrap();
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
         assert!(matches!(
             workers.dispatch(
                 StateDirectory::unanchored(root.path().to_path_buf()),
@@ -5728,6 +5775,7 @@ mod tests {
             ),
             Err(RuntimeSpineRunError::EffectQueueFull)
         ));
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
         for _ in 0..2 {
             started_rx
                 .recv_timeout(Duration::from_secs(1))

@@ -47,6 +47,8 @@ use super::root_provision_process::{
     RootProvisionAbsencePurpose, RootProvisionManagedStopInspection,
     RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
 };
+#[cfg(test)]
+use super::serving_blockd_process::ServingBlockdAdoptionObserver;
 use super::serving_blockd_process::{ServingBlockdProcessGlobalPort, ServingBlockdStartEffect};
 use super::serving_handoff::{
     target_control_process_launch_identity, ReopenedTargetControlAuthorization,
@@ -343,6 +345,18 @@ impl SignedRunningEffect {
             persistent_filesystem: Some(persistent_filesystem),
             physical_start_runtime: Some(physical_start_runtime),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_serving_adoption_observer_for_test(
+        mut self,
+        observer: ServingBlockdAdoptionObserver,
+    ) -> Self {
+        self.serving_process = self
+            .serving_process
+            .take()
+            .map(|effect| effect.with_after_exact_adoption_for_test(observer));
+        self
     }
 }
 

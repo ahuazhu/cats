@@ -1262,6 +1262,7 @@ dependencies = [
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
+ "cats-object-store-aws-s3",
  "cats-object-store-file",
  "cats-storage",
  "cats-test-support",

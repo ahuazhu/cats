@@ -575,7 +575,7 @@ trap 'linux_gate_signal 143' TERM
 
 main() {
   local attempt
-  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test"
+  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test"
   local expected_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.expected"
   local image_inspection=""
   local iidfile_expected=""
@@ -938,7 +938,7 @@ main() {
       timeout --signal=TERM --kill-after=30s 20m \
       cargo test -p cats-node-agent --lib --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
         -- --ignored --exact --list; then
       while IFS= read -r listed_test; do
         case "$listed_test" in
@@ -963,7 +963,7 @@ main() {
       timeout --signal=TERM --kill-after=30s 20m \
       cargo test -p cats-node-agent --lib --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
         -- --ignored --exact --nocapture; then
       :
     else

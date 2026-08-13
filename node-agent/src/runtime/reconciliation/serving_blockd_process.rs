@@ -8,14 +8,16 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
-    ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
-    ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead,
-    RuntimeCheckpoint, ServingAuthorityProvenance, UnixMillis, WireU64,
+    encode_runtime_checkpoint, ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id,
+    ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
+    PreparedDeviceInput, ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep,
+    RemoteHead, RuntimeCheckpoint, ServingAuthorityProvenance, UnixMillis, VolumeAuthorityEvidence,
+    WireU64,
 };
 use cats_storage::authority::{
     remote_head_is_same_or_later, validate_authorized_serving_attachment, validate_volume_record,
@@ -37,8 +39,8 @@ use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
 use super::network::{
-    prepare_device_checkpoint_view, prepare_network_volume_admission_is_exact,
-    prepared_device_input, prepared_device_inputs, prepared_device_set_is_exact,
+    prepare_device_checkpoint_view, prepared_device_input, prepared_device_inputs,
+    prepared_device_set_is_exact,
 };
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
@@ -1384,7 +1386,13 @@ pub(crate) struct ServingBlockdStartEffect {
     systemd: RootProvisionSystemdConfig,
     process: Arc<dyn ServingBlockdProcessGlobalPort>,
     submitted_admission: Mutex<Option<RandomId128>>,
+    #[cfg(test)]
+    after_exact_adoption: Option<ServingBlockdAdoptionObserver>,
 }
+
+#[cfg(test)]
+pub(crate) type ServingBlockdAdoptionObserver =
+    Arc<dyn Fn(&Id) -> anyhow::Result<()> + Send + Sync>;
 
 struct AdmittedServingStart<'a> {
     expected: ServingBlockdExpectation,
@@ -1405,7 +1413,18 @@ impl ServingBlockdStartEffect {
             systemd,
             process,
             submitted_admission: Mutex::new(None),
+            #[cfg(test)]
+            after_exact_adoption: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_exact_adoption_for_test(
+        mut self,
+        observer: ServingBlockdAdoptionObserver,
+    ) -> Self {
+        self.after_exact_adoption = Some(observer);
+        self
     }
 
     /// Return `None` only after accepted full inventory and the sealed global
@@ -1511,21 +1530,6 @@ impl ServingBlockdStartEffect {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
             };
             if !admitted_expected.matches_device_contract(&desired.cat_id, device)
-                || observed_devices.is_some()
-                    && !prepare_network_volume_admission_is_exact(
-                        desired,
-                        runtime,
-                        device,
-                        admitted_expected.volume_id(),
-                        runtime
-                            .volumes
-                            .iter()
-                            .find(|volume| volume.volume_id == device.volume_id)
-                            .and_then(|volume| match volume.devices.as_slice() {
-                                [observed] => Some(observed),
-                                _ => None,
-                            }),
-                    )
                 || !accepted_devices_are_compatible(
                     context,
                     runtime,
@@ -1633,6 +1637,23 @@ impl ServingBlockdStartEffect {
         }
         store.revalidate_current(&stored, &guard)?;
         let Some(selected) = selected_absent else {
+            if let Some(successor) = publisher_clean_checkpoint_successor(
+                &stored,
+                runtime,
+                &serving,
+                &current_authorities,
+            )? {
+                drop(guard);
+                context.check_active()?;
+                store
+                    .replace(&stored, &successor)
+                    .context("publish serving publisher-clean checkpoint successor")?;
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
+            #[cfg(test)]
+            if let Some(observer) = &self.after_exact_adoption {
+                observer(&desired.cat_id)?;
+            }
             return Ok(None);
         };
         let selected_entry = &serving[selected];
@@ -1698,6 +1719,137 @@ impl ServingBlockdStartEffect {
         );
         Ok(current)
     }
+}
+
+/// A retained serving writer may advance the remote head after a Relaxed
+/// publisher settles its local tail.  The immutable grant remains the origin
+/// authority, while this bounded Runtime checkpoint records the newer launch
+/// head.  Progress is allowed only from one exact full scan that proves every
+/// serving process and lineage fully drained at the independently reread head.
+fn publisher_clean_checkpoint_successor(
+    stored: &StoredCheckpoint,
+    runtime: &ObservedRuntimeStatus,
+    serving: &[AdmittedServingStart<'_>],
+    current_authorities: &[VolumeRecord],
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let ReconcileStep::PrepareNetwork { devices, .. } = &stored.checkpoint().step else {
+        return Ok(None);
+    };
+    if devices.len() != serving.len() || serving.len() != current_authorities.len() {
+        return Ok(None);
+    }
+
+    let mut advanced = Vec::new();
+    for ((device, entry), current) in devices.iter().zip(serving).zip(current_authorities) {
+        let Some(exact) = entry.admitted_exact else {
+            return Ok(None);
+        };
+        let Some(observed) = runtime
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == device.volume_id)
+        else {
+            return Ok(None);
+        };
+        let [lineage] = observed.local_lineages.as_slice() else {
+            return Ok(None);
+        };
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            head,
+        } = &observed.authority
+        else {
+            return Ok(None);
+        };
+        if head != &current.head
+            || attachment_id != &device.attachment_id
+            || *attachment_epoch != device.attachment_epoch
+            || !remote_head_is_same_or_later(&current.head, &device.expected_head)
+            || lineage.attachment_id != device.attachment_id
+            || lineage.attachment_epoch != device.attachment_epoch
+            || lineage.acquire_origin != device.acquire_origin
+            || lineage.local_durable_generation != current.head.generation
+            || lineage.remote_durable_generation != current.head.generation
+            || lineage.pending_pack_count.get() != 0
+            || lineage.fenced
+            || !matches!(
+                lineage.state,
+                cats_api::runtime_reconciliation::LocalLineageState::Active
+            )
+            || !exact
+                .validates_fully_drained_status_at_head(exact.durability_status(), &current.head)
+        {
+            return Ok(None);
+        }
+        if current.head != device.expected_head {
+            advanced.push((device.volume_id.clone(), current.head.clone()));
+        }
+    }
+    if advanced.is_empty() {
+        return Ok(None);
+    }
+
+    let mut successor = stored.checkpoint().clone();
+    let ReconcileStep::PrepareNetwork { devices, .. } = &mut successor.step else {
+        unreachable!("predecessor phase was checked above")
+    };
+    for (volume_id, head) in &advanced {
+        let Some(device) = devices
+            .iter_mut()
+            .find(|device| &device.volume_id == volume_id)
+        else {
+            return Ok(None);
+        };
+        device.expected_head = head.clone();
+
+        let Some(volume) = successor
+            .volumes
+            .iter_mut()
+            .find(|volume| &volume.volume_id == volume_id)
+        else {
+            return Ok(None);
+        };
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            head: checkpoint_head,
+        } = &mut volume.authority
+        else {
+            return Ok(None);
+        };
+        let [lineage] = volume.local_lineages.as_mut_slice() else {
+            return Ok(None);
+        };
+        if attachment_id != &device.attachment_id
+            || *attachment_epoch != device.attachment_epoch
+            || lineage.attachment_id != device.attachment_id
+            || lineage.attachment_epoch != device.attachment_epoch
+            || lineage.acquire_origin != device.acquire_origin
+        {
+            return Ok(None);
+        }
+        *checkpoint_head = head.clone();
+        lineage.local_durable_generation = head.generation;
+        lineage.remote_durable_generation = head.generation;
+        lineage.pending_pack_count = WireU64::new(0).expect("zero fits WireU64");
+    }
+    let wall_clock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    let wall_clock_ms = u64::try_from(wall_clock_ms).context("system time exceeds wire range")?;
+    let minimum = stored
+        .checkpoint()
+        .updated_at_unix_ms
+        .get()
+        .checked_add(1)
+        .context("publisher-clean checkpoint timestamp exhausted")?;
+    successor.updated_at_unix_ms = UnixMillis::new(wall_clock_ms.max(minimum))
+        .context("publisher-clean checkpoint timestamp exceeds the wire range")?;
+    encode_runtime_checkpoint(&successor)
+        .context("publisher-clean checkpoint successor is not canonical V1")?;
+    Ok(Some(successor))
 }
 
 fn public_process_matches(process: &ProcessEvidence, expected: &ServingBlockdExpectation) -> bool {
