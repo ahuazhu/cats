@@ -2378,10 +2378,8 @@ fn validate_desired_mutation_disks(
                 "current Desired Disk/Volume authority does not match its intent",
             ));
         }
-        if let (
-            DiskKind::Root,
-            DesiredVolumeMutation::DeleteCat { delete_id },
-        ) = (&intent.disk_kind, volume_mutation)
+        if let (DiskKind::Root, DesiredVolumeMutation::DeleteCat { delete_id }) =
+            (&intent.disk_kind, volume_mutation)
         {
             // Cat delete may create this authorization only after the exact
             // Deleted revision is current. Seeing it before publication means
@@ -3203,11 +3201,7 @@ fn validate_desired_mutation_bundle(
         ));
     }
     validate_desired_volume_mutation(expected_current, desired, volume_mutation)?;
-    validate_route_epoch_successor(
-        expected_current,
-        desired,
-        require_idle_open_busy_proof,
-    )?;
+    validate_route_epoch_successor(expected_current, desired, require_idle_open_busy_proof)?;
 
     let mutation_class = if old_placement != new_placement
         || expected_current.runtime != desired.runtime
@@ -3305,11 +3299,7 @@ fn validate_desired_volume_mutation(
                 ));
             }
             let mut roots = 0_u8;
-            for (current, successor) in expected_current
-                .volumes
-                .iter()
-                .zip(&desired.volumes)
-            {
+            for (current, successor) in expected_current.volumes.iter().zip(&desired.volumes) {
                 let mut normalized = successor.clone();
                 normalized.disposition = current.disposition.clone();
                 if normalized != *current {

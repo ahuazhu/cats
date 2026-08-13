@@ -1249,7 +1249,7 @@ async fn spawn_inner(
                 }
             },
         )
-        });
+    });
     let delete_sweeper = Arc::new(
         crate::store::runtime_authority::delete_sweeper::DeleteSweeper::new(
             state.store.clone(),
