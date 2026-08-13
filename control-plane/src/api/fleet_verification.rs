@@ -9,7 +9,7 @@ use axum::response::Response;
 use cats_api::error::ApiError;
 use cats_api::fleet_verification::encode_fleet_verification_snapshot;
 
-use super::{check_admin_auth, ApiResult};
+use super::{check_fleet_verification_admin_auth, ApiResult};
 use crate::server::AppState;
 use crate::store::AuthorityRequestContext;
 
@@ -94,7 +94,7 @@ pub(super) async fn fleet_verification(
     {
         return Err(ApiError::invalid("fleet verification request target is invalid").into());
     }
-    check_admin_auth(&state, &headers).await?;
+    check_fleet_verification_admin_auth(&state, &headers).await?;
     let request_guard = state
         .fleet_verification_service
         .begin(request_context.clone())

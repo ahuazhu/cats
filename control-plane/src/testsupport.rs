@@ -236,6 +236,22 @@ pub fn route_grant_signer() -> Arc<crate::route_grant::RouteGrantSigner> {
     )
 }
 
+/// PostgreSQL backend PID for the ordinary single-connection control Store.
+/// Integration concurrency tests use it only to distinguish one claimed
+/// production request from unrelated sessions in the same disposable server.
+pub async fn control_store_backend_pid(store: &Arc<crate::store::Store>) -> i32 {
+    store
+        .execute(|store| {
+            store.with(|client| {
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .map(|row| row.get(0))
+            })
+        })
+        .await
+        .expect("read test control Store backend PID")
+}
+
 /// Base DSN of the disposable test server.
 ///
 /// Panics with instructions when unset: silently skipping the store tests

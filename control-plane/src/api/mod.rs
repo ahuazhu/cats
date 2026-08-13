@@ -324,6 +324,47 @@ async fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()
     ))
 }
 
+/// Authenticate the observation-only fleet verifier without entering the
+/// control Store before its request owner/registry exists.
+///
+/// Workspace automation tokens have a closed, disjoint `cats_wst_` namespace,
+/// while WorkOS JWTs are verified cryptographically. Keeping this route off
+/// the generic workspace-token lookup prevents a dropped HTTP request or
+/// graceful shutdown from detaching a claimed Store lane outside the fleet
+/// verification service's cancellation boundary.
+async fn check_fleet_verification_admin_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<()> {
+    if let Some(token) = bearer_token(headers) {
+        // Preserve the generic principal precedence when deployments have
+        // accidentally configured equal static credentials: service never
+        // becomes fleet administrator authority.
+        if token == state.cfg.auth_token {
+            return Err(auth_failure(true));
+        }
+        if token == state.cfg.admin_token {
+            return Ok(());
+        }
+        if token.starts_with("cats_wst_") {
+            return Err(auth_failure(true));
+        }
+        let workos = state.cfg.workos.as_ref().ok_or_else(|| {
+            ApiError::unauthenticated("missing or invalid authentication credential")
+        })?;
+        let identity = workos.verify_access_token(token).await?;
+        if workos.is_fleet_administrator(&identity) {
+            return Ok(());
+        }
+        return Err(auth_failure(true));
+    }
+
+    if crate::auth::web_session_is_admin_without_store(state, headers) {
+        return Ok(());
+    }
+    Err(auth_failure(false))
+}
+
 /// Authenticate the observability endpoint without consulting PostgreSQL.
 /// Static scrape credentials, WorkOS administrator JWTs, and the sealed admin
 /// browser session preserve the existing administrator surface while a stuck
