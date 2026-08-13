@@ -16,7 +16,7 @@ cats-blockd = { workspace = true }
 cats-block-client = { workspace = true }
 cats-network = { workspace = true, features = ["legacy-test-harness"] }
 cats-storage = { workspace = true }
-cats-metadata-store-sqlite = { workspace = true, features = ["test-support"] }
+cats-metadata-store-sqlite = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
 cats-object-store-aws-s3 = { workspace = true }
 cats-object-store-file = { workspace = true }

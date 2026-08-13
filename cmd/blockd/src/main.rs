@@ -30,15 +30,11 @@ use cats_blockd::target_control::{
     StableDirectoryIdentity, StableFileIdentity, TargetControlAuthorizationArtifact,
     TARGET_CONTROL_AUTHORIZATION_MAX_BYTES,
 };
-use cats_metadata_store_postgres::{PostgresMetadataStoreFactory, PostgresVolumeDataAuthority};
-use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
+use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
 use cats_storage::authority::AuthorizedServingAttachment;
-use cats_storage::{
-    open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetaError,
-    MetadataStoreFactory,
-};
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -129,13 +125,9 @@ struct Args {
     #[arg(long, value_name = "ID")]
     guest_device_serial: Option<String>,
 
-    /// Exact externally granted attachment epoch to adopt. Target modes also
-    /// bind this value through their complete authorization artifact.
-    #[arg(long)]
-    attachment_epoch: Option<i64>,
-
-    /// Provider-neutral metadata-store adapter name. Not needed to publish an
-    /// image, which touches no volume metadata.
+    /// Volume Authority adapter. The terminal release accepts only PostgreSQL;
+    /// the option remains explicit so deployment cannot silently select a
+    /// different authority.
     #[arg(long)]
     metadata_store_adapter: Option<String>,
     /// Opaque metadata adapter option (`key=value`); may be repeated.
@@ -152,13 +144,8 @@ struct Args {
     /// Serve NBD on this unix socket path.
     #[arg(long)]
     listen_unix: Option<PathBuf>,
-    /// ... or on this TCP address (host:port).
-    #[arg(long)]
-    listen_tcp: Option<String>,
-
-    /// Serve vhost-user-blk on this unix socket path (Linux only). May be
-    /// combined with an NBD listener: the VMM uses vhost-user while seeding and
-    /// recovery tooling keeps using NBD on the same engine.
+    /// Serve vhost-user-blk on this unix socket path (Linux only). Signed
+    /// serving chooses exactly one Guest frontend.
     #[arg(long)]
     listen_vhost_user: Option<PathBuf>,
     /// virtio-blk virtqueues to expose (must match the VMM's num_queues).
@@ -167,17 +154,6 @@ struct Args {
     /// Depth of each virtqueue (power of two).
     #[arg(long, default_value_t = 256)]
     vhost_user_queue_size: u16,
-
-    /// Dev helper: create the volume row with this size if it is missing.
-    /// This never grants ownership; `--attachment-epoch` must name an owner
-    /// already installed by an external authority.
-    #[arg(long)]
-    create_volume_size: Option<u64>,
-
-    /// Delete objects this volume no longer references, then exit (spec §9).
-    /// The caller must first install and pass an exact attachment grant.
-    #[arg(long)]
-    collect_garbage: bool,
 
     /// Publish this raw image as a shared base image and exit, printing
     /// `IMAGE <image-id>` (ADR-0017).
@@ -190,19 +166,6 @@ struct Args {
     /// digest, so calling it on every node start is the intended usage.
     #[arg(long)]
     publish_image: Option<PathBuf>,
-
-    /// Provision an empty volume from an already-published image (ADR-0017).
-    #[arg(long, conflicts_with = "seed_image", hide = true)]
-    seed_image_id: Option<String>,
-
-    /// Provision an empty volume from this raw image, publishing it first if
-    /// needed. This compatibility path still requires an external grant.
-    #[arg(long, hide = true)]
-    seed_image: Option<PathBuf>,
-
-    /// Sweep unreachable objects every N ms while serving (0 disables it).
-    #[arg(long, default_value_t = 600_000)]
-    gc_interval_ms: u64,
 
     #[arg(long, default_value_t = 5_000)]
     lease_ttl_ms: i64,
@@ -261,37 +224,9 @@ fn publish_image(blob: &dyn cats_storage::BlobStore, path: &Path) -> Result<()> 
         publish_ms = started.elapsed().as_millis(),
         "published base image"
     );
-    // Machine-readable, so a node agent can publish once and then pass
-    // --seed-image-id to every launch.
+    // Machine-readable so the external provisioning effect can persist and
+    // reference the immutable manifest without coupling publication to serve.
     println!("IMAGE {}", published.manifest.image_id);
-    Ok(())
-}
-
-/// Provision a fresh volume from a shared base image, or do nothing if it
-/// already has data. The image is resolved before the externally granted
-/// attachment is adopted, so the grant is not held across an image upload.
-fn seed_from_image(
-    engine: &cats_blockd::engine::ChunkEngine,
-    manifest: &cats_blockd::format::ImageManifest,
-) -> Result<()> {
-    if engine.generation() != 0 {
-        tracing::info!(
-            generation = engine.generation(),
-            "volume already has data; not seeding from the image"
-        );
-        return Ok(());
-    }
-    let started = std::time::Instant::now();
-    let generation = engine
-        .provision_from_image(manifest)
-        .context("provision from base image")?;
-    tracing::info!(
-        image = %manifest.image_id,
-        chunks = manifest.chunks.len(),
-        provision_ms = started.elapsed().as_millis(),
-        generation,
-        "seeded volume from a shared base image"
-    );
     Ok(())
 }
 
@@ -332,7 +267,6 @@ struct TargetControlExpectation<'a> {
     data_dir: &'a Path,
     volume_id: &'a str,
     attachment_id: &'a str,
-    attachment_epoch: i64,
     provision_transition_id: &'a RandomId128,
     provision_context_digest: &'a Sha256Digest,
     runtime_scope_id: &'a Id,
@@ -383,8 +317,6 @@ fn read_target_control_authorization(
     let artifact = decode_target_control_authorization(&bytes)
         .context("decode target-control authorization")?;
     let expected_name = target_control_authorization_file_name(expected.provision_transition_id);
-    let expected_epoch = u64::try_from(expected.attachment_epoch)
-        .context("--attachment-epoch is negative for target-control authorization")?;
     if artifact.provision_transition_id != *expected.provision_transition_id
         || artifact.provision_context_digest.as_sha256_digest() != expected.provision_context_digest
         || artifact.runtime_scope_id != *expected.runtime_scope_id
@@ -394,7 +326,6 @@ fn read_target_control_authorization(
         || Path::new(artifact.local_state.attachment_directory.path.as_str()) != expected.data_dir
         || artifact.attachment.identity.volume_id.as_str() != expected.volume_id
         || artifact.attachment.identity.attachment_id.as_str() != expected.attachment_id
-        || artifact.attachment.identity.attachment_epoch.get() != expected_epoch
     {
         bail!(
             "target-control authorization does not match its transition, stable checkpoint context, process binding, path, or attachment context"
@@ -1376,17 +1307,8 @@ fn main() -> Result<()> {
         return publish_image(blob.as_ref(), path);
     }
 
-    // Reject an impossible listener set before taking the attachment lease.
-    if args.listen_unix.is_some() && args.listen_tcp.is_some() {
-        bail!("--listen-unix and --listen-tcp are mutually exclusive");
-    }
-    if !args.control_only
-        && !args.collect_garbage
-        && args.listen_unix.is_none()
-        && args.listen_tcp.is_none()
-        && args.listen_vhost_user.is_none()
-    {
-        bail!("give at least one of --listen-unix, --listen-tcp or --listen-vhost-user");
+    if !args.control_only && args.listen_unix.is_none() && args.listen_vhost_user.is_none() {
+        bail!("give exactly one of --listen-unix or --listen-vhost-user");
     }
     let volume_id = args
         .volume_id
@@ -1400,26 +1322,6 @@ fn main() -> Result<()> {
         .attachment_id
         .clone()
         .context("--attachment-id is required to serve a volume")?;
-    let metadata_store_adapter = args
-        .metadata_store_adapter
-        .clone()
-        .context("--metadata-store-adapter is required to serve a volume")?;
-
-    // Resolve the image before adopting the externally installed grant. Image
-    // publication must not consume any of the attachment lease window.
-    let seed = match (&args.seed_image_id, &args.seed_image) {
-        (Some(image_id), _) => Some(
-            cats_blockd::image::load(blob.as_ref(), image_id)
-                .with_context(|| format!("load base image {image_id}"))?,
-        ),
-        (None, Some(path)) => Some(
-            cats_blockd::image::publish(blob.as_ref(), path)
-                .with_context(|| format!("publish base image {}", path.display()))?
-                .manifest,
-        ),
-        (None, None) => None,
-    };
-
     let metadata_config = AdapterConfig::from_cli(std::mem::take(&mut args.metadata_store_options))
         .context("metadata adapter options")?;
     let durability = match args.durability.as_str() {
@@ -1445,7 +1347,6 @@ fn main() -> Result<()> {
         .transpose()?;
     let authorized_serving =
         read_authorized_serving_input(&args, &config, runtime_process_identity.as_ref())?;
-    let authorized_serving_mode = authorized_serving.is_some();
     let authorized_control = args
         .authorized_control_spec
         .as_deref()
@@ -1465,9 +1366,6 @@ fn main() -> Result<()> {
                     .context("process-mode validation requires a provision context digest")?,
             )
             .context("--provision-root-authorization-context-digest is not a valid Sha256Digest")?;
-            let attachment_epoch = args
-                .attachment_epoch
-                .context("process-mode validation requires an attachment epoch")?;
             let process_identity = runtime_process_identity
                 .as_ref()
                 .context("process-mode validation requires Runtime process identity")?;
@@ -1481,7 +1379,6 @@ fn main() -> Result<()> {
                     data_dir: &config.data_dir,
                     volume_id: &volume_id,
                     attachment_id: &config.attachment_id,
-                    attachment_epoch,
                     provision_transition_id: &provision_transition_id,
                     provision_context_digest: &provision_context_digest,
                     runtime_scope_id: &process_identity.scope_id,
@@ -1509,12 +1406,6 @@ fn main() -> Result<()> {
             .map(|artifact| &artifact.attachment)
             .or(authorized_control.as_ref())
             .context("process-mode validation requires an authorized control grant")?;
-        let presented_epoch = args
-            .attachment_epoch
-            .context("process-mode validation requires an attachment epoch")?;
-        if u64::try_from(presented_epoch).ok() != Some(attachment.identity.attachment_epoch.get()) {
-            bail!("--attachment-epoch does not match the authorized control input");
-        }
         ChunkEngine::attach_authorized_control_only(
             config,
             attachment.clone(),
@@ -1522,7 +1413,9 @@ fn main() -> Result<()> {
             authority,
         )
         .context("adopt exact authorized control-only chunk engine")?
-    } else if let Some(input) = authorized_serving {
+    } else {
+        let input = authorized_serving
+            .context("process-mode validation requires an authorized serving input")?;
         // Opening PostgreSQL may block. Complete it before `apply` performs
         // the final descriptor-relative handoff revalidation, so the closure
         // crosses directly into the engine effect with no intervening setup.
@@ -1532,27 +1425,6 @@ fn main() -> Result<()> {
             ChunkEngine::attach_authorized_serving(config, attachment, blob.clone(), authority)
                 .context("adopt authorized serving chunk engine")
         })?
-    } else {
-        let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-            [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-        let meta = open_metadata_store(
-            &metadata_store_adapter,
-            &metadata_config,
-            &metadata_factories,
-        )
-        .context("open metadata store")?;
-        if let Some(size) = args.create_volume_size {
-            let size = cats_api::chunk::round_up_to_chunk(size);
-            match meta.create_volume(&volume_id, size) {
-                Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
-                Err(error) => return Err(error).context("create volume"),
-            }
-        }
-        let expected_epoch = args
-            .attachment_epoch
-            .context("compatibility serving requires --attachment-epoch")?;
-        ChunkEngine::attach_granted_epoch(config, expected_epoch, blob.clone(), meta)
-            .context("adopt exact externally granted chunk engine")?
     };
     // EngineConfig may name blockd's procfs descriptor on Linux. Keep that
     // descriptor alive until every engine/frontend thread has stopped.
@@ -1593,43 +1465,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(manifest) = &seed {
-        seed_from_image(&engine, manifest)
-            .with_context(|| format!("seed volume {volume_id} from image {}", manifest.image_id))?;
-    }
-
-    if args.collect_garbage {
-        let stats = engine.collect_garbage().context("collect garbage")?;
-        engine.detach().context("detach after garbage collection")?;
-        println!(
-            "GC data_live={} data_deleted={} nodes_live={} nodes_deleted={}",
-            stats.data_objects_live,
-            stats.data_objects_deleted,
-            stats.map_nodes_live,
-            stats.map_nodes_deleted
-        );
-        return Ok(());
-    }
-
-    // The signed target Runtime does not invoke the compatibility-owned GC
-    // loop. The explicit-grant dev/data-plane composition preserves its
-    // existing collector without gaining any ownership transition.
-    if !authorized_serving_mode {
-        engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
-    }
-
     // Bind every requested socket before printing READY: a VMM told to start on
     // readiness must never race a socket that does not exist yet.
     let nbd_unix = match &args.listen_unix {
         Some(path) => {
             if path.exists() {
-                if authorized_serving_mode {
-                    bail!(
-                        "authorized serving socket {} already exists; refusing to replace an unverified owner",
-                        path.display()
-                    );
-                }
-                std::fs::remove_file(path).ok();
+                bail!(
+                    "authorized serving socket {} already exists; refusing to replace an unverified owner",
+                    path.display()
+                );
             }
             Some(
                 UnixListener::bind(path)
@@ -1638,28 +1482,19 @@ fn main() -> Result<()> {
         }
         None => None,
     };
-    let nbd_tcp = match &args.listen_tcp {
-        Some(address) => Some(
-            std::net::TcpListener::bind(address).with_context(|| format!("bind tcp {address}"))?,
-        ),
-        None => None,
-    };
-    let vhost_user = bind_vhost_user(&vhost_user_args, !authorized_serving_mode)?;
+    let vhost_user = bind_vhost_user(&vhost_user_args)?;
     if let Some(path) = &args.listen_control {
         if path.exists() {
-            if authorized_serving_mode {
-                bail!(
-                    "authorized control socket {} already exists; refusing to replace an unverified owner",
-                    path.display()
-                );
-            }
-            std::fs::remove_file(path).ok();
+            bail!(
+                "authorized control socket {} already exists; refusing to replace an unverified owner",
+                path.display()
+            );
         }
         let listener = UnixListener::bind(path)
             .with_context(|| format!("bind control socket {}", path.display()))?;
         let engine = engine.clone();
         let process_identity = runtime_process_identity.clone();
-        std::thread::spawn(move || serve_legacy_control(listener, engine, process_identity));
+        std::thread::spawn(move || serve_authorized_control(listener, engine, process_identity));
     }
 
     let ready = args
@@ -1667,7 +1502,6 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| args.listen_unix.as_ref().map(|p| p.display().to_string()))
-        .or_else(|| args.listen_tcp.clone())
         .expect("a listener was validated above");
     println!("READY {ready}");
 
@@ -1681,34 +1515,17 @@ fn main() -> Result<()> {
             nbd::serve_unix(listener, engine)
         }));
     }
-    if let Some(listener) = nbd_tcp {
-        let engine = engine.clone();
-        nbd_threads.push(std::thread::spawn(move || {
-            for connection in listener.incoming() {
-                let Ok(connection) = connection else { return };
-                connection.set_nodelay(true).ok();
-                let engine = engine.clone();
-                std::thread::spawn(move || {
-                    let _ = nbd::handle_connection(connection, engine);
-                });
-            }
-        }));
-    }
     let serving = serve_vhost_user(vhost_user, &vhost_user_args, engine.clone(), nbd_threads);
-    let detached = if authorized_serving_mode {
-        engine
-            .stop_authorized_serving()
-            .context("final authorized blockd drain and stop")
-    } else {
-        engine.detach().context("final blockd drain and detach")
-    };
+    let detached = engine
+        .stop_authorized_serving()
+        .context("final authorized blockd drain and stop");
     serving?;
     detached
 }
 
 /// The host-side control plane of one blockd: line-oriented, one command per
 /// connection. Failure to serve one connection never takes the loop down.
-fn serve_legacy_control(
+fn serve_authorized_control(
     listener: UnixListener,
     engine: std::sync::Arc<cats_blockd::engine::ChunkEngine>,
     process_identity: Option<RuntimeProcessIdentity>,
@@ -1997,27 +1814,14 @@ fn validate_process_mode(args: &Args) -> Result<()> {
                 "blank --authorized-control-spec requires --provision-transition-id and forbids target checkpoint expectations"
             );
         }
-        if args.attachment_epoch.is_none() {
-            bail!("--control-only requires --attachment-epoch");
-        }
         if args.listen_control.is_none() {
             bail!("--control-only requires --listen-control");
         }
-        if args.listen_unix.is_some()
-            || args.listen_tcp.is_some()
-            || args.listen_vhost_user.is_some()
-        {
+        if args.listen_unix.is_some() || args.listen_vhost_user.is_some() {
             bail!("--control-only forbids every NBD and vhost-user listener");
         }
-        if args.seed_image_id.is_some()
-            || args.seed_image.is_some()
-            || args.publish_image.is_some()
-            || args.collect_garbage
-            || args.create_volume_size.is_some()
-        {
-            bail!(
-                "--control-only forbids compatibility seed, image publish, GC, and volume creation modes"
-            );
+        if args.publish_image.is_some() {
+            bail!("--control-only forbids image publication");
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
             bail!("--control-only requires --metadata-store-adapter postgres");
@@ -2026,27 +1830,16 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         if args.authorized_control_spec.is_some() || args.authorized_target_control_spec.is_some() {
             bail!("authorized serving input conflicts with authorized control input");
         }
-        if args.attachment_epoch.is_some()
-            || args.provision_transition_id.is_some()
+        if args.provision_transition_id.is_some()
             || args.provision_root_authorization_context_digest.is_some()
         {
             bail!("authorized serving input carries its own target lineage and epoch");
         }
-        if args.seed_image_id.is_some()
-            || args.seed_image.is_some()
-            || args.publish_image.is_some()
-            || args.collect_garbage
-            || args.create_volume_size.is_some()
-        {
-            bail!(
-                "authorized serving input forbids compatibility seed, image publish, GC, and volume creation modes"
-            );
+        if args.publish_image.is_some() {
+            bail!("authorized serving input forbids image publication");
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
             bail!("authorized serving input requires --metadata-store-adapter postgres");
-        }
-        if args.listen_tcp.is_some() {
-            bail!("authorized serving input forbids the unscoped TCP frontend");
         }
         let control = args
             .listen_control
@@ -2099,8 +1892,8 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         || args.provision_root_authorization_context_digest.is_some()
     {
         bail!("target-control expectations require --authorized-target-control-spec");
-    } else if args.attachment_epoch.is_none() {
-        bail!("compatibility serving requires an explicit --attachment-epoch grant");
+    } else {
+        bail!("volume serving requires one complete authorized serving artifact");
     }
     if args.listen_vhost_user.is_some() && args.guest_device_serial.is_none() {
         bail!("--listen-vhost-user requires --guest-device-serial");
@@ -2272,18 +2065,11 @@ fn vhost_user_options(args: &VhostUserArgs) -> Result<cats_blockd::vhost_user::V
 }
 
 #[cfg(target_os = "linux")]
-fn bind_vhost_user(
-    args: &VhostUserArgs,
-    replace_existing: bool,
-) -> Result<Option<vhost::vhost_user::Listener>> {
+fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<vhost::vhost_user::Listener>> {
     match &args.socket {
         Some(path) => {
             let options = vhost_user_options(args)?;
-            let listener = if replace_existing {
-                cats_blockd::vhost_user::bind(path, options)
-            } else {
-                cats_blockd::vhost_user::bind_new(path, options)
-            };
+            let listener = cats_blockd::vhost_user::bind_new(path, options);
             Ok(Some(listener.with_context(|| {
                 format!("bind vhost-user socket {}", path.display())
             })?))
@@ -2293,7 +2079,7 @@ fn bind_vhost_user(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_vhost_user(args: &VhostUserArgs, _replace_existing: bool) -> Result<Option<()>> {
+fn bind_vhost_user(args: &VhostUserArgs) -> Result<Option<()>> {
     if args.socket.is_some() {
         bail!(
             "--listen-vhost-user requires Linux (vhost-user needs eventfd and shared Guest memory)"
@@ -2456,7 +2242,6 @@ mod tests {
                 data_dir: &self.data_dir,
                 volume_id: TARGET_VOLUME_ID,
                 attachment_id: TARGET_ATTACHMENT_ID,
-                attachment_epoch: 7,
                 provision_transition_id: &self.transition,
                 provision_context_digest: &self.context_digest,
                 runtime_scope_id: &self.runtime_scope_id,
@@ -3476,8 +3261,6 @@ mod tests {
             transition.as_str().to_owned(),
             "--provision-root-authorization-context-digest".to_owned(),
             "sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b".to_owned(),
-            "--attachment-epoch".to_owned(),
-            "7".to_owned(),
             "--listen-control".to_owned(),
             control_socket.display().to_string(),
             "--runtime-scope-id".to_owned(),
@@ -3513,8 +3296,6 @@ mod tests {
                 "--control-only".to_owned(),
                 "--authorized-control-spec".to_owned(),
                 "/runtime/root-data/authorized-serving.json".to_owned(),
-                "--attachment-epoch".to_owned(),
-                "7".to_owned(),
                 "--listen-control".to_owned(),
                 control_socket.display().to_string(),
                 "--runtime-scope-id".to_owned(),
@@ -3588,7 +3369,7 @@ mod tests {
         assert!(validate_runtime_socket_paths(&serving).is_err());
     }
 
-    fn parse_target(extra: &[&str]) -> Args {
+    fn try_parse_target(extra: &[&str]) -> Result<Args, clap::Error> {
         let mut arguments = vec![
             "cats-blockd",
             "--object-store-adapter",
@@ -3609,7 +3390,11 @@ mod tests {
             "cats-root",
         ];
         arguments.extend_from_slice(extra);
-        Args::try_parse_from(arguments).unwrap()
+        Args::try_parse_from(arguments)
+    }
+
+    fn parse_target(extra: &[&str]) -> Args {
+        try_parse_target(extra).unwrap()
     }
 
     #[test]
@@ -3639,8 +3424,8 @@ mod tests {
             vec!["--seed-image", "/legacy/image.raw"],
         ] {
             assert!(
-                validate_process_mode(&parse_target(&forbidden)).is_err(),
-                "authorized serving unexpectedly accepted {forbidden:?}"
+                try_parse_target(&forbidden).is_err(),
+                "legacy CLI flag parsed: {forbidden:?}"
             );
         }
     }
@@ -3677,56 +3462,6 @@ mod tests {
             ]);
             assert!(validate_process_mode(&args).is_ok());
         }
-
-        // The same queue values remain untouched in a legacy NBD-only mode.
-        let legacy = Args::try_parse_from([
-            "cats-blockd",
-            "--volume-id",
-            TARGET_VOLUME_ID,
-            "--data-dir",
-            "/runtime/root-data",
-            "--attachment-id",
-            TARGET_ATTACHMENT_ID,
-            "--object-store-adapter",
-            "file",
-            "--listen-unix",
-            "/runtime/block.sock",
-            "--vhost-user-queues",
-            "0",
-            "--vhost-user-queue-size",
-            "1",
-        ])
-        .unwrap();
-        assert!(validate_process_mode(&legacy).is_ok());
-    }
-
-    #[test]
-    fn legacy_vhost_requires_the_exact_guest_serial_before_the_engine_effect() {
-        let mut args = Args::try_parse_from([
-            "cats-blockd",
-            "--volume-id",
-            TARGET_VOLUME_ID,
-            "--data-dir",
-            "/runtime/root-data",
-            "--attachment-id",
-            TARGET_ATTACHMENT_ID,
-            "--object-store-adapter",
-            "file",
-            "--listen-vhost-user",
-            "/runtime/vhost.sock",
-        ])
-        .unwrap();
-        let effect_calls = std::cell::Cell::new(0_u64);
-        let result = validate_process_mode(&args).map(|()| {
-            effect_calls.set(effect_calls.get() + 1);
-        });
-        assert!(result.is_err());
-        assert_eq!(effect_calls.get(), 0);
-
-        args.guest_device_serial = Some("12345678901234567890".to_owned());
-        assert!(validate_process_mode(&args).is_ok());
-        args.guest_device_serial = Some("123456789012345678901".to_owned());
-        assert!(validate_process_mode(&args).is_err());
     }
 
     #[test]

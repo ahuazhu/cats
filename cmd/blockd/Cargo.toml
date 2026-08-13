@@ -18,7 +18,6 @@ cats-blockd = { workspace = true }
 cats-storage = { workspace = true }
 cats-object-store-file = { workspace = true }
 cats-object-store-aws-s3 = { workspace = true }
-cats-metadata-store-sqlite = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +31,7 @@ libc = { workspace = true }
 vhost = { workspace = true }
 
 [dev-dependencies]
-cats-metadata-store-sqlite = { workspace = true, features = ["test-support"] }
+cats-metadata-store-sqlite = { workspace = true }
 cats-control-plane = { workspace = true }
 cats-test-support = { workspace = true }
 cats-block-client = { workspace = true }

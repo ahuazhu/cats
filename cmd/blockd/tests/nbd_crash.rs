@@ -3,57 +3,259 @@
 //! empty-cache cold restore. Ownership changes are made by this harness before
 //! the daemon starts; blockd only adopts the exact presented epoch.
 
-use std::path::PathBuf;
+#![cfg(target_os = "linux")]
+
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use cats_api::runtime_reconciliation::{
+    AcquireOrigin, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
+    RandomId128, RemoteHead, Revision,
+};
 use cats_block_client::{NbdClient, NbdError, EPERM};
-use cats_metadata_store_sqlite::SqliteMetadataStore;
-use cats_storage::MetadataStore;
+use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
+use cats_control_plane::store::Store;
+use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
+use cats_storage::authority::{
+    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
+    AuthorizedServingAttachment, LastVolumeTransition, UnixMillis, VolumeAdminState,
+    VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
+};
+use postgres::{Client, NoTls};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const VOL_SIZE: u64 = 4 * CHUNK;
 
 struct TestEnv {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
+    canonical_root: PathBuf,
+    postgres_url: String,
 }
 
 impl TestEnv {
     fn new() -> Self {
-        let env = Self {
-            dir: tempfile::tempdir().unwrap(),
-        };
-        env.meta().create_volume("vol_it", VOL_SIZE).unwrap();
-        env
-    }
-
-    fn meta_path(&self) -> PathBuf {
-        self.dir.path().join("meta.db")
+        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = tempfile::tempdir_in(canonical_temp).unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
+        drop(Store::connect(&postgres_url, None).unwrap());
+        Self {
+            _dir: dir,
+            canonical_root,
+            postgres_url,
+        }
     }
 
     fn blob_root(&self) -> PathBuf {
-        self.dir.path().join("blob")
+        self.canonical_root.join("blob")
     }
 
     fn data_dir(&self, host: &str) -> PathBuf {
-        self.dir.path().join(format!("data-{host}"))
+        self.canonical_root.join(format!("data-{host}"))
     }
 
-    fn socket(&self, host: &str) -> PathBuf {
-        self.dir.path().join(format!("nbd-{host}.sock"))
-    }
-
-    fn meta(&self) -> SqliteMetadataStore {
-        SqliteMetadataStore::open(&self.meta_path()).unwrap()
+    fn authority(&self) -> PostgresVolumeDataAuthority {
+        PostgresVolumeDataAuthority::connect(&self.postgres_url, None).unwrap()
     }
 
     /// Test-only stand-in for the external Volume Authority. The helper is
     /// deliberately outside blockd and installs the exact epoch it will pass.
     fn install_grant(&self, attachment: &str, epoch: i64) {
-        self.meta()
-            .install_grant_for_tests("vol_it", attachment, epoch)
+        let mut client = Client::connect(&self.postgres_url, NoTls).unwrap();
+        let current = client
+            .query_opt(
+                "SELECT record::text FROM volume_records WHERE volume_id=$1",
+                &[&"vol_it"],
+            )
+            .unwrap()
+            .map(|row| {
+                let record: String = row.get(0);
+                serde_json::from_str::<VolumeRecord>(&record).unwrap()
+            });
+        let head = current.map_or_else(blank_head, |record| record.head);
+        let (request, result) = acquire_receipt(attachment, epoch, head.clone());
+        let record = VolumeRecord {
+            volume_id: Id::new("vol_it").unwrap(),
+            size_bytes: VOL_SIZE,
+            durability: VolumeDurability::Strict,
+            admin_state: VolumeAdminState::Active,
+            head,
+            lease_owner: Some(Id::new(attachment).unwrap()),
+            lease_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
+            lease_expires_at: Some(result.lease_expires_at),
+            last_transition: Some(LastVolumeTransition::NormalAcquire { request, result }),
+        };
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .execute(
+                "DELETE FROM volume_records WHERE volume_id=$1",
+                &[&"vol_it"],
+            )
             .unwrap();
+        insert_volume(&mut transaction, &record);
+        transaction.commit().unwrap();
     }
+
+    fn authorized_attachment(&self, attachment: &str, epoch: i64) -> AuthorizedServingAttachment {
+        let record = self
+            .authority()
+            .load_volume(&Id::new("vol_it").unwrap())
+            .unwrap();
+        assert_eq!(record.lease_owner.as_ref().unwrap().as_str(), attachment);
+        assert_eq!(record.lease_epoch.get(), u64::try_from(epoch).unwrap());
+        let LastVolumeTransition::NormalAcquire { request, result } =
+            record.last_transition.clone().unwrap()
+        else {
+            panic!("test authority did not install a normal acquire marker");
+        };
+        AuthorizedServingAttachment {
+            identity: AttachmentLineageIdentity {
+                volume_id: record.volume_id.clone(),
+                attachment_id: Id::new(attachment).unwrap(),
+                attachment_epoch: record.lease_epoch,
+                acquire_origin: AcquireOrigin::Normal {
+                    transition_id: request.transition_id.clone(),
+                },
+                node_id: Id::new("node_nbd_crash").unwrap(),
+                placement_epoch: request.placement_epoch,
+            },
+            size_bytes: record.size_bytes,
+            durability: record.durability,
+            head: record.head,
+            lease_expires_at: result.lease_expires_at,
+            acquire: AuthorizedServingAcquire::Normal { request, result },
+        }
+    }
+}
+
+fn blank_head() -> RemoteHead {
+    RemoteHead {
+        generation: Generation::new(0).unwrap(),
+        root_hash: None,
+        root_object_id: None,
+    }
+}
+
+fn acquire_receipt(
+    attachment: &str,
+    epoch: i64,
+    head: RemoteHead,
+) -> (NormalAcquireRequest, NormalAcquireResult) {
+    let sequence = next_sequence();
+    let request = NormalAcquireRequest {
+        volume_id: Id::new("vol_it").unwrap(),
+        transition_id: RandomId128::new(format!("{sequence:032x}")).unwrap(),
+        attachment_id: Id::new(attachment).unwrap(),
+        expected_unowned_epoch: FenceEpoch::new(u64::try_from(epoch - 1).unwrap()).unwrap(),
+        desired_revision: Revision::new(u64::try_from(epoch).unwrap()).unwrap(),
+        placement_epoch: Epoch::new(u64::try_from(epoch).unwrap()).unwrap(),
+        lease_duration_ms: 1_500,
+    };
+    let result = NormalAcquireResult {
+        volume_id: request.volume_id.clone(),
+        transition_id: request.transition_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        resulting_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
+        resulting_head: head,
+        lease_expires_at: UnixMillis::new(1_900_000_001_500).unwrap(),
+    };
+    (request, result)
+}
+
+fn insert_volume(client: &mut impl postgres::GenericClient, record: &VolumeRecord) {
+    let projection = project_volume_record(record).unwrap();
+    let record_json = serde_json::to_string(record).unwrap();
+    let owner_binding = VolumeOwnerBinding {
+        volume_id: record.volume_id.clone(),
+        owner_node_id: Id::new("node_nbd_crash").unwrap(),
+        attachment_id: record.lease_owner.clone().unwrap(),
+        attachment_epoch: record.lease_epoch,
+    };
+    let owner_binding_json = serde_json::to_string(&owner_binding).unwrap();
+    let size_bytes = i64::try_from(projection.size_bytes).unwrap();
+    let generation = i64::try_from(projection.head_generation.get()).unwrap();
+    let epoch = i64::try_from(projection.lease_epoch.get()).unwrap();
+    let expires = projection
+        .lease_expires_at
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let revision = projection
+        .transition_desired_revision
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let placement = projection
+        .transition_placement_epoch
+        .map(|value| i64::try_from(value.get()).unwrap());
+    let duration = projection
+        .transition_lease_duration_ms
+        .map(|value| i64::try_from(value).unwrap());
+    client
+        .execute(
+            "INSERT INTO volume_records (
+                volume_id, record, size_bytes, durability, admin_state, delete_id,
+                head_generation, head_root_hash, head_root_object_id,
+                lease_owner, lease_epoch, lease_expires_at,
+                last_transition_kind, last_transition_id,
+                transition_desired_revision, transition_placement_epoch,
+                transition_lease_duration_ms, owner_binding, owner_node_id
+             ) VALUES (
+                $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14, $15, $16, $17,
+                $18::TEXT::jsonb, $19
+             )",
+            &[
+                &projection.volume_id,
+                &record_json,
+                &size_bytes,
+                &projection.durability,
+                &projection.admin_state,
+                &projection.delete_id,
+                &generation,
+                &projection.head_root_hash,
+                &projection.head_root_object_id,
+                &projection.lease_owner,
+                &epoch,
+                &expires,
+                &projection.last_transition_kind,
+                &projection.last_transition_id,
+                &revision,
+                &placement,
+                &duration,
+                &owner_binding_json,
+                &"node_nbd_crash",
+            ],
+        )
+        .unwrap();
+}
+
+fn next_sequence() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn stable_token(root: &Path, host: &str, sequence: u64) -> RandomId128 {
+    let inode = std::fs::symlink_metadata(root).unwrap().ino();
+    let host_bits = host
+        .bytes()
+        .fold(0_u64, |value, byte| value.rotate_left(5) ^ u64::from(byte));
+    RandomId128::new(format!(
+        "{:016x}{:016x}",
+        inode ^ host_bits,
+        sequence ^ u64::from(std::process::id())
+    ))
+    .unwrap()
+}
+
+fn provision_installed_directory(path: &Path, mode: u32) {
+    match std::fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("create installed directory {}: {error}", path.display()),
+    }
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    assert!(metadata.file_type().is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(metadata.mode() & 0o7777, mode);
 }
 
 struct Server {
@@ -69,33 +271,74 @@ impl Server {
         epoch: i64,
         crash_point: Option<&str>,
     ) -> Self {
-        let socket = env.socket(host);
+        let attachment_token = stable_token(&env.canonical_root, host, 0);
+        let process_token = stable_token(&env.canonical_root, host, next_sequence());
+        let paths = ManagedBlockdSocketRoot::installed()
+            .serving_paths(&attachment_token)
+            .unwrap();
+        provision_installed_directory(Path::new("/run/cats"), 0o755);
+        provision_installed_directory(Path::new(paths.root().as_str()), 0o700);
+        let owner_directory = PathBuf::from(paths.public_directory().as_str());
+        provision_installed_directory(&owner_directory, 0o700);
+        let socket = PathBuf::from(paths.io_socket().as_str());
+        let control_socket = PathBuf::from(paths.control_socket().as_str());
         let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(&control_socket);
+        let data_dir = env.data_dir(host);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let attachment_artifact = env.authorized_attachment(attachment, epoch);
+        let identity_path = data_dir.join("identity.json");
+        let artifact_path = data_dir.join("authorized-serving.json");
+        for (path, bytes) in [
+            (
+                &identity_path,
+                serde_json::to_vec(&attachment_artifact.identity).unwrap(),
+            ),
+            (
+                &artifact_path,
+                serde_json::to_vec(&attachment_artifact).unwrap(),
+            ),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cats-blockd"));
         cmd.args([
             "--volume-id",
             "vol_it",
             "--attachment-id",
             attachment,
-            "--attachment-epoch",
-            &epoch.to_string(),
             "--lease-ttl-ms",
             "1500",
         ])
         .arg("--data-dir")
-        .arg(env.data_dir(host))
+        .arg(&data_dir)
+        .arg("--authorized-serving-spec")
+        .arg(&artifact_path)
+        .arg("--runtime-scope-id")
+        .arg("cats-nbd-crash.scope")
+        .arg("--process-identity-token")
+        .arg(process_token.as_str())
+        .arg("--device-ownership-token")
+        .arg(attachment_token.as_str())
+        .arg("--guest-device-serial")
+        .arg("cats-root")
         .arg("--metadata-store-adapter")
-        .arg("sqlite")
+        .arg("postgres")
         .arg("--metadata-store-option")
-        .arg(format!("path={}", env.meta_path().display()))
+        .arg("url-env=CATS_BLOCKD_TARGET_TEST_POSTGRES_URL")
         .arg("--object-store-adapter")
         .arg("file")
         .arg("--object-store-option")
         .arg(format!("root={}", env.blob_root().display()))
         .arg("--listen-unix")
         .arg(&socket)
+        .arg("--listen-control")
+        .arg(&control_socket)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .env("CATS_BLOCKD_TARGET_TEST_POSTGRES_URL", &env.postgres_url);
         cmd.env_remove("CATS_CRASH_POINT");
         if let Some(point) = crash_point {
             cmd.env("CATS_CRASH_POINT", point);
@@ -211,8 +454,16 @@ fn crash_matrix_every_window_recovers_exactly_once() {
         client.disconnect().unwrap();
         drop(server);
 
-        let head = env.meta().load_head("vol_it").unwrap();
-        assert_eq!(head.generation, 1, "{point}: replay must not double-commit");
+        let head = env
+            .authority()
+            .load_volume(&Id::new("vol_it").unwrap())
+            .unwrap()
+            .head;
+        assert_eq!(
+            head.generation.get(),
+            1,
+            "{point}: replay must not double-commit"
+        );
         let pending = std::fs::read_dir(env.data_dir("a").join("pending"))
             .map(|entries| entries.count())
             .unwrap_or(0);
@@ -253,7 +504,15 @@ fn fenced_writer_gets_eperm_and_new_host_takes_over() {
     client_b.write(4096, &pattern(4096, 2)).unwrap();
     client_b.flush().unwrap();
     client_b.disconnect().unwrap();
-    assert_eq!(env.meta().load_head("vol_it").unwrap().generation, 2);
+    assert_eq!(
+        env.authority()
+            .load_volume(&Id::new("vol_it").unwrap())
+            .unwrap()
+            .head
+            .generation
+            .get(),
+        2
+    );
 }
 
 #[test]

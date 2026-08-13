@@ -87,41 +87,6 @@ impl SqliteMetadataStore {
             .lock()
             .map_err(|_| MetaError::Backend("SQLite connection mutex was poisoned".into()))
     }
-
-    /// Install an externally decided owner/epoch in SQLite-only test and
-    /// development fixtures.
-    ///
-    /// This is deliberately not part of [`MetadataStore`] and the production
-    /// PostgreSQL adapter has no equivalent. Runtime ownership transitions
-    /// belong to the Volume Authority transaction path; this helper only lets
-    /// data-plane tests present the explicit grant that `blockd` now requires.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn install_grant_for_tests(
-        &self,
-        volume_id: &str,
-        attachment_id: &str,
-        epoch: i64,
-    ) -> Result<()> {
-        if epoch <= 0 {
-            return Err(MetaError::InvalidArgument(
-                "test attachment epoch must be positive".into(),
-            ));
-        }
-        let conn = self.connection()?;
-        let changed = conn
-            .execute(
-                "UPDATE volumes
-                    SET lease_owner = ?2, lease_epoch = ?3, lease_expires_at_ms = ?4
-                  WHERE volume_id = ?1",
-                params![volume_id, attachment_id, epoch, i64::MAX],
-            )
-            .map_err(sql_err)?;
-        if changed != 1 {
-            return Err(MetaError::NotFound(volume_id.to_string()));
-        }
-        Ok(())
-    }
 }
 
 /// Put the database in WAL mode, tolerating other processes doing the same.
@@ -444,11 +409,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("meta.db");
         let store = std::sync::Arc::new(SqliteMetadataStore::open(&path).unwrap());
-        let authority = store.clone();
         cats_test_support::metadata_store_contract(store, move |volume, attachment, epoch| {
-            authority
-                .install_grant_for_tests(volume, attachment, epoch)
-                .unwrap();
+            cats_test_support::install_sqlite_grant(&path, volume, attachment, epoch).unwrap();
         });
     }
 }

@@ -631,8 +631,6 @@ fn build_launch_with_authorization(
         data_directory.as_os_str().to_owned(),
         OsString::from("--attachment-id"),
         OsString::from(expected.attachment_id.as_str()),
-        OsString::from("--attachment-epoch"),
-        OsString::from(expected.attachment_epoch.get().to_string()),
         OsString::from("--control-only"),
     ];
     match authorization {
@@ -3899,7 +3897,9 @@ while True:
         use cats_blockd::vhost_user::{self, VhostUserOptions};
         use cats_metadata_store_sqlite::SqliteMetadataStore;
         use cats_object_store_file::FileBlobStore;
+        use cats_storage::authority::VolumeDurability;
         use cats_storage::MetadataStore as _;
+        use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
         use vhost::vhost_user::Frontend;
         use vhost::VhostBackend as _;
 
@@ -3911,20 +3911,22 @@ while True:
             .create_volume("vol_listener_probe", 16 * 1024 * 1024)
             .unwrap();
         let epoch = 1;
-        metadata
-            .install_grant_for_tests("vol_listener_probe", "att_listener_probe", epoch)
-            .unwrap();
-        let engine = ChunkEngine::attach_granted_epoch(
-            EngineConfig::new(
+        let data_dir = directory.path().join("data");
+        let config = EngineConfig::new("vol_listener_probe", &data_dir, "att_listener_probe");
+        let (attachment, authority) = prepare_sqlite_authorized_serving(
+            &directory.path().join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
                 "vol_listener_probe",
-                directory.path().join("data"),
                 "att_listener_probe",
+                epoch,
+                u64::try_from(config.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
             ),
-            epoch,
-            blob,
-            metadata,
         )
         .unwrap();
+        let engine =
+            ChunkEngine::attach_authorized_serving(config, attachment, blob, authority).unwrap();
         let managed_root_path = directory.path().join("managed-blockd-sockets");
         let managed_root = Arc::new(
             RetainedManagedBlockdSocketRoot::provision_for_test(&managed_root_path).unwrap(),

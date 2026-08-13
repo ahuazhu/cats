@@ -18,7 +18,9 @@ use std::sync::Arc;
 use cats_blockd::engine::{ChunkEngine, EngineConfig};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::{AwsS3BlobStore, AwsS3Config};
+use cats_storage::authority::VolumeDurability;
 use cats_storage::{BlobStore, MetadataStore};
+use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 
 fn live_store(prefix: &str) -> Option<AwsS3BlobStore> {
     let endpoint = std::env::var("CATS_AWS_S3_TEST_ENDPOINT").ok()?;
@@ -59,34 +61,48 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     let size = 2 * cats_api::chunk::CHUNK_SIZE as u64;
     meta.create_volume("vol_live", size).unwrap();
-    meta.install_grant_for_tests("vol_live", "att_a", 1)
-        .unwrap();
-
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     {
-        let engine = ChunkEngine::attach_granted_epoch(
-            EngineConfig::new("vol_live", dir.path().join("data-a"), "att_a"),
-            1,
-            blob.clone(),
-            meta.clone(),
+        let data_dir = dir.path().join("data-a");
+        let config = EngineConfig::new("vol_live", &data_dir, "att_a");
+        let (attachment, authority) = prepare_sqlite_authorized_serving(
+            &dir.path().join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
+                "vol_live",
+                "att_a",
+                1,
+                u64::try_from(config.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
+            ),
         )
         .unwrap();
+        let engine =
+            ChunkEngine::attach_authorized_serving(config, attachment, blob.clone(), authority)
+                .unwrap();
         engine.write(4096, &payload).unwrap();
         assert_eq!(engine.flush().unwrap(), 1);
-        engine.detach().unwrap();
+        engine.stop_authorized_serving().unwrap();
     }
     // Fresh "host", empty cache: everything must come back from S3.
-    meta.install_grant_for_tests("vol_live", "att_b", 2)
-        .unwrap();
-    let engine = ChunkEngine::attach_granted_epoch(
-        EngineConfig::new("vol_live", dir.path().join("data-b"), "att_b"),
-        2,
-        blob,
-        meta,
+    let data_dir = dir.path().join("data-b");
+    let config = EngineConfig::new("vol_live", &data_dir, "att_b");
+    let (attachment, authority) = prepare_sqlite_authorized_serving(
+        &dir.path().join("meta.db"),
+        &data_dir,
+        SqliteTestVolumeGrant::new(
+            "vol_live",
+            "att_b",
+            2,
+            u64::try_from(config.lease_ttl_ms).unwrap(),
+            VolumeDurability::Strict,
+        ),
     )
     .unwrap();
+    let engine =
+        ChunkEngine::attach_authorized_serving(config, attachment, blob, authority).unwrap();
     let mut back = vec![0u8; payload.len()];
     engine.read(4096, &mut back).unwrap();
     assert_eq!(back, payload, "cold restore through live S3 lost data");
-    engine.detach().unwrap();
+    engine.stop_authorized_serving().unwrap();
 }

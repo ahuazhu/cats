@@ -1345,7 +1345,10 @@ dependencies = [
 name = "cats-test-support"
 version = "0.1.0"
 dependencies = [
+ "cats-api",
  "cats-storage",
+ "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

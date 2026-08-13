@@ -41,7 +41,9 @@ use cats_blockd::nbd;
 use cats_blockd::vhost_user::{self, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::VolumeDurability;
 use cats_storage::MetadataStore;
+use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 use vhu_frontend::{BlkFrontend, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 
 const VOLUME_ID: &str = "vol_vhu_bench";
@@ -177,15 +179,22 @@ impl Bench {
         let meta =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta store"));
         meta.create_volume(VOLUME_ID, VOLUME_SIZE).expect("volume");
-        meta.install_grant_for_tests(VOLUME_ID, "att-bench", 1)
-            .expect("external grant");
-        let engine = ChunkEngine::attach_granted_epoch(
-            EngineConfig::new(VOLUME_ID, dir.path().join("data"), "att-bench"),
-            1,
-            blob,
-            meta,
+        let data_dir = dir.path().join("data");
+        let config = EngineConfig::new(VOLUME_ID, &data_dir, "att-bench");
+        let (attachment, authority) = prepare_sqlite_authorized_serving(
+            &dir.path().join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
+                VOLUME_ID,
+                "att-bench",
+                1,
+                u64::try_from(config.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
+            ),
         )
-        .expect("attach engine");
+        .expect("external grant");
+        let engine = ChunkEngine::attach_authorized_serving(config, attachment, blob, authority)
+            .expect("attach engine");
 
         let vhost_user_socket = dir.path().join("vhu.sock");
         let server = if serve_vhost_user {
@@ -517,7 +526,7 @@ fn frontend_cost_nbd_versus_vhost_user() {
                 totals[index].1 += sample.mib_per_sec();
                 // The engine holds the volume lease; release it before the next
                 // run attaches.
-                bench.engine.detach().unwrap();
+                bench.engine.stop_authorized_serving().unwrap();
                 drop(bench);
                 if let Some(server) = server {
                     let _ = server.join();
@@ -600,7 +609,7 @@ fn vhost_user_queue_depth_scaling() {
             sample.ops_per_sec(),
             sample.mib_per_sec()
         );
-        bench.engine.detach().unwrap();
+        bench.engine.stop_authorized_serving().unwrap();
         drop(bench);
         if let Some(server) = server {
             let _ = server.join();
@@ -648,7 +657,7 @@ fn vhost_user_queue_count_versus_depth() {
             sample.ops_per_sec(),
             sample.mib_per_sec()
         );
-        bench.engine.detach().unwrap();
+        bench.engine.stop_authorized_serving().unwrap();
         drop(bench);
         if let Some(server) = server {
             let _ = server.join();
@@ -698,7 +707,7 @@ fn vhost_user_notification_cost() {
                 sample.mib_per_sec(),
                 sample.percentile_us(&sorted, 0.50)
             );
-            bench.engine.detach().unwrap();
+            bench.engine.stop_authorized_serving().unwrap();
             drop(bench);
             if let Some(server) = server {
                 let _ = server.join();

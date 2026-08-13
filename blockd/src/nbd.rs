@@ -345,7 +345,7 @@ mod tests {
         meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
             .unwrap();
         let epoch = 1;
-        meta.install_grant_for_tests("vol_nbd", "att1", epoch)
+        cats_test_support::install_sqlite_grant(&dir.join("meta.db"), "vol_nbd", "att1", epoch)
             .unwrap();
         ChunkEngine::attach_granted_epoch(
             EngineConfig::new("vol_nbd", dir.join("data"), "att1"),

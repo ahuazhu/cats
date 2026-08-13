@@ -7,8 +7,8 @@
 //!
 //! ```sh
 //! sudo modprobe nbd nbds_max=8
-//! cargo build -p cats-blockd-daemon
-//! sudo -E CATS_NBD_TEST_BLOCKD_BIN=target/debug/cats-blockd \
+//! cargo build -p cats-blockd --example sqlite_nbd_test_server
+//! sudo -E CATS_NBD_TEST_BLOCKD_BIN=target/debug/examples/sqlite_nbd_test_server \
 //!     CATS_NBD_TEST_DEVICES=8 \
 //!     cargo test -p cats-e2e --test nbd_leak_reclaim -- --ignored --nocapture
 //! ```
@@ -111,27 +111,16 @@ impl Blockd {
         let metadata_path = dir.path().join("meta.db");
         let metadata = SqliteMetadataStore::open(&metadata_path)?;
         metadata.create_volume(&volume_id, VOLUME_BYTES)?;
-        metadata.install_grant_for_tests(&volume_id, &attachment_id, 1)?;
+        cats_test_support::install_sqlite_grant(&metadata_path, &volume_id, &attachment_id, 1)
+            .map_err(anyhow::Error::msg)?;
         let child = Command::new(binary)
-            .arg("--volume-id")
             .arg(&volume_id)
-            .arg("--attachment-id")
             .arg(&attachment_id)
-            .arg("--attachment-epoch")
             .arg("1")
-            .arg("--lease-ttl-ms")
             .arg("5000")
-            .arg("--data-dir")
             .arg(dir.path().join("data"))
-            .arg("--metadata-store-adapter")
-            .arg("sqlite")
-            .arg("--metadata-store-option")
-            .arg(format!("path={}", metadata_path.display()))
-            .arg("--object-store-adapter")
-            .arg("file")
-            .arg("--object-store-option")
-            .arg(format!("root={}", dir.path().join("blob").display()))
-            .arg("--listen-unix")
+            .arg(&metadata_path)
+            .arg(dir.path().join("blob"))
             .arg(&socket)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

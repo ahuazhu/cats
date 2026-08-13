@@ -64,7 +64,8 @@ impl ChunkEngine {
     /// releasing the lease. A failed drain keeps renewal, the lease and all
     /// local journal files alive so the caller can retry; silently releasing
     /// them would turn a transient remote outage into acknowledged data loss.
-    pub fn detach(&self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn detach(&self) -> Result<()> {
         let AuthorityBackend::Legacy(metadata) = &self.authority else {
             return Err(EngineError::GuestIoDisabled);
         };

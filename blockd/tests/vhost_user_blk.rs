@@ -22,7 +22,9 @@ use cats_blockd::nbd;
 use cats_blockd::vhost_user::{self, VhostUserDeviceId, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::VolumeDurability;
 use cats_storage::MetadataStore;
+use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 use vhu_frontend::{
     BlkFrontend, SECTOR_SIZE, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
     VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES,
@@ -50,15 +52,22 @@ impl Harness {
         let meta =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta store"));
         meta.create_volume(VOLUME_ID, VOLUME_SIZE).expect("volume");
-        meta.install_grant_for_tests(VOLUME_ID, "att-vhu", 1)
-            .expect("external grant");
-        let engine = ChunkEngine::attach_granted_epoch(
-            EngineConfig::new(VOLUME_ID, dir.path().join("data"), "att-vhu"),
-            1,
-            blob,
-            meta.clone(),
+        let data_dir = dir.path().join("data");
+        let config = EngineConfig::new(VOLUME_ID, &data_dir, "att-vhu");
+        let (attachment, authority) = prepare_sqlite_authorized_serving(
+            &dir.path().join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
+                VOLUME_ID,
+                "att-vhu",
+                1,
+                u64::try_from(config.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
+            ),
         )
-        .expect("attach engine");
+        .expect("external grant");
+        let engine = ChunkEngine::attach_authorized_serving(config, attachment, blob, authority)
+            .expect("attach engine");
 
         // Bind before spawning so a connect() right after `start` cannot race
         // the listener; this is also why the daemon exposes `bind` separately.
@@ -137,7 +146,7 @@ impl Harness {
         let server = self.server.take().expect("server handle");
         let result = server.join().expect("vhost-user server panicked");
         result.expect("vhost-user server ended with an error");
-        let detach = self.engine.detach();
+        let detach = self.engine.stop_authorized_serving();
         if expect_fenced {
             assert!(matches!(detach, Err(EngineError::Fenced)));
         } else {

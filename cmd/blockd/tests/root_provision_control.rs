@@ -46,7 +46,6 @@ struct Env {
     owner_directory: PathBuf,
     owner_directory_identity: (u64, u64),
     postgres_url: String,
-    epoch: i64,
     request: ProvisionRootImageRequest,
 }
 
@@ -110,7 +109,6 @@ impl Env {
             owner_directory,
             owner_directory_identity,
             postgres_url,
-            epoch,
             request,
         }
     }
@@ -150,8 +148,6 @@ impl Env {
             .arg(VOLUME_ID)
             .arg("--attachment-id")
             .arg(ATTACHMENT_ID)
-            .arg("--attachment-epoch")
-            .arg(self.epoch.to_string())
             .arg("--control-only")
             .arg("--authorized-control-spec")
             .arg(self.authorized_control_spec())
@@ -537,8 +533,6 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
     let env = Env::new();
     let rejected = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
         .arg("--control-only")
-        .arg("--attachment-epoch")
-        .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
         .arg("--provision-transition-id")
@@ -562,8 +556,6 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
 
     let rejected_legacy_authority = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
         .arg("--control-only")
-        .arg("--attachment-epoch")
-        .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
         .arg("--provision-transition-id")
