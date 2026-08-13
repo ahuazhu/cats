@@ -51,4 +51,17 @@ fn blockd_has_no_self_acquire_composition() {
             "raw owner/epoch constructor is available in release: {raw_constructor}"
         );
     }
+
+    let test_socket_capability = daemon
+        .find("CATS_BLOCKD_TEST_SOCKET_ROOT")
+        .expect("debug integration-test socket capability exists");
+    let prefix = &daemon[test_socket_capability.saturating_sub(500)..test_socket_capability];
+    assert!(
+        prefix.contains("#[cfg(debug_assertions)]"),
+        "temporary socket-root capability is not compiled out of release"
+    );
+    assert!(
+        !daemon[..test_socket_capability].contains("arg(long = \"test-socket-root\")"),
+        "temporary socket root became a release CLI capability"
+    );
 }

@@ -1906,6 +1906,7 @@ fn validate_process_mode(args: &Args) -> Result<()> {
 /// engine or binding a listener. The public CLI fields remain persisted wire
 /// values, but only the provider-owned mapping may reach a signed process.
 fn validate_runtime_socket_paths(args: &Args) -> Result<()> {
+    let socket_root = admitted_runtime_socket_root()?;
     if args.control_only {
         let transition = RandomId128::new(
             args.provision_transition_id
@@ -1913,7 +1914,7 @@ fn validate_runtime_socket_paths(args: &Args) -> Result<()> {
                 .context("control-only mode requires --provision-transition-id")?,
         )
         .context("--provision-transition-id is not a valid RandomId128")?;
-        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+        let paths = socket_root
             .root_paths(&transition)
             .context("derive managed Root blockd socket paths")?;
         let control = args
@@ -1934,7 +1935,7 @@ fn validate_runtime_socket_paths(args: &Args) -> Result<()> {
                 .context("authorized serving requires --device-ownership-token")?,
         )
         .context("--device-ownership-token is not a valid RandomId128")?;
-        let paths = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed()
+        let paths = socket_root
             .serving_paths(&ownership)
             .context("derive managed serving blockd socket paths")?;
         let control = args
@@ -1953,6 +1954,26 @@ fn validate_runtime_socket_paths(args: &Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Production admits only the installed socket namespace. Debug artifacts
+/// used by real-binary integration tests may opt into one canonical temporary
+/// root through an environment capability; the branch and its capability name
+/// are absent from release binaries and there is no CLI switch for it.
+fn admitted_runtime_socket_root(
+) -> Result<cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot> {
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os("CATS_BLOCKD_TEST_SOCKET_ROOT") {
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("test socket root is not UTF-8"))?;
+        let path = HostPath::new(value).context("test socket root is not a canonical HostPath")?;
+        return cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::from_canonical_path(
+            path,
+        )
+        .context("test socket root does not fit the managed socket contract");
+    }
+    Ok(cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed())
 }
 
 fn runtime_process_identity(args: &Args) -> Result<Option<RuntimeProcessIdentity>> {

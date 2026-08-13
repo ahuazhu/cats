@@ -73,6 +73,7 @@ fn release_help_exposes_only_artifact_authorized_volume_modes() {
         .expect("run cats-blockd --help");
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
+    let protocol = include_str!("../../../docs/specs/blockd-protocol.md");
     assert!(help.contains("--authorized-serving-spec"));
     assert!(help.contains("--authorized-control-spec"));
     for legacy in [
@@ -85,6 +86,17 @@ fn release_help_exposes_only_artifact_authorized_volume_modes() {
     ] {
         assert!(!help.contains(legacy), "release help exposes {legacy}");
     }
+    for retired_gc_flag in [
+        "--attachment-epoch",
+        "--collect-garbage",
+        "--gc-interval-ms",
+    ] {
+        assert!(
+            !protocol.contains(retired_gc_flag),
+            "frozen protocol advertises removed release flag {retired_gc_flag}"
+        );
+    }
+    assert!(protocol.contains("typed lifecycle/sweeper effect"));
 }
 
 #[test]

@@ -32,6 +32,7 @@ const VOL_SIZE: u64 = 4 * CHUNK;
 struct TestEnv {
     _dir: tempfile::TempDir,
     canonical_root: PathBuf,
+    socket_root: PathBuf,
     postgres_url: String,
 }
 
@@ -40,11 +41,15 @@ impl TestEnv {
         let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let dir = tempfile::tempdir_in(canonical_temp).unwrap();
         let canonical_root = dir.path().canonicalize().unwrap();
+        let socket_root = canonical_root.join("s");
+        std::fs::create_dir(&socket_root).unwrap();
+        std::fs::set_permissions(&socket_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
         drop(Store::connect(&postgres_url, None).unwrap());
         Self {
             _dir: dir,
             canonical_root,
+            socket_root,
             postgres_url,
         }
     }
@@ -59,6 +64,16 @@ impl TestEnv {
 
     fn authority(&self) -> PostgresVolumeDataAuthority {
         PostgresVolumeDataAuthority::connect(&self.postgres_url, None).unwrap()
+    }
+
+    fn socket_namespace(&self) -> ManagedBlockdSocketRoot {
+        ManagedBlockdSocketRoot::from_canonical_path(
+            cats_api::runtime_reconciliation::HostPath::new(
+                self.socket_root.to_str().unwrap().to_owned(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     /// Test-only stand-in for the external Volume Authority. The helper is
@@ -273,11 +288,10 @@ impl Server {
     ) -> Self {
         let attachment_token = stable_token(&env.canonical_root, host, 0);
         let process_token = stable_token(&env.canonical_root, host, next_sequence());
-        let paths = ManagedBlockdSocketRoot::installed()
+        let paths = env
+            .socket_namespace()
             .serving_paths(&attachment_token)
             .unwrap();
-        provision_installed_directory(Path::new("/run/cats"), 0o755);
-        provision_installed_directory(Path::new(paths.root().as_str()), 0o700);
         let owner_directory = PathBuf::from(paths.public_directory().as_str());
         provision_installed_directory(&owner_directory, 0o700);
         let socket = PathBuf::from(paths.io_socket().as_str());
@@ -338,6 +352,7 @@ impl Server {
         .arg(&control_socket)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .env("CATS_BLOCKD_TEST_SOCKET_ROOT", &env.socket_root)
         .env("CATS_BLOCKD_TARGET_TEST_POSTGRES_URL", &env.postgres_url);
         cmd.env_remove("CATS_CRASH_POINT");
         if let Some(point) = crash_point {
@@ -404,8 +419,12 @@ fn read_all(client: &mut NbdClient) -> Vec<u8> {
 }
 
 #[test]
-fn write_flush_read_through_binary() {
+fn unprivileged_temp_socket_root_serves_authorized_nbd() {
     let env = TestEnv::new();
+    assert!(
+        !env.socket_root.starts_with("/run/cats"),
+        "default Linux acceptance must not require the privileged installed socket root"
+    );
     env.install_grant("att_a", 1);
     let mut server = Server::spawn(&env, "a", "att_a", 1, None);
     let mut client = server.connect();
