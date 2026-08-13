@@ -16,6 +16,9 @@ import tarfile
 import tempfile
 from typing import Any
 
+sys.dont_write_bytecode = True
+from manual_image_reference import ImageReferenceError, require_distinct_image_tags
+
 
 MANIFEST_DOMAIN = b"cats.release.guest-runtime-manifest.v1\0"
 INPUT_DOMAIN = b"cats.release.manual-build-inputs.v1\0"
@@ -31,6 +34,7 @@ MAX_GATEWAY_BINARY_BYTES = 256 * 1024 * 1024
 WORKER_STATIC_FILES = {
     "cats",
     "cats-noded",
+    "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-blockd",
     "cats-guest-agent",
@@ -39,6 +43,7 @@ WORKER_STATIC_FILES = {
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
+    "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
     "guest-systemd/cats-grow-root.service",
     "guest-systemd/cats-guest-agent.service",
@@ -60,6 +65,7 @@ WORKER_DIRECTORIES = {
 WORKER_EXECUTABLE_FILES = {
     "cats",
     "cats-noded",
+    "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-blockd",
     "cats-guest-agent",
@@ -68,6 +74,8 @@ WORKER_EXECUTABLE_FILES = {
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
+    "install-route-v2-node-r1.sh",
+    "worker-deployment-transaction.sh",
 }
 
 
@@ -586,6 +594,12 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
         )
     ):
         raise VerificationError("Gateway image reference must be a bounded tag reference without @")
+    try:
+        require_distinct_image_tags(
+            arguments.control_image_reference, arguments.gateway_image_reference
+        )
+    except ImageReferenceError as error:
+        raise VerificationError(str(error)) from error
     if arguments.platform != "linux/amd64":
         raise VerificationError("the production artifact platform must be linux/amd64")
     if arguments.guest_target != "x86_64-unknown-linux-musl":

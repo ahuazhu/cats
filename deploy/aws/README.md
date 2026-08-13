@@ -84,12 +84,16 @@ ARN (plus its already-scoped runtime/database secrets). Terraform also pins
 the exact Secrets Manager version ID, so a later `AWSCURRENT` change cannot
 alter a fresh Host's revision-1 bytes. The SSM transaction decodes, validates
 and installs the four fixed Node files with the same owner,
-directory and mode contract before starting `cats-noded`; Route v2 listens on
-7444. A23 `node_transport_target` must therefore be the reviewed canonical
+directory and mode contract through the same Rust ring/rustls validator used
+at daemon startup before starting `cats-noded`; the production unit passes the
+literal Route v2 listener `0.0.0.0:7444` and removes stale environment overrides.
+A23 `node_transport_target` must therefore be the reviewed canonical
 `https://<node-private-dns>:7444`, never the signed Runtime port 7301.
 
 This wiring is initial revision 1 only. Kubernetes Secret names must end in
-`-r1`, and the worker ARN must identify an `-r1-` secret. A fresh Pod renders a
+`-r1`, and the worker ARN must identify the exact
+`cats-<environment>-route-v2-node-r1` secret in the expected partition,
+account and region. A fresh Pod renders a
 fresh emptyDir; a worker publishes `/etc/cats/route-v2` only when it is absent.
 An existing worker directory is accepted only when the closed set, ownership,
 modes, link counts and every byte are identical; any difference fails before
@@ -248,8 +252,9 @@ or conflicting evidence is never promoted to a complete observation. The
 shared-bearer heartbeat and
 legacy NodeJob listener are not rollout or compatibility options. Route v2
 machine ingress remains independently closed unless the
-provisioner installs its reviewed signing ring, mTLS artifacts and listener
-configuration. The exact current evidence endpoint is recorded in
+provisioner installs its reviewed signing ring and mTLS artifacts through the
+validated revision-1 transaction; the generic direct-metal unit deliberately
+does not opt into this listener. The exact current evidence endpoint is recorded in
 [`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal

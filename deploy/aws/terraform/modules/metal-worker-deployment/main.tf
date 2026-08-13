@@ -70,7 +70,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl cmp wc flock stat systemd-run; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 cmp flock stat systemd-run; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -85,7 +85,6 @@ locals {
     seed_temp=""
     route_v2_secret=""
     route_v2_stage=""
-    route_v2_publish=""
     archive_entries=""
     release_transaction_active=0
     release_installer=""
@@ -107,9 +106,6 @@ locals {
       if [ -n "$route_v2_stage" ]; then
         rm -rf -- "$route_v2_stage"
       fi
-      if [ -n "$route_v2_publish" ]; then
-        rm -rf -- "$route_v2_publish"
-      fi
       exit "$status"
     }
     trap cleanup EXIT
@@ -127,6 +123,7 @@ locals {
     tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
     . "$stage_path/worker-deployment-transaction.sh"
+    . "$stage_path/install-route-v2-node-r1.sh"
     "$stage_path/install-guest-runtime-release.sh" verify \
       "$stage_path/guest-runtime-release.v1"
     # The validator is itself part of the digest-checked, preflighted bundle.
@@ -134,34 +131,6 @@ locals {
     # Identity validation still precedes the idle check, service stop, or any
     # installed-file mutation.
     "$stage_path/validate-node-identity-installation.sh"
-
-    cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
-
-    # ControlGroup is only populated once the unit has actually run. On a first
-    # install it is empty, and `test -n` then killed the association with no
-    # message at all -- the deployment had only ever met hosts where the service
-    # had already started. Slice is populated while the unit is merely loaded,
-    # and gives the same path systemd will use.
-    service_cgroup="$(systemctl show cats-worker --property ControlGroup --value)"
-    if [ -z "$service_cgroup" ]; then
-      service_slice="$(systemctl show cats-worker --property Slice --value)"
-      test -n "$service_slice"
-      service_cgroup="/$service_slice/cats-worker.service"
-    fi
-    test -n "$cgroup_mount"
-    test -n "$service_cgroup"
-    metering_root="$${cgroup_mount}$${service_cgroup}/metering"
-
-    # A worker release is an operator-controlled drain boundary. Killing a
-    # Cloud Hypervisor while its kernel-NBD backend is still publishing can
-    # leave an uninterruptible VMM thread in the delegated cgroup and prevent
-    # systemd from starting the replacement worker. A live cats-blockd is not
-    # metered and so is invisible to the cgroup walk, yet stopping the unit
-    # would kill it along with any unpublished journal it holds (issue #98);
-    # the guard therefore also scans the process table for the installed
-    # runtime binaries. Fail before changing any installed file unless the
-    # target node is already drained and cordoned.
-    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
 
     # Fetch the closed Node Route v2 artifact set before the first Cats
     # installed-file mutation. Terraform and the SSM command carry only the
@@ -201,48 +170,7 @@ locals {
     decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
     decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
     decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600
-
-    printf '%s' "$(jq -cS . "$route_v2_stage/public-key-ring.v1.json")" > "$route_v2_stage/public-key-ring.canonical"
-    cmp "$route_v2_stage/public-key-ring.v1.json" "$route_v2_stage/public-key-ring.canonical"
-    rm -f -- "$route_v2_stage/public-key-ring.canonical"
-    jq -e '.version == 1 and .ring_version == 1 and .expected_previous == null' \
-      "$route_v2_stage/public-key-ring.v1.json" >/dev/null
-    test "$(wc -c < "$route_v2_stage/public-key-ring.v1.json")" -le 16384
-    test "$(wc -c < "$route_v2_stage/gateway-client-ca-bundle.pem")" -le 65536
-    test "$(wc -c < "$route_v2_stage/node-machine-server-certificate.pem")" -le 65536
-    test "$(wc -c < "$route_v2_stage/node-machine-server-private-key.pem")" -le 16384
-    openssl crl2pkcs7 -nocrl -certfile "$route_v2_stage/gateway-client-ca-bundle.pem" \
-      | openssl pkcs7 -print_certs -noout >/dev/null
-    openssl x509 -in "$route_v2_stage/node-machine-server-certificate.pem" -pubkey -noout \
-      | openssl pkey -pubin -outform DER > "$route_v2_stage/certificate-public.der"
-    openssl pkey -in "$route_v2_stage/node-machine-server-private-key.pem" -pubout -outform DER \
-      > "$route_v2_stage/private-key-public.der"
-    cmp "$route_v2_stage/certificate-public.der" "$route_v2_stage/private-key-public.der"
-    rm -f -- "$route_v2_stage/certificate-public.der" "$route_v2_stage/private-key-public.der"
-
-    route_v2_names='public-key-ring.v1.json gateway-client-ca-bundle.pem node-machine-server-certificate.pem node-machine-server-private-key.pem'
-    verify_installed_route_v2_r1() {
-      test -d /etc/cats/route-v2
-      test ! -L /etc/cats/route-v2
-      test "$(stat -c '%U:%G:%a' /etc/cats/route-v2)" = root:root:700
-      test "$(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 | wc -l)" -eq 4
-      test "$(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l)" -eq 4
-      for name in $route_v2_names; do
-        mode=644
-        test "$name" != node-machine-server-private-key.pem || mode=600
-        test "$(stat -c '%U:%G:%a:%h' "/etc/cats/route-v2/$name")" = "root:root:$mode:1"
-        cmp "$route_v2_stage/$name" "/etc/cats/route-v2/$name"
-      done
-    }
-
-    # G2 is initial revision-1 delivery, not G3 rotation. An already-installed
-    # set is accepted only when every byte and metadata field is identical.
-    # Any conflict fails before the deployment mutates binaries or units.
-    route_v2_already_installed=false
-    if [ -e /etc/cats/route-v2 ] || [ -L /etc/cats/route-v2 ]; then
-      verify_installed_route_v2_r1
-      route_v2_already_installed=true
-    fi
+    "$stage_path/cats-route-v2-node-r1-validator" --directory "$route_v2_stage"
 
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
@@ -250,42 +178,29 @@ locals {
     release_installer="${var.install_root}/bin/install-guest-runtime-release"
     cats_acquire_worker_deployment_lock
 
-    # Before publishing an activation journal, close both ways the cached old
+    # Recheck the immutable initial state under the Host-global lock before the
+    # first systemd query. Concurrent installers can only converge on exact
+    # replay; conflicting bytes fail without a service mutation.
+    route_v2_install_state="$(cats_classify_route_v2_node_r1 \
+      "$stage_path/cats-route-v2-node-r1-validator" \
+      "$route_v2_stage" /etc/cats/route-v2)"
+    case "$route_v2_install_state" in absent|exact) ;; *) exit 1 ;; esac
+
+    # Only after that classification may the installer query systemd. Before
+    # publishing an activation journal, close both ways the cached old
     # unit could start: a runtime mask covers this boot, while the fsynced new
     # unit/recovery helper covers a reboot. Only then may prepare expose a
-    # candidate release identity. The unlocked idle check above is only an
-    # early preflight: recompute the cgroup path after serialization and prove
-    # physical idle again immediately before the masked stop.
+    # candidate release identity. Prove physical idle immediately before the
+    # masked stop.
     metering_root="$(cats_worker_metering_root cats-worker)"
     "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
 
-    if [ "$route_v2_already_installed" = true ]; then
-      verify_installed_route_v2_r1
-    else
-      test ! -e /etc/cats/route-v2
-      test ! -L /etc/cats/route-v2
-      if [ ! -e /etc/cats ]; then
-        install -d -o root -g root -m 0755 /etc/cats
-      else
-        test -d /etc/cats
-        test ! -L /etc/cats
-      fi
-      route_v2_publish="$(mktemp -d /etc/cats/.route-v2-r1.XXXXXX)"
-      chmod 0700 "$route_v2_publish"
-      for name in $route_v2_names; do
-        mode=0644
-        test "$name" != node-machine-server-private-key.pem || mode=0600
-        install -o root -g root -m "$mode" "$route_v2_stage/$name" "$route_v2_publish/$name"
-        sync -f "$route_v2_publish/$name"
-      done
-      sync -f "$route_v2_publish"
-      test ! -e /etc/cats/route-v2
-      mv -T -- "$route_v2_publish" /etc/cats/route-v2
-      route_v2_publish=""
-      sync -f /etc/cats
-      verify_installed_route_v2_r1
+    if [ "$route_v2_install_state" = absent ]; then
+      cats_publish_route_v2_node_r1 \
+        "$stage_path/cats-route-v2-node-r1-validator" \
+        "$route_v2_stage" /etc/cats/route-v2
       cats_worker_deployment_crash_probe after-install-route-v2-artifacts
     fi
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
@@ -387,9 +302,10 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_AUTH_TOKEN") {
+        if (key == "CATS_AUTH_TOKEN" || key == "CATS_ROUTE_V2_MACHINE_LISTEN") {
           # Signed Agent registration is the only production Node credential.
-          # A rolling cutover must remove a bearer left by an older release.
+          # A rolling cutover must remove a bearer or listener override left
+          # by an older release; the production unit passes literal 7444.
           next
         } else if (key == "CATS_METERING_CGROUP_ROOT") {
           print "CATS_METERING_CGROUP_ROOT=" metering_root

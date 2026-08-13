@@ -27,11 +27,13 @@ RUN cargo build --locked --release \
     && strip \
       target/release/cats \
       target/release/cats-noded \
+      target/release/cats-route-v2-node-r1-validator \
       target/release/cats-vmm-launcher \
       target/release/cats-blockd \
       target/release/cats-guest-agent \
     && install -D -m 0755 target/release/cats /out/cats \
     && install -D -m 0755 target/release/cats-noded /out/cats-noded \
+    && install -D -m 0755 target/release/cats-route-v2-node-r1-validator /out/cats-route-v2-node-r1-validator \
     && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent
@@ -41,6 +43,7 @@ COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
 COPY deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
 COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh
 COPY --chmod=0755 deploy/aws/metal/validate-node-identity-installation.sh /out/validate-node-identity-installation.sh
+COPY --chmod=0755 deploy/aws/metal/install-route-v2-node-r1.sh /out/install-route-v2-node-r1.sh
 COPY --chmod=0755 deploy/aws/metal/worker-deployment-transaction.sh /out/worker-deployment-transaction.sh
 COPY deploy/metal/guest-systemd /out/guest-systemd
 
@@ -48,6 +51,7 @@ FROM scratch AS artifact
 
 COPY --from=builder /out/cats /cats
 COPY --from=builder /out/cats-noded /cats-noded
+COPY --from=builder /out/cats-route-v2-node-r1-validator /cats-route-v2-node-r1-validator
 COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
@@ -56,6 +60,7 @@ COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
 COPY --from=builder /out/render-postgres-url.sh /render-postgres-url.sh
 COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh
 COPY --from=builder --chmod=0755 /out/validate-node-identity-installation.sh /validate-node-identity-installation.sh
+COPY --from=builder --chmod=0755 /out/install-route-v2-node-r1.sh /install-route-v2-node-r1.sh
 COPY --from=builder --chmod=0755 /out/worker-deployment-transaction.sh /worker-deployment-transaction.sh
 COPY --from=builder /out/guest-systemd /guest-systemd
 COPY deploy/aws/metal/cats-worker.service /cats-worker.service

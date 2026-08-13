@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "cats-vmm-launcher"
 path = "src/vmm_launcher.rs"
 
+[[bin]]
+name = "cats-route-v2-node-r1-validator"
+path = "src/route_v2_node_r1_validator.rs"
+
 [dependencies]
 cats-api = { workspace = true }
 cats-node-agent = { workspace = true }

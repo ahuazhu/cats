@@ -28,7 +28,7 @@ ROUTE_V2_NODE_ARTIFACT_SOURCE=${CATS_ROUTE_V2_NODE_ARTIFACT_DIR:-}
   echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory" >&2
   exit 1
 }
-for required in cmp find install jq openssl stat wc; do
+for required in cmp find install stat wc; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required before Route v2 artifact validation" >&2
     exit 1
@@ -38,13 +38,9 @@ done
 # private key is durable root-only state; staging copies must not survive a
 # Host reboot if the installer is killed before its EXIT trap runs.
 ROUTE_V2_NODE_ARTIFACT_STAGE=$(mktemp -d /run/cats-route-v2-stage.XXXXXX)
-ROUTE_V2_PUBLISH_STAGE=
 chmod 0700 "$ROUTE_V2_NODE_ARTIFACT_STAGE"
 cleanup_route_v2_artifacts() {
   rm -rf -- "$ROUTE_V2_NODE_ARTIFACT_STAGE"
-  if [[ -n $ROUTE_V2_PUBLISH_STAGE ]]; then
-    rm -rf -- "$ROUTE_V2_PUBLISH_STAGE"
-  fi
 }
 trap cleanup_route_v2_artifacts EXIT
 route_v2_expected=(
@@ -75,53 +71,9 @@ for name in "${route_v2_expected[@]}"; do
     exit 1
   }
 done
-printf '%s' "$(jq -cS . "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json")" \
-  > "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
-cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json" \
-  "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
-rm -f -- "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.canonical"
-jq -e \
-  '.version == 1 and .ring_version == 1 and .expected_previous == null' \
-  "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json" >/dev/null
-[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/public-key-ring.v1.json") -le 16384 ]]
-[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/gateway-client-ca-bundle.pem") -le 65536 ]]
-[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-certificate.pem") -le 65536 ]]
-[[ $(wc -c < "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-private-key.pem") -le 16384 ]]
-openssl crl2pkcs7 -nocrl -certfile "$ROUTE_V2_NODE_ARTIFACT_STAGE/gateway-client-ca-bundle.pem" \
-  | openssl pkcs7 -print_certs -noout >/dev/null
-openssl x509 -in "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-certificate.pem" -pubkey -noout \
-  | openssl pkey -pubin -outform DER > "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der"
-openssl pkey -in "$ROUTE_V2_NODE_ARTIFACT_STAGE/node-machine-server-private-key.pem" -pubout -outform DER \
-  > "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
-cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der" \
-  "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
-rm -f -- "$ROUTE_V2_NODE_ARTIFACT_STAGE/certificate-public.der" \
-  "$ROUTE_V2_NODE_ARTIFACT_STAGE/private-key-public.der"
-
-verify_installed_route_v2_r1() {
-  [[ -d /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
-  [[ $(stat -c '%U:%G:%a' /etc/cats/route-v2) == root:root:700 ]]
-  [[ $(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 | wc -l) -eq 4 ]]
-  [[ $(find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 4 ]]
-  for name in "${route_v2_expected[@]}"; do
-    mode=644
-    [[ $name != node-machine-server-private-key.pem ]] || mode=600
-    [[ $(stat -c '%U:%G:%a:%h' "/etc/cats/route-v2/$name") == "root:root:$mode:1" ]]
-    cmp "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name" "/etc/cats/route-v2/$name"
-  done
-}
-
-# G2 distributes revision 1 only. It may make the first installation or prove
-# an exact idempotent replay, but it must never turn a bootstrap into an
-# implicit ring/certificate rotation.
-ROUTE_V2_ALREADY_INSTALLED=false
-if [[ -e /etc/cats/route-v2 || -L /etc/cats/route-v2 ]]; then
-  verify_installed_route_v2_r1
-  ROUTE_V2_ALREADY_INSTALLED=true
-fi
-
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
+. "$CATS_REPO/deploy/aws/metal/install-route-v2-node-r1.sh"
 for required in flock stat curl openssl cmp wc findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
@@ -148,12 +100,11 @@ fi
 
 (cd "$CATS_REPO" && cargo build --locked --release \
   -p cats-cli -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
+"$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+  --directory "$ROUTE_V2_NODE_ARTIFACT_STAGE"
 
 release_installer="$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
-metering_root=$(cats_worker_metering_root cats-worker)
-"$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
-  "$metering_root" "$CATS_PREFIX/bin"
 release_transaction_active=0
 deployment_cleanup() {
   status=$?
@@ -170,40 +121,27 @@ trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cats_acquire_worker_deployment_lock
-# The unlocked check above is only an early, non-mutating preflight. Recompute
-# the cgroup path after serialization and prove physical idle again immediately
-# before masking/stopping the service, because another deployment may have
-# started runtime children while this process waited for the Host lock.
+# Classify only while holding the Host-global lock, immediately before any
+# systemctl or installed-file mutation. A second installer that won the lock
+# while this bootstrap built can therefore yield only exact replay or a
+# fail-closed conflict.
+ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1 \
+  "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2)
+[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]
+# Only after the artifact state is classified under the Host lock may systemd
+# be queried. Prove physical idle immediately before masking/stopping so a
+# worker deployment cannot race a runtime child.
 metering_root=$(cats_worker_metering_root cats-worker)
 "$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
   "$metering_root" "$CATS_PREFIX/bin"
 cats_gate_node_service cats-worker
 cats_worker_deployment_crash_probe after-mask-worker
 
-if [[ $ROUTE_V2_ALREADY_INSTALLED == true ]]; then
-  verify_installed_route_v2_r1
-else
-  [[ ! -e /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
-  if [[ ! -e /etc/cats ]]; then
-    install -d -o root -g root -m 0755 /etc/cats
-  else
-    [[ -d /etc/cats && ! -L /etc/cats ]]
-  fi
-  ROUTE_V2_PUBLISH_STAGE=$(mktemp -d /etc/cats/.route-v2-r1.XXXXXX)
-  chmod 0700 "$ROUTE_V2_PUBLISH_STAGE"
-  for name in "${route_v2_expected[@]}"; do
-    mode=0644
-    [[ $name != node-machine-server-private-key.pem ]] || mode=0600
-    install -o root -g root -m "$mode" \
-      "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name" "$ROUTE_V2_PUBLISH_STAGE/$name"
-    sync -f "$ROUTE_V2_PUBLISH_STAGE/$name"
-  done
-  sync -f "$ROUTE_V2_PUBLISH_STAGE"
-  [[ ! -e /etc/cats/route-v2 && ! -L /etc/cats/route-v2 ]]
-  mv -T -- "$ROUTE_V2_PUBLISH_STAGE" /etc/cats/route-v2
-  ROUTE_V2_PUBLISH_STAGE=
-  sync -f /etc/cats
-  verify_installed_route_v2_r1
+if [[ $ROUTE_V2_INSTALL_STATE == absent ]]; then
+  cats_publish_route_v2_node_r1 \
+    "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+    "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2
   cats_worker_deployment_crash_probe after-install-route-v2-artifacts
 fi
 
@@ -340,7 +278,8 @@ if [[ -f /etc/cats/worker.env ]]; then
   # Signed Agent registration replaced the Host-wide shared Control bearer.
   # Remove a value retained by an older install before the candidate can run.
   worker_env_temp=$(mktemp /etc/cats/.worker.env.XXXXXX)
-  awk -F= '$1 != "CATS_AUTH_TOKEN"' /etc/cats/worker.env > "$worker_env_temp"
+  awk -F= '$1 != "CATS_AUTH_TOKEN" && $1 != "CATS_ROUTE_V2_MACHINE_LISTEN"' \
+    /etc/cats/worker.env > "$worker_env_temp"
   chown root:root "$worker_env_temp"
   chmod 0600 "$worker_env_temp"
   mv -f -- "$worker_env_temp" /etc/cats/worker.env

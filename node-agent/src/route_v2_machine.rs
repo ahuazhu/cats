@@ -82,13 +82,7 @@ impl RouteV2MachineConfig {
         local_node_id: Id,
         artifacts: &InstalledNodeRouteV2MachineArtifacts,
     ) -> anyhow::Result<Self> {
-        let ring = RouteGrantV2KeyRing::from_artifact(artifacts.ring().ring())
-            .context("compose installed Route Grant v2 verification ring")?;
-        let tls = build_server_tls(
-            artifacts.gateway_client_ca_bundle_pem(),
-            artifacts.server_certificate_pem(),
-            artifacts.server_private_key_pem(),
-        )?;
+        let (ring, tls) = compose_node_route_v2_machine_artifacts(artifacts)?;
         Ok(Self {
             listen,
             local_node_id,
@@ -121,6 +115,35 @@ impl RouteV2MachineConfig {
             verifier,
         })
     }
+}
+
+/// Validate the complete, immutable revision-1 Node artifact transaction.
+///
+/// Installers call this before publishing any file. The same ring and rustls
+/// composition is used by daemon startup, so shell tooling cannot introduce a
+/// competing JSON, PEM, certificate or private-key interpretation.
+pub fn validate_initial_node_route_v2_machine_artifacts(
+    artifacts: &InstalledNodeRouteV2MachineArtifacts,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        artifacts.ring().ring().ring_version.get() == 1
+            && artifacts.ring().ring().expected_previous.is_none(),
+        "Node Route v2 initial artifact ring is not revision 1"
+    );
+    compose_node_route_v2_machine_artifacts(artifacts).map(drop)
+}
+
+fn compose_node_route_v2_machine_artifacts(
+    artifacts: &InstalledNodeRouteV2MachineArtifacts,
+) -> anyhow::Result<(RouteGrantV2KeyRing, Arc<ServerConfig>)> {
+    let ring = RouteGrantV2KeyRing::from_artifact(artifacts.ring().ring())
+        .context("compose installed Route Grant v2 verification ring")?;
+    let tls = build_server_tls(
+        artifacts.gateway_client_ca_bundle_pem(),
+        artifacts.server_certificate_pem(),
+        artifacts.server_private_key_pem(),
+    )?;
+    Ok((ring, tls))
 }
 
 pub(crate) struct RouteV2MachineListener {
@@ -831,6 +854,17 @@ mod tests {
     fn gateway_digest() -> Sha256Digest {
         let certificate = CertificateDer::from_pem_slice(CLIENT_CERTIFICATE).unwrap();
         leaf_ed25519_spki_sha256(certificate.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn node_machine_tls_composition_rejects_nonclosed_or_mismatched_pem() {
+        build_server_tls(CA_CERTIFICATE, SERVER_CERTIFICATE, SERVER_PRIVATE_KEY).unwrap();
+
+        let mut trailing = SERVER_CERTIFICATE.to_vec();
+        trailing.extend_from_slice(b"not-pem\n");
+        assert!(build_server_tls(CA_CERTIFICATE, &trailing, SERVER_PRIVATE_KEY).is_err());
+        assert!(build_server_tls(CA_CERTIFICATE, SERVER_CERTIFICATE, CLIENT_PRIVATE_KEY).is_err());
+        assert!(build_server_tls(b"", SERVER_CERTIFICATE, SERVER_PRIVATE_KEY).is_err());
     }
 
     fn now() -> u64 {

@@ -17,6 +17,7 @@ import tempfile
 WORKER_FILES = {
     "cats",
     "cats-noded",
+    "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-blockd",
     "cats-guest-agent",
@@ -25,6 +26,7 @@ WORKER_FILES = {
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
+    "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
     "guest-systemd/cats-grow-root.service",
     "guest-systemd/cats-guest-agent.service",
@@ -111,6 +113,8 @@ def run_verifier(
     *,
     expect_success: bool,
     gateway_digest: str = "sha256:" + "6" * 64,
+    control_reference: str = "registry.example/cats/control-plane:fixture",
+    gateway_reference: str = "registry.example/cats/gateway:fixture",
 ) -> subprocess.CompletedProcess[bytes]:
     shared = workspace / "shared"
     control = workspace / "control"
@@ -119,6 +123,7 @@ def run_verifier(
     source_input = workspace / "Cargo.lock"
     command = [
         sys.executable,
+        "-B",
         str(verifier),
         "--shared-guest-runtime",
         str(shared),
@@ -127,7 +132,7 @@ def run_verifier(
         "--worker-bundle",
         str(bundle),
         "--control-image-reference",
-        "registry.example/cats/control-plane:fixture",
+        control_reference,
         "--control-image-digest",
         "sha256:" + "1" * 64,
         "--control-image-config-digest",
@@ -137,7 +142,7 @@ def run_verifier(
         "--gateway-image-root",
         str(gateway),
         "--gateway-image-reference",
-        "registry.example/cats/gateway:fixture",
+        gateway_reference,
         "--gateway-image-digest",
         gateway_digest,
         "--gateway-image-config-digest",
@@ -217,6 +222,7 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
     executable = {
         "cats",
         "cats-noded",
+        "cats-route-v2-node-r1-validator",
         "cats-vmm-launcher",
         "cats-blockd",
         "cats-guest-agent",
@@ -225,6 +231,8 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
         "render-postgres-url.sh",
         "install-guest-runtime-release.sh",
         "validate-node-identity-installation.sh",
+        "install-route-v2-node-r1.sh",
+        "worker-deployment-transaction.sh",
     }
     for relative in WORKER_FILES - {
         "guest-runtime-release.v1/manifest.v1.json",
@@ -324,6 +332,28 @@ def main() -> int:
             gateway_digest="sha256:not-a-digest",
         )
         assert b"Gateway OCI digest" in malformed_gateway_digest.stderr
+        assert not output.exists()
+
+        same_image = run_verifier(
+            verifier,
+            root,
+            output,
+            expect_success=False,
+            control_reference="registry.example/cats/shared:fixture",
+            gateway_reference="REGISTRY.EXAMPLE:443/cats/shared:fixture",
+        )
+        assert b"same mutable tag" in same_image.stderr
+        assert not output.exists()
+
+        docker_hub_alias = run_verifier(
+            verifier,
+            root,
+            output,
+            expect_success=False,
+            control_reference="cats:fixture",
+            gateway_reference="index.docker.io/library/cats:fixture",
+        )
+        assert b"same mutable tag" in docker_hub_alias.stderr
         assert not output.exists()
 
         cats = root / "worker/cats"

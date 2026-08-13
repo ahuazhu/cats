@@ -88,6 +88,11 @@ fi
   exit 2
 }
 
+# Reject one mutable tag expressed twice (including Docker Hub and default-443
+# aliases) before probing Docker or touching a network/build output.
+python3 "$(dirname "$0")/manual_image_reference.py" \
+  "$image_reference" "$gateway_image_reference"
+
 for required in docker git python3 sha256sum stat tar zstd; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "manual release build needs $required" >&2
@@ -363,9 +368,10 @@ verifier_arguments=(
   --input-file "worker_build_metadata=$worker_metadata"
   --input-file "release_verifier=$source_root/deploy/aws/tools/verify-manual-release.py"
   --input-file "release_builder=$source_root/deploy/aws/tools/build-manual-release.sh"
+  --input-file "manual_image_reference_validator=$source_root/deploy/aws/tools/manual_image_reference.py"
 )
 preflight_manifest="$output_incomplete/release-manifest.preflight.v1.json"
-python3 deploy/aws/tools/verify-manual-release.py \
+PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-manual-release.py \
   "${verifier_arguments[@]}" \
   --control-image-registry-verified false \
   --gateway-image-registry-verified false \
@@ -384,7 +390,7 @@ if [[ $push_image == true ]]; then
     echo "registry Gateway digest differs from the verified local digest" >&2
     exit 1
   }
-  python3 deploy/aws/tools/verify-manual-release.py \
+  PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-manual-release.py \
     "${verifier_arguments[@]}" \
     --control-image-registry-verified true \
     --gateway-image-registry-verified true \

@@ -127,11 +127,26 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Alarm recipient contracts
+      - name: Deployment and Terraform contracts
         run: |
           terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
           terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
+          terraform -chdir=deploy/aws/terraform/modules/metal-worker-deployment init -backend=false
+          terraform -chdir=deploy/aws/terraform/modules/metal-worker-deployment test
           terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+          terraform -chdir=deploy/aws/terraform/stacks/production-application test
           python3 deploy/aws/terraform/test-alert-recipient-privacy.py
           python3 deploy/aws/preflight-alarm-recipients-fixture.py
           python3 deploy/aws/run-controlled-alarm-recipient-test-fixture.py
+          python3 deploy/aws/verify-aws-target-fixture.py
+          python3 deploy/aws/tools/manual-image-reference-fixture.py \
+            --builder deploy/aws/tools/build-manual-release.sh
+          python3 deploy/aws/tools/manual-release-fixture.py \
+            --verifier deploy/aws/tools/verify-manual-release.py
+          python3 deploy/aws/route-v2-node-r1-install-fixture.py \
+            --helper deploy/aws/metal/install-route-v2-node-r1.sh \
+            --manual-installer deploy/aws/metal/install-worker.sh \
+            --terraform-module deploy/aws/terraform/modules/metal-worker-deployment/main.tf
+          sudo python3 deploy/aws/systemd-route-v2-effective-argv-fixture.py \
+            --production-unit deploy/aws/metal/cats-worker.service \
+            --direct-unit deploy/metal/systemd/cats-noded.service

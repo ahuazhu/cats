@@ -1,7 +1,8 @@
 # Route v2 Signing Authority v1
 
 - 状态：Frozen target contract；artifact codecs/readers、PG initial/current binding、Control machine
-  resolve current compare与Node installed-ring observation已实现，installer和持久rotation rollout尚未实现
+  resolve current compare、Node installed-ring observation与revision-1初装/部署接线已实现；successor
+  rotation、热加载/ACK rollout及真实production mTLS qualification尚未实现
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -92,7 +93,9 @@ atomic rename到fixed path并fsync parent，最后才原子swap进程内整环�
 `ring_version`、`key_ring_digest`和sorted `loaded_kids`。production scanner 现已从固定路径每轮只读一次，
 把artifact构造成完整in-process verifier replacement后投影该exact observation；artifact缺席只投影
 unavailable，存在但partial/corrupt/unsafe/读取不稳定时
-整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。installer 仍未实现。
+整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。revision-1 installer复用同一
+Rust decoder、closed four-file reader和Node rustls composition，只允许absent初装或exact replay；上述
+successor temp-file/rename、进程内swap与ACK仍属于尚未实现的rotation合同。
 
 ## 4. Control signer descriptor
 
@@ -197,4 +200,4 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
 | rotation（future） | overlap ACK -> switch -> 305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK |
 | revocation（future） | disable先于新签发停止；reachable close/drain、unreachable fence；fresh全量ACK后才resume；existing stream不因删key被伪装终止 |
-| deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |
+| deploy（revision 1 implemented；rotation future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file；Node初装只接受schema-order canonical fixed vector、closed four-file TLS transaction及exact replay |
