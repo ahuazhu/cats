@@ -70,7 +70,7 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [A23 Production Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Implemented operations contract | revision-1 trust与Host initial NodeIdentity prepare/export/official-apply/activate |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
 | [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
-| [Route Grant v2](specs/route-grant-v2.md) | Core与machine tunnel implemented；public proxy closed | ADR-0041 AdmissionCell、Grant及machine tunnel；未安装ring/mTLS时不监听 |
+| [Route Grant v2](specs/route-grant-v2.md) | Core、machine tunnel与gatewayd proxy composition implemented；deployment closed | ADR-0041 AdmissionCell、Grant及public HTTP/WS byte proxy；未分发ring/mTLS或未部署gatewayd时不监听 |
 | [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen target，部分实现 | 独立signer reference/public ring artifact；持久rotation/ACK composition未实现 |
 | [Volume Authority](specs/volume-authority.md) | Current-Desired Running attachment/ext4 path implemented | superseded publication及ADR-0042 Snapshot/GC/Host-fence边界仍按明确qualification矩阵推进 |
 

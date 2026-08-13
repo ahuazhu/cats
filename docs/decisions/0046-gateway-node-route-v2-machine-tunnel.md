@@ -61,11 +61,11 @@ Control resolve已经由current PostgreSQL Gateway credential签发Grant。若Gr
 
 ## 当前实现边界
 
-Node machine listener、Gateway client primitive、fixed artifact readers和`noded`显式配置后的runtime
-composition已经实现。
-`cats-gatewayd`的public listener仍有意关闭：本ADR不组成public SNI/Host listener、Control resolve client、
-cache到public proxy的完整流水线，也不恢复legacy ingress。未配置production machine artifacts时没有Node
-listener；`None`是明确的closed composition。现有shipped metal installer/systemd仍只携带已退役
+Node machine listener、Gateway client primitive、fixed artifact readers、`noded`显式配置后的runtime
+composition，以及`cats-gatewayd`的Control resolve→bounded cache→public Host listener→Node tunnel
+byte proxy已经实现；HTTP与WebSocket当前请求都只尝试一次且不恢复legacy ingress。production artifact与部署
+接线仍保持关闭：未配置production machine artifacts时没有Node listener；`None`是明确的closed composition。
+现有shipped metal installer/systemd仍只携带已退役
 single-key文件，尚无production CA/private-key authority或secret reference可原子安装本ADR的ring/mTLS
 closed set；因此这些部署模板不传`--route-v2-machine-listen`，worker继续运行但Node ingress保持关闭。
 旧`--route-grant-public-key-file`参数在`noded`中保持inert且绝不作为v2 authority读取。

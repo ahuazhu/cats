@@ -1,13 +1,13 @@
-use std::io::ErrorKind;
-use std::net::TcpListener;
 use std::process::Command;
 
-const CUTOVER_BLOCKER: &str = "cats-gatewayd is intentionally unavailable: Route Grant v2 is not composed: missing Gateway workload credential and policy authority and Route v2 signer and Node key-ring distribution and Control machine-authenticated resolve transport and public ingress proxy/listener composition; production ingress remains fail-closed";
-const FORBIDDEN_SHIPPED_GATEWAY_SURFACES: [&str; 4] = [
+const FORBIDDEN_SHIPPED_GATEWAY_SURFACES: [&str; 7] = [
     "CATS_SHARED_ROUTE_CACHE_TABLE",
     "/v1/routes/resolve",
     "/v1/routes/wake",
     "/v1/cats/",
+    "/etc/cats/route-v2/signer-private-key.pem",
+    "/etc/cats/route-v2/public-key-ring.v1.json",
+    "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
 ];
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -34,6 +34,9 @@ fn legacy_surface_probe_ignores_dependency_paths_but_detects_cats_routes() {
         b"/v1/routes/wake".as_slice(),
         b"/v1/cats/cat_a/proxy".as_slice(),
         b"/v1/cats/cat_a/proxy-websocket".as_slice(),
+        b"/etc/cats/route-v2/signer-private-key.pem".as_slice(),
+        b"/etc/cats/route-v2/public-key-ring.v1.json".as_slice(),
+        b"CATS_ROUTE_GRANT_PRIVATE_KEY_FILE".as_slice(),
     ] {
         assert!(
             embedded_forbidden_surface(legacy_surface).is_some(),
@@ -43,19 +46,13 @@ fn legacy_surface_probe_ignores_dependency_paths_but_detects_cats_routes() {
 }
 
 #[test]
-fn shipped_gateway_binary_exits_before_listening_or_legacy_outbound() {
-    let canary = TcpListener::bind("127.0.0.1:0").expect("bind outbound canary");
-    canary
-        .set_nonblocking(true)
-        .expect("make outbound canary nonblocking");
-    let canary_url = format!("http://{}", canary.local_addr().expect("canary address"));
-
+fn shipped_gateway_binary_contains_only_terminal_route_v2_composition() {
     let output = Command::new(env!("CARGO_BIN_EXE_cats-gatewayd"))
         .args([
             "--listen",
             "127.0.0.1:0",
             "--control-plane-url",
-            &canary_url,
+            "http://control.internal:7443",
         ])
         .env("CATS_SHARED_ROUTE_CACHE_TABLE", "must-not-be-read")
         .output()
@@ -63,21 +60,17 @@ fn shipped_gateway_binary_exits_before_listening_or_legacy_outbound() {
 
     assert!(
         !output.status.success(),
-        "cutover blocker unexpectedly exited 0"
+        "missing fixed artifacts must fail startup"
     );
     assert!(
         output.stdout.is_empty(),
         "fail-closed binary printed READY output"
     );
-    assert_eq!(
+    assert!(
         String::from_utf8(output.stderr)
             .expect("stderr is UTF-8")
-            .trim(),
-        CUTOVER_BLOCKER
-    );
-    assert!(
-        matches!(canary.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
-        "fail-closed binary contacted the legacy control-plane canary"
+            .contains("must be a canonical HTTPS authority"),
+        "startup did not reject plaintext Control transport before bind"
     );
 
     let binary = std::fs::read(env!("CARGO_BIN_EXE_cats-gatewayd"))
@@ -87,4 +80,16 @@ fn shipped_gateway_binary_exits_before_listening_or_legacy_outbound() {
         "shipped gateway binary still embeds legacy surface {:?}",
         embedded_forbidden_surface(&binary)
     );
+    for required in [
+        "/v1/internal/routes/resolve",
+        "/v1/internal/routes/tunnel",
+        "/etc/cats/route-v2/node-server-ca-bundle.pem",
+        "/etc/cats/route-v2/gateway-machine-client-certificate.pem",
+        "/etc/cats/route-v2/gateway-machine-client-private-key.pem",
+    ] {
+        assert!(
+            contains_bytes(&binary, required.as_bytes()),
+            "shipped Gateway omitted terminal Route v2 surface {required}"
+        );
+    }
 }

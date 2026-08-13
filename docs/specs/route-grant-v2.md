@@ -1,7 +1,8 @@
 # Route Grant v2
 
 - 状态：Target contract；shared codec、Control独立Gateway machine resolve transport、Node
-  verification/admission core与Gateway到Node machine tunnel已实现；public proxy仍保持关闭
+  verification/admission core、Gateway到Node machine tunnel与`cats-gatewayd` public proxy composition已实现；
+  production artifact/deployment wiring仍保持关闭
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)

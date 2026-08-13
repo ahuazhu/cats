@@ -180,12 +180,12 @@ impl GatewayNodeRouteV2Client {
 /// Tokio detaches a task when its bare `JoinHandle` is dropped. The HTTP
 /// driver owns the TLS socket, so cancellation of `open_tunnel` must abort the
 /// driver instead of allowing the authenticated request to continue unseen.
-struct AbortOnDropTask<T> {
+pub(super) struct AbortOnDropTask<T> {
     task: Option<JoinHandle<T>>,
 }
 
 impl<T> AbortOnDropTask<T> {
-    fn new(task: JoinHandle<T>) -> Self {
+    pub(super) fn new(task: JoinHandle<T>) -> Self {
         Self { task: Some(task) }
     }
 
@@ -199,7 +199,7 @@ impl<T> AbortOnDropTask<T> {
         self.task.take();
     }
 
-    async fn abort_and_join(&mut self) {
+    pub(super) async fn abort_and_join(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -363,7 +363,7 @@ fn parse_target(target: &str) -> Result<(&str, u16), GatewayNodeRouteV2Error> {
     Ok((hostname, port))
 }
 
-fn build_client_tls(
+pub(super) fn build_client_tls(
     server_ca_bundle_pem: &[u8],
     client_certificate_pem: &[u8],
     client_private_key_pem: &[u8],
