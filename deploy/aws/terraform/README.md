@@ -65,10 +65,21 @@ assume. Apply it directly after bootstrap:
 cd deploy/aws/terraform/stacks/platform
 cp backend.hcl.example backend.hcl
 cp platform.tfvars.example platform.auto.tfvars
+../../check-platform-tfvars.sh platform.auto.tfvars
 terraform init -backend-config=backend.hcl
+terraform plan -refresh-only -out=platform-refresh.tfplan
+terraform show platform-refresh.tfplan
 terraform plan -out=platform.tfplan
+terraform show platform.tfplan
 terraform apply platform.tfplan
 ```
+
+Production `*.auto.tfvars` stay private and are not repository artifacts. Before
+every platform plan, the preflight above requires the operator-supplied file to
+preserve one NAT gateway per availability zone. Correct any older private file
+that still says `one_nat_gateway_per_az = false`, then review the refresh-only
+and normal saved plans and stop if either proposes any NAT gateway or
+private-route change.
 
 Four things about this stack are easy to get wrong.
 
