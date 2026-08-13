@@ -1283,7 +1283,7 @@ pub(super) fn load_delete_completions_by_volume(
         .collect()
 }
 
-pub(super) fn load_disposable_root_completion_candidates(
+pub(super) fn load_root_delete_completion_candidates(
     transaction: &mut Transaction<'_>,
     delete_id: &Id,
     disk_id: &Id,
@@ -1308,6 +1308,15 @@ pub(super) fn load_disposable_root_completion_candidates(
             UNION
             (SELECT delete_id FROM delete_completion_receipts
               WHERE record->>'volume_id'=$3 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'delete_id'=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'disk_id'=$2 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'volume_id'=$3 LIMIT 2)
          )
          SELECT {DELETE_COMPLETION_COLUMNS} FROM delete_completion_receipts
           WHERE delete_id IN (SELECT delete_id FROM candidate_ids)

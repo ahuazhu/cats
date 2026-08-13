@@ -19,8 +19,9 @@ use cats_api::runtime_reconciliation::{
     VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
-    complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire,
-    AuthorizationRecord, AuthorizationState, DisposableDeleteIsolationBasis,
+    begin_delete, complete_disposable_root_delete, complete_normal_delete,
+    consume_disposable_root_delete, normal_acquire, AuthorizationRecord, AuthorizationState,
+    BeginDeleteRequest, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
     DisposableRootDeleteAuthorization,
     HostFenceEvent, HostFenceEventState, HostIsolationState, LastVolumeTransition, NodeBootId,
     NormalAcquireRequest, RemoteHead, VolumeAdminState, VolumeAuthorization, VolumeDurability,
@@ -4054,8 +4055,72 @@ fn sweep_completed_root_for_product_read(
     deleting
 }
 
+fn sweep_completed_normal_root_for_product_read(
+    store: &Store,
+    create: &CoveredCatCreateRequest,
+) -> DeleteCompletionReceipt {
+    let mut desired = create.candidate.desired.clone();
+    let root = desired.volumes.first().unwrap().clone();
+    let delete_id = id("delete_normal_product_read");
+    desired.target = RuntimeTarget::Deleted;
+    desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+        delete_id: delete_id.clone(),
+    };
+    desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    desired.spec_digest = spec_digest(&desired).unwrap();
+
+    let (deleting, _) = begin_delete(
+        &create.candidate.volume,
+        &BeginDeleteRequest {
+            delete_id,
+            disk_id: root.disk_id.clone(),
+            volume_id: root.volume_id.clone(),
+            expected_unowned_epoch: create.candidate.volume.lease_epoch,
+            expected_head: create.candidate.volume.head.clone(),
+        },
+    )
+    .unwrap();
+    let completion = complete_normal_delete(&deleting, unix_millis(40_000)).unwrap();
+    let desired_json = String::from_utf8(encode_desired_runtime_spec(&desired).unwrap()).unwrap();
+
+    store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$2::TEXT::jsonb, spec_digest=$3, target='deleted'
+                      WHERE cat_id=$1",
+                    &[
+                        &desired.cat_id.as_str(),
+                        &desired_json,
+                        &desired.spec_digest.as_str(),
+                    ],
+                )?,
+                1
+            );
+            insert_delete_completion(transaction, &completion)?;
+            assert_eq!(
+                transaction.execute(
+                    "DELETE FROM disk_records WHERE disk_id=$1",
+                    &[&root.disk_id.as_str()],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "DELETE FROM volume_records WHERE volume_id=$1",
+                    &[&root.volume_id.as_str()],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    completion
+}
+
 #[test]
-fn runtime_cat_read_accepts_only_a_completed_disposable_root_sweep() {
+fn runtime_cat_read_accepts_completed_disposable_root_sweep() {
     let (_url, store, _second, workspace) = stores();
     let create = request(&workspace, "deleted-read", 1, "deleted-read");
     store
@@ -4071,6 +4136,111 @@ fn runtime_cat_read_accepts_only_a_completed_disposable_root_sweep() {
     };
     assert_eq!(cat.desired.target, RuntimeTarget::Deleted);
     assert_eq!(cat.desired.root_disk_id, create.candidate.root_disk.disk_id);
+}
+
+#[test]
+fn runtime_cat_read_accepts_exact_completed_normal_root_sweep() {
+    let (_url, store, _second, workspace) = stores();
+    let create = request(&workspace, "normal-deleted-read", 1, "normal-deleted-read");
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    sweep_completed_normal_root_for_product_read(&store, &create);
+
+    let ProductRead::Found(cat) = store
+        .get_runtime_cat(&workspace, &create.candidate.cat_id)
+        .unwrap()
+    else {
+        panic!("closed normal Root completion was rejected")
+    };
+    assert_eq!(cat.desired.target, RuntimeTarget::Deleted);
+    assert_eq!(cat.desired.root_disk_id, create.candidate.root_disk.disk_id);
+}
+
+#[test]
+fn runtime_cat_read_rejects_drifted_or_duplicate_normal_root_completion() {
+    for (index, corruption) in [
+        "request-tuple",
+        "scalar-projection",
+        "conflicting-completion",
+        "hidden-record-duplicate",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_url, store, _second, workspace) = stores();
+        let fixture_name = format!("normal-completion-corrupt-{index}");
+        let create = request(&workspace, &fixture_name, 1, &fixture_name);
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        let completion = sweep_completed_normal_root_for_product_read(&store, &create);
+        let DeleteCompletionReceipt::Normal { request, .. } = &completion else {
+            unreachable!()
+        };
+
+        if corruption == "conflicting-completion" {
+            let mut conflicting = completion.clone();
+            let DeleteCompletionReceipt::Normal { request, .. } = &mut conflicting else {
+                unreachable!()
+            };
+            request.delete_id = id("delete_conflicting_normal_completion");
+            request.volume_id = id("volume_conflicting_normal_completion");
+            store
+                .authority_transaction(|transaction| {
+                    insert_delete_completion(transaction, &conflicting)
+                })
+                .unwrap();
+        } else {
+            store
+                .with(|client| {
+                    match corruption {
+                        "request-tuple" => client.execute(
+                            "UPDATE delete_completion_receipts
+                            SET disk_id='disk_wrong_normal',
+                                record=jsonb_set(
+                                    record, '{request,disk_id}',
+                                    to_jsonb('disk_wrong_normal'::TEXT), FALSE
+                                )
+                          WHERE delete_id=$1",
+                            &[&request.delete_id.as_str()],
+                        )?,
+                        "scalar-projection" => client.execute(
+                            "UPDATE delete_completion_receipts
+                            SET disk_id='disk_wrong_projection'
+                          WHERE delete_id=$1",
+                            &[&request.delete_id.as_str()],
+                        )?,
+                        "hidden-record-duplicate" => client.execute(
+                            "INSERT INTO delete_completion_receipts (
+                            delete_id, record, kind, disk_id, volume_id,
+                            authorization_id, prior_attachment_id,
+                            deleting_epoch, head_generation, head_root_hash,
+                            head_root_object_id, completed_at
+                         ) SELECT
+                            'delete_hidden_normal_duplicate', record, kind,
+                            'disk_hidden_normal_duplicate',
+                            'volume_hidden_normal_duplicate', authorization_id,
+                            prior_attachment_id, deleting_epoch, head_generation,
+                            head_root_hash, head_root_object_id, completed_at
+                           FROM delete_completion_receipts WHERE delete_id=$1",
+                            &[&request.delete_id.as_str()],
+                        )?,
+                        _ => unreachable!(),
+                    };
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .get_runtime_cat(&workspace, &create.candidate.cat_id)
+                .unwrap(),
+            ProductRead::Corrupt,
+            "{corruption} completion escaped exact Normal validation"
+        );
+    }
 }
 
 #[test]

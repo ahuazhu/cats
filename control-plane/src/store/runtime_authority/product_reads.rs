@@ -18,7 +18,7 @@ use super::product_rows::{
     DISK_COLUMNS,
 };
 use super::rows::{
-    load_disposable_root_completion_candidates, load_disposable_root_graph_authorizations,
+    load_disposable_root_graph_authorizations, load_root_delete_completion_candidates,
 };
 use super::runtime_spine::load_product_cat_observation;
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
@@ -326,7 +326,7 @@ fn compose_cat(
                 && root_record.volume_id == root.volume_id
                 && root_record.size_bytes == root.size_bytes
                 && durability(root_record.durability) == root.durability => {}
-        [] => completed_disposable_root_sweep(transaction, &desired, root)?,
+        [] => completed_root_sweep(transaction, &desired, root)?,
         _ => return Err(ComposeError::Corrupt),
     }
     let observed = projection_result(load_product_cat_observation(
@@ -425,7 +425,7 @@ fn root_disk_candidates(
         .collect()
 }
 
-fn completed_disposable_root_sweep(
+fn completed_root_sweep(
     transaction: &mut Transaction<'_>,
     desired: &DesiredRuntimeSpec,
     root: &cats_api::runtime_reconciliation::VolumeIntent,
@@ -436,16 +436,19 @@ fn completed_disposable_root_sweep(
     let VolumeDisposition::DeleteDisposableRoot { delete_id } = &root.disposition else {
         return Err(ComposeError::Corrupt);
     };
-    if disposable_root_volume_still_reachable(transaction, &root.volume_id, delete_id)? {
+    if deleted_root_volume_still_reachable(transaction, &root.volume_id, delete_id)? {
         return Err(ComposeError::Corrupt);
     }
-    let completions = projection_result(load_disposable_root_completion_candidates(
+    let completions = projection_result(load_root_delete_completion_candidates(
         transaction,
         delete_id,
         &root.disk_id,
         &root.volume_id,
     ))?;
-    let [DeleteCompletionReceipt::DisposableRoot {
+    let [completion] = completions.as_slice() else {
+        return Err(ComposeError::Corrupt);
+    };
+    let DeleteCompletionReceipt::DisposableRoot {
         disk_id,
         volume_id,
         delete_id: completed_delete_id,
@@ -454,9 +457,19 @@ fn completed_disposable_root_sweep(
         deleting_epoch,
         deleting_head,
         completed_at,
-    }] = completions.as_slice()
+    } = completion
     else {
-        return Err(ComposeError::Corrupt);
+        let DeleteCompletionReceipt::Normal { request, .. } = completion else {
+            unreachable!()
+        };
+        return if request.delete_id == *delete_id
+            && request.disk_id == root.disk_id
+            && request.volume_id == root.volume_id
+        {
+            Ok(())
+        } else {
+            Err(ComposeError::Corrupt)
+        };
     };
     if disk_id != &root.disk_id
         || volume_id != &root.volume_id
@@ -513,7 +526,7 @@ fn completed_disposable_root_sweep(
     Ok(())
 }
 
-fn disposable_root_volume_still_reachable(
+fn deleted_root_volume_still_reachable(
     transaction: &mut Transaction<'_>,
     volume_id: &Id,
     delete_id: &Id,

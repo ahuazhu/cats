@@ -1133,6 +1133,33 @@ fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
 }
 
 #[test]
+fn refuses_expression_index_with_wrong_catalog_collation_without_repair() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let changed = admin
+        .execute(
+            "UPDATE pg_index
+                SET indcollation=(
+                    'pg_catalog.\"POSIX\"'::regcollation::OID::TEXT
+                )::OIDVECTOR
+              WHERE indexrelid='volume_records_record_volume'::regclass",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("a stamped expression index with wrong collation must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(
+        error.to_string().contains("volume_records_record_volume"),
+        "operator must see the wrong expression index, got: {error}"
+    );
+}
+
+#[test]
 fn refuses_missing_runtime_operation_lookup_indexes_without_repair() {
     for index in [
         "runtime_operations_lookup_scalar_scalar",

@@ -483,7 +483,9 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
-    for (table, index, access_method, operator_class, expression) in REQUIRED_EXPRESSION_INDEXES {
+    for (table, index, access_method, operator_class, expression, collation) in
+        REQUIRED_EXPRESSION_INDEXES
+    {
         let present: bool = transaction
             .query_one(
                 "SELECT EXISTS (
@@ -510,8 +512,18 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
                        AND operator_namespace.nspname='pg_catalog'
                        AND operator_class.opcname=$4
                        AND pg_get_expr(i.indexprs, i.indrelid)=$5
+                       AND (($6::TEXT IS NULL AND i.indcollation[0]=0)
+                            OR ($6::TEXT IS NOT NULL
+                                AND i.indcollation[0]=to_regcollation($6)))
                  )",
-                &[table, index, access_method, operator_class, expression],
+                &[
+                    table,
+                    index,
+                    access_method,
+                    operator_class,
+                    expression,
+                    collation,
+                ],
             )
             .map_err(|error| {
                 internal(format!(
@@ -1266,13 +1278,23 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     ),
 ];
 
-const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
+type RequiredExpressionIndex = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+const REQUIRED_EXPRESSION_INDEXES: &[RequiredExpressionIndex] = &[
     (
         "volume_records",
         "volume_records_record_volume",
         "btree",
         "text_ops",
         "(record ->> 'volume_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "volume_records",
@@ -1280,6 +1302,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "COALESCE(delete_id, ''::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "volume_records",
@@ -1287,6 +1310,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "((record -> 'admin_state'::text) ->> 'delete_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "volume_authorizations",
@@ -1294,6 +1318,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "gin",
         "jsonb_path_ops",
         "(record -> 'authorization'::text)",
+        None,
     ),
     (
         "desired_runtime_specs",
@@ -1301,6 +1326,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "gin",
         "jsonb_path_ops",
         "(record -> 'volumes'::text)",
+        None,
     ),
     (
         "delete_completion_receipts",
@@ -1308,6 +1334,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "(record ->> 'delete_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "delete_completion_receipts",
@@ -1315,6 +1342,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "(record ->> 'disk_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "delete_completion_receipts",
@@ -1322,6 +1350,31 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "(record ->> 'volume_id'::text)",
+        Some("pg_catalog.\"default\""),
+    ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_request_delete",
+        "btree",
+        "text_ops",
+        "((record -> 'request'::text) ->> 'delete_id'::text)",
+        Some("pg_catalog.\"default\""),
+    ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_request_disk",
+        "btree",
+        "text_ops",
+        "((record -> 'request'::text) ->> 'disk_id'::text)",
+        Some("pg_catalog.\"default\""),
+    ),
+    (
+        "delete_completion_receipts",
+        "delete_completion_receipts_record_request_volume",
+        "btree",
+        "text_ops",
+        "((record -> 'request'::text) ->> 'volume_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "disk_records",
@@ -1329,6 +1382,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "((record -> 'role'::text) ->> 'cat_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
     (
         "disk_records",
@@ -1336,6 +1390,7 @@ const REQUIRED_EXPRESSION_INDEXES: &[(&str, &str, &str, &str, &str)] = &[
         "btree",
         "text_ops",
         "(record ->> 'volume_id'::text)",
+        Some("pg_catalog.\"default\""),
     ),
 ];
 
@@ -2176,6 +2231,12 @@ CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_disk
 ON delete_completion_receipts((record->>'disk_id'));
 CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_volume
 ON delete_completion_receipts((record->>'volume_id'));
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_request_delete
+ON delete_completion_receipts((record->'request'->>'delete_id'));
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_request_disk
+ON delete_completion_receipts((record->'request'->>'disk_id'));
+CREATE INDEX IF NOT EXISTS delete_completion_receipts_record_request_volume
+ON delete_completion_receipts((record->'request'->>'volume_id'));
 CREATE TABLE IF NOT EXISTS cat_records (
     cat_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
