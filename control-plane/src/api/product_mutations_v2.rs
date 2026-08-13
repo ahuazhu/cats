@@ -338,11 +338,9 @@ async fn timeout_at<T>(
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use cats_api::runtime_reconciliation::Id;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::MetadataStore;
-
-    use super::*;
 
     #[tokio::test]
     async fn body_reader_stops_at_the_fixed_boundary() {
@@ -364,10 +362,6 @@ mod tests {
     async fn production_lifecycle_route_enforces_auth_envelope_and_exact_replay() {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
-            cats_metadata_store_sqlite::SqliteMetadataStore::open(&dir.path().join("storage.db"))
-                .unwrap(),
-        );
         let handle = crate::server::spawn(crate::server::Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: crate::store::DsnSource::Literal(
@@ -376,7 +370,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:

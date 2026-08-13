@@ -629,10 +629,6 @@ pub fn router(state: AppState) -> Router {
             get(get_cat_work),
         )
         .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
-            post(disk_action),
-        )
-        .route(
             "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
             post(create_snapshot).get(list_snapshots),
         )
@@ -952,8 +948,11 @@ mod tests {
                 && router.contains("product_mutations_v2"),
             "conditional retired/new mutation routers are missing",
         );
+        routes.push("DELETE /v1/workspaces/{workspace}/cats/{cat}".to_string());
         routes.push("GET /v1/workspaces/{workspace}/cats/{cat}".to_string());
         routes.push("GET /v1/workspaces/{workspace}/cats/{cat}/endpoints".to_string());
+        routes.push("POST /v1/workspaces/{workspace}/cats/{cat}/endpoints".to_string());
+        routes.push("DELETE /v1/workspaces/{workspace}/disks/{disk}".to_string());
         routes.push("GET /v1/workspaces/{workspace}/disks/{disk}".to_string());
         routes.sort();
         routes.dedup();
@@ -991,6 +990,7 @@ GET /ui/cat-create-v2.mjs
 GET /ui/common.js
 GET /ui/i18n.js
 GET /ui/persistent-disk-create-v1.mjs
+GET /ui/runtime-product-load.mjs
 GET /ui/styles.css
 GET /ui/user.js
 GET /user
@@ -1052,12 +1052,15 @@ POST /v1/nodes/{id}/actions/cordon
 POST /v1/routes/wake
 POST /v1/workspaces/{workspace}/billing/checkout
 POST /v1/workspaces/{workspace}/cats
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/resume
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/stop
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/suspend
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/warm
 POST /v1/workspaces/{workspace}/cats/{cat}/actions/{verb}
 POST /v1/workspaces/{workspace}/cats/{cat}/endpoints
 POST /v1/workspaces/{workspace}/cats/{cat}/exec
 POST /v1/workspaces/{workspace}/cats/{cat}/oci-deployments
 POST /v1/workspaces/{workspace}/disks
-POST /v1/workspaces/{workspace}/disks/{disk}/actions/{verb}
 POST /v1/workspaces/{workspace}/disks/{disk}/snapshots
 POST /v1/workspaces/{workspace}/tokens
 PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend

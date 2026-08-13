@@ -49,7 +49,7 @@ use super::product_rows::{
     load_operation_by_cat_revision_for_update, load_operation_by_cat_revision_unlocked,
     load_operation_by_workspace_unlocked, load_operation_for_update,
     load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
-    update_disk, update_operation,
+    update_operation,
 };
 use super::route_epoch_engine::RequireIdleOpenBusyProof;
 use super::rows::{

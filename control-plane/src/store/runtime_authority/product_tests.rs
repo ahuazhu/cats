@@ -39,11 +39,10 @@ use super::product::{
     persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
     CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
     CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
-    CoveredDiskDeleteRequest, CoveredPlannedDesiredMutation, CoveredProductMutationTarget,
-    DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate,
-    DiskRole, EndpointRecordCandidate, ExactContentType, ExactHttpResponse,
-    HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
-    PersistentDiskInitialization, RuntimeOperationRead,
+    CoveredDiskDeleteRequest, CoveredPlannedDesiredMutation, DesiredMutationCommit,
+    DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
+    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
+    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
