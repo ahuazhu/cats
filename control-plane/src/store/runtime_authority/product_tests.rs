@@ -2990,7 +2990,7 @@ fn assert_volume_guard_rejected_without_writes(
     assert_eq!(error.code, ErrorCode::Internal, "{label}");
     assert_eq!(
         error.message,
-        "covered Desired mutation candidate is inconsistent: volume intent changes require covered VolumeRecord and Disk authority",
+        "covered Desired mutation candidate is inconsistent: volume intent changes require a closed covered mutation",
         "{label}"
     );
     store
