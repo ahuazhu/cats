@@ -22,10 +22,9 @@ use cats_storage::authority::{
     begin_delete, complete_disposable_root_delete, complete_normal_delete,
     consume_disposable_root_delete, normal_acquire, AuthorizationRecord, AuthorizationState,
     BeginDeleteRequest, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
-    DisposableRootDeleteAuthorization,
-    HostFenceEvent, HostFenceEventState, HostIsolationState, LastVolumeTransition, NodeBootId,
-    NormalAcquireRequest, RemoteHead, VolumeAdminState, VolumeAuthorization, VolumeDurability,
-    VolumeRecord,
+    DisposableRootDeleteAuthorization, HostFenceEvent, HostFenceEventState, HostIsolationState,
+    LastVolumeTransition, NodeBootId, NormalAcquireRequest, RemoteHead, VolumeAdminState,
+    VolumeAuthorization, VolumeDurability, VolumeRecord,
 };
 use postgres::error::SqlState;
 use sha2::{Digest, Sha256};
