@@ -61,8 +61,10 @@ The independent maintenance actor supplies a small, non-secret JSON document
 after the fresh release passes qualification. It binds the exact fresh targets,
 Git commit, independent artifact digest and a placeholder old-writer declaration
 to an external evidence manifest; it does not embed logs, tokens, object keys,
-headers, private keys or database URLs. Until E13's canonical parser lands,
-neither the declaration nor its digest authorizes production execution.
+headers, private keys or database URLs. The
+[Proposed E13 producer/parser](../../docs/specs/old-host-positive-stop-v1.md)
+is not an accepted reset authority, so neither this declaration, its digest,
+nor a Proposed E13 evidence set authorizes production execution.
 
 ```json
 {
@@ -102,14 +104,16 @@ neither the declaration nor its digest authorizes production execution.
 old. A plan outside that closed window requires newly observed evidence and a
 new review; a different reset can never reuse the document.
 
-No accepted canonical E13 proof format exists yet. The `old_writers` strings
-and arbitrary manifest digest above are only closed declarations; this executor
-does not turn them into shutdown authority. This exact binary mechanically
-blocks every production `--execute` before any AWS or PostgreSQL call. A future
-reviewed change may remove that block only after E13 defines a canonical,
-parseable positive systemd/process-tree stop result and external isolation
-receipt. A self-written document or this repository's offline fixture is not
-positive shutdown evidence.
+No accepted canonical E13 proof format exists yet. The Proposed candidate
+defines parseable systemd/process-tree stop and EC2 isolation receipts, but has
+no accepted authority or consumer transaction. The `old_writers` strings and
+arbitrary manifest digest above are only closed declarations; this executor
+does not turn them—or Proposed receipts—into shutdown authority. This exact
+binary mechanically blocks every production `--execute` before any AWS or
+PostgreSQL call. A future reviewed change may remove that block only after an
+ADR/accepted spec approves the authority, parser, freshness and reset-consumption
+transaction. A self-written document or this repository's offline fixture is
+not positive shutdown evidence.
 
 ## Database and credential boundary
 
@@ -144,12 +148,14 @@ identities and inventories; the fresh control schema must be terminal schema
 version 14.
 
 Deleting the old Kinesis stream/table additionally requires a signed final
-usage epoch/barrier receipt from E9. No accepted canonical format exists yet,
-so this exact binary mechanically blocks production `--execute` before any
-destructive stage. It does not infer a final epoch from an empty stream, table,
-schema, digest or operator string. Once a later reviewed implementation accepts
-that authority, the fresh stream/table remain live and both immutable
-Object-Locked usage archives remain retained evidence.
+usage epoch/barrier receipt from E9. A Proposed producer/parser now exists for
+E13 positive stop/isolation evidence, but no accepted final-epoch or
+cross-component close-proof formats exist yet, so this exact binary still
+mechanically blocks production `--execute` before any destructive stage. It
+does not infer a final epoch from an empty stream, table, schema, digest or
+operator string. Once later reviewed implementations accept those authorities,
+the fresh stream/table remain live and both immutable Object-Locked usage
+archives remain retained evidence.
 
 ## Read-only plan and dry-run
 
@@ -216,12 +222,13 @@ and review a new plan; never edit a receipt.
 ## Execute and receipts
 
 Production execution is intentionally unavailable in this binary. E13 positive
-stop/isolation, E9 signed final usage epoch/barrier and the cross-component
-Closed route/mutation admission proof have no accepted canonical formats. Each
-is a separate mechanical pre-start block, evaluated before AWS or PostgreSQL
-access. `plan`, dry-run and the offline fake fixture remain available; no digest
-or declaration bypasses these blocks. Removing a block belongs to the branch
-that lands its accepted proof parser and calibrated negative fixtures.
+stop/isolation remains Proposed and non-authoritative, and E9 signed final
+usage epoch/barrier plus the cross-component Closed route/mutation admission
+proof still have no accepted canonical formats. Each is a separate mechanical
+pre-start block, evaluated before AWS or PostgreSQL access. `plan`, dry-run and
+the offline fake fixture remain available; no digest or declaration bypasses
+these blocks. Removing a block belongs to the branch that lands its accepted
+proof parser and calibrated negative fixtures.
 
 Only the independent maintenance actor has the narrow delete/drop permissions.
 Add `--execute` to the already reviewed `apply` invocation. Before the first

@@ -217,6 +217,61 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
 }
 
 #[test]
+fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
+    let root = workspace_root();
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/old-host-positive-stop-fixture.py"))
+        .arg("--tool")
+        .arg(root.join("deploy/aws/old-host-positive-stop.py"))
+        .output()
+        .expect("run old-Host positive-stop fixture");
+    assert!(
+        output.status.success(),
+        "old-Host positive-stop fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    for calibrated_boundary in [
+        "calibrated runtime refusal",
+        "descendant/PID-reuse",
+        "absent/failed units",
+        "ambiguous EC2 discovery/replay",
+        "exact AWS identity/rules/ENIs/stable-deadline",
+        "no-replace",
+        "exact coverage",
+    ] {
+        assert!(
+            stdout.contains(calibrated_boundary),
+            "fixture omitted {calibrated_boundary:?}"
+        );
+    }
+
+    let producer = read_workspace_file("deploy/aws/old-host-positive-stop.py");
+    for required in [
+        "cats.old-host-positive-stop-inventory.v1",
+        "\"--no-ask-password\", \"stop\"",
+        "modify-network-interface-attribute",
+        "host_fence_event\": \"not_established",
+        "object_write_fence\": \"not_established",
+        "production_reset_prerequisite\": \"proposed_unaccepted",
+    ] {
+        assert!(producer.contains(required), "producer lost {required:?}");
+    }
+    assert!(!producer.contains("shell=True"));
+
+    let specification = read_workspace_file("docs/specs/old-host-positive-stop-v1.md");
+    assert!(specification.contains("Status: **Proposed**"));
+    assert!(specification.contains("不是 ADR-0040 的 `HostFenceEvent`"));
+    assert!(specification.contains("不能解除"));
+
+    let reset = read_workspace_file("deploy/aws/production-clean-slate-reset.py");
+    assert!(reset.contains("def _require_accepted_execute_prerequisites"));
+    assert!(reset.contains("positive-stop/isolation proof format is accepted and verified"));
+    assert!(reset.contains("self._require_accepted_execute_prerequisites()"));
+}
+
+#[test]
 fn legacy_route_grant_private_key_is_control_only_until_c1_removes_v1() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
@@ -3372,6 +3427,9 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     }
     let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
+    assert!(worker_image.contains(
+        "COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py"
+    ));
     let noded = read_workspace_file("cmd/noded/src/main.rs");
     assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
     assert!(noded.contains("validate_installed_node_guest_runtime"));
@@ -3464,6 +3522,7 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--gateway-image-registry-verified false",
         "--gateway-image-registry-verified true",
         "--input-file \"guest_host_kernel=$guest_kernel\"",
+        "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
     ] {
         assert!(
             builder.contains(required),

@@ -69,6 +69,7 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Implemented frozen v1 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
 | [A23 Production Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Implemented operations contract | revision-1 trust与Host initial NodeIdentity prepare/export/official-apply/activate |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
+| [Old Host Positive Stop Evidence v1](specs/old-host-positive-stop-v1.md) | Producer implemented；contract Proposed，未接受 | E13 systemd/process-tree正向停止与EC2 deny-all SG隔离候选receipt；非HostFence authority，production reset仍机械Blocked |
 | [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
 | [Route Grant v2](specs/route-grant-v2.md) | Core、machine tunnel、gatewayd proxy与production deployment wiring implemented | ADR-0041 AdmissionCell、Grant、public HTTP/WS byte proxy、closed artifact distribution、独立machine listeners与wildcard ingress；真实production mTLS E2E/rotation qualification仍单列 |
 | [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen target，revision-1 wiring implemented | 独立signer/ring与closed初装工件；successor持久rotation/热加载/ACK composition未实现 |

@@ -195,6 +195,12 @@ both images remain only in the local Docker store and the manifest records both
 registry verifications as false; that output is useful for dry-run
 qualification but is not a registry deployment receipt.
 The builder never invokes Terraform, Kubernetes or a production service.
+The worker bundle also carries the exact
+[`old-host-positive-stop.py`](old-host-positive-stop.py) bytes bound as a
+manual-build input. That program emits the
+[Proposed E13 evidence format](../../docs/specs/old-host-positive-stop-v1.md);
+shipping it does not make the format accepted and does not remove the
+production reset's mechanical block.
 
 The application rollout also mounts the central provisioner's canonical public
 trust bundle as the root-owned regular file

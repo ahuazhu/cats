@@ -298,7 +298,8 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    `enable_public_ingress`仍保持false，不能用Terraform资源存在性虚构route/mutation Closed证明。全绿后生成绑定exact release、
    fresh targets、唯一reset ID、qualification manifest与全部旧writer stopped-or-isolated证明的post-green evidence。
    evidence在首次destructive start时必须不晚于当前时间且age不超过900秒；其中`old_writers`只是closed declaration，
-   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13 canonical格式尚未accepted；
+   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13已有
+   [Proposed候选格式](specs/old-host-positive-stop-v1.md)，但尚未accepted、不是`HostFenceEvent`且未接入reset authority；
    E9 signed final usage epoch/barrier receipt与跨组件Closed-admission proof也尚未accepted。本版reset binary对三项分别机械
    Blocked且在任何AWS/PostgreSQL调用前拒绝production execute；随机digest或operator字符串不能绕过。
 7. post-green后才执行旧namespace的exact destructive retirement。仓库内的

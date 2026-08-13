@@ -359,6 +359,7 @@ verifier_arguments=(
   --input-file "control_dockerfile=$source_root/deploy/aws/Dockerfile.control-plane"
   --input-file "gateway_dockerfile=$source_root/deploy/aws/Dockerfile.gateway"
   --input-file "worker_dockerfile=$source_root/deploy/aws/Dockerfile.worker-artifact"
+  --input-file "old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py"
   --input-file "guest_builder=$source_root/deploy/metal/build-guest-image.sh"
   --input-file "guest_host_kernel=$guest_kernel"
   --input-file "guest_host_modules=/lib/modules/$(uname -r)/modules.dep"

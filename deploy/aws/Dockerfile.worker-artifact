@@ -40,6 +40,7 @@ RUN cargo build --locked --release \
 
 COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
 COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
+COPY --chmod=0755 deploy/aws/old-host-positive-stop.py /out/old-host-positive-stop.py
 COPY deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
 COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh
 COPY --chmod=0755 deploy/aws/metal/validate-node-identity-installation.sh /out/validate-node-identity-installation.sh
@@ -57,6 +58,7 @@ COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
 COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
+COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py
 COPY --from=builder /out/render-postgres-url.sh /render-postgres-url.sh
 COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh
 COPY --from=builder --chmod=0755 /out/validate-node-identity-installation.sh /validate-node-identity-installation.sh
