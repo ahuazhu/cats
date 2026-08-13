@@ -1618,18 +1618,21 @@ async fn invalid_public_egress_deadlines_are_rejected_at_startup_case() {
     let cache = RouteCache::new(cache_config(), resolver).unwrap();
     let connector: TunnelConnector =
         Arc::new(|_| Box::pin(async { Err(GatewayNodeRouteV2Error::Protocol) }) as TunnelFuture);
-    assert!(GatewayIngress::new(
-        GatewayIngressConfig {
-            public_egress_deadline: Duration::from_secs(60),
-            ..GatewayIngressConfig::default()
-        },
-        cache.clone(),
-        connector.clone(),
-    )
-    .is_ok());
+    for public_egress_deadline in [Duration::from_millis(1), Duration::from_secs(60)] {
+        assert!(GatewayIngress::new(
+            GatewayIngressConfig {
+                public_egress_deadline,
+                ..GatewayIngressConfig::default()
+            },
+            cache.clone(),
+            connector.clone(),
+        )
+        .is_ok());
+    }
 
     for public_egress_deadline in [
         Duration::ZERO,
+        Duration::from_nanos(999_999),
         Duration::from_millis(60_001),
         Duration::from_millis(u64::MAX),
     ] {
