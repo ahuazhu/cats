@@ -10,13 +10,15 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, CheckpointEvidence, CleanupRelease, CleanupTarget,
+    encode_runtime_checkpoint, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
     DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, LifecycleAdmission, NodeResidue,
     ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
-    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget, SessionBinding,
-    StableState, VolumeAuthorityEvidence, VolumeDisposition, VolumeHeadEvidence,
+    RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionRequest, SessionBinding, StableState,
+    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition, VolumeHeadEvidence,
     VolumeReleaseReplay, WarmSnapshotEvidence,
 };
+use cats_storage::authority::VolumeDataAuthority;
 
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
@@ -24,7 +26,12 @@ use crate::runtime_spine::{
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::prepare_device_retirement::unique_runtime;
-use super::{FileCheckpointStore, StoredCheckpoint};
+use super::signed_running::SignedLifecycleVolumePort;
+use super::{
+    recover_lifecycle_release_from_authority, DisposableRootDeleteAttempt, FileCheckpointStore,
+    NormalAcquireAcceptedContext, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
+    StoredCheckpoint,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecyclePhysicalAttempt {
@@ -342,12 +349,20 @@ fn valid_token(
 
 pub(crate) struct LifecycleStepEffect {
     physical: Arc<dyn LifecyclePhysicalPort>,
+    volume_transition: Arc<dyn SignedLifecycleVolumePort>,
+    volume_authority: Arc<dyn VolumeDataAuthority>,
 }
 
 impl LifecycleStepEffect {
-    pub(crate) fn platform(network_ip_binary: PathBuf) -> Self {
+    pub(crate) fn platform(
+        network_ip_binary: PathBuf,
+        volume_transition: Arc<dyn SignedLifecycleVolumePort>,
+        volume_authority: Arc<dyn VolumeDataAuthority>,
+    ) -> Self {
         Self {
             physical: Arc::new(PlatformLifecyclePhysicalPort { network_ip_binary }),
+            volume_transition,
+            volume_authority,
         }
     }
 
@@ -368,21 +383,6 @@ impl LifecycleStepEffect {
             }
             return Ok(None);
         }
-        if matches!(
-            &runtime.step,
-            ReconcileStep::CleanupRelease {
-                cleanup: cats_api::runtime_reconciliation::CleanupRelease {
-                    target: CleanupTarget::Volume { .. },
-                    ..
-                }
-            }
-        ) {
-            // Volume cleanup remains owned by the signed A22 transition
-            // planner.  N1 owns every other CleanupTarget and must not turn a
-            // local physical adapter into storage authority.
-            return Ok(None);
-        }
-
         let CheckpointEvidence::Valid {
             checkpoint_path,
             content_digest,
@@ -419,16 +419,80 @@ impl LifecycleStepEffect {
             // explicit repair plan.  This stale invocation performs no I/O.
             return Ok(Some(stop_local()));
         }
-        if let ReconcileStep::CleanupRelease { cleanup } = &runtime.step {
-            if !cleanup_is_fresh(accepted, cleanup) {
-                return Ok(Some(stop_local()));
-            }
-        }
-
         context.check_active()?;
         let current = store
             .assert_current(&stored)
             .context("retain exact lifecycle checkpoint across one physical effect")?;
+        if let ReconcileStep::DeleteDisposableRoot { authorization_id } = &stored.checkpoint().step
+        {
+            return self
+                .apply_disposable_root_delete(
+                    context,
+                    accepted,
+                    desired,
+                    runtime,
+                    &store,
+                    &stored,
+                    &current,
+                    authorization_id,
+                )
+                .map(Some);
+        }
+        if let ReconcileStep::CleanupRelease { cleanup } = &stored.checkpoint().step {
+            if !cleanup_is_fresh(accepted, cleanup) {
+                let permit = LifecycleEffectPermit {
+                    desired,
+                    runtime,
+                    stored: &stored,
+                };
+                if !cleanup_can_rebind(context, &permit, cleanup)? {
+                    return Ok(Some(stop_local()));
+                }
+                let Some(desired_read_position) = accepted.desired_read_position() else {
+                    return Ok(Some(stop_local()));
+                };
+                let mut rebound = stored.checkpoint().clone();
+                rebound.processes = runtime.processes.clone();
+                rebound.volumes = runtime.volumes.clone();
+                rebound.mounts = runtime.mounts.clone();
+                rebound.networks = runtime.networks.clone();
+                rebound.guest_transport = runtime.guest_transport.clone();
+                rebound.warm_snapshot = runtime.warm_snapshot.clone();
+                rebound.updated_at_unix_ms = accepted.attestation().accepted_at_unix_ms;
+                let ReconcileStep::CleanupRelease {
+                    cleanup: rebound_cleanup,
+                } = &mut rebound.step
+                else {
+                    unreachable!("rebound lifecycle step changed kind")
+                };
+                rebound_cleanup.inventory_session = SessionBinding {
+                    node_id: accepted.session().node_id.clone(),
+                    node_boot_id: accepted.session().node_boot_id.clone(),
+                    agent_instance_id: accepted.session().agent_instance_id.clone(),
+                    agent_session_epoch: accepted.session().agent_session_epoch,
+                };
+                rebound_cleanup.inventory_epoch = accepted.attestation().inventory_epoch;
+                rebound_cleanup.inventory_read_position =
+                    accepted.attestation().inventory_read_position;
+                rebound_cleanup.desired_read_position = desired_read_position;
+                persist_lifecycle_successor(
+                    context,
+                    &store,
+                    &stored,
+                    &rebound,
+                    &current,
+                    "rebind exact lifecycle cleanup to fresh inventory",
+                )?;
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
+            if matches!(cleanup.target, CleanupTarget::Volume { .. }) {
+                return self
+                    .apply_volume_release(
+                        context, accepted, desired, runtime, &store, &stored, &current, cleanup,
+                    )
+                    .map(Some);
+            }
+        }
         let attempt = self.physical.apply(
             context,
             LifecycleEffectPermit {
@@ -477,6 +541,397 @@ impl LifecycleStepEffect {
             }
             LifecyclePhysicalAttempt::Conflict => stop_local(),
         }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_volume_release(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
+        cleanup: &CleanupRelease,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let (
+            CleanupTarget::Volume {
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+            },
+            Some(replay),
+        ) = (&cleanup.target, &cleanup.volume_release)
+        else {
+            return Ok(stop_local());
+        };
+        let mut intents = desired
+            .volumes
+            .iter()
+            .filter(|intent| &intent.volume_id == volume_id);
+        let Some(intent) = intents.next() else {
+            return Ok(stop_local());
+        };
+        if intents.next().is_some()
+            || &intent.attachment_id != attachment_id
+            || intent.disposition != replay.disposition
+        {
+            return Ok(stop_local());
+        }
+        let mut observed_matches = runtime
+            .volumes
+            .iter()
+            .filter(|volume| &volume.volume_id == volume_id);
+        let Some(observed) = observed_matches.next() else {
+            return Ok(stop_local());
+        };
+        if observed_matches.next().is_some() || !observed.devices.is_empty() {
+            return Ok(stop_local());
+        }
+        let permit = LifecycleEffectPermit {
+            desired,
+            runtime,
+            stored,
+        };
+        if !volume_cleanup_observation_is_compatible(&permit, cleanup) {
+            return Ok(stop_local());
+        }
+        let expected_head = match &observed.authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_id: owner,
+                attachment_epoch: epoch,
+                head,
+            } if owner == attachment_id
+                && epoch == attachment_epoch
+                && head.generation == replay.generation =>
+            {
+                head.clone()
+            }
+            VolumeAuthorityEvidence::Unowned {
+                attachment_epoch: epoch,
+                head,
+            } if attachment_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                == Some(*epoch)
+                && head.generation == replay.generation =>
+            {
+                head.clone()
+            }
+            VolumeAuthorityEvidence::Deleting { .. }
+                if matches!(
+                    intent.disposition,
+                    VolumeDisposition::DeleteDisposableRoot { .. }
+                ) =>
+            {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+            VolumeAuthorityEvidence::Absent
+                if matches!(
+                    intent.disposition,
+                    VolumeDisposition::DeleteDisposableRoot { .. }
+                ) =>
+            {
+                let successor = cleanup_postcondition_successor(
+                    accepted,
+                    desired,
+                    runtime,
+                    stored.checkpoint(),
+                )?
+                .context("absent disposable Root lacks a canonical lifecycle successor")?;
+                persist_lifecycle_successor(
+                    context,
+                    store,
+                    stored,
+                    &successor,
+                    current,
+                    "settle completed disposable Root cleanup",
+                )?;
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+            _ => return Ok(stop_local()),
+        };
+        let request = RuntimeVolumeTransitionRequest {
+            version: ContractVersion::V1,
+            session: cleanup.inventory_session.clone(),
+            cat_id: desired.cat_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            transition: RuntimeVolumeTransition::Release {
+                cleanup: cleanup.clone(),
+            },
+        };
+        let accepted_context = NormalAcquireAcceptedContext {
+            session: accepted.session().clone(),
+            inventory_attestation: accepted.attestation().clone(),
+        };
+        if matches!(observed.authority, VolumeAuthorityEvidence::Unowned { .. }) {
+            context.check_active()?;
+            let record = match self.volume_authority.load_volume(volume_id) {
+                Ok(record) => record,
+                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            };
+            return match recover_lifecycle_release_from_authority(
+                &request,
+                intent,
+                &expected_head,
+                &record,
+            ) {
+                Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
+                    if let Some(successor) = cleanup_postcondition_successor(
+                        accepted,
+                        desired,
+                        runtime,
+                        stored.checkpoint(),
+                    )? {
+                        persist_lifecycle_successor(
+                            context,
+                            store,
+                            stored,
+                            &successor,
+                            current,
+                            "settle exact lifecycle Volume release",
+                        )?;
+                    }
+                    Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                }
+                Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
+                    Ok(RuntimeDesiredEffectOutcome::RetryExact)
+                }
+                Ok(NormalReleaseAuthorityRecovery::Blocked) | Err(_) => Ok(stop_local()),
+            };
+        }
+        match store.load_definite_release_rejection(stored) {
+            Ok(Some(_)) | Err(_) => return Ok(stop_local()),
+            Ok(None) => {}
+        }
+        context.check_active()?;
+        let attempt = match self.volume_transition.release(
+            &request,
+            intent,
+            &expected_head,
+            &accepted_context,
+            context.deadline(),
+        ) {
+            Ok(attempt) => attempt,
+            Err(_) => return Ok(stop_local()),
+        };
+        Ok(match attempt {
+            NormalReleaseAttempt::Released(_) => RuntimeDesiredEffectOutcome::RefreshInventory,
+            NormalReleaseAttempt::RetryExact => RuntimeDesiredEffectOutcome::RetryExact,
+            NormalReleaseAttempt::RefreshInventory => RuntimeDesiredEffectOutcome::RefreshInventory,
+            NormalReleaseAttempt::ReplanDesired => RuntimeDesiredEffectOutcome::ReplanDesired,
+            NormalReleaseAttempt::SessionReplacementRequired => {
+                RuntimeDesiredEffectOutcome::SessionReplacementRequired
+            }
+            NormalReleaseAttempt::IdentityRepairRequired => {
+                RuntimeDesiredEffectOutcome::IdentityRepairRequired
+            }
+            NormalReleaseAttempt::AuthorityRejected(reason) => RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
+            ),
+            NormalReleaseAttempt::DefiniteCleanupConflict(problem) => {
+                if store
+                    .persist_definite_release_rejection(stored, &request, problem)
+                    .is_err()
+                {
+                    return Ok(stop_local());
+                }
+                RuntimeDesiredEffectOutcome::RefreshInventory
+            }
+            NormalReleaseAttempt::StopForLocalContract => stop_local(),
+            NormalReleaseAttempt::StopForDeploymentMismatch => RuntimeDesiredEffectOutcome::Stop(
+                RuntimeDesiredEffectStopReason::DeploymentMismatch,
+            ),
+            NormalReleaseAttempt::Ambiguous => {
+                context.check_active()?;
+                let record = match self.volume_authority.load_volume(volume_id) {
+                    Ok(record) => record,
+                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+                };
+                match recover_lifecycle_release_from_authority(
+                    &request,
+                    intent,
+                    &expected_head,
+                    &record,
+                ) {
+                    Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
+                        RuntimeDesiredEffectOutcome::RetryExact
+                    }
+                    Ok(NormalReleaseAuthorityRecovery::Blocked) | Err(_) => stop_local(),
+                }
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_disposable_root_delete(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
+        authorization_id: &Id,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        if desired.target != RuntimeTarget::Deleted {
+            return Ok(stop_local());
+        }
+        let mut disposable = desired.volumes.iter().filter(|intent| {
+            intent.disk_kind == cats_api::runtime_reconciliation::DiskKind::Root
+                && matches!(
+                    intent.disposition,
+                    VolumeDisposition::DeleteDisposableRoot { .. }
+                )
+        });
+        let Some(intent) = disposable.next() else {
+            return Ok(stop_local());
+        };
+        if disposable.next().is_some() {
+            return Ok(stop_local());
+        }
+        let mut observed = runtime
+            .volumes
+            .iter()
+            .filter(|volume| volume.volume_id == intent.volume_id);
+        let Some(volume) = observed.next() else {
+            return Ok(stop_local());
+        };
+        if observed.next().is_some() || !volume.devices.is_empty() {
+            return Ok(stop_local());
+        }
+        let VolumeDisposition::DeleteDisposableRoot { delete_id } = &intent.disposition else {
+            unreachable!("disposable Root selection changed disposition")
+        };
+        match &volume.authority {
+            VolumeAuthorityEvidence::Absent if volume.local_lineages.is_empty() => {
+                let mut successor = stored.checkpoint().clone();
+                successor.processes = runtime.processes.clone();
+                successor.volumes = runtime.volumes.clone();
+                successor.mounts = runtime.mounts.clone();
+                successor.networks = runtime.networks.clone();
+                successor.guest_transport = runtime.guest_transport.clone();
+                successor.warm_snapshot = runtime.warm_snapshot.clone();
+                successor.updated_at_unix_ms = accepted.attestation().accepted_at_unix_ms;
+                anyhow::ensure!(
+                    canonical_remaining_cleanup(
+                        desired,
+                        runtime,
+                        stored.checkpoint(),
+                        accepted.observation().residue.as_slice(),
+                    )?
+                    .is_empty(),
+                    "disposable Root completion preceded another canonical cleanup"
+                );
+                settle_cleanup_target(desired, runtime, &mut successor)?;
+                persist_lifecycle_successor(
+                    context,
+                    store,
+                    stored,
+                    &successor,
+                    current,
+                    "settle exact disposable Root absence",
+                )?;
+                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            VolumeAuthorityEvidence::Deleting {
+                delete_id: observed_delete_id,
+                ..
+            } if observed_delete_id == delete_id => {
+                // The signed authority mutation is complete, but this release
+                // has no descriptor-retained exact-lineage deletion permit.
+                // Re-scan without touching local data.
+                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            }
+            VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch,
+                head,
+            } if attachment_id == &intent.attachment_id
+                && disposable_lineage_is_exact(
+                    desired,
+                    intent,
+                    volume,
+                    *attachment_epoch,
+                    head,
+                ) =>
+            {
+                let request = RuntimeVolumeTransitionRequest {
+                    version: ContractVersion::V1,
+                    session: SessionBinding {
+                        node_id: accepted.session().node_id.clone(),
+                        node_boot_id: accepted.session().node_boot_id.clone(),
+                        agent_instance_id: accepted.session().agent_instance_id.clone(),
+                        agent_session_epoch: accepted.session().agent_session_epoch,
+                    },
+                    cat_id: desired.cat_id.clone(),
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement: desired.placement.clone(),
+                    transition: RuntimeVolumeTransition::DeleteDisposableRoot {
+                        authorization_id: authorization_id.clone(),
+                    },
+                };
+                let accepted_context = NormalAcquireAcceptedContext {
+                    session: accepted.session().clone(),
+                    inventory_attestation: accepted.attestation().clone(),
+                };
+                context.check_active()?;
+                let attempt = match self.volume_transition.delete_disposable_root(
+                    &request,
+                    intent,
+                    *attachment_epoch,
+                    head,
+                    &accepted_context,
+                    context.deadline(),
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(_) => return Ok(stop_local()),
+                };
+                Ok(match attempt {
+                    DisposableRootDeleteAttempt::Deleting(_) => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    DisposableRootDeleteAttempt::RetryExact => {
+                        RuntimeDesiredEffectOutcome::RetryExact
+                    }
+                    DisposableRootDeleteAttempt::RefreshInventory
+                    | DisposableRootDeleteAttempt::Ambiguous => {
+                        RuntimeDesiredEffectOutcome::RefreshInventory
+                    }
+                    DisposableRootDeleteAttempt::ReplanDesired => {
+                        RuntimeDesiredEffectOutcome::ReplanDesired
+                    }
+                    DisposableRootDeleteAttempt::SessionReplacementRequired => {
+                        RuntimeDesiredEffectOutcome::SessionReplacementRequired
+                    }
+                    DisposableRootDeleteAttempt::IdentityRepairRequired => {
+                        RuntimeDesiredEffectOutcome::IdentityRepairRequired
+                    }
+                    DisposableRootDeleteAttempt::AuthorizationRejected(
+                        cats_api::runtime_reconciliation::RuntimeVolumeAuthorizationRejection::InvalidLeaseDuration,
+                    ) => stop_local(),
+                    DisposableRootDeleteAttempt::AuthorizationRejected(_) => {
+                        RuntimeDesiredEffectOutcome::ReplanDesired
+                    }
+                    DisposableRootDeleteAttempt::StopForLocalContract => stop_local(),
+                    DisposableRootDeleteAttempt::StopForDeploymentMismatch => {
+                        RuntimeDesiredEffectOutcome::Stop(
+                            RuntimeDesiredEffectStopReason::DeploymentMismatch,
+                        )
+                    }
+                })
+            }
+            _ => Ok(stop_local()),
+        }
     }
 
     fn plan_first(
@@ -551,6 +1006,186 @@ impl LifecycleStepEffect {
         )?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
+}
+
+fn cleanup_can_rebind(
+    context: &RuntimeDesiredEffectContext,
+    permit: &LifecycleEffectPermit<'_>,
+    cleanup: &CleanupRelease,
+) -> anyhow::Result<bool> {
+    match &cleanup.target {
+        CleanupTarget::Volume { .. } => {
+            Ok(volume_cleanup_observation_is_compatible(permit, cleanup))
+        }
+        CleanupTarget::Network {
+            network_id,
+            ownership_token,
+        } => {
+            let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
+                return Ok(false);
+            };
+            let expected = launch.network.as_ref();
+            if &expected.network_config.network_id != network_id
+                || &expected.ownership_token != ownership_token
+            {
+                return Ok(false);
+            }
+            let mut matches = permit.runtime().networks.iter().filter(|network| {
+                &network.network_id == network_id
+                    && valid_token(&network.ownership_token) == Some(ownership_token)
+            });
+            Ok(matches.next().is_some_and(|_| matches.next().is_none())
+                || permit.runtime().networks.is_empty())
+        }
+        target => Ok(classify_unadapted_cleanup(context, permit, target)?
+            != LifecyclePhysicalAttempt::Conflict),
+    }
+}
+
+fn volume_cleanup_observation_is_compatible(
+    permit: &LifecycleEffectPermit<'_>,
+    cleanup: &CleanupRelease,
+) -> bool {
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return false;
+    };
+    let mut intents = permit
+        .desired()
+        .volumes
+        .iter()
+        .filter(|intent| &intent.volume_id == volume_id);
+    let Some(intent) = intents.next() else {
+        return false;
+    };
+    if intents.next().is_some()
+        || &intent.attachment_id != attachment_id
+        || intent.disposition != replay.disposition
+    {
+        return false;
+    }
+    let mut volumes = permit
+        .runtime()
+        .volumes
+        .iter()
+        .filter(|volume| &volume.volume_id == volume_id);
+    let Some(volume) = volumes.next() else {
+        return matches!(
+            intent.disposition,
+            VolumeDisposition::DeleteDisposableRoot { .. }
+        );
+    };
+    if volumes.next().is_some() || !volume.devices.is_empty() {
+        return false;
+    }
+    match &volume.authority {
+        VolumeAuthorityEvidence::Owned {
+            attachment_id: owner,
+            attachment_epoch: epoch,
+            head,
+        } => {
+            owner == attachment_id
+                && epoch == attachment_epoch
+                && head.generation == replay.generation
+                && drained_lineage_is_exact(permit.desired(), intent, volume, *epoch, replay)
+        }
+        VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: epoch,
+            head,
+        } => {
+            attachment_epoch
+                .get()
+                .checked_add(1)
+                .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                == Some(*epoch)
+                && head.generation == replay.generation
+        }
+        VolumeAuthorityEvidence::Deleting { .. } | VolumeAuthorityEvidence::Absent => {
+            matches!(
+                intent.disposition,
+                VolumeDisposition::DeleteDisposableRoot { .. }
+            )
+        }
+        VolumeAuthorityEvidence::Unavailable => false,
+    }
+}
+
+fn drained_lineage_is_exact(
+    desired: &DesiredRuntimeSpec,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    volume: &cats_api::runtime_reconciliation::ObservedVolume,
+    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    replay: &VolumeReleaseReplay,
+) -> bool {
+    let mut exact = volume.local_lineages.iter().filter(|lineage| {
+        lineage.attachment_id == intent.attachment_id
+            && lineage.attachment_epoch == attachment_epoch
+            && lineage.node_id == desired.placement.node_id
+            && lineage.placement_epoch == desired.placement.placement_epoch
+            && lineage.local_durable_generation == replay.generation
+            && lineage.remote_durable_generation == replay.generation
+            && lineage.pending_pack_count.get() == 0
+            && !lineage.fenced
+            && match (&lineage.acquire_origin, &intent.acquire) {
+                (
+                    cats_api::runtime_reconciliation::AcquireOrigin::Normal { transition_id },
+                    VolumeAcquire::Normal {
+                        transition_id: intended,
+                        ..
+                    },
+                ) => transition_id == intended,
+                (
+                    cats_api::runtime_reconciliation::AcquireOrigin::Takeover { authorization_id },
+                    VolumeAcquire::Takeover {
+                        authorization_id: intended,
+                    },
+                ) => authorization_id == intended,
+                _ => false,
+            }
+    });
+    exact.next().is_some() && exact.next().is_none()
+}
+
+fn disposable_lineage_is_exact(
+    desired: &DesiredRuntimeSpec,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    volume: &cats_api::runtime_reconciliation::ObservedVolume,
+    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    let mut exact = volume.local_lineages.iter().filter(|lineage| {
+        lineage.attachment_id == intent.attachment_id
+            && lineage.attachment_epoch == attachment_epoch
+            && lineage.node_id == desired.placement.node_id
+            && lineage.placement_epoch == desired.placement.placement_epoch
+            && lineage.local_durable_generation >= lineage.remote_durable_generation
+            && lineage.remote_durable_generation == head.generation
+            && !lineage.fenced
+            && match (&lineage.acquire_origin, &intent.acquire) {
+                (
+                    cats_api::runtime_reconciliation::AcquireOrigin::Normal { transition_id },
+                    VolumeAcquire::Normal {
+                        transition_id: intended,
+                        ..
+                    },
+                ) => transition_id == intended,
+                (
+                    cats_api::runtime_reconciliation::AcquireOrigin::Takeover { authorization_id },
+                    VolumeAcquire::Takeover {
+                        authorization_id: intended,
+                    },
+                ) => authorization_id == intended,
+                _ => false,
+            }
+    });
+    exact.next().is_some() && exact.next().is_none()
 }
 
 #[derive(Debug)]
@@ -750,7 +1385,48 @@ fn cleanup_target_is_absent(
                     && valid_token(observed_token) == Some(ownership_token)
             )
         }),
-        CleanupTarget::Volume { .. } | CleanupTarget::CheckpointFile { .. } => false,
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        } => {
+            let Some(replay) = &completed.volume_release else {
+                return false;
+            };
+            let mut volumes = runtime
+                .volumes
+                .iter()
+                .filter(|volume| &volume.volume_id == volume_id);
+            let Some(volume) = volumes.next() else {
+                return matches!(
+                    replay.disposition,
+                    VolumeDisposition::DeleteDisposableRoot { .. }
+                );
+            };
+            if volumes.next().is_some() || !volume.devices.is_empty() {
+                return false;
+            }
+            matches!(
+                &volume.authority,
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch: observed_epoch,
+                    head,
+                } if attachment_epoch
+                    .get()
+                    .checked_add(1)
+                    .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+                    == Some(*observed_epoch)
+                    && head.generation == replay.generation
+                    && runtime.volumes.iter().all(|candidate| {
+                        &candidate.volume_id != volume_id
+                            || candidate.local_lineages.iter().all(|lineage| {
+                                lineage.attachment_id == *attachment_id
+                                    && lineage.attachment_epoch == *attachment_epoch
+                            })
+                    })
+            )
+        }
+        CleanupTarget::CheckpointFile { .. } => false,
     }
 }
 
@@ -947,16 +1623,6 @@ fn canonical_remaining_cleanup(
                     attachment_epoch,
                     head,
                 } => {
-                    if matches!(
-                        intent.disposition,
-                        VolumeDisposition::DeleteDisposableRoot { .. }
-                    ) {
-                        // A normal release cannot authorize discarding a Root
-                        // tail.  A2 must first consume the exact V2 delete
-                        // authorization and expose Deleting evidence; N1 must
-                        // not synthesize that transition from Desired alone.
-                        continue;
-                    }
                     anyhow::ensure!(
                         attachment_id == &intent.attachment_id && volume.devices.is_empty(),
                         "cleanup successor cannot release a changed or published attachment"
@@ -970,9 +1636,42 @@ fn canonical_remaining_cleanup(
                             && lineage.remote_durable_generation == head.generation
                             && lineage.pending_pack_count.get() == 0
                             && !lineage.fenced
+                            && match (&lineage.acquire_origin, &intent.acquire) {
+                                (
+                                    cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                                        transition_id,
+                                    },
+                                    VolumeAcquire::Normal {
+                                        transition_id: intended,
+                                        ..
+                                    },
+                                ) => transition_id == intended,
+                                (
+                                    cats_api::runtime_reconciliation::AcquireOrigin::Takeover {
+                                        authorization_id,
+                                    },
+                                    VolumeAcquire::Takeover {
+                                        authorization_id: intended,
+                                    },
+                                ) => authorization_id == intended,
+                                _ => false,
+                            }
                     });
+                    let fully_drained = exact.next().is_some() && exact.next().is_none();
+                    if !fully_drained
+                        && matches!(
+                            intent.disposition,
+                            VolumeDisposition::DeleteDisposableRoot { .. }
+                        )
+                    {
+                        // R < L cannot take the normal release branch. The
+                        // authorization ID is intentionally absent from
+                        // Desired/checkpoint inventory, so this frozen schema
+                        // cannot mint DeleteDisposableRoot here.
+                        continue;
+                    }
                     anyhow::ensure!(
-                        exact.next().is_some() && exact.next().is_none(),
+                        fully_drained,
                         "cleanup successor cannot prove one fully drained local lineage"
                     );
                     let release_transition_id =
@@ -1552,7 +2251,7 @@ mod tests {
                 .unwrap();
         assert_eq!(successor.stable_state, Some(StableState::Suspended));
         assert!(matches!(
-            successor.step,
+            &successor.step,
             ReconcileStep::Stable {
                 state: StableState::Suspended
             }
@@ -1709,11 +2408,95 @@ mod tests {
         runtime.networks.clear();
         runtime.guest_transport = GuestTransportEvidence::Unavailable;
 
-        assert!(
-            cleanup_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor,)
+        let successor =
+            cleanup_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor)
                 .unwrap()
-                .is_none()
+                .expect("R == L disposable Root must take the normal release branch");
+        assert!(matches!(
+            &successor.step,
+            ReconcileStep::CleanupRelease {
+                cleanup: CleanupRelease {
+                    target: CleanupTarget::Volume { .. },
+                    volume_release: Some(_),
+                    ..
+                }
+            }
+        ));
+        assert!(!matches!(
+            successor.step,
+            ReconcileStep::DeleteDisposableRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_release_planner_covers_the_complete_multi_volume_set() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        let mut persistent_intent = desired.volumes[0].clone();
+        persistent_intent.volume_intent_id = Id::new("persistent-intent-02").unwrap();
+        persistent_intent.disk_id = Id::new("persistent-disk-02").unwrap();
+        persistent_intent.volume_id = Id::new("persistent-volume-02").unwrap();
+        persistent_intent.attachment_id = Id::new("persistent-attachment-02").unwrap();
+        persistent_intent.guest_device.slot = 2;
+        persistent_intent.disk_kind = cats_api::runtime_reconciliation::DiskKind::Persistent;
+        persistent_intent.disposition = VolumeDisposition::DetachRetained;
+        persistent_intent.acquire = VolumeAcquire::Takeover {
+            authorization_id: Id::new("persistent-takeover-02").unwrap(),
+        };
+        persistent_intent.mount = Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+            filesystem_uuid: RandomId128::new("88888888888888888888888888888888").unwrap(),
+            mount_path: HostPath::new("/data".to_owned()).unwrap(),
+            initialization: cats_api::runtime_reconciliation::FilesystemInitialization::Existing,
+        });
+        let mut persistent = runtime.volumes[0].clone();
+        persistent.volume_intent_id = Some(persistent_intent.volume_intent_id.clone());
+        persistent.disk_id = Some(persistent_intent.disk_id.clone());
+        persistent.volume_id = persistent_intent.volume_id.clone();
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            ..
+        } = &mut persistent.authority
+        else {
+            panic!("fixture volume is not Owned")
+        };
+        *attachment_id = persistent_intent.attachment_id.clone();
+        persistent.local_lineages[0].attachment_id = persistent_intent.attachment_id.clone();
+        persistent.local_lineages[0].attachment_epoch = *attachment_epoch;
+        persistent.local_lineages[0].acquire_origin =
+            cats_api::runtime_reconciliation::AcquireOrigin::Takeover {
+                authorization_id: Id::new("persistent-takeover-02").unwrap(),
+            };
+        persistent.devices.clear();
+        desired.volumes.push(persistent_intent);
+        runtime.volumes.push(persistent);
+        runtime.processes.clear();
+        runtime.networks.clear();
+        runtime.mounts.clear();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        checkpoint.processes.clear();
+        checkpoint.networks.clear();
+        checkpoint.mounts.clear();
+        checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+
+        let mut plans = canonical_remaining_cleanup(&desired, &runtime, &checkpoint, &[]).unwrap();
+        plans.sort_by(|left, right| left.order.cmp(&right.order));
+        assert_eq!(plans.len(), 2);
+        let planned_ids = plans
+            .iter()
+            .map(|plan| match &plan.target {
+                CleanupTarget::Volume { volume_id, .. } => volume_id.clone(),
+                other => panic!("unexpected non-Volume cleanup: {other:?}"),
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            planned_ids,
+            desired
+                .volumes
+                .iter()
+                .map(|intent| intent.volume_id.clone())
+                .collect()
         );
+        assert!(plans.iter().all(|plan| plan.volume_release.is_some()));
     }
 
     #[test]
@@ -1840,6 +2623,126 @@ mod tests {
                 recovered.checkpoint(),
                 if published { &successor } else { &predecessor },
                 "wrong durable token boundary after {stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_volume_release_successor_is_atomic_across_checkpoint_crashes() {
+        for stage in [
+            WriteStage::Write,
+            WriteStage::TempWritten,
+            WriteStage::FileSynced,
+            WriteStage::Renamed,
+            WriteStage::DirectorySynced,
+        ] {
+            let (desired, mut predecessor, mut runtime) = fixtures(RuntimeTarget::Cold);
+            predecessor.processes.clear();
+            predecessor.networks.clear();
+            predecessor.mounts.clear();
+            predecessor.guest_transport = GuestTransportEvidence::Unavailable;
+            runtime.processes.clear();
+            runtime.networks.clear();
+            runtime.mounts.clear();
+            runtime.guest_transport = GuestTransportEvidence::Unavailable;
+            let plans = canonical_remaining_cleanup(&desired, &runtime, &predecessor, &[]).unwrap();
+            let release = plans
+                .into_iter()
+                .find(|plan| matches!(plan.target, CleanupTarget::Volume { .. }))
+                .unwrap();
+            predecessor.stable_state = None;
+            predecessor.runtime_incarnation = None;
+            predecessor.runtime_launch = RuntimeLaunch::Absent;
+            predecessor.step = ReconcileStep::CleanupRelease {
+                cleanup: CleanupRelease {
+                    target: release.target,
+                    inventory_session: SessionBinding {
+                        node_id: predecessor.node_id.clone(),
+                        node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                            "11111111111111111111111111111111".to_owned(),
+                        )
+                        .unwrap(),
+                        agent_instance_id: RandomId128::new("99999999999999999999999999999999")
+                            .unwrap(),
+                        agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1)
+                            .unwrap(),
+                    },
+                    inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+                    inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(1)
+                        .unwrap(),
+                    desired_read_position: cats_api::runtime_reconciliation::Sequence::new(1)
+                        .unwrap(),
+                    volume_release: release.volume_release,
+                },
+            };
+            let (attachment_epoch, head) = match &runtime.volumes[0].authority {
+                VolumeAuthorityEvidence::Owned {
+                    attachment_epoch,
+                    head,
+                    ..
+                } => (*attachment_epoch, head.clone()),
+                _ => panic!("fixture volume is not Owned"),
+            };
+            runtime.volumes[0].authority = VolumeAuthorityEvidence::Unowned {
+                attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(
+                    attachment_epoch.get() + 1,
+                )
+                .unwrap(),
+                head,
+            };
+            runtime.volumes[0].local_lineages.clear();
+            let cursor = FreshCleanupCursor {
+                session: match &predecessor.step {
+                    ReconcileStep::CleanupRelease { cleanup } => cleanup.inventory_session.clone(),
+                    _ => unreachable!(),
+                },
+                inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(2).unwrap(),
+                inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(2)
+                    .unwrap(),
+                desired_read_position: cats_api::runtime_reconciliation::Sequence::new(2).unwrap(),
+                observed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_800_000_000_000)
+                    .unwrap(),
+            };
+            let successor =
+                cleanup_postcondition_successor_at(&desired, &runtime, &predecessor, &[], &cursor)
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                successor.step,
+                ReconcileStep::Stable {
+                    state: StableState::Cold
+                }
+            ));
+
+            let directory = TempDir::new().unwrap();
+            let store = FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
+            let stored = store.create(&predecessor).unwrap();
+            let context = RuntimeDesiredEffectContext::for_test(
+                crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let current = store.assert_current(&stored).unwrap();
+            store.inject_crash_once(stage);
+            assert!(persist_lifecycle_successor(
+                &context,
+                &store,
+                &stored,
+                &successor,
+                &current,
+                "test exact Volume release successor crash",
+            )
+            .is_err());
+            drop(current);
+            drop(store);
+
+            let reopened =
+                FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
+            let recovered = reopened.load().unwrap().unwrap();
+            let published = matches!(stage, WriteStage::Renamed | WriteStage::DirectorySynced);
+            assert_eq!(
+                recovered.checkpoint(),
+                if published { &successor } else { &predecessor },
+                "wrong Volume successor boundary after {stage:?}"
             );
         }
     }
