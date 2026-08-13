@@ -3374,10 +3374,31 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
         "the workflow must have one Guest release producer"
     );
     assert!(workflow.contains("RELEASE_OUT=\"$PWD/guest-runtime-release.v1\""));
-    assert_eq!(
-        workflow.matches("needs: guest-runtime-release").count(),
-        2,
-        "Control and Node artifacts must consume the same build job"
+    let control = workflow
+        .split_once("  control-plane-image:\n")
+        .and_then(|(_, rest)| rest.split_once("  gateway-image:\n"))
+        .map(|(section, _)| section)
+        .expect("control-plane image job");
+    let gateway = workflow
+        .split_once("  gateway-image:\n")
+        .and_then(|(_, rest)| rest.split_once("  worker-bundle:\n"))
+        .map(|(section, _)| section)
+        .expect("gateway image job");
+    let worker = workflow
+        .split_once("  worker-bundle:\n")
+        .map(|(_, section)| section)
+        .expect("worker bundle job");
+    for consumer in [control, worker] {
+        assert!(
+            consumer.contains("needs: [aws-target, guest-runtime-release]"),
+            "Control and Node artifacts must consume the canonical Guest release after the AWS target fence"
+        );
+        assert!(consumer.contains("uses: actions/download-artifact@v4"));
+        assert!(consumer.contains("name: guest-runtime-release-v1"));
+    }
+    assert!(
+        !gateway.contains("guest-runtime-release-v1"),
+        "the Gateway image must not pretend to consume the shared Guest release artifact"
     );
     assert_eq!(
         workflow.matches("name: guest-runtime-release-v1").count(),
@@ -3649,15 +3670,19 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let identity_validate = terraform
         .find("validate-node-identity-installation.sh\"")
         .expect("staged identity validation");
-    let early_idle_guard = terraform
-        .find("require-idle-worker.sh\"")
-        .expect("drained worker guard");
+    let route_v2_validate = terraform
+        .find("cats-route-v2-node-r1-validator\" --directory \"$route_v2_stage\"")
+        .expect("staged Route v2 candidate validation");
     let deployment_lock = terraform
         .find("cats_acquire_worker_deployment_lock")
         .expect("Host deployment lock");
-    let locked_metering = terraform[deployment_lock..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let exact_classification = terraform[deployment_lock..]
+        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
+        .expect("exact Route v2 classification under the Host lock");
+    let locked_metering = terraform[exact_classification..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+        .map(|offset| exact_classification + offset)
         .expect("metering cgroup recomputation under the Host lock");
     let locked_idle_guard = terraform[locked_metering..]
         .find("require-idle-worker.sh\"")
@@ -3677,7 +3702,8 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     assert!(
         archive_listing < archive_extract
             && archive_extract < release_verify
-            && release_verify < identity_validate,
+            && release_verify < identity_validate
+            && identity_validate < route_v2_validate,
         "nothing from the empty stage may execute before verified extraction"
     );
     let authorize = terraform
@@ -3696,13 +3722,23 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         first_install < authorize && authorize < start && start < readiness && readiness < commit
     );
     assert!(
-        identity_validate < early_idle_guard
-            && early_idle_guard < deployment_lock
+        route_v2_validate < deployment_lock
             && deployment_lock < locked_metering
+            && deployment_lock < exact_classification
+            && exact_classification < locked_metering
             && locked_metering < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
+    );
+    let pre_lock = &terraform[..deployment_lock];
+    assert!(
+        !pre_lock.contains("systemctl show"),
+        "exact Route v2 classification must happen under the Host lock before any systemctl query"
+    );
+    assert!(
+        !pre_lock.contains("require-idle-worker.sh"),
+        "the worker deployment must not reintroduce an unlocked idle guard before the Host lock"
     );
     for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
         assert!(
