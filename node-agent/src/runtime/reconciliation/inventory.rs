@@ -620,35 +620,43 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 });
             }
             if let Some(kernel_nbd) = &self.kernel_nbd_port {
-                let managed_processes = node_global_process_admission.as_ref().context(
-                    "kernel-NBD pool scan lacks its same-pass managed-process admission",
-                )?;
-                match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
-                    KernelNbdPoolScanOutcome::Complete(admission) => {
-                        if admission.has_unavailable_device() {
+                if let Some(managed_processes) = node_global_process_admission.as_ref() {
+                    match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
+                        KernelNbdPoolScanOutcome::Complete(admission) => {
+                            if admission.has_unavailable_device() {
+                                aggregate
+                                    .unavailable_sources
+                                    .push(InventorySource::BlockFrontend);
+                            }
+                            for (cat_id, projections) in admission.device_projections() {
+                                for (volume_id, device) in projections {
+                                    anyhow::ensure!(
+                                        serving_devices_by_cat
+                                            .entry(cat_id.clone())
+                                            .or_default()
+                                            .insert(volume_id, device)
+                                            .is_none(),
+                                        "managed frontend scan projects two devices for one Volume"
+                                    );
+                                }
+                            }
+                            kernel_nbd_pool_admission = Some(admission);
+                        }
+                        KernelNbdPoolScanOutcome::Unavailable => {
                             aggregate
                                 .unavailable_sources
                                 .push(InventorySource::BlockFrontend);
                         }
-                        for (cat_id, projections) in admission.device_projections() {
-                            for (volume_id, device) in projections {
-                                anyhow::ensure!(
-                                    serving_devices_by_cat
-                                        .entry(cat_id.clone())
-                                        .or_default()
-                                        .insert(volume_id, device)
-                                        .is_none(),
-                                    "managed frontend scan projects two devices for one Volume"
-                                );
-                            }
-                        }
-                        kernel_nbd_pool_admission = Some(admission);
                     }
-                    KernelNbdPoolScanOutcome::Unavailable => {
-                        aggregate
-                            .unavailable_sources
-                            .push(InventorySource::BlockFrontend);
-                    }
+                } else {
+                    // A failed process bridge has already made this scan
+                    // incomplete. Kernel-NBD proof is a join with that exact
+                    // same-pass admission, so touching the pool cannot restore
+                    // completeness and must not replace an earlier exact VMM
+                    // negative with a scanner error.
+                    aggregate
+                        .unavailable_sources
+                        .push(InventorySource::BlockFrontend);
                 }
             }
             if processes_by_cat.keys().any(|cat_id| {
