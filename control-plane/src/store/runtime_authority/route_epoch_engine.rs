@@ -70,6 +70,40 @@ pub(crate) struct RequireIdleOpenBusyProof {
     pub(crate) source_runtime_incarnation: RandomId128,
 }
 
+/// Stable G4 domain identity and exact accepted-observation suffix for a
+/// one-shot RequireIdle Busy result.  `gate_closed` is deliberately absent:
+/// the commit-side validator derives that authority from the accepted
+/// checkpoint and matching condition rather than trusting a caller boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequireIdleBusyEvidence {
+    pub(crate) node_id: Id,
+    pub(crate) agent_session_epoch: Epoch,
+    pub(crate) inventory_epoch: Epoch,
+    pub(crate) observation_id: RandomId128,
+    pub(crate) heartbeat_sequence: cats_api::runtime_reconciliation::Sequence,
+    pub(crate) attempt_id: RandomId128,
+    pub(crate) source_revision: Revision,
+    pub(crate) source_runtime_incarnation: RandomId128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouteEpochSystemSource {
+    RequireIdleAttempt {
+        attempt_id: RandomId128,
+        source_revision: Revision,
+        source_runtime_incarnation: RandomId128,
+    },
+    RequireIdleBusy {
+        evidence: RequireIdleBusyEvidence,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequireIdleGateOutcome {
+    NeverClosed,
+    ClosedOrAmbiguous,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteEpochMutationPlan {
     pub(crate) expected_current: DesiredRuntimeSpec,
@@ -78,6 +112,7 @@ pub(crate) struct RouteEpochMutationPlan {
     pub(crate) placement_snapshots: Vec<PlacementTargetSnapshot>,
     pub(crate) active_guest_digest: Sha256Digest,
     pub(crate) require_idle_open_busy_proof: Option<RequireIdleOpenBusyProof>,
+    pub(crate) system_source: Option<RouteEpochSystemSource>,
 }
 
 impl Store {
@@ -255,7 +290,7 @@ fn plan_endpoint_mutation(
         .endpoints
         .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
     endpoint_records.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-    finish_plan(current, desired, endpoint_records, Vec::new(), None)
+    finish_plan(current, desired, endpoint_records, Vec::new(), None, None)
 }
 
 fn plan_require_idle(
@@ -284,11 +319,23 @@ fn plan_require_idle(
     let mut desired = successor_shell(&current)?;
     desired.target = RuntimeTarget::Suspended;
     desired.transition = RuntimeTransition::RequireIdle {
+        attempt_id: attempt_id.clone(),
+        source_revision: current.desired_revision,
+        source_runtime_incarnation: source_runtime_incarnation.clone(),
+    };
+    let system_source = RouteEpochSystemSource::RequireIdleAttempt {
         attempt_id,
         source_revision: current.desired_revision,
         source_runtime_incarnation,
     };
-    finish_plan(current, desired, endpoint_records, Vec::new(), None)
+    finish_plan(
+        current,
+        desired,
+        endpoint_records,
+        Vec::new(),
+        None,
+        Some(system_source),
+    )
 }
 
 fn plan_busy_recovery(
@@ -322,6 +369,16 @@ fn plan_busy_recovery(
     let mut desired = successor_shell(&current)?;
     desired.target = RuntimeTarget::Running;
     desired.transition = RuntimeTransition::CancelAndDrain;
+    let evidence = RequireIdleBusyEvidence {
+        node_id: observed.session.node_id.clone(),
+        agent_session_epoch: observed.session.agent_session_epoch,
+        inventory_epoch: observed.inventory_epoch,
+        observation_id: observed.source_observation_id.clone(),
+        heartbeat_sequence: observed.heartbeat_sequence,
+        attempt_id: attempt_id.clone(),
+        source_revision: *source_revision,
+        source_runtime_incarnation: source_runtime_incarnation.clone(),
+    };
     let proof = if busy.gate_closed {
         for endpoint in &mut desired.endpoints {
             endpoint.route_epoch = next_epoch(endpoint.route_epoch)?;
@@ -345,6 +402,7 @@ fn plan_busy_recovery(
         endpoint_records,
         placement_snapshots,
         proof,
+        Some(RouteEpochSystemSource::RequireIdleBusy { evidence }),
     )
 }
 
@@ -454,6 +512,48 @@ pub(super) fn open_busy_proof_matches(
         .is_ok_and(|busy| !busy.gate_closed)
 }
 
+pub(super) fn busy_evidence_matches(
+    expected_current: &DesiredRuntimeSpec,
+    observed: &CurrentCatRuntime,
+    evidence: &RequireIdleBusyEvidence,
+) -> Option<RequireIdleGateOutcome> {
+    let RuntimeTransition::RequireIdle {
+        attempt_id,
+        source_revision,
+        source_runtime_incarnation,
+    } = &expected_current.transition
+    else {
+        return None;
+    };
+    if evidence.node_id != expected_current.placement.node_id
+        || evidence.node_id != observed.session.node_id
+        || evidence.agent_session_epoch != observed.session.agent_session_epoch
+        || evidence.inventory_epoch != observed.inventory_epoch
+        || evidence.observation_id != observed.source_observation_id
+        || evidence.heartbeat_sequence != observed.heartbeat_sequence
+        || evidence.attempt_id != *attempt_id
+        || evidence.source_revision != *source_revision
+        || evidence.source_runtime_incarnation != *source_runtime_incarnation
+        || validate_applied_current(expected_current, observed).is_err()
+    {
+        return None;
+    }
+    require_idle_busy_fact(
+        observed,
+        attempt_id,
+        *source_revision,
+        source_runtime_incarnation,
+    )
+    .ok()
+    .map(|busy| {
+        if busy.gate_closed {
+            RequireIdleGateOutcome::ClosedOrAmbiguous
+        } else {
+            RequireIdleGateOutcome::NeverClosed
+        }
+    })
+}
+
 fn validate_applied_current(
     current: &DesiredRuntimeSpec,
     observed: &CurrentCatRuntime,
@@ -492,6 +592,7 @@ fn finish_plan(
     endpoint_records: Vec<EndpointRecordCandidate>,
     placement_snapshots: Vec<PlacementTargetSnapshot>,
     require_idle_open_busy_proof: Option<RequireIdleOpenBusyProof>,
+    system_source: Option<RouteEpochSystemSource>,
 ) -> Result<RouteEpochMutationPlan> {
     desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
     desired.spec_digest = spec_digest(&desired)
@@ -503,6 +604,7 @@ fn finish_plan(
         endpoint_records,
         placement_snapshots,
         require_idle_open_busy_proof,
+        system_source,
     })
 }
 

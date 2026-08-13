@@ -33,7 +33,10 @@ use super::product_rows::{
     load_assigned_desired_for_update, load_assigned_desired_unlocked, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_operation,
 };
-use super::route_epoch_engine::{open_busy_proof_matches, RequireIdleOpenBusyProof};
+use super::route_epoch_engine::{
+    busy_evidence_matches, open_busy_proof_matches, RequireIdleBusyEvidence,
+    RequireIdleGateOutcome, RequireIdleOpenBusyProof,
+};
 use super::rows::{database_now, load_delete_completion_for_update, load_volume_for_update};
 use crate::store::agent_sessions::{
     load_current_session_for_update, load_current_session_unlocked,
@@ -3265,6 +3268,41 @@ pub(super) fn validate_require_idle_open_busy_proof_in(
         return Ok(false);
     }
     Ok(open_busy_proof_matches(expected_current, &observed, proof))
+}
+
+/// Commit-side validator for the system-domain Busy source.  Unlike the
+/// narrow old-epoch exception above, this accepts both Busy outcomes and
+/// returns the gate classification derived from the exact stored fact.
+#[allow(
+    dead_code,
+    reason = "the A3 common system-domain commit consumes this G4 validator after branch composition"
+)]
+pub(super) fn validate_require_idle_busy_evidence_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    evidence: &RequireIdleBusyEvidence,
+) -> AuthorityTxResult<Option<RequireIdleGateOutcome>> {
+    if evidence.node_id != expected_current.placement.node_id {
+        return Ok(None);
+    }
+    let Some(session) = load_current_session_for_update(transaction, &evidence.node_id)? else {
+        return Ok(None);
+    };
+    if session.agent_session_epoch != evidence.agent_session_epoch {
+        return Ok(None);
+    }
+    let Some(observed) = load_current_cat_runtime_for_update(
+        transaction,
+        &evidence.node_id,
+        &expected_current.cat_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(None);
+    }
+    Ok(busy_evidence_matches(expected_current, &observed, evidence))
 }
 
 fn load_current_cat_runtime_for_update(

@@ -60,7 +60,8 @@ use super::product_rows::{
     load_operation_by_cat_revision_unlocked, operation_by_workspace_candidates_sql,
 };
 use super::route_epoch_engine::{
-    EndpointBindingWithoutEpoch, EndpointMutation, RouteEpochMutationPlan,
+    EndpointBindingWithoutEpoch, EndpointMutation, RequireIdleGateOutcome, RouteEpochMutationPlan,
+    RouteEpochSystemSource,
 };
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
@@ -3154,6 +3155,16 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
         RuntimeTransition::CancelAndDrain => panic!("planner omitted RequireIdle"),
     };
     assert_eq!(suspend_plan.desired.target, RuntimeTarget::Suspended);
+    assert!(matches!(
+        &suspend_plan.system_source,
+        Some(RouteEpochSystemSource::RequireIdleAttempt {
+            attempt_id,
+            source_revision,
+            source_runtime_incarnation,
+        }) if *attempt_id == random_id(0x7001)
+            && *source_revision == create.candidate.desired.desired_revision
+            && *source_runtime_incarnation == source_incarnation
+    ));
     assert_eq!(
         suspend_plan.desired.endpoints[0].route_epoch,
         create.candidate.desired.endpoints[0].route_epoch
@@ -3184,6 +3195,22 @@ fn g4_require_idle_open_busy_recovery_preserves_epochs_and_replays_once() {
         .as_ref()
         .expect("never-closed Busy carries a typed proof");
     assert_eq!(proof.source_runtime_incarnation, source_incarnation);
+    let evidence = match &recovery_plan.system_source {
+        Some(RouteEpochSystemSource::RequireIdleBusy { evidence }) => evidence,
+        _ => panic!("Busy recovery omitted its typed system source"),
+    };
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                super::runtime_spine::validate_require_idle_busy_evidence_in(
+                    transaction,
+                    &recovery_plan.expected_current,
+                    evidence,
+                )
+            })
+            .unwrap(),
+        Some(RequireIdleGateOutcome::NeverClosed)
+    );
     let recovery =
         desired_mutation_from_route_plan(recovery_plan, "op_g4_idle_recovery", "g4-idle-recovery");
     assert!(matches!(
@@ -3237,6 +3264,11 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
     let old_plan = store
         .plan_require_idle_busy_recovery(&create.candidate.cat_id)
         .unwrap();
+    let old_evidence = match &old_plan.system_source {
+        Some(RouteEpochSystemSource::RequireIdleBusy { evidence }) => evidence.clone(),
+        _ => panic!("Busy recovery omitted its typed system source"),
+    };
+    let old_expected = old_plan.expected_current.clone();
     let old_recovery =
         desired_mutation_from_route_plan(old_plan, "op_g4_old_session", "g4-old-session");
     refresh_assigned_route_runtime_for_test(
@@ -3245,6 +3277,18 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
         &release,
         712,
         AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed: false },
+    );
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                super::runtime_spine::validate_require_idle_busy_evidence_in(
+                    transaction,
+                    &old_expected,
+                    &old_evidence,
+                )
+            })
+            .unwrap(),
+        None
     );
     assert!(matches!(
         commit_desired_mutation(&store, &old_recovery),
@@ -3266,6 +3310,22 @@ fn g4_require_idle_closed_busy_burns_epoch_and_old_session_proof_is_stale() {
     assert_eq!(
         closed_plan.desired.endpoints[0].route_epoch.get(),
         suspend.desired.endpoints[0].route_epoch.get() + 1
+    );
+    let closed_evidence = match &closed_plan.system_source {
+        Some(RouteEpochSystemSource::RequireIdleBusy { evidence }) => evidence,
+        _ => panic!("closed Busy recovery omitted its typed system source"),
+    };
+    assert_eq!(
+        store
+            .authority_transaction(|transaction| {
+                super::runtime_spine::validate_require_idle_busy_evidence_in(
+                    transaction,
+                    &closed_plan.expected_current,
+                    closed_evidence,
+                )
+            })
+            .unwrap(),
+        Some(RequireIdleGateOutcome::ClosedOrAmbiguous)
     );
 }
 
