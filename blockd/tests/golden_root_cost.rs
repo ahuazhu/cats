@@ -162,12 +162,16 @@ fn attach(env: &Env, volume: &str, size: u64) -> Arc<ChunkEngine> {
         Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(error) => panic!("create volume: {error}"),
     }
+    let epoch = env.meta.load_head(volume).unwrap().lease_epoch + 1;
+    env.meta
+        .install_grant_for_tests(volume, volume, epoch)
+        .expect("external grant");
     let mut cfg = EngineConfig::new(volume, env.root.join(format!("data-{volume}")), volume);
     // A benchmark deliberately runs commits that take tens of seconds against a
     // remote store; the 5 s default lease would expire under the copy path and
     // fail the CAS, which is a property of the benchmark, not of the code.
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).expect("attach")
+    ChunkEngine::attach_granted(cfg, env.blob.clone(), env.meta.clone()).expect("attach")
 }
 
 /// The old path: write the image through the engine and commit it.

@@ -59,10 +59,12 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
     let size = 2 * cats_api::chunk::CHUNK_SIZE as u64;
     meta.create_volume("vol_live", size).unwrap();
+    meta.install_grant_for_tests("vol_live", "att_a", 1)
+        .unwrap();
 
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     {
-        let engine = ChunkEngine::attach(
+        let engine = ChunkEngine::attach_granted(
             EngineConfig::new("vol_live", dir.path().join("data-a"), "att_a"),
             blob.clone(),
             meta.clone(),
@@ -73,7 +75,9 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
         engine.detach().unwrap();
     }
     // Fresh "host", empty cache: everything must come back from S3.
-    let engine = ChunkEngine::attach(
+    meta.install_grant_for_tests("vol_live", "att_b", 2)
+        .unwrap();
+    let engine = ChunkEngine::attach_granted(
         EngineConfig::new("vol_live", dir.path().join("data-b"), "att_b"),
         blob,
         meta,

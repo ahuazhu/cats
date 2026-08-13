@@ -37,8 +37,8 @@ impl ChunkEngine {
                     ) {
                         Ok(()) => {}
                         // The row no longer names this attachment and epoch: the
-                        // lease was revoked or acquired by someone else. That is
-                        // the one terminal outcome.
+                        // external authority changed or closed the exact grant.
+                        // That is the one terminal outcome.
                         Err(e @ (MetaError::Fenced | MetaError::NotFound(_))) => {
                             tracing::error!("lease renewal failed; fencing writes: {e}");
                             engine.fenced.store(true, Ordering::SeqCst);

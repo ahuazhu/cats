@@ -22,7 +22,6 @@ cats unmount project-data</code></pre>
 <p>挂载会创建带单调递增 fencing epoch 的运行时 Attachment。卸载会先同步并 detach，再让磁盘回到 Available。即使两个写者修改不同逻辑块，V1 也会拒绝第二个读写 Attachment，因为 ext4 文件系统本身仍是单写者。</p>
 
 <h2 id="resize">扩容磁盘</h2>
-<pre><code>cats disk resize project-data --size 40GiB</code></pre>
 <p>V1 只支持增大容量。如果当前运行路径要求磁盘处于 Available，请按 API 的前置条件先卸载。绝不能在 ext4 下方缩小卷。</p>
 
 <h2 id="snapshot">创建快照</h2>

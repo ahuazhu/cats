@@ -3,14 +3,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use cats_control_plane::store::DsnSource as ControlStoreDsnSource;
-use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
-use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
-use cats_storage::{
-    open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetadataStoreFactory,
-};
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
 use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
 use cats_usage_store_postgres::{DsnSource, PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
@@ -24,8 +20,7 @@ struct Args {
     /// control resource store itself is PostgreSQL (`--control-store-url`).
     #[arg(long, default_value = "cats-control.db")]
     db_path: std::path::PathBuf,
-    /// Control resource database. Falls back to CATS_POSTGRES_URL, the same
-    /// DSN the storage metadata adapter uses: one database, disjoint tables.
+    /// Control resource database. Falls back to CATS_POSTGRES_URL.
     #[arg(long, env = "CATS_CONTROL_POSTGRES_URL")]
     control_store_url: Option<String>,
     /// File holding the control resource PostgreSQL URL. It is re-read after
@@ -95,14 +90,6 @@ struct Args {
         default_value_t = DEFAULT_WORKERS
     )]
     usage_postgres_workers: usize,
-    #[arg(long, default_value = "sqlite")]
-    metadata_store_adapter: String,
-    #[arg(
-        long = "metadata-store-option",
-        value_name = "KEY=VALUE",
-        default_value = "path=cats-storage-meta.db"
-    )]
-    metadata_store_options: Vec<String>,
     /// Provider-neutral immutable-object adapter used only to read exact
     /// golden-image manifest keys.
     #[arg(long, env = "CATS_OBJECT_STORE_ADAPTER", default_value = "file")]
@@ -298,14 +285,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let metadata_config = AdapterConfig::from_cli(args.metadata_store_options)?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let storage_meta = open_metadata_store(
-        &args.metadata_store_adapter,
-        &metadata_config,
-        &metadata_factories,
-    )?;
     let object_config = AdapterConfig::from_cli(args.object_store_options)?;
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
@@ -592,7 +571,7 @@ async fn main() -> anyhow::Result<()> {
         control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
-        storage_meta,
+        retired_storage_meta_for_tests: None,
         image_blob,
         auth_token: args.auth_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),

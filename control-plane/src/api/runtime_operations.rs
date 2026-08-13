@@ -109,9 +109,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::{header, HeaderValue};
-    use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::MetadataStore;
 
     use super::*;
     use crate::controller::AutoTierPolicy;
@@ -123,9 +121,6 @@ mod tests {
         let usage = Arc::new(
             SqliteUsageStore::open(&dir.path().join("usage.db")).expect("open usage store"),
         );
-        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
-            SqliteMetadataStore::open(&dir.path().join("storage.db")).expect("open metadata store"),
-        );
         let dsn = crate::testsupport::isolated_control_store_url();
         let handle = crate::server::spawn(Config {
             listen: "127.0.0.1:0".into(),
@@ -133,7 +128,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:

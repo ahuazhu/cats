@@ -685,9 +685,13 @@ chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直�
   `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
   让链更长、冷读更贵、GC 还得当它活着)。
 
-入口有两个:
+兼容数据面入口有两个，二者都必须采用外部权威已安装并显式传入的精确 owner/epoch，blockd
+不会自行抢租约：
 
-- `cats-blockd --collect-garbage`:附着、扫一遍、退出,不需要监听套接字。
-- 服务期间**按 `--gc-interval-ms` 定时自动跑**(默认 600000,设 0 关闭)。默认开着,因为没有它
-  被取代的对象会伴随卷的整个生命周期堆积,而**只有持有租约的这个进程有资格扫**。扫描失败只是
-  记一条 warn,下一轮重试,不会挡住 Guest。
+- `cats-blockd --collect-garbage --attachment-epoch <epoch>`：采用授权、扫一遍、退出，
+  不需要监听套接字。
+- 兼容 serving 期间按 `--gc-interval-ms` 定时自动跑（默认 600000，设 0 关闭）。扫描失败只记
+  warn，下一轮重试，不会挡住 Guest。
+
+clean-slate signed Runtime 不调用这两个兼容入口；其删除生命周期仍须使用带精确卷授权、快照
+保留集与完成回执的 typed effect。

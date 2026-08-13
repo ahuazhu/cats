@@ -71,7 +71,6 @@ Status reports platform and Guest work leases, signal freshness, eligibility, an
     cats disk create NAME --size SIZE
     cats disk ls
     cats disk get NAME
-    cats disk resize NAME --size SIZE
     cats disk snapshot NAME
     cats disk delete NAME
     cats mount DISK --cat CAT [--at /data]

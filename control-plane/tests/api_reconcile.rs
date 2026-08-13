@@ -71,6 +71,7 @@ struct StubNode {
     /// models the ambiguous boundary where the Host is already serving the
     /// Guest but the control plane never receives the successful job result.
     lose_start_responses_remaining: Arc<AtomicUsize>,
+    started_volumes: Arc<Mutex<Vec<(String, String)>>>,
     /// Hold selected lifecycle HTTP responses after their result has been
     /// computed. Successful results are journaled by job id first, matching
     /// NodeRuntime's ambiguous-success boundary during a reconciler handoff;
@@ -79,8 +80,6 @@ struct StubNode {
     job_response_ready: Arc<tokio::sync::Notify>,
     job_response_release: Arc<tokio::sync::Notify>,
     applied_lifecycle_jobs: Arc<Mutex<HashMap<String, NodeJobResult>>>,
-    started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
-    storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
     /// Every OCI deploy that reached this node, as `(cat, app, image)`. The
     /// count is the assertion that matters: a retried or duplicated request
@@ -263,18 +262,11 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         let NodeJobAction::StartCat { volumes, .. } = &job.action else {
             unreachable!("checked StartCat above")
         };
-        let mut epochs = node.started_volume_epochs.lock().unwrap();
-        for volume in volumes {
-            let epoch = node
-                .storage_meta
-                .acquire_lease(&volume.volume_id, &volume.attachment_id, 60_000)
-                .unwrap();
-            epochs.push((
-                volume.volume_id.clone(),
-                volume.attachment_id.clone(),
-                epoch,
-            ));
-        }
+        node.started_volumes.lock().unwrap().extend(
+            volumes
+                .iter()
+                .map(|volume| (volume.volume_id.clone(), volume.attachment_id.clone())),
+        );
     }
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
@@ -394,12 +386,11 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
         fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
         lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        started_volumes: Arc::new(Mutex::new(Vec::new())),
         hold_job_responses_remaining: Arc::new(Mutex::new(HashMap::new())),
         job_response_ready: Arc::new(tokio::sync::Notify::new()),
         job_response_release: Arc::new(tokio::sync::Notify::new()),
         applied_lifecycle_jobs: Arc::new(Mutex::new(HashMap::new())),
-        started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
-        storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
         oci_deploys: Arc::new(Mutex::new(Vec::new())),
         oci_deploy_delay: Arc::new(Mutex::new(Duration::ZERO)),
@@ -605,7 +596,7 @@ impl Ctx {
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            storage_meta,
+            retired_storage_meta_for_tests: Some(storage_meta),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt:
@@ -1079,7 +1070,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
@@ -1216,7 +1207,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
@@ -2085,7 +2076,7 @@ async fn snapshot_requires_the_running_disks_remote_watermark() {
 }
 
 #[tokio::test]
-async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_epoch() {
+async fn ambiguous_start_response_retries_the_same_node_job() {
     let ctx = Ctx::new_with_auto_tier(Default::default(), 1_500).await;
     let source = start_stub_node(&ctx.cp, "node_z").await;
     source
@@ -2095,22 +2086,16 @@ async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_ep
 
     ctx.create_cat("ambiguous-start", None).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let (volume_id, attachment_id, epoch) = loop {
-        if let Some(epoch) = source
-            .started_volume_epochs
-            .lock()
-            .unwrap()
-            .first()
-            .cloned()
-        {
-            break epoch;
+    loop {
+        if !source.started_volumes.lock().unwrap().is_empty() {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the injected StartCat never acquired its disk epoch"
+            "the injected StartCat never presented its disk binding"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    }
 
     // If the control plane treats the missing response as a failed launch, this
     // lexicographically earlier node wins the next placement. A safe retry must
@@ -2140,15 +2125,10 @@ async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_ep
             .all(|job| !job.contains("_start_cat")),
         "an ambiguous launch must not move to another Host"
     );
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&volume_id, &attachment_id, epoch, 60_000)
-        .expect("replaying an ambiguous StartCat must preserve its live disk epoch");
 }
 
 #[tokio::test]
-async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
+async fn node_loss_preserves_placement_until_fencing_is_explicitly_confirmed() {
     let ctx = Ctx::new().await;
     let node_a = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("dev", None).await;
@@ -2157,20 +2137,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     ctx.create_cat("doomed", None).await;
     let doomed = ctx.wait_observed("doomed", ObservedState::Running).await;
     assert_eq!(doomed.node_id.as_deref(), Some("node_a"));
-    let root = ctx
-        .cp
-        .state
-        .store
-        .get_disk(&cat.workspace_id, &cat.root_disk_id)
-        .unwrap();
-    let old_attachment = "old-node-a-attachment";
-    let old_epoch = ctx
-        .cp
-        .state
-        .storage_meta
-        .acquire_lease(&root.volume_id, old_attachment, 60_000)
-        .unwrap();
-
     // A second node joins and the first heartbeat stream is interrupted. This
     // is suspicion, not proof that the old runtime has stopped.
     let node_b = start_stub_node(&ctx.cp, "node_b").await;
@@ -2194,11 +2160,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     assert_eq!(cat.observed_state, ObservedState::Unknown);
     assert_eq!(cat.node_id.as_deref(), Some("node_a"));
     assert!(node_b.cats.lock().unwrap().is_empty());
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
-        .expect("heartbeat loss alone must not revoke the old epoch");
 
     // A restarted agent cannot prove that its preserved claims are still
     // running by merely re-registering and sending an empty inventory. Keep
@@ -2312,11 +2273,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
-        .expect("a rejected fence confirmation must leave the claim intact");
 
     let fenced = ctx
         .http
@@ -2348,13 +2304,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert!(matches!(
-        ctx.cp
-            .state
-            .storage_meta
-            .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000),
-        Err(cats_storage::MetaError::Fenced)
-    ));
 }
 
 #[tokio::test]
@@ -2426,7 +2375,7 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         credit_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
         control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
         control_store_ca_file: None,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
@@ -2758,7 +2707,7 @@ async fn static_user_tokens_are_not_accepted() {
         control_store_ca_file: None,
         usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
@@ -3316,8 +3265,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let dir = tempfile::tempdir().unwrap();
     let usage: Arc<SqliteUsageStore> =
         Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
-    let storage_meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
     let config = Config {
         listen: "127.0.0.1:0".into(),
         control_store_dsn: DsnSource::Literal(
@@ -3326,7 +3273,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: None,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:

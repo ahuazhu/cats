@@ -522,10 +522,6 @@ pub fn router(state: AppState) -> Router {
             get(get_disk).delete(delete_disk),
         )
         .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/{verb}",
-            post(disk_action),
-        )
-        .route(
             "/v1/workspaces/{workspace}/disks/{disk}/snapshots",
             post(create_snapshot).get(list_snapshots),
         )

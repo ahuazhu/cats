@@ -36,11 +36,10 @@ use cats_api::runtime_reconciliation::{
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::DsnSource;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
-    LowerHexSha256, MetadataStore, IMAGE_MANIFEST_MAX_BYTES,
+    LowerHexSha256, IMAGE_MANIFEST_MAX_BYTES,
 };
 use reqwest::{Response, StatusCode};
 use ring::signature::Ed25519KeyPair;
@@ -195,8 +194,6 @@ impl ControlContext {
         let directory = tempfile::tempdir().unwrap();
         let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
         let usage = Arc::new(SqliteUsageStore::open(&directory.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&directory.path().join("storage.db")).unwrap());
         let release = cats_control_plane::testsupport::test_guest_runtime_profile_receipt();
         let digest = Sha256Digest::new(IMAGE_DIGEST).unwrap();
         let manifest = ImageManifestV1 {
@@ -216,7 +213,7 @@ impl ControlContext {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: release.clone(),

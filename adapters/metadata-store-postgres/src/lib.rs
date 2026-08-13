@@ -60,8 +60,8 @@ pub struct PostgresMetadataStore {
     /// Every operation on a shared worker is serial, so a renewal queued behind
     /// a commit's metadata work waits for it. Renewals use a separate connection
     /// to keep the lease fresh and make takeover latency predictable. A bare
-    /// expiry lapse is not itself a fence: only a revoke or competing acquire
-    /// changes the owner/epoch token.
+    /// expiry lapse is not itself a fence: only an external Volume Authority
+    /// transition changes the owner/epoch token.
     lease_jobs: mpsc::SyncSender<Job>,
 }
 
@@ -214,6 +214,40 @@ impl PostgresMetadataStore {
         T: Send + 'static,
     {
         dispatch_on(&self.lease_jobs, operation)
+    }
+
+    /// Test-only stand-in for the external Volume Authority. This is not part
+    /// of `MetadataStore` and therefore cannot become a production ownership
+    /// transition through the compatibility port.
+    #[cfg(test)]
+    fn install_grant_for_tests(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> Result<()> {
+        if epoch <= 0 {
+            return Err(MetaError::InvalidArgument(
+                "test attachment epoch must be positive".into(),
+            ));
+        }
+        let volume_id = volume_id.to_string();
+        let attachment_id = attachment_id.to_string();
+        self.dispatch(move |client| {
+            let changed = client
+                .execute(
+                    "UPDATE cats_storage_volumes
+                        SET lease_owner = $2, lease_epoch = $3,
+                            lease_expires_at_ms = 9223372036854775807
+                      WHERE volume_id = $1",
+                    &[&volume_id, &attachment_id, &epoch],
+                )
+                .map_err(pg_err)?;
+            if changed != 1 {
+                return Err(MetaError::NotFound(volume_id));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -598,75 +632,6 @@ impl MetadataStore for PostgresMetadataStore {
         })
     }
 
-    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()> {
-        let new_size_bytes = signed(new_size_bytes, "new_size_bytes")?;
-        let volume_id = volume_id.to_string();
-        let sql = format!(
-            "UPDATE cats_storage_volumes SET size_bytes = $2
-              WHERE volume_id = $1 AND size_bytes <= $2
-                AND (lease_owner IS NULL OR lease_expires_at_ms <= {DB_NOW_MS})"
-        );
-        self.dispatch(move |client| {
-            let rows = client
-                .execute(&sql, &[&volume_id, &new_size_bytes])
-                .map_err(pg_err)?;
-            if rows == 0 {
-                let exists = client
-                    .query_opt(
-                        "SELECT 1 FROM cats_storage_volumes WHERE volume_id = $1",
-                        &[&volume_id],
-                    )
-                    .map_err(pg_err)?
-                    .is_some();
-                return if exists {
-                    Err(MetaError::Backend(
-                        "resize rejected: shrink not allowed or lease active".into(),
-                    ))
-                } else {
-                    Err(MetaError::NotFound(volume_id))
-                };
-            }
-            Ok(())
-        })
-    }
-
-    fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64> {
-        validate_lease_ttl(ttl_ms)?;
-        let volume_id = volume_id.to_string();
-        let attachment_id = attachment_id.to_string();
-        let sql = format!(
-            "UPDATE cats_storage_volumes
-                SET lease_owner = $2,
-                    lease_epoch = lease_epoch + 1,
-                    lease_expires_at_ms = {DB_NOW_MS} + $3
-              WHERE volume_id = $1
-                AND (lease_owner IS NULL
-                     OR lease_expires_at_ms <= {DB_NOW_MS}
-                     OR lease_owner = $2)
-              RETURNING lease_epoch"
-        );
-        self.dispatch_lease(move |client| {
-            if let Some(row) = client
-                .query_opt(&sql, &[&volume_id, &attachment_id, &ttl_ms])
-                .map_err(pg_err)?
-            {
-                return Ok(row.get(0));
-            }
-            let exists = client
-                .query_opt(
-                    "SELECT 1 FROM cats_storage_volumes WHERE volume_id = $1",
-                    &[&volume_id],
-                )
-                .map_err(pg_err)?
-                .is_some();
-            if exists {
-                Err(MetaError::LeaseHeld)
-            } else {
-                Err(MetaError::NotFound(volume_id))
-            }
-        })
-    }
-
     fn renew_lease(
         &self,
         volume_id: &str,
@@ -708,23 +673,6 @@ impl MetadataStore for PostgresMetadataStore {
                         SET lease_owner = NULL, lease_expires_at_ms = 0
                       WHERE volume_id = $1 AND lease_owner = $2 AND lease_epoch = $3",
                     &[&volume_id, &attachment_id, &epoch],
-                )
-                .map(|_| ())
-                .map_err(pg_err)
-        })
-    }
-
-    // The epoch bump is what makes a revoke stick: renewal tolerates a bare
-    // expiry, so expiring the row alone would let the old holder renew back in.
-    fn revoke_lease(&self, volume_id: &str) -> Result<()> {
-        let volume_id = volume_id.to_string();
-        self.dispatch(move |client| {
-            client
-                .execute(
-                    "UPDATE cats_storage_volumes
-                        SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
-                      WHERE volume_id = $1",
-                    &[&volume_id],
                 )
                 .map(|_| ())
                 .map_err(pg_err)
@@ -1123,8 +1071,12 @@ mod tests {
             eprintln!("skipped: {DEFAULT_URL_ENV} not set");
             return;
         };
-        cats_test_support::metadata_store_contract(|| {
-            std::sync::Arc::new(PostgresMetadataStore::connect(&url, None).unwrap())
+        let store = std::sync::Arc::new(PostgresMetadataStore::connect(&url, None).unwrap());
+        let authority = store.clone();
+        cats_test_support::metadata_store_contract(store, move |volume, attachment, epoch| {
+            authority
+                .install_grant_for_tests(volume, attachment, epoch)
+                .unwrap();
         });
     }
 }

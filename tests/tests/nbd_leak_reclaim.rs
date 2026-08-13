@@ -24,10 +24,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::ch::{
     leaked_nbd_device_count, nbd_attach, nbd_detach, reclaim_leaked_nbd_devices, BlockPath,
     ChConfig,
 };
+use cats_storage::MetadataStore;
 
 const VOLUME_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -104,11 +106,19 @@ impl Blockd {
     fn spawn(binary: &Path, id: &str) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("nbd.sock");
+        let volume_id = format!("vol_{id}");
+        let attachment_id = format!("att_{id}");
+        let metadata_path = dir.path().join("meta.db");
+        let metadata = SqliteMetadataStore::open(&metadata_path)?;
+        metadata.create_volume(&volume_id, VOLUME_BYTES)?;
+        metadata.install_grant_for_tests(&volume_id, &attachment_id, 1)?;
         let child = Command::new(binary)
             .arg("--volume-id")
-            .arg(format!("vol_{id}"))
+            .arg(&volume_id)
             .arg("--attachment-id")
-            .arg(format!("att_{id}"))
+            .arg(&attachment_id)
+            .arg("--attachment-epoch")
+            .arg("1")
             .arg("--lease-ttl-ms")
             .arg("5000")
             .arg("--data-dir")
@@ -116,15 +126,13 @@ impl Blockd {
             .arg("--metadata-store-adapter")
             .arg("sqlite")
             .arg("--metadata-store-option")
-            .arg(format!("path={}", dir.path().join("meta.db").display()))
+            .arg(format!("path={}", metadata_path.display()))
             .arg("--object-store-adapter")
             .arg("file")
             .arg("--object-store-option")
             .arg(format!("root={}", dir.path().join("blob").display()))
             .arg("--listen-unix")
             .arg(&socket)
-            .arg("--create-volume-size")
-            .arg(VOLUME_BYTES.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

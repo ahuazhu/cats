@@ -934,9 +934,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::MetadataStore;
     use ring::signature::Ed25519KeyPair;
 
     const UPDATE: &[u8] = br#"{"apply_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
@@ -978,8 +976,6 @@ mod tests {
     async fn test_server_with_dsn() -> (tempfile::TempDir, crate::server::Handle, String) {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let dsn = crate::testsupport::isolated_control_store_url();
         let server = crate::server::spawn(crate::server::Config {
             listen: "127.0.0.1:0".into(),
@@ -987,7 +983,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             auth_token: "runtime-node-authority-unit-service-token".into(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),

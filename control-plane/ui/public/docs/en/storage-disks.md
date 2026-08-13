@@ -29,7 +29,6 @@ A mount creates a runtime Attachment with a monotonically increasing fencing epo
 
 ## Grow a disk
 
-    cats disk resize project-data --size 40GiB
 
 V1 supports growth only. Follow the API error if the disk must be Available before resizing in the selected runtime path. Never shrink the backing volume under ext4.
 

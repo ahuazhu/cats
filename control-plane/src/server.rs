@@ -400,8 +400,11 @@ pub struct Config {
     /// Append-only prepaid credit ledger. It may share the same physical
     /// database as the usage projection while remaining a separate port.
     pub credit_store: Arc<dyn CreditStore>,
-    /// Open authoritative volume-root/lease port, shared with blockd.
-    pub storage_meta: Arc<dyn MetadataStore>,
+    /// Legacy storage fixture for the explicit retired-product test
+    /// composition. Production must leave this absent; Volume transitions use
+    /// the Control Store's target authority transaction path.
+    #[doc(hidden)]
+    pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     /// Read-only access to the immutable golden-image namespace. The A21
     /// resolver applies its own exact key, byte cap and concurrency boundary.
     pub image_blob: Arc<dyn BlobStore>,
@@ -501,7 +504,8 @@ pub struct AppState {
     pub(crate) observation_store: Arc<ObservationStoreLane>,
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
-    pub storage_meta: Arc<dyn MetadataStore>,
+    #[doc(hidden)]
+    pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     pub(crate) cat_create:
         Arc<crate::store::runtime_authority::cat_create_service::CatCreateService>,
     pub(crate) persistent_disk_create: Arc<
@@ -987,7 +991,11 @@ async fn spawn_inner(
     }
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();
-    let storage_meta = cfg.storage_meta.clone();
+    anyhow::ensure!(
+        retired_product_authority_for_tests || cfg.retired_storage_meta_for_tests.is_none(),
+        "legacy storage metadata is only valid in the retired product test composition"
+    );
+    let retired_storage_meta = cfg.retired_storage_meta_for_tests.clone();
     let image_manifests = Arc::new(
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver::new(
             cfg.image_blob.clone(),
@@ -1019,7 +1027,7 @@ async fn spawn_inner(
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new_with_liveness_authority(
         store.clone(),
-        storage_meta.clone(),
+        retired_storage_meta.clone(),
         notify.clone(),
         cfg.node_lease_timeout_ms,
         cfg.auth_token.clone(),
@@ -1042,7 +1050,7 @@ async fn spawn_inner(
         observation_store,
         usage,
         credits,
-        storage_meta,
+        retired_storage_meta_for_tests: retired_storage_meta,
         cat_create,
         persistent_disk_create,
         readiness,

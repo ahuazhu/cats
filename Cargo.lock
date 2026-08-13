@@ -1119,8 +1119,6 @@ dependencies = [
  "anyhow",
  "cats-api",
  "cats-control-plane",
- "cats-metadata-store-postgres",
- "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-object-store-aws-s3",
  "cats-object-store-file",

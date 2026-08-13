@@ -344,7 +344,7 @@ mod tests {
         let meta = Arc::new(SqliteMetadataStore::open(&dir.join("meta.db")).unwrap());
         meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
             .unwrap();
-        ChunkEngine::attach(
+        ChunkEngine::attach_granted(
             EngineConfig::new("vol_nbd", dir.join("data"), "att1"),
             blob,
             meta,

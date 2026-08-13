@@ -32,6 +32,7 @@ libc = { workspace = true }
 vhost = { workspace = true }
 
 [dev-dependencies]
+cats-metadata-store-sqlite = { workspace = true, features = ["test-support"] }
 cats-control-plane = { workspace = true }
 cats-test-support = { workspace = true }
 cats-block-client = { workspace = true }

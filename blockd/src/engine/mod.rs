@@ -293,10 +293,10 @@ pub struct ChunkEngine {
 
 #[derive(Clone, Copy)]
 enum AttachmentMode {
-    Acquire,
-    AdoptControlOnly { expected_epoch: i64 },
-    AdoptAuthorizedControlOnly { expected_epoch: i64 },
-    AdoptAuthorizedServing { expected_epoch: i64 },
+    Granted { expected_epoch: i64 },
+    ControlOnly { expected_epoch: i64 },
+    AuthorizedControlOnly { expected_epoch: i64 },
+    AuthorizedServing { expected_epoch: i64 },
 }
 
 enum AuthorityBackend {
@@ -709,26 +709,48 @@ impl ChunkEngine {
         }
     }
 
-    /// Attach to a volume: acquire the lease (bumping the fencing epoch),
-    /// start lease renewal, then load the committed map and recover pending
-    /// packs under the live lease.
-    pub fn attach(
+    /// Adopt an exact lease grant already recorded by an external authority.
+    ///
+    /// This compatibility data-plane entry point never creates ownership and
+    /// never increments an epoch. Production Runtime uses
+    /// [`Self::attach_authorized_serving`], whose grant also carries the full
+    /// immutable lineage. This narrower form remains for data-plane contract
+    /// fixtures backed by the legacy metadata projection.
+    #[doc(hidden)]
+    pub fn attach_granted(
         cfg: EngineConfig,
         blob: Arc<dyn BlobStore>,
         meta: Arc<dyn MetadataStore>,
     ) -> Result<Arc<Self>> {
+        let head = meta.load_head(&cfg.volume_id)?;
+        Self::attach_granted_epoch(cfg, head.lease_epoch, blob, meta)
+    }
+
+    /// Adopt the caller's exact externally granted owner/epoch tuple through
+    /// the compatibility metadata data plane. Unlike the retired attach path,
+    /// this performs no acquire, expiry takeover, or epoch mutation.
+    #[doc(hidden)]
+    pub fn attach_granted_epoch(
+        cfg: EngineConfig,
+        expected_epoch: i64,
+        blob: Arc<dyn BlobStore>,
+        meta: Arc<dyn MetadataStore>,
+    ) -> Result<Arc<Self>> {
+        if expected_epoch <= 0 {
+            return Err(EngineError::Meta(MetaError::Fenced));
+        }
         Self::open(
             cfg,
             blob,
             AuthorityBackend::Legacy(meta),
-            AttachmentMode::Acquire,
+            AttachmentMode::Granted { expected_epoch },
             None,
         )
     }
 
     /// Adopt an already-authorized attachment for the root-provision effect.
     ///
-    /// Unlike [`Self::attach`], this does not acquire or bump the lease epoch,
+    /// This does not acquire or bump the lease epoch,
     /// replay pending packs, start a publisher, or enable any Guest I/O entry
     /// point. The caller obtained the exact owner/epoch grant before spawning
     /// blockd; every publication remains guarded by that same tuple.
@@ -747,7 +769,7 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptControlOnly { expected_epoch },
+            AttachmentMode::ControlOnly { expected_epoch },
             None,
         )
     }
@@ -773,7 +795,7 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+            AttachmentMode::AuthorizedControlOnly { expected_epoch },
             Some(attachment),
         )
     }
@@ -800,7 +822,7 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+            AttachmentMode::AuthorizedServing { expected_epoch },
             Some(attachment),
         )
     }
@@ -834,14 +856,14 @@ impl ChunkEngine {
         }
         match (&mode, &authority, &authorized_attachment) {
             (
-                AttachmentMode::AdoptAuthorizedServing { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
+                AttachmentMode::AuthorizedServing { .. }
+                | AttachmentMode::AuthorizedControlOnly { .. },
                 AuthorityBackend::Target(target),
                 Some(attachment),
             ) => preflight_authorized_serving(&cfg, attachment, target.as_ref())?,
             (
-                AttachmentMode::AdoptAuthorizedServing { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
+                AttachmentMode::AuthorizedServing { .. }
+                | AttachmentMode::AuthorizedControlOnly { .. },
                 _,
                 _,
             ) => {
@@ -871,10 +893,15 @@ impl ChunkEngine {
         let chunk_count = chunk::chunk_count(size);
 
         let epoch = match (mode, &authority) {
-            (AttachmentMode::Acquire, AuthorityBackend::Legacy(metadata)) => {
-                metadata.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?
+            (AttachmentMode::Granted { expected_epoch }, AuthorityBackend::Legacy(_)) => {
+                if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
+                    || head.lease_epoch != expected_epoch
+                {
+                    return Err(EngineError::Meta(MetaError::Fenced));
+                }
+                expected_epoch
             }
-            (AttachmentMode::AdoptControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
+            (AttachmentMode::ControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
                 if head.lease_owner.is_some() && head.lease_epoch <= 0 {
                     return Err(EngineError::Corrupt(
                         "an owned volume cannot have lease epoch zero".into(),
@@ -888,8 +915,8 @@ impl ChunkEngine {
                 expected_epoch
             }
             (
-                AttachmentMode::AdoptAuthorizedServing { expected_epoch }
-                | AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+                AttachmentMode::AuthorizedServing { expected_epoch }
+                | AttachmentMode::AuthorizedControlOnly { expected_epoch },
                 AuthorityBackend::Target(_),
             ) => {
                 let attachment = authorized_attachment.as_ref().ok_or_else(|| {
@@ -906,10 +933,10 @@ impl ChunkEngine {
                 }
                 expected_epoch
             }
-            (AttachmentMode::Acquire, AuthorityBackend::Target(_))
-            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_))
-            | (AttachmentMode::AdoptAuthorizedControlOnly { .. }, AuthorityBackend::Legacy(_))
-            | (AttachmentMode::AdoptAuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
+            (AttachmentMode::Granted { .. }, AuthorityBackend::Target(_))
+            | (AttachmentMode::ControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AuthorizedControlOnly { .. }, AuthorityBackend::Legacy(_))
+            | (AttachmentMode::AuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
                 return Err(EngineError::InvalidConfig(
                     "attachment mode and authority backend do not match".into(),
                 ));
@@ -917,8 +944,7 @@ impl ChunkEngine {
         };
         let control_only = matches!(
             mode,
-            AttachmentMode::AdoptControlOnly { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. }
+            AttachmentMode::ControlOnly { .. } | AttachmentMode::AuthorizedControlOnly { .. }
         );
 
         fs::create_dir_all(cfg.data_dir.join(PENDING_PACK_DIR))?;

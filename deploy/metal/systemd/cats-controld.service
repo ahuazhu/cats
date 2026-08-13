@@ -12,8 +12,7 @@ ExecStart=/opt/cats/bin/cats-controld \
   --route-grant-public-key-file /etc/cats/route-grant-public.pem \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json \
-  --db-path /var/lib/cats/control.db \
-  $CATS_METADATA_STORE_ARGS
+  --db-path /var/lib/cats/control.db
 TimeoutStopSec=35s
 Restart=always
 RestartSec=1

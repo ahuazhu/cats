@@ -1,10 +1,10 @@
 //! Integration tests against the real `cats-blockd` binary: NBD transport,
 //! crash injection at every commit-protocol window (spec §8), fencing and
-//! empty-cache cold restore.
+//! empty-cache cold restore. Ownership changes are made by this harness before
+//! the daemon starts; blockd only adopts the exact presented epoch.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cats_block_client::{NbdClient, NbdError, EPERM};
@@ -20,24 +20,39 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        Self {
+        let env = Self {
             dir: tempfile::tempdir().unwrap(),
-        }
+        };
+        env.meta().create_volume("vol_it", VOL_SIZE).unwrap();
+        env
     }
+
     fn meta_path(&self) -> PathBuf {
         self.dir.path().join("meta.db")
     }
+
     fn blob_root(&self) -> PathBuf {
         self.dir.path().join("blob")
     }
+
     fn data_dir(&self, host: &str) -> PathBuf {
         self.dir.path().join(format!("data-{host}"))
     }
+
     fn socket(&self, host: &str) -> PathBuf {
         self.dir.path().join(format!("nbd-{host}.sock"))
     }
+
     fn meta(&self) -> SqliteMetadataStore {
         SqliteMetadataStore::open(&self.meta_path()).unwrap()
+    }
+
+    /// Test-only stand-in for the external Volume Authority. The helper is
+    /// deliberately outside blockd and installs the exact epoch it will pass.
+    fn install_grant(&self, attachment: &str, epoch: i64) {
+        self.meta()
+            .install_grant_for_tests("vol_it", attachment, epoch)
+            .unwrap();
     }
 }
 
@@ -47,7 +62,13 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(env: &TestEnv, host: &str, attachment: &str, crash_point: Option<&str>) -> Self {
+    fn spawn(
+        env: &TestEnv,
+        host: &str,
+        attachment: &str,
+        epoch: i64,
+        crash_point: Option<&str>,
+    ) -> Self {
         let socket = env.socket(host);
         let _ = std::fs::remove_file(&socket);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cats-blockd"));
@@ -56,6 +77,8 @@ impl Server {
             "vol_it",
             "--attachment-id",
             attachment,
+            "--attachment-epoch",
+            &epoch.to_string(),
             "--lease-ttl-ms",
             "1500",
         ])
@@ -71,23 +94,21 @@ impl Server {
         .arg(format!("root={}", env.blob_root().display()))
         .arg("--listen-unix")
         .arg(&socket)
-        .arg("--create-volume-size")
-        .arg(VOL_SIZE.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
         cmd.env_remove("CATS_CRASH_POINT");
-        if let Some(p) = crash_point {
-            cmd.env("CATS_CRASH_POINT", p);
+        if let Some(point) = crash_point {
+            cmd.env("CATS_CRASH_POINT", point);
         }
         let child = cmd.spawn().expect("spawn cats-blockd");
-        Server { child, socket }
+        Self { child, socket }
     }
 
     fn connect(&mut self) -> NbdClient {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(c) = NbdClient::connect_unix(&self.socket) {
-                return c;
+            if let Ok(client) = NbdClient::connect_unix(&self.socket) {
+                return client;
             }
             if let Some(status) = self.child.try_wait().unwrap() {
                 panic!("cats-blockd exited early: {status}");
@@ -131,10 +152,10 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 fn read_all(client: &mut NbdClient) -> Vec<u8> {
     let mut out = Vec::with_capacity(VOL_SIZE as usize);
     let step = 1 << 20;
-    let mut off = 0;
-    while off < VOL_SIZE {
-        out.extend_from_slice(&client.read(off, step as u32).unwrap());
-        off += step;
+    let mut offset = 0;
+    while offset < VOL_SIZE {
+        out.extend_from_slice(&client.read(offset, step as u32).unwrap());
+        offset += step;
     }
     out
 }
@@ -142,31 +163,32 @@ fn read_all(client: &mut NbdClient) -> Vec<u8> {
 #[test]
 fn write_flush_read_through_binary() {
     let env = TestEnv::new();
-    let mut server = Server::spawn(&env, "a", "att_a", None);
+    env.install_grant("att_a", 1);
+    let mut server = Server::spawn(&env, "a", "att_a", 1, None);
     let mut client = server.connect();
     assert_eq!(client.size(), VOL_SIZE);
 
     let data = pattern(300_000, 1);
-    client.write(CHUNK - 1234, &data).unwrap(); // straddles a chunk boundary
+    client.write(CHUNK - 1234, &data).unwrap();
     client.flush().unwrap();
     assert_eq!(client.read(CHUNK - 1234, 300_000).unwrap(), data);
     client.disconnect().unwrap();
 }
 
-/// Spec §8.1/§8.4: crash at every window; restart must recover the frozen
-/// flush exactly once (generation advances to 1, data intact, pack drained).
+/// Spec §8.1/§8.4: crash at every window; restart under the same external
+/// grant must recover the frozen flush exactly once.
 #[test]
 fn crash_matrix_every_window_recovers_exactly_once() {
     for point in ["after_pack", "after_data_upload", "before_cas", "after_cas"] {
         let env = TestEnv::new();
+        env.install_grant("att_a", 1);
         let data0 = pattern(64_000, 3);
         let data1 = pattern(120_000, 7);
         {
-            let mut server = Server::spawn(&env, "a", "att_a", Some(point));
+            let mut server = Server::spawn(&env, "a", "att_a", 1, Some(point));
             let mut client = server.connect();
             client.write(0, &data0).unwrap();
             client.write(2 * CHUNK + 999, &data1).unwrap();
-            // The server aborts mid-flush: the client sees an I/O failure.
             let err = client.flush().unwrap_err();
             assert!(
                 matches!(err, NbdError::Io(_)),
@@ -174,9 +196,7 @@ fn crash_matrix_every_window_recovers_exactly_once() {
             );
             server.wait_exit(Duration::from_secs(10));
         }
-        // Same-host restart with the same attachment id (allowed lease
-        // re-acquire) and no crash point: recovery must converge.
-        let mut server = Server::spawn(&env, "a", "att_a", None);
+        let mut server = Server::spawn(&env, "a", "att_a", 1, None);
         let mut client = server.connect();
         assert_eq!(
             client.read(0, 64_000).unwrap(),
@@ -194,7 +214,7 @@ fn crash_matrix_every_window_recovers_exactly_once() {
         let head = env.meta().load_head("vol_it").unwrap();
         assert_eq!(head.generation, 1, "{point}: replay must not double-commit");
         let pending = std::fs::read_dir(env.data_dir("a").join("pending"))
-            .map(|d| d.count())
+            .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(pending, 0, "{point}: pack must be drained after recovery");
     }
@@ -203,20 +223,19 @@ fn crash_matrix_every_window_recovers_exactly_once() {
 #[test]
 fn fenced_writer_gets_eperm_and_new_host_takes_over() {
     let env = TestEnv::new();
-    let mut server_a = Server::spawn(&env, "a", "att_a", None);
+    env.install_grant("att_a", 1);
+    let mut server_a = Server::spawn(&env, "a", "att_a", 1, None);
     let mut client_a = server_a.connect();
     client_a.write(0, &pattern(4096, 1)).unwrap();
     client_a.flush().unwrap();
 
-    // Control plane fences the volume (host presumed lost).
-    let meta: Arc<dyn MetadataStore> = Arc::new(env.meta());
-    meta.revoke_lease("vol_it").unwrap();
-
-    // The old writer must fail closed within a renew interval.
+    // External authority fences the old tuple; blockd never performs this
+    // transition itself.
+    env.install_grant("att_a", 2);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match client_a.write(0, b"stale") {
-            Err(NbdError::Server(e)) if e == EPERM => break,
+            Err(NbdError::Server(error)) if error == EPERM => break,
             Ok(()) | Err(_) => {
                 if Instant::now() > deadline {
                     panic!("old writer was never fenced");
@@ -225,26 +244,25 @@ fn fenced_writer_gets_eperm_and_new_host_takes_over() {
             }
         }
     }
-    assert!(matches!(client_a.flush(), Err(NbdError::Server(e)) if e == EPERM));
+    assert!(matches!(client_a.flush(), Err(NbdError::Server(error)) if error == EPERM));
 
-    // A new attachment on a fresh host continues from the committed state.
-    let mut server_b = Server::spawn(&env, "b", "att_b", None);
+    env.install_grant("att_b", 3);
+    let mut server_b = Server::spawn(&env, "b", "att_b", 3, None);
     let mut client_b = server_b.connect();
     assert_eq!(client_b.read(0, 4096).unwrap(), pattern(4096, 1));
     client_b.write(4096, &pattern(4096, 2)).unwrap();
     client_b.flush().unwrap();
     client_b.disconnect().unwrap();
-
-    let head = env.meta().load_head("vol_it").unwrap();
-    assert_eq!(head.generation, 2);
+    assert_eq!(env.meta().load_head("vol_it").unwrap().generation, 2);
 }
 
 #[test]
 fn empty_cache_cold_restore_preserves_digest() {
     let env = TestEnv::new();
+    env.install_grant("att_a", 1);
     let digest_before;
     {
-        let mut server = Server::spawn(&env, "a", "att_a", None);
+        let mut server = Server::spawn(&env, "a", "att_a", 1, None);
         let mut client = server.connect();
         client.write(0, &pattern(CHUNK as usize, 11)).unwrap();
         client.write(CHUNK * 2, &pattern(8192, 13)).unwrap();
@@ -252,19 +270,15 @@ fn empty_cache_cold_restore_preserves_digest() {
         client.flush().unwrap();
         digest_before = read_all(&mut client);
         client.disconnect().unwrap();
-        server.kill(); // hard kill: lease still held
+        server.kill();
     }
-    // Wipe every local byte; fence the dead host; start on a "new host".
     std::fs::remove_dir_all(env.data_dir("a")).unwrap();
-    env.meta().revoke_lease("vol_it").unwrap();
+    env.install_grant("att_b", 2);
 
-    let mut server = Server::spawn(&env, "b", "att_b", None);
+    let mut server = Server::spawn(&env, "b", "att_b", 2, None);
     let mut client = server.connect();
     let digest_after = read_all(&mut client);
     assert_eq!(digest_before.len(), digest_after.len());
-    assert!(
-        digest_before == digest_after,
-        "cold restore digest mismatch"
-    );
+    assert_eq!(digest_before, digest_after, "cold restore digest mismatch");
     client.disconnect().unwrap();
 }

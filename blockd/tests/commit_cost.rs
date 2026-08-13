@@ -100,9 +100,13 @@ impl Env {
 
     /// Attach again after the local cache has been deleted: a fresh host.
     fn reattach(&self, attachment: &str) -> Arc<ChunkEngine> {
+        let epoch = self.meta.load_head("vol_commit").unwrap().lease_epoch + 1;
+        self.meta
+            .install_grant_for_tests("vol_commit", attachment, epoch)
+            .unwrap();
         let mut cfg = EngineConfig::new("vol_commit", self.data_dir(), attachment);
         cfg.lease_ttl_ms = bench_lease_ttl_ms();
-        ChunkEngine::attach(cfg, self.blob.clone(), self.meta.clone()).expect("reattach")
+        ChunkEngine::attach_granted(cfg, self.blob.clone(), self.meta.clone()).expect("reattach")
     }
 }
 
@@ -112,10 +116,12 @@ fn env(chunks: u64, run: &str) -> Env {
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
+    meta.install_grant_for_tests("vol_commit", "att-commit", 1)
+        .expect("external grant");
     let meta_for_reattach = meta.clone();
     let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
+    let engine = ChunkEngine::attach_granted(cfg, published.clone(), meta).expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -132,6 +138,8 @@ fn relaxed_env(chunks: u64, run: &str) -> Env {
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
+    meta.install_grant_for_tests("vol_commit", "att-commit", 1)
+        .expect("external grant");
     let meta_for_reattach = meta.clone();
     let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
@@ -140,7 +148,7 @@ fn relaxed_env(chunks: u64, run: &str) -> Env {
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 0,
     };
-    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
+    let engine = ChunkEngine::attach_granted(cfg, published.clone(), meta).expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,

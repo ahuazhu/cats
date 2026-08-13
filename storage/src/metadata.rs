@@ -29,8 +29,6 @@ pub enum MetaError {
     NotFound(String),
     #[error("volume already exists: {0}")]
     AlreadyExists(String),
-    #[error("lease is held by another attachment")]
-    LeaseHeld,
     #[error("lease owner or epoch is stale (fenced)")]
     Fenced,
     #[error("root CAS conflict: expected generation {expected}")]
@@ -43,26 +41,20 @@ pub enum MetaError {
 
 pub type Result<T> = std::result::Result<T, MetaError>;
 
-/// Authoritative metadata operations.
+/// Compatibility data-plane metadata operations.
 ///
-/// Implementations must be safe for concurrent callers and must preserve the
-/// single-statement generation/owner/epoch CAS required before a FLUSH may be
-/// acknowledged. Expiry controls when another attachment may acquire the
-/// lease; acquisition bumps the epoch. A bare expiry lapse must not fence the
-/// unchanged owner, because owner + epoch remain the authoritative fencing
-/// token until a revoke or competing acquire changes them.
+/// Ownership transitions are intentionally absent. The Runtime/Volume
+/// Authority transaction path owns acquire/takeover authorization and
+/// immutable capacity. New blockd composition uses
+/// `VolumeDataAuthority`; this narrower port remains for data-plane fixtures
+/// while they are converted.
 pub trait MetadataStore: Send + Sync {
     fn create_volume(&self, volume_id: &str, size_bytes: u64) -> Result<()>;
     fn load_head(&self, volume_id: &str) -> Result<VolumeHead>;
     fn delete_volume(&self, volume_id: &str) -> Result<()>;
-    /// Grow-only resize; V1 rejects resize while a live lease exists.
-    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()>;
 
-    /// Acquire the sole writer lease and return a newly incremented epoch.
-    fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64>;
     /// Extend the lease. Succeeds while the row still names this attachment
-    /// and epoch: an expiry lapse alone stays renewable, because everything
-    /// that must fence — a revoke, a competing acquire — bumps the epoch.
+    /// and epoch. The grant itself must have come from the Volume Authority.
     fn renew_lease(
         &self,
         volume_id: &str,
@@ -71,9 +63,6 @@ pub trait MetadataStore: Send + Sync {
         ttl_ms: i64,
     ) -> Result<()>;
     fn release_lease(&self, volume_id: &str, attachment_id: &str, epoch: i64) -> Result<()>;
-    /// Expire the current lease immediately and bump the epoch, so the old
-    /// holder fails closed and cannot renew back in.
-    fn revoke_lease(&self, volume_id: &str) -> Result<()>;
 
     /// Atomically publish a new root and return the new generation.
     ///
@@ -97,4 +86,31 @@ pub trait MetadataStore: Send + Sync {
 
     fn create_snapshot(&self, snapshot_id: &str, volume_id: &str) -> Result<SnapshotRow>;
     fn list_snapshots(&self, volume_id: &str) -> Result<Vec<SnapshotRow>>;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compatibility_port_exposes_no_ownership_or_capacity_mutations() {
+        let source = include_str!("metadata.rs");
+        let trait_source = source
+            .split_once("pub trait MetadataStore")
+            .and_then(|(_, tail)| tail.split_once("#[cfg(test)]"))
+            .map(|(trait_source, _)| trait_source)
+            .expect("MetadataStore trait source boundary");
+        assert!(
+            trait_source.contains("fn renew_lease"),
+            "calibration failed: compatibility data-plane method is not visible"
+        );
+        for retired in [
+            concat!("fn acquire", "_lease"),
+            concat!("fn revoke", "_lease"),
+            concat!("fn resize", "_volume"),
+        ] {
+            assert!(
+                !trait_source.contains(retired),
+                "legacy metadata port still exposes {retired}"
+            );
+        }
+    }
 }

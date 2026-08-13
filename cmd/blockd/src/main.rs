@@ -129,8 +129,9 @@ struct Args {
     #[arg(long, value_name = "ID")]
     guest_device_serial: Option<String>,
 
-    /// Exact grant epoch to adopt in `--control-only` mode.
-    #[arg(long, requires = "control_only")]
+    /// Exact externally granted attachment epoch to adopt. Target modes also
+    /// bind this value through their complete authorization artifact.
+    #[arg(long)]
     attachment_epoch: Option<i64>,
 
     /// Provider-neutral metadata-store adapter name. Not needed to publish an
@@ -168,14 +169,13 @@ struct Args {
     vhost_user_queue_size: u16,
 
     /// Dev helper: create the volume row with this size if it is missing.
+    /// This never grants ownership; `--attachment-epoch` must name an owner
+    /// already installed by an external authority.
     #[arg(long)]
     create_volume_size: Option<u64>,
 
     /// Delete objects this volume no longer references, then exit (spec §9).
-    ///
-    /// Takes the volume's lease like any attachment, which is what makes it safe:
-    /// no other writer can be publishing objects the Root does not name yet.
-    /// Never touches `images/` — those belong to the image, not to any volume.
+    /// The caller must first install and pass an exact attachment grant.
     #[arg(long)]
     collect_garbage: bool,
 
@@ -192,37 +192,20 @@ struct Args {
     publish_image: Option<PathBuf>,
 
     /// Provision an empty volume from an already-published image (ADR-0017).
-    ///
-    /// This is the per-launch path: it costs one manifest GET plus a map write,
-    /// no data bytes. A volume that already has a generation is left alone, so it
-    /// is safe to pass on a resume too.
-    // Temporary V1-only baseline. The runtime vertical cutover deletes both
-    // seed flags; the new reconciler never invokes or parses this implicit
-    // effect and control-only mode rejects it.
     #[arg(long, conflicts_with = "seed_image", hide = true)]
     seed_image_id: Option<String>,
 
     /// Provision an empty volume from this raw image, publishing it first if
-    /// needed. Convenient for standalone and dev use; a node agent should
-    /// `--publish-image` once and then pass `--seed-image-id`, because this path
-    /// re-hashes the image on every launch to learn its id.
+    /// needed. This compatibility path still requires an external grant.
     #[arg(long, hide = true)]
     seed_image: Option<PathBuf>,
 
     /// Sweep unreachable objects every N ms while serving (0 disables it).
-    ///
-    /// On by default: without it, superseded objects accumulate for the life of a
-    /// volume and nothing else is in a position to remove them, because a sweep
-    /// needs the volume's lease and this process holds it.
     #[arg(long, default_value_t = 600_000)]
     gc_interval_ms: u64,
 
     #[arg(long, default_value_t = 5_000)]
     lease_ttl_ms: i64,
-
-    /// How long to wait for a held lease to expire before giving up.
-    #[arg(long, default_value_t = 15_000)]
-    acquire_wait_ms: u64,
 
     /// When a FLUSH acknowledgment reaches the Guest (ADR-0021).
     ///
@@ -284,11 +267,9 @@ fn publish_image(blob: &dyn cats_storage::BlobStore, path: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Provision a fresh volume from a shared base image, or do nothing if it already
-/// has data.
-///
-/// The manifest is resolved *before* attaching, so no lease is held while the
-/// image is being read or uploaded; only the map write happens under the lease.
+/// Provision a fresh volume from a shared base image, or do nothing if it
+/// already has data. The image is resolved before the externally granted
+/// attachment is adopted, so the grant is not held across an image upload.
 fn seed_from_image(
     engine: &cats_blockd::engine::ChunkEngine,
     manifest: &cats_blockd::format::ImageManifest,
@@ -1399,7 +1380,6 @@ fn main() -> Result<()> {
     if args.listen_unix.is_some() && args.listen_tcp.is_some() {
         bail!("--listen-unix and --listen-tcp are mutually exclusive");
     }
-    // A GC pass attaches to the volume but serves no Guest, so it needs no socket.
     if !args.control_only
         && !args.collect_garbage
         && args.listen_unix.is_none()
@@ -1425,8 +1405,8 @@ fn main() -> Result<()> {
         .clone()
         .context("--metadata-store-adapter is required to serve a volume")?;
 
-    // Resolve the image before attaching, for the same reason: reading and
-    // uploading it must not happen under the volume's lease.
+    // Resolve the image before adopting the externally installed grant. Image
+    // publication must not consume any of the attachment lease window.
     let seed = match (&args.seed_image_id, &args.seed_image) {
         (Some(image_id), _) => Some(
             cats_blockd::image::load(blob.as_ref(), image_id)
@@ -1553,8 +1533,6 @@ fn main() -> Result<()> {
                 .context("adopt authorized serving chunk engine")
         })?
     } else {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(args.acquire_wait_ms);
         let metadata_factories: [&dyn MetadataStoreFactory; 2] =
             [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
         let meta = open_metadata_store(
@@ -1570,18 +1548,11 @@ fn main() -> Result<()> {
                 Err(error) => return Err(error).context("create volume"),
             }
         }
-        loop {
-            match ChunkEngine::attach(config.clone(), blob.clone(), meta.clone()) {
-                Ok(engine) => break engine,
-                Err(cats_blockd::engine::EngineError::Meta(MetaError::LeaseHeld))
-                    if std::time::Instant::now() < deadline =>
-                {
-                    tracing::info!("lease held by another attachment; waiting for expiry");
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err(error) => return Err(error).context("attach chunk engine"),
-            }
-        }
+        let expected_epoch = args
+            .attachment_epoch
+            .context("compatibility serving requires --attachment-epoch")?;
+        ChunkEngine::attach_granted_epoch(config, expected_epoch, blob.clone(), meta)
+            .context("adopt exact externally granted chunk engine")?
     };
     // EngineConfig may name blockd's procfs descriptor on Linux. Keep that
     // descriptor alive until every engine/frontend thread has stopped.
@@ -1640,9 +1611,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // The signed Runtime slice does not invoke the legacy attachment-owned GC
-    // loop. Object reclamation remains fail-closed until it has its own typed
-    // target authority/evidence boundary.
+    // The signed target Runtime does not invoke the compatibility-owned GC
+    // loop. The explicit-grant dev/data-plane composition preserves its
+    // existing collector without gaining any ownership transition.
     if !authorized_serving_mode {
         engine.start_gc_thread(std::time::Duration::from_millis(args.gc_interval_ms));
     }
@@ -2045,7 +2016,7 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             || args.create_volume_size.is_some()
         {
             bail!(
-                "--control-only forbids legacy seed, image publish, GC, and volume creation modes"
+                "--control-only forbids compatibility seed, image publish, GC, and volume creation modes"
             );
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
@@ -2068,7 +2039,7 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             || args.create_volume_size.is_some()
         {
             bail!(
-                "authorized serving input forbids legacy seed, image publish, GC, and volume creation modes"
+                "authorized serving input forbids compatibility seed, image publish, GC, and volume creation modes"
             );
         }
         if args.metadata_store_adapter.as_deref() != Some("postgres") {
@@ -2112,8 +2083,14 @@ fn validate_process_mode(args: &Args) -> Result<()> {
             )
             .context("authorized-serving vhost-user shape is outside the frozen contract")?;
         }
-    } else if args.attachment_epoch.is_some() {
-        bail!("--attachment-epoch is only valid with --control-only");
+    } else if args.publish_image.is_some() {
+        if args.volume_id.is_some()
+            || args.data_dir.is_some()
+            || args.attachment_id.is_some()
+            || args.metadata_store_adapter.is_some()
+        {
+            bail!("--publish-image is a standalone object-store operation");
+        }
     } else if args.authorized_control_spec.is_some()
         || args.authorized_target_control_spec.is_some()
     {
@@ -2122,6 +2099,8 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         || args.provision_root_authorization_context_digest.is_some()
     {
         bail!("target-control expectations require --authorized-target-control-spec");
+    } else if args.attachment_epoch.is_none() {
+        bail!("compatibility serving requires an explicit --attachment-epoch grant");
     }
     if args.listen_vhost_user.is_some() && args.guest_device_serial.is_none() {
         bail!("--listen-vhost-user requires --guest-device-serial");
@@ -3657,6 +3636,7 @@ mod tests {
             vec!["--collect-garbage"],
             vec!["--create-volume-size", "4194304"],
             vec!["--seed-image-id", "legacy-image"],
+            vec!["--seed-image", "/legacy/image.raw"],
         ] {
             assert!(
                 validate_process_mode(&parse_target(&forbidden)).is_err(),

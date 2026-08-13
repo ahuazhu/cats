@@ -177,7 +177,9 @@ impl Bench {
         let meta =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta store"));
         meta.create_volume(VOLUME_ID, VOLUME_SIZE).expect("volume");
-        let engine = ChunkEngine::attach(
+        meta.install_grant_for_tests(VOLUME_ID, "att-bench", 1)
+            .expect("external grant");
+        let engine = ChunkEngine::attach_granted(
             EngineConfig::new(VOLUME_ID, dir.path().join("data"), "att-bench"),
             blob,
             meta,

@@ -13,9 +13,7 @@ use cats_control_plane::server::{spawn, spawn_singleton_task, Config, Handle};
 use cats_control_plane::store::{
     DsnSource, OciDeploymentClaim, SingletonRole, Store, CONTROL_STORE_BLOCKING_WORKERS,
 };
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
-use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "store-metrics-service-token";
 const ADMIN_TOKEN: &str = "store-metrics-admin-token";
@@ -31,8 +29,6 @@ impl MetricsContext {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let dsn = cats_control_plane::testsupport::isolated_control_store_url();
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("metering.db")).unwrap());
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
@@ -40,7 +36,7 @@ impl MetricsContext {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.to_string(),
             guest_runtime_profile_receipt:

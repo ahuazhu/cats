@@ -22,7 +22,6 @@ cats unmount project-data</code></pre>
 <p>A mount creates a runtime Attachment with a monotonically increasing fencing epoch. Unmount syncs and detaches before returning the disk to Available. V1 rejects a second read-write attachment even when it targets different logical blocks—the ext4 filesystem itself is single-writer.</p>
 
 <h2 id="resize">Grow a disk</h2>
-<pre><code>cats disk resize project-data --size 40GiB</code></pre>
 <p>V1 supports growth only. Follow the API error if the disk must be Available before resizing in the selected runtime path. Never shrink the backing volume under ext4.</p>
 
 <h2 id="snapshot">Create a snapshot</h2>

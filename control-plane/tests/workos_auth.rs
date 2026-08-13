@@ -619,7 +619,7 @@ impl Ctx {
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            storage_meta,
+            retired_storage_meta_for_tests: Some(storage_meta),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: "service-token".into(),
             guest_runtime_profile_receipt:

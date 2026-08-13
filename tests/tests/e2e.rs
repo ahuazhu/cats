@@ -117,7 +117,7 @@ impl Cluster {
                 credit_store: Arc::new(
                     SqliteUsageStore::open(&dir.path().join("control.db")).unwrap(),
                 ),
-                storage_meta,
+                retired_storage_meta_for_tests: Some(storage_meta),
                 image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
                 auth_token: SERVICE_TOKEN.into(),
                 guest_runtime_profile_receipt:

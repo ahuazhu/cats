@@ -87,6 +87,41 @@ impl SqliteMetadataStore {
             .lock()
             .map_err(|_| MetaError::Backend("SQLite connection mutex was poisoned".into()))
     }
+
+    /// Install an externally decided owner/epoch in SQLite-only test and
+    /// development fixtures.
+    ///
+    /// This is deliberately not part of [`MetadataStore`] and the production
+    /// PostgreSQL adapter has no equivalent. Runtime ownership transitions
+    /// belong to the Volume Authority transaction path; this helper only lets
+    /// data-plane tests present the explicit grant that `blockd` now requires.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_grant_for_tests(
+        &self,
+        volume_id: &str,
+        attachment_id: &str,
+        epoch: i64,
+    ) -> Result<()> {
+        if epoch <= 0 {
+            return Err(MetaError::InvalidArgument(
+                "test attachment epoch must be positive".into(),
+            ));
+        }
+        let conn = self.connection()?;
+        let changed = conn
+            .execute(
+                "UPDATE volumes
+                    SET lease_owner = ?2, lease_epoch = ?3, lease_expires_at_ms = ?4
+                  WHERE volume_id = ?1",
+                params![volume_id, attachment_id, epoch, i64::MAX],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(MetaError::NotFound(volume_id.to_string()));
+        }
+        Ok(())
+    }
 }
 
 /// Put the database in WAL mode, tolerating other processes doing the same.
@@ -205,78 +240,8 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
-    fn resize_volume(&self, volume_id: &str, new_size_bytes: u64) -> Result<()> {
-        let new_size_bytes = sqlite_integer(new_size_bytes, "new_size_bytes")?;
-        let now = now_ms();
-        let conn = self.connection()?;
-        let n = conn
-            .execute(
-                "UPDATE volumes SET size_bytes = ?2
-                  WHERE volume_id = ?1 AND size_bytes <= ?2
-                    AND (lease_owner IS NULL OR lease_expires_at_ms <= ?3)",
-                params![volume_id, new_size_bytes, now],
-            )
-            .map_err(sql_err)?;
-        if n == 0 {
-            let exists: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM volumes WHERE volume_id = ?1",
-                    params![volume_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sql_err)?;
-            return match exists {
-                None => Err(MetaError::NotFound(volume_id.to_string())),
-                Some(_) => Err(MetaError::Backend(
-                    "resize rejected: shrink not allowed or lease active".into(),
-                )),
-            };
-        }
-        Ok(())
-    }
-
-    fn acquire_lease(&self, volume_id: &str, attachment_id: &str, ttl_ms: i64) -> Result<i64> {
-        let (now, expires_at) = lease_window(ttl_ms)?;
-        let conn = self.connection()?;
-        let n = conn
-            .execute(
-                "UPDATE volumes
-                    SET lease_owner = ?2,
-                        lease_epoch = lease_epoch + 1,
-                        lease_expires_at_ms = ?3
-                  WHERE volume_id = ?1
-                    AND (lease_owner IS NULL
-                         OR lease_expires_at_ms <= ?4
-                         OR lease_owner = ?2)",
-                params![volume_id, attachment_id, expires_at, now],
-            )
-            .map_err(sql_err)?;
-        if n == 0 {
-            // Distinguish missing volume from a held lease.
-            let exists: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM volumes WHERE volume_id = ?1",
-                    params![volume_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sql_err)?;
-            return match exists {
-                None => Err(MetaError::NotFound(volume_id.to_string())),
-                Some(_) => Err(MetaError::LeaseHeld),
-            };
-        }
-        conn.query_row(
-            "SELECT lease_epoch FROM volumes WHERE volume_id = ?1",
-            params![volume_id],
-            |r| r.get(0),
-        )
-        .map_err(sql_err)
-    }
-
     // Deliberately no expiry check: an expired-but-unclaimed lease means
-    // nobody revoked or acquired it in between (both bump the epoch), so the
+    // no external authority transition changed its owner/epoch in between, so the
     // holder renews straight through a lapse. A slow attach or a metadata
     // hiccup must not become a permanent self-fence; everything that must
     // fence does so via the epoch.
@@ -308,19 +273,6 @@ impl MetadataStore for SqliteMetadataStore {
             "UPDATE volumes SET lease_owner = NULL, lease_expires_at_ms = 0
               WHERE volume_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
             params![volume_id, attachment_id, epoch],
-        )
-        .map_err(sql_err)?;
-        Ok(())
-    }
-
-    // The epoch bump is what makes a revoke stick: renewal tolerates a bare
-    // expiry, so expiring the row alone would let the old holder renew back in.
-    fn revoke_lease(&self, volume_id: &str) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute(
-            "UPDATE volumes SET lease_expires_at_ms = 0, lease_epoch = lease_epoch + 1
-              WHERE volume_id = ?1",
-            params![volume_id],
         )
         .map_err(sql_err)?;
         Ok(())
@@ -491,8 +443,12 @@ mod tests {
     fn shared_metadata_store_contract() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("meta.db");
-        cats_test_support::metadata_store_contract(|| {
-            std::sync::Arc::new(SqliteMetadataStore::open(&path).unwrap())
+        let store = std::sync::Arc::new(SqliteMetadataStore::open(&path).unwrap());
+        let authority = store.clone();
+        cats_test_support::metadata_store_contract(store, move |volume, attachment, epoch| {
+            authority
+                .install_grant_for_tests(volume, attachment, epoch)
+                .unwrap();
         });
     }
 }

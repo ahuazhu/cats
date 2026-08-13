@@ -45,14 +45,13 @@ use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::{
     RuntimeCutoverAcceptanceFacts, RuntimeOperationsTableLockForTest,
 };
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, CreditStore,
     CreditStoreFuture, CreditSummary, SqliteUsageStore,
 };
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
-    LowerHexSha256, MetadataStore, IMAGE_MANIFEST_MAX_BYTES,
+    LowerHexSha256, IMAGE_MANIFEST_MAX_BYTES,
 };
 use reqwest::{RequestBuilder, Response, StatusCode};
 use ring::signature::Ed25519KeyPair;
@@ -241,8 +240,6 @@ impl Context {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let release = cats_control_plane::testsupport::test_guest_runtime_profile_receipt();
         let digest = Sha256Digest::new(IMAGE_DIGEST).unwrap();
         let manifest = ImageManifestV1 {
@@ -264,7 +261,7 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: credits.clone(),
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: release.clone(),

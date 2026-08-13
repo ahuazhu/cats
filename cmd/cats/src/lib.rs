@@ -316,11 +316,6 @@ pub enum DiskCommand {
     Get {
         name: String,
     },
-    Resize {
-        name: String,
-        #[arg(long)]
-        size: String,
-    },
     Delete {
         name: String,
     },
@@ -2000,15 +1995,6 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             print_disk(&disk, cli.json);
             Ok(())
         }
-        DiskCommand::Resize { name, size } => {
-            let v = client.post(
-                &format!("/disks/{name}/actions/resize"),
-                Some(json!({ "size_bytes": parse_size(size)? })),
-            )?;
-            let disk: Disk = serde_json::from_value(v)?;
-            print_disk(&disk, cli.json);
-            Ok(())
-        }
         DiskCommand::Delete { name } => {
             client.send(client.http.delete(client.url(&format!("/disks/{name}"))))?;
             println!("deleted {name}");
@@ -3370,7 +3356,6 @@ mod tests {
             &["expiry", "app"],
             &["disk", "ls"],
             &["disk", "get", "data"],
-            &["disk", "resize", "data", "--size", "2GiB"],
             &["disk", "delete", "data"],
             &["disk", "snapshot", "data"],
             &["mount", "data", "--cat", "app"],
@@ -3417,6 +3402,17 @@ mod tests {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
             ));
         }
+    }
+
+    #[test]
+    fn disk_resize_is_not_a_cli_command() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["cats", "disk", "resize", "data", "--size", "2GiB"]);
+        assert!(
+            parsed.is_err(),
+            "immutable volume capacity still has a CLI mutation"
+        );
     }
 
     #[test]

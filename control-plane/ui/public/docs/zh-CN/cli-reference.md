@@ -71,7 +71,6 @@ Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签
     cats disk create NAME --size SIZE
     cats disk ls
     cats disk get NAME
-    cats disk resize NAME --size SIZE
     cats disk snapshot NAME
     cats disk delete NAME
     cats mount DISK --cat CAT [--at /data]

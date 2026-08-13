@@ -216,7 +216,7 @@ mod tests {
     use axum::http::HeaderValue;
     use cats_api::error::ErrorCode;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::{BlobError, BlobStore, MetadataStore};
+    use cats_storage::{BlobError, BlobStore};
     use futures_util::StreamExt;
 
     use crate::store::runtime_authority::cat_create_service::CAT_CREATE_TOTAL_DEADLINE;
@@ -389,10 +389,6 @@ mod tests {
         let usage = Arc::new(
             SqliteUsageStore::open(&dir.path().join("usage.db")).expect("open usage store"),
         );
-        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
-            cats_metadata_store_sqlite::SqliteMetadataStore::open(&dir.path().join("storage.db"))
-                .unwrap(),
-        );
         let image_blob = Arc::new(FixedImageBlob {
             reads: AtomicUsize::new(0),
         });
@@ -405,7 +401,7 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:

@@ -29,7 +29,6 @@
 
 ## 扩容磁盘
 
-    cats disk resize project-data --size 40GiB
 
 V1 只支持增大容量。如果当前运行路径要求磁盘处于 Available，请按 API 的前置条件先卸载。绝不能在 ext4 下方缩小卷。
 

@@ -701,7 +701,13 @@ impl Soak {
         for volume_id in self.volumes.lock().unwrap().clone() {
             // A failed test may leave an epoch live. The exact test-scoped row
             // is revoked before deletion so a stale child cannot republish.
-            let _ = self.metadata.revoke_lease(&volume_id);
+            if let Ok(head) = self.metadata.load_head(&volume_id) {
+                if let Some(owner) = head.lease_owner.as_deref() {
+                    let _ = self
+                        .metadata
+                        .release_lease(&volume_id, owner, head.lease_epoch);
+                }
+            }
             if let Err(error) = self.metadata.delete_volume(&volume_id) {
                 errors.push(format!("delete metadata {volume_id}: {error}"));
             }

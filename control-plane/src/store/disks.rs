@@ -179,18 +179,6 @@ impl Store {
         })
     }
 
-    pub fn set_disk_size(&self, disk_id: &str, size: u64) -> Result<()> {
-        let size = size as i64;
-        self.with(|client| {
-            client
-                .execute(
-                    "UPDATE disks SET size_bytes=$2 WHERE id=$1",
-                    &[&disk_id, &size],
-                )
-                .map(|_| ())
-        })
-    }
-
     pub fn delete_disk_row(&self, disk_id: &str) -> Result<()> {
         self.with(|client| {
             client

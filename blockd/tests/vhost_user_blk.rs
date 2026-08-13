@@ -50,7 +50,9 @@ impl Harness {
         let meta =
             Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta store"));
         meta.create_volume(VOLUME_ID, VOLUME_SIZE).expect("volume");
-        let engine = ChunkEngine::attach(
+        meta.install_grant_for_tests(VOLUME_ID, "att-vhu", 1)
+            .expect("external grant");
+        let engine = ChunkEngine::attach_granted(
             EngineConfig::new(VOLUME_ID, dir.path().join("data"), "att-vhu"),
             blob,
             meta.clone(),
@@ -380,9 +382,17 @@ fn fenced_attachment_fails_closed_for_the_guest() {
     let queue = frontend.queue(0);
     queue.write_at(0, &pattern(4096, 2)).expect("write");
 
-    // The control plane revokes the lease (host presumed lost). The engine
-    // discovers this on its next commit and fences itself.
-    harness.meta.revoke_lease(VOLUME_ID).expect("revoke lease");
+    // The authority closes the exact grant. The engine discovers this on its
+    // next commit and fences itself.
+    let head = harness.meta.load_head(VOLUME_ID).expect("load grant");
+    harness
+        .meta
+        .release_lease(
+            VOLUME_ID,
+            head.lease_owner.as_deref().expect("owned test volume"),
+            head.lease_epoch,
+        )
+        .expect("close grant");
     let flush = queue.flush().expect("flush completes");
     assert_eq!(flush.status, VIRTIO_BLK_S_IOERR, "revoked lease must fail");
     assert!(harness.engine.is_fenced());

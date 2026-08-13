@@ -529,9 +529,7 @@ mod tests {
         NodeIdentity, NodeIdentityState, NodeObservation, RandomId128, Sequence, SessionBinding,
         UnixMillis,
     };
-    use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::MetadataStore;
 
     use super::*;
     use crate::controller::AutoTierPolicy;
@@ -553,8 +551,6 @@ mod tests {
         async fn new(suffix: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-            let storage_meta: Arc<dyn MetadataStore> =
-                Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
             let receipt = crate::testsupport::test_guest_runtime_profile_receipt();
             let server = spawn(Config {
                 listen: "127.0.0.1:0".into(),
@@ -564,7 +560,7 @@ mod tests {
                 control_store_ca_file: None,
                 usage_store: usage.clone(),
                 credit_store: usage,
-                storage_meta,
+                retired_storage_meta_for_tests: None,
                 image_blob: crate::testsupport::unavailable_image_blob(),
                 auth_token: SERVICE_TOKEN.into(),
                 guest_runtime_profile_receipt: receipt.clone(),
