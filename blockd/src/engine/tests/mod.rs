@@ -40,8 +40,7 @@ fn env() -> Env {
 }
 
 fn next_test_epoch(meta: &SqliteMetadataStore) -> i64 {
-    let epoch = meta.load_head(VOL).unwrap().lease_epoch + 1;
-    epoch
+    meta.load_head(VOL).unwrap().lease_epoch + 1
 }
 
 fn install_test_grant_at(path: impl AsRef<Path>, attachment_id: &str) -> i64 {
