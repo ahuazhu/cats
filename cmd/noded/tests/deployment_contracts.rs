@@ -73,7 +73,7 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
 }
 
 #[test]
-fn node_agent_restart_requires_a_drained_idle_node() {
+fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -84,9 +84,10 @@ fn node_agent_restart_requires_a_drained_idle_node() {
             .map(str::trim)
             .filter(|line| line.starts_with("KillMode="))
             .collect::<Vec<_>>();
-        assert!(
-            kill_modes.is_empty(),
-            "{unit} must retain systemd's control-group default while V1 cannot safely preserve and re-adopt every child runtime across an agent stop; found {kill_modes:?}"
+        assert_eq!(
+            kill_modes,
+            ["KillMode=control-group"],
+            "{unit} must explicitly reap every process in the Agent service cgroup"
         );
         assert!(
             text.contains("cats=0/orphans=0"),
@@ -113,6 +114,37 @@ fn node_agent_restart_requires_a_drained_idle_node() {
             && later_cordon_guard < later_empty_guard,
         "metal restart instructions must limit the direct command to first install and then document the drain/idle guard"
     );
+
+    let process_owner =
+        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
+    for exact in [
+        "const SYSTEM_SLICE: &str = \"system.slice\";",
+        "const ROOT_PROVISION_KILL_MODE: &str = \"control-group\";",
+        ".arg(format!(\"--slice={SYSTEM_SLICE}\"))",
+        ".arg(format!(\"--property=KillMode={ROOT_PROVISION_KILL_MODE}\"))",
+        ".arg(format!(\"--property=Restart={ROOT_PROVISION_RESTART}\"))",
+    ] {
+        assert!(
+            process_owner.contains(exact),
+            "per-Cat process ownership lost its independent systemd-service contract {exact:?}"
+        );
+    }
+
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    for exact in [
+        "agent_unit=cats-noded.service",
+        "cat_unit=cats-serving-11111111111111111111111111111111.service",
+        "systemctl stop \"$agent_unit\"",
+        "systemctl restart \"$agent_unit\"",
+        "cat_start_ticks_after_restart",
+        "cat_control_group_after_restart",
+        "systemctl stop \"$cat_unit\"",
+    ] {
+        assert!(
+            linux_gate.contains(exact),
+            "the real PID1 Linux gate lacks the production Agent-stop/restart sibling-adoption probe {exact:?}"
+        );
+    }
 }
 
 #[test]

@@ -16917,9 +16917,18 @@ mod tests {
     }
 
     #[test]
-    fn systemd_global_sweep_recognizes_transient_cats_services() {
+    fn systemd_global_sweep_allows_agent_units_but_reports_unknown_runtime_residue() {
         let environment = TestEnvironment::new();
-        std::fs::create_dir(environment.systemd_root.join("cats-root-token.service")).unwrap();
+        for agent_unit in ["cats-noded.service", "cats-worker.service"] {
+            std::fs::create_dir(environment.systemd_root.join(agent_unit)).unwrap();
+        }
+        let unknown_runtime = environment
+            .systemd_root
+            .join("cats-unknown-runtime.service");
+        std::fs::create_dir(&unknown_runtime).unwrap();
+
+        // Calibrate the same reserved-namespace probe against a known residue
+        // before trusting the negative result for the production Agent units.
         let mut budget = 16;
         assert_eq!(
             scan_cgroup_tree(
@@ -16932,6 +16941,21 @@ mod tests {
             )
             .unwrap(),
             ProbeFact::Present
+        );
+
+        std::fs::remove_dir(unknown_runtime).unwrap();
+        let mut budget = 16;
+        assert_eq!(
+            scan_cgroup_tree(
+                &environment.systemd_root,
+                CgroupKind::Systemd,
+                0,
+                &mut budget,
+                4,
+                &context(),
+            )
+            .unwrap(),
+            ProbeFact::Empty
         );
     }
 }
