@@ -28,7 +28,9 @@ mod volume;
 )]
 pub(crate) mod volume_transition_auth;
 
-pub(crate) use product::{RuntimeOperationRead, SystemDesiredMutationCommit};
+pub(crate) use product::{
+    BillingExhaustionDecision, RuntimeOperationRead, SystemDesiredMutationCommit,
+};
 #[allow(
     dead_code,
     reason = "A22 transaction-local evidence loader is composed by the authenticated A23 route"

@@ -5,6 +5,10 @@ use super::*;
 /// every singleton.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SingletonRole {
+    RuntimeSweeper,
+    /// Retired command-dispatch controller role used only by its test harness.
+    /// It deliberately shares the production sweeper lock so both authorities
+    /// can never run against one schema if composition regresses.
     Reconciler,
     BillingEnforcer,
     UsageProjector,
@@ -14,7 +18,7 @@ pub enum SingletonRole {
 impl SingletonRole {
     fn lock_key(self) -> i32 {
         match self {
-            Self::Reconciler => 420_201,
+            Self::RuntimeSweeper | Self::Reconciler => 420_201,
             Self::BillingEnforcer => 420_202,
             Self::UsageProjector => 420_203,
             Self::VolumeDeleteSweeper => 420_204,
@@ -23,6 +27,7 @@ impl SingletonRole {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::RuntimeSweeper => "runtime-sweeper",
             Self::Reconciler => "reconciler",
             Self::BillingEnforcer => "billing-enforcer",
             Self::UsageProjector => "usage-projector",

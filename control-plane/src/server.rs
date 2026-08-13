@@ -871,9 +871,30 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
     tokio::join!(controller.run(interval), reap_interrupted_deploys);
 }
 
+async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match store
+            .execute(|store| store.runtime_maintenance_scan())
+            .await
+        {
+            Ok(report) => tracing::debug!(
+                sampled_pending_operations = report.sampled_pending_operations,
+                sampled_pending_on_fenced_node = report.sampled_pending_on_fenced_node,
+                sampled_deleted_tombstones = report.sampled_deleted_tombstones,
+                sampled_retained_api_results = report.sampled_retained_api_results,
+                "completed production runtime maintenance scan"
+            ),
+            Err(error) => tracing::error!(%error, "production runtime maintenance scan failed"),
+        }
+    }
+}
+
 /// Start the control plane inside the current tokio runtime.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, false, None).await
+    spawn_inner(cfg, false, None).await
 }
 
 /// Start the public control plane plus the isolated mTLS Gateway machine
@@ -883,7 +904,7 @@ pub async fn spawn_with_gateway_machine(
     cfg: Config,
     gateway_machine: GatewayMachineConfig,
 ) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, false, Some(gateway_machine)).await
+    spawn_inner(cfg, false, Some(gateway_machine)).await
 }
 
 /// Retired product/controller harness. It uses the exact production Node
@@ -891,21 +912,12 @@ pub async fn spawn_with_gateway_machine(
 /// registration, or work-status compatibility routes.
 #[cfg(debug_assertions)]
 pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, true, false, None).await
-}
-
-/// Production runtime-authority router with mutable billing enabled solely for
-/// cross-router acceptance. Unlike `spawn_for_retired_product_tests`, this
-/// does not install or run any retired product/controller authority.
-#[doc(hidden)]
-pub async fn spawn_runtime_authority_with_billing_for_tests(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, true, None).await
+    spawn_inner(cfg, true, None).await
 }
 
 async fn spawn_inner(
     cfg: Config,
     retired_product_authority_for_tests: bool,
-    runtime_billing_for_tests: bool,
     gateway_machine: Option<GatewayMachineConfig>,
 ) -> anyhow::Result<Handle> {
     #[cfg(not(debug_assertions))]
@@ -921,12 +933,6 @@ async fn spawn_inner(
     anyhow::ensure!(
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
-    );
-    anyhow::ensure!(
-        retired_product_authority_for_tests
-            || runtime_billing_for_tests
-            || !cfg.billing_enforcement_enabled,
-        "legacy Cat billing enforcement is unavailable during the signed runtime cutover"
     );
     ensure_route_signing_keys_are_separate(
         cfg.route_grant_signer.public_key_sha256(),
@@ -1174,15 +1180,22 @@ async fn spawn_inner(
         }
     });
     let interval = Duration::from_millis(cfg.reconcile_interval_ms);
-    let reconciler_task = retired_product_authority_for_tests.then(|| {
+    let reconciler_task = Some(if retired_product_authority_for_tests {
         let reconciler = controller.clone();
         let reconciler_store = state.store.clone();
         spawn_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
             run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
         })
+    } else {
+        let maintenance_store = state.store.clone();
+        let maintenance_interval = interval.max(Duration::from_secs(5));
+        spawn_singleton_task(
+            state.store.clone(),
+            SingletonRole::RuntimeSweeper,
+            move || run_runtime_maintenance_role(maintenance_store.clone(), maintenance_interval),
+        )
     });
-    let billing_enforcer_task =
-        (retired_product_authority_for_tests && cfg.billing_enforcement_enabled).then(|| {
+    let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
         let enforcement_state = state.clone();
         spawn_singleton_task(
             state.store.clone(),
@@ -1190,12 +1203,16 @@ async fn spawn_inner(
             move || {
                 let enforcement_state = enforcement_state.clone();
                 async move {
+                    let mut cursor = None;
                     let mut interval = tokio::time::interval(Duration::from_secs(10));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         interval.tick().await;
-                        if let Err(error) =
-                            crate::api::enforce_exhausted_billing_accounts(&enforcement_state).await
+                        if let Err(error) = crate::api::enforce_exhausted_billing_accounts(
+                            &enforcement_state,
+                            &mut cursor,
+                        )
+                        .await
                         {
                             tracing::error!(error = %error.0, "billing credit enforcement failed");
                         }

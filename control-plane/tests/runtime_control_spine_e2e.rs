@@ -39,9 +39,7 @@ use cats_api::runtime_reconciliation::{
     UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{
-    spawn, spawn_runtime_authority_with_billing_for_tests, Config, Handle,
-};
+use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::{
     RuntimeCutoverAcceptanceFacts, RuntimeOperationsTableLockForTest,
@@ -1459,9 +1457,10 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
     let context = Context::new().await;
     let mut billed_config = context.config.clone();
     billed_config.billing_enforcement_enabled = true;
-    let billed = spawn_runtime_authority_with_billing_for_tests(billed_config)
-        .await
-        .unwrap();
+    // Production composition must accept the rollout gate and run the
+    // elected BillingEnforcer. A test-only spawn path would hide the exact
+    // cutover regression this test characterizes.
+    let billed = spawn(billed_config).await.unwrap();
     let workspaces = context
         .http
         .get(format!("{}/v1/admin/workspaces", billed.base_url()))

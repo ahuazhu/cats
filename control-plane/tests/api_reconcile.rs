@@ -3292,19 +3292,8 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     };
     let mut legacy_billing = config.clone();
     legacy_billing.billing_enforcement_enabled = true;
-    let billing_error = match spawn_production(legacy_billing).await {
-        Ok(handle) => {
-            handle.shutdown().await.unwrap();
-            panic!("production started the legacy Cat billing enforcer")
-        }
-        Err(error) => error,
-    };
-    assert!(
-        billing_error
-            .to_string()
-            .contains("legacy Cat billing enforcement is unavailable"),
-        "unexpected startup error: {billing_error:#}",
-    );
+    let billing = spawn_production(legacy_billing).await.unwrap();
+    billing.shutdown().await.unwrap();
     let production = spawn_production(config.clone()).await.unwrap();
     let workspace_id = default_workspace_id(&production);
 

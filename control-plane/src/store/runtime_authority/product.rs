@@ -651,31 +651,31 @@ impl SystemDesiredMutationRequest {
 /// wins only before PostgreSQL COMMIT is claimed; after that, exact Operation
 /// replay resolves ambiguity without inventing an API result row.
 pub(crate) struct SystemDesiredMutationCommitGuard {
-    cancellation: CoveredCommitCancellation,
+    _cancellation: CoveredCommitCancellation,
     state: CoveredCommitState,
 }
 
 impl SystemDesiredMutationCommitGuard {
-    #[allow(dead_code, reason = "consumed by the A3 Billing and G4 service owners")]
     pub(crate) fn new(operation_name: &'static str, absolute_deadline: Instant) -> Self {
         let (cancellation, state) =
             CoveredCommitCancellation::new(operation_name, absolute_deadline);
         Self {
-            cancellation,
+            _cancellation: cancellation,
             state,
         }
     }
 
-    pub(super) fn state(&self) -> &CoveredCommitState {
-        &self.state
+    pub(super) fn state(&self) -> CoveredCommitState {
+        self.state.clone()
     }
 
     pub(crate) fn commit_was_sent(&self) -> bool {
         self.state.commit_was_sent()
     }
 
-    pub(crate) fn cancel_before_commit(&self) -> bool {
-        self.cancellation.cancel_before_commit()
+    #[cfg(test)]
+    pub(super) fn cancel_before_commit(&self) -> bool {
+        self._cancellation.cancel_before_commit()
     }
 }
 
@@ -1477,11 +1477,97 @@ impl Store {
         }
     }
 
+    /// Resolve one Billing domain decision through the system mutation's
+    /// stable Operation identity. A COMMIT response loss is retried as an
+    /// exact read of current Desired+Operation; no ApiIdempotencyResult is
+    /// fabricated for this non-HTTP domain.
+    pub(crate) async fn commit_billing_exhaustion(
+        self: &std::sync::Arc<Self>,
+        candidate: BillingDesiredCandidate,
+        decision: BillingExhaustionDecision,
+        absolute_deadline: Instant,
+    ) -> Result<SystemDesiredMutationCommit> {
+        let planned_candidate = candidate.clone();
+        let request = self
+            .execute(move |store| store.prepare_billing_exhaustion(&planned_candidate, decision))
+            .await?;
+        let Some(request) = request else {
+            return Ok(SystemDesiredMutationCommit::Stale);
+        };
+        let request = std::sync::Arc::new(request);
+        let guard = SystemDesiredMutationCommitGuard::new(
+            "Billing system Desired mutation",
+            absolute_deadline,
+        );
+        loop {
+            let commit_request = std::sync::Arc::clone(&request);
+            let state = guard.state();
+            match self
+                .execute(move |store| store.commit_system_desired_mutation(&commit_request, &state))
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) if guard.commit_was_sent() => {
+                    tracing::warn!(
+                        %error,
+                        "resolving ambiguous Billing system Desired commit by exact replay"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn prepare_billing_exhaustion(
+        &self,
+        candidate: &BillingDesiredCandidate,
+        decision: BillingExhaustionDecision,
+    ) -> Result<Option<SystemDesiredMutationRequest>> {
+        self.authority_read_snapshot(|transaction| {
+            let Some(current) = load_desired_unlocked(transaction, &candidate.cat_id)? else {
+                return Ok(None);
+            };
+            if current.workspace_id != candidate.workspace_id
+                || current.desired_revision != candidate.desired_revision
+                || current.target != RuntimeTarget::Running
+            {
+                return Ok(None);
+            }
+            let endpoint_records = current
+                .endpoints
+                .iter()
+                .map(|intent| {
+                    load_endpoint_by_id_unlocked(transaction, &intent.endpoint_id)?
+                        .map(|record| EndpointRecordCandidate {
+                            endpoint_id: record.endpoint_id,
+                            workspace_id: record.workspace_id,
+                            cat_id: record.cat_id,
+                            name: record.name,
+                        })
+                        .ok_or_else(|| {
+                            stored_corruption("billing candidate Endpoint record disappeared")
+                        })
+                })
+                .collect::<AuthorityTxResult<Vec<_>>>()?;
+            let active_guest_digest = current.runtime.guest_config_digest.clone();
+            SystemDesiredMutationRequest::billing_exhaustion(
+                current,
+                decision.clone(),
+                active_guest_digest,
+                endpoint_records,
+            )
+            .map(Some)
+            .map_err(Into::into)
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn commit_billing_cold(
         &self,
         candidate: &BillingDesiredCandidate,
     ) -> Result<BillingDesiredCommit> {
+        let ledger = self.billing_ledger_for_workspace(candidate.workspace_id.as_str())?;
         let loaded = self.authority_read_snapshot(|transaction| {
             let Some(current) = load_desired_unlocked(transaction, &candidate.cat_id)? else {
                 return Ok(None);
@@ -1516,8 +1602,8 @@ impl Store {
         let request = SystemDesiredMutationRequest::billing_exhaustion(
             current.clone(),
             BillingExhaustionDecision {
-                billing_account_id: format!("test-billing/{}", candidate.workspace_id),
-                account_id: format!("test-account/{}", candidate.workspace_id),
+                billing_account_id: ledger.billing_account_id.clone(),
+                account_id: ledger.account_id.clone(),
                 credit_nanos: 0,
                 usage_nanos: 1,
                 usage_visible_through_unix_ms: Some(1),
@@ -1530,12 +1616,13 @@ impl Store {
             "test Billing mutation",
             Instant::now() + std::time::Duration::from_secs(5),
         );
-        self.commit_system_desired_mutation(&request, guard.state())
+        let state = guard.state();
+        self.commit_system_desired_mutation(&request, &state)
     }
 }
 
 fn validate_system_desired_mutation_source(
-    _transaction: &mut Transaction<'_>,
+    transaction: &mut Transaction<'_>,
     request: &SystemDesiredMutationRequest,
 ) -> AuthorityTxResult<()> {
     match &request.source {
@@ -1551,6 +1638,26 @@ fn validate_system_desired_mutation_source(
             {
                 return Err(ApiError::invalid(
                     "BillingExhaustion source is incomplete or not exhausted",
+                )
+                .into());
+            }
+            let Some(row) = transaction.query_opt(
+                "SELECT account.id, account.billing_account_id
+                   FROM workspaces workspace
+                   JOIN accounts account ON account.id=workspace.account_id
+                  WHERE workspace.id=$1",
+                &[&request.expected_current.workspace_id.as_str()],
+            )?
+            else {
+                return Err(stored_corruption(
+                    "Billing source Workspace has no Account authority",
+                ));
+            };
+            if row.try_get::<_, String>(0)? != decision.account_id
+                || row.try_get::<_, String>(1)? != decision.billing_account_id
+            {
+                return Err(ApiError::conflict(
+                    "Billing exhaustion decision belongs to another Account",
                 )
                 .into());
             }
@@ -1576,6 +1683,18 @@ fn system_operation_id(request: &SystemDesiredMutationRequest) -> Result<Id> {
     match &request.source {
         SystemDesiredMutationSource::BillingExhaustion(decision) => {
             hash_frame(&mut hasher, b"billing-exhaustion")?;
+            // The same Account balance projection can recur after a funded
+            // restart. Bind the decision to the exact Running source revision
+            // so a later exhaustion cycle cannot collide with its old
+            // retained Operation.
+            hash_frame(
+                &mut hasher,
+                &request
+                    .expected_current
+                    .desired_revision
+                    .get()
+                    .to_be_bytes(),
+            )?;
             hash_frame(&mut hasher, decision.billing_account_id.as_bytes())?;
             hash_frame(&mut hasher, decision.account_id.as_bytes())?;
             hash_frame(&mut hasher, decision.credit_nanos.to_string().as_bytes())?;

@@ -36,13 +36,15 @@ use super::placement_policy::{insert_policy_on_store_for_test, update_policy_for
 use super::product::{
     api_request_fingerprint, candidate_matches_placement_mutation,
     encode_cat_create_accepted_response, encode_cat_name_conflict_response,
-    persistent_initialization_matches_mount, ApiIdempotencyRequest, CandidateCollision,
-    CatCreateCandidate, CatCreateEnvelopes, CatRecord, CoveredCatCreateError,
-    CoveredCatCreateRequest, CoveredDesiredMutationError, CoveredDesiredMutationRequest,
-    CoveredDiskDeleteRequest, CoveredPlannedDesiredMutation, DesiredMutationCommit,
-    DesiredVolumeMutation, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, HostnameDesiredLocation,
-    HostnameDesiredLookup, IfMatchFingerprint, PersistentDiskInitialization, RuntimeOperationRead,
+    persistent_initialization_matches_mount, ApiIdempotencyRequest, BillingDesiredCandidate,
+    BillingDesiredCommit, BillingExhaustionDecision, CandidateCollision, CatCreateCandidate,
+    CatCreateEnvelopes, CatRecord, CoveredCatCreateError, CoveredCatCreateRequest,
+    CoveredDesiredMutationError, CoveredDesiredMutationRequest, CoveredDiskDeleteRequest,
+    CoveredPlannedDesiredMutation, DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState,
+    DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
+    ExactHttpResponse, HostnameDesiredLocation, HostnameDesiredLookup, IfMatchFingerprint,
+    PersistentDiskInitialization, RuntimeOperationRead,
+    SystemDesiredMutationCommit, SystemDesiredMutationCommitGuard, SystemDesiredMutationRequest,
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
@@ -167,6 +169,20 @@ fn stores() -> (String, Store, Store, Id) {
     let second = Store::connect(&url, None).unwrap();
     let workspace = bootstrap_workspace(&first, "f2a");
     (url, first, second, workspace)
+}
+
+fn billing_decision(store: &Store, workspace_id: &Id) -> BillingExhaustionDecision {
+    let ledger = store
+        .billing_ledger_for_workspace(workspace_id.as_str())
+        .unwrap();
+    BillingExhaustionDecision {
+        billing_account_id: ledger.billing_account_id,
+        account_id: ledger.account_id,
+        credit_nanos: 0,
+        usage_nanos: 1,
+        usage_visible_through_unix_ms: Some(1),
+        rate_card_id: "test-rate-card-v1".to_string(),
+    }
 }
 
 fn node_identity(node_id: &Id, discriminator: u8) -> NodeIdentity {
@@ -416,6 +432,16 @@ fn advance_target(current: &DesiredRuntimeSpec, target: RuntimeTarget) -> Desire
     desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
     desired.spec_digest = spec_digest(&desired).unwrap();
     desired
+}
+
+const fn runtime_target_projection(target: RuntimeTarget) -> &'static str {
+    match target {
+        RuntimeTarget::Running => "running",
+        RuntimeTarget::Suspended => "suspended",
+        RuntimeTarget::Warm => "warm",
+        RuntimeTarget::Cold => "cold",
+        RuntimeTarget::Deleted => "deleted",
+    }
 }
 
 fn default_endpoint_record(create: &CoveredCatCreateRequest) -> EndpointRecordCandidate {
@@ -781,6 +807,324 @@ fn desired_mutation_cas_supersedes_exact_pending_history_and_skips_empty_revisio
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn billing_enforcer_publishes_one_covered_downward_desired_without_api_result() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(&workspace, "billing-cold", 81, "billing-cold-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 81);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let candidate = BillingDesiredCandidate {
+        cat_id: create.candidate.cat_id.clone(),
+        workspace_id: workspace.clone(),
+        desired_revision: revision(1),
+    };
+    let decision = billing_decision(&store, &workspace);
+    let store = Arc::new(store);
+
+    assert_eq!(
+        store
+            .commit_billing_exhaustion(
+                candidate.clone(),
+                decision.clone(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+        SystemDesiredMutationCommit::Changed
+    );
+    assert_eq!(
+        store
+            .commit_billing_exhaustion(
+                candidate.clone(),
+                decision,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+        SystemDesiredMutationCommit::Stale,
+        "same source revision must not publish a second billing revision"
+    );
+    store
+        .authority_transaction(|transaction| {
+            let desired =
+                super::product_rows::load_desired_for_update(transaction, &candidate.cat_id)?
+                    .unwrap();
+            assert_eq!(desired.desired_revision, revision(2));
+            assert_eq!(desired.target, RuntimeTarget::Cold);
+            let operation = load_operation_by_cat_revision_unlocked(
+                transaction,
+                &candidate.cat_id,
+                revision(2),
+            )?
+            .unwrap();
+            assert_eq!(operation.phase, OperationPhase::Pending);
+            assert_eq!(operation.target, RuntimeTarget::Cold);
+            assert_eq!(
+                transaction
+                    .query_one("SELECT count(*) FROM api_idempotency_results", &[])?
+                    .get::<_, i64>(0),
+                1,
+                "Billing is a domain mutation and must not fabricate an API replay key"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn concurrent_billing_replicas_publish_at_most_one_successor_effect() {
+    let (_url, first, second, workspace) = stores();
+    let mut create = request(&workspace, "billing-race", 82, "billing-race-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&first, &mut create, 82);
+    first
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let candidate = BillingDesiredCandidate {
+        cat_id: create.candidate.cat_id.clone(),
+        workspace_id: workspace,
+        desired_revision: revision(1),
+    };
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| first.commit_billing_cold(&candidate));
+        let right = scope.spawn(|| second.commit_billing_cold(&candidate));
+        (
+            left.join().unwrap().unwrap(),
+            right.join().unwrap().unwrap(),
+        )
+    });
+    assert_eq!(
+        [left, right]
+            .into_iter()
+            .filter(|result| *result == BillingDesiredCommit::Changed)
+            .count(),
+        1
+    );
+    first
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                transaction
+                    .query_one(
+                        "SELECT count(*) FROM runtime_operations WHERE cat_id=$1",
+                        &[&candidate.cat_id.as_str()],
+                    )?
+                    .get::<_, i64>(0),
+                2
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn billing_commit_response_loss_replays_the_stable_system_event() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "billing-response-loss",
+        84,
+        "billing-response-create",
+    );
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 84);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let request = SystemDesiredMutationRequest::billing_exhaustion(
+        create.candidate.desired.clone(),
+        billing_decision(&store, &workspace),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    )
+    .unwrap();
+    let guard = SystemDesiredMutationCommitGuard::new(
+        "Billing response-loss test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    let state = guard.state();
+
+    store.inject_committed_response_loss_once();
+    let lost = store.commit_system_desired_mutation(&request, &state);
+    assert!(matches!(lost, Err(ref error) if error.code == ErrorCode::Unavailable));
+    assert!(guard.commit_was_sent());
+    assert_eq!(
+        store
+            .commit_system_desired_mutation(&request, &state)
+            .unwrap(),
+        SystemDesiredMutationCommit::Replayed
+    );
+    store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                transaction
+                    .query_one(
+                        "SELECT count(*) FROM runtime_operations WHERE cat_id=$1",
+                        &[&create.candidate.cat_id.as_str()],
+                    )?
+                    .get::<_, i64>(0),
+                2
+            );
+            assert_eq!(
+                transaction
+                    .query_one("SELECT count(*) FROM api_idempotency_results", &[])?
+                    .get::<_, i64>(0),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn billing_commit_cancellation_before_postgres_commit_writes_nothing() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(&workspace, "billing-cancel", 85, "billing-cancel-create");
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 85);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let request = SystemDesiredMutationRequest::billing_exhaustion(
+        create.candidate.desired.clone(),
+        billing_decision(&store, &workspace),
+        guest_config_digest(&release).unwrap(),
+        vec![default_endpoint_record(&create)],
+    )
+    .unwrap();
+    let guard = SystemDesiredMutationCommitGuard::new(
+        "Billing cancellation test",
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert!(guard.cancel_before_commit());
+    let result = store.commit_system_desired_mutation(&request, &guard.state());
+    assert!(matches!(result, Err(ref error) if error.code == ErrorCode::Unavailable));
+    store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                load_operation_by_cat_revision_unlocked(
+                    transaction,
+                    &create.candidate.cat_id,
+                    revision(1),
+                )?
+                .unwrap()
+                .phase,
+                OperationPhase::Pending
+            );
+            assert!(load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(2),
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn production_billing_composition_uses_only_the_typed_system_boundary() {
+    let billing_source = include_str!("../../api/billing.rs");
+    let server_source = include_str!("../../server.rs");
+
+    assert!(billing_source.contains(".commit_billing_exhaustion("));
+    assert!(!billing_source.contains("commit_system_desired_mutation"));
+    assert!(!billing_source.contains(".set_desired("));
+    assert!(!billing_source.contains("NodeJob"));
+    assert!(server_source.contains("SingletonRole::BillingEnforcer"));
+    assert!(!server_source.contains("spawn_runtime_authority_with_billing_for_tests"));
+}
+
+#[test]
+fn maintenance_scan_never_guesses_host_lost_or_gcs_retained_results() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(&workspace, "maintenance", 83, "maintenance-create");
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 83);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+
+    let without_fence = store.runtime_maintenance_scan().unwrap();
+    assert_eq!(without_fence.sampled_pending_operations, 1);
+    assert_eq!(without_fence.sampled_pending_on_fenced_node, 0);
+    assert_eq!(without_fence.sampled_retained_api_results, 1);
+
+    let target = refresh_mutation_target(&store, &identity, &policy, &release, 830);
+    let event = active_host_fence_event(&target, 831);
+    store
+        .authority_transaction(|transaction| insert_event(transaction, &event))
+        .unwrap();
+    let with_fence = store.runtime_maintenance_scan().unwrap();
+    assert_eq!(with_fence.sampled_pending_operations, 1);
+    assert_eq!(with_fence.sampled_pending_on_fenced_node, 1);
+    assert_eq!(with_fence.sampled_retained_api_results, 1);
+
+    let pending = store
+        .authority_transaction(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(1),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.phase, OperationPhase::Pending);
+    assert!(pending.terminal.is_none());
+}
+
+#[test]
+fn maintenance_scan_retains_deleted_tombstone_and_api_replay_rows() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "maintenance-deleted",
+        86,
+        "maintenance-deleted-create",
+    );
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 86);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let mut deleted = create.candidate.desired.clone();
+    deleted.target = RuntimeTarget::Deleted;
+    deleted.volumes.clear();
+    deleted.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    deleted.spec_digest = spec_digest(&deleted).unwrap();
+    rewrite_current_desired_and_operation(&store, &deleted, None);
+    // Seed the post-V2 closed state directly: this A3 test owns only the
+    // retention decision and must not fabricate the future delete receipt.
+    store
+        .with(|client| {
+            let mut transaction = client.transaction()?;
+            transaction.execute(
+                "DELETE FROM disk_records WHERE disk_id=$1",
+                &[&create.candidate.root_disk.disk_id.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM volume_records WHERE volume_id=$1",
+                &[&create.candidate.volume.volume_id.as_str()],
+            )?;
+            transaction.commit()
+        })
+        .unwrap();
+
+    let report = store.runtime_maintenance_scan().unwrap();
+    assert_eq!(report.sampled_deleted_tombstones, 1);
+    assert_eq!(report.sampled_retained_api_results, 1);
+    let retained: (String, i64) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT record->>'target' FROM desired_runtime_specs WHERE cat_id=$1),
+                        (SELECT count(*) FROM api_idempotency_results)",
+                    &[&create.candidate.cat_id.as_str()],
+                )
+                .map(|row| (row.get(0), row.get(1)))
+        })
+        .unwrap();
+    assert_eq!(retained, ("deleted".to_string(), 1));
 }
 
 #[test]
@@ -3426,15 +3770,17 @@ fn rewrite_current_desired_and_operation(
             )?
             .ok_or_else(|| internal("test setup lost the current Operation"))?;
             operation.desired_spec_digest = desired.spec_digest.clone();
+            operation.target = desired.target;
             let operation_json = String::from_utf8(encode_operation(&operation).unwrap()).unwrap();
             assert_eq!(
                 transaction.execute(
                     "UPDATE desired_runtime_specs
-                        SET record=$1::TEXT::jsonb, spec_digest=$2
-                      WHERE cat_id=$3",
+                        SET record=$1::TEXT::jsonb, spec_digest=$2, target=$3
+                      WHERE cat_id=$4",
                     &[
                         &desired_json,
                         &desired.spec_digest.as_str(),
+                        &runtime_target_projection(desired.target),
                         &desired.cat_id.as_str(),
                     ],
                 )?,
@@ -3443,11 +3789,12 @@ fn rewrite_current_desired_and_operation(
             assert_eq!(
                 transaction.execute(
                     "UPDATE runtime_operations
-                        SET record=$1::TEXT::jsonb, desired_spec_digest=$2
-                      WHERE operation_id=$3",
+                        SET record=$1::TEXT::jsonb, desired_spec_digest=$2, target=$3
+                      WHERE operation_id=$4",
                     &[
                         &operation_json,
                         &operation.desired_spec_digest.as_str(),
+                        &runtime_target_projection(operation.target),
                         &operation.operation_id.as_str(),
                     ],
                 )?,

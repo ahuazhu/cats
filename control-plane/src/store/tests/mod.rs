@@ -566,14 +566,19 @@ fn oci_owner_lock_distinguishes_a_live_replica_from_a_dead_one() {
 #[test]
 fn singleton_roles_elect_independently_and_release_on_session_drop() {
     let (first, second) = test_store_pair();
-    let mut first_reconciler = first.singleton_session(SingletonRole::Reconciler).unwrap();
+    let mut first_reconciler = first
+        .singleton_session(SingletonRole::RuntimeSweeper)
+        .unwrap();
     let mut second_reconciler = second.singleton_session(SingletonRole::Reconciler).unwrap();
     let mut second_billing = second
         .singleton_session(SingletonRole::BillingEnforcer)
         .unwrap();
 
     assert!(first_reconciler.try_acquire().unwrap());
-    assert!(!second_reconciler.try_acquire().unwrap());
+    assert!(
+        !second_reconciler.try_acquire().unwrap(),
+        "retired Controller and production sweeper must share one exclusion lock"
+    );
     assert!(
         second_billing.try_acquire().unwrap(),
         "one role's leader must not make every other role a hot standby"
@@ -604,7 +609,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
     let starts = Arc::new(AtomicUsize::new(0));
 
     let first_task =
-        crate::server::spawn_singleton_task(Arc::new(first), SingletonRole::Reconciler, {
+        crate::server::spawn_singleton_task(Arc::new(first), SingletonRole::BillingEnforcer, {
             let active = active.clone();
             let max_active = max_active.clone();
             let starts = starts.clone();
@@ -635,7 +640,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
     .expect("the first replica should acquire leadership");
 
     let second_task =
-        crate::server::spawn_singleton_task(Arc::new(second), SingletonRole::Reconciler, {
+        crate::server::spawn_singleton_task(Arc::new(second), SingletonRole::BillingEnforcer, {
             let active = active.clone();
             let max_active = max_active.clone();
             let starts = starts.clone();
