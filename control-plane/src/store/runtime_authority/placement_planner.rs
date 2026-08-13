@@ -568,6 +568,7 @@ pub(super) fn revalidate_desired_mutation_placement_after_identity_locks(
     transaction: &mut Transaction<'_>,
     planned: &PlacementTargetSnapshot,
     active_guest_digest: &Sha256Digest,
+    checkpoint: &mut impl FnMut(&mut Transaction<'_>) -> AuthorityTxResult<()>,
 ) -> AuthorityTxResult<PlacementCommitLoad> {
     if planned.policy.node_id != planned.admission.node_identity.node_id
         || planned.policy.capabilities.guest_config_digest != *active_guest_digest
@@ -575,6 +576,7 @@ pub(super) fn revalidate_desired_mutation_placement_after_identity_locks(
         return Ok(PlacementCommitLoad::Stale);
     }
 
+    checkpoint(transaction)?;
     let Some(current_policy) =
         load_policy_unlocked(transaction, &planned.admission.node_identity.node_id)?
     else {
@@ -585,24 +587,25 @@ pub(super) fn revalidate_desired_mutation_placement_after_identity_locks(
     if current_policy.node_id != planned.admission.node_identity.node_id {
         return Err(corrupt("placement policy belongs to another Node"));
     }
+    checkpoint(transaction)?;
     let current_assigned = load_assigned_desired_unlocked(
         transaction,
         &planned.admission.node_identity.node_id,
         MAX_ASSIGNED_SPECS.saturating_add(1),
     )?;
     validate_current_assigned(&current_policy, &current_assigned)?;
+    checkpoint(transaction)?;
     let current_event =
         load_active_event_by_node_unlocked(transaction, &planned.admission.node_identity.node_id)?;
     if current_policy != planned.policy || current_event != planned.active_host_fence_event {
         return Ok(PlacementCommitLoad::Stale);
     }
 
-    let mut checkpoint = |_: &mut Transaction<'_>| Ok(());
     let current_admission = match lock_placement_admission_for_desired_mutation_checked(
         transaction,
         &planned.admission,
         active_guest_digest,
-        &mut checkpoint,
+        checkpoint,
     )? {
         PlacementAdmissionLoad::Accepted(admission) => *admission,
         PlacementAdmissionLoad::Rejected(_) => return Ok(PlacementCommitLoad::Stale),
@@ -645,11 +648,19 @@ pub(super) fn revalidate_desired_mutation_post_assignment(
     }
 
     let placement_changed = source_node != target_node;
-    let runtime_changed = expected_current.runtime != desired.runtime;
     let target = planned
         .iter()
         .find(|snapshot| snapshot.policy.node_id == *target_node)
         .ok_or_else(|| corrupt("Desired mutation omitted its target placement snapshot"))?;
+    // This helper is called only for PlacementRequired mutations. Re-entry
+    // into activity consumes target eligibility just like a shape change or a
+    // new assignment: an already-assigned Cat cannot use its old A20 snapshot
+    // to reactivate on a Cordoned or actively fenced Node.
+    if target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
+        || target.active_host_fence_event.is_some()
+    {
+        return Ok(PlacementCommitLoad::Stale);
+    }
     if placement_changed {
         // This generic A1 boundary covers planned migration/placement retry.
         // Host takeover requires the later exact event + per-volume
@@ -660,9 +671,7 @@ pub(super) fn revalidate_desired_mutation_post_assignment(
         }
         let current_target =
             validate_current_assigned(&target.policy, &target.admission.assigned_desired_specs)?;
-        if target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
-            || target.active_host_fence_event.is_some()
-            || !observation_networks_are_clean(&target.admission, &current_target.desired_networks)
+        if !observation_networks_are_clean(&target.admission, &current_target.desired_networks)
             || allocate_network(
                 &target.policy,
                 &desired.runtime.network_config.network_id,
@@ -671,11 +680,6 @@ pub(super) fn revalidate_desired_mutation_post_assignment(
         {
             return Ok(PlacementCommitLoad::Stale);
         }
-    } else if runtime_changed
-        && (target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
-            || target.active_host_fence_event.is_some())
-    {
-        return Ok(PlacementCommitLoad::Stale);
     }
 
     for snapshot in planned {
@@ -694,7 +698,7 @@ pub(super) fn revalidate_desired_mutation_post_assignment(
             post.push(desired.clone());
         }
         let validated = validate_current_assigned(&snapshot.policy, &post)?;
-        let capacity_relevant = node_id == target_node && (placement_changed || runtime_changed);
+        let capacity_relevant = node_id == target_node;
         if post.len() > MAX_ASSIGNED_SPECS
             || (capacity_relevant
                 && (validated.total_vcpus > u128::from(snapshot.policy.allocatable_vcpus.get())

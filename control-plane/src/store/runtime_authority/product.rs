@@ -965,9 +965,15 @@ fn commit_desired_mutation_in(
             ]);
             for node_id in nodes {
                 checkpoint_covered_commit(transaction, commit_state)?;
-                if load_identity_by_node_for_update(transaction, &node_id)?.is_none() {
+                let identity = load_identity_by_node_for_update(transaction, &node_id)?
+                    .ok_or_else(|| {
+                        stored_corruption(
+                            "assigned current Desired has no NodeIdentity coordination row",
+                        )
+                    })?;
+                if identity.state != NodeIdentityState::Provisioned {
                     return Err(stored_corruption(
-                        "assigned current Desired has no NodeIdentity coordination row",
+                        "assigned current Desired refers to a retired NodeIdentity",
                     ));
                 }
             }
@@ -986,11 +992,14 @@ fn commit_desired_mutation_in(
                 }
             }
             for planned in &request.placement_snapshots {
-                checkpoint_covered_commit(transaction, commit_state)?;
+                let mut checkpoint = |transaction: &mut Transaction<'_>| {
+                    checkpoint_covered_commit(transaction, commit_state)
+                };
                 if revalidate_desired_mutation_placement_after_identity_locks(
                     transaction,
                     planned,
                     &request.active_guest_digest,
+                    &mut checkpoint,
                 )? == PlacementCommitLoad::Stale
                 {
                     return Ok(DesiredMutationTransactionOutcome::Stale);
@@ -1944,6 +1953,7 @@ fn validate_desired_mutation_request(
             "volume intent changes require covered VolumeRecord and Disk authority",
         ));
     }
+    validate_route_epoch_successor(&request.expected_current, &request.desired)?;
 
     let mutation_class = if old_placement != new_placement
         || request.expected_current.runtime != request.desired.runtime
@@ -2025,6 +2035,69 @@ fn validate_desired_mutation_request(
         }
     }
     Ok(mutation_class)
+}
+
+/// Closes the per-Endpoint serving lineage inside the same transaction that
+/// replaces the complete Desired. The request cannot choose whether an epoch
+/// bump is necessary: new product identities start at one, exact bindings do
+/// not churn, and every changed or re-opened binding advances exactly once.
+fn validate_route_epoch_successor(
+    current: &DesiredRuntimeSpec,
+    desired: &DesiredRuntimeSpec,
+) -> Result<()> {
+    // This A1 boundary carries no G4 RequireIdle Busy/Open proof that a gate
+    // stayed open. Every successor that re-enters Running, or changes another
+    // global Running binding, is therefore a real reopen and burns all
+    // retained Endpoint epochs.
+    let reopens_running =
+        current.target != RuntimeTarget::Running && desired.target == RuntimeTarget::Running;
+    let rebinds_running_globally = desired.target == RuntimeTarget::Running
+        && (current.placement != desired.placement
+            || current.runtime != desired.runtime
+            || current.volumes != desired.volumes
+            || current.transition != desired.transition);
+    for successor in &desired.endpoints {
+        let Some(predecessor) = current
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == successor.endpoint_id)
+        else {
+            if successor.route_epoch.get() != 1 {
+                return Err(invalid_desired_mutation_bundle(
+                    "new Endpoint route epoch must start at one",
+                ));
+            }
+            continue;
+        };
+        let binding_changed = predecessor.hostname != successor.hostname
+            || predecessor.protocol != successor.protocol
+            || predecessor.target_port != successor.target_port;
+        let expected = if binding_changed || reopens_running || rebinds_running_globally {
+            predecessor
+                .route_epoch
+                .get()
+                .checked_add(1)
+                .and_then(Epoch::new)
+                .ok_or_else(|| {
+                    invalid_desired_mutation_bundle("Endpoint route epoch is exhausted")
+                })?
+        } else {
+            predecessor.route_epoch
+        };
+        if successor.route_epoch != expected {
+            let reason = if binding_changed {
+                "changed Endpoint binding must advance route epoch exactly once"
+            } else if reopens_running {
+                "non-Running to Running must advance every retained Endpoint route epoch exactly once"
+            } else if rebinds_running_globally {
+                "global Running rebind must advance every retained Endpoint route epoch exactly once"
+            } else {
+                "unchanged Endpoint binding must preserve route epoch"
+            };
+            return Err(invalid_desired_mutation_bundle(reason));
+        }
+    }
+    Ok(())
 }
 
 const fn runtime_target_activity(target: RuntimeTarget) -> u8 {
@@ -2124,8 +2197,16 @@ fn validate_mutation_endpoint_candidates(
                 if existing.endpoint_id == candidate.endpoint_id
                     && existing.workspace_id == candidate.workspace_id
                     && existing.cat_id == candidate.cat_id
-                    && existing.name == candidate.name => {}
+                    && existing.name == candidate.name
+                    && request
+                        .expected_current
+                        .endpoints
+                        .iter()
+                        .any(|current| current.endpoint_id == candidate.endpoint_id) => {}
             Some(_) => {
+                // EndpointRecord is retained after removal. Reusing that ID as
+                // a "new" epoch-one Endpoint would revive an older serving
+                // lineage without a persisted predecessor epoch.
                 return Ok(Some(CandidateCollision::EndpointIdOrName));
             }
             None if require_existing => {
