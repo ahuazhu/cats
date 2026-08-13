@@ -515,7 +515,12 @@ async fn forward_chunked_body(
     config: GatewayIngressConfig,
 ) -> Result<(), ()> {
     loop {
-        let line = take_crlf_line(public, pending, MAX_CHUNK_LINE_BYTES).await?;
+        let line = take_crlf_line(
+            public,
+            pending,
+            MAX_CHUNK_LINE_BYTES.min(config.max_public_request_head_bytes),
+        )
+        .await?;
         let chunk_size = parse_chunk_size(&line).ok_or(())?;
         tunnel.write_all(&line).await.map_err(|_| ())?;
         if chunk_size == 0 {
@@ -614,6 +619,8 @@ async fn read_more(public: &mut TcpStream, pending: &mut Vec<u8>) -> Result<(), 
 }
 
 fn parse_chunk_size(line: &[u8]) -> Option<u64> {
+    // Extensions are deliberately excluded from the production v1 proxy. A
+    // single hexadecimal size keeps the local boundary proof closed.
     let size = line.strip_suffix(b"\r\n")?;
     if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
         return None;
@@ -632,11 +639,28 @@ fn valid_trailer_line(line: &[u8]) -> bool {
     let Some(separator) = line.iter().position(|byte| *byte == b':') else {
         return false;
     };
+    let name = &line[..separator];
     separator != 0
-        && line[..separator].iter().copied().all(is_token_byte)
+        && name.iter().copied().all(is_token_byte)
+        && !forbidden_trailer_name(name)
         && line[separator + 1..]
             .iter()
             .all(|byte| (*byte >= 0x20 || *byte == b'\t') && *byte != 0x7f)
+}
+
+fn forbidden_trailer_name(name: &[u8]) -> bool {
+    [
+        b"host".as_slice(),
+        b"content-length",
+        b"transfer-encoding",
+        b"connection",
+        b"trailer",
+        b"te",
+        b"upgrade",
+        b"expect",
+    ]
+    .iter()
+    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
 fn parse_content_length(value: &str) -> Option<usize> {
