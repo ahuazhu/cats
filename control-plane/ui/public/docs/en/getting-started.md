@@ -12,7 +12,7 @@ The console also creates PersistentDisks. Its closed durability default is Stric
 ## Create with the CLI
 
     cats login
-    cats create dev +      --boot-image-digest sha256:<64-lowercase-hex> +      --cpus 2 +      --memory 2GiB +      --root-size 1GiB +      --durability strict
+    cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
     cats ls
     cats get cat_…
     cats operation wait op_…

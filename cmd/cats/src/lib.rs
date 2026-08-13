@@ -3622,6 +3622,31 @@ mod tests {
     }
 
     #[test]
+    fn served_getting_started_examples_are_accepted_by_the_shipped_parser() {
+        use clap::Parser;
+
+        const CREATE: &str = "cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict";
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in [
+            "control-plane/ui/public/docs/en/getting-started.md",
+            "control-plane/ui/public/docs/en/getting-started.html",
+            "control-plane/ui/public/docs/zh-CN/getting-started.md",
+            "control-plane/ui/public/docs/zh-CN/getting-started.html",
+        ] {
+            let path = workspace.join(relative);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(
+                source.contains(CREATE),
+                "served documentation {relative} lost the copyable create command"
+            );
+            Cli::try_parse_from(CREATE.split_whitespace()).unwrap_or_else(|error| {
+                panic!("served documentation {relative} has an invalid create command: {error}")
+            });
+        }
+    }
+
+    #[test]
     fn fleet_admin_commands_reject_workspace_scope_before_authentication() {
         for arguments in [
             vec!["cats", "--workspace", "ordinary", "admin", "login"],

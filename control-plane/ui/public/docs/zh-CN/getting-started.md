@@ -12,7 +12,7 @@ Cat Create 使用浏览器持久化。若服务端已 Commit 但响应丢失，R
 ## 使用 CLI Create
 
     cats login
-    cats create dev +      --boot-image-digest sha256:<64-lowercase-hex> +      --cpus 2 +      --memory 2GiB +      --root-size 1GiB +      --durability strict
+    cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
     cats ls
     cats get cat_…
     cats operation wait op_…
