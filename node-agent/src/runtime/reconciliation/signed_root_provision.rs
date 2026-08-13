@@ -307,6 +307,8 @@ impl SignedRunningEffect {
                 network_ip_binary,
                 acquire.lifecycle_volume_port(),
                 Arc::clone(&authority),
+                Arc::clone(&process_ports.serving_global),
+                Arc::clone(&process_ports.vmm_global),
             )),
             acquire,
             provision: SignedRootProvisionEffect::platform(

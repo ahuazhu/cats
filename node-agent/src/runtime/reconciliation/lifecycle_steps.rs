@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
@@ -28,7 +30,11 @@ use crate::runtime_spine::{
 
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::prepare_device_retirement::unique_runtime;
+use super::serving_blockd_process::{
+    ServingBlockdProcessGlobalPort, ServingBlockdProcessInspection,
+};
 use super::signed_running::SignedLifecycleVolumePort;
+use super::vmm_process::{VmmProcessGlobalInspection, VmmProcessGlobalPort};
 use super::{
     recover_lifecycle_release_from_authority, DisposableRootDeleteAttempt, FileCheckpointStore,
     NormalAcquireAcceptedContext, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
@@ -90,9 +96,10 @@ pub(crate) trait LifecyclePhysicalPort: Send + Sync {
     ) -> anyhow::Result<LifecyclePhysicalAttempt>;
 }
 
-#[derive(Debug)]
 struct PlatformLifecyclePhysicalPort {
     network_ip_binary: PathBuf,
+    serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+    vmm_process: Arc<dyn VmmProcessGlobalPort>,
 }
 
 impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
@@ -103,74 +110,73 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
     ) -> anyhow::Result<LifecyclePhysicalAttempt> {
         let _accepted_projection = permit.runtime();
         if let ReconcileStep::CleanupRelease { cleanup } = &permit.checkpoint().step {
-            if let CleanupTarget::Network {
-                network_id,
-                ownership_token,
-            } = &cleanup.target
-            {
-                let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                };
-                let identity = launch.network.as_ref();
-                if &identity.network_config.network_id != network_id
-                    || &identity.ownership_token != ownership_token
-                {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                }
-                let accepted = context.accepted_full()?;
-                let admitted = context.node_global_network()?;
-                if !admitted.matches_observation(accepted.observation()) {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                }
-                let Some(expected) = admitted.expected_networks(&permit.desired().cat_id, identity)
-                else {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                };
-                if permit.runtime().networks != expected {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                }
-                let NetworkCleanupPlan::Remove(network) = plan_network_cleanup(identity, &expected)
-                else {
-                    return Ok(LifecyclePhysicalAttempt::ExactPostcondition);
-                };
-                let _node_global = context.lock_node_global_effect()?;
-                let admitted = context.node_global_network()?;
-                if !admitted.matches_observation(accepted.observation())
-                    || !admitted.has_exact_network(&permit.desired().cat_id, identity)
-                {
-                    return Ok(LifecyclePhysicalAttempt::Conflict);
-                }
-                context.check_active()?;
-                let _ =
-                    crate::ch::remove_network_bounded(&self.network_ip_binary, &network, context);
-                return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
-            }
-            return classify_unadapted_cleanup(context, &permit, &cleanup.target);
+            return match &cleanup.target {
+                CleanupTarget::Network {
+                    network_id,
+                    ownership_token,
+                } => self.remove_exact_network(context, &permit, network_id, ownership_token),
+                CleanupTarget::Scope {
+                    scope_id,
+                    process_start_time_ticks,
+                } => self.stop_exact_scope(context, &permit, scope_id, *process_start_time_ticks),
+                target => classify_unadapted_cleanup(context, &permit, target),
+            };
         }
-        let ReconcileStep::PauseRuntime {
-            runtime_incarnation,
-            process_start_time_ticks,
-        } = &permit.checkpoint().step
-        else {
-            // Drain needs a Guest quiesce+exact blockd proof, snapshot needs
-            // a durable temp/rename owner, stop needs a pidfd/systemd exact
-            // stop receipt, and cleanup needs target-specific retained
-            // handles.  None may be approximated by a pathname operation.
-            return Ok(LifecyclePhysicalAttempt::Unavailable);
-        };
+        let (runtime_incarnation, process_start_time_ticks, stop_scope) =
+            match &permit.checkpoint().step {
+                ReconcileStep::PauseRuntime {
+                    runtime_incarnation,
+                    process_start_time_ticks,
+                } => (runtime_incarnation, *process_start_time_ticks, None),
+                ReconcileStep::StopRuntime {
+                    runtime_incarnation,
+                    process_start_time_ticks,
+                    scope_id,
+                } => (
+                    runtime_incarnation,
+                    *process_start_time_ticks,
+                    Some(scope_id),
+                ),
+                // Drain requires a replayable Guest-quiesce receipt and a
+                // canonical all-volume cursor. Snapshot requires its own
+                // descriptor-retained durable publication owner. Neither is
+                // approximated by an unjournaled request here.
+                _ => return Ok(LifecyclePhysicalAttempt::Unavailable),
+            };
         let accepted = context.accepted_full()?;
         let processes = context.node_global_process()?;
         if !processes.matches_observation(accepted.observation()) {
             return Ok(LifecyclePhysicalAttempt::Conflict);
         }
-        let Some((expected, Some(exact))) = processes.vmm(&permit.desired().cat_id) else {
+        let Some((expected, admitted_exact)) = processes.vmm(&permit.desired().cat_id) else {
             return Ok(LifecyclePhysicalAttempt::Conflict);
         };
         if expected.checkpoint() != permit.checkpoint()
-            || exact.expectation().runtime_incarnation() != runtime_incarnation
-            || exact.evidence().process_start_time_ticks() != *process_start_time_ticks
+            || expected.runtime_incarnation() != runtime_incarnation
         {
             return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let Some(exact) = admitted_exact else {
+            return if stop_scope.is_some()
+                && !permit.runtime().processes.iter().any(|process| {
+                    matches!(
+                        &process.role,
+                        ProcessRole::Vmm { runtime_incarnation: observed }
+                            if observed == runtime_incarnation
+                    )
+                }) {
+                Ok(LifecyclePhysicalAttempt::ExactPostcondition)
+            } else {
+                Ok(LifecyclePhysicalAttempt::Conflict)
+            };
+        };
+        if exact.evidence().process_start_time_ticks() != process_start_time_ticks
+            || stop_scope.is_some_and(|scope| exact.evidence().unit_id() != scope)
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        if stop_scope.is_some() {
+            return self.stop_exact_vmm(context, expected, exact);
         }
         match exact.evidence().state() {
             cats_api::runtime_reconciliation::ProcessState::Paused => {
@@ -189,6 +195,220 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
             }
         }
     }
+}
+
+impl PlatformLifecyclePhysicalPort {
+    fn remove_exact_network(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        permit: &LifecycleEffectPermit<'_>,
+        network_id: &Id,
+        ownership_token: &RandomId128,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        };
+        let identity = launch.network.as_ref();
+        if &identity.network_config.network_id != network_id
+            || &identity.ownership_token != ownership_token
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let accepted = context.accepted_full()?;
+        let admitted = context.node_global_network()?;
+        if !admitted.matches_observation(accepted.observation()) {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let Some(expected) = admitted.expected_networks(&permit.desired().cat_id, identity) else {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        };
+        if permit.runtime().networks != expected {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let NetworkCleanupPlan::Remove(network) = plan_network_cleanup(identity, &expected) else {
+            return Ok(LifecyclePhysicalAttempt::ExactPostcondition);
+        };
+        let _node_global = context.lock_node_global_effect()?;
+        let admitted = context.node_global_network()?;
+        if !admitted.matches_observation(accepted.observation())
+            || !admitted.has_exact_network(&permit.desired().cat_id, identity)
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        context.check_active()?;
+        let _ = crate::ch::remove_network_bounded(&self.network_ip_binary, &network, context);
+        Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+    }
+
+    fn stop_exact_vmm(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        expected: &super::vmm_process::VmmProcessExpectation,
+        admitted: &super::vmm_process::ExactVmmProcessProof,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        match self
+            .vmm_process
+            .inspect_vmm_exact_or_absent_after_node_global_sweep(expected, context)?
+        {
+            VmmProcessGlobalInspection::Absent(_) => {
+                Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+            }
+            VmmProcessGlobalInspection::Exact(fresh)
+                if fresh.expectation() == admitted.expectation()
+                    && fresh.evidence() == admitted.evidence() =>
+            {
+                if fresh.assert_current(context).is_err() {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                }
+                signal_exact_process_bounded(
+                    context,
+                    fresh.evidence().clone().into_process_evidence(),
+                )
+            }
+            VmmProcessGlobalInspection::Unavailable => Ok(LifecyclePhysicalAttempt::Unavailable),
+            VmmProcessGlobalInspection::Exact(_) | VmmProcessGlobalInspection::Conflict(_) => {
+                Ok(LifecyclePhysicalAttempt::Conflict)
+            }
+        }
+    }
+
+    fn stop_exact_scope(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        permit: &LifecycleEffectPermit<'_>,
+        scope_id: &Id,
+        process_start_time_ticks: cats_api::runtime_reconciliation::WireU64,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        let classified = classify_unadapted_cleanup(
+            context,
+            permit,
+            &CleanupTarget::Scope {
+                scope_id: scope_id.clone(),
+                process_start_time_ticks,
+            },
+        )?;
+        if classified != LifecyclePhysicalAttempt::Unavailable {
+            return Ok(classified);
+        }
+        let accepted = context.accepted_full()?;
+        let processes = context.node_global_process()?;
+        if !processes.matches_observation(accepted.observation()) {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let mut matches = permit.runtime().processes.iter().filter(|process| {
+            &process.scope_id == scope_id
+                && process.process_start_time_ticks == process_start_time_ticks
+        });
+        let Some(public) = matches.next() else {
+            return Ok(LifecyclePhysicalAttempt::ExactPostcondition);
+        };
+        if matches.next().is_some() {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        match &public.role {
+            ProcessRole::Vmm {
+                runtime_incarnation,
+            } => {
+                let Some((expected, Some(admitted))) = processes.vmm(&permit.desired().cat_id)
+                else {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                };
+                if expected.checkpoint() != permit.checkpoint()
+                    || expected.runtime_incarnation() != runtime_incarnation
+                    || admitted.clone().into_process_evidence() != *public
+                {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                }
+                self.stop_exact_vmm(context, expected, admitted)
+            }
+            ProcessRole::Blockd { volume_id, .. } => {
+                let Some((expected, Some(admitted))) =
+                    processes.serving_blockd(&permit.desired().cat_id, volume_id)
+                else {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                };
+                if !admitted.matches_public_process(public) {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                }
+                match self
+                    .serving_process
+                    .inspect_serving_exact_or_absent_after_node_global_sweep(expected, context)?
+                {
+                    ServingBlockdProcessInspection::Absent => {
+                        Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+                    }
+                    ServingBlockdProcessInspection::Exact(fresh)
+                        if fresh.as_ref() == admitted.evidence() =>
+                    {
+                        if admitted.assert_listener_current(context).is_err() {
+                            return Ok(LifecyclePhysicalAttempt::Conflict);
+                        }
+                        signal_exact_process_bounded(
+                            context,
+                            fresh.as_ref().clone().into_process_evidence(),
+                        )
+                    }
+                    ServingBlockdProcessInspection::Unavailable => {
+                        Ok(LifecyclePhysicalAttempt::Unavailable)
+                    }
+                    ServingBlockdProcessInspection::Exact(_)
+                    | ServingBlockdProcessInspection::Conflict(_) => {
+                        Ok(LifecyclePhysicalAttempt::Conflict)
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_exact_process_bounded(
+    context: &RuntimeDesiredEffectContext,
+    process: ProcessEvidence,
+) -> anyhow::Result<LifecyclePhysicalAttempt> {
+    use crate::proc::{ExactPidFd, ExactPidFdOpen, PidFdSignal, ProcIdentity};
+
+    context.check_active()?;
+    let expected = ProcIdentity {
+        pid: process.process_id,
+        start_ticks: Some(process.process_start_time_ticks.get()),
+        exe: Some(PathBuf::from(process.executable_path.as_str())),
+    };
+    let pidfd = match ExactPidFd::open_exact(&expected)? {
+        ExactPidFdOpen::Exact(pidfd) => pidfd,
+        ExactPidFdOpen::Absent => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+        ExactPidFdOpen::IdentityMismatch => return Ok(LifecyclePhysicalAttempt::Conflict),
+        ExactPidFdOpen::Unsupported => return Ok(LifecyclePhysicalAttempt::Unavailable),
+    };
+    context.check_active()?;
+    match pidfd.signal(libc::SIGTERM)? {
+        PidFdSignal::Submitted | PidFdSignal::AlreadyExited => {}
+        PidFdSignal::Unsupported => return Ok(LifecyclePhysicalAttempt::Unavailable),
+    }
+    let graceful_deadline = context
+        .deadline()
+        .min(Instant::now() + Duration::from_secs(2));
+    while Instant::now() < graceful_deadline {
+        if pidfd.exited()? || context.check_active().is_err() {
+            return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if context.check_active().is_ok() {
+        match pidfd.signal(libc::SIGKILL)? {
+            PidFdSignal::Submitted | PidFdSignal::AlreadyExited => {}
+            PidFdSignal::Unsupported => return Ok(LifecyclePhysicalAttempt::Unavailable),
+        }
+    }
+    Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_exact_process_bounded(
+    _context: &RuntimeDesiredEffectContext,
+    _process: ProcessEvidence,
+) -> anyhow::Result<LifecyclePhysicalAttempt> {
+    Ok(LifecyclePhysicalAttempt::Unavailable)
 }
 
 enum NetworkCleanupPlan {
@@ -366,9 +586,15 @@ impl LifecycleStepEffect {
         network_ip_binary: PathBuf,
         volume_transition: Arc<dyn SignedLifecycleVolumePort>,
         volume_authority: Arc<dyn VolumeDataAuthority>,
+        serving_process: Arc<dyn ServingBlockdProcessGlobalPort>,
+        vmm_process: Arc<dyn VmmProcessGlobalPort>,
     ) -> Self {
         Self {
-            physical: Arc::new(PlatformLifecyclePhysicalPort { network_ip_binary }),
+            physical: Arc::new(PlatformLifecyclePhysicalPort {
+                network_ip_binary,
+                serving_process,
+                vmm_process,
+            }),
             volume_transition,
             volume_authority,
         }
@@ -515,18 +741,22 @@ impl LifecycleStepEffect {
             .revalidate_current(&stored, &current)
             .context("revalidate lifecycle checkpoint after physical effect")?;
         if attempt == LifecyclePhysicalAttempt::ExactPostcondition {
-            let successor = if matches!(
-                stored.checkpoint().step,
-                ReconcileStep::CleanupRelease { .. }
-            ) {
-                cleanup_postcondition_successor(accepted, desired, runtime, stored.checkpoint())?
-            } else {
-                exact_postcondition_successor(
+            let successor = match &stored.checkpoint().step {
+                ReconcileStep::CleanupRelease { .. } => cleanup_postcondition_successor(
+                    accepted,
+                    desired,
+                    runtime,
+                    stored.checkpoint(),
+                )?,
+                ReconcileStep::StopRuntime { .. } => {
+                    stop_postcondition_successor(accepted, desired, runtime, stored.checkpoint())?
+                }
+                _ => exact_postcondition_successor(
                     context.state_directory().path(),
                     desired,
                     runtime,
                     stored.checkpoint(),
-                )?
+                )?,
             };
             if let Some(successor) = successor {
                 encode_runtime_checkpoint(&successor)
@@ -1486,10 +1716,23 @@ fn cleanup_postcondition_successor(
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let cursor = fresh_cleanup_cursor(accepted)?;
+    cleanup_postcondition_successor_at(
+        desired,
+        runtime,
+        checkpoint,
+        accepted.observation().residue.as_slice(),
+        &cursor,
+    )
+}
+
+fn fresh_cleanup_cursor(
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+) -> anyhow::Result<FreshCleanupCursor> {
     let Some(desired_read_position) = accepted.desired_read_position() else {
         anyhow::bail!("cleanup successor planner lacks a current Desired read position")
     };
-    let cursor = FreshCleanupCursor {
+    Ok(FreshCleanupCursor {
         session: SessionBinding {
             node_id: accepted.session().node_id.clone(),
             node_boot_id: accepted.session().node_boot_id.clone(),
@@ -1500,14 +1743,7 @@ fn cleanup_postcondition_successor(
         inventory_read_position: accepted.attestation().inventory_read_position,
         desired_read_position,
         observed_at: accepted.attestation().accepted_at_unix_ms,
-    };
-    cleanup_postcondition_successor_at(
-        desired,
-        runtime,
-        checkpoint,
-        accepted.observation().residue.as_slice(),
-        &cursor,
-    )
+    })
 }
 
 fn cleanup_postcondition_successor_at(
@@ -1524,6 +1760,73 @@ fn cleanup_postcondition_successor_at(
         cleanup_target_is_absent(completed, runtime, residue),
         "cleanup successor planner did not receive the exact target-absent postcondition"
     );
+    remaining_cleanup_successor_at(desired, runtime, checkpoint, residue, cursor)
+}
+
+fn stop_postcondition_successor(
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let cursor = fresh_cleanup_cursor(accepted)?;
+    stop_postcondition_successor_at(
+        desired,
+        runtime,
+        checkpoint,
+        accepted.observation().residue.as_slice(),
+        &cursor,
+    )
+}
+
+fn stop_postcondition_successor_at(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    cursor: &FreshCleanupCursor,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let ReconcileStep::StopRuntime {
+        runtime_incarnation,
+        process_start_time_ticks,
+        scope_id,
+    } = &checkpoint.step
+    else {
+        anyhow::bail!("StopRuntime successor planner received another lifecycle step")
+    };
+    anyhow::ensure!(
+        matches!(
+            desired.target,
+            RuntimeTarget::Warm | RuntimeTarget::Cold | RuntimeTarget::Deleted
+        ),
+        "StopRuntime cannot settle the current Desired target"
+    );
+    let launch = checkpoint
+        .runtime_launch
+        .identity()
+        .context("StopRuntime successor lost its retained launch")?;
+    anyhow::ensure!(
+        checkpoint.runtime_incarnation.as_ref() == Some(runtime_incarnation)
+            && runtime.runtime_incarnation.as_ref() == Some(runtime_incarnation)
+            && launch.runtime_incarnation == *runtime_incarnation
+            && launch.scope_id == *scope_id
+            && !runtime.processes.iter().any(|process| {
+                matches!(process.role, ProcessRole::Vmm { .. })
+                    || (&process.scope_id == scope_id
+                        && process.process_start_time_ticks == *process_start_time_ticks)
+            }),
+        "StopRuntime postcondition does not prove the exact VMM absent"
+    );
+    remaining_cleanup_successor_at(desired, runtime, checkpoint, residue, cursor)
+}
+
+fn remaining_cleanup_successor_at(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    cursor: &FreshCleanupCursor,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
     let mut plans = canonical_remaining_cleanup(desired, runtime, checkpoint, residue)?;
     // This order is the teardown dependency order, not history carried over
     // from the completed token.  Every successor is rebuilt from this one
@@ -2910,6 +3213,59 @@ mod tests {
         assert!(
             exact_postcondition_successor(directory.path(), &desired, &runtime, &checkpoint,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn stopped_postcondition_advances_only_after_the_exact_vmm_is_absent() {
+        let (desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        let launch = checkpoint.runtime_launch.identity().unwrap().clone();
+        let process_start_time_ticks = runtime.processes[0].process_start_time_ticks;
+        checkpoint.stable_state = None;
+        checkpoint.step = ReconcileStep::StopRuntime {
+            runtime_incarnation: launch.runtime_incarnation.clone(),
+            process_start_time_ticks,
+            scope_id: launch.scope_id.clone(),
+        };
+        runtime.step = checkpoint.step.clone();
+        runtime.stable_state = None;
+        runtime.processes.clear();
+        let cursor = FreshCleanupCursor {
+            session: SessionBinding {
+                node_id: checkpoint.node_id.clone(),
+                node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                    "11111111111111111111111111111111".to_owned(),
+                )
+                .unwrap(),
+                agent_instance_id: launch.process_identity_token.clone(),
+                agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+            },
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(2).unwrap(),
+            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(2).unwrap(),
+            desired_read_position: cats_api::runtime_reconciliation::Sequence::new(3).unwrap(),
+            observed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_800_000_000_000)
+                .unwrap(),
+        };
+
+        let successor =
+            stop_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor)
+                .unwrap()
+                .expect("exact VMM absence must advance into canonical cleanup");
+        assert!(matches!(
+            successor.step,
+            ReconcileStep::CleanupRelease { .. }
+        ));
+        assert!(matches!(
+            successor.runtime_launch,
+            RuntimeLaunch::Present(_)
+        ));
+        assert!(successor.processes.is_empty());
+        encode_runtime_checkpoint(&successor).unwrap();
+
+        runtime.processes = checkpoint.processes.clone();
+        assert!(
+            stop_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor).is_err(),
+            "an exact live VMM must keep StopRuntime unsettled"
         );
     }
 
