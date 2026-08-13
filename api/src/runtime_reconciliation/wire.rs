@@ -3329,6 +3329,7 @@ fn authorized_serving_acquire_schema() -> Schema {
     )
 }
 
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
 fn residue_lineage_schema() -> Schema {
     union(
         "kind",
@@ -3347,6 +3348,59 @@ fn residue_lineage_schema() -> Schema {
             ),
         ],
     )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_lineage_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("unreadable", vec![]),
+            variant(
+                "readable",
+                vec![field("lineage", residue_data_directory_lineage_schema())],
+            ),
+        ],
+    )
+}
+
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
+fn data_directory_residue_fields() -> Vec<Field> {
+    vec![
+        field("volume_id_hint", nullable(id())),
+        field("data_directory", string(StringRule::HostPath)),
+        field("ownership_token", ownership_token_schema()),
+        field("lineage", residue_lineage_schema()),
+    ]
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn data_directory_residue_fields() -> Vec<Field> {
+    vec![
+        field("cat_id_hint", nullable(id())),
+        field("disk_id_hint", nullable(id())),
+        field("volume_id_hint", nullable(id())),
+        field("data_directory", string(StringRule::HostPath)),
+        field("allocated_bytes", wire_u64()),
+        field(
+            "retention_reason",
+            closed(&[
+                "current_desired_attachment",
+                "superseded_desired_attachment",
+                "unassigned_cat",
+                "unreadable_identity",
+                "incomplete_physical_inventory",
+                "authority_proof_pending",
+                "authority_does_not_authorize_reclaim",
+                "unique_local_tail",
+                "persistent_disk_retained",
+                "root_disk_retained",
+                "exact_reclaim_pending",
+            ]),
+        ),
+        field("ownership_token", ownership_token_schema()),
+        field("lineage", residue_lineage_schema()),
+    ]
 }
 
 fn residue_checkpoint_schema() -> Schema {
@@ -3440,15 +3494,7 @@ fn node_residue_schema() -> Schema {
                     field("ownership_token", ownership_token_schema()),
                 ],
             ),
-            variant(
-                "data_directory",
-                vec![
-                    field("volume_id_hint", nullable(id())),
-                    field("data_directory", string(StringRule::HostPath)),
-                    field("ownership_token", ownership_token_schema()),
-                    field("lineage", residue_lineage_schema()),
-                ],
-            ),
+            variant("data_directory", data_directory_residue_fields()),
             variant(
                 "mount",
                 vec![
@@ -10193,8 +10239,32 @@ fn collect_node_residue_cross(
     path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     if let NodeResidue::DataDirectory { lineage, .. } = residue {
         collect_residue_lineage_cross(lineage, &child(path, "lineage"), output);
+    }
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if let NodeResidue::DataDirectory {
+        cat_id_hint,
+        disk_id_hint,
+        volume_id_hint,
+        lineage,
+        ..
+    } = residue
+    {
+        collect_residue_lineage_cross(lineage, &child(path, "lineage"), output);
+        if let ResidueLineageEvidence::Readable { lineage } = lineage {
+            if cat_id_hint.as_ref().is_some_and(|id| id != &lineage.cat_id)
+                || disk_id_hint
+                    .as_ref()
+                    .is_some_and(|id| id != &lineage.disk_id)
+                || volume_id_hint
+                    .as_ref()
+                    .is_some_and(|id| id != &lineage.volume_id)
+            {
+                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+            }
+        }
     }
 }
 
@@ -10203,6 +10273,7 @@ fn collect_residue_lineage_cross(
     path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     if let ResidueLineageEvidence::Readable {
         attachment_id_hint,
         attachment_epoch_hint,
@@ -10214,6 +10285,12 @@ fn collect_residue_lineage_cross(
         if attachment_id_hint.is_some() != attachment_epoch_hint.is_some()
             || local_durable_generation.get() < remote_durable_generation.get()
         {
+            output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+        }
+    }
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if let ResidueLineageEvidence::Readable { lineage } = lineage {
+        if !residue_lineage_valid(lineage) {
             output.push(Candidate::at(path, MalformedProblem::InvalidValue));
         }
     }

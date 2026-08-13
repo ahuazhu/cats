@@ -2390,8 +2390,16 @@ pub enum NodeResidue {
         ownership_token: OwnershipTokenEvidence,
     },
     DataDirectory {
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        cat_id_hint: Option<Id>,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        disk_id_hint: Option<Id>,
         volume_id_hint: Option<Id>,
         data_directory: HostPath,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        allocated_bytes: WireU64,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        retention_reason: DataDirectoryRetentionReason,
         ownership_token: OwnershipTokenEvidence,
         lineage: ResidueLineageEvidence,
     },
@@ -2421,11 +2429,19 @@ pub enum NodeResidue {
 pub enum ResidueLineageEvidence {
     Unreadable,
     Readable {
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        lineage: Box<ResidueDataDirectoryLineage>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         attachment_id_hint: Option<Id>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         attachment_epoch_hint: Option<FenceEpoch>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         local_durable_generation: Generation,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         remote_durable_generation: Generation,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         pending_pack_count: WireU64,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         fenced: bool,
     },
 }

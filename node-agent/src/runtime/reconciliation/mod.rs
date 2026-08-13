@@ -189,6 +189,10 @@ pub(crate) use kernel_nbd::{
 };
 pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use normal_acquire::residue_authority_request_from_observed;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use normal_acquire::RuntimeVolumeTransitionHttpClient as ProposedResidueAuthorityHttpClient;
 pub use normal_acquire::{
     recover_lifecycle_release_from_authority, recover_normal_acquire_from_authority,
     recover_normal_release_from_authority, A19SignedVolumeTransitionTransport,
@@ -224,10 +228,12 @@ pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublica
 pub(crate) use vmm_cid::PlatformExactVmmCidInventoryPort;
 pub(crate) use vmm_cid::{VmmCidAllocationPort, VmmCidInventoryPort};
 pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
+#[cfg(test)]
+pub(crate) use vmm_process::VmmProcessExpectation;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use vmm_process::{
     stale_boot_recovery_global_sealed, ExactVmmProcessAbsenceProof,
-    StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+    StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort,
 };
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;

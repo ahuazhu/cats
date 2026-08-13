@@ -3502,6 +3502,22 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         target_port: 8080,
     }];
     desired.spec_digest = spec_digest(&desired).unwrap();
+    let endpoint_id_b = id("ep_route_b");
+    let hostname_b = Hostname::new("route-b.cats.run").unwrap();
+    let mut desired_b = desired.clone();
+    desired_b.cat_id = id("cat_route_b");
+    desired_b.runtime.network_config.network_id = id("net_route_b");
+    desired_b.runtime.network_config.guest_mac = MacAddress::new("02:00:00:00:00:0b").unwrap();
+    desired_b.runtime.network_config.guest_ipv4 = Ipv4Address::new("10.0.0.5").unwrap();
+    desired_b.runtime.network_config.gateway_ipv4 = Ipv4Address::new("10.0.0.6").unwrap();
+    desired_b.endpoints = vec![EndpointIntent {
+        endpoint_id: endpoint_id_b.clone(),
+        hostname: hostname_b.clone(),
+        route_epoch: Epoch::new(8).unwrap(),
+        protocol: HttpProtocol::Http,
+        target_port: 8081,
+    }];
+    desired_b.spec_digest = spec_digest(&desired_b).unwrap();
     store
         .authority_transaction(|transaction| {
             let now = database_now(transaction)?;
@@ -3533,6 +3549,36 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                     cat_id: desired.cat_id.clone(),
                     endpoint_id: endpoint_id.clone(),
                     desired_revision: desired.desired_revision,
+                },
+            )?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired_b.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("route-cat-b"),
+                    created_at: now,
+                },
+            )?;
+            insert_endpoint(
+                transaction,
+                &EndpointRecord {
+                    endpoint_id: endpoint_id_b.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired_b.cat_id.clone(),
+                    name: id("web-b"),
+                    created_at: now,
+                },
+            )?;
+            insert_desired(transaction, &desired_b)?;
+            insert_hostname_lookup(
+                transaction,
+                &HostnameDesiredLookup {
+                    hostname: hostname_b.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired_b.cat_id.clone(),
+                    endpoint_id: endpoint_id_b.clone(),
+                    desired_revision: desired_b.desired_revision,
                 },
             )
         })
@@ -3609,6 +3655,20 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
     let signer_binding = Arc::new(installed_signing_authority.binding().clone());
     let active_kid = route_signer.kid().clone();
     let ring_version = Epoch::new(3).unwrap();
+    let mut runtime_b = route_ready_runtime(&desired_b);
+    let CheckpointEvidence::Valid {
+        checkpoint_path, ..
+    } = &mut runtime_b.checkpoint
+    else {
+        unreachable!()
+    };
+    *checkpoint_path = HostPath::new("/var/lib/cats/checkpoints/cat_route_b.json").unwrap();
+    runtime_b.processes[0].process_id = 102;
+    runtime_b.processes[0].process_start_time_ticks = WireU64::new(2).unwrap();
+    runtime_b.processes[0].scope_id = id("cats-route-b.service");
+    runtime_b.processes[0].control_socket_path =
+        HostPath::new("/run/cats/route-b/vmm.sock").unwrap();
+    runtime_b.networks[0].tap_name = id("tap-route-b");
     let mut full = observation(
         &store,
         &session,
@@ -3616,7 +3676,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         1,
         true,
         Some(desired_snapshot.read_position),
-        vec![route_ready_runtime(&desired)],
+        vec![runtime_b, route_ready_runtime(&desired)],
     );
     full.key_ring_version = Some(ring_version);
     full.loaded_kids = vec![active_kid.clone()];
@@ -3703,6 +3763,155 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         "https://node-a.internal:7301"
     );
     assert!(snapshot.evaluated_at_unix_ms.get() > 0);
+
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    let mut negative_a = route_ready_runtime(&desired);
+    negative_a.lifecycle_admission = LifecycleAdmission::Closed;
+    negative_a.processes.clear();
+    for route in &mut negative_a.routes {
+        route.gate = RouteGateState::Closed;
+        route.cancellation_pending = true;
+    }
+    negative_a.conditions = vec![Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Process],
+            since_unix_ms: db_now(&store),
+        },
+    }];
+    let negative_partial = observation(
+        &store,
+        &session,
+        3,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![negative_a],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &negative_partial)
+            .unwrap(),
+    );
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Pending),
+        "the exact-negative Cat in a partial must not receive a new Grant",
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    let omitted_b_source: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT source_kind FROM runtime_current_cat_observations
+                      WHERE node_id=$1 AND cat_id=$2",
+                    &[&identity.node_id.as_str(), &desired_b.cat_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(
+        omitted_b_source, "full",
+        "an unrelated Cat omitted by a partial retains its accepted full row",
+    );
+
+    let mut partial_b_runtime = route_ready_runtime(&desired_b);
+    partial_b_runtime.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Network],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let partial_b = observation(
+        &store,
+        &session,
+        4,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![partial_b_runtime],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial_b)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Pending),
+    );
+
+    let mut restored_a = route_ready_runtime(&desired);
+    restored_a.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Network],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let restored_partial = observation(
+        &store,
+        &session,
+        5,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![restored_a],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &restored_partial)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+
     let unknown = KeyId::new("b".repeat(64)).unwrap();
     assert_eq!(
         store

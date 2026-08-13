@@ -13,6 +13,13 @@ use cats_api::agent_registration::{
     Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_AUTHENTICATE_CHALLENGE,
     NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    decode_runtime_residue_authority_success, encode_runtime_residue_authority_request,
+    ContractVersion, NodeResidue, ResidueLineageEvidence, RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess, RUNTIME_RESIDUE_AUTHORITY_PATH,
+    RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
+};
 use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
     encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
@@ -1710,6 +1717,81 @@ impl RuntimeVolumeTransitionHttpClient {
     }
 }
 
+/// Projects the exact feature-on scanner evidence into the only authority
+/// request the Node may forward. Hint disagreement or a non-data/unreadable
+/// residue has no request representation and remains retained locally.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn residue_authority_request_from_observed(
+    session: &SessionBinding,
+    residue: &NodeResidue,
+) -> Option<RuntimeResidueAuthorityRequest> {
+    let NodeResidue::DataDirectory {
+        cat_id_hint,
+        disk_id_hint,
+        volume_id_hint,
+        lineage: ResidueLineageEvidence::Readable { lineage },
+        ..
+    } = residue
+    else {
+        return None;
+    };
+    if lineage.node_id != session.node_id
+        || cat_id_hint.as_ref().is_some_and(|id| id != &lineage.cat_id)
+        || disk_id_hint
+            .as_ref()
+            .is_some_and(|id| id != &lineage.disk_id)
+        || volume_id_hint
+            .as_ref()
+            .is_some_and(|id| id != &lineage.volume_id)
+    {
+        return None;
+    }
+    let request = RuntimeResidueAuthorityRequest {
+        version: ContractVersion::V1,
+        session: session.clone(),
+        lineage: lineage.as_ref().clone(),
+    };
+    encode_runtime_residue_authority_request(&request)
+        .is_ok()
+        .then_some(request)
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+impl RuntimeVolumeTransitionHttpClient {
+    /// Sends one exact, feature-gated residue qualification request through
+    /// the same A19 credential, signature, fixed-path and bounded-response
+    /// envelope as the accepted volume authority calls.
+    ///
+    /// Any transport ambiguity, route absence or response mismatch remains
+    /// `None`; callers must retain the physical directory and retry later.
+    pub fn request_residue_authority(
+        &self,
+        request: &RuntimeResidueAuthorityRequest,
+        deadline: Instant,
+    ) -> Result<
+        Option<Box<RuntimeResidueAuthoritySuccess>>,
+        cats_api::runtime_reconciliation::ContractError,
+    > {
+        let body = encode_runtime_residue_authority_request(request)?;
+        let response = self.post_exact_signed_json(
+            RUNTIME_RESIDUE_AUTHORITY_PATH,
+            &body,
+            RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        );
+        let Ok(StrictSignedJsonResponse::Success(body)) = response else {
+            return Ok(None);
+        };
+        let Ok(success) = decode_runtime_residue_authority_success(&body) else {
+            return Ok(None);
+        };
+        Ok((success.version == request.version
+            && success.session == request.session
+            && success.lineage == request.lineage)
+            .then(|| Box::new(success)))
+    }
+}
+
 impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
     fn post_a19_signed_json(
         &self,
@@ -2018,6 +2100,10 @@ mod tests {
         decode_runtime_volume_transition_request, encode_runtime_volume_transition_error,
         ContractError, ContractVersion, Durability, Generation, GuestDeviceIdentity, Id,
         RemoteHead, Revision, RuntimeVolumeTransitionPreconditionProblem, Sha256Digest, UnixMillis,
+    };
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    use cats_api::runtime_reconciliation::{
+        Epoch, FenceEpoch, HostPath, NodeBootId, RandomId128, WireU64,
     };
 
     use super::*;
@@ -3012,6 +3098,169 @@ mod tests {
         );
         server.join().unwrap();
         result
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn proposal_lineage() -> cats_api::runtime_reconciliation::ResidueDataDirectoryLineage {
+        use cats_api::runtime_reconciliation::{
+            residue_acquisition_digest, AssignedKind, AssignedPlacement,
+            ResidueDataDirectoryLineage,
+        };
+        let request = decode_runtime_volume_transition_request(REQUEST).unwrap();
+        let volume = volume();
+        let acquisition = cats_api::runtime_reconciliation::AuthorizedServingAcquire::Normal {
+            request: NormalAcquireRequest {
+                volume_id: volume.volume_id.clone(),
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                attachment_id: volume.attachment_id.clone(),
+                expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+                desired_revision: request.desired_revision,
+                placement_epoch: request.placement.placement_epoch,
+                lease_duration_ms: 60_000,
+            },
+            result: NormalAcquireResult {
+                volume_id: volume.volume_id.clone(),
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                attachment_id: volume.attachment_id.clone(),
+                resulting_epoch: FenceEpoch::new(1).unwrap(),
+                resulting_head: RemoteHead {
+                    generation: Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+                lease_expires_at: UnixMillis::new(1_720_000_060_000).unwrap(),
+            },
+        };
+        ResidueDataDirectoryLineage {
+            workspace_id: Id::new("ws_01").unwrap(),
+            cat_id: Id::new("cat_01").unwrap(),
+            disk_id: volume.disk_id,
+            disk_kind: DiskKind::Root,
+            volume_id: volume.volume_id,
+            attachment_id: volume.attachment_id,
+            attachment_epoch: FenceEpoch::new(1).unwrap(),
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            },
+            node_id: request.session.node_id.clone(),
+            desired_revision: request.desired_revision,
+            spec_digest: request.spec_digest,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: request.session.node_id,
+                placement_epoch: request.placement.placement_epoch,
+            },
+            placement_epoch: request.placement.placement_epoch,
+            acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+            acquisition,
+            local_durable_generation: Generation::new(0).unwrap(),
+            remote_durable_generation: Generation::new(0).unwrap(),
+            remote_head: RemoteHead {
+                generation: Generation::new(0).unwrap(),
+                root_hash: None,
+                root_object_id: None,
+            },
+            pending_pack_count: WireU64::new(0).unwrap(),
+            fenced: true,
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn proposal_residue_client_forwards_only_the_exact_signed_envelope() {
+        use cats_api::runtime_reconciliation::{
+            encode_runtime_residue_authority_success, RuntimeResidueAuthorityOutcome,
+        };
+        let session = SessionBinding {
+            node_id: Id::new("node_a").unwrap(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+            agent_session_epoch: Epoch::new(2).unwrap(),
+        };
+        let lineage = proposal_lineage();
+        let scanned = NodeResidue::DataDirectory {
+            cat_id_hint: Some(lineage.cat_id.clone()),
+            disk_id_hint: Some(lineage.disk_id.clone()),
+            volume_id_hint: Some(lineage.volume_id.clone()),
+            data_directory: HostPath::new("/var/lib/cats/data/orphan").unwrap(),
+            allocated_bytes: WireU64::new(4096).unwrap(),
+            retention_reason:
+                cats_api::runtime_reconciliation::DataDirectoryRetentionReason::AuthorityProofPending,
+            ownership_token:
+                cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Readable {
+                lineage: Box::new(lineage),
+            },
+        };
+        let request = residue_authority_request_from_observed(&session, &scanned)
+            .expect("feature scanner residue must become one exact request");
+        let success = RuntimeResidueAuthoritySuccess {
+            version: request.version,
+            session: request.session.clone(),
+            lineage: request.lineage.clone(),
+            outcome: RuntimeResidueAuthorityOutcome::Retained {
+                reason: cats_api::runtime_reconciliation::ResidueAuthorityRetentionReason::UniqueLocalTail,
+            },
+        };
+        let body = encode_runtime_residue_authority_success(&success).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_body = encode_runtime_residue_authority_request(&request).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert_eq!(
+                request_line,
+                "POST /v1/internal/runtime/residue-authority HTTP/1.1\r\n"
+            );
+            let mut content_length = None;
+            let mut proof_headers = std::collections::BTreeMap::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+                proof_headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            let mut observed_body = vec![0; content_length.unwrap()];
+            reader.read_exact(&mut observed_body).unwrap();
+            assert_eq!(observed_body, expected_body);
+            verify_request_proof(
+                RUNTIME_SPINE_METHOD,
+                RUNTIME_RESIDUE_AUTHORITY_PATH,
+                &observed_body,
+                &proof_headers[NODE_CREDENTIAL_ID_HEADER],
+                &proof_headers[NODE_PUBLIC_KEY_SPKI_HEADER],
+                &proof_headers[NODE_SIGNATURE_HEADER],
+            )
+            .unwrap();
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let client = RuntimeVolumeTransitionHttpClient::for_loopback_test(
+            &format!("http://{address}/"),
+            signer(),
+        )
+        .unwrap();
+        let received = client
+            .request_residue_authority(&request, Instant::now() + Duration::from_secs(2))
+            .unwrap()
+            .expect("exact response must be forwarded");
+        server.join().unwrap();
+        assert_eq!(*received, success);
     }
 
     #[test]

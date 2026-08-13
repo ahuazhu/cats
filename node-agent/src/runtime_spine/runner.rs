@@ -17,9 +17,9 @@ use cats_api::runtime_reconciliation::{
     ContractVersion, DegradedReason, DegradedSource, DesiredReadRequest, DesiredReadSnapshot,
     DesiredRuntimeSpec, Epoch, Id, InventorySource, KeyId, LifecycleAdmission, NodeObservation,
     NodeResidue, ObservationAcceptance, ObservationInventoryAcceptance, ObservedRuntimeStatus,
-    ProcessRole, ProcessState, RandomId128, ReadyReason, ReconcileStep, RuntimeSpineError,
-    RuntimeSpineErrorDetail, RuntimeTarget, RuntimeVolumeAuthorityRejection, Sha256Digest,
-    StableState, UnixMillis, NODE_OBSERVATION_MAX_WIRE_BYTES,
+    ProcessRole, ProcessState, RandomId128, ReadyReason, ReconcileStep, RouteGateState,
+    RuntimeSpineError, RuntimeSpineErrorDetail, RuntimeTarget, RuntimeVolumeAuthorityRejection,
+    Sha256Digest, StableState, UnixMillis, NODE_OBSERVATION_MAX_WIRE_BYTES,
 };
 use thiserror::Error;
 
@@ -106,12 +106,14 @@ pub(crate) trait RuntimePreScanAdmission: Send + Sync + 'static {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RuntimePreScanAdmissionOutcome {
     retained_running_cats: BTreeSet<Id>,
+    exact_physical_negative_cats: BTreeSet<Id>,
 }
 
 impl RuntimePreScanAdmissionOutcome {
     pub(crate) fn retained_running_cats(cat_ids: impl IntoIterator<Item = Id>) -> Self {
         Self {
             retained_running_cats: cat_ids.into_iter().collect(),
+            exact_physical_negative_cats: BTreeSet::new(),
         }
     }
 
@@ -122,6 +124,8 @@ impl RuntimePreScanAdmissionOutcome {
     fn exclude(&mut self, cat_ids: &BTreeSet<Id>) {
         self.retained_running_cats
             .retain(|cat_id| !cat_ids.contains(cat_id));
+        self.exact_physical_negative_cats
+            .extend(cat_ids.iter().cloned());
     }
 }
 
@@ -2944,12 +2948,22 @@ impl RuntimeSpineRunner {
                 };
                 let mut wire_budget_sources = inventory.residue_sources();
                 let node_global_process = inventory.take_node_global_process_admission();
+                let exact_running_negative_cats = node_global_process
+                    .as_ref()
+                    .map(NodeGlobalManagedProcessScanAdmission::exact_running_negative_cats)
+                    .unwrap_or_default();
                 let node_global_network = inventory.take_node_global_network_admission();
                 let kernel_nbd_pool = inventory.take_kernel_nbd_pool_admission();
                 let running_tail = inventory.take_running_tail_admission();
                 let mut candidate =
                     build_full_observation_candidate(coordinates.clone(), inventory);
                 if node_observation_exceeds_wire_budget(&candidate)? {
+                    apply_incomplete_physical_negatives(
+                        &coordinates,
+                        self.coordinator_lane.as_ref(),
+                        &mut retained_admission,
+                        &exact_running_negative_cats,
+                    )?;
                     if wire_budget_sources.is_empty() {
                         wire_budget_sources.extend(REQUIRED_INVENTORY_SOURCES);
                     }
@@ -3713,8 +3727,11 @@ fn build_degraded_partial_observation(
         let Some(desired) = desired_by_cat.get(&runtime.cat_id) else {
             continue;
         };
-        if !retained_admission.retains(&runtime.cat_id)
-            || !is_proven_current_running(runtime, desired)
+        let exact_physical_negative = retained_admission
+            .exact_physical_negative_cats
+            .contains(&runtime.cat_id);
+        if !is_proven_current_running(runtime, desired)
+            || (!exact_physical_negative && !retained_admission.retains(&runtime.cat_id))
         {
             continue;
         }
@@ -3739,6 +3756,31 @@ fn build_degraded_partial_observation(
             _ => observed_at_unix_ms,
         };
         let mut degraded = runtime.clone();
+        if exact_physical_negative {
+            // The private Node-global process sweep proved that the exact VMM
+            // which made this old Running/Open status route-ready is absent
+            // (or no longer Running). Publish that Cat explicitly: omission
+            // from a partial deliberately leaves Control's prior Cat row
+            // unchanged. The process-local cell was closed before this
+            // projection was handed to the journal lane.
+            degraded.lifecycle_admission = LifecycleAdmission::Closed;
+            for route in &mut degraded.routes {
+                route.gate = RouteGateState::Closed;
+                route.cancellation_pending = true;
+            }
+            let expected_incarnation = degraded.runtime_incarnation.clone();
+            degraded.processes.retain(|process| {
+                !matches!(
+                    &process.role,
+                    ProcessRole::Vmm {
+                        runtime_incarnation
+                    } if Some(runtime_incarnation) == expected_incarnation.as_ref()
+                )
+            });
+            degraded
+                .conditions
+                .retain(|condition| !matches!(condition, Condition::Ready { .. }));
+        }
         degraded
             .conditions
             .retain(|condition| !matches!(condition, Condition::Degraded { .. }));
@@ -3784,7 +3826,10 @@ fn build_degraded_partial_observation(
         runtimes,
         residue: Vec::new(),
     };
-    if !fit_partial_observation_to_wire_budget(&mut observation) {
+    if !fit_partial_observation_to_wire_budget(
+        &mut observation,
+        &retained_admission.exact_physical_negative_cats,
+    ) {
         return None;
     }
     if observation.runtimes.is_empty() && !wire_budget_exceeded {
@@ -3793,14 +3838,22 @@ fn build_degraded_partial_observation(
     Some(observation)
 }
 
-fn fit_partial_observation_to_wire_budget(observation: &mut NodeObservation) -> bool {
+fn fit_partial_observation_to_wire_budget(
+    observation: &mut NodeObservation,
+    protected_cats: &BTreeSet<Id>,
+) -> bool {
     let Ok(mut wire_size) = node_observation_canonical_wire_size(observation) else {
         return false;
     };
     while wire_size > NODE_OBSERVATION_MAX_WIRE_BYTES {
-        let Some(removed) = observation.runtimes.pop() else {
+        let Some(remove_index) = observation
+            .runtimes
+            .iter()
+            .rposition(|runtime| !protected_cats.contains(&runtime.cat_id))
+        else {
             return false;
         };
+        let removed = observation.runtimes.remove(remove_index);
         let Ok(encoded) = serde_json::to_vec(&removed) else {
             return false;
         };
@@ -4030,23 +4083,29 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
+    use cats_api::route_grant_v2::{
+        RouteAdmissionV2Reason, RouteGrantV2Claims, RouteGrantV2TimeVerdict,
+        ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER, ROUTE_GRANT_V2_VERSION,
+    };
     use cats_api::runtime_reconciliation::{
         decode_agent_session, decode_desired_read_request, decode_desired_read_snapshot,
         decode_node_observation, decode_runtime_checkpoint, encode_desired_read_snapshot,
         encode_node_observation, encode_observation_acceptance, encode_runtime_spine_error,
         spec_digest, AdmissionInventoryAttestation, AppliedDesiredEvidence, AssignedKind,
-        AssignedPlacement, CheckpointEvidence, Condition, ContractVersion,
-        ControlHandshakeEvidence, FenceEpoch, GuestBootId, GuestTransportEvidence, HostPath, Id,
-        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, NetworkConfig,
-        ObservationAcceptance, ObservationInventoryAcceptance, ObservedVmShape,
-        OwnershipTokenEvidence, ProcessEvidence, ProcessRole, ProcessState, ReadyReason,
-        ReconcileStep, Revision, RuntimeConfig, RuntimeLaunch, RuntimeSpineErrorDetail,
-        RuntimeTarget, RuntimeTransition, Sequence, SessionBinding, StableState, UnixMillis,
-        WarmSnapshotEvidence, WireU64, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+        AssignedPlacement, CheckpointEvidence, CheckpointRouteGate, Condition, ContractVersion,
+        ControlHandshakeEvidence, EndpointIntent, FenceEpoch, GuestBootId, GuestTransportEvidence,
+        HostPath, Hostname, HttpProtocol, Id, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
+        MacAddress, NetworkConfig, ObservationAcceptance, ObservationInventoryAcceptance,
+        ObservedRouteGate, ObservedVmShape, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
+        ProcessState, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
+        RuntimeConfig, RuntimeLaunch, RuntimeSpineErrorDetail, RuntimeTarget, RuntimeTransition,
+        Sequence, SessionBinding, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+        DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
     };
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     use crate::ch::{BlockPath, ChConfig, ChNetwork};
+    use crate::runtime::reconciliation::{AdmissionCell, AdmissionSnapshot, VmmProcessExpectation};
     use crate::runtime_spine::{ProductionRuntimeDesiredEffect, RuntimeLaunchPort};
 
     use super::*;
@@ -4069,6 +4128,8 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct ExactRunningNegativeWireOverflowScanner;
+
     struct TransientRunningProbeScanner {
         calls: AtomicUsize,
     }
@@ -4081,6 +4142,18 @@ mod tests {
     struct InvalidIncompleteScanner;
 
     struct ErrorScanner;
+
+    fn wire_overflow_residue() -> Vec<NodeResidue> {
+        (0..cats_api::runtime_reconciliation::NODE_OBSERVATION_MAX_RESIDUE_ITEMS)
+            .map(|index| NodeResidue::ControlSocket {
+                // 4,096 stable items can exceed the wire budget even though
+                // the independent item-count budget is satisfied.
+                socket_path: HostPath::new(format!("/{}-{index:04}", "x".repeat(2_194))).unwrap(),
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            })
+            .collect()
+    }
 
     impl crate::runtime_spine::inventory_scanner_sealed::Sealed for IncompleteScanner {}
 
@@ -4106,22 +4179,63 @@ mod tests {
         ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             context.check_active()?;
-            let residue = (0..cats_api::runtime_reconciliation::NODE_OBSERVATION_MAX_RESIDUE_ITEMS)
-                .map(|index| NodeResidue::ControlSocket {
-                    // 4,096 stable items can exceed the wire budget even
-                    // though the independent item-count budget is satisfied.
-                    socket_path: HostPath::new(format!("/{}-{index:04}", "x".repeat(2_194)))
-                        .unwrap(),
-                    role_hint: None,
-                    ownership_token: OwnershipTokenEvidence::Missing,
-                })
-                .collect();
             let mut inventory = CompleteRuntimeInventory::for_test(
                 UnixMillis::new(1_720_000_004_000).unwrap(),
                 RuntimeInventoryKeyRing::Unavailable,
                 Vec::new(),
-                residue,
+                wire_overflow_residue(),
             );
+            inventory
+                .residue_sources
+                .insert(InventorySource::ControlSocket);
+            Ok(RuntimeInventoryScanOutcome::Complete(inventory))
+        }
+    }
+
+    impl crate::runtime_spine::inventory_scanner_sealed::Sealed
+        for ExactRunningNegativeWireOverflowScanner
+    {
+    }
+
+    impl RuntimeInventoryScanner for ExactRunningNegativeWireOverflowScanner {
+        fn scan_complete(
+            &self,
+            context: RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+            context.check_active()?;
+            let desired = context
+                .coordinates()
+                .desired
+                .desired_specs
+                .first()
+                .context("test Desired lacks its Running Cat")?;
+            let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+            )))?;
+            anyhow::ensure!(
+                checkpoint.cat_id == desired.cat_id,
+                "test absent-VMM expectation names another Cat"
+            );
+            let vmm = VmmProcessExpectation::from_checkpoint(checkpoint)?.with_checkpoint_path(
+                HostPath::new("/var/lib/cats/checkpoints/cat_01.json")
+                    .context("test checkpoint path is canonical")?,
+            )?;
+            let process_admission = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )?
+            .with_vmms(
+                BTreeMap::from([(desired.cat_id.clone(), vmm)]),
+                BTreeMap::new(),
+            )?;
+            let mut inventory = CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_020_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                Vec::new(),
+                wire_overflow_residue(),
+            )
+            .with_node_global_process_admission(Some(process_admission));
             inventory
                 .residue_sources
                 .insert(InventorySource::ControlSocket);
@@ -4301,6 +4415,12 @@ mod tests {
         fail: AtomicBool,
     }
 
+    struct CellBackedPreScanAdmission {
+        cat_id: Id,
+        cell: Arc<AdmissionCell>,
+        fail_closes: AtomicUsize,
+    }
+
     struct OrderedPreScanAdmission {
         calls: AtomicUsize,
         cell_open: Arc<AtomicBool>,
@@ -4433,6 +4553,39 @@ mod tests {
 
         fn fail_close_cats(&self, _cat_ids: &BTreeSet<Id>) {
             self.fail_closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl RuntimePreScanAdmission for CellBackedPreScanAdmission {
+        fn reconcile(
+            &self,
+            context: RuntimePreScanAdmissionContext,
+        ) -> anyhow::Result<RuntimePreScanAdmissionOutcome> {
+            context.check_active()?;
+            anyhow::ensure!(
+                context
+                    .coordinates()
+                    .desired
+                    .desired_specs
+                    .iter()
+                    .any(|desired| desired.cat_id == self.cat_id),
+                "test admission Cat is outside Desired"
+            );
+            Ok(RuntimePreScanAdmissionOutcome::retained_running_cats([
+                self.cat_id.clone(),
+            ]))
+        }
+
+        fn fail_close_all(&self) {
+            self.fail_closes.fetch_add(1, Ordering::SeqCst);
+            self.cell.force_close();
+        }
+
+        fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>) {
+            if cat_ids.contains(&self.cat_id) {
+                self.fail_closes.fetch_add(1, Ordering::SeqCst);
+                self.cell.force_close();
+            }
         }
     }
 
@@ -4983,6 +5136,79 @@ mod tests {
         desired.cat_id = Id::new(cat_id).unwrap();
         desired.spec_digest = spec_digest(&desired).unwrap();
         desired
+    }
+
+    fn running_route_fixture() -> (
+        DesiredRuntimeSpec,
+        ObservedRuntimeStatus,
+        Arc<AdmissionCell>,
+        RouteGrantV2Claims,
+    ) {
+        let mut desired = desired_with_network();
+        let endpoint = EndpointIntent {
+            endpoint_id: Id::new("endpoint_01").unwrap(),
+            hostname: Hostname::new("app.cats.run").unwrap(),
+            route_epoch: Epoch::new(1).unwrap(),
+            protocol: HttpProtocol::Http,
+            target_port: 8080,
+        };
+        desired.endpoints = vec![endpoint.clone()];
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let mut runtime = ready_running_runtime(&desired);
+        let runtime_incarnation = runtime.runtime_incarnation.clone().unwrap();
+        let binding = RouteGateBinding {
+            workspace_id: desired.workspace_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            hostname: endpoint.hostname.clone(),
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            runtime_incarnation: runtime_incarnation.clone(),
+            route_epoch: endpoint.route_epoch,
+            protocol: endpoint.protocol,
+            target_port: endpoint.target_port,
+        };
+        runtime.routes = vec![ObservedRouteGate {
+            binding: binding.clone(),
+            gate: RouteGateState::Active,
+            active_guards: 0,
+            cancellation_pending: false,
+            instance_count: 1,
+        }];
+        let cell = AdmissionCell::new(
+            AdmissionSnapshot::new(
+                desired.desired_revision,
+                desired.spec_digest.clone(),
+                desired.placement.clone(),
+                Some(runtime_incarnation.clone()),
+                LifecycleAdmission::Open,
+                vec![CheckpointRouteGate {
+                    binding: binding.clone(),
+                    gate: RouteGateState::Active,
+                }],
+            )
+            .with_guest_ipv4(desired.runtime.network_config.guest_ipv4.clone()),
+        )
+        .unwrap();
+        let claims = RouteGrantV2Claims {
+            version: ROUTE_GRANT_V2_VERSION,
+            iss: ROUTE_GRANT_V2_ISSUER.to_owned(),
+            aud: ROUTE_GRANT_V2_AUDIENCE.to_owned(),
+            workspace_id: binding.workspace_id,
+            endpoint_id: binding.endpoint_id,
+            hostname: binding.hostname,
+            cat_id: binding.cat_id,
+            node_id: binding.node_id,
+            runtime_incarnation,
+            route_epoch: binding.route_epoch,
+            protocol: binding.protocol,
+            target_port: binding.target_port,
+            gateway_public_key_spki_sha256: Sha256Digest::from_bytes([0; 32]),
+            iat: 1_786_156_800,
+            nbf: 1_786_156_800,
+            exp: 1_786_156_920,
+        };
+        (desired, runtime, cell, claims)
     }
 
     fn ready_running_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
@@ -6101,6 +6327,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anchored_wire_overflow_fail_closes_exact_absent_vmm_before_partial_publication() {
+        let (desired, running, cell, claims) = running_route_fixture();
+        drop(
+            cell.acquire_verified_route(&claims, RouteGrantV2TimeVerdict::Valid)
+                .expect("known-positive local route must admit before the negative scan")
+                .0,
+        );
+
+        let registered = decode_agent_session(SESSION).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDirectory::unanchored(root.path().to_path_buf());
+        let mut predecessor =
+            RuntimeSpineJournal::open_for_test(&state, registered.clone()).unwrap();
+        assert!(matches!(
+            predecessor.desired_work().unwrap(),
+            RuntimeSpineDesiredWork::Request(_)
+        ));
+        let mut initial_snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        initial_snapshot.desired_specs = vec![desired.clone()];
+        let initial_snapshot_bytes = encode_desired_read_snapshot(&initial_snapshot).unwrap();
+        predecessor
+            .accept_desired(initial_snapshot.clone(), &initial_snapshot_bytes)
+            .unwrap();
+        let initial_full = build_full_observation(
+            predecessor.full_scan().unwrap(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                vec![running],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        predecessor
+            .prepare_observation(initial_full.clone())
+            .unwrap();
+        let accepted_at = UnixMillis::new(1_720_000_005_000).unwrap();
+        let initial_acceptance = ObservationAcceptance {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: initial_full.node_id.clone(),
+                node_boot_id: initial_full.node_boot_id.clone(),
+                agent_instance_id: initial_full.agent_instance_id.clone(),
+                agent_session_epoch: initial_full.agent_session_epoch,
+            },
+            observation_id: initial_full.observation_id.clone(),
+            heartbeat_sequence: initial_full.heartbeat_sequence,
+            accepted_at_unix_ms: accepted_at,
+            lease_deadline_unix_ms: UnixMillis::new(1_720_000_065_000).unwrap(),
+            inventory: ObservationInventoryAcceptance::Full {
+                attestation: AdmissionInventoryAttestation {
+                    version: ContractVersion::V1,
+                    node_id: initial_full.node_id.clone(),
+                    agent_session_epoch: initial_full.agent_session_epoch,
+                    inventory_epoch: initial_full.inventory_epoch,
+                    inventory_digest: initial_full.inventory_digest.clone().unwrap(),
+                    inventory_read_position: initial_full.inventory_read_position.unwrap(),
+                    accepted_at_unix_ms: accepted_at,
+                },
+            },
+        };
+        predecessor
+            .accept_observation(
+                initial_acceptance.clone(),
+                &encode_observation_acceptance(&initial_acceptance).unwrap(),
+            )
+            .unwrap();
+        drop(predecessor);
+
+        let observed = Arc::new(Mutex::new(Vec::<NodeObservation>::new()));
+        let serving_observed = Arc::clone(&observed);
+        let serving_desired = desired.clone();
+        let app = Router::new()
+            .route(
+                cats_api::runtime_reconciliation::DESIRED_READ_PATH,
+                post(move |request: Request<Body>| {
+                    let desired = serving_desired.clone();
+                    async move {
+                        let body =
+                            to_bytes(request.into_body(), DESIRED_READ_REQUEST_MAX_WIRE_BYTES)
+                                .await
+                                .unwrap();
+                        let request = decode_desired_read_request(&body).unwrap();
+                        let sequence = request.request_sequence.get();
+                        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+                        snapshot.session = request.session;
+                        snapshot.request_sequence = request.request_sequence;
+                        snapshot.read_position = Sequence::new(12 + sequence).unwrap();
+                        snapshot.issued_at_unix_ms =
+                            UnixMillis::new(1_720_000_010_000 + sequence).unwrap();
+                        snapshot.expires_at_unix_ms =
+                            UnixMillis::new(1_720_000_040_000 + sequence).unwrap();
+                        snapshot.desired_specs = vec![desired];
+                        wire_response(
+                            StatusCode::OK,
+                            encode_desired_read_snapshot(&snapshot).unwrap(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                cats_api::runtime_reconciliation::OBSERVATION_PATH,
+                post(move |request: Request<Body>| {
+                    let observed = Arc::clone(&serving_observed);
+                    async move {
+                        let body = to_bytes(request.into_body(), NODE_OBSERVATION_MAX_WIRE_BYTES)
+                            .await
+                            .unwrap();
+                        let observation = decode_node_observation(&body).unwrap();
+                        assert!(!observation.complete_inventory);
+                        observed.lock().unwrap().push(observation.clone());
+                        let accepted_at = UnixMillis::new(1_720_000_100_000).unwrap();
+                        wire_response(
+                            StatusCode::OK,
+                            encode_observation_acceptance(&ObservationAcceptance {
+                                version: ContractVersion::V1,
+                                session: SessionBinding {
+                                    node_id: observation.node_id.clone(),
+                                    node_boot_id: observation.node_boot_id.clone(),
+                                    agent_instance_id: observation.agent_instance_id.clone(),
+                                    agent_session_epoch: observation.agent_session_epoch,
+                                },
+                                observation_id: observation.observation_id,
+                                heartbeat_sequence: observation.heartbeat_sequence,
+                                accepted_at_unix_ms: accepted_at,
+                                lease_deadline_unix_ms: UnixMillis::new(1_720_000_160_000).unwrap(),
+                                inventory: ObservationInventoryAcceptance::Partial {
+                                    inventory_epoch: observation.inventory_epoch,
+                                },
+                            })
+                            .unwrap(),
+                        )
+                    }
+                }),
+            );
+        let (origin, server) = spawn(app).await;
+        let admission = Arc::new(CellBackedPreScanAdmission {
+            cat_id: desired.cat_id.clone(),
+            cell: Arc::clone(&cell),
+            fail_closes: AtomicUsize::new(0),
+        });
+        let effect = Arc::new(CountingEffect {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = RuntimeSpineRunner::new_inner(
+            state,
+            registered,
+            RuntimeSpineHttpClient::for_loopback_test(&origin, signer()).unwrap(),
+            Arc::new(ExactRunningNegativeWireOverflowScanner),
+            Some(effect.clone()),
+            Some(admission.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::DesiredAccepted
+        ));
+        assert!(matches!(
+            runner
+                .run_once_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap(),
+            RuntimeSpineRunStep::PartialObservationAccepted {
+                degraded_runtimes: 1
+            }
+        ));
+        assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
+        {
+            let observations = observed.lock().unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].runtimes.len(), 1);
+            let negative = &observations[0].runtimes[0];
+            assert_eq!(negative.cat_id, desired.cat_id);
+            assert_eq!(negative.lifecycle_admission, LifecycleAdmission::Closed);
+            assert!(negative.routes.iter().all(|route| {
+                route.gate == RouteGateState::Closed && route.cancellation_pending
+            }));
+            assert!(!negative
+                .processes
+                .iter()
+                .any(|process| matches!(process.role, ProcessRole::Vmm { .. })));
+            assert!(!negative
+                .conditions
+                .iter()
+                .any(|condition| matches!(condition, Condition::Ready { .. })));
+        }
+        assert_eq!(
+            cell.acquire_verified_route(&claims, RouteGrantV2TimeVerdict::Valid)
+                .unwrap_err(),
+            RouteAdmissionV2Reason::GateClosed
+        );
+
+        runner.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unavailable_full_inventory_never_reaches_the_typed_effect_seam() {
         let snapshot = snapshot_with_network();
         let app = Router::new().route(
@@ -6204,7 +6634,7 @@ mod tests {
             .unwrap();
         assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
         assert!(!retained.retains(&desired.cat_id));
-        assert!(build_degraded_partial_observation(
+        let partial = build_degraded_partial_observation(
             coordinates,
             Some(&full),
             Some(&full),
@@ -6212,7 +6642,23 @@ mod tests {
             &retained,
             UnixMillis::new(1_720_000_005_000).unwrap(),
         )
-        .is_none());
+        .expect("the exact negative Cat must be projected rather than omitted");
+        assert_eq!(partial.runtimes.len(), 1);
+        let runtime = &partial.runtimes[0];
+        assert_eq!(runtime.cat_id, desired.cat_id);
+        assert_eq!(runtime.lifecycle_admission, LifecycleAdmission::Closed);
+        assert!(runtime
+            .routes
+            .iter()
+            .all(|route| { route.gate == RouteGateState::Closed && route.cancellation_pending }));
+        assert!(!runtime
+            .processes
+            .iter()
+            .any(|process| matches!(process.role, ProcessRole::Vmm { .. })));
+        assert!(!runtime
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition, Condition::Ready { .. })));
         lane.shutdown_blocking().unwrap();
     }
 
