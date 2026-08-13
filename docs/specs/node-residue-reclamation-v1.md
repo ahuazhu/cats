@@ -21,12 +21,21 @@ source does not invent residue: it makes the inventory incomplete.
 optional Cat/Disk/Volume hints, ownership-token evidence, a closed retention
 reason and either unreadable lineage or this exact readable lineage:
 
-- Cat, Disk, Disk kind and Volume;
+- Workspace, Cat, Disk, Disk kind and Volume;
 - attachment ID and epoch;
-- the normal transition ID or takeover authorization ID which created it;
-- Node and placement epoch;
+- the normal transition ID or takeover authorization ID which created it,
+  plus that acquisition's complete immutable request/result or consumed
+  authorization/receipt pair;
+- the domain-separated SHA-256 digest of that complete acquisition value;
+- current Desired revision, spec digest and assigned placement, plus the
+  historical acquisition placement epoch;
 - local and remote durable generations, complete remote head, pending-pack
   count and local fenced observation.
+
+The acquisition digest preimage is
+`"cats.runtime.residue-acquisition.v1" || NUL || canonical(acquisition)`.
+It is a corruption/binding check, never a replacement for the complete
+acquisition receipt carried beside it.
 
 Hints and retention reasons are diagnostic only. They MUST NOT authorize a
 filesystem mutation. Readable lineage fields must agree with any repeated
@@ -34,20 +43,47 @@ hints. Unknown, corrupt, duplicated, raced, over-budget or partially scanned
 artifacts remain visible when they can be bounded and remain retained; they
 never become guessed Cold state or guessed deletion proof.
 
+Unassigned data is enumerated only through retained directory descriptors.
+Each child is opened with no-follow semantics and matched back to the device,
+inode, owner and expected type that was enumerated. Allocated-byte traversal
+is iterative and depth bounded. One source-wide counter admits at most 4,096
+residue values; discovery of item 4,097, cancellation, deadline, depth
+overflow, a path/type substitution or any partial enumeration makes the data
+source incomplete without deleting or hiding the retained bytes.
+
+A corrupt or wrong-binding checkpoint at the canonical filename of an
+assigned Cat is projected as that Cat's `CheckpointEvidence.corrupt`, not as a
+second top-level residue at the same path. The Cat remains at
+`InspectInventory`, lifecycle admission remains closed, and an independently
+exact local data lineage may still be observed without treating the corrupt
+checkpoint as process, route or mutation authority.
+
 ## 2. Exact Control query
 
-The proposed signed endpoint is
-`POST /v1/internal/runtime/residue-authority`. It uses the common current
-AgentSession proof and binds the request lineage's Node to that authenticated
-session. Control evaluates one exact lineage in one repeatable-read PostgreSQL
-snapshot and returns the same session and lineage plus exactly one outcome:
+The proposed signed endpoint name is
+`POST /v1/internal/runtime/residue-authority`, but the production router does
+not install it while this document remains Proposed. Its read-only Store seam
+uses the common current AgentSession proof and binds the request lineage's
+Node to that authenticated session. Control evaluates one exact lineage in one
+repeatable-read PostgreSQL snapshot and returns the same session and lineage
+plus exactly one outcome:
 
 - `retained { reason }`, which is diagnostic only; or
 - `reclaimable { proof }`, containing one of the three proofs in §3.
 
+The same repeatable-read snapshot must bind the current Desired Workspace,
+Cat, revision, spec digest and assigned Node/placement; its exact Volume intent
+must bind Disk, kind, Volume, attachment and acquisition coordinate; and the
+product Disk row (or the exact typed completion retained after atomic product
+deletion) must bind the same Workspace/Disk/Volume/Cat. Existing cross-
+Workspace coordinates and missing coordinates return the same closed error so
+this seam cannot become a metadata-existence oracle.
+
 The query is read-only. Response loss is resolved by repeating the same exact
 query; no reply is a deletion authorization. Missing, duplicate, split or
-corrupt authority rows fail closed.
+corrupt authority rows fail closed. Enabling the HTTP route or using a proof
+for physical deletion requires a separately accepted decision and release
+composition change.
 
 ## 3. Closed reclaim proofs
 
@@ -63,8 +99,10 @@ No proof outside this list is valid:
    head must be the same or later.
 3. `disposable_root_delete_completion`: a Root-only completion and its exact
    consumed disposable-delete authorization jointly bind Cat, Disk, Volume,
-   old attachment, old epoch, Node, placement and head. This is the only proof
-   allowed to consume a retained `R < L` tail.
+   delete ID, old attachment, old epoch, Node, placement and head. The
+   completion's delete ID must equal both the authorization and consumed
+   receipt, and its completion time must not precede consumption. This is the
+   only proof allowed to consume a retained `R < L` tail.
 
 PersistentDisk, unknown lineage and `R < L` without the exact disposable Root
 pair always remain retained. Observation fields, directory names, audit logs,

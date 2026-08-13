@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 
 pub use cats_api::runtime_reconciliation::{
-    AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
-    AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
-    BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DiskKind,
+    residue_acquisition_digest, AcquireOrigin, AsciiText, AuthorizationConsumedReceipt,
+    AuthorizationRecord, AuthorizationState, AuthorizedServingAcquire, BeginDeleteRequest,
+    BeginDeleteResult, BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DiskKind,
     DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization, Epoch, FenceEpoch,
     Generation, Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest, NormalAcquireResult,
     RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, ResidueAuthorityRetentionReason,
@@ -49,22 +49,6 @@ pub struct AuthorizedServingAttachment {
     pub head: RemoteHead,
     pub lease_expires_at: UnixMillis,
     pub acquire: AuthorizedServingAcquire,
-}
-
-/// Immutable, thick authority that created one serving attachment.  Normal
-/// acquire keeps its exact request/result pair; takeover keeps the complete
-/// consumed authorization and receipt rather than a lossy result projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuthorizedServingAcquire {
-    Normal {
-        request: NormalAcquireRequest,
-        result: NormalAcquireResult,
-    },
-    Takeover {
-        authorization: VolumeTakeoverAuthorization,
-        receipt: TakeoverConsumedReceipt,
-    },
 }
 
 impl AuthorizedServingAttachment {

@@ -109,6 +109,11 @@ pub(crate) use billing::enforce_exhausted_billing_accounts;
 #[cfg(debug_assertions)]
 pub use cats::ensure_running;
 
+/// The residue reclamation contract is still Proposed. Keep its signed HTTP
+/// ingress mechanically absent from every production router until an accepted
+/// ADR/spec explicitly flips the deployment composition.
+const ENABLE_PROPOSED_RESIDUE_AUTHORITY: bool = false;
+
 #[derive(Debug)]
 pub struct Failure(pub ApiError);
 
@@ -721,7 +726,7 @@ pub fn router(state: AppState) -> Router {
     let runtime_volume_authority = if state.retired_product_authority_for_tests() {
         Router::new()
     } else {
-        Router::new()
+        let router = Router::new()
             .route(
                 "/v1/internal/runtime/volume-transitions",
                 post(runtime_volume_transitions::mutation)
@@ -731,12 +736,16 @@ pub fn router(state: AppState) -> Router {
                 "/v1/internal/runtime/volume-transition-evidence",
                 post(runtime_volume_transitions::evidence)
                     .fallback(runtime_volume_transitions::evidence),
-            )
-            .route(
+            );
+        if ENABLE_PROPOSED_RESIDUE_AUTHORITY {
+            router.route(
                 "/v1/internal/runtime/residue-authority",
                 post(runtime_volume_transitions::residue_authority)
                     .fallback(runtime_volume_transitions::residue_authority),
             )
+        } else {
+            router
+        }
     };
     #[cfg(not(debug_assertions))]
     let runtime_volume_authority = Router::new()

@@ -33,7 +33,7 @@ use cats_api::runtime_reconciliation::{
     ProcessState, ReconcileStep, ResidueCheckpointFileEvidence, ResidueDataDirectoryLineage,
     ResidueLineageEvidence, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess, VolumeAcquire,
     VolumeAdminState, VolumeAuthorityEvidence, VolumeIntent, WireU64,
-    RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    NODE_OBSERVATION_MAX_RESIDUE_ITEMS, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
 use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
@@ -1719,6 +1719,7 @@ fn scan_runtime_checkpoints(
         .collect::<BTreeMap<_, _>>();
 
     let mut checkpoints = BTreeMap::new();
+    let mut corrupt_checkpoints = BTreeMap::new();
     let mut residue = Vec::new();
     let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
     for entry in entries {
@@ -1798,18 +1799,28 @@ fn scan_runtime_checkpoints(
         let checkpoint = match decode_runtime_checkpoint(&bytes) {
             Ok(checkpoint) => checkpoint,
             Err(_) => {
-                residue.push(checkpoint_file_residue(
-                    &state_path.join(CHECKPOINT_NAMESPACE).join(name),
-                    &bytes,
-                )?);
+                anyhow::ensure!(
+                    corrupt_checkpoints
+                        .insert(
+                            desired.cat_id.clone(),
+                            Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+                        )
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
                 continue;
             }
         };
         let Ok(binding) = checkpoint_binding(desired, &checkpoint) else {
-            residue.push(valid_checkpoint_file_residue(
-                &state_path.join(CHECKPOINT_NAMESPACE).join(name),
-                &checkpoint,
-            )?);
+            anyhow::ensure!(
+                corrupt_checkpoints
+                    .insert(
+                        desired.cat_id.clone(),
+                        Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+                    )
+                    .is_none(),
+                "checkpoint inventory duplicated one Cat"
+            );
             continue;
         };
         anyhow::ensure!(
@@ -1827,19 +1838,28 @@ fn scan_runtime_checkpoints(
         );
     }
     for (cat_id, (marker, path)) in release_rejections {
+        if corrupt_checkpoints.contains_key(&cat_id) {
+            return Ok(InventoryAbsence::Unavailable);
+        }
         let Some(evidence) = checkpoints.get_mut(&cat_id) else {
             return Ok(InventoryAbsence::Unavailable);
         };
         validate_definite_release_rejection(&marker, &evidence.checkpoint, &path)?;
         evidence.definite_release_rejected = true;
     }
-    if checkpoints.is_empty() && residue.is_empty() {
+    if checkpoints.is_empty() && corrupt_checkpoints.is_empty() && residue.is_empty() {
         Ok(InventoryAbsence::Empty)
-    } else if residue.is_empty() {
+    } else if corrupt_checkpoints.is_empty() && residue.is_empty() {
         Ok(InventoryAbsence::RuntimeCheckpoints(checkpoints))
-    } else {
+    } else if corrupt_checkpoints.is_empty() {
         Ok(InventoryAbsence::RuntimeCheckpointsWithResidue {
             checkpoints,
+            residue,
+        })
+    } else {
+        Ok(InventoryAbsence::RuntimeCheckpointsWithCorrupt {
+            checkpoints,
+            corrupt_checkpoints,
             residue,
         })
     }
@@ -2482,6 +2502,42 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
     assigned_cats: &RuntimeAssignedCatSet,
     limit: usize,
 ) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
+    snapshot_runtime_checkpoint_namespace_inner(root, context, assigned_cats, limit, false)
+}
+
+fn snapshot_runtime_checkpoint_namespace_for_data_inventory(
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+    assigned_cats: &RuntimeAssignedCatSet,
+    limit: usize,
+) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
+    let Some(mut snapshot) =
+        snapshot_runtime_checkpoint_namespace_inner(root, context, assigned_cats, limit, true)?
+    else {
+        return Ok(None);
+    };
+    let desired = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (&desired.cat_id, desired))
+        .collect::<BTreeMap<_, _>>();
+    snapshot.checkpoints.retain(|cat_id, checkpoint| {
+        desired
+            .get(cat_id)
+            .is_some_and(|desired| checkpoint_binding(desired, checkpoint).is_ok())
+    });
+    Ok(Some(snapshot))
+}
+
+fn snapshot_runtime_checkpoint_namespace_inner(
+    root: &File,
+    context: &dyn RuntimePhysicalReadContext,
+    assigned_cats: &RuntimeAssignedCatSet,
+    limit: usize,
+    omit_corrupt_assigned: bool,
+) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
     let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
         ManagedDirectory::Open(directory) => directory,
         ManagedDirectory::Missing | ManagedDirectory::Unavailable => return Ok(None),
@@ -2591,12 +2647,12 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
         else {
             return Ok(None);
         };
-        let checkpoint =
-            decode_runtime_checkpoint(&bytes).context("decode handoff-index Runtime checkpoint")?;
-        anyhow::ensure!(
-            &checkpoint.cat_id == *cat_id,
-            "handoff index checkpoint filename and Cat identity disagree"
-        );
+        let checkpoint = match decode_runtime_checkpoint(&bytes) {
+            Ok(checkpoint) if &checkpoint.cat_id == *cat_id => checkpoint,
+            Ok(_) | Err(_) if omit_corrupt_assigned => continue,
+            Ok(_) => bail!("handoff index checkpoint filename and Cat identity disagree"),
+            Err(error) => return Err(error).context("decode handoff-index Runtime checkpoint"),
+        };
         anyhow::ensure!(
             checkpoints.insert((*cat_id).clone(), checkpoint).is_none(),
             "handoff index contains duplicate Runtime checkpoints for one Cat"
@@ -2756,9 +2812,17 @@ fn scan_authorized_blockd_data(
         .map(|desired| (format!("cat-{}", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
     let assigned_cats = context.assigned_cats()?;
-    let checkpoint_snapshot =
-        snapshot_runtime_checkpoint_namespace(root, context, &assigned_cats, limits.state_entries)?;
+    let checkpoint_snapshot = snapshot_runtime_checkpoint_namespace_for_data_inventory(
+        root,
+        context,
+        &assigned_cats,
+        limits.state_entries,
+    )?;
     let mut budget = limits.state_entries;
+    // NodeObservation admits at most 4,096 residue items. Keep one shared
+    // source-wide budget and discover item 4,097 before returning Incomplete;
+    // no per-Cat reset may manufacture an over-limit wire projection.
+    let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
     let Some(cat_entries) = strict_directory_entries(&directory, &mut budget, context)? else {
         return Ok(AuthorizedBlockdDataScan {
             evidence: BTreeMap::new(),
@@ -2801,7 +2865,17 @@ fn scan_authorized_blockd_data(
         };
         let Some(desired) = desired_by_directory.get(cat_name) else {
             let path = state_path.join(DATA_NAMESPACE).join(cat_name);
-            let Some(mut residue) = scan_unassigned_cat_data(&path, cat_name) else {
+            let Some(mut residue) = scan_unassigned_cat_data(
+                root,
+                &cat_directory,
+                &path,
+                cat_name,
+                &mut budget,
+                &mut residue_wire_budget,
+                context,
+                limits.recursion_depth,
+            )?
+            else {
                 scan.complete = false;
                 scan.unattributed_incomplete = true;
                 continue;
@@ -2841,11 +2915,32 @@ fn scan_authorized_blockd_data(
                     .join(DATA_NAMESPACE)
                     .join(cat_name)
                     .join(&volume_name);
-                let Some(allocated_bytes) = observed_allocated_bytes(&path) else {
+                let Some(volume_directory) =
+                    open_strict_child_directory(&cat_directory, &volume_entry, root)
+                        .unwrap_or_default()
+                else {
                     scan.complete = false;
                     scan.unattributed_incomplete = true;
                     continue;
                 };
+                let Some(allocated_bytes) = observed_allocated_bytes_at(
+                    &volume_directory,
+                    root,
+                    &mut budget,
+                    context,
+                    limits.recursion_depth,
+                )?
+                else {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    continue;
+                };
+                if residue_wire_budget.checked_sub(1).is_none() {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    return Ok(scan);
+                }
+                residue_wire_budget -= 1;
                 scan.residue.push(NodeResidue::DataDirectory {
                     cat_id_hint: Some(desired.cat_id.clone()),
                     disk_id_hint: None,
@@ -3464,96 +3559,230 @@ fn host_path(path: &Path) -> anyhow::Result<HostPath> {
     .context("retained data-directory path is not canonical")
 }
 
-fn scan_unassigned_cat_data(cat_path: &Path, cat_name: &str) -> Option<Vec<NodeResidue>> {
+#[allow(clippy::too_many_arguments)]
+fn scan_unassigned_cat_data(
+    root: &File,
+    cat_directory: &File,
+    cat_path: &Path,
+    cat_name: &str,
+    entry_budget: &mut usize,
+    residue_wire_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
     let cat_hint = cat_name
         .strip_prefix("cat-")
         .and_then(|value| Id::new(value.to_owned()));
-    let entries = std::fs::read_dir(cat_path)
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    let entries = match strict_directory_entries_bounded(
+        cat_directory,
+        entry_budget,
+        context,
+        *residue_wire_budget,
+    ) {
+        Ok(Some(BoundedDirectoryEntries::Complete(entries))) => entries,
+        Ok(Some(BoundedDirectoryEntries::LimitExceeded)) => return Ok(None),
+        Ok(None) | Err(_) => return Ok(None),
+    };
     if entries.is_empty() {
-        return Some(vec![unreadable_data_residue(
+        if !consume_residue_wire_slot(residue_wire_budget) {
+            return Ok(None);
+        }
+        let Some(allocated_bytes) =
+            observed_allocated_bytes_at(cat_directory, root, entry_budget, context, maximum_depth)?
+        else {
+            return Ok(None);
+        };
+        let Some(residue) = unreadable_data_residue(
             cat_path,
             cat_hint,
             None,
             None,
             DataDirectoryRetentionReason::UnassignedCat,
-        )?]);
-    }
-    if entries.len() > RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT {
-        return None;
+            allocated_bytes,
+        ) else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![residue]));
     }
     let mut residue = Vec::with_capacity(entries.len());
     for entry in entries {
-        let volume_path = entry.path();
-        let volume_name = entry.file_name();
+        if !consume_residue_wire_slot(residue_wire_budget) {
+            return Ok(None);
+        }
+        let Some(volume_name) = entry.name.to_str() else {
+            return Ok(None);
+        };
+        let volume_path = cat_path.join(volume_name);
         let volume_hint = volume_name
-            .to_str()
-            .and_then(|name| name.strip_prefix("volume-"))
+            .strip_prefix("volume-")
             .and_then(|value| Id::new(value.to_owned()));
-        let exact = entry
-            .file_type()
-            .ok()
-            .filter(|kind| kind.is_dir())
-            .and_then(|_| scan_unassigned_volume_lineage(&volume_path, cat_hint.as_ref()));
-        residue.push(match exact {
+        let volume_directory = match open_strict_child_directory(cat_directory, &entry, root) {
+            Ok(Some(directory)) => directory,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let allocated_bytes = match observed_allocated_bytes_at(
+            &volume_directory,
+            root,
+            entry_budget,
+            context,
+            maximum_depth,
+        )? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let exact = scan_unassigned_volume_lineage_at(
+            root,
+            &volume_directory,
+            &volume_path,
+            volume_name,
+            cat_hint.as_ref(),
+            entry_budget,
+            context,
+            maximum_depth,
+        )?;
+        let observed = match exact {
             Some(exact) => exact,
-            None => unreadable_data_residue(
-                &volume_path,
-                cat_hint.clone(),
-                None,
-                volume_hint,
-                DataDirectoryRetentionReason::UnreadableIdentity,
-            )?,
-        });
+            None => {
+                let Some(residue) = unreadable_data_residue(
+                    &volume_path,
+                    cat_hint.clone(),
+                    None,
+                    volume_hint,
+                    DataDirectoryRetentionReason::UnreadableIdentity,
+                    allocated_bytes,
+                ) else {
+                    return Ok(None);
+                };
+                residue
+            }
+        };
+        residue.push(observed);
     }
-    Some(residue)
+    Ok(Some(residue))
 }
 
-fn scan_unassigned_volume_lineage(
+#[allow(clippy::too_many_arguments)]
+fn scan_unassigned_volume_lineage_at(
+    root: &File,
+    volume_directory: &File,
     volume_path: &Path,
+    volume_name: &str,
     cat_hint: Option<&Id>,
-) -> Option<NodeResidue> {
-    let attachment_entries = only_residue_directory(volume_path)?;
-    let epoch_entries = only_residue_directory(&attachment_entries.path())?;
-    let epoch_path = epoch_entries.path();
-    let identity: AttachmentLineageIdentity =
-        read_residue_exact_json(&epoch_path.join(IDENTITY_FILE), MAX_IDENTITY_BYTES)?;
-    let attachment: AuthorizedServingAttachment = read_residue_exact_json(
-        &epoch_path.join(AUTHORIZED_SERVING_FILE),
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+) -> anyhow::Result<Option<NodeResidue>> {
+    let (attachment_name, attachment_directory) = match descend_only_directory(
+        volume_directory,
+        root,
+        entry_budget,
+        context,
+        "unassigned attachment",
+    ) {
+        Ok(OnlyDirectoryDescent::Open { name, directory }) => (name, directory),
+        Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
+            return Ok(None)
+        }
+    };
+    let (epoch_name, epoch_directory) = match descend_only_directory(
+        &attachment_directory,
+        root,
+        entry_budget,
+        context,
+        "unassigned epoch",
+    ) {
+        Ok(OnlyDirectoryDescent::Open { name, directory }) => (name, directory),
+        Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
+            return Ok(None)
+        }
+    };
+    let epoch_path = volume_path.join(&attachment_name).join(&epoch_name);
+    let Some(allocated_bytes) =
+        observed_allocated_bytes_at(&epoch_directory, root, entry_budget, context, maximum_depth)?
+    else {
+        return Ok(None);
+    };
+    let entries = match strict_directory_entries(&epoch_directory, entry_budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => {
+            return Ok(None);
+        }
+    };
+    let by_name = entries
+        .iter()
+        .filter_map(|entry| entry.name.to_str().map(|name| (name, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let Some(identity_entry) = by_name.get(IDENTITY_FILE) else {
+        return Ok(None);
+    };
+    let Some(attachment_entry) = by_name.get(AUTHORIZED_SERVING_FILE) else {
+        return Ok(None);
+    };
+    let Some(checkpoint_entry) = by_name.get(LAUNCH_CHECKPOINT_FILE) else {
+        return Ok(None);
+    };
+    let Some(identity): Option<AttachmentLineageIdentity> = read_residue_exact_json_at(
+        &epoch_directory,
+        identity_entry,
+        root,
+        MAX_IDENTITY_BYTES,
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(attachment): Option<AuthorizedServingAttachment> = read_residue_exact_json_at(
+        &epoch_directory,
+        attachment_entry,
+        root,
         MAX_AUTHORIZED_SERVING_BYTES,
-    )?;
-    let checkpoint: AuthorizedBlockdCheckpoint = read_residue_exact_json(
-        &epoch_path.join(LAUNCH_CHECKPOINT_FILE),
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(checkpoint): Option<AuthorizedBlockdCheckpoint> = read_residue_exact_json_at(
+        &epoch_directory,
+        checkpoint_entry,
+        root,
         MAX_LAUNCH_CHECKPOINT_BYTES,
-    )?;
-    validate_authorized_blockd_checkpoint(&checkpoint).ok()?;
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    if validate_authorized_blockd_checkpoint(&checkpoint).is_err() {
+        return Ok(None);
+    }
     if identity != attachment.identity
         || attachment != checkpoint.attachment
         || cat_hint != Some(&checkpoint.desired.cat_id)
         || checkpoint.volume.volume_id != identity.volume_id
-        || volume_path.file_name()?.to_str()? != format!("volume-{}", identity.volume_id)
-        || attachment_entries.file_name().to_str()?
-            != format!("attachment-{}", identity.attachment_id)
-        || epoch_entries.file_name().to_str()?
-            != format!("epoch-{}", identity.attachment_epoch.get())
+        || volume_name != format!("volume-{}", identity.volume_id)
+        || attachment_name != format!("attachment-{}", identity.attachment_id)
+        || epoch_name != format!("epoch-{}", identity.attachment_epoch.get())
     {
-        return None;
+        return Ok(None);
     }
-    let pending_pack_count = count_residue_pending_packs(&epoch_path)?;
+    let Some(pending_pack_count) =
+        count_residue_pending_packs_at(root, &epoch_directory, &by_name, entry_budget, context)?
+    else {
+        return Ok(None);
+    };
     let remote_generation = attachment.head.generation;
-    let local_generation = remote_generation
+    let Some(local_generation) = remote_generation
         .get()
         .checked_add(pending_pack_count)
-        .and_then(Generation::new)?;
-    let allocated_bytes = observed_allocated_bytes(&epoch_path)?;
+        .and_then(Generation::new)
+    else {
+        return Ok(None);
+    };
     let disk = &checkpoint.volume;
-    Some(NodeResidue::DataDirectory {
+    Ok(Some(NodeResidue::DataDirectory {
         cat_id_hint: Some(checkpoint.desired.cat_id.clone()),
         disk_id_hint: Some(disk.disk_id.clone()),
         volume_id_hint: Some(identity.volume_id.clone()),
-        data_directory: host_path(&epoch_path).ok()?,
+        data_directory: host_path(&epoch_path)?,
         allocated_bytes,
         retention_reason: if pending_pack_count == 0 {
             DataDirectoryRetentionReason::AuthorityProofPending
@@ -3563,6 +3792,7 @@ fn scan_unassigned_volume_lineage(
         ownership_token: OwnershipTokenEvidence::Missing,
         lineage: ResidueLineageEvidence::Readable {
             lineage: Box::new(ResidueDataDirectoryLineage {
+                workspace_id: checkpoint.desired.workspace_id.clone(),
                 cat_id: checkpoint.desired.cat_id.clone(),
                 disk_id: disk.disk_id.clone(),
                 disk_kind: disk.disk_kind,
@@ -3571,79 +3801,83 @@ fn scan_unassigned_volume_lineage(
                 attachment_epoch: identity.attachment_epoch,
                 acquire_origin: identity.acquire_origin.clone(),
                 node_id: identity.node_id.clone(),
+                desired_revision: checkpoint.desired.desired_revision,
+                spec_digest: checkpoint.desired.spec_digest.clone(),
+                placement: checkpoint.desired.placement.clone(),
                 placement_epoch: identity.placement_epoch,
+                acquisition: attachment.acquire.clone(),
+                acquisition_digest: cats_api::runtime_reconciliation::residue_acquisition_digest(
+                    &attachment.acquire,
+                )?,
                 local_durable_generation: local_generation,
                 remote_durable_generation: remote_generation,
                 remote_head: attachment.head.clone(),
-                pending_pack_count: WireU64::new(pending_pack_count)?,
+                pending_pack_count: WireU64::new(pending_pack_count)
+                    .context("pending-pack count exceeds WireU64")?,
                 fenced: false,
             }),
         },
-    })
+    }))
 }
 
-fn only_residue_directory(path: &Path) -> Option<std::fs::DirEntry> {
-    let mut entries = std::fs::read_dir(path).ok()?;
-    let entry = entries.next()?.ok()?;
-    if entries.next().is_some() || !entry.file_type().ok()?.is_dir() {
-        return None;
-    }
-    Some(entry)
-}
-
-fn count_residue_pending_packs(epoch_path: &Path) -> Option<u64> {
-    let pending = epoch_path.join(PENDING_PACK_DIR);
-    let entries = match std::fs::read_dir(&pending) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(0),
-        Err(_) => return None,
+fn count_residue_pending_packs_at(
+    root: &File,
+    epoch_directory: &File,
+    by_name: &BTreeMap<&str, &StrictDirectoryEntry>,
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<u64>> {
+    let Some(pending_entry) = by_name.get(PENDING_PACK_DIR) else {
+        return Ok(Some(0));
+    };
+    let pending = match open_strict_child_directory(epoch_directory, pending_entry, root) {
+        Ok(Some(directory)) => directory,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let entries = match strict_directory_entries(&pending, entry_budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => return Ok(None),
     };
     let mut count = 0_u64;
     for entry in entries {
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_file()
+        if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFREG
             || !entry
-                .file_name()
+                .name
                 .to_str()
                 .is_some_and(|name| name.ends_with(PACK_FILE_SUFFIX))
         {
-            return None;
+            return Ok(None);
         }
-        count = count.checked_add(1)?;
+        // Re-open every pack descriptor-relative. Identity drift or a
+        // symlink/type swap makes this inventory incomplete.
+        let Some(_) = read_strict_regular_prefix_at(&pending, &entry, root, context)? else {
+            return Ok(None);
+        };
+        let Some(next) = count.checked_add(1) else {
+            return Ok(None);
+        };
+        count = next;
     }
-    Some(count)
+    Ok(Some(count))
 }
 
-fn read_residue_exact_json<T>(path: &Path, maximum: usize) -> Option<T>
+fn read_residue_exact_json_at<T>(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    maximum: usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<T>>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
-    let before = std::fs::symlink_metadata(path).ok()?;
-    if !before.file_type().is_file()
-        || before.nlink() != 1
-        || usize::try_from(before.len()).ok()? > maximum
-    {
-        return None;
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).ok()?);
-    file.by_ref()
-        .take(u64::try_from(maximum).ok()?.checked_add(1)?)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > maximum {
-        return None;
-    }
-    let after = file.metadata().ok()?;
-    if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len() {
-        return None;
-    }
-    let value = serde_json::from_slice(&bytes).ok()?;
-    (serde_json::to_vec(&value).ok()? == bytes).then_some(value)
+    let Some(bytes) = read_strict_regular_at(directory, entry, root, maximum, context)? else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_slice(&bytes) else {
+        return Ok(None);
+    };
+    Ok((serde_json::to_vec(&value).ok().as_deref() == Some(bytes.as_slice())).then_some(value))
 }
 
 fn unreadable_data_residue(
@@ -3652,43 +3886,201 @@ fn unreadable_data_residue(
     disk_id_hint: Option<Id>,
     volume_id_hint: Option<Id>,
     retention_reason: DataDirectoryRetentionReason,
+    allocated_bytes: WireU64,
 ) -> Option<NodeResidue> {
     Some(NodeResidue::DataDirectory {
         cat_id_hint,
         disk_id_hint,
         volume_id_hint,
         data_directory: host_path(path).ok()?,
-        allocated_bytes: observed_allocated_bytes(path)?,
+        allocated_bytes,
         retention_reason,
         ownership_token: OwnershipTokenEvidence::Missing,
         lineage: ResidueLineageEvidence::Unreadable,
     })
 }
 
-/// Read-only allocated-byte observation. Symlinks are counted as links and
-/// never followed. Any race, unreadable child, overflow, or excessive tree
-/// turns the DataDirectory source unavailable instead of manufacturing zero.
-fn observed_allocated_bytes(path: &Path) -> Option<WireU64> {
-    const MAX_RESIDUE_TREE_ENTRIES: usize = RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT;
-
-    fn walk(path: &Path, remaining: &mut usize) -> Option<u64> {
-        if *remaining == 0 {
-            return None;
+/// Descriptor-relative, iterative allocated-byte observation. Every child is
+/// enumerated against a retained parent descriptor, directories are reopened
+/// with O_NOFOLLOW plus inode/device comparison, and the caller supplies the
+/// one source-wide entry/depth budget. Races and cap+1 become Incomplete.
+fn observed_allocated_bytes_at(
+    directory: &File,
+    root: &File,
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+) -> anyhow::Result<Option<WireU64>> {
+    let root_metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let Some(mut bytes) = root_metadata.blocks().checked_mul(512) else {
+        return Ok(None);
+    };
+    let Some(reopened) = reopen_directory_descriptor(directory)? else {
+        return Ok(None);
+    };
+    let mut stack = vec![(reopened, 0_usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > maximum_depth || context.check_active().is_err() {
+            return Ok(None);
         }
-        *remaining -= 1;
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        let mut bytes = metadata.blocks().checked_mul(512)?;
-        if metadata.file_type().is_dir() {
-            for entry in std::fs::read_dir(path).ok()? {
-                let entry = entry.ok()?;
-                bytes = bytes.checked_add(walk(&entry.path(), remaining)?)?;
+        let entries = match strict_directory_entries(&current, entry_budget, context) {
+            Ok(Some(entries)) => entries,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        for entry in entries {
+            let Some(entry_bytes) = raw_blocks_to_u64(entry.metadata.st_blocks)
+                .and_then(|blocks| blocks.checked_mul(512))
+            else {
+                return Ok(None);
+            };
+            let Some(total) = bytes.checked_add(entry_bytes) else {
+                return Ok(None);
+            };
+            bytes = total;
+            if entry.metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                if depth == maximum_depth {
+                    return Ok(None);
+                }
+                let child = match open_residue_child_directory(&current, &entry, root) {
+                    Ok(Some(child)) => child,
+                    Ok(None) | Err(_) => return Ok(None),
+                };
+                stack.push((child, depth + 1));
+            } else if stat_at(&current, &entry.name)
+                .ok()
+                .is_none_or(|after| !same_stat_identity(&entry.metadata, &after))
+            {
+                return Ok(None);
             }
         }
-        Some(bytes)
     }
+    Ok(WireU64::new(bytes))
+}
 
-    let mut remaining = MAX_RESIDUE_TREE_ENTRIES;
-    walk(path, &mut remaining).and_then(WireU64::new)
+fn open_residue_child_directory(
+    parent: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+) -> anyhow::Result<Option<File>> {
+    if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Ok(None);
+    }
+    let name = CString::new(entry.name.as_bytes()).context("directory name contains NUL")?;
+    // SAFETY: retained parent/name are live. O_NOFOLLOW plus the fstat identity
+    // comparison prevents traversal or a path-replacement attribution.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returned one newly owned descriptor.
+    let directory = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = directory.metadata()?;
+    let root_metadata = root.metadata()?;
+    Ok((metadata.is_dir()
+        && raw_device_to_u64(entry.metadata.st_dev) == Some(metadata.dev())
+        && metadata.ino() == entry.metadata.st_ino
+        && metadata.uid() == root_metadata.uid())
+    .then_some(directory))
+}
+
+fn reopen_directory_descriptor(directory: &File) -> anyhow::Result<Option<File>> {
+    let dot = c".";
+    // SAFETY: `directory` and the static C string remain live; success returns
+    // one newly owned descriptor with an independent directory-stream offset.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returned one newly owned descriptor.
+    let reopened = unsafe { File::from_raw_fd(descriptor) };
+    let before = directory.metadata()?;
+    let after = reopened.metadata()?;
+    Ok((before.is_dir()
+        && after.is_dir()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino())
+    .then_some(reopened))
+}
+
+fn consume_residue_wire_slot(remaining: &mut usize) -> bool {
+    let Some(next) = remaining.checked_sub(1) else {
+        return false;
+    };
+    *remaining = next;
+    true
+}
+
+fn same_stat_identity(before: &libc::stat, after: &libc::stat) -> bool {
+    before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_mode == after.st_mode
+        && before.st_nlink == after.st_nlink
+        && before.st_size == after.st_size
+        && before.st_ctime == after.st_ctime
+}
+
+fn raw_blocks_to_u64(blocks: libc::blkcnt_t) -> Option<u64> {
+    u64::try_from(blocks).ok()
+}
+
+fn read_strict_regular_prefix_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<()>> {
+    validate_strict_regular_entry(entry, root, 0o600)?;
+    context.check_active()?;
+    let name = CString::new(entry.name.as_bytes()).context("file name contains NUL")?;
+    // SAFETY: retained parent/name are live; O_NOFOLLOW prevents symlink
+    // traversal and the post-open fstat binds the enumerated inode.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returns one newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    Ok((metadata.is_file()
+        && raw_device_to_u64(entry.metadata.st_dev) == Some(metadata.dev())
+        && entry.metadata.st_ino == metadata.ino()
+        && entry.metadata.st_size == i64::try_from(metadata.len()).unwrap_or(-1))
+    .then_some(()))
 }
 
 fn is_serving_handoff_artifact_name(name: &str) -> bool {
@@ -6202,6 +6594,9 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                 InventoryAbsence::RuntimeCheckpointsWithResidue { checkpoints, .. } => {
                     (Some(checkpoints), true)
                 }
+                InventoryAbsence::RuntimeCheckpointsWithCorrupt { checkpoints, .. } => {
+                    (Some(checkpoints), true)
+                }
                 InventoryAbsence::Empty => (None, true),
                 InventoryAbsence::Unavailable => (None, false),
                 _ => unreachable!("checkpoint scan returns only checkpoint evidence"),
@@ -7018,12 +7413,29 @@ struct StrictDirectoryEntry {
     metadata: libc::stat,
 }
 
+enum BoundedDirectoryEntries {
+    Complete(Vec<StrictDirectoryEntry>),
+    LimitExceeded,
+}
+
 fn strict_directory_entries(
     directory: &File,
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
-    strict_directory_entries_with_release_links(directory, budget, context, false)
+    match strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        usize::MAX,
+        false,
+    )? {
+        Some(BoundedDirectoryEntries::Complete(entries)) => Ok(Some(entries)),
+        Some(BoundedDirectoryEntries::LimitExceeded) => {
+            unreachable!("usize::MAX directory cap cannot be exceeded")
+        }
+        None => Ok(None),
+    }
 }
 
 fn strict_checkpoint_directory_entries(
@@ -7031,15 +7443,43 @@ fn strict_checkpoint_directory_entries(
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
-    strict_directory_entries_with_release_links(directory, budget, context, true)
+    match strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        usize::MAX,
+        true,
+    )? {
+        Some(BoundedDirectoryEntries::Complete(entries)) => Ok(Some(entries)),
+        Some(BoundedDirectoryEntries::LimitExceeded) => {
+            unreachable!("usize::MAX directory cap cannot be exceeded")
+        }
+        None => Ok(None),
+    }
 }
 
-fn strict_directory_entries_with_release_links(
+fn strict_directory_entries_bounded(
     directory: &File,
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
+    maximum_entries: usize,
+) -> anyhow::Result<Option<BoundedDirectoryEntries>> {
+    strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        maximum_entries,
+        false,
+    )
+}
+
+fn strict_directory_entries_bounded_with_release_links(
+    directory: &File,
+    budget: &mut usize,
+    context: &dyn RuntimePhysicalReadContext,
+    maximum_entries: usize,
     allow_release_publication_links: bool,
-) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
+) -> anyhow::Result<Option<BoundedDirectoryEntries>> {
     let mut stream = match DirectoryStream::open(directory) {
         Ok(stream) => stream,
         Err(source) if unavailable_io(&source) => return Ok(None),
@@ -7058,6 +7498,9 @@ fn strict_directory_entries_with_release_links(
             Some(remaining) => remaining,
             None => bail!("authorized Runtime namespace exceeds entry cap"),
         };
+        if entries.len() == maximum_entries {
+            return Ok(Some(BoundedDirectoryEntries::LimitExceeded));
+        }
         let metadata = match stat_at(directory, &name) {
             Ok(metadata) => metadata,
             Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
@@ -7083,7 +7526,7 @@ fn strict_directory_entries_with_release_links(
     }
     context.check_active()?;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(Some(entries))
+    Ok(Some(BoundedDirectoryEntries::Complete(entries)))
 }
 
 fn open_exact_only_child_directory(
@@ -11090,6 +11533,32 @@ mod tests {
         }
     }
 
+    fn retain_only_data_cat(
+        environment: &TestEnvironment,
+        context: &RuntimeInventoryScanContext,
+    ) -> (std::fs::File, std::fs::File, PathBuf, String) {
+        let state = StateDirectory::unanchored(environment.state.clone());
+        let root = clone_state_root(&state).unwrap().unwrap();
+        let ManagedDirectory::Open(data_root) =
+            open_state_namespace(&root, DATA_NAMESPACE).unwrap()
+        else {
+            panic!("fixture lacks its data namespace")
+        };
+        let mut entry_budget = ProbeLimits::default().state_entries;
+        let entries = strict_directory_entries(&data_root, &mut entry_budget, context)
+            .unwrap()
+            .unwrap();
+        let [entry] = entries.as_slice() else {
+            panic!("fixture must have exactly one retained Cat directory")
+        };
+        let cat_name = entry.name.to_str().unwrap().to_owned();
+        let cat_path = environment.state.join(DATA_NAMESPACE).join(&cat_name);
+        let cat = open_exact_only_child_directory(&data_root, entry, &root, context)
+            .unwrap()
+            .unwrap();
+        (root, cat, cat_path, cat_name)
+    }
+
     fn write_empty_dirty_bitmap(path: &Path, size_bytes: u64) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -11221,12 +11690,11 @@ mod tests {
             }
             scan_context.coordinates_mut().desired.desired_specs.clear();
 
-            let InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. } =
-                authorized_data_probe(&environment)
-                    .prove_absent(&scan_context)
-                    .unwrap()
-            else {
-                panic!("{mutation} lineage was not reported as residue")
+            let result = authorized_data_probe(&environment)
+                .prove_absent(&scan_context)
+                .unwrap();
+            let InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. } = result else {
+                panic!("{mutation} lineage was not reported as residue: {result:?}")
             };
             assert_eq!(residue.len(), 1);
             assert!(matches!(
@@ -11253,6 +11721,7 @@ mod tests {
         let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
         install_exact_control_only_files(&data_directory, attachment.size_bytes);
         scan_context.coordinates_mut().desired.desired_specs.clear();
+        let restart_context = scan_context.clone();
 
         let scanner = scanner(environment.config()).unwrap();
         let RuntimeInventoryScanOutcome::Complete(inventory) =
@@ -11272,6 +11741,148 @@ mod tests {
             data_directory.exists(),
             "inventory must be observation-only"
         );
+        let RuntimeInventoryScanOutcome::Complete(restarted) =
+            scanner.scan_complete(restart_context).unwrap()
+        else {
+            panic!("restart must rediscover the same closed residue")
+        };
+        assert_eq!(
+            inventory.residue(),
+            restarted.residue(),
+            "restart must not turn observation into mutation or lose residue"
+        );
+    }
+
+    #[test]
+    fn unassigned_residue_budget_is_global_and_item_4097_stops_before_projection() {
+        let environment = TestEnvironment::new();
+        let context = assigned_context(true);
+        let desired = context.coordinates().desired.desired_specs[0].clone();
+        let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+
+        let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
+        for item in 1..=NODE_OBSERVATION_MAX_RESIDUE_ITEMS {
+            assert!(
+                consume_residue_wire_slot(&mut residue_wire_budget),
+                "wire item {item} must fit the global observation cap"
+            );
+        }
+        assert_eq!(residue_wire_budget, 0);
+        assert!(
+            !consume_residue_wire_slot(&mut residue_wire_budget),
+            "wire item 4097 must stop the source without wrapping its budget"
+        );
+
+        let (root, cat, cat_path, cat_name) = retain_only_data_cat(&environment, &context);
+        let mut entry_budget = ProbeLimits::default().state_entries;
+        assert!(
+            scan_unassigned_cat_data(
+                &root,
+                &cat,
+                &cat_path,
+                &cat_name,
+                &mut entry_budget,
+                &mut residue_wire_budget,
+                &context,
+                ProbeLimits::default().recursion_depth,
+            )
+            .unwrap()
+            .is_none(),
+            "an exhausted shared wire budget must map the source to Incomplete"
+        );
+        assert!(
+            data_directory.exists(),
+            "the cap path must not delete residue"
+        );
+    }
+
+    #[test]
+    fn unassigned_descriptor_scan_maps_cancellation_and_deadline_to_incomplete() {
+        for boundary in ["cancellation", "deadline"] {
+            let environment = TestEnvironment::new();
+            let live_context = assigned_context(true);
+            let desired = live_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let (root, cat, cat_path, cat_name) = retain_only_data_cat(&environment, &live_context);
+            let inactive_context = if boundary == "cancellation" {
+                let context = live_context.clone();
+                context.cancel_for_test();
+                context
+            } else {
+                context_until(Instant::now())
+            };
+            let mut entry_budget = ProbeLimits::default().state_entries;
+            let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
+            assert!(
+                scan_unassigned_cat_data(
+                    &root,
+                    &cat,
+                    &cat_path,
+                    &cat_name,
+                    &mut entry_budget,
+                    &mut residue_wire_budget,
+                    &inactive_context,
+                    ProbeLimits::default().recursion_depth,
+                )
+                .unwrap()
+                .is_none(),
+                "{boundary} must make the unassigned source Incomplete"
+            );
+            assert!(
+                data_directory.exists(),
+                "{boundary} must preserve descriptor-retained residue"
+            );
+        }
+    }
+
+    #[test]
+    fn unassigned_depth_and_path_substitution_make_the_full_inventory_incomplete() {
+        for boundary in ["depth", "path_substitution"] {
+            let environment = TestEnvironment::new();
+            let mut scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let mut config = environment.config();
+            let retained_path = if boundary == "depth" {
+                config.limits.recursion_depth = 3;
+                let first = data_directory.join("nested-residue");
+                let second = first.join("past-depth-bound");
+                std::fs::create_dir(&first).unwrap();
+                std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::create_dir(&second).unwrap();
+                std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o700)).unwrap();
+                second
+            } else {
+                let volume_directory = data_directory.parent().unwrap().parent().unwrap();
+                let substituted = environment.state.join("substituted-volume");
+                std::fs::rename(volume_directory, &substituted).unwrap();
+                std::os::unix::fs::symlink(&substituted, volume_directory).unwrap();
+                volume_directory.to_path_buf()
+            };
+            scan_context.coordinates_mut().desired.desired_specs.clear();
+
+            let outcome = scanner(config)
+                .unwrap()
+                .scan_complete(scan_context)
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    ..
+                } if unavailable_sources.contains(&InventorySource::DataDirectory)
+            ));
+            assert!(
+                std::fs::symlink_metadata(&retained_path).is_ok(),
+                "{boundary} must not mutate the substituted or over-depth path"
+            );
+        }
     }
 
     #[test]
@@ -11302,6 +11913,106 @@ mod tests {
             checkpoint_path.exists(),
             "inventory must be observation-only"
         );
+    }
+
+    #[test]
+    fn assigned_canonical_corrupt_or_wrong_binding_checkpoint_projects_only_cat_corruption() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for case in ["malformed", "wrong_binding", "malformed_with_lineage"] {
+            let environment = TestEnvironment::new();
+            let scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (record, attachment) = exact_owned_record_and_attachment(&desired);
+            let retained_data = (case == "malformed_with_lineage").then(|| {
+                let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+                install_exact_control_only_files(&data_directory, attachment.size_bytes);
+                data_directory
+            });
+            let checkpoint_directory = environment.state.join(CHECKPOINT_NAMESPACE);
+            std::fs::create_dir_all(&checkpoint_directory).unwrap();
+            let checkpoint_path =
+                super::super::runtime_checkpoint_path(&checkpoint_directory, &desired.cat_id);
+            let bytes = if case != "wrong_binding" {
+                b"not-a-checkpoint".to_vec()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "cat_id": desired.cat_id,
+                    "node_id": desired.placement.node_id,
+                    "placement_epoch": desired.placement.placement_epoch,
+                    "desired_revision": desired.desired_revision,
+                    "spec_digest": Sha256Digest::from_bytes([99; 32]),
+                    "runtime_incarnation": null,
+                    "runtime_launch": {"kind": "absent"},
+                    "stable_state": null,
+                    "step": {"kind": "inspect_inventory", "inventory_epoch": 1},
+                    "require_idle": {"kind": "not_applicable"},
+                    "updated_at_unix_ms": 1,
+                    "lifecycle_admission": "closed",
+                    "processes": [],
+                    "volumes": [],
+                    "mounts": [],
+                    "networks": [],
+                    "guest_transport": {"kind": "unavailable"},
+                    "warm_snapshot": {"kind": "absent"},
+                    "route_gates": [],
+                }))
+                .unwrap()
+            };
+            std::fs::write(&checkpoint_path, &bytes).unwrap();
+            std::fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+
+            let (authority, _) = TestVolumeDataAuthority::exact(record);
+            let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
+            let outcome = scanner_with_metadata_authority(environment.config(), reader)
+                .unwrap()
+                .scan_complete(scan_context)
+                .unwrap();
+            let RuntimeInventoryScanOutcome::Complete(inventory) = outcome else {
+                panic!(
+                    "assigned canonical {case} checkpoint must remain an encodable full scan: {outcome:?}"
+                )
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("assigned Cat must have one runtime projection")
+            };
+            assert!(matches!(
+                &runtime.checkpoint,
+                CheckpointEvidence::Corrupt {
+                    checkpoint_path: observed,
+                    raw_content_digest,
+                } if observed.as_str() == checkpoint_path.to_str().unwrap()
+                    && raw_content_digest == &Sha256Digest::from_bytes(Sha256::digest(&bytes).into())
+            ));
+            assert!(matches!(
+                runtime.step,
+                ReconcileStep::InspectInventory { .. }
+            ));
+            assert_eq!(runtime.lifecycle_admission, LifecycleAdmission::Closed);
+            assert!(runtime.conditions.is_empty());
+            assert!(inventory.residue().is_empty());
+            if let Some(retained_data) = retained_data {
+                assert!(matches!(
+                    runtime.volumes.as_slice(),
+                    [ObservedVolume { local_lineages, .. }]
+                        if matches!(local_lineages.as_slice(), [lineage]
+                            if lineage.data_directory.as_str()
+                                == retained_data.to_str().unwrap())
+                ));
+                assert!(
+                    retained_data.exists(),
+                    "inventory must not mutate local lineage"
+                );
+            } else {
+                assert!(runtime
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.local_lineages.is_empty()));
+            }
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+        }
     }
 
     #[test]

@@ -3,9 +3,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::types::{
-    Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
-    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem,
-    NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
+    AuthorizedServingAcquire, Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName,
+    ContractVersion, DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId,
+    MalformedProblem, NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet,
+    Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
@@ -13,6 +14,17 @@ const CHECKPOINT_DOMAIN: &[u8] = b"cats.runtime.checkpoint-content.v1";
 const INVENTORY_DOMAIN: &[u8] = b"cats.runtime.inventory.v1";
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
 const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
+const RESIDUE_ACQUISITION_DOMAIN: &[u8] = b"cats.runtime.residue-acquisition.v1";
+
+/// Computes the digest of the complete immutable acquire receipt carried by a
+/// residue authority request. The digest is diagnostic binding, never an
+/// authority substitute for the receipt itself.
+pub fn residue_acquisition_digest(
+    acquisition: &AuthorizedServingAcquire,
+) -> Result<Sha256Digest, ContractError> {
+    let value = as_value(acquisition, ContractName::RuntimeResidueAuthorityRequest)?;
+    Ok(digest_value(RESIDUE_ACQUISITION_DOMAIN, &value))
+}
 
 /// Computes the digest of one validated canonical GuestRuntimeProfileReceipt artifact.
 pub fn guest_config_digest(

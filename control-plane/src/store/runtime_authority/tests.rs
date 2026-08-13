@@ -6,17 +6,17 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     decode_runtime_checkpoint, encode_desired_runtime_spec, guest_config_digest, inventory_digest,
-    spec_digest, AcquireOrigin, AgentRegistrationAttempt, AgentSession, AppliedDesiredEvidence,
-    AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement, CheckpointEvidence,
-    CleanupRelease, CleanupTarget, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
-    CredentialBinding, DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent,
-    FilesystemInitialization, GuestDeviceIdentity, GuestRuntimeProfileReceipt,
-    GuestTransportEvidence, HostPath, Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission,
-    LocalLineageState, LocalVolumeLineage, MacAddress, MountAccess, NetworkConfig, NodeBootId,
-    NodeIdentity, NodeIdentityState, NodeObservation, NodeResidue, ObservedDevice,
-    ObservedDiskKind, ObservedMount, ObservedRuntimeStatus, ObservedVolume, Operation,
-    OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding, ProcessEvidence,
-    ProcessRole, ProcessState, ReconcileStep, ResidueAuthorityRetentionReason,
+    residue_acquisition_digest, spec_digest, AcquireOrigin, AgentRegistrationAttempt, AgentSession,
+    AppliedDesiredEvidence, AsciiText as RuntimeAsciiText, AssignedKind, AssignedPlacement,
+    AuthorizedServingAcquire, CheckpointEvidence, CleanupRelease, CleanupTarget,
+    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
+    DesiredReadRequest, DesiredRuntimeSpec, DiskKind, Ext4MountIntent, FilesystemInitialization,
+    GuestDeviceIdentity, GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Ipv4Address,
+    IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress,
+    MountAccess, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
+    NodeResidue, ObservedDevice, ObservedDiskKind, ObservedMount, ObservedRuntimeStatus,
+    ObservedVolume, Operation, OperationPhase, OwnershipTokenEvidence, PersistentFilesystemBinding,
+    ProcessEvidence, ProcessRole, ProcessState, ReconcileStep, ResidueAuthorityRetentionReason,
     ResidueDataDirectoryLineage, ResidueReclaimProof, RuntimeCheckpoint, RuntimeConfig,
     RuntimeResidueAuthorityOutcome, RuntimeResidueAuthorityRequest, RuntimeTarget,
     RuntimeTransition, RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition,
@@ -31,9 +31,9 @@ use cats_storage::authority::{
     AuthorityError, AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
     DeleteCompletionReceipt, DisposableDeleteIsolationBasis, DisposableRootDeleteAuthorization,
     Epoch, FenceEpoch, Generation, HostFenceEvent, HostFenceEventState, HostIsolationState, Id,
-    NormalAcquireRequest, RandomId128, ReleaseRequest, RemoteHead, Revision, Sha256Digest,
-    TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability,
-    VolumeOwnerBinding, VolumeRecord, VolumeTakeoverAuthorization,
+    NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest, RemoteHead, Revision,
+    Sha256Digest, TakeoverConsumedReceipt, UnixMillis, VolumeAdminState, VolumeAuthorization,
+    VolumeDurability, VolumeOwnerBinding, VolumeRecord, VolumeTakeoverAuthorization,
 };
 
 use super::product::{
@@ -1770,34 +1770,6 @@ pub(crate) fn prepare_a22_http_takeover_fixture(
     )
 }
 
-pub(crate) fn prepare_residue_authority_http_fixture(
-    store: &Store,
-    authenticated: AuthenticatedNodeCredential,
-    session: SessionBinding,
-    active_guest_config_digest: Sha256Digest,
-) -> RuntimeResidueAuthorityRequest {
-    let node = TransitionNode {
-        authenticated,
-        session,
-        active_guest_config_digest,
-    };
-    let owned = acquire_owned_volume(store);
-    let (released, _) = cats_storage::authority::release(
-        &owned,
-        &ReleaseRequest {
-            volume_id: owned.volume_id.clone(),
-            transition_id: random_id(90),
-            attachment_id: id("attachment-old"),
-            expected_epoch: owned.lease_epoch,
-        },
-    )
-    .unwrap();
-    store
-        .authority_transaction(|transaction| update_volume_owner(transaction, &released, None))
-        .unwrap();
-    residue_authority_request(&node, 4, 4)
-}
-
 fn evidence_request(node_id: &str) -> RuntimeVolumeTransitionEvidenceRequest {
     evidence_request_for(node_id, "takeover-auth-1")
 }
@@ -1820,24 +1792,41 @@ fn evidence_request_for(
 
 fn residue_authority_request(
     node: &TransitionNode,
+    desired: &DesiredRuntimeSpec,
     local_generation: u64,
     remote_generation: u64,
 ) -> RuntimeResidueAuthorityRequest {
+    let transition_id = random_id(1);
+    let acquisition = AuthorizedServingAcquire::Normal {
+        request: acquire_request(1, "attachment-old", 7),
+        result: NormalAcquireResult {
+            volume_id: id("volume-1"),
+            transition_id: transition_id.clone(),
+            attachment_id: id("attachment-old"),
+            resulting_epoch: fence_epoch(8),
+            resulting_head: head(4),
+            lease_expires_at: unix_millis(40_000),
+        },
+    };
     RuntimeResidueAuthorityRequest {
         version: ContractVersion::V1,
         session: node.session.clone(),
         lineage: ResidueDataDirectoryLineage {
+            workspace_id: desired.workspace_id.clone(),
             cat_id: id("cat-1"),
             disk_id: id("disk-1"),
             disk_kind: DiskKind::Root,
             volume_id: id("volume-1"),
             attachment_id: id("attachment-old"),
             attachment_epoch: fence_epoch(8),
-            acquire_origin: AcquireOrigin::Normal {
-                transition_id: random_id(1),
-            },
+            acquire_origin: AcquireOrigin::Normal { transition_id },
             node_id: node.session.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
             placement_epoch: epoch(3),
+            acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+            acquisition,
             local_durable_generation: generation(local_generation),
             remote_durable_generation: generation(remote_generation),
             remote_head: head(remote_generation),
@@ -1846,6 +1835,62 @@ fn residue_authority_request(
             fenced: true,
         },
     }
+}
+
+fn prepare_residue_product_snapshot(
+    store: &Store,
+    node: &TransitionNode,
+    volume: &VolumeRecord,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> DesiredRuntimeSpec {
+    let workspace = super::product_tests::bootstrap_workspace(store, "residue-authority");
+    let desired = transition_desired(
+        &workspace,
+        node,
+        volume,
+        RuntimeTarget::Running,
+        desired_revision,
+        placement_epoch,
+        id("attachment-old"),
+        VolumeAcquire::Normal {
+            transition_id: random_id(1),
+            expected_unowned_epoch: fence_epoch(7),
+        },
+        VolumeDisposition::Retain,
+    );
+    store
+        .authority_transaction(|transaction| {
+            let now = database_now(transaction)?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("cat-1"),
+                    created_at: now,
+                },
+            )?;
+            insert_disk(
+                transaction,
+                &DiskRecord {
+                    disk_id: id("disk-1"),
+                    workspace_id: workspace.clone(),
+                    name: id("disk-1"),
+                    volume_id: volume.volume_id.clone(),
+                    size_bytes: volume.size_bytes,
+                    durability: volume.durability,
+                    created_at: now,
+                    admin_state: DiskAdminState::Active,
+                    role: DiskRole::Root {
+                        cat_id: desired.cat_id.clone(),
+                    },
+                },
+            )?;
+            insert_desired(transaction, &desired)
+        })
+        .unwrap();
+    desired
 }
 
 fn head(value: u64) -> RemoteHead {
@@ -5108,7 +5153,9 @@ fn evidence_snapshot_returns_disposable_completion_after_rows_are_gone() {
 fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
+    let owned_binding = stored_volume_owner(&store, &owned.volume_id).unwrap();
     let node = transition_node(&store, "node-new");
+    let desired = prepare_residue_product_snapshot(&store, &node, &owned, revision(11), epoch(3));
     let (released, _) = cats_storage::authority::release(
         &owned,
         &ReleaseRequest {
@@ -5123,20 +5170,20 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
         .authority_transaction(|transaction| update_volume_owner(transaction, &released, None))
         .unwrap();
 
-    let request = residue_authority_request(&node, 4, 4);
-    let response = match store
+    let request = residue_authority_request(&node, &desired, 4, 4);
+    let disabled = store
         .runtime_residue_authority(
             &node.authenticated,
             &request,
             &node.active_guest_config_digest,
         )
-        .unwrap()
-    {
-        VolumeTransitionStoreOutcome::Accepted(response) => response,
-        VolumeTransitionStoreOutcome::Rejected(rejection) => {
-            panic!("exact residue authority request was rejected: {rejection:?}")
-        }
-    };
+        .expect_err("the Proposed Store entrypoint must be mechanically disabled");
+    assert_eq!(disabled.code, ErrorCode::NotFound);
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
     assert_eq!(response.session, request.session);
     assert_eq!(response.lineage, request.lineage);
     assert_eq!(
@@ -5147,18 +5194,109 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
             }),
         }
     );
+    let replay = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert_eq!(
+        response, replay,
+        "response loss must be an exact read replay"
+    );
 
-    let mut stale = request;
-    stale.lineage.attachment_epoch = fence_epoch(7);
+    let existing_other_workspace =
+        super::product_tests::bootstrap_workspace(&store, "residue-authority-other");
+    let mut mismatches = Vec::new();
+    let mut mismatch = request.clone();
+    mismatch.lineage.workspace_id = existing_other_workspace;
+    mismatches.push(("existing cross-workspace", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.workspace_id = id("workspace-missing");
+    mismatches.push(("missing workspace", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.cat_id = id("cat-missing");
+    mismatches.push(("Cat", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.disk_id = id("disk-missing");
+    mismatches.push(("Disk", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.volume_id = id("volume-missing");
+    let AuthorizedServingAcquire::Normal {
+        request: acquire_request,
+        result: acquire_result,
+    } = &mut mismatch.lineage.acquisition
+    else {
+        unreachable!("fixture is a normal acquisition")
+    };
+    acquire_request.volume_id = mismatch.lineage.volume_id.clone();
+    acquire_result.volume_id = mismatch.lineage.volume_id.clone();
+    mismatch.lineage.acquisition_digest =
+        residue_acquisition_digest(&mismatch.lineage.acquisition).unwrap();
+    mismatches.push(("Volume", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.desired_revision = revision(12);
+    mismatches.push(("Desired revision", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.spec_digest = Sha256Digest::from_bytes([44; 32]);
+    mismatches.push(("Desired digest", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.placement.placement_epoch = epoch(4);
+    mismatches.push(("current placement", mismatch));
+    let mut mismatch = request.clone();
+    mismatch.lineage.node_id = id("node-other");
+    mismatch.lineage.placement.node_id = id("node-other");
+    mismatches.push(("Node", mismatch));
+    let mut mismatch = request.clone();
+    let other_transition = random_id(2);
+    mismatch.lineage.acquire_origin = AcquireOrigin::Normal {
+        transition_id: other_transition.clone(),
+    };
+    let AuthorizedServingAcquire::Normal {
+        request: acquire_request,
+        result: acquire_result,
+    } = &mut mismatch.lineage.acquisition
+    else {
+        unreachable!("fixture is a normal acquisition")
+    };
+    acquire_request.transition_id = other_transition.clone();
+    acquire_result.transition_id = other_transition;
+    mismatch.lineage.acquisition_digest =
+        residue_acquisition_digest(&mismatch.lineage.acquisition).unwrap();
+    mismatches.push(("acquisition receipt", mismatch));
+
+    let mut indistinguishable_error = None;
+    for (coordinate, mismatch) in mismatches {
+        let error = store
+            .authority_locking_read_snapshot(|transaction| {
+                load_residue_authority(transaction, &node, &mismatch)
+            })
+            .expect_err("a cross-bound residue request must fail closed");
+        assert_eq!(error.code, ErrorCode::Internal);
+        let signature = (error.code, error.message);
+        if let Some(expected) = &indistinguishable_error {
+            assert_eq!(
+                &signature, expected,
+                "{coordinate} mismatch exposed a distinguishable authority error"
+            );
+        } else {
+            indistinguishable_error = Some(signature);
+        }
+    }
+
+    store
+        .authority_transaction(|transaction| {
+            update_volume_owner(transaction, &owned, Some(&owned_binding))
+        })
+        .unwrap();
     let response = store
         .authority_locking_read_snapshot(|transaction| {
-            load_residue_authority(transaction, &node, &stale)
+            load_residue_authority(transaction, &node, &request)
         })
         .unwrap();
     assert_eq!(
         response.outcome,
         RuntimeResidueAuthorityOutcome::Retained {
-            reason: ResidueAuthorityRetentionReason::ReleaseNotRecorded,
+            reason: ResidueAuthorityRetentionReason::CurrentOrNewerOwner,
         }
     );
 }
@@ -5167,6 +5305,8 @@ fn residue_authority_snapshot_returns_only_exact_ordinary_release_proof() {
 fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let owned = acquire_owned_volume(&store);
+    let node = transition_node(&store, "node-new");
+    let desired = prepare_residue_product_snapshot(&store, &node, &owned, revision(12), epoch(4));
     let original = disposable_authorization(&owned);
     store
         .authority_transaction(|transaction| insert_authorization(transaction, &original))
@@ -5186,6 +5326,7 @@ fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
             update_volume_owner(transaction, &deleting, None)?;
             update_authorization(transaction, &original, &consumed)?;
             insert_delete_completion(transaction, &completion)?;
+            transaction.execute("DELETE FROM disk_records WHERE disk_id=$1", &[&"disk-1"])?;
             transaction.execute(
                 "DELETE FROM volume_records WHERE volume_id=$1",
                 &[&owned.volume_id.as_str()],
@@ -5193,9 +5334,7 @@ fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
             Ok(())
         })
         .unwrap();
-    let node = transition_node(&store, "node-new");
-    let mut request = residue_authority_request(&node, 6, 4);
-    request.lineage.placement_epoch = epoch(4);
+    let request = residue_authority_request(&node, &desired, 6, 4);
     let response = store
         .authority_locking_read_snapshot(|transaction| {
             load_residue_authority(transaction, &node, &request)
@@ -5206,6 +5345,64 @@ fn residue_authority_disposable_tail_requires_the_consumed_completion_pair() {
         RuntimeResidueAuthorityOutcome::Reclaimable { proof }
             if matches!(proof.as_ref(), ResidueReclaimProof::DisposableRootDeleteCompletion { .. })
     ));
+
+    let mut wrong_delete = completion.clone();
+    let DeleteCompletionReceipt::DisposableRoot { delete_id, .. } = &mut wrong_delete else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *delete_id = id("delete-other");
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM delete_completion_receipts WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            insert_delete_completion(transaction, &wrong_delete)
+        })
+        .unwrap();
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+
+    let mut before_consumption = completion.clone();
+    let DeleteCompletionReceipt::DisposableRoot { completed_at, .. } = &mut before_consumption
+    else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *completed_at = unix_millis(19_999);
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM delete_completion_receipts WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            insert_delete_completion(transaction, &before_consumption)
+        })
+        .unwrap();
+    let response = store
+        .authority_locking_read_snapshot(|transaction| {
+            load_residue_authority(transaction, &node, &request)
+        })
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM delete_completion_receipts WHERE volume_id=$1",
+                &[&owned.volume_id.as_str()],
+            )?;
+            insert_delete_completion(transaction, &completion)
+        })
+        .unwrap();
 
     store
         .with(|client| {

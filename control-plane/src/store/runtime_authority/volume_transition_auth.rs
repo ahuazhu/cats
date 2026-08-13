@@ -267,6 +267,12 @@ impl Store {
         request: &RuntimeResidueAuthorityRequest,
         active_guest_config_digest: &Sha256Digest,
     ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if !super::residue_authority::PROPOSED_RESIDUE_AUTHORITY_ENABLED {
+            return Err(cats_api::error::ApiError::new(
+                cats_api::error::ErrorCode::NotFound,
+                "proposed residue authority is not enabled",
+            ));
+        }
         if let Err(error) = encode_runtime_residue_authority_request(request) {
             return Ok(contract_rejected(error));
         }
@@ -294,6 +300,12 @@ impl Store {
         active_guest_config_digest: &Sha256Digest,
         request_context: &AuthorityRequestContext,
     ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if !super::residue_authority::PROPOSED_RESIDUE_AUTHORITY_ENABLED {
+            return Err(cats_api::error::ApiError::new(
+                cats_api::error::ErrorCode::NotFound,
+                "proposed residue authority is not enabled",
+            ));
+        }
         if let Err(error) = encode_runtime_residue_authority_request(request) {
             return Ok(contract_rejected(error));
         }

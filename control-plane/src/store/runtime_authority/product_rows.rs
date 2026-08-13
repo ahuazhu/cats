@@ -641,6 +641,17 @@ pub(super) fn load_disk_by_id_for_update(
         .transpose()
 }
 
+pub(super) fn load_disk_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!("SELECT {DISK_COLUMNS} FROM disk_records WHERE disk_id=$1");
+    transaction
+        .query_opt(&sql, &[&disk_id.as_str()])?
+        .map(|row| decode_disk(&row))
+        .transpose()
+}
+
 pub(super) fn load_disk_by_volume_unlocked(
     transaction: &mut Transaction<'_>,
     volume_id: &cats_api::runtime_reconciliation::Id,

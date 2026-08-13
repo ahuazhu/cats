@@ -676,10 +676,9 @@ mod tests {
 
     use cats_api::agent_registration::{Ed25519RequestSigner, REGISTRATION_PATH};
     use cats_api::runtime_reconciliation::{
-        decode_agent_session, decode_runtime_residue_authority_success,
-        decode_runtime_volume_transition_error, decode_runtime_volume_transition_evidence_success,
+        decode_agent_session, decode_runtime_volume_transition_error,
+        decode_runtime_volume_transition_evidence_success,
         decode_runtime_volume_transition_success, encode_agent_registration_attempt,
-        encode_runtime_residue_authority_request,
         encode_runtime_volume_transition_evidence_request,
         encode_runtime_volume_transition_request, guest_config_digest, AgentRegistrationAttempt,
         ContractVersion, CredentialBinding, Id, NodeBootId, NodeIdentity, NodeIdentityState,
@@ -1256,57 +1255,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn residue_authority_http_replays_the_same_closed_release_proof() {
+    async fn proposed_residue_authority_route_is_not_installed() {
         let context = Context::new().await;
         let node = context.register("residue", '7').await;
-        let authenticated = node.authenticated();
-        let session = node.binding();
-        let digest = context.active_guest_config_digest.clone();
-        let request = context
-            .server
-            .state
-            .store
-            .execute(move |store| {
-                Ok(
-                    crate::store::runtime_authority::tests::prepare_residue_authority_http_fixture(
-                        store,
-                        authenticated,
-                        session,
-                        digest,
-                    ),
-                )
-            })
-            .await
-            .unwrap();
-        let body = encode_runtime_residue_authority_request(&request).unwrap();
-
-        let first = context
-            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, body.clone())
+        let response = context
+            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, b"{}".to_vec())
             .send()
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let first =
-            decode_runtime_residue_authority_success(&first.bytes().await.unwrap()).unwrap();
-
-        let replay = context
-            .signed(&node, RUNTIME_RESIDUE_AUTHORITY_PATH, body)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(replay.status(), StatusCode::OK);
-        let replay =
-            decode_runtime_residue_authority_success(&replay.bytes().await.unwrap()).unwrap();
-        assert_eq!(first, replay);
-        assert_eq!(replay.session, request.session);
-        assert_eq!(replay.lineage, request.lineage);
-        assert!(matches!(
-            replay.outcome,
-            cats_api::runtime_reconciliation::RuntimeResidueAuthorityOutcome::Reclaimable {
-                proof
-            }
-                if matches!(proof.as_ref(), cats_api::runtime_reconciliation::ResidueReclaimProof::OrdinaryRelease { .. })
-        ));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(decode_runtime_volume_transition_error(&response.bytes().await.unwrap()).is_err());
     }
 
     #[tokio::test]

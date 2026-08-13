@@ -17,13 +17,14 @@ use cats_api::runtime_reconciliation::{
     InventorySource, LastVolumeTransition, LifecycleAdmission, LocalLineageState,
     LocalVolumeLineage, NodeResidue, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
     ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
-    RuntimeTarget, UnixMillis, VolumeAdminState, VolumeAuthorityEvidence, WarmSnapshotEvidence,
-    WireU64,
+    RuntimeTarget, Sha256Digest, UnixMillis, VolumeAdminState, VolumeAuthorityEvidence,
+    WarmSnapshotEvidence, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
 };
 use cats_storage::{
     authority::{
         remote_head_is_same_or_later, validate_authorized_serving_attachment,
-        validate_volume_record, AuthorizedServingAcquire, VolumeRecord,
+        validate_authorized_serving_record, validate_volume_record, AuthorizedServingAcquire,
+        VolumeRecord,
     },
     BlobStore,
 };
@@ -89,6 +90,14 @@ pub enum InventoryAbsence {
     RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpointInventoryEvidence>),
     RuntimeCheckpointsWithResidue {
         checkpoints: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        residue: Vec<NodeResidue>,
+    },
+    /// Canonical assigned checkpoint files which were readable but could not
+    /// be decoded or bound to that filename's exact Desired. They belong to
+    /// the Cat projection, never to top-level residue at the same path.
+    RuntimeCheckpointsWithCorrupt {
+        checkpoints: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        corrupt_checkpoints: BTreeMap<Id, Sha256Digest>,
         residue: Vec<NodeResidue>,
     },
     AuthorizedBlockd(BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>),
@@ -436,6 +445,7 @@ struct InventoryProbeAggregation {
     unavailable_sources: Vec<InventorySource>,
     volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    corrupt_checkpoints_by_cat: BTreeMap<Id, Sha256Digest>,
     blockd_by_cat: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
     residue: Vec<NodeResidue>,
     coverage: InventoryCoverageAggregator,
@@ -447,11 +457,31 @@ impl InventoryProbeAggregation {
             unavailable_sources: Vec::new(),
             volumes_by_cat: BTreeMap::new(),
             checkpoints_by_cat: BTreeMap::new(),
+            corrupt_checkpoints_by_cat: BTreeMap::new(),
             blockd_by_cat: BTreeMap::new(),
             residue: Vec::new(),
             coverage: InventoryCoverageAggregator::new(),
         }
     }
+}
+
+fn append_residue_or_mark_incomplete(
+    aggregate: &mut InventoryProbeAggregation,
+    source: InventorySource,
+    mut residue: Vec<NodeResidue>,
+) {
+    if aggregate
+        .residue
+        .len()
+        .checked_add(residue.len())
+        .is_none_or(|total| total > NODE_OBSERVATION_MAX_RESIDUE_ITEMS)
+    {
+        if !aggregate.unavailable_sources.contains(&source) {
+            aggregate.unavailable_sources.push(source);
+        }
+        return;
+    }
+    aggregate.residue.append(&mut residue);
 }
 
 fn inspect_inventory_probe(
@@ -467,7 +497,9 @@ fn inspect_inventory_probe(
         .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
     {
         InventoryAbsence::Empty => {}
-        InventoryAbsence::Residue(mut residue) => aggregate.residue.append(&mut residue),
+        InventoryAbsence::Residue(residue) => {
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue)
+        }
         InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
             anyhow::ensure!(
                 probe.source() == InventorySource::Checkpoint,
@@ -485,7 +517,7 @@ fn inspect_inventory_probe(
         }
         InventoryAbsence::RuntimeCheckpointsWithResidue {
             checkpoints,
-            mut residue,
+            residue,
         } => {
             anyhow::ensure!(
                 probe.source() == InventorySource::Checkpoint,
@@ -500,7 +532,37 @@ fn inspect_inventory_probe(
                     "checkpoint inventory duplicated one Cat"
                 );
             }
-            aggregate.residue.append(&mut residue);
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
+        }
+        InventoryAbsence::RuntimeCheckpointsWithCorrupt {
+            checkpoints,
+            corrupt_checkpoints,
+            residue,
+        } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::Checkpoint,
+                "only the checkpoint source may report Runtime checkpoints"
+            );
+            for (cat_id, checkpoint) in checkpoints {
+                anyhow::ensure!(
+                    aggregate
+                        .checkpoints_by_cat
+                        .insert(cat_id, checkpoint)
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            for (cat_id, digest) in corrupt_checkpoints {
+                anyhow::ensure!(
+                    !aggregate.checkpoints_by_cat.contains_key(&cat_id)
+                        && aggregate
+                            .corrupt_checkpoints_by_cat
+                            .insert(cat_id, digest)
+                            .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
         }
         InventoryAbsence::AuthorizedBlockd(blockds) => {
             anyhow::ensure!(
@@ -522,10 +584,7 @@ fn inspect_inventory_probe(
                 }
             }
         }
-        InventoryAbsence::AuthorizedBlockdWithResidue {
-            blockds,
-            mut residue,
-        } => {
+        InventoryAbsence::AuthorizedBlockdWithResidue { blockds, residue } => {
             anyhow::ensure!(
                 probe.source() == InventorySource::DataDirectory,
                 "only the data-directory source may report authorized blockd lineage"
@@ -544,7 +603,7 @@ fn inspect_inventory_probe(
                     );
                 }
             }
-            aggregate.residue.append(&mut residue);
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
         }
         InventoryAbsence::DesiredVolumes(observed) => {
             anyhow::ensure!(
@@ -1110,6 +1169,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             .desired_specs
             .iter()
             .map(|desired| {
+                let checkpoint = RuntimeCheckpointProjectionInput::from_parts(
+                    aggregate.checkpoints_by_cat.remove(&desired.cat_id),
+                    aggregate.corrupt_checkpoints_by_cat.remove(&desired.cat_id),
+                )?;
                 runtime_from_inventory(
                     desired,
                     inventory_epoch,
@@ -1118,7 +1181,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         .volumes_by_cat
                         .remove(&desired.cat_id)
                         .unwrap_or_default(),
-                    aggregate.checkpoints_by_cat.remove(&desired.cat_id),
+                    checkpoint,
                     aggregate
                         .blockd_by_cat
                         .remove(&desired.cat_id)
@@ -1144,6 +1207,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         anyhow::ensure!(
             aggregate.volumes_by_cat.is_empty()
                 && aggregate.checkpoints_by_cat.is_empty()
+                && aggregate.corrupt_checkpoints_by_cat.is_empty()
                 && aggregate.blockd_by_cat.is_empty()
                 && processes_by_cat.is_empty()
                 && serving_devices_by_cat.is_empty()
@@ -1599,15 +1663,41 @@ struct RuntimeManagedProjection {
     networks: Vec<cats_api::runtime_reconciliation::ObservedNetwork>,
 }
 
+enum RuntimeCheckpointProjectionInput {
+    Missing,
+    Valid(Box<RuntimeCheckpointInventoryEvidence>),
+    Corrupt(Sha256Digest),
+}
+
+impl RuntimeCheckpointProjectionInput {
+    fn from_parts(
+        checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
+        corrupt_digest: Option<Sha256Digest>,
+    ) -> anyhow::Result<Self> {
+        match (checkpoint, corrupt_digest) {
+            (None, None) => Ok(Self::Missing),
+            (Some(checkpoint), None) => Ok(Self::Valid(Box::new(checkpoint))),
+            (None, Some(digest)) => Ok(Self::Corrupt(digest)),
+            (Some(_), Some(_)) => anyhow::bail!("checkpoint inventory duplicated one Cat"),
+        }
+    }
+}
+
 fn runtime_from_inventory(
     desired: &DesiredRuntimeSpec,
     inventory_epoch: cats_api::runtime_reconciliation::Epoch,
     projection: &InventoryProjectionContext<'_>,
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
-    checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
+    checkpoint_input: RuntimeCheckpointProjectionInput,
     blockds: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
     mut managed: RuntimeManagedProjection,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
+    let (checkpoint, corrupt_checkpoint_digest) = match checkpoint_input {
+        RuntimeCheckpointProjectionInput::Missing => (None, None),
+        RuntimeCheckpointProjectionInput::Valid(checkpoint) => (Some(*checkpoint), None),
+        RuntimeCheckpointProjectionInput::Corrupt(digest) => (None, Some(digest)),
+    };
+    let corrupt_checkpoint_present = corrupt_checkpoint_digest.is_some();
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
         checkpoint_path
@@ -1618,6 +1708,53 @@ fn runtime_from_inventory(
     .ok_or_else(|| anyhow::anyhow!("checkpoint path is not a valid HostPath"))?;
 
     for blockd in blockds.values() {
+        if checkpoint.is_none() {
+            anyhow::ensure!(
+                corrupt_checkpoint_present
+                    && blockd.binding == DesiredCheckpointBinding::Current
+                    && blockd.checkpoint.desired == *desired,
+                "local blockd lineage without a valid Runtime checkpoint is not exact current-Cat evidence"
+            );
+            let attachment = &blockd.checkpoint.attachment;
+            let volume_evidence = volume_evidence
+                .iter_mut()
+                .find(|volume| volume.observed.volume_id == attachment.identity.volume_id)
+                .context("authorized blockd lineage lacks its authority Volume")?;
+            validate_authorized_serving_record(&volume_evidence.record, attachment, None)
+                .context("corrupt-checkpoint Cat has non-exact local blockd lineage")?;
+            let volume = &mut volume_evidence.observed;
+            anyhow::ensure!(
+                matches!(
+                    &volume.authority,
+                    VolumeAuthorityEvidence::Owned {
+                        attachment_id,
+                        attachment_epoch,
+                        head,
+                    } if attachment_id == &attachment.identity.attachment_id
+                        && *attachment_epoch == attachment.identity.attachment_epoch
+                        && head == &attachment.head
+                ) && volume.local_lineages.is_empty()
+                    && managed
+                        .serving_status
+                        .remove(&attachment.identity.volume_id)
+                        .is_none(),
+                "corrupt-checkpoint Cat cannot attribute a live or conflicting blockd lineage"
+            );
+            volume.local_lineages.push(LocalVolumeLineage {
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                acquire_origin: attachment.identity.acquire_origin.clone(),
+                node_id: attachment.identity.node_id.clone(),
+                placement_epoch: attachment.identity.placement_epoch,
+                local_durable_generation: attachment.head.generation,
+                remote_durable_generation: attachment.head.generation,
+                data_directory: blockd.data_directory.clone(),
+                pending_pack_count: WireU64::new(0).expect("zero fits WireU64"),
+                fenced: false,
+                state: LocalLineageState::Active,
+            });
+            continue;
+        }
         anyhow::ensure!(
             checkpoint.is_some(),
             "authorized blockd lineage lacks its Runtime checkpoint"
@@ -1908,7 +2045,6 @@ fn runtime_from_inventory(
                 )
         })
     });
-
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
             Some(inventory_checkpoint) => {
@@ -1952,6 +2088,17 @@ fn runtime_from_inventory(
                     },
                 )
             }
+            None if corrupt_checkpoint_digest.is_some() => (
+                ReconcileStep::InspectInventory { inventory_epoch },
+                CheckpointEvidence::Corrupt {
+                    checkpoint_path,
+                    raw_content_digest: corrupt_checkpoint_digest
+                        .expect("branch established corrupt checkpoint evidence"),
+                },
+                None,
+                None,
+                LifecycleAdmission::Closed,
+            ),
             None => {
                 anyhow::ensure!(
                     blockds.is_empty(),
@@ -1969,6 +2116,7 @@ fn runtime_from_inventory(
         };
 
     let frozen_contract_stop = matches!(&step, ReconcileStep::Quarantined)
+        || corrupt_checkpoint_present
         || unsupported_superseded
         || definite_release_rejected
         || closed_takeover_history
@@ -2980,9 +3128,9 @@ mod tests {
         decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
         encode_runtime_checkpoint, inventory_digest, spec_digest, AssignedKind, AssignedPlacement,
         ContractVersion, DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address,
-        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation, RandomId128,
-        ReconcileStep, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding,
-        Sha256Digest, StableState,
+        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation,
+        OwnershipTokenEvidence, RandomId128, ReconcileStep, Revision, RuntimeConfig, RuntimeTarget,
+        RuntimeTransition, SessionBinding, Sha256Digest, StableState,
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::{decode_desired_runtime_spec, RuntimeLaunch};
@@ -2992,6 +3140,42 @@ mod tests {
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
     const ACTIVE_ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+
+    #[test]
+    fn residue_aggregation_never_builds_item_4097_across_sources() {
+        let residue = |index| NodeResidue::ControlSocket {
+            socket_path: HostPath::new(format!("/tmp/residue-{index}")).unwrap(),
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+        };
+        let mut aggregate = InventoryProbeAggregation::new();
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::Checkpoint,
+            (0..NODE_OBSERVATION_MAX_RESIDUE_ITEMS - 1)
+                .map(residue)
+                .collect(),
+        );
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::DataDirectory,
+            vec![residue(NODE_OBSERVATION_MAX_RESIDUE_ITEMS - 1)],
+        );
+        assert_eq!(aggregate.residue.len(), NODE_OBSERVATION_MAX_RESIDUE_ITEMS);
+        assert!(aggregate.unavailable_sources.is_empty());
+
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::Network,
+            vec![residue(NODE_OBSERVATION_MAX_RESIDUE_ITEMS)],
+        );
+        assert_eq!(
+            aggregate.residue.len(),
+            NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
+            "item 4097 must not enter the wire projection"
+        );
+        assert_eq!(aggregate.unavailable_sources, [InventorySource::Network]);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

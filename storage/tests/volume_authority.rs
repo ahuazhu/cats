@@ -112,7 +112,14 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
 }
 
 fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
+    let acquired = acquired_volume();
+    let Some(LastVolumeTransition::NormalAcquire { request, result }) = acquired.last_transition
+    else {
+        unreachable!("fixture is a normal acquire")
+    };
+    let acquisition = AuthorizedServingAcquire::Normal { request, result };
     ResidueDataDirectoryLineage {
+        workspace_id: id("workspace-1"),
         cat_id: id("cat-1"),
         disk_id: id("disk-1"),
         disk_kind: DiskKind::Root,
@@ -123,7 +130,16 @@ fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
             transition_id: random_id(1),
         },
         node_id: id("node-old"),
+        desired_revision: revision(11),
+        spec_digest: Sha256Digest::from_bytes([11; 32]),
+        placement: cats_api::runtime_reconciliation::AssignedPlacement {
+            kind: cats_api::runtime_reconciliation::AssignedKind::Assigned,
+            node_id: id("node-old"),
+            placement_epoch: epoch(3),
+        },
         placement_epoch: epoch(3),
+        acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+        acquisition,
         local_durable_generation: generation(local),
         remote_durable_generation: generation(remote),
         remote_head: head(remote),
@@ -1219,7 +1235,8 @@ fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
     )
     .unwrap();
     let completion = complete_disposable_root_delete(&deleting, &consumed, time(40_000)).unwrap();
-    let lineage = residue_lineage(6, 4);
+    let mut lineage = residue_lineage(6, 4);
+    lineage.desired_revision = revision(13);
     assert!(matches!(
         classify_residue_reclaim_authority(&lineage, None, Some(&completion), Some(&consumed),)
             .unwrap(),
@@ -1242,6 +1259,34 @@ fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
             reason: ResidueAuthorityRetentionReason::UnsupportedDiskKind,
         }
     );
+
+    let mut wrong_delete = completion.clone();
+    let DeleteCompletionReceipt::DisposableRoot { delete_id, .. } = &mut wrong_delete else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *delete_id = id("delete-other");
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&wrong_delete), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+
+    let mut before_consumption = completion;
+    let DeleteCompletionReceipt::DisposableRoot { completed_at, .. } = &mut before_consumption
+    else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *completed_at = time(19_999);
+    assert!(matches!(
+        classify_residue_reclaim_authority(
+            &lineage,
+            None,
+            Some(&before_consumption),
+            Some(&consumed),
+        )
+        .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
 }
 
 #[test]

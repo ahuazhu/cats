@@ -61,7 +61,7 @@ const EMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"4444444444444444444
 
 const UNEXPECTED_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":5,"inventory_read_position":13,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"kind":"control_socket","ownership_token":{"kind":"valid","ownership_token":"abababababababababababababababab"},"role_hint":null,"socket_path":"/run/cats/orphan/valid.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","evidence":{"cat_id":"cat_01","content_digest":"sha256:ac539e62743af98193ed3758d4bb830e1b8d6c7adfc913c0eb8c7e8f4059eb45","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"runtime_incarnation":null,"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","version":1},"kind":"checkpoint_file"}],"runtimes":[],"version":1}"#;
 
-const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"allocated_bytes":4096,"cat_id_hint":"cat_orphan","data_directory":"/var/lib/cats/orphan-vol","disk_id_hint":"disk_orphan","kind":"data_directory","lineage":{"kind":"readable","lineage":{"acquire_origin":{"kind":"normal","transition_id":"2468ace013579bdf2468ace013579bdf"},"attachment_epoch":4,"attachment_id":"att_orphan","cat_id":"cat_orphan","disk_id":"disk_orphan","disk_kind":"root","fenced":false,"local_durable_generation":6,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":5,"remote_head":{"generation":5,"root_hash":"sha256:5555555555555555555555555555555555555555555555555555555555555555","root_object_id":"volumes/vol_orphan/roots/5"},"volume_id":"vol_orphan"}},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"retention_reason":"unique_local_tail","volume_id_hint":"vol_orphan"}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:ac539e62743af98193ed3758d4bb830e1b8d6c7adfc913c0eb8c7e8f4059eb45","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"runtime_launch":{"kind":"absent"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
+const NONEMPTY_INVENTORY_INPUT: &str = r#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"inventory_epoch":4,"inventory_read_position":12,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","residue":[{"cgroup_path":"/sys/fs/cgroup/system.slice/cats-orphan.scope","kind":"systemd_scope","ownership_token":{"kind":"valid","ownership_token":"dddddddddddddddddddddddddddddddd"},"scope_id":"cats-orphan.scope"},{"kind":"control_socket","ownership_token":{"kind":"missing"},"role_hint":null,"socket_path":"/run/cats/orphan/control.sock"},{"checkpoint_path":"/var/lib/cats/checkpoints/orphan.json","evidence":{"kind":"corrupt","raw_content_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"kind":"checkpoint_file"},{"allocated_bytes":4096,"cat_id_hint":"cat_orphan","data_directory":"/var/lib/cats/orphan-vol","disk_id_hint":"disk_orphan","kind":"data_directory","lineage":{"kind":"readable","lineage":{"acquire_origin":{"kind":"normal","transition_id":"2468ace013579bdf2468ace013579bdf"},"acquisition":{"kind":"normal","request":{"attachment_id":"att_orphan","desired_revision":7,"expected_unowned_epoch":3,"lease_duration_ms":60000,"placement_epoch":3,"transition_id":"2468ace013579bdf2468ace013579bdf","volume_id":"vol_orphan"},"result":{"attachment_id":"att_orphan","lease_expires_at":1720000060000,"resulting_epoch":4,"resulting_head":{"generation":5,"root_hash":"sha256:5555555555555555555555555555555555555555555555555555555555555555","root_object_id":"volumes/vol_orphan/roots/5"},"transition_id":"2468ace013579bdf2468ace013579bdf","volume_id":"vol_orphan"}},"acquisition_digest":"sha256:c85cfd1e2fe5d89d0ac217c7e7afea28b8b6316355bde3c76794b3c20f405027","attachment_epoch":4,"attachment_id":"att_orphan","cat_id":"cat_orphan","desired_revision":7,"disk_id":"disk_orphan","disk_kind":"root","fenced":false,"local_durable_generation":6,"node_id":"node_a","pending_pack_count":1,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"placement_epoch":3,"remote_durable_generation":5,"remote_head":{"generation":5,"root_hash":"sha256:5555555555555555555555555555555555555555555555555555555555555555","root_object_id":"volumes/vol_orphan/roots/5"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","volume_id":"vol_orphan","workspace_id":"ws_01"}},"ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"retention_reason":"unique_local_tail","volume_id_hint":"vol_orphan"}],"runtimes":[{"applied_desired":{"desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","target":"running"},"cat_id":"cat_01","checkpoint":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:ac539e62743af98193ed3758d4bb830e1b8d6c7adfc913c0eb8c7e8f4059eb45","desired_revision":7,"kind":"valid","node_id":"node_a","placement_epoch":3,"require_idle":{"kind":"not_applicable"},"runtime_incarnation":null,"runtime_launch":{"kind":"absent"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"updated_at_unix_ms":1720000000000,"version":1},"guest_transport":{"guest_agent_protocol_version":1,"guest_boot_id":"cccccccccccccccccccccccccccccccc","guest_cid":3,"guest_port":5000,"kind":"vsock_ready","runtime_incarnation":"55555555555555555555555555555555"},"lifecycle_admission":"closed","mounts":[{"access":"read_write","filesystem_uuid":"99999999999999999999999999999999","guest_device":{"serial":"cats-root","slot":0},"instance_count":1,"mount_path":"/","source_path":"/dev/nbd0","volume_id":"vol_root"}],"networks":[{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"valid","ownership_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"prefix_length":30,"tap_name":"tap0"},{"gateway_ipv4":"10.240.0.5","guest_ipv4":"10.240.0.6","guest_mac":"02:ca:0a:f0:00:06","kind":"isolated_ipv4","network_id":"net_01","ownership_token":{"kind":"corrupt","raw_content_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"prefix_length":30,"tap_name":"tap1"}],"platform_guards":0,"processes":[{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/vmm.sock","executable_path":"/usr/bin/cloud-hypervisor","observed_vm_shape":{"boot_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","memory_bytes":2147483648,"vcpus":2},"ownership_token":{"kind":"valid","ownership_token":"66666666666666666666666666666666"},"process_id":1001,"process_start_time_ticks":9001,"role":{"kind":"vmm","runtime_incarnation":"55555555555555555555555555555555"},"scope_id":"cats-cat_01","state":"running"},{"control_handshake":{"kind":"verified"},"control_socket_path":"/run/cats/cat_01/blockd-root.sock","executable_path":"/usr/bin/cats-blockd","observed_vm_shape":null,"ownership_token":{"kind":"valid","ownership_token":"77777777777777777777777777777777"},"process_id":1002,"process_start_time_ticks":9002,"role":{"attachment_epoch":8,"attachment_id":"att_01","kind":"blockd","volume_id":"vol_root"},"scope_id":"cats-cat_01","state":"running"}],"routes":[{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":9,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":2},{"active_guards":0,"binding":{"cat_id":"cat_01","endpoint_id":"ep_01","hostname":"app.example.test","node_id":"node_a","protocol":"http","route_epoch":10,"runtime_incarnation":"55555555555555555555555555555555","target_port":8080,"workspace_id":"ws_01"},"cancellation_pending":false,"gate":"closed","instance_count":1}],"runtime_incarnation":"55555555555555555555555555555555","stable_state":null,"step":{"inventory_epoch":4,"kind":"inspect_inventory"},"volumes":[{"authority":{"attachment_epoch":8,"attachment_id":"att_01","head":{"generation":4,"root_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","root_object_id":"volumes/vol_root/roots/4"},"kind":"owned"},"devices":[{"device_path":"/dev/nbd0","guest_device":{"serial":"cats-root","slot":0},"kind":"kernel_nbd","ownership_token":{"kind":"valid","ownership_token":"88888888888888888888888888888888"}},{"guest_device":{"serial":"cats-root","slot":0},"kind":"vhost_user_blk","ownership_token":{"kind":"missing"},"socket_path":"/run/cats/cat_01/root.sock"}],"disk_id":"disk_root","disk_kind":"root","durability":"strict","local_lineages":[{"acquire_origin":{"kind":"normal","transition_id":"13579bdf2468ace013579bdf2468ace0"},"attachment_epoch":8,"attachment_id":"att_01","data_directory":"/var/lib/cats/vol_root","fenced":false,"local_durable_generation":5,"node_id":"node_a","pending_pack_count":1,"placement_epoch":3,"remote_durable_generation":4,"state":"active"}],"size_bytes":4294967296,"volume_id":"vol_root","volume_intent_id":"vint_root"}],"warm_snapshot":{"kind":"absent"}}],"version":1}"#;
 
 const NODE_CLEANUP_WIRE: &str = r#"{"cleanup":{"desired_read_position":15,"inventory_epoch":4,"inventory_read_position":12,"inventory_session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"target":{"cat_id":"cat_01","checkpoint_path":"/var/lib/cats/checkpoints/cat_01.json","content_digest":"sha256:ac539e62743af98193ed3758d4bb830e1b8d6c7adfc913c0eb8c7e8f4059eb45","desired_revision":7,"kind":"checkpoint_file","node_id":"node_a","placement_epoch":3},"volume_release":null},"node_id":"node_a","version":1}"#;
 
@@ -935,7 +935,7 @@ fn complete_observation_wire(projection: &str, claim: &str) -> Vec<u8> {
 fn nonempty_observation_value() -> serde_json::Value {
     serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b",
+        "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64",
     ))
     .unwrap()
 }
@@ -1517,7 +1517,7 @@ fn fixed_unexpected_inventory_digest_matches() {
 
 #[test]
 fn fixed_nonempty_inventory_digest_matches() {
-    let expected = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let expected = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let observation = decode_node_observation(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
         expected,
@@ -1624,25 +1624,55 @@ fn a22_authorization_evidence_fixed_vectors_round_trip_exactly() {
 }
 
 fn residue_authority_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
+    let transition_id = RandomId128::new("22222222222222222222222222222222").unwrap();
+    let attachment_id = Id::new("att_01").unwrap();
+    let remote_head = RemoteHead {
+        generation: Generation::new(remote).unwrap(),
+        root_hash: Some(Sha256Digest::new(format!("sha256:{:064x}", remote.max(1))).unwrap()),
+        root_object_id: Some(AsciiText::new(format!("roots/{remote}")).unwrap()),
+    };
+    let acquisition = AuthorizedServingAcquire::Normal {
+        request: NormalAcquireRequest {
+            volume_id: Id::new("vol_root").unwrap(),
+            transition_id: transition_id.clone(),
+            attachment_id: attachment_id.clone(),
+            expected_unowned_epoch: FenceEpoch::new(7).unwrap(),
+            desired_revision: Revision::new(7).unwrap(),
+            placement_epoch: Epoch::new(3).unwrap(),
+            lease_duration_ms: 60_000,
+        },
+        result: NormalAcquireResult {
+            volume_id: Id::new("vol_root").unwrap(),
+            transition_id: transition_id.clone(),
+            attachment_id: attachment_id.clone(),
+            resulting_epoch: FenceEpoch::new(8).unwrap(),
+            resulting_head: remote_head.clone(),
+            lease_expires_at: UnixMillis::new(1_720_000_060_000).unwrap(),
+        },
+    };
     ResidueDataDirectoryLineage {
+        workspace_id: Id::new("ws_01").unwrap(),
         cat_id: Id::new("cat_01").unwrap(),
         disk_id: Id::new("disk_root").unwrap(),
         disk_kind: DiskKind::Root,
         volume_id: Id::new("vol_root").unwrap(),
-        attachment_id: Id::new("att_01").unwrap(),
+        attachment_id,
         attachment_epoch: FenceEpoch::new(8).unwrap(),
-        acquire_origin: AcquireOrigin::Normal {
-            transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
-        },
+        acquire_origin: AcquireOrigin::Normal { transition_id },
         node_id: Id::new("node_a").unwrap(),
+        desired_revision: Revision::new(7).unwrap(),
+        spec_digest: Sha256Digest::new(SPEC_DIGEST).unwrap(),
+        placement: AssignedPlacement {
+            kind: AssignedKind::Assigned,
+            node_id: Id::new("node_a").unwrap(),
+            placement_epoch: Epoch::new(3).unwrap(),
+        },
         placement_epoch: Epoch::new(3).unwrap(),
+        acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+        acquisition,
         local_durable_generation: Generation::new(local).unwrap(),
         remote_durable_generation: Generation::new(remote).unwrap(),
-        remote_head: RemoteHead {
-            generation: Generation::new(remote).unwrap(),
-            root_hash: Some(Sha256Digest::new(format!("sha256:{:064x}", remote.max(1))).unwrap()),
-            root_object_id: Some(AsciiText::new(format!("roots/{remote}")).unwrap()),
-        },
+        remote_head,
         pending_pack_count: WireU64::new(local.saturating_sub(remote)).unwrap(),
         fenced: true,
     }
@@ -1672,6 +1702,7 @@ fn residue_authority_codecs_are_closed_and_bind_the_exact_session_lineage() {
 
     let mut wrong_node = request.clone();
     wrong_node.lineage.node_id = Id::new("node_b").unwrap();
+    wrong_node.lineage.placement.node_id = Id::new("node_b").unwrap();
     let raw = serde_json::to_vec(&wrong_node).unwrap();
     let error = decode_runtime_residue_authority_request(&raw).unwrap_err();
     assert_eq!(malformed(&error).0.as_str(), "/lineage/node_id");
@@ -1744,8 +1775,16 @@ fn residue_authority_success_rejects_a_proof_for_another_epoch_or_tail() {
         success
     );
 
-    let mut stale: serde_json::Value = serde_json::from_slice(&wire).unwrap();
-    stale["lineage"]["attachment_epoch"] = 7.into();
+    let mut stale = success.clone();
+    stale.lineage.attachment_epoch = FenceEpoch::new(7).unwrap();
+    let AuthorizedServingAcquire::Normal { request, result } = &mut stale.lineage.acquisition
+    else {
+        unreachable!("fixture is a normal acquisition")
+    };
+    request.expected_unowned_epoch = FenceEpoch::new(6).unwrap();
+    result.resulting_epoch = FenceEpoch::new(7).unwrap();
+    stale.lineage.acquisition_digest =
+        residue_acquisition_digest(&stale.lineage.acquisition).unwrap();
     let error =
         decode_runtime_residue_authority_success(&serde_json::to_vec(&stale).unwrap()).unwrap_err();
     assert_eq!(malformed(&error).0.as_str(), "/outcome/proof");
@@ -1755,6 +1794,84 @@ fn residue_authority_success_rejects_a_proof_for_another_epoch_or_tail() {
     tail["lineage"]["pending_pack_count"] = 1.into();
     let error =
         decode_runtime_residue_authority_success(&serde_json::to_vec(&tail).unwrap()).unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/outcome/proof");
+}
+
+#[test]
+fn residue_authority_codec_rejects_mismatched_or_time_reversed_disposable_completion() {
+    let lineage = residue_authority_lineage(6, 5);
+    let deleting_epoch = FenceEpoch::new(9).unwrap();
+    let consumed_at = UnixMillis::new(100).unwrap();
+    let delete_id = Id::new("delete_01").unwrap();
+    let authorization_id = Id::new("delete_auth_01").unwrap();
+    let authorization = DisposableRootDeleteAuthorization {
+        authorization_id: authorization_id.clone(),
+        authorized_node_id: lineage.node_id.clone(),
+        delete_id: delete_id.clone(),
+        disk_id: lineage.disk_id.clone(),
+        volume_id: lineage.volume_id.clone(),
+        cat_id: lineage.cat_id.clone(),
+        desired_revision: lineage.desired_revision,
+        placement_epoch: lineage.placement.placement_epoch,
+        expected_attachment_id: lineage.attachment_id.clone(),
+        expected_epoch: lineage.attachment_epoch,
+        expected_head: lineage.remote_head.clone(),
+        isolation_basis: DisposableDeleteIsolationBasis::HostFenceEvent {
+            event_id: Id::new("fence_01").unwrap(),
+        },
+        not_after: UnixMillis::new(300).unwrap(),
+    };
+    let consumed = BeginDisposableDeleteConsumedReceipt {
+        authorization_id: authorization_id.clone(),
+        volume_id: lineage.volume_id.clone(),
+        disk_id: lineage.disk_id.clone(),
+        cat_id: lineage.cat_id.clone(),
+        delete_id: delete_id.clone(),
+        prior_attachment_id: lineage.attachment_id.clone(),
+        resulting_epoch: deleting_epoch,
+        resulting_head: lineage.remote_head.clone(),
+        consumed_at,
+    };
+    let completion = DeleteCompletionReceipt::DisposableRoot {
+        disk_id: lineage.disk_id.clone(),
+        volume_id: lineage.volume_id.clone(),
+        delete_id,
+        authorization_id,
+        prior_attachment_id: lineage.attachment_id.clone(),
+        deleting_epoch,
+        deleting_head: lineage.remote_head.clone(),
+        completed_at: UnixMillis::new(200).unwrap(),
+    };
+    let success = RuntimeResidueAuthoritySuccess {
+        version: ContractVersion::V1,
+        session: residue_authority_session(),
+        lineage,
+        outcome: RuntimeResidueAuthorityOutcome::Reclaimable {
+            proof: Box::new(ResidueReclaimProof::DisposableRootDeleteCompletion {
+                completion,
+                consumed_authorization: AuthorizationRecord {
+                    authorization: VolumeAuthorization::DisposableRootDelete(authorization),
+                    state: AuthorizationState::Consumed(Box::new(
+                        AuthorizationConsumedReceipt::BeginDisposableDelete(consumed),
+                    )),
+                },
+            }),
+        },
+    };
+    let wire = encode_runtime_residue_authority_success(&success).unwrap();
+
+    let mut wrong_delete: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    wrong_delete["outcome"]["proof"]["completion"]["delete_id"] = "delete_other".into();
+    let error =
+        decode_runtime_residue_authority_success(&serde_json::to_vec(&wrong_delete).unwrap())
+            .unwrap_err();
+    assert_eq!(malformed(&error).0.as_str(), "/outcome/proof");
+
+    let mut before_consumption: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    before_consumption["outcome"]["proof"]["completion"]["completed_at"] = 99.into();
+    let error =
+        decode_runtime_residue_authority_success(&serde_json::to_vec(&before_consumption).unwrap())
+            .unwrap_err();
     assert_eq!(malformed(&error).0.as_str(), "/outcome/proof");
 }
 
@@ -2367,7 +2484,7 @@ fn canonical_digests_ignore_member_order_and_bind_exact_projections() {
         checkpoint_content_digest(&changed_checkpoint).unwrap()
     );
 
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let observation =
         decode_node_observation(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -2979,7 +3096,7 @@ fn cleanup_release_intrinsic_constraints_are_bidirectional() {
 
 #[test]
 fn partial_observation_requires_applied_desired_for_every_reported_runtime() {
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -3010,7 +3127,7 @@ fn every_reconcile_step_host_reuses_the_same_cross_field_validator() {
     let mut checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT_WIRE).unwrap();
     checkpoint["step"] = invalid_step.clone();
 
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -5632,7 +5749,7 @@ fn close_gate_is_one_exact_narrow_step_in_every_wire_host() {
 
     let observation: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b",
+        "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64",
     ))
     .unwrap();
     let mut observed_runtime_and_checkpoint = observation.clone();
@@ -5923,7 +6040,7 @@ fn every_remote_head_host_reuses_the_same_validator() {
 
     let observation: serde_json::Value = serde_json::from_slice(&complete_observation_wire(
         NONEMPTY_INVENTORY_INPUT,
-        "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b",
+        "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64",
     ))
     .unwrap();
 
@@ -6297,7 +6414,7 @@ fn every_readable_residue_lineage_host_reuses_the_same_validator() {
     reversed_generations["lineage"]["lineage"]["remote_durable_generation"] = 5.into();
     invalid_lineages.push(("reversed_generations", reversed_generations));
 
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     for (invariant, residue) in invalid_lineages {
         let observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -6402,7 +6519,7 @@ fn runtime_condition_fact_conflicts_point_to_the_runtime_common_object() {
         }),
     ];
 
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     for condition in reasons {
         let mut observation: serde_json::Value =
             serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
@@ -6747,7 +6864,7 @@ fn desired_acquire_ids_are_unique_even_across_normal_and_takeover_variants() {
 
 #[test]
 fn multiplicity_facts_cannot_be_split_across_duplicate_items() {
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let base: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();
@@ -7162,7 +7279,7 @@ fn operation_terminal_bindings_and_removed_tag_fail_closed() {
 
 #[test]
 fn removed_contract_error_condition_tag_is_not_a_compatibility_surface() {
-    let claim = "sha256:dafaca49ed879ad2c7fc0bfb08d31a0aa55e898fefcde5746f25331899d2985b";
+    let claim = "sha256:48c3d2fcce804f713137fd0fc7df89856c528f034d86cf6517f19f363e0ccc64";
     let mut observation: serde_json::Value =
         serde_json::from_slice(&complete_observation_wire(NONEMPTY_INVENTORY_INPUT, claim))
             .unwrap();

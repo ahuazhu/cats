@@ -1846,6 +1846,23 @@ pub struct RuntimeVolumeTransitionEvidenceSuccess {
     pub direct_successor_authorization: Option<AuthorizationRecord>,
 }
 
+/// Immutable, complete Control receipt which created one serving attachment.
+///
+/// The residue contract carries this exact value (plus its domain-separated
+/// digest) instead of reconstructing authority from path or identifier hints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizedServingAcquire {
+    Normal {
+        request: NormalAcquireRequest,
+        result: NormalAcquireResult,
+    },
+    Takeover {
+        authorization: VolumeTakeoverAuthorization,
+        receipt: TakeoverConsumedReceipt,
+    },
+}
+
 /// One exact local block-data lineage presented for read-only reclaim
 /// qualification.  This is physical evidence, not ownership authority.  The
 /// Control Plane must bind it to the current PostgreSQL authority snapshot and
@@ -1853,6 +1870,7 @@ pub struct RuntimeVolumeTransitionEvidenceSuccess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidueDataDirectoryLineage {
+    pub workspace_id: Id,
     pub cat_id: Id,
     pub disk_id: Id,
     pub disk_kind: DiskKind,
@@ -1861,7 +1879,15 @@ pub struct ResidueDataDirectoryLineage {
     pub attachment_epoch: FenceEpoch,
     pub acquire_origin: AcquireOrigin,
     pub node_id: Id,
+    /// Current Desired coordinate under which Control is asked to qualify
+    /// reclamation. The immutable acquire receipt below carries its own
+    /// historical revision and placement.
+    pub desired_revision: Revision,
+    pub spec_digest: Sha256Digest,
+    pub placement: AssignedPlacement,
     pub placement_epoch: Epoch,
+    pub acquisition: AuthorizedServingAcquire,
+    pub acquisition_digest: Sha256Digest,
     pub local_durable_generation: Generation,
     pub remote_durable_generation: Generation,
     pub remote_head: RemoteHead,
