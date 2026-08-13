@@ -675,50 +675,67 @@ fn first_lifecycle_step(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
 ) -> anyhow::Result<Option<ReconcileStep>> {
-    for volume in &runtime.volumes {
-        let VolumeAuthorityEvidence::Owned {
-            attachment_epoch, ..
-        } = &volume.authority
-        else {
-            anyhow::bail!("lifecycle planner found a non-Owned retained volume")
-        };
-        let mut lineages = volume.local_lineages.iter().filter(|lineage| {
-            lineage.attachment_epoch == *attachment_epoch
-                && lineage.node_id == desired.placement.node_id
-                && lineage.placement_epoch == desired.placement.placement_epoch
-        });
-        let Some(lineage) = lineages.next() else {
-            anyhow::bail!("lifecycle planner lacks the exact current local lineage")
-        };
-        anyhow::ensure!(
-            lineages.next().is_none(),
-            "lifecycle planner found duplicate current local lineages"
-        );
-        if lineage.local_durable_generation != lineage.remote_durable_generation {
-            return Ok(Some(ReconcileStep::DrainPublish {
-                volume_id: volume.volume_id.clone(),
-                attachment_epoch: *attachment_epoch,
-                local_generation: lineage.local_durable_generation,
-                remote_generation: lineage.remote_durable_generation,
-            }));
-        }
+    if desired.target == RuntimeTarget::Running {
+        return Ok(None);
     }
-
-    let process = exact_vmm_process(runtime)?;
-    let Some(incarnation) = runtime.runtime_incarnation.clone() else {
-        anyhow::bail!("Running lifecycle predecessor lacks its incarnation")
+    // An accepted R==L observation predates this effect batch and says
+    // nothing about Guest/page-cache writes after the scan.  Every departure
+    // from Running therefore starts with a fresh quiesce+durability token;
+    // Pause/Stop may only be selected by a later exact Drain postcondition.
+    let _vmm = exact_vmm_process(runtime)?;
+    anyhow::ensure!(
+        !desired.volumes.is_empty() && runtime.volumes.len() == desired.volumes.len(),
+        "lifecycle drain planner lacks the complete Desired volume set"
+    );
+    let first = desired
+        .volumes
+        .iter()
+        .min_by_key(|volume| volume.guest_device.slot)
+        .context("lifecycle drain planner lacks a canonical first volume")?;
+    let mut observed = runtime
+        .volumes
+        .iter()
+        .filter(|observed| observed.volume_id == first.volume_id);
+    let volume = observed
+        .next()
+        .context("lifecycle drain planner lacks the first Desired volume")?;
+    anyhow::ensure!(
+        observed.next().is_none()
+            && volume.volume_intent_id.as_ref() == Some(&first.volume_intent_id)
+            && volume.disk_id.as_ref() == Some(&first.disk_id),
+        "lifecycle drain planner found an ambiguous first Desired volume"
+    );
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        ..
+    } = &volume.authority
+    else {
+        anyhow::bail!("lifecycle drain planner found a non-Owned retained volume")
     };
-    Ok(Some(match desired.target {
-        RuntimeTarget::Suspended | RuntimeTarget::Warm => ReconcileStep::PauseRuntime {
-            runtime_incarnation: incarnation,
-            process_start_time_ticks: process.process_start_time_ticks,
-        },
-        RuntimeTarget::Cold | RuntimeTarget::Deleted => ReconcileStep::StopRuntime {
-            runtime_incarnation: incarnation,
-            process_start_time_ticks: process.process_start_time_ticks,
-            scope_id: process.scope_id.clone(),
-        },
-        RuntimeTarget::Running => return Ok(None),
+    anyhow::ensure!(
+        attachment_id == &first.attachment_id,
+        "lifecycle drain planner found another attachment owner"
+    );
+    let mut lineages = volume.local_lineages.iter().filter(|lineage| {
+        lineage.attachment_id == *attachment_id
+            && lineage.attachment_epoch == *attachment_epoch
+            && lineage.node_id == desired.placement.node_id
+            && lineage.placement_epoch == desired.placement.placement_epoch
+    });
+    let lineage = lineages
+        .next()
+        .context("lifecycle drain planner lacks the exact current local lineage")?;
+    anyhow::ensure!(
+        lineages.next().is_none()
+            && lineage.local_durable_generation >= lineage.remote_durable_generation,
+        "lifecycle drain planner found duplicate or regressed current lineage"
+    );
+    Ok(Some(ReconcileStep::DrainPublish {
+        volume_id: volume.volume_id.clone(),
+        attachment_epoch: *attachment_epoch,
+        local_generation: lineage.local_durable_generation,
+        remote_generation: lineage.remote_durable_generation,
     }))
 }
 
@@ -821,7 +838,7 @@ mod tests {
                 .unwrap(),
             },
             processes: checkpoint.processes.clone(),
-            volumes: Vec::new(),
+            volumes: checkpoint.volumes.clone(),
             mounts: Vec::new(),
             networks: checkpoint.networks.clone(),
             guest_transport: checkpoint.guest_transport.clone(),
@@ -835,39 +852,36 @@ mod tests {
     }
 
     #[test]
-    fn planner_selects_pause_for_suspended_and_warm() {
-        for target in [RuntimeTarget::Suspended, RuntimeTarget::Warm] {
+    fn r_equals_l_still_requires_drain_before_any_pause_or_stop() {
+        for target in [
+            RuntimeTarget::Suspended,
+            RuntimeTarget::Warm,
+            RuntimeTarget::Cold,
+            RuntimeTarget::Deleted,
+        ] {
             let (desired, _, runtime) = fixtures(target);
+            let lineage = &runtime.volumes[0].local_lineages[0];
+            assert_eq!(
+                lineage.local_durable_generation, lineage.remote_durable_generation,
+                "regression control must start from accepted R == L"
+            );
             assert!(matches!(
                 first_lifecycle_step(&desired, &runtime).unwrap(),
-                Some(ReconcileStep::PauseRuntime {
-                    process_start_time_ticks,
+                Some(ReconcileStep::DrainPublish {
+                    ref volume_id,
+                    local_generation,
+                    remote_generation,
                     ..
-                }) if process_start_time_ticks.get() == 99
-            ));
-        }
-    }
-
-    #[test]
-    fn planner_selects_exact_stop_for_cold_and_deleted() {
-        for target in [RuntimeTarget::Cold, RuntimeTarget::Deleted] {
-            let (desired, checkpoint, runtime) = fixtures(target);
-            let launch = checkpoint.runtime_launch.identity().unwrap();
-            assert!(matches!(
-                first_lifecycle_step(&desired, &runtime).unwrap(),
-                Some(ReconcileStep::StopRuntime {
-                    process_start_time_ticks,
-                    ref scope_id,
-                    ..
-                }) if process_start_time_ticks.get() == 99 && scope_id == &launch.scope_id
+                }) if volume_id == &runtime.volumes[0].volume_id
+                    && local_generation == lineage.local_durable_generation
+                    && remote_generation == lineage.remote_durable_generation
             ));
         }
     }
 
     #[test]
     fn planner_drains_exact_owned_lineage_before_pausing() {
-        let (desired, checkpoint, mut runtime) = fixtures(RuntimeTarget::Suspended);
-        runtime.volumes = checkpoint.volumes.clone();
+        let (desired, _, mut runtime) = fixtures(RuntimeTarget::Suspended);
         let lineage = &mut runtime.volumes[0].local_lineages[0];
         lineage.local_durable_generation =
             cats_api::runtime_reconciliation::Generation::new(2).unwrap();
