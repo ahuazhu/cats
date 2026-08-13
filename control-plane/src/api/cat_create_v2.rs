@@ -60,20 +60,49 @@ async fn create_cat_v2_from_headers_at(
     // in a handler timeout: before COMMIT_SENT it cancels safely, while after
     // COMMIT_SENT its registered non-cancellable owner must resolve the exact
     // durable result even if the deadline or client connection is gone.
+    match state.cat_create.replay(&ingress).await {
+        Ok(Some(result)) => return cat_create_http_response(result),
+        Ok(None) => {}
+        Err(error) => return cat_create_service_error_response(&state, error),
+    }
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(ingress.absolute_deadline()),
+        require_funded(&state, ingress.authenticated_workspace_id().as_str()),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Ok(closed_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TEMPORARILY_UNAVAILABLE_BODY,
+                true,
+            ));
+        }
+    }
     match state.cat_create.create(ingress).await {
         Ok(result) => cat_create_http_response(result),
-        Err(CatCreateServiceError::Request(error)) => Err(Failure(error)),
-        Err(CatCreateServiceError::PlacementUnavailable) => Ok(closed_response(
+        Err(error) => cat_create_service_error_response(&state, error),
+    }
+}
+
+fn cat_create_service_error_response(
+    state: &AppState,
+    error: CatCreateServiceError,
+) -> ApiResult<Response> {
+    match error {
+        CatCreateServiceError::Request(error) => Err(Failure(error)),
+        CatCreateServiceError::PlacementUnavailable => Ok(closed_response(
             StatusCode::SERVICE_UNAVAILABLE,
             PLACEMENT_UNAVAILABLE_BODY,
             true,
         )),
-        Err(CatCreateServiceError::TemporarilyUnavailable) => Ok(closed_response(
+        CatCreateServiceError::TemporarilyUnavailable => Ok(closed_response(
             StatusCode::SERVICE_UNAVAILABLE,
             TEMPORARILY_UNAVAILABLE_BODY,
             true,
         )),
-        Err(CatCreateServiceError::Fatal(error)) => {
+        CatCreateServiceError::Fatal(error) => {
             tracing::error!(error = %error, "Cat create encountered fatal stored/runtime corruption");
             state.readiness.poison();
             Ok(closed_response(
@@ -85,8 +114,8 @@ async fn create_cat_v2_from_headers_at(
     }
 }
 
-/// Authenticate and fund the public request before parsing any byte of its
-/// Cat-create payload, while retaining every byte the A17 fingerprint binds.
+/// Authenticate the public request before parsing any byte of its Cat-create
+/// payload, while retaining every byte the A17 fingerprint binds.
 async fn authorized_cat_create_ingress(
     state: &AppState,
     workspace: &str,
@@ -94,7 +123,6 @@ async fn authorized_cat_create_ingress(
     request: Request<Body>,
 ) -> ApiResult<AuthorizedCatCreateIngress> {
     let scope = check_workspace_auth(state, request.headers(), workspace).await?;
-    require_funded(state, &scope.workspace.id).await?;
 
     let authenticated_workspace_id =
         cats_api::runtime_reconciliation::Id::new(scope.workspace.id.clone())

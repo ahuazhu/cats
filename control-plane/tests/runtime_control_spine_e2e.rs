@@ -1111,3 +1111,129 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
     context.first.shutdown().await.unwrap();
     context.second.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cat_exact_replay_precedes_mutable_funding_admission() {
+    let context = Context::new().await;
+
+    let provision_body = encode_runtime_node_authority_apply(&provision_apply(&context)).unwrap();
+    let provisioned = context
+        .node_authority_request(&context.first, provision_body)
+        .send()
+        .await
+        .unwrap();
+    json_body(provisioned, StatusCode::OK).await;
+
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: id("node_cutover_a"),
+        immutable_host_id: id("host_cutover_a"),
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: random("22222222222222222222222222222222"),
+        registration_attempt_id: random("33333333333333333333333333333333"),
+        guest_config_digest: guest_config_digest(&context.release).unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let registered = context
+        .registration_request(
+            &context.first,
+            encode_agent_registration_attempt(&attempt).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let session = decode_agent_session(&json_body(registered, StatusCode::OK).await).unwrap();
+
+    let desired_read = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: session_binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let desired = context
+        .node_request(
+            &context.first,
+            DESIRED_READ_PATH,
+            encode_desired_read_request(&desired_read).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let snapshot = decode_desired_read_snapshot(&json_body(desired, StatusCode::OK).await).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let observed = context
+        .node_request(
+            &context.first,
+            OBSERVATION_PATH,
+            encode_node_observation(&full_observation(&session, snapshot.read_position)).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    json_body(observed, StatusCode::OK).await;
+
+    let schedulable = context
+        .node_authority_request(
+            &context.first,
+            encode_runtime_node_authority_apply(&schedulable_apply(&context)).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    json_body(schedulable, StatusCode::OK).await;
+
+    let mut billed_config = context.config.clone();
+    billed_config.billing_enforcement_enabled = true;
+    let billed = spawn_runtime_authority_with_billing_for_tests(billed_config)
+        .await
+        .unwrap();
+    let workspaces = context
+        .http
+        .get(format!("{}/v1/admin/workspaces", billed.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(workspaces.status(), StatusCode::OK);
+    let workspaces: ListResponse<cats_api::auth::Workspace> =
+        serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
+    let workspace_id = workspaces
+        .items
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("bootstrap account has one default Workspace")
+        .id;
+
+    let key = "cat-funding-change-replay";
+    let first = context
+        .cat_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    let first_body = json_body(first, StatusCode::ACCEPTED).await;
+    let reads_after_commit = context.image_blob.reads.load(Ordering::SeqCst);
+    context.credits.set_funded(false);
+
+    let replay = context
+        .cat_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_body(replay, StatusCode::ACCEPTED).await, first_body);
+    assert_eq!(
+        context.image_blob.reads.load(Ordering::SeqCst),
+        reads_after_commit,
+        "settled replay must not re-read the immutable manifest"
+    );
+
+    let fresh = context
+        .cat_create_request(&billed, &workspace_id, "unfunded-fresh-cat-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::PAYMENT_REQUIRED);
+
+    billed.shutdown().await.unwrap();
+    context.first.shutdown().await.unwrap();
+    context.second.shutdown().await.unwrap();
+}
