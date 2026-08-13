@@ -11,6 +11,9 @@ locals {
     "app.kubernetes.io/managed-by" = "terraform"
   }
 
+  effective_control_plane_replicas = var.maintenance_mode ? 0 : var.control_plane_replicas
+  effective_public_ingress         = var.enable_public_ingress && !var.maintenance_mode
+
   runtime_secret_data = merge(
     var.runtime_secret_data,
     {
@@ -103,7 +106,7 @@ resource "kubernetes_namespace_v1" "cats" {
   metadata {
     name = var.namespace
     labels = merge(local.labels, {
-      "cats.run/ingress" = "enabled"
+      "cats.run/ingress" = local.effective_public_ingress ? "enabled" : "disabled"
     })
   }
 }
@@ -186,7 +189,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
   }
 
   spec {
-    replicas = var.control_plane_replicas
+    replicas = local.effective_control_plane_replicas
 
     strategy {
       type = "RollingUpdate"
@@ -463,7 +466,7 @@ resource "kubernetes_pod_disruption_budget_v1" "control_plane" {
   }
 
   spec {
-    min_available = "1"
+    min_available = var.maintenance_mode ? "0" : "1"
 
     selector {
       match_labels = {
@@ -494,7 +497,7 @@ resource "kubernetes_service_v1" "control_plane" {
 }
 
 resource "kubernetes_manifest" "ingress_class_params" {
-  for_each = var.enable_public_ingress ? toset(["enabled"]) : toset([])
+  for_each = local.effective_public_ingress ? toset(["enabled"]) : toset([])
 
   manifest = {
     apiVersion = "eks.amazonaws.com/v1"
@@ -532,7 +535,7 @@ resource "kubernetes_manifest" "ingress_class_params" {
 }
 
 resource "kubernetes_ingress_class_v1" "public" {
-  count = var.enable_public_ingress ? 1 : 0
+  count = local.effective_public_ingress ? 1 : 0
 
   metadata {
     name   = var.ingress_class_name
@@ -553,7 +556,7 @@ resource "kubernetes_ingress_class_v1" "public" {
 }
 
 resource "kubernetes_ingress_v1" "public" {
-  count = var.enable_public_ingress ? 1 : 0
+  count = local.effective_public_ingress ? 1 : 0
 
   metadata {
     name      = "cats-public"
@@ -678,6 +681,7 @@ resource "kubernetes_cron_job_v1" "credential_refresher" {
 
   spec {
     schedule                      = var.credential_refresher_schedule
+    suspend                       = var.maintenance_mode
     concurrency_policy            = "Forbid"
     starting_deadline_seconds     = 300
     successful_jobs_history_limit = 3

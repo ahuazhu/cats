@@ -10,7 +10,7 @@ output "control_plane_service" {
 
 output "ingress_name" {
   description = "Public ingress name, or null when public ingress is disabled."
-  value       = var.enable_public_ingress ? kubernetes_ingress_v1.public[0].metadata[0].name : null
+  value       = local.effective_public_ingress ? kubernetes_ingress_v1.public[0].metadata[0].name : null
 }
 
 output "ingress_load_balancer_hostname" {

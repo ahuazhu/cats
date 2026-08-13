@@ -30,6 +30,12 @@ variable "control_plane_replicas" {
   }
 }
 
+variable "maintenance_mode" {
+  description = "Close public ingress and keep cats-controld at zero replicas during a reviewed destructive maintenance window."
+  type        = bool
+  default     = false
+}
+
 variable "runtime_secret_data" {
   description = "Additional cats-runtime environment variables, such as WorkOS credentials and Cats service tokens."
   type        = map(string)

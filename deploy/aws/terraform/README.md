@@ -224,6 +224,39 @@ Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
 control as production credentials.
 
+### First clean-slate maintenance/reset
+
+The production-application stack exposes `maintenance_mode`. A reviewed plan
+with it set to `true` removes public ingress/DNS and scales `cats-controld` to
+zero without creating kubectl drift. After the old writers are positively
+stopped or isolated, review a second plan that points the terminal release at
+disjoint fresh control/usage schemas, ChunkStore prefix or bucket, Kinesis
+stream, DynamoDB checkpoint table and immutable usage archive. Set
+`maintenance_mode = false` only in that reviewed fresh-target plan.
+
+The destructive reset is a post-green retirement, not a prerequisite for
+starting the fresh release. The separate fail-closed executor requires the
+fresh deployment to be fully available, the exact release qualification to be
+green and every old writer to remain stopped or isolated. Before
+`apply --execute` publishes its immutable start receipt, retirement may be
+cancelled and all old resources remain untouched. It never accepts `public` or
+another shared PostgreSQL schema as a deletion target; legacy data there stays
+retained for a later exact table-level retirement. The two-phase commands,
+fresh-target evidence schema, exact old-resource deletion and receipt contract
+are documented in
+[`production-clean-slate-reset.md`](../production-clean-slate-reset.md).
+Every S3 operation also binds `--expected-bucket-owner` to the same 12-digit
+account proven by STS; bucket name and region alone are not destructive
+authority.
+The post-green document is exact-reset-bound and has a 15-minute pre-start
+freshness window. Its old-writer strings only bind the separately retained,
+parseable E13 positive-stop/isolation manifest; they are not proof by
+themselves, and production execute remains Blocked until that manifest is
+independently verified. After `reset-started`, repeat the same reviewed
+`apply --execute` to forward-resume the immutable stage chain; another plan,
+evidence digest or target set fails closed.
+The executor never runs as part of Terraform apply or normal release CI.
+
 ### Route admission
 
 The retained V1 Terraform inputs use one Ed25519 key pair. They describe the

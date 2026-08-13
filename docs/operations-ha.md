@@ -277,38 +277,55 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    隔离metal Host验证同一artifact；没有合格Host时该上线门保持Blocked。
 2. 进入维护窗口，关闭公网 ingress 和 mutation。drain 可达 runtime；对不可达 Host 执行外部
    fence，并正向证明旧 Gateway、Controller、Node Agent、VMM 和 blockd 已停止或被隔离。
-3. 按批准的 destructive runbook 删除 Cat、Disk、Snapshot、Operation、旧API幂等状态、route/cache、Node runtime
-   state、产品 object prefixes 以及 Metadata/Control/Usage/Billing 数据。Terraform state、实验和
-   审计 evidence 继续受限保留，但不导入新系统。
-   产品object prefixes明确包括configured ChunkStore prefix下的`images/`；maintenance actor用独立权限删除，
-   不能借用Control Plane只读manifest IAM。步骤3必须生成记录exact bucket/prefix与删除边界的reset receipt，并在
-   credential rotation或任何target组件启动前对该prefix做authoritative empty verification。receipt缺失/不完整、
-   prefix不可读、仍非空或范围unknown都停止cutover；不得把旧schema缺表或步骤5的新空schema当成零引用proof。
-4. 在任何终态组件启动前，核对待部署artifact与步骤1的receipt完全一致，并证明其schema/IaC不含
+3. 在任何终态组件启动前，核对待部署artifact与步骤1的receipt完全一致，并证明其schema/IaC不含
    NodeJob、heartbeat overwrite、旧Route parser/mirror、旧IAM/Terraform inputs或transitional
-   writes；随后轮换service、per-Node、database、object-store与route-signing credentials。此步不
-   重建或修改artifact。
-5. 创建空目标 schema（含A23 Node/provisioner credential all-history lineage DDL），安装并验证
+   writes。创建与旧边界不重叠的fresh Control/Usage schema、ChunkStore bucket/prefix、Kinesis stream、
+   DynamoDB checkpoint table与Object-Locked usage archive；旧边界完整保留，不导入fresh系统。
+   随后为fresh边界轮换service、per-Node、database、object-store与route-signing credentials。此步不
+   重建或修改artifact，也不复用仍能授权旧writer的credential。
+4. 在fresh Control schema安装终态DDL（含A23 Node/provisioner credential all-history lineage），安装并验证
    A23 deployment provisioner Ed25519 revision-1/null-previous trust bundle，在打开admin listener前CAS持久
    revision receipt与active/retired tombstone，
    再启动同一个exact release
    的Control Plane；central IaC通过single signed node-authority route原子provision
    `NodeIdentity`/per-Node credential binding与revision-1 cordoned `NodePlacementPolicy`。不得direct SQL或
    使用Node/static admin bearer补row。
-6. Node 以所有 gate Closed 注册新 `AgentSession`，提交 complete empty inventory attestation 和
+5. Node 以所有 gate Closed 注册新 `AgentSession`，提交 complete empty inventory attestation 和
    key-ring ACK；随后启动 Gateway。
-7. 在 cordoned 状态运行第 6 节全部 qualification 和故障 oracle。全绿后才开放 ingress、
-   uncordon 并创建全新产品资源。
+6. 在cordoned且mutation Closed状态运行第6节全部qualification和故障oracle。fresh Kubernetes rollout
+   必须以至少两个fully available Control replica、matching Running/Ready Pods及唯一受Terraform管理的public
+   Ingress/IngressClass组成，但route/admission仍保持Closed，不能创建产品资源。全绿后生成绑定exact release、
+   fresh targets、唯一reset ID、qualification manifest与全部旧writer stopped-or-isolated证明的post-green evidence。
+   evidence在首次destructive start时必须不晚于当前时间且age不超过900秒；其中`old_writers`只是closed declaration，
+   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13尚未产出并被独立验证时生产execute保持Blocked。
+7. post-green后才执行旧namespace的exact destructive retirement。仓库内的
+   [`production-clean-slate-reset.py`](../deploy/aws/production-clean-slate-reset.py)是其中Control/Usage/ChunkStore
+   边界的两阶段执行器：reviewed `plan`与省略`--execute`的`apply`均只读；只有exact plan SHA、reset ID和
+   `--execute`同时存在才先发布immutable `reset-started` receipt，再删除明确命名的旧ChunkStore prefix、旧
+   Kinesis stream、旧DynamoDB checkpoint table及两个旧dedicated `cats_*` schema。旧immutable usage archive、
+   Terraform state、实验和审计evidence保留；`public`或任意shared PostgreSQL schema永不作为删除目标，旧schema-1
+   数据若仍在`public`则留待另一个closed table/dependency retirement。工具同时重验fresh namespace仍green且
+   old/fresh全部不重叠；STS caller account必须等于explicit 12-digit target account，且同一个值作为每次S3
+   read/list/delete/abort的expected bucket owner。不能把fresh空schema、旧schema缺表或retention等待当成零引用proof。完整合同见
+   [production clean-slate reset](../deploy/aws/production-clean-slate-reset.md)。其他旧Cat/Disk/Snapshot/Operation、
+   route/cache、Node runtime state和credential必须由各自批准的exact retirement继续处理，不能扩大本工具范围。
+   `reset-started`后若进程或effect响应丢失，只能以同一plan/reset/release/targets/evidence digest重进：逐stage验证
+   canonical receipt/SHA与predecessor链，对缺receipt的stage先做authoritative live discovery，只执行尚未完成的effect；
+   已absent的exact stream/table/schema与空prefix只结算receipt，complete replay零mutation。receipt gap/drift、live
+   postcondition矛盾或另一plan/evidence一律fail closed。
+8. 独立验证final reset receipt及所有剩余old-retirement evidence后，才开放route/mutation admission、uncordon并
+   创建全新产品资源。已retire credential、ID、SPKI、schema、prefix、stream或checkpoint name不得复用。
 
-步骤3前可以取消并恢复旧部署；步骤3后只允许forward-fix终态版本。目标schema/protocol version
-是启动前置事实，运行期只有这一套authority。
+在步骤7的`reset-started`发布前可以取消destructive retirement并完整保留旧namespace；若决定放弃fresh release，
+必须先停止其writer并走另一个reviewed rollback，任何时候都不能让old/fresh writer重叠。`reset-started`发布后只允许
+forward-fix同一终态版本。fresh目标schema/protocol version是启动前置事实，运行期只有这一套authority。
 
 后续同一终态协议内的普通 release 可以逐副本/逐空 Node 部署，但必须保持 schema 兼容范围、
 key overlap、Node drain 和不可变 artifact digest；provisioner key rotation必须以单调revision和exact previous-set
 CAS先所有replica overlap、再切signer、最后用下一revision移除old，已retire ID/SPKI跨release不得重用；
 stale/same-revision不同set的replica必须fail startup，不能按本地缺席隐式retire。该路径不能用于首次 cutover。
 
-步骤4–6还必须遵守
+步骤3–6还必须遵守
 [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)和
 [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)，policy/auth/planner另外遵守
 [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md)：provisioner安装并封闭验证唯一的
