@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
@@ -165,15 +164,11 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
             cats_api::runtime_reconciliation::ProcessState::Running => {
                 exact.assert_current(context)?;
                 context.check_active()?;
-                let Some(remaining) = context.deadline().checked_duration_since(Instant::now())
-                else {
-                    return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
-                };
                 // Any return after connecting to the VMM is an ambiguous
                 // external outcome.  A fresh full scan is the only oracle.
                 let _ = crate::ch::pause_bounded(
                     Path::new(exact.evidence().api_socket_path().as_str()),
-                    remaining,
+                    context,
                 );
                 Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
             }
@@ -447,7 +442,6 @@ impl LifecycleStepEffect {
         store
             .revalidate_current(&stored, &current)
             .context("revalidate lifecycle checkpoint after physical effect")?;
-        drop(current);
         if attempt == LifecyclePhysicalAttempt::ExactPostcondition {
             let successor = if matches!(
                 stored.checkpoint().step,
@@ -465,9 +459,14 @@ impl LifecycleStepEffect {
             if let Some(successor) = successor {
                 encode_runtime_checkpoint(&successor)
                     .context("validate settled lifecycle successor checkpoint")?;
-                store
-                    .replace(&stored, &successor)
-                    .context("settle exact lifecycle postcondition")?;
+                persist_lifecycle_successor(
+                    context,
+                    &store,
+                    &stored,
+                    &successor,
+                    &current,
+                    "settle exact lifecycle postcondition",
+                )?;
             }
         }
         Ok(Some(match attempt {
@@ -539,7 +538,17 @@ impl LifecycleStepEffect {
         );
         encode_runtime_checkpoint(&successor)
             .context("validate first lifecycle successor checkpoint")?;
-        persist_first_lifecycle_step(&store, &stored, &successor)?;
+        let current = store
+            .assert_current(&stored)
+            .context("retain first lifecycle predecessor for checkpoint CAS")?;
+        persist_lifecycle_successor(
+            context,
+            &store,
+            &stored,
+            &successor,
+            &current,
+            "persist first lifecycle step before physical effect",
+        )?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
 }
@@ -1231,14 +1240,26 @@ fn fully_drained_source_heads(
     Ok(heads)
 }
 
-fn persist_first_lifecycle_step(
+fn persist_lifecycle_successor(
+    context: &RuntimeDesiredEffectContext,
     store: &FileCheckpointStore,
     predecessor: &StoredCheckpoint,
     successor: &RuntimeCheckpoint,
+    current: &super::checkpoint::CurrentCheckpointGuard<'_>,
+    operation: &'static str,
 ) -> anyhow::Result<()> {
+    // The cancellation read permit and checkpoint writer/CAS guard stay live
+    // together through rename+directory fsync. A cancellation which wins
+    // before this point therefore observes the exact predecessor unchanged.
+    let _active = context
+        .linearization_permit()
+        .context("linearize lifecycle checkpoint publication with cancellation")?;
     store
-        .replace(predecessor, successor)
-        .context("persist first lifecycle step before physical effect")?;
+        .revalidate_current(predecessor, current)
+        .context("revalidate lifecycle predecessor before checkpoint CAS")?;
+    store
+        .replace_current(predecessor, successor, current)
+        .context(operation)?;
     Ok(())
 }
 
@@ -1793,8 +1814,22 @@ mod tests {
             let directory = TempDir::new().unwrap();
             let store = FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
             let stored = store.create(&predecessor).unwrap();
+            let context = RuntimeDesiredEffectContext::for_test(
+                crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let current = store.assert_current(&stored).unwrap();
             store.inject_crash_once(stage);
-            assert!(persist_first_lifecycle_step(&store, &stored, &successor).is_err());
+            assert!(persist_lifecycle_successor(
+                &context,
+                &store,
+                &stored,
+                &successor,
+                &current,
+                "test lifecycle checkpoint crash",
+            )
+            .is_err());
+            drop(current);
             drop(store);
 
             let reopened =
@@ -1807,5 +1842,35 @@ mod tests {
                 "wrong durable token boundary after {stage:?}"
             );
         }
+    }
+
+    #[test]
+    fn cancellation_before_lifecycle_checkpoint_cas_changes_nothing() {
+        let (_, predecessor, runtime) = fixtures(RuntimeTarget::Suspended);
+        let mut successor = predecessor.clone();
+        successor.stable_state = None;
+        successor.step = first_lifecycle_step(&fixtures(RuntimeTarget::Suspended).0, &runtime)
+            .unwrap()
+            .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store = FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
+        let stored = store.create(&predecessor).unwrap();
+        let context = RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let current = store.assert_current(&stored).unwrap();
+        context.cancel_for_test();
+        assert!(persist_lifecycle_successor(
+            &context,
+            &store,
+            &stored,
+            &successor,
+            &current,
+            "test cancelled lifecycle checkpoint",
+        )
+        .is_err());
+        drop(current);
+        assert_eq!(store.load().unwrap().unwrap().checkpoint(), &predecessor);
     }
 }

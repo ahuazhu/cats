@@ -835,6 +835,27 @@ pub(crate) struct NodeGlobalManagedProcessAdmission {
 }
 
 impl NodeGlobalManagedProcessScanAdmission {
+    /// Exact VMM facts from this shared process sweep which invalidate an old
+    /// Running/Open admission even if a later independent source makes the
+    /// overall inventory incomplete. `None` is exact absence because an
+    /// unavailable process inspection cannot construct this admission.
+    pub(crate) fn exact_running_negative_cats(&self) -> BTreeSet<Id> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::Vmm { expectation, exact }
+                    if exact.as_ref().is_none_or(|proof| {
+                        proof.evidence().state()
+                            != cats_api::runtime_reconciliation::ProcessState::Running
+                    }) =>
+                {
+                    Some(expectation.cat_id().clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn exact_process_count(&self, cat_id: &Id) -> usize {
         self.entries
             .iter()

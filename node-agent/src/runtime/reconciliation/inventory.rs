@@ -516,6 +516,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut node_global_process_admission = None;
         let mut node_global_network_admission = None;
         let mut kernel_nbd_pool_admission = None;
+        let mut exact_physical_negative_cats = BTreeSet::new();
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
             // authorities have completed. Read each prerequisite exactly
@@ -535,6 +536,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             if !aggregate.unavailable_sources.is_empty() {
                 return Ok(RuntimeInventoryScanOutcome::Incomplete {
                     unavailable_sources: aggregate.unavailable_sources,
+                    exact_physical_negative_cats,
                 });
             }
 
@@ -584,6 +586,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &context,
             )? {
                 RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                    exact_physical_negative_cats = admission.exact_running_negative_cats();
                     processes_by_cat = admission.process_projections();
                     serving_devices_by_cat = admission.vhost_device_projections();
                     serving_status_by_cat = admission.serving_status_projections();
@@ -656,6 +659,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         InventorySource::ControlSocket,
                         InventorySource::DataDirectory,
                     ],
+                    exact_physical_negative_cats,
                 });
             }
             for source in [
@@ -704,6 +708,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         if !aggregate.unavailable_sources.is_empty() {
             return Ok(RuntimeInventoryScanOutcome::Incomplete {
                 unavailable_sources: aggregate.unavailable_sources,
+                exact_physical_negative_cats,
             });
         }
 
@@ -3292,7 +3297,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
     }

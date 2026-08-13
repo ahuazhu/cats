@@ -7,7 +7,7 @@
 //! empty registry and every cell is initialized from a fail-closed snapshot;
 //! neither a stable checkpoint nor an Active route reconstructs admission.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -370,6 +370,21 @@ impl AdmissionCellRegistry {
         }
         // `ready_sessions` uses the observing poison path, which itself
         // closes and clears every reachable Ready slot before returning Err.
+    }
+
+    pub(crate) fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>) {
+        for cat_id in cat_ids {
+            match self.existing_session(cat_id) {
+                Ok(Some(session)) => session.close(),
+                Ok(None) => {}
+                Err(_) => {
+                    // The observing poison/Initializing paths cannot provide
+                    // a trustworthy subset. Close every reachable session.
+                    self.fail_close_all();
+                    return;
+                }
+            }
+        }
     }
 }
 

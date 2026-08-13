@@ -9894,7 +9894,10 @@ mod tests {
 
     struct ExactRunningNetworkBridge;
 
+    struct UnavailableRunningNetworkBridge;
+
     impl network_inventory_bridge_sealed::Sealed for ExactRunningNetworkBridge {}
+    impl network_inventory_bridge_sealed::Sealed for UnavailableRunningNetworkBridge {}
 
     impl NetworkInventoryBridge for ExactRunningNetworkBridge {
         fn inspect_all(
@@ -9913,6 +9916,16 @@ mod tests {
             Ok(NetworkInventoryBridgeOutcome::Complete(
                 NodeGlobalNetworkScanAdmission::exact_checkpoint_for_test(&checkpoint.checkpoint)?,
             ))
+        }
+    }
+
+    impl NetworkInventoryBridge for UnavailableRunningNetworkBridge {
+        fn inspect_all(
+            &self,
+            _checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<NetworkInventoryBridgeOutcome> {
+            Ok(NetworkInventoryBridgeOutcome::Unavailable)
         }
     }
 
@@ -11828,7 +11841,10 @@ mod tests {
         let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
         assert!(calls.lock().unwrap().is_empty());
@@ -11867,7 +11883,10 @@ mod tests {
         let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(assigned_context(true)).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
         assert_eq!(
@@ -12202,7 +12221,10 @@ mod tests {
             let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
             assert!(matches!(
                 scanner.scan_complete(assigned_context(true)).unwrap(),
-                RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+                RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    ..
+                }
                     if unavailable_sources == [InventorySource::MetadataStore]
             ));
             assert_eq!(calls.lock().unwrap().len(), 1, "{behavior:?}");
@@ -14495,6 +14517,32 @@ mod tests {
             paused_tail.route_retirement_mode_for_test(&desired.cat_id),
             Some(super::super::RouteRetirementMode::GlobalPhysicalNegative)
         );
+
+        let hybrid_scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(Arc::new(ExactRunningProcessBridge {
+                state_directory: state_directory.clone(),
+                systemd: test_root_provision_systemd(&environment.blockd_binary),
+                executable_path: HostPath::new(
+                    environment.blockd_binary.to_string_lossy().into_owned(),
+                )
+                .unwrap(),
+                exact_vmm_state: Some(ProcessState::Paused),
+            }))
+            .with_network_bridge(Arc::new(UnavailableRunningNetworkBridge));
+        let RuntimeInventoryScanOutcome::Incomplete {
+            unavailable_sources,
+            exact_physical_negative_cats,
+        } = hybrid_scanner
+            .scan_complete(fixture.scan_context.clone())
+            .unwrap()
+        else {
+            panic!("a later unavailable source must retain the earlier exact Paused negative")
+        };
+        assert!(unavailable_sources.contains(&InventorySource::Network));
+        assert_eq!(
+            exact_physical_negative_cats,
+            BTreeSet::from([desired.cat_id.clone()])
+        );
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
             observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
@@ -16519,7 +16567,10 @@ mod tests {
 
         assert!(matches!(
             scanner.scan_complete(fixture.scan_context).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources.contains(&InventorySource::DataDirectory)
         ));
         for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {

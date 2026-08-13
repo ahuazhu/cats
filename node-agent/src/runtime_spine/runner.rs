@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -92,6 +92,7 @@ pub(crate) trait RuntimePreScanAdmission: Send + Sync + 'static {
         &self,
         context: RuntimePreScanAdmissionContext,
     ) -> anyhow::Result<RuntimePreScanAdmissionOutcome>;
+    fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>);
     fn fail_close_all(&self);
 }
 
@@ -113,6 +114,11 @@ impl RuntimePreScanAdmissionOutcome {
 
     fn retains(&self, cat_id: &Id) -> bool {
         self.retained_running_cats.contains(cat_id)
+    }
+
+    fn exclude(&mut self, cat_ids: &BTreeSet<Id>) {
+        self.retained_running_cats
+            .retain(|cat_id| !cat_ids.contains(cat_id));
     }
 }
 
@@ -699,6 +705,17 @@ impl RuntimeDesiredEffectContext {
         Ok(())
     }
 
+    pub(crate) fn linearization_permit(
+        &self,
+    ) -> anyhow::Result<RuntimeDesiredEffectLinearizationPermit<'_>> {
+        let permit = self.cancellation.linearization_permit()?;
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "runtime Desired effect deadline expired"
+        );
+        Ok(permit)
+    }
+
     pub fn accepted_full(&self) -> anyhow::Result<&RuntimeDesiredEffectAdmission> {
         self.accepted_full.as_ref().ok_or_else(|| {
             anyhow::anyhow!("runtime Desired effect lacks current-process full admission")
@@ -926,22 +943,57 @@ impl RuntimePhysicalReadContext for RuntimeInventoryScanContext {
 
 #[derive(Debug, Clone)]
 struct RuntimeInventoryScanCancellation {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<RuntimeCancellationState>,
+}
+
+#[derive(Debug)]
+struct RuntimeCancellationState {
+    cancelled: AtomicBool,
+    linearization: RwLock<()>,
+}
+
+/// Read-side permit which orders one final durable CAS against cancellation.
+/// Cancellation takes the write side before publishing its state, so either
+/// it wins and no checkpoint changes, or the already-admitted CAS completes
+/// before cancellation becomes observable.
+pub(crate) struct RuntimeDesiredEffectLinearizationPermit<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
 }
 
 impl RuntimeInventoryScanCancellation {
     fn new() -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(RuntimeCancellationState {
+                cancelled: AtomicBool::new(false),
+                linearization: RwLock::new(()),
+            }),
         }
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let _linearization = self
+            .state
+            .linearization
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state.cancelled.store(true, Ordering::Release);
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    fn linearization_permit(&self) -> anyhow::Result<RuntimeDesiredEffectLinearizationPermit<'_>> {
+        let guard = self
+            .state
+            .linearization
+            .read()
+            .map_err(|_| anyhow::anyhow!("runtime cancellation linearization was poisoned"))?;
+        anyhow::ensure!(
+            !self.state.cancelled.load(Ordering::Acquire),
+            "runtime Desired effect was cancelled"
+        );
+        Ok(RuntimeDesiredEffectLinearizationPermit { _guard: guard })
     }
 }
 
@@ -1151,6 +1203,10 @@ pub enum RuntimeInventoryScanOutcome {
     Complete(CompleteRuntimeInventory),
     Incomplete {
         unavailable_sources: Vec<InventorySource>,
+        /// Per-Cat physical negatives completed before a later source became
+        /// unavailable. These facts may only close retained Running authority;
+        /// they never manufacture a partial runtime projection themselves.
+        exact_physical_negative_cats: BTreeSet<Id>,
     },
 }
 
@@ -1844,6 +1900,12 @@ impl CoordinatorLane {
     fn fail_close_all_admission(&self) {
         if let Some(admission) = &self.pre_scan_admission {
             admission.fail_close_all();
+        }
+    }
+
+    fn fail_close_admission_cats(&self, cat_ids: &BTreeSet<Id>) {
+        if let Some(admission) = &self.pre_scan_admission {
+            admission.fail_close_cats(cat_ids);
         }
     }
 
@@ -2798,6 +2860,7 @@ impl RuntimeSpineRunner {
                     RuntimeInventoryScanOutcome::Complete(inventory) => inventory,
                     RuntimeInventoryScanOutcome::Incomplete {
                         unavailable_sources,
+                        exact_physical_negative_cats,
                     } => {
                         if unavailable_sources.is_empty() {
                             if let Some(coordinator_lane) = &self.coordinator_lane {
@@ -2807,6 +2870,12 @@ impl RuntimeSpineRunner {
                                 "an incomplete scan has no unavailable source",
                             ));
                         }
+                        apply_incomplete_physical_negatives(
+                            &coordinates,
+                            self.coordinator_lane.as_ref(),
+                            &mut retained_admission,
+                            &exact_physical_negative_cats,
+                        )?;
                         return self
                             .publish_degraded_partial(
                                 coordinates,
@@ -3486,6 +3555,40 @@ fn current_unix_millis() -> Result<UnixMillis, RuntimeSpineRunError> {
     ))
 }
 
+fn apply_incomplete_physical_negatives(
+    coordinates: &RuntimeSpineFullScan,
+    coordinator_lane: Option<&CoordinatorLane>,
+    retained_admission: &mut RuntimePreScanAdmissionOutcome,
+    exact_physical_negative_cats: &BTreeSet<Id>,
+) -> Result<(), RuntimeSpineRunError> {
+    let assigned = coordinates
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| &desired.cat_id)
+        .collect::<BTreeSet<_>>();
+    if exact_physical_negative_cats
+        .iter()
+        .any(|cat_id| !assigned.contains(cat_id))
+    {
+        if let Some(coordinator_lane) = coordinator_lane {
+            coordinator_lane.fail_close_all_admission();
+        }
+        return Err(RuntimeSpineRunError::InvalidScan(
+            "an incomplete scan named a physical-negative Cat outside Desired",
+        ));
+    }
+    if !exact_physical_negative_cats.is_empty() {
+        // Close the live cell before allowing the journal lane to clone any
+        // old full Runtime into a partial heartbeat.
+        if let Some(coordinator_lane) = coordinator_lane {
+            coordinator_lane.fail_close_admission_cats(exact_physical_negative_cats);
+        }
+        retained_admission.exclude(exact_physical_negative_cats);
+    }
+    Ok(())
+}
+
 fn build_degraded_partial_observation(
     scan: RuntimeSpineFullScan,
     full: Option<&NodeObservation>,
@@ -3856,6 +3959,7 @@ mod tests {
             context.check_active()?;
             Ok(RuntimeInventoryScanOutcome::Incomplete {
                 unavailable_sources: vec![InventorySource::Process],
+                exact_physical_negative_cats: BTreeSet::new(),
             })
         }
     }
@@ -3872,6 +3976,7 @@ mod tests {
             if call < 2 {
                 return Ok(RuntimeInventoryScanOutcome::Incomplete {
                     unavailable_sources: vec![InventorySource::Process],
+                    exact_physical_negative_cats: BTreeSet::new(),
                 });
             }
             let desired = context
@@ -3936,6 +4041,7 @@ mod tests {
         ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
             Ok(RuntimeInventoryScanOutcome::Incomplete {
                 unavailable_sources: Vec::new(),
+                exact_physical_negative_cats: BTreeSet::new(),
             })
         }
     }
@@ -4159,6 +4265,10 @@ mod tests {
         fn fail_close_all(&self) {
             self.fail_closes.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn fail_close_cats(&self, _cat_ids: &BTreeSet<Id>) {
+            self.fail_closes.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl RuntimePreScanAdmission for OrderedPreScanAdmission {
@@ -4174,6 +4284,10 @@ mod tests {
         }
 
         fn fail_close_all(&self) {
+            self.cell_open.store(false, Ordering::SeqCst);
+        }
+
+        fn fail_close_cats(&self, _cat_ids: &BTreeSet<Id>) {
             self.cell_open.store(false, Ordering::SeqCst);
         }
     }
@@ -5808,6 +5922,62 @@ mod tests {
 
         runner.shutdown().await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn hybrid_incomplete_closes_exact_negative_before_partial_projection() {
+        let desired = desired_with_network();
+        let mut snapshot = decode_desired_read_snapshot(SNAPSHOT).unwrap();
+        snapshot.desired_specs = vec![desired.clone()];
+        let coordinates = RuntimeSpineFullScan {
+            session: snapshot.session.clone(),
+            heartbeat_sequence: Sequence::new(2).unwrap(),
+            inventory_epoch: Epoch::new(1).unwrap(),
+            desired: snapshot,
+        };
+        let full = build_full_observation(
+            coordinates.clone(),
+            CompleteRuntimeInventory::for_test(
+                UnixMillis::new(1_720_000_004_000).unwrap(),
+                RuntimeInventoryKeyRing::Unavailable,
+                vec![ready_running_runtime(&desired)],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            full.runtimes[0].lifecycle_admission,
+            LifecycleAdmission::Open
+        );
+        assert!(full.runtimes[0]
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition, Condition::Ready { .. })));
+
+        let admission = Arc::new(TestPreScanAdmission {
+            calls: AtomicUsize::new(0),
+            fail_closes: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let admission_port: Arc<dyn RuntimePreScanAdmission> = admission.clone();
+        let mut lane = CoordinatorLane::start(Some(admission_port), None, None).unwrap();
+        let negatives = BTreeSet::from([desired.cat_id.clone()]);
+        let mut retained =
+            RuntimePreScanAdmissionOutcome::retained_running_cats([desired.cat_id.clone()]);
+        apply_incomplete_physical_negatives(&coordinates, Some(&lane), &mut retained, &negatives)
+            .unwrap();
+        assert_eq!(admission.fail_closes.load(Ordering::SeqCst), 1);
+        assert!(!retained.retains(&desired.cat_id));
+        assert!(build_degraded_partial_observation(
+            coordinates,
+            Some(&full),
+            Some(&full),
+            DegradedObservationCause::SourceUnavailable(vec![InventorySource::Network]),
+            &retained,
+            UnixMillis::new(1_720_000_005_000).unwrap(),
+        )
+        .is_none());
+        lane.shutdown_blocking().unwrap();
     }
 
     #[tokio::test]

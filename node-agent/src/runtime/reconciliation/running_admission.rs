@@ -7,7 +7,7 @@
 //! the only constructor for that token; the Desired effect must still repeat
 //! the complete physical proof immediately before its local gate mutation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1147,6 +1147,10 @@ impl RuntimePreScanAdmission for RunningAdmissionPreScan {
             self.registry.fail_close_all();
         }
         result
+    }
+
+    fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>) {
+        self.registry.fail_close_cats(cat_ids);
     }
 
     fn fail_close_all(&self) {
