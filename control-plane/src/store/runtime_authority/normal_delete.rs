@@ -237,11 +237,15 @@ fn lock_and_revalidate_desired_set(
     disk_id: &Id,
     volume_id: &Id,
 ) -> AuthorityTxResult<()> {
-    let expected: BTreeMap<&Id, _> = admissions
+    let mut expected = BTreeMap::new();
+    for desired in admissions
         .iter()
         .flat_map(|admission| admission.assigned_desired_specs.iter())
-        .map(|desired| (&desired.cat_id, desired))
-        .collect();
+    {
+        if expected.insert(&desired.cat_id, desired).is_some() {
+            return Err(AuthorityError::BackendUnknown.into());
+        }
+    }
     let rows = transaction.query(
         "SELECT cat_id FROM desired_runtime_specs ORDER BY cat_id COLLATE \"C\" FOR UPDATE",
         &[],
@@ -254,7 +258,10 @@ fn lock_and_revalidate_desired_set(
             Id::new(row.try_get::<_, String>("cat_id")?).ok_or(AuthorityError::BackendUnknown)?;
         let current =
             load_desired_for_update(transaction, &cat_id)?.ok_or(AuthorityError::BackendUnknown)?;
-        if &current != expected[&cat_id]
+        let Some(expected_current) = expected.get(&cat_id) else {
+            return Err(AuthorityError::AdminBusy.into());
+        };
+        if &current != *expected_current
             || current
                 .volumes
                 .iter()

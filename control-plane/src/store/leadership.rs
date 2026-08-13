@@ -8,6 +8,7 @@ pub enum SingletonRole {
     Reconciler,
     BillingEnforcer,
     UsageProjector,
+    VolumeDeleteSweeper,
 }
 
 impl SingletonRole {
@@ -16,6 +17,7 @@ impl SingletonRole {
             Self::Reconciler => 420_201,
             Self::BillingEnforcer => 420_202,
             Self::UsageProjector => 420_203,
+            Self::VolumeDeleteSweeper => 420_204,
         }
     }
 
@@ -24,6 +26,7 @@ impl SingletonRole {
             Self::Reconciler => "reconciler",
             Self::BillingEnforcer => "billing-enforcer",
             Self::UsageProjector => "usage-projector",
+            Self::VolumeDeleteSweeper => "volume-delete-sweeper",
         }
     }
 }

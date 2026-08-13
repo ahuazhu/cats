@@ -641,6 +641,36 @@ pub(super) fn load_disk_by_id_for_update(
         .transpose()
 }
 
+pub(super) fn load_disk_by_volume_unlocked(
+    transaction: &mut Transaction<'_>,
+    volume_id: &cats_api::runtime_reconciliation::Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE volume_id=$1 OR record->>'volume_id'=$1
+          ORDER BY disk_id COLLATE \"C\" LIMIT 2"
+    );
+    decode_at_most_one_disk(transaction.query(&sql, &[&volume_id.as_str()])?)
+}
+
+pub(super) fn delete_disk(
+    transaction: &mut Transaction<'_>,
+    record: &DiskRecord,
+) -> AuthorityTxResult<()> {
+    let projection = DiskProjection::from_record(record)?;
+    let changed = transaction.execute(
+        "DELETE FROM disk_records
+          WHERE disk_id=$1 AND volume_id=$2 AND admin_state='deleting'
+            AND delete_id=$3",
+        &[
+            &projection.disk_id,
+            &projection.volume_id,
+            &projection.delete_id,
+        ],
+    )?;
+    exactly_one(changed)
+}
+
 pub(super) fn update_disk(
     transaction: &mut Transaction<'_>,
     record: &DiskRecord,

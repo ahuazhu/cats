@@ -406,8 +406,9 @@ pub struct Config {
     /// composition. This field does not exist in release builds.
     #[cfg(debug_assertions)]
     pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
-    /// Read-only access to the immutable golden-image namespace. The A21
-    /// resolver applies its own exact key, byte cap and concurrency boundary.
+    /// Control-owned object-store boundary. A21 reads exact immutable
+    /// golden-image keys; the delete sweeper removes only an authority-proved
+    /// exact `volumes/<volume_id>/` prefix.
     pub image_blob: Arc<dyn BlobStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
@@ -555,6 +556,7 @@ pub struct Handle {
     server_task: tokio::task::JoinHandle<()>,
     reconciler_task: Option<tokio::task::JoinHandle<()>>,
     billing_enforcer_task: Option<tokio::task::JoinHandle<()>>,
+    volume_delete_sweeper_task: Option<tokio::task::JoinHandle<()>>,
     image_manifest_resolver: Arc<
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
     >,
@@ -608,6 +610,9 @@ impl Handle {
             task.abort();
         }
         if let Some(task) = &self.billing_enforcer_task {
+            task.abort();
+        }
+        if let Some(task) = &self.volume_delete_sweeper_task {
             task.abort();
         }
     }
@@ -1198,7 +1203,52 @@ async fn spawn_inner(
                 }
             },
         )
-    });
+        });
+    let delete_sweeper = Arc::new(
+        crate::store::runtime_authority::delete_sweeper::DeleteSweeper::new(
+            state.store.clone(),
+            cfg.image_blob.clone(),
+        ),
+    );
+    let volume_delete_sweeper_task = Some(spawn_singleton_task(
+        state.store.clone(),
+        SingletonRole::VolumeDeleteSweeper,
+        move || {
+            let delete_sweeper = Arc::clone(&delete_sweeper);
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    let budget =
+                        crate::store::runtime_authority::delete_sweeper::DeleteSweepBudget::new(
+                            32,
+                            cats_storage::BLOB_LIST_PAGE_MAX_KEYS,
+                        )
+                        .expect("fixed production delete sweep budget is valid");
+                    match delete_sweeper.run_once(budget, deadline).await {
+                        Ok(pass) => {
+                            if pass.candidates_examined > 0 {
+                                tracing::info!(
+                                    candidates = pass.candidates_examined,
+                                    objects_deleted = pass.objects_deleted,
+                                    completions = pass.completions_committed,
+                                    blocked_missing_provider_evidence =
+                                        pass.blocked_missing_provider_evidence,
+                                    more_work = pass.more_work,
+                                    "volume delete sweep pass completed"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "volume delete sweep pass failed");
+                        }
+                    }
+                }
+            }
+        },
+    ));
 
     let gateway_machine_addr = gateway_machine_listener
         .as_ref()
@@ -1211,6 +1261,7 @@ async fn spawn_inner(
         server_task,
         reconciler_task,
         billing_enforcer_task,
+        volume_delete_sweeper_task,
         image_manifest_resolver: image_manifests,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
         gateway_machine_listener,

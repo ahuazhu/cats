@@ -996,7 +996,7 @@ impl BlobStore for AwsS3BlobStore {
         };
         let query = vec![
             ("list-type".to_string(), "2".to_string()),
-            ("prefix".to_string(), full_prefix),
+            ("prefix".to_string(), full_prefix.clone()),
             ("max-keys".to_string(), maximum.to_string()),
         ];
         let path = format!("/{}", uri_encode(&self.cfg.bucket, false));
@@ -1031,6 +1031,31 @@ impl BlobStore for AwsS3BlobStore {
             key: prefix.to_string(),
             message: format!("LIST response is not UTF-8: {error}"),
         })?;
+        if !xml.contains("<ListBucketResult") || !xml.contains("</ListBucketResult>") {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response is missing its root element".into(),
+            });
+        }
+        let response_prefix = unique_tag(xml, "Prefix", prefix)?;
+        if xml_unescape(&response_prefix) != full_prefix {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response prefix differs from the request".into(),
+            });
+        }
+        let response_maximum = unique_tag(xml, "MaxKeys", prefix)?
+            .parse::<usize>()
+            .map_err(|error| BlobError::Backend {
+                key: prefix.to_string(),
+                message: format!("LIST response has invalid MaxKeys: {error}"),
+            })?;
+        if response_maximum != maximum {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response MaxKeys differs from the request".into(),
+            });
+        }
         let truncated_values = extract_tags(xml, "IsTruncated");
         let is_truncated = match truncated_values.as_slice() {
             [value] if value == "true" => true,
@@ -1049,6 +1074,18 @@ impl BlobStore for AwsS3BlobStore {
                 key.strip_prefix(&strip).unwrap_or(&key).to_string()
             })
             .collect::<Vec<_>>();
+        let key_count = unique_tag(xml, "KeyCount", prefix)?
+            .parse::<usize>()
+            .map_err(|error| BlobError::Backend {
+                key: prefix.to_string(),
+                message: format!("LIST response has invalid KeyCount: {error}"),
+            })?;
+        if key_count != keys.len() {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response KeyCount differs from decoded keys".into(),
+            });
+        }
         if keys.len() > maximum {
             return Err(BlobError::Backend {
                 key: prefix.to_string(),
@@ -1060,6 +1097,15 @@ impl BlobStore for AwsS3BlobStore {
             return Err(BlobError::Backend {
                 key: prefix.to_string(),
                 message: "LIST response repeated an object key".into(),
+            });
+        }
+        let continuation_tokens = extract_tags(xml, "NextContinuationToken");
+        if (is_truncated && !matches!(continuation_tokens.as_slice(), [token] if !token.is_empty()))
+            || (!is_truncated && !continuation_tokens.is_empty())
+        {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response continuation-token shape is invalid".into(),
             });
         }
         validate_list_result(prefix, &keys)?;
@@ -1197,6 +1243,23 @@ fn extract_tags(xml: &str, tag: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn unique_tag(xml: &str, tag: &str, key: &str) -> Result<String> {
+    let mut values = extract_tags(xml, tag).into_iter();
+    let Some(value) = values.next() else {
+        return Err(BlobError::Backend {
+            key: key.to_string(),
+            message: format!("LIST response has no unique {tag} value"),
+        });
+    };
+    if values.next().is_some() {
+        return Err(BlobError::Backend {
+            key: key.to_string(),
+            message: format!("LIST response has no unique {tag} value"),
+        });
+    }
+    Ok(value)
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -1555,7 +1618,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             request_tx.send(read_request(&mut stream)).unwrap();
-            let body = b"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>env/volumes/vol_a/data/a</Key></Contents><Contents><Key>env/volumes/vol_a/maps/b</Key></Contents><NextContinuationToken>opaque</NextContinuationToken></ListBucketResult>";
+            let body = b"<ListBucketResult><Prefix>env/volumes/vol_a/</Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>env/volumes/vol_a/data/a</Key></Contents><Contents><Key>env/volumes/vol_a/maps/b</Key></Contents><NextContinuationToken>opaque</NextContinuationToken></ListBucketResult>";
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1592,7 +1655,7 @@ mod tests {
     #[test]
     fn bounded_list_fails_closed_on_a_key_outside_the_requested_prefix() {
         let (store, server) = local_store(|mut stream| {
-            let body = b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>volumes/vol_ab/data/not-a</Key></Contents></ListBucketResult>";
+            let body = b"<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>1</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>volumes/vol_ab/data/not-a</Key></Contents></ListBucketResult>";
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

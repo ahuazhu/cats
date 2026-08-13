@@ -928,6 +928,29 @@ pub(super) fn load_authorization_for_update(
         .transpose()
 }
 
+pub(super) fn delete_volume(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+) -> AuthorityTxResult<()> {
+    let projection = project_volume_record(record)?;
+    let changed = transaction.execute(
+        "DELETE FROM volume_records
+          WHERE volume_id=$1 AND admin_state='deleting' AND delete_id=$2
+            AND lease_epoch=$3 AND head_generation=$4
+            AND head_root_hash IS NOT DISTINCT FROM $5
+            AND head_root_object_id IS NOT DISTINCT FROM $6",
+        &[
+            &projection.volume_id,
+            &projection.delete_id,
+            &projection.lease_epoch.to_pg().map_err(corrupt)?,
+            &projection.head_generation.to_pg().map_err(corrupt)?,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+        ],
+    )?;
+    exactly_one(changed)
+}
+
 /// Loads the primary evidence row through the one non-enumerating access
 /// predicate. A missing id and an id owned by another Node are intentionally
 /// indistinguishable, and neither path decodes the protected JSON payload.
@@ -1332,9 +1355,6 @@ pub(super) fn load_root_delete_completion_candidates(
         .collect()
 }
 
-// The A12 sweeper is out of scope; F1 owns only this exact row codec and
-// transaction-local idempotent persistence primitive.
-#[allow(dead_code)]
 pub(super) fn insert_delete_completion(
     transaction: &mut Transaction<'_>,
     receipt: &DeleteCompletionReceipt,

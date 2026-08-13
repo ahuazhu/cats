@@ -70,6 +70,12 @@ fn checked_page(
             message: "bounded LIST exceeded its requested key count".into(),
         });
     }
+    if page.keys.is_empty() && page.is_truncated {
+        return Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "bounded LIST claimed an empty truncated page".into(),
+        });
+    }
     validate_list_result(prefix, &page.keys)?;
     Ok(page)
 }
