@@ -14,6 +14,7 @@ use std::time::Duration;
 use cats_api::route_grant_v2::RouteAdmissionV2Reason;
 use cats_api::runtime_reconciliation::Hostname;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -194,36 +195,37 @@ impl GatewayIngress {
 }
 
 async fn handle_connection(
-    mut public: TcpStream,
+    public: TcpStream,
     cache: RouteCache,
     connector: TunnelConnector,
     config: GatewayIngressConfig,
 ) {
+    let (mut public_reader, mut public_writer) = public.into_split();
     let mut pending = Vec::new();
     let mut served_request = false;
     loop {
-        let header_end = match read_request_head(&mut public, &mut pending, config).await {
+        let header_end = match read_request_head(&mut public_reader, &mut pending, config).await {
             Ok(header_end) => header_end,
             Err(ReadRequestHeadError::CleanClose) if served_request => return,
             Err(_) => {
-                write_public_error(&mut public, PublicError::BadRequest).await;
+                write_public_error(&mut public_writer, PublicError::BadRequest).await;
                 return;
             }
         };
         let parsed = match parse_request_head(&pending[..header_end], header_end) {
             Some(parsed) => parsed,
             None => {
-                write_public_error(&mut public, PublicError::BadRequest).await;
+                write_public_error(&mut public_writer, PublicError::BadRequest).await;
                 return;
             }
         };
         match parsed.local_health {
             LocalHealthDisposition::RespondOk => {
-                write_local_health(&mut public).await;
+                write_local_health(&mut public_writer).await;
                 return;
             }
             LocalHealthDisposition::Reject => {
-                write_public_error(&mut public, PublicError::BadRequest).await;
+                write_public_error(&mut public_writer, PublicError::BadRequest).await;
                 return;
             }
             LocalHealthDisposition::NotHealth => {}
@@ -231,15 +233,15 @@ async fn handle_connection(
         let route = match cache.lookup(parsed.hostname.as_str()).await {
             Ok(CacheLookup::Positive(route)) => route,
             Ok(CacheLookup::Negative(NegativeRoute::NotFound)) => {
-                write_public_error(&mut public, PublicError::NotFound).await;
+                write_public_error(&mut public_writer, PublicError::NotFound).await;
                 return;
             }
             Ok(CacheLookup::Negative(NegativeRoute::Gone)) => {
-                write_public_error(&mut public, PublicError::Gone).await;
+                write_public_error(&mut public_writer, PublicError::Gone).await;
                 return;
             }
             Err(_) => {
-                write_public_error(&mut public, PublicError::Unavailable).await;
+                write_public_error(&mut public_writer, PublicError::Unavailable).await;
                 return;
             }
         };
@@ -266,21 +268,25 @@ async fn handle_connection(
                 } else {
                     PublicError::Unavailable
                 };
-                write_public_error(&mut public, response).await;
+                write_public_error(&mut public_writer, response).await;
                 return;
             }
             Err(_) => {
-                write_public_error(&mut public, PublicError::BadGateway).await;
+                write_public_error(&mut public_writer, PublicError::BadGateway).await;
                 return;
             }
         };
 
         if parsed.request_kind == RequestKind::WebSocketUpgrade {
-            if tunnel.write_all(&pending).await.is_err() {
-                return;
-            }
-            pending.clear();
-            let _ = tokio::io::copy_bidirectional(&mut public, &mut tunnel).await;
+            proxy_websocket(
+                public_reader,
+                public_writer,
+                tunnel,
+                pending,
+                header_end,
+                config,
+            )
+            .await;
             return;
         }
 
@@ -290,15 +296,20 @@ async fn handle_connection(
         pending.drain(..header_end);
         match parsed.body_framing {
             BodyFraming::Fixed(content_length) => {
-                if forward_fixed_body(&mut public, &mut tunnel, &mut pending, content_length)
-                    .await
-                    .is_err()
+                if forward_fixed_body(
+                    &mut public_reader,
+                    &mut tunnel,
+                    &mut pending,
+                    content_length,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
             }
             BodyFraming::Chunked => {
-                if forward_chunked_body(&mut public, &mut tunnel, &mut pending, config)
+                if forward_chunked_body(&mut public_reader, &mut tunnel, &mut pending, config)
                     .await
                     .is_err()
                 {
@@ -309,13 +320,21 @@ async fn handle_connection(
         if tunnel.shutdown().await.is_err() {
             return;
         }
-        if tokio::io::copy(&mut tunnel, &mut public).await.is_err() {
-            return;
-        }
-        served_request = true;
-        if parsed.connection_close {
-            let _ = public.shutdown().await;
-            return;
+        match proxy_http_response(
+            &mut public_reader,
+            &mut public_writer,
+            &mut tunnel,
+            &mut pending,
+            &parsed,
+            config,
+        )
+        .await
+        {
+            ResponseDisposition::ReusePublic => served_request = true,
+            ResponseDisposition::ClosePublic => {
+                let _ = public_writer.shutdown().await;
+                return;
+            }
         }
     }
 }
@@ -327,7 +346,7 @@ enum ReadRequestHeadError {
 }
 
 async fn read_request_head(
-    stream: &mut TcpStream,
+    stream: &mut OwnedReadHalf,
     pending: &mut Vec<u8>,
     config: GatewayIngressConfig,
 ) -> Result<usize, ReadRequestHeadError> {
@@ -380,6 +399,7 @@ struct ParsedInitialRequest {
     request_kind: RequestKind,
     body_framing: BodyFraming,
     connection_close: bool,
+    response_body_forbidden: bool,
     local_health: LocalHealthDisposition,
 }
 
@@ -510,12 +530,13 @@ fn parse_request_head(bytes: &[u8], header_end: usize) -> Option<ParsedInitialRe
         request_kind,
         body_framing,
         connection_close,
+        response_body_forbidden: method == "HEAD",
         local_health,
     })
 }
 
 async fn forward_fixed_body(
-    public: &mut TcpStream,
+    public: &mut OwnedReadHalf,
     tunnel: &mut BoxedGatewayTunnel,
     pending: &mut Vec<u8>,
     content_length: usize,
@@ -538,7 +559,7 @@ async fn forward_fixed_body(
 }
 
 async fn forward_chunked_body(
-    public: &mut TcpStream,
+    public: &mut OwnedReadHalf,
     tunnel: &mut BoxedGatewayTunnel,
     pending: &mut Vec<u8>,
     config: GatewayIngressConfig,
@@ -581,7 +602,7 @@ async fn forward_chunked_body(
 }
 
 async fn forward_exact_bytes(
-    public: &mut TcpStream,
+    public: &mut OwnedReadHalf,
     tunnel: &mut BoxedGatewayTunnel,
     pending: &mut Vec<u8>,
     length: u64,
@@ -607,7 +628,7 @@ async fn forward_exact_bytes(
 }
 
 async fn take_crlf_line(
-    public: &mut TcpStream,
+    public: &mut OwnedReadHalf,
     pending: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ()> {
@@ -627,7 +648,7 @@ async fn take_crlf_line(
 }
 
 async fn ensure_pending(
-    public: &mut TcpStream,
+    public: &mut OwnedReadHalf,
     pending: &mut Vec<u8>,
     required: usize,
 ) -> Result<(), ()> {
@@ -637,7 +658,7 @@ async fn ensure_pending(
     Ok(())
 }
 
-async fn read_more(public: &mut TcpStream, pending: &mut Vec<u8>) -> Result<(), ()> {
+async fn read_more(public: &mut OwnedReadHalf, pending: &mut Vec<u8>) -> Result<(), ()> {
     let mut chunk = [0_u8; 4 * 1024];
     let read = public.read(&mut chunk).await.map_err(|_| ())?;
     if read == 0 {
@@ -690,6 +711,637 @@ fn forbidden_trailer_name(name: &[u8]) -> bool {
     ]
     .iter()
     .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseDisposition {
+    ReusePublic,
+    ClosePublic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseBodyFraming {
+    Fixed(usize),
+    Chunked,
+    CloseDelimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedResponseHead {
+    body_framing: ResponseBodyFraming,
+    connection_close: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseFields {
+    status: u16,
+    connection_upgrade: bool,
+    connection_close: bool,
+    websocket_upgrade: bool,
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamProgress {
+    Data,
+    Eof,
+}
+
+async fn proxy_websocket(
+    mut public_reader: OwnedReadHalf,
+    mut public_writer: OwnedWriteHalf,
+    mut tunnel: BoxedGatewayTunnel,
+    mut public_pending: Vec<u8>,
+    request_head_end: usize,
+    config: GatewayIngressConfig,
+) {
+    if public_pending.len() > config.max_public_request_head_bytes {
+        return;
+    }
+    if tunnel
+        .write_all(&public_pending[..request_head_end])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    public_pending.drain(..request_head_end);
+
+    let mut upstream_pending = Vec::new();
+    let Ok(response_head_end) = read_upstream_head(
+        &mut tunnel,
+        &mut upstream_pending,
+        &mut public_reader,
+        &mut public_pending,
+        config,
+    )
+    .await
+    else {
+        return;
+    };
+    if !valid_websocket_response(&upstream_pending[..response_head_end]) {
+        return;
+    }
+    if public_writer
+        .write_all(&upstream_pending[..response_head_end])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    upstream_pending.drain(..response_head_end);
+
+    // Client bytes read past the Upgrade head are not application data until
+    // the Guest has returned an exact valid 101 response.
+    if tunnel.write_all(&public_pending).await.is_err() {
+        return;
+    }
+    if public_writer.write_all(&upstream_pending).await.is_err() {
+        return;
+    }
+
+    let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
+    let client_to_guest = tokio::io::copy(&mut public_reader, &mut tunnel_writer);
+    let guest_to_client = tokio::io::copy(&mut tunnel_reader, &mut public_writer);
+    tokio::pin!(client_to_guest);
+    tokio::pin!(guest_to_client);
+    tokio::select! {
+        _ = &mut client_to_guest => {}
+        _ = &mut guest_to_client => {}
+    }
+}
+
+async fn proxy_http_response(
+    public_reader: &mut OwnedReadHalf,
+    public_writer: &mut OwnedWriteHalf,
+    tunnel: &mut BoxedGatewayTunnel,
+    public_pending: &mut Vec<u8>,
+    request: &ParsedInitialRequest,
+    config: GatewayIngressConfig,
+) -> ResponseDisposition {
+    if public_pending.len() > config.max_public_request_head_bytes {
+        return ResponseDisposition::ClosePublic;
+    }
+    let mut upstream_pending = Vec::new();
+    let Ok(response_head_end) = read_upstream_head(
+        tunnel,
+        &mut upstream_pending,
+        public_reader,
+        public_pending,
+        config,
+    )
+    .await
+    else {
+        return ResponseDisposition::ClosePublic;
+    };
+    let Some(response) = parse_http_response_head(
+        &upstream_pending[..response_head_end],
+        request.response_body_forbidden,
+    ) else {
+        return ResponseDisposition::ClosePublic;
+    };
+    if public_writer
+        .write_all(&upstream_pending[..response_head_end])
+        .await
+        .is_err()
+    {
+        return ResponseDisposition::ClosePublic;
+    }
+    upstream_pending.drain(..response_head_end);
+
+    let body_result = match response.body_framing {
+        ResponseBodyFraming::Fixed(length) => {
+            forward_upstream_exact(
+                tunnel,
+                public_writer,
+                &mut upstream_pending,
+                public_reader,
+                public_pending,
+                config.max_public_request_head_bytes,
+                length,
+            )
+            .await
+        }
+        ResponseBodyFraming::Chunked => {
+            forward_upstream_chunked(
+                tunnel,
+                public_writer,
+                &mut upstream_pending,
+                public_reader,
+                public_pending,
+                config,
+            )
+            .await
+        }
+        ResponseBodyFraming::CloseDelimited => {
+            let _ = forward_close_delimited(
+                tunnel,
+                public_writer,
+                &mut upstream_pending,
+                public_reader,
+                public_pending,
+                config.max_public_request_head_bytes,
+            )
+            .await;
+            return ResponseDisposition::ClosePublic;
+        }
+    };
+    if body_result.is_err() || request.connection_close || response.connection_close {
+        return ResponseDisposition::ClosePublic;
+    }
+    if !upstream_pending.is_empty() {
+        return ResponseDisposition::ClosePublic;
+    }
+
+    // The Node tunnel is one request. Even a self-delimited response may be
+    // reused publicly only after the tunnel proves EOF with no second frame.
+    match tokio::time::timeout(
+        config.public_request_head_deadline,
+        read_upstream_more(
+            tunnel,
+            &mut upstream_pending,
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(UpstreamProgress::Eof)) => ResponseDisposition::ReusePublic,
+        Ok(Ok(UpstreamProgress::Data)) | Ok(Err(())) | Err(_) => ResponseDisposition::ClosePublic,
+    }
+}
+
+async fn read_upstream_head(
+    upstream: &mut BoxedGatewayTunnel,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    config: GatewayIngressConfig,
+) -> Result<usize, ()> {
+    tokio::time::timeout(config.public_request_head_deadline, async {
+        loop {
+            if let Some(header_end) = find_header_end(upstream_pending) {
+                return (header_end <= config.max_public_request_head_bytes)
+                    .then_some(header_end)
+                    .ok_or(());
+            }
+            if upstream_pending.len() >= config.max_public_request_head_bytes {
+                return Err(());
+            }
+            match read_upstream_more(
+                upstream,
+                upstream_pending,
+                public_reader,
+                public_pending,
+                config.max_public_request_head_bytes,
+            )
+            .await?
+            {
+                UpstreamProgress::Data => {}
+                UpstreamProgress::Eof => return Err(()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+async fn read_upstream_more(
+    upstream: &mut BoxedGatewayTunnel,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_public_pending: usize,
+) -> Result<UpstreamProgress, ()> {
+    let mut upstream_chunk = [0_u8; 4 * 1024];
+    loop {
+        let public_capacity = max_public_pending.saturating_sub(public_pending.len());
+        if public_capacity == 0 {
+            let mut overflow = [0_u8; 1];
+            return tokio::select! {
+                upstream_read = upstream.read(&mut upstream_chunk) => {
+                    match upstream_read.map_err(|_| ())? {
+                        0 => Ok(UpstreamProgress::Eof),
+                        read => {
+                            upstream_pending.extend_from_slice(&upstream_chunk[..read]);
+                            Ok(UpstreamProgress::Data)
+                        }
+                    }
+                }
+                // Once the bounded pipeline buffer is full, any additional
+                // public byte or EOF closes this request instead of hiding a
+                // disconnect behind unconsumed attacker-controlled bytes.
+                _ = public_reader.read(&mut overflow) => Err(()),
+            };
+        }
+        let mut public_chunk = [0_u8; 4 * 1024];
+        let public_read_limit = public_capacity.min(public_chunk.len());
+        tokio::select! {
+            upstream_read = upstream.read(&mut upstream_chunk) => {
+                return match upstream_read.map_err(|_| ())? {
+                    0 => Ok(UpstreamProgress::Eof),
+                    read => {
+                        upstream_pending.extend_from_slice(&upstream_chunk[..read]);
+                        Ok(UpstreamProgress::Data)
+                    }
+                };
+            }
+            public_read = public_reader.read(&mut public_chunk[..public_read_limit]) => {
+                let read = public_read.map_err(|_| ())?;
+                if read == 0 {
+                    return Err(());
+                }
+                public_pending.extend_from_slice(&public_chunk[..read]);
+            }
+        }
+    }
+}
+
+async fn forward_upstream_exact(
+    upstream: &mut BoxedGatewayTunnel,
+    public_writer: &mut OwnedWriteHalf,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_public_pending: usize,
+    length: usize,
+) -> Result<(), ()> {
+    let mut remaining = length;
+    while remaining != 0 {
+        if upstream_pending.is_empty()
+            && read_upstream_more(
+                upstream,
+                upstream_pending,
+                public_reader,
+                public_pending,
+                max_public_pending,
+            )
+            .await?
+                == UpstreamProgress::Eof
+        {
+            return Err(());
+        }
+        let forwarded = remaining.min(upstream_pending.len());
+        public_writer
+            .write_all(&upstream_pending[..forwarded])
+            .await
+            .map_err(|_| ())?;
+        upstream_pending.drain(..forwarded);
+        remaining -= forwarded;
+    }
+    Ok(())
+}
+
+async fn forward_upstream_chunked(
+    upstream: &mut BoxedGatewayTunnel,
+    public_writer: &mut OwnedWriteHalf,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    config: GatewayIngressConfig,
+) -> Result<(), ()> {
+    loop {
+        let line = take_upstream_crlf_line(
+            upstream,
+            upstream_pending,
+            public_reader,
+            public_pending,
+            MAX_CHUNK_LINE_BYTES.min(config.max_public_request_head_bytes),
+            config.max_public_request_head_bytes,
+        )
+        .await?;
+        let chunk_size = parse_chunk_size(&line).ok_or(())?;
+        public_writer.write_all(&line).await.map_err(|_| ())?;
+        if chunk_size == 0 {
+            let mut trailer_bytes = 0_usize;
+            loop {
+                let trailer = take_upstream_crlf_line(
+                    upstream,
+                    upstream_pending,
+                    public_reader,
+                    public_pending,
+                    config.max_public_request_head_bytes,
+                    config.max_public_request_head_bytes,
+                )
+                .await?;
+                trailer_bytes = trailer_bytes.checked_add(trailer.len()).ok_or(())?;
+                if trailer_bytes > config.max_public_request_head_bytes
+                    || (trailer != b"\r\n" && !valid_trailer_line(&trailer))
+                {
+                    return Err(());
+                }
+                public_writer.write_all(&trailer).await.map_err(|_| ())?;
+                if trailer == b"\r\n" {
+                    return Ok(());
+                }
+            }
+        }
+        let chunk_size = usize::try_from(chunk_size).map_err(|_| ())?;
+        forward_upstream_exact(
+            upstream,
+            public_writer,
+            upstream_pending,
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+            chunk_size,
+        )
+        .await?;
+        ensure_upstream_pending(
+            upstream,
+            upstream_pending,
+            public_reader,
+            public_pending,
+            config.max_public_request_head_bytes,
+            2,
+        )
+        .await?;
+        if upstream_pending.get(..2) != Some(b"\r\n") {
+            return Err(());
+        }
+        public_writer
+            .write_all(&upstream_pending[..2])
+            .await
+            .map_err(|_| ())?;
+        upstream_pending.drain(..2);
+    }
+}
+
+async fn forward_close_delimited(
+    upstream: &mut BoxedGatewayTunnel,
+    public_writer: &mut OwnedWriteHalf,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_public_pending: usize,
+) -> Result<(), ()> {
+    loop {
+        if !upstream_pending.is_empty() {
+            public_writer
+                .write_all(upstream_pending)
+                .await
+                .map_err(|_| ())?;
+            upstream_pending.clear();
+        }
+        if read_upstream_more(
+            upstream,
+            upstream_pending,
+            public_reader,
+            public_pending,
+            max_public_pending,
+        )
+        .await?
+            == UpstreamProgress::Eof
+        {
+            return Ok(());
+        }
+    }
+}
+
+async fn take_upstream_crlf_line(
+    upstream: &mut BoxedGatewayTunnel,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_line_bytes: usize,
+    max_public_pending: usize,
+) -> Result<Vec<u8>, ()> {
+    loop {
+        if let Some(position) = upstream_pending
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        {
+            let end = position.checked_add(2).ok_or(())?;
+            if end > max_line_bytes {
+                return Err(());
+            }
+            return Ok(upstream_pending.drain(..end).collect());
+        }
+        if upstream_pending.len() >= max_line_bytes
+            || read_upstream_more(
+                upstream,
+                upstream_pending,
+                public_reader,
+                public_pending,
+                max_public_pending,
+            )
+            .await?
+                == UpstreamProgress::Eof
+        {
+            return Err(());
+        }
+    }
+}
+
+async fn ensure_upstream_pending(
+    upstream: &mut BoxedGatewayTunnel,
+    upstream_pending: &mut Vec<u8>,
+    public_reader: &mut OwnedReadHalf,
+    public_pending: &mut Vec<u8>,
+    max_public_pending: usize,
+    required: usize,
+) -> Result<(), ()> {
+    while upstream_pending.len() < required {
+        if read_upstream_more(
+            upstream,
+            upstream_pending,
+            public_reader,
+            public_pending,
+            max_public_pending,
+        )
+        .await?
+            == UpstreamProgress::Eof
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn parse_http_response_head(bytes: &[u8], request_was_head: bool) -> Option<ParsedResponseHead> {
+    let fields = parse_response_fields(bytes)?;
+    // Interim responses are not forwarded in v1. Request `Expect` is rejected,
+    // so failing closed on 1xx does not break the ordinary request path.
+    if (100..200).contains(&fields.status) || fields.connection_upgrade || fields.websocket_upgrade
+    {
+        return None;
+    }
+    let body_framing = if request_was_head {
+        if fields.chunked {
+            return None;
+        }
+        ResponseBodyFraming::Fixed(0)
+    } else if fields.status == 204 || fields.status == 205 {
+        if fields.chunked || fields.content_length.is_some_and(|length| length != 0) {
+            return None;
+        }
+        ResponseBodyFraming::Fixed(0)
+    } else if fields.status == 304 {
+        if fields.chunked {
+            return None;
+        }
+        ResponseBodyFraming::Fixed(0)
+    } else if fields.chunked {
+        ResponseBodyFraming::Chunked
+    } else if let Some(length) = fields.content_length {
+        ResponseBodyFraming::Fixed(length)
+    } else {
+        ResponseBodyFraming::CloseDelimited
+    };
+    Some(ParsedResponseHead {
+        body_framing,
+        connection_close: fields.connection_close,
+    })
+}
+
+fn valid_websocket_response(bytes: &[u8]) -> bool {
+    parse_response_fields(bytes).is_some_and(|fields| {
+        fields.status == 101
+            && fields.connection_upgrade
+            && !fields.connection_close
+            && fields.websocket_upgrade
+            && fields.content_length.is_none()
+            && !fields.chunked
+    })
+}
+
+fn parse_response_fields(bytes: &[u8]) -> Option<ResponseFields> {
+    let header_end = find_header_end(bytes)?;
+    if header_end != bytes.len() {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes.get(..header_end.checked_sub(4)?)?).ok()?;
+    if !text.is_ascii() || text.bytes().any(|byte| byte == 0 || byte == 0x7f) {
+        return None;
+    }
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next()?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    if status_parts.next()? != "HTTP/1.1" {
+        return None;
+    }
+    let status_wire = status_parts.next()?;
+    let reason = status_parts.next()?;
+    if status_wire.len() != 3
+        || !status_wire.bytes().all(|byte| byte.is_ascii_digit())
+        || reason
+            .bytes()
+            .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+    {
+        return None;
+    }
+    let status = status_wire.parse::<u16>().ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
+
+    let mut connection_seen = false;
+    let mut connection_upgrade = false;
+    let mut connection_close = false;
+    let mut upgrade_seen = false;
+    let mut websocket_upgrade = false;
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in lines {
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty() || !name.bytes().all(is_token_byte) {
+            return None;
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if value
+            .bytes()
+            .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("connection") {
+            if connection_seen {
+                return None;
+            }
+            connection_seen = true;
+            for token in value.split(',').map(str::trim) {
+                connection_upgrade |= token.eq_ignore_ascii_case("upgrade");
+                connection_close |= token.eq_ignore_ascii_case("close");
+            }
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            if upgrade_seen {
+                return None;
+            }
+            upgrade_seen = true;
+            websocket_upgrade = value.eq_ignore_ascii_case("websocket");
+            if !websocket_upgrade {
+                return None;
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length
+                .replace(parse_content_length(value)?)
+                .is_some()
+            {
+                return None;
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !value.eq_ignore_ascii_case("chunked") {
+                return None;
+            }
+            chunked = true;
+        }
+    }
+    if chunked && content_length.is_some() {
+        return None;
+    }
+    Some(ResponseFields {
+        status,
+        connection_upgrade,
+        connection_close,
+        websocket_upgrade,
+        content_length,
+        chunked,
+    })
 }
 
 fn parse_content_length(value: &str) -> Option<usize> {
@@ -751,7 +1403,7 @@ enum PublicError {
     Unavailable,
 }
 
-async fn write_public_error(stream: &mut TcpStream, error: PublicError) {
+async fn write_public_error(stream: &mut OwnedWriteHalf, error: PublicError) {
     let response: &[u8] = match error {
         PublicError::BadRequest => {
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbad request\n"
@@ -773,7 +1425,7 @@ async fn write_public_error(stream: &mut TcpStream, error: PublicError) {
     let _ = stream.shutdown().await;
 }
 
-async fn write_local_health(stream: &mut TcpStream) {
+async fn write_local_health(stream: &mut OwnedWriteHalf) {
     let _ = stream
         .write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",

@@ -155,6 +155,19 @@ headers 作为应用数据转发给 Guest。Cats management API 继续使用自�
 不得访问cache、Control、Node或其他外部I/O。其他method、相近path和query仍是普通应用route；带body或
 transfer encoding的`GET /healthz`返回`400`并关闭连接，已缓冲的pipeline bytes不得成为下一请求。
 
+Gateway的public HTTP/1.1 proxy按一个request/一个Node tunnel严格证明response boundary。response head与
+chunk/trailer metadata沿用public head byte cap，拒绝重复或冲突的`Content-Length`/`Transfer-Encoding`；
+HEAD、204/205、304、fixed Content-Length与single canonical chunked分别按其精确边界转发。无长度response只
+能以tunnel EOF定界，完成后必须关闭public connection；`Connection: close`、畸形、截断或response边界后的
+额外tunnel bytes同样关闭且额外bytes不转发。只有self-delimited response后同一单请求tunnel立即证明EOF且
+无extra bytes，才可把public keepalive用于下一次独立resolve/admission。普通HTTP的interim 1xx在v1中fail
+closed；request `Expect`也被拒绝，因此不会破坏普通non-interim路径。WebSocket只先转发upgrade head；只有
+Guest返回exact HTTP/1.1 101、`Connection: Upgrade`与`Upgrade: websocket`后，才转发已缓冲及后续raw bytes。
+非101或畸形upgrade response关闭双方连接并丢弃client pipeline。
+等待Guest response、转发response body与WebSocket raw stream期间都持续观察public peer EOF/error；命中即
+立即drop当前tunnel并释放Node guard与Gateway connection permit。为下一request预读的public bytes只进入同一
+有硬上限的pipeline buffer，不由detached watcher消费；超限fail closed。
+
 Gateway -> Control Plane resolve 和 Gateway -> Node hop 必须使用独立的 workload machine identity
 并全程加密；Node 同时要求可信 Gateway identity 和有效 Grant。Grant 放在保留的内部字段，进入
 Guest 前删除，不能发送给浏览器。日志、trace、错误页和 qualification evidence 都不能包含 token、
