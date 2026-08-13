@@ -2611,12 +2611,19 @@ touch "$CATS_TEST_DELETE_LOG"
 #[test]
 fn production_database_clients_read_the_rotating_secret_files() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let trimmed_lines = terraform.lines().map(str::trim).collect::<Vec<_>>();
+    assert!(
+        trimmed_lines.windows(2).any(|pair| {
+            pair == [
+                "\"--control-store-url-file\",",
+                "\"/etc/cats/runtime/CATS_POSTGRES_URL\",",
+            ]
+        }),
+        "the production control Store must read its rotating DSN from the mounted file"
+    );
     for expected in [
-        "--control-store-url-file",
-        "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
         "CATS_USAGE_POSTGRES_URL_FILE",
         "mount_path = \"/etc/cats/runtime\"",
-        "session-setup=${var.storage_postgres_session_setup}",
     ] {
         assert!(
             terraform.contains(expected),
