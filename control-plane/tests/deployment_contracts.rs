@@ -3185,6 +3185,35 @@ fn manual_release_builder_verifies_both_final_artifacts_and_writes_one_receipt()
 }
 
 #[test]
+fn production_deployment_builds_the_same_guest_payload_as_release() {
+    let release = read_workspace_file(".github/workflows/release.yml");
+    let production = read_workspace_file(".github/workflows/deploy-production.yml");
+    let payload_build = production
+        .find("      - name: Build the one Guest payload\n")
+        .expect("production Guest payload build");
+    let image_build = production
+        .find("      - name: Build and push control-plane image\n")
+        .expect("production control-plane image build");
+    assert!(
+        payload_build < image_build,
+        "the Guest payload must exist before Docker consumes it",
+    );
+    let step = |workflow: &str| {
+        workflow
+            .split_once("      - name: Build the one Guest payload\n")
+            .and_then(|(_, rest)| rest.split_once("\n      - "))
+            .map(|(body, _)| body.trim_end().to_owned())
+            .expect("Guest runtime payload build step")
+    };
+
+    assert_eq!(
+        step(&production),
+        step(&release),
+        "production and release workflows must build the exact same Guest runtime payload before the control-plane Docker build",
+    );
+}
+
+#[test]
 fn runtime_node_authority_deployments_pin_exact_trust_artifact_and_shutdown_window() {
     let argument =
         "--runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json";
