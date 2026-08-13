@@ -3360,6 +3360,16 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     ] {
         assert!(control_image.contains(copy), "Control image lost {copy:?}");
     }
+    for release_binding in [
+        "ARG CATS_RELEASE_COMMIT_SHA",
+        "ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}",
+        "grep -Eq '^[0-9a-f]{40}$'",
+    ] {
+        assert!(
+            control_image.contains(release_binding),
+            "Control image lost qualified source binding {release_binding:?}"
+        );
+    }
     let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
     let noded = read_workspace_file("cmd/noded/src/main.rs");
@@ -3400,10 +3410,15 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
         !gateway.contains("guest-runtime-release-v1"),
         "the Gateway image must not pretend to consume the shared Guest release artifact"
     );
+    assert!(workflow.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ github.sha }}"));
     assert_eq!(
         workflow.matches("name: guest-runtime-release-v1").count(),
         3,
         "one upload and exactly two consumers must name the same artifact"
+    );
+    let production_workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(
+        production_workflow.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ env.RELEASE_SHA }}")
     );
     assert!(
         workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
@@ -3439,6 +3454,7 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "RELEASE_OUT=\"$guest_release\"",
         "--file deploy/aws/Dockerfile.control-plane",
         "--file deploy/aws/Dockerfile.gateway",
+        "--build-arg \"CATS_RELEASE_COMMIT_SHA=$source_sha\"",
         "--file deploy/aws/Dockerfile.worker-artifact",
         "docker create --platform linux/amd64 \"$control_image_id\"",
         "docker create --platform linux/amd64 \"$gateway_image_id\"",

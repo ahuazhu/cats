@@ -768,6 +768,25 @@ pub(super) fn load_provisioned_identities_after(
         .collect()
 }
 
+/// Strictly decodes the complete NodeIdentity table for a fleet-wide
+/// verification snapshot. Filtering on a denormalized `state` projection
+/// before decoding could otherwise hide a corrupt row from cutover evidence.
+pub(super) fn load_all_identities_for_fleet_verification(
+    transaction: &mut Transaction<'_>,
+    query_limit: i64,
+) -> AuthorityTxResult<Vec<NodeIdentity>> {
+    let sql = format!(
+        "SELECT {NODE_IDENTITY_COLUMNS} FROM node_identities
+          ORDER BY node_id COLLATE \"C\"
+          LIMIT $1"
+    );
+    transaction
+        .query(&sql, &[&query_limit])?
+        .iter()
+        .map(decode_identity)
+        .collect()
+}
+
 /// Returns only the ordered scalar keys for one planner page. The planner
 /// deliberately decodes each complete NodeIdentity only when it reaches that
 /// candidate, so selecting an earlier eligible Node cannot be poisoned by a

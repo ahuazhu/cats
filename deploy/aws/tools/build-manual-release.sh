@@ -221,6 +221,7 @@ build_arguments=(
   --file deploy/aws/Dockerfile.control-plane
   --target runtime
   --platform linux/amd64
+  --build-arg "CATS_RELEASE_COMMIT_SHA=$source_sha"
   --provenance=false
   --metadata-file "$control_metadata"
   --tag "$image_reference"

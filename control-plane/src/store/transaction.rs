@@ -478,6 +478,32 @@ impl Store {
         }
     }
 
+    /// Runs an HTTP-request-scoped authority facts loader in one read-only
+    /// repeatable-read snapshot. The explicit rollback disposition prevents a
+    /// read from entering commit ambiguity, while the request context applies
+    /// one absolute deadline to queue admission and PostgreSQL statements.
+    pub(super) fn authority_request_read_snapshot<T: Send>(
+        &self,
+        request: &AuthorityRequestContext,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with_hook(
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
+            AuthorityTransactionMode::RepeatableReadOnly,
+            Some(request),
+            || {},
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in an authority request read snapshot",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in an authority request read snapshot",
+            )),
+        }
+    }
+
     /// Runs a logically read-only authority closure in one repeatable-read
     /// snapshot that may acquire `FOR SHARE` locks. PostgreSQL forbids row
     /// locks in a transaction declared `READ ONLY`, so A22 uses this mode for

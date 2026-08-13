@@ -3,6 +3,7 @@
 pub(crate) mod cat_create_service;
 mod covered_commit;
 pub(crate) mod delete_sweeper;
+pub(crate) mod fleet_verification;
 pub(crate) mod gateway_identity;
 pub(crate) mod image_manifest_resolver;
 pub(crate) mod normal_delete;

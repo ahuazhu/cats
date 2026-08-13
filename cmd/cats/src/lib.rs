@@ -14,6 +14,7 @@ mod cat_create_pending;
 mod cat_create_pending_unsupported_compile_shape;
 mod config;
 mod credential_store;
+mod fleet_verify;
 #[cfg(unix)]
 mod runtime_node_admin;
 #[cfg(not(unix))]
@@ -350,6 +351,24 @@ pub enum AdminCommand {
     Login,
     /// Remove the independent fleet-administrator session.
     Logout,
+    /// Prove that an explicitly named production fleet is registered and empty.
+    FleetVerify {
+        /// One expected provisioned Node ID. Repeat for every Node.
+        #[arg(long = "expected-node", required = true)]
+        expected_nodes: Vec<String>,
+        /// Exact canonical Route Grant v2 public-key ring artifact.
+        #[arg(long = "key-ring")]
+        key_ring: std::path::PathBuf,
+        /// Qualified 40-lowercase-hex release commit expected on Control.
+        #[arg(long = "release-commit")]
+        release_commit: String,
+        /// Absolute polling budget in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        /// Delay between non-ready snapshots.
+        #[arg(long, default_value_t = 1_000)]
+        poll_interval_ms: u64,
+    },
     /// Show fleet health, lifecycle and capacity counters.
     #[command(hide = true)]
     Monitoring,
@@ -1128,6 +1147,7 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
             cmd:
                 AdminCommand::Login
                 | AdminCommand::Logout
+                | AdminCommand::FleetVerify { .. }
                 | AdminCommand::RuntimeNode { .. }
                 | AdminCommand::RuntimeProvisioner { .. },
         } => None,
@@ -1263,6 +1283,25 @@ pub fn run(cli: Cli) -> Result<()> {
             auth::fleet_admin_logout(cli.api_url.as_deref())?;
             println!("Fleet administrator logged out");
             return Ok(());
+        }
+        Command::Admin {
+            cmd:
+                AdminCommand::FleetVerify {
+                    expected_nodes,
+                    key_ring,
+                    release_commit,
+                    timeout_seconds,
+                    poll_interval_ms,
+                },
+        } => {
+            return fleet_verify::run(
+                &cli,
+                expected_nodes,
+                key_ring,
+                release_commit,
+                *timeout_seconds,
+                *poll_interval_ms,
+            );
         }
         Command::Admin {
             cmd:
@@ -1937,7 +1976,7 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
             }
             Ok(())
         }
-        AdminCommand::RuntimeNode { .. } => {
+        AdminCommand::RuntimeNode { .. } | AdminCommand::FleetVerify { .. } => {
             unreachable!("Runtime Node authority commands bypass workspace API construction")
         }
         AdminCommand::RuntimeProvisioner { .. } => {
@@ -2475,6 +2514,27 @@ mod tests {
             Cli::parse_from(["cats", "admin", "logout"]).command,
             Command::Admin {
                 cmd: AdminCommand::Logout
+            }
+        ));
+        let fleet_verify = Cli::parse_from([
+            "cats",
+            "admin",
+            "fleet-verify",
+            "--expected-node",
+            "node_a",
+            "--key-ring",
+            "route-ring.json",
+            "--release-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--timeout-seconds",
+            "60",
+            "--poll-interval-ms",
+            "10",
+        ]);
+        assert!(matches!(
+            fleet_verify.command,
+            Command::Admin {
+                cmd: AdminCommand::FleetVerify { .. }
             }
         ));
         let machine = Cli::parse_from([

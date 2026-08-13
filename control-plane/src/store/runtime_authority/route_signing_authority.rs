@@ -256,7 +256,7 @@ fn insert_initial_signer(
     Ok(())
 }
 
-fn load_current_signer(
+pub(super) fn load_current_signer(
     transaction: &mut Transaction<'_>,
     lock: &str,
 ) -> AuthorityTxResult<Option<RouteGrantV2SignerBinding>> {

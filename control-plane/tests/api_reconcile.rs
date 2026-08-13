@@ -17,6 +17,7 @@ use cats_api::agent_registration::{
     NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
 };
 use cats_api::billing::BillingBalance;
+use cats_api::fleet_verification::{decode_fleet_verification_snapshot, FLEET_VERIFICATION_PATH};
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
     UsageReport, MAX_USAGE_INGEST_BODY_BYTES,
@@ -49,6 +50,96 @@ async fn reject_unexpected_production_node_call(
 ) -> StatusCode {
     calls.fetch_add(1, Ordering::SeqCst);
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn fleet_verification_route_is_production_admin_only_and_observation_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("fleet-control.db")).unwrap());
+    let production = spawn_production(Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        ),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        retired_storage_meta_for_tests: None,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+        auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 30_000,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: AutoTierPolicy::default(),
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", production.base_url(), FLEET_VERIFICATION_PATH);
+
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(SERVICE_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let response = client
+        .get(&url)
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter()
+            .map(reqwest::header::HeaderValue::as_bytes)
+            .collect::<Vec<_>>(),
+        vec![b"application/json".as_slice()]
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get_all(reqwest::header::CACHE_CONTROL)
+            .iter()
+            .map(reqwest::header::HeaderValue::as_bytes)
+            .collect::<Vec<_>>(),
+        vec![b"no-store".as_slice()]
+    );
+    let snapshot = decode_fleet_verification_snapshot(&response.bytes().await.unwrap()).unwrap();
+    assert!(snapshot.nodes.is_empty());
+    assert_eq!(snapshot.desired_runtime_count.get(), 0);
+    assert_eq!(snapshot.current_runtime_observation_count.get(), 0);
+    assert!(snapshot.route_signing_authority.is_none());
+
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        405
+    );
+    production.shutdown().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

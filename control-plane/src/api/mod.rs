@@ -65,6 +65,7 @@ mod cats;
 mod disks;
 #[cfg(debug_assertions)]
 mod endpoints;
+mod fleet_verification;
 mod nodes;
 #[cfg(debug_assertions)]
 mod operations;
@@ -840,6 +841,10 @@ pub fn router(state: AppState) -> Router {
                 .fallback(runtime_node_authority::apply_runtime_node_authority),
         )
         .route(
+            "/v1/admin/runtime/fleet-verification",
+            get(fleet_verification::fleet_verification),
+        )
+        .route(
             "/v1/workspaces/{workspace}/billing/balance",
             get(workspace_billing_balance),
         )
@@ -1003,6 +1008,7 @@ GET /v1/admin/monitoring
 GET /v1/admin/nodes
 GET /v1/admin/nodes/{id}
 GET /v1/admin/nodes/{id}/cats
+GET /v1/admin/runtime/fleet-verification
 GET /v1/admin/workspaces
 GET /v1/me
 GET /v1/nodes

@@ -190,10 +190,10 @@ struct ObservationReceiveState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AdmissionInventoryState {
-    attestation: AdmissionInventoryAttestation,
-    full_observation: NodeObservation,
-    assigned_snapshot: DesiredReadSnapshot,
+pub(super) struct AdmissionInventoryState {
+    pub(super) attestation: AdmissionInventoryAttestation,
+    pub(super) full_observation: NodeObservation,
+    pub(super) assigned_snapshot: DesiredReadSnapshot,
 }
 
 /// Context validation has two deliberately separate failure channels: a
@@ -2965,7 +2965,7 @@ fn load_admission_inventory_state_for_update(
         .transpose()
 }
 
-fn load_admission_inventory_state_unlocked(
+pub(super) fn load_admission_inventory_state_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AdmissionInventoryState>> {

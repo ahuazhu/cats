@@ -1156,6 +1156,119 @@ fn accept_empty_admission(
     }
 }
 
+#[test]
+fn fleet_verification_snapshot_retains_exact_full_ack_and_counts_global_desired() {
+    const RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+    const SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+    let (store, identity, authenticated, policy, session) = fixture();
+    let ring = cats_api::route_grant_v2::decode_route_grant_v2_public_key_ring(RING).unwrap();
+    let reference =
+        cats_api::route_grant_v2::decode_route_grant_v2_signer_reference(SIGNER).unwrap();
+    let installed =
+        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &reference,
+            SIGNER,
+            &ring,
+            Some(include_bytes!(
+                "../../../../tests/fixtures/route_grant_v2_private_ed25519.pem"
+            )),
+            120,
+        )
+        .unwrap();
+    store
+        .install_route_grant_v2_signer_authority(&installed)
+        .unwrap();
+
+    let desired_read = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&session),
+                    request_sequence: Sequence::new(1).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let mut full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(desired_read.read_position),
+        Vec::new(),
+    );
+    full.key_ring_version = Some(ring.ring_version);
+    full.loaded_kids = ring.keys.iter().map(|key| key.kid.clone()).collect();
+    full.key_ring_digest = Some(ring.digest().unwrap());
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+
+    let request = crate::store::transaction::AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    );
+    let snapshot = store
+        .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+        .unwrap();
+    assert_eq!(snapshot.desired_runtime_count.get(), 0);
+    assert_eq!(snapshot.current_runtime_observation_count.get(), 0);
+    assert_eq!(snapshot.nodes.len(), 1);
+    let inventory = snapshot.nodes[0].inventory.as_ref().unwrap();
+    assert_eq!(inventory.loaded_kids, full.loaded_kids);
+    assert_eq!(inventory.key_ring_digest, full.key_ring_digest);
+    assert_eq!(inventory.runtime_count.get(), 0);
+    assert_eq!(inventory.residue_count.get(), 0);
+    assert_eq!(
+        snapshot
+            .route_signing_authority
+            .as_ref()
+            .unwrap()
+            .signer_reference_sha256,
+        installed.binding().reference_sha256().clone()
+    );
+
+    // A partial heartbeat is newer telemetry but cannot replace or refresh
+    // the retained session-bound complete inventory/key-ring attestation.
+    let partial = observation(&store, &session, 2, 1, false, None, Vec::new());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
+    let after_partial = store
+        .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+        .unwrap();
+    assert_eq!(
+        after_partial.nodes[0]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .source_observation_id,
+        full.observation_id
+    );
+
+    // Calibrate the global empty-set probe against a known positive: this
+    // Desired row was not present in the retained assigned snapshot, yet the
+    // fleet-wide count must reveal it and prevent an empty-fleet proof.
+    let workspace = bootstrap_workspace(&store, "fleet-verification");
+    let desired = current_desired(&workspace, &identity.node_id);
+    insert_pending_operation(&store, &desired);
+    assert_eq!(
+        store
+            .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+            .unwrap()
+            .desired_runtime_count
+            .get(),
+        1
+    );
+}
+
 fn bind_create_to_admission(
     request: &mut super::product::CoveredCatCreateRequest,
     admission: &super::runtime_spine::PlacementAdmissionSnapshot,
