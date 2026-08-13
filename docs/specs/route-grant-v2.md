@@ -149,6 +149,12 @@ Guest transport。它不表示用户应用已经监听 `target_port`。应用 he
 WorkOS session，也不替用户应用做 Workspace 成员鉴权。用户的 Authorization、Cookie 和应用
 headers 作为应用数据转发给 Guest。Cats management API 继续使用自己的用户/Workspace 鉴权。
 
+唯一local operational exception是同一listener在完成有界request-head解析后处理exact
+`GET /healthz`：请求必须有一个合法Host、没有body/transfer encoding或WebSocket upgrade，响应固定为
+`200`并`Connection: close`。它只证明Gateway fixed artifacts、TLS clients、cache与listener已完成启动组合，
+不得访问cache、Control、Node或其他外部I/O。其他method、相近path和query仍是普通应用route；带body或
+transfer encoding的`GET /healthz`返回`400`并关闭连接，已缓冲的pipeline bytes不得成为下一请求。
+
 Gateway -> Control Plane resolve 和 Gateway -> Node hop 必须使用独立的 workload machine identity
 并全程加密；Node 同时要求可信 Gateway identity 和有效 Grant。Grant 放在保留的内部字段，进入
 Guest 前删除，不能发送给浏览器。日志、trace、错误页和 qualification evidence 都不能包含 token、

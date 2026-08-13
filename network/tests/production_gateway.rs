@@ -68,6 +68,72 @@ async fn spawn_gateway(
 }
 
 #[tokio::test]
+async fn exact_local_health_is_the_only_request_that_bypasses_route_authority() {
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let resolve_calls_call = Arc::clone(&resolve_calls);
+    let resolver: RouteResolver = Arc::new(move |hostname| {
+        resolve_calls_call.fetch_add(1, Ordering::SeqCst);
+        let route = route(hostname, b"ordinary-route-grant");
+        Box::pin(async move { Ok(RouteResolution::Positive(route)) }) as ResolveFuture
+    });
+    let cache = RouteCache::new(cache_config(), resolver).unwrap();
+    let tunnel_attempts = Arc::new(AtomicUsize::new(0));
+    let tunnel_attempts_call = Arc::clone(&tunnel_attempts);
+    let connector: TunnelConnector = Arc::new(move |_| {
+        tunnel_attempts_call.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(GatewayNodeRouteV2Error::Protocol) }) as TunnelFuture
+    });
+    let (address, shutdown, server) = spawn_gateway(cache, connector).await;
+
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: alb.internal\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert_eq!(
+        response,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n"
+    );
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel_attempts.load(Ordering::SeqCst), 0);
+
+    for request in [
+        b"GET /healthz/ HTTP/1.1\r\nHost: app.cats.run\r\n\r\n".as_slice(),
+        b"GET /healthz?probe HTTP/1.1\r\nHost: app.cats.run\r\n\r\n".as_slice(),
+        b"POST /healthz HTTP/1.1\r\nHost: app.cats.run\r\nContent-Length: 0\r\n\r\n".as_slice(),
+    ] {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+    }
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel_attempts.load(Ordering::SeqCst), 3);
+
+    for request in [
+        b"GET /healthz HTTP/1.1\r\n\r\n".as_slice(),
+        b"GET /healthz HTTP/1.1\r\nHost: alb.internal\r\nContent-Length: 4\r\n\r\ndataGET /smuggled HTTP/1.1\r\nHost: app.cats.run\r\n\r\n".as_slice(),
+        b"GET /healthz HTTP/1.1\r\nHost: alb.internal\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: app.cats.run\r\n\r\n".as_slice(),
+    ] {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel_attempts.load(Ordering::SeqCst), 3);
+
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn public_http_bytes_cross_one_route_lookup_and_one_node_tunnel() {
     let resolved_hostname = Arc::new(Mutex::new(None));
     let resolved_hostname_call = Arc::clone(&resolved_hostname);

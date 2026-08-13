@@ -217,6 +217,17 @@ async fn handle_connection(
                 return;
             }
         };
+        match parsed.local_health {
+            LocalHealthDisposition::RespondOk => {
+                write_local_health(&mut public).await;
+                return;
+            }
+            LocalHealthDisposition::Reject => {
+                write_public_error(&mut public, PublicError::BadRequest).await;
+                return;
+            }
+            LocalHealthDisposition::NotHealth => {}
+        }
         let route = match cache.lookup(parsed.hostname.as_str()).await {
             Ok(CacheLookup::Positive(route)) => route,
             Ok(CacheLookup::Negative(NegativeRoute::NotFound)) => {
@@ -369,12 +380,20 @@ struct ParsedInitialRequest {
     request_kind: RequestKind,
     body_framing: BodyFraming,
     connection_close: bool,
+    local_health: LocalHealthDisposition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyFraming {
     Fixed(usize),
     Chunked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalHealthDisposition {
+    NotHealth,
+    RespondOk,
+    Reject,
 }
 
 fn parse_request_head(bytes: &[u8], header_end: usize) -> Option<ParsedInitialRequest> {
@@ -477,11 +496,21 @@ fn parse_request_head(bytes: &[u8], header_end: usize) -> Option<ParsedInitialRe
     if request_kind == RequestKind::WebSocketUpgrade && body_framing != BodyFraming::Fixed(0) {
         return None;
     }
+    let local_health = if method == "GET" && request_target == "/healthz" {
+        if request_kind == RequestKind::Http && body_framing == BodyFraming::Fixed(0) {
+            LocalHealthDisposition::RespondOk
+        } else {
+            LocalHealthDisposition::Reject
+        }
+    } else {
+        LocalHealthDisposition::NotHealth
+    };
     Some(ParsedInitialRequest {
         hostname: host?,
         request_kind,
         body_framing,
         connection_close,
+        local_health,
     })
 }
 
@@ -741,5 +770,14 @@ async fn write_public_error(stream: &mut TcpStream, error: PublicError) {
         }
     };
     let _ = stream.write_all(response).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn write_local_health(stream: &mut TcpStream) {
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+        )
+        .await;
     let _ = stream.shutdown().await;
 }

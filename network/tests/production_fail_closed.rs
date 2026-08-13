@@ -81,6 +81,9 @@ fn shipped_gateway_binary_contains_only_terminal_route_v2_composition() {
         embedded_forbidden_surface(&binary)
     );
     for required in [
+        // The sole local operational route is an exact GET handled only after
+        // bounded public head parsing. Every application route uses v2.
+        "/healthz",
         "/v1/internal/routes/resolve",
         "/v1/internal/routes/tunnel",
         "/etc/cats/route-v2/node-server-ca-bundle.pem",
