@@ -168,6 +168,56 @@ const DEFAULT_SYSTEMD_CGROUP_ROOT: &str = "/sys/fs/cgroup/system.slice";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_BLOCK_CLASS_ROOT: &str = "/sys/class/block";
 const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
+const STATIC_SERVICE_CGROUP_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StaticServiceIdentity {
+    process_id: u32,
+    executable: PathBuf,
+    control_group: String,
+    expected_units: BTreeSet<Id>,
+}
+
+impl StaticServiceIdentity {
+    fn from_process_facts(process_id: u32, executable: PathBuf, cgroup: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(cgroup).ok()?;
+        let mut unified = text.lines().filter_map(|line| line.strip_prefix("0::"));
+        let control_group = unified.next()?;
+        if unified.next().is_some() {
+            return None;
+        }
+        let agent_unit = control_group.strip_prefix("/system.slice/")?;
+        if agent_unit.contains('/') {
+            return None;
+        }
+        let expected_names = match agent_unit {
+            "cats-noded.service" => ["cats-noded.service", "cats-controld.service"],
+            "cats-worker.service" => ["cats-worker.service", "cats-postgres-url.service"],
+            _ => return None,
+        };
+        let expected_units = expected_names
+            .into_iter()
+            .map(Id::new)
+            .collect::<Option<BTreeSet<_>>>()?;
+        Some(Self {
+            process_id,
+            executable,
+            control_group: control_group.to_owned(),
+            expected_units,
+        })
+    }
+
+    fn discover(proc_root: &Path) -> Option<Self> {
+        let process_id = std::process::id();
+        let process = proc_root.join(process_id.to_string());
+        let executable = std::fs::read_link(process.join("exe")).ok()?;
+        let cgroup = std::fs::read(process.join("cgroup")).ok()?;
+        if cgroup.len() > STATIC_SERVICE_CGROUP_MAX_BYTES {
+            return None;
+        }
+        Self::from_process_facts(process_id, executable, &cgroup)
+    }
+}
 
 /// Read-only classification consumed by the serialized pre-scan mutation
 /// lane. Classification never repairs, removes, or rewrites an entry.
@@ -1018,6 +1068,7 @@ struct ProbeConfig {
     cloud_hypervisor_binary: PathBuf,
     blockd_binary: PathBuf,
     guest_agent_binary: PathBuf,
+    static_service_identity: Option<StaticServiceIdentity>,
     linux_sources_supported: bool,
     limits: ProbeLimits,
     root_process_port: Option<Arc<dyn RootProvisionProcessPort>>,
@@ -1050,6 +1101,8 @@ impl ProbeConfig {
             );
         }
         let checkpoint_directory = config.state_directory.path().join(CHECKPOINT_NAMESPACE);
+        let proc_root = PathBuf::from(DEFAULT_PROC_ROOT);
+        let static_service_identity = StaticServiceIdentity::discover(&proc_root);
         let managed_blockd_socket_root =
             Arc::new(RetainedManagedBlockdSocketRoot::open_installed()?);
         let blockd_socket_intents = Arc::new(BlockdSocketIntentStore::open_existing(
@@ -1084,7 +1137,7 @@ impl ProbeConfig {
         Ok(Self {
             state_directory: config.state_directory.clone(),
             checkpoint_directory,
-            proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
+            proc_root,
             systemd_cgroup_root: PathBuf::from(DEFAULT_SYSTEMD_CGROUP_ROOT),
             metering_cgroup_root: config.metering_cgroup_root,
             block_class_root: PathBuf::from(DEFAULT_BLOCK_CLASS_ROOT),
@@ -1093,6 +1146,7 @@ impl ProbeConfig {
             cloud_hypervisor_binary: config.cloud_hypervisor_binary,
             blockd_binary: config.blockd_binary,
             guest_agent_binary: config.guest_agent_binary,
+            static_service_identity,
             linux_sources_supported: cfg!(target_os = "linux"),
             limits: ProbeLimits::default(),
             root_process_port: Some(Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
@@ -1172,11 +1226,8 @@ pub(crate) fn installed_root_process_effect_ports(
     let config = ProbeConfig::installed(config)?;
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
-        binaries: vec![
-            config.cloud_hypervisor_binary.clone(),
-            config.blockd_binary.clone(),
-            config.guest_agent_binary.clone(),
-        ],
+        binaries: managed_process_binaries(&config),
+        current_static_service: config.static_service_identity.clone(),
         supported: config.linux_sources_supported,
         limits: config.limits,
     };
@@ -1206,6 +1257,18 @@ pub(crate) fn installed_root_process_effect_ports(
         #[cfg(target_os = "linux")]
         stale_boot_vmm,
     })
+}
+
+fn managed_process_binaries(config: &ProbeConfig) -> Vec<PathBuf> {
+    let mut binaries = vec![
+        config.cloud_hypervisor_binary.clone(),
+        config.blockd_binary.clone(),
+        config.guest_agent_binary.clone(),
+    ];
+    if let Some(identity) = &config.static_service_identity {
+        binaries.push(identity.executable.clone());
+    }
+    binaries
 }
 
 #[cfg(test)]
@@ -1277,6 +1340,7 @@ fn clean_slate_scanner_with_metadata_for_test(
             cloud_hypervisor_binary: config.cloud_hypervisor_binary,
             blockd_binary: config.blockd_binary,
             guest_agent_binary: config.guest_agent_binary,
+            static_service_identity: None,
             linux_sources_supported: true,
             limits: ProbeLimits::default(),
             root_process_port: None,
@@ -1321,11 +1385,8 @@ fn scanner_with_metadata_authority_and_blob(
     let state = config.state_directory.clone();
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
-        binaries: vec![
-            config.cloud_hypervisor_binary.clone(),
-            config.blockd_binary.clone(),
-            config.guest_agent_binary.clone(),
-        ],
+        binaries: managed_process_binaries(&config),
+        current_static_service: config.static_service_identity.clone(),
         supported: config.linux_sources_supported,
         limits: config.limits,
     };
@@ -1338,6 +1399,7 @@ fn scanner_with_metadata_authority_and_blob(
         Arc::new(SystemdProbe {
             systemd_root: config.systemd_cgroup_root.clone(),
             metering_root: config.metering_cgroup_root.clone(),
+            static_service_identity: config.static_service_identity.clone(),
             supported: config.linux_sources_supported,
             limits: config.limits,
         }),
@@ -1396,6 +1458,7 @@ fn scanner_with_metadata_authority_and_blob(
             guest_process_paths: ProcessPaths {
                 root: config.proc_root.clone(),
                 binaries: vec![config.guest_agent_binary.clone()],
+                current_static_service: None,
                 supported: config.linux_sources_supported,
                 limits: config.limits,
             },
@@ -1471,6 +1534,7 @@ fn platform_root_process_inventory_bridge(
         state_directory: config.state_directory.clone(),
         process_paths,
         systemd_root: config.systemd_cgroup_root.clone(),
+        static_service_identity: config.static_service_identity.clone(),
         metering_root: config.metering_cgroup_root.clone(),
         legacy_socket_root: config.legacy_socket_root.clone(),
         limits: config.limits,
@@ -3463,6 +3527,7 @@ struct PlatformRootProcessInventoryBridge {
     state_directory: StateDirectory,
     process_paths: ProcessPaths,
     systemd_root: PathBuf,
+    static_service_identity: Option<StaticServiceIdentity>,
     metering_root: Option<PathBuf>,
     legacy_socket_root: PathBuf,
     limits: ProbeLimits,
@@ -3909,13 +3974,22 @@ impl PlatformRootProcessInventoryBridge {
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<ProbeFact> {
         let mut budget = self.limits.os_entries;
+        let no_static_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_static_units);
         let systemd = scan_cgroup_tree_allowing(
             &self.systemd_root,
             CgroupKind::Systemd,
             0,
             &mut budget,
             self.limits.recursion_depth,
-            allowed_units,
+            SystemdUnitAllowances {
+                managed: allowed_units,
+                static_at_root: static_units,
+            },
             context,
         )?;
         let metering = if let Some(root) = &self.metering_root {
@@ -3925,7 +3999,10 @@ impl PlatformRootProcessInventoryBridge {
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
-                &BTreeSet::new(),
+                SystemdUnitAllowances {
+                    managed: &BTreeSet::new(),
+                    static_at_root: &BTreeSet::new(),
+                },
                 context,
             )?
         } else {
@@ -4062,6 +4139,12 @@ impl PlatformRootProcessInventoryBridge {
             return Ok(ProbeFact::Present);
         }
         let mut budget = self.limits.os_entries;
+        let no_static_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_static_units);
         let mut allowed_units = BTreeSet::new();
         let mut allowed_pids = BTreeSet::new();
         let mut allowed_sockets = BTreeSet::new();
@@ -4143,7 +4226,10 @@ impl PlatformRootProcessInventoryBridge {
             0,
             &mut budget,
             self.limits.recursion_depth,
-            &allowed_units,
+            SystemdUnitAllowances {
+                managed: &allowed_units,
+                static_at_root: static_units,
+            },
             &physical,
         )?;
         let metering = if let Some(root) = &self.metering_root {
@@ -4153,7 +4239,10 @@ impl PlatformRootProcessInventoryBridge {
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
-                &BTreeSet::new(),
+                SystemdUnitAllowances {
+                    managed: &BTreeSet::new(),
+                    static_at_root: &BTreeSet::new(),
+                },
                 &physical,
             )?
         } else {
@@ -5456,6 +5545,7 @@ impl InventoryAbsenceProbe for StateNamespaceProbe {
 struct ProcessPaths {
     root: PathBuf,
     binaries: Vec<PathBuf>,
+    current_static_service: Option<StaticServiceIdentity>,
     supported: bool,
     limits: ProbeLimits,
 }
@@ -5482,6 +5572,7 @@ impl InventoryAbsenceProbe for ProcessProbe {
 struct SystemdProbe {
     systemd_root: PathBuf,
     metering_root: Option<PathBuf>,
+    static_service_identity: Option<StaticServiceIdentity>,
     supported: bool,
     limits: ProbeLimits,
 }
@@ -5501,21 +5592,35 @@ impl InventoryAbsenceProbe for SystemdProbe {
             return Ok(InventoryAbsence::Unavailable);
         }
         let mut budget = self.limits.os_entries;
-        let mut facts = vec![scan_cgroup_tree(
+        let no_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_units);
+        let mut facts = vec![scan_cgroup_tree_allowing(
             &self.systemd_root,
             CgroupKind::Systemd,
             0,
             &mut budget,
             self.limits.recursion_depth,
+            SystemdUnitAllowances {
+                managed: &no_units,
+                static_at_root: static_units,
+            },
             context,
         )?];
         if let Some(root) = &self.metering_root {
-            facts.push(scan_cgroup_tree(
+            facts.push(scan_cgroup_tree_allowing(
                 root,
                 CgroupKind::DedicatedMeteringRoot,
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
+                SystemdUnitAllowances {
+                    managed: &no_units,
+                    static_at_root: &no_units,
+                },
                 context,
             )?);
         }
@@ -7091,23 +7196,10 @@ enum CgroupKind {
     DedicatedMeteringRoot,
 }
 
-fn scan_cgroup_tree(
-    root: &Path,
-    kind: CgroupKind,
-    depth: usize,
-    budget: &mut usize,
-    depth_cap: usize,
-    context: &dyn RuntimePhysicalReadContext,
-) -> anyhow::Result<ProbeFact> {
-    scan_cgroup_tree_allowing(
-        root,
-        kind,
-        depth,
-        budget,
-        depth_cap,
-        &BTreeSet::new(),
-        context,
-    )
+#[derive(Clone, Copy)]
+struct SystemdUnitAllowances<'a> {
+    managed: &'a BTreeSet<Id>,
+    static_at_root: &'a BTreeSet<Id>,
 }
 
 fn scan_cgroup_tree_allowing(
@@ -7116,7 +7208,7 @@ fn scan_cgroup_tree_allowing(
     depth: usize,
     budget: &mut usize,
     depth_cap: usize,
-    allowed_systemd_units: &BTreeSet<Id>,
+    allowances: SystemdUnitAllowances<'_>,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
@@ -7180,10 +7272,10 @@ fn scan_cgroup_tree_allowing(
         };
         if candidate {
             let allowed = matches!(kind, CgroupKind::Systemd)
-                && name
-                    .to_str()
-                    .and_then(Id::new)
-                    .is_some_and(|unit| allowed_systemd_units.contains(&unit));
+                && name.to_str().and_then(Id::new).is_some_and(|unit| {
+                    allowances.managed.contains(&unit)
+                        || (depth == 0 && allowances.static_at_root.contains(&unit))
+                });
             if !allowed {
                 return Ok(ProbeFact::Present);
             }
@@ -7193,7 +7285,7 @@ fn scan_cgroup_tree_allowing(
                 depth + 1,
                 budget,
                 depth_cap,
-                allowed_systemd_units,
+                allowances,
                 context,
             )? {
                 ProbeFact::Present => return Ok(ProbeFact::Present),
@@ -7208,7 +7300,7 @@ fn scan_cgroup_tree_allowing(
             depth + 1,
             budget,
             depth_cap,
-            allowed_systemd_units,
+            allowances,
             context,
         )? {
             ProbeFact::Present => return Ok(ProbeFact::Present),
@@ -7227,15 +7319,11 @@ fn is_cats_unit(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    is_reserved_runtime_unit(name) && !is_static_agent_unit(name)
+    is_reserved_runtime_unit(name)
 }
 
 fn is_reserved_runtime_unit(name: &str) -> bool {
     name.starts_with("cats-") && (name.ends_with(".scope") || name.ends_with(".service"))
-}
-
-fn is_static_agent_unit(name: &str) -> bool {
-    matches!(name, "cats-noded.service" | "cats-worker.service")
 }
 
 fn scan_processes(
@@ -7268,7 +7356,16 @@ fn scan_processes_allowing(
         Err(source) => return Err(source).context("read proc root"),
     };
     let mut count = 0_usize;
-    let mut unavailable = false;
+    let static_process = paths
+        .current_static_service
+        .as_ref()
+        .map(|identity| inspect_static_service_process(paths, identity, context))
+        .transpose()?;
+    let mut unavailable = matches!(static_process, Some(StaticProcessInspection::Unavailable));
+    if matches!(static_process, Some(StaticProcessInspection::Conflict)) {
+        return Ok(ProbeFact::Present);
+    }
+    let mut saw_static_process = false;
     for entry in entries {
         context.check_active()?;
         let entry = match entry {
@@ -7304,6 +7401,14 @@ fn scan_processes_allowing(
         );
         let pid_path = entry.path();
         let process_id = name.to_str().and_then(|value| value.parse::<u32>().ok());
+        if process_id
+            == paths
+                .current_static_service
+                .as_ref()
+                .map(|identity| identity.process_id)
+        {
+            saw_static_process = true;
+        }
         let exe = std::fs::read_link(pid_path.join("exe"));
         let exe_matches = exe
             .as_ref()
@@ -7322,10 +7427,28 @@ fn scan_processes_allowing(
         } else {
             false
         };
-        if (exe_matches || cmdline_matches)
-            && !process_id.is_some_and(|process_id| allowed_pids.contains(&process_id))
-        {
-            return Ok(ProbeFact::Present);
+        if exe_matches || cmdline_matches {
+            let dynamically_allowed =
+                process_id.is_some_and(|process_id| allowed_pids.contains(&process_id));
+            let exact_static_process = process_id
+                == paths
+                    .current_static_service
+                    .as_ref()
+                    .map(|identity| identity.process_id)
+                && matches!(static_process, Some(StaticProcessInspection::Exact));
+            if !dynamically_allowed && !exact_static_process {
+                if process_id
+                    == paths
+                        .current_static_service
+                        .as_ref()
+                        .map(|identity| identity.process_id)
+                    && matches!(static_process, Some(StaticProcessInspection::Unavailable))
+                {
+                    unavailable = true;
+                } else {
+                    return Ok(ProbeFact::Present);
+                }
+            }
         }
         if let Err(source) = exe {
             unavailable |= source.kind() != io::ErrorKind::NotFound
@@ -7335,12 +7458,55 @@ fn scan_processes_allowing(
             unavailable = true;
         }
     }
+    if paths.current_static_service.is_some() && !saw_static_process {
+        unavailable = true;
+    }
     context.check_active()?;
     Ok(if unavailable {
         ProbeFact::Unavailable
     } else {
         ProbeFact::Empty
     })
+}
+
+#[derive(Clone, Copy)]
+enum StaticProcessInspection {
+    Exact,
+    Unavailable,
+    Conflict,
+}
+
+fn inspect_static_service_process(
+    paths: &ProcessPaths,
+    expected: &StaticServiceIdentity,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<StaticProcessInspection> {
+    context.check_active()?;
+    let process = paths.root.join(expected.process_id.to_string());
+    let executable = match std::fs::read_link(process.join("exe")) {
+        Ok(executable) => executable,
+        Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+            return Ok(StaticProcessInspection::Unavailable)
+        }
+        Err(source) => return Err(source).context("inspect current static service executable"),
+    };
+    let cgroup = match read_bounded_optional(
+        &process.join("cgroup"),
+        STATIC_SERVICE_CGROUP_MAX_BYTES,
+        context,
+    )? {
+        OptionalBytes::Bytes(cgroup) => cgroup,
+        OptionalBytes::Missing | OptionalBytes::Unavailable => {
+            return Ok(StaticProcessInspection::Unavailable)
+        }
+    };
+    context.check_active()?;
+    Ok(
+        match StaticServiceIdentity::from_process_facts(expected.process_id, executable, &cgroup) {
+            Some(observed) if &observed == expected => StaticProcessInspection::Exact,
+            Some(_) | None => StaticProcessInspection::Conflict,
+        },
+    )
 }
 
 enum OptionalBytes {
@@ -8838,6 +9004,7 @@ mod tests {
                 cloud_hypervisor_binary: self.ch_binary.clone(),
                 blockd_binary: self.blockd_binary.clone(),
                 guest_agent_binary: self.guest_binary.clone(),
+                static_service_identity: None,
                 linux_sources_supported: true,
                 limits: ProbeLimits::default(),
                 root_process_port: None,
@@ -10155,10 +10322,12 @@ mod tests {
             process_paths: ProcessPaths {
                 root: environment.proc_root.clone(),
                 binaries: vec![environment.blockd_binary.clone()],
+                current_static_service: None,
                 supported: true,
                 limits: ProbeLimits::default(),
             },
             systemd_root: environment.systemd_root.clone(),
+            static_service_identity: None,
             metering_root: None,
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
@@ -12097,6 +12266,7 @@ mod tests {
         let unavailable_process = ProcessPaths {
             root: environment.proc_root.clone(),
             binaries: vec![environment.guest_binary.clone()],
+            current_static_service: None,
             supported: false,
             limits,
         };
@@ -12111,6 +12281,7 @@ mod tests {
             Box::new(SystemdProbe {
                 systemd_root: environment.systemd_root.clone(),
                 metering_root: None,
+                static_service_identity: None,
                 supported: false,
                 limits,
             }),
@@ -12289,6 +12460,7 @@ mod tests {
         let systemd = SystemdProbe {
             systemd_root: environment.systemd_root.clone(),
             metering_root: None,
+            static_service_identity: None,
             supported: true,
             limits: ProbeLimits::default(),
         };
@@ -12302,6 +12474,7 @@ mod tests {
             paths: ProcessPaths {
                 root: environment.proc_root.clone(),
                 binaries: vec![environment.ch_binary.clone()],
+                current_static_service: None,
                 supported: true,
                 limits: ProbeLimits::default(),
             },
@@ -16925,45 +17098,100 @@ mod tests {
     }
 
     #[test]
-    fn systemd_global_sweep_allows_agent_units_but_reports_unknown_runtime_residue() {
-        let environment = TestEnvironment::new();
-        for agent_unit in ["cats-noded.service", "cats-worker.service"] {
-            std::fs::create_dir(environment.systemd_root.join(agent_unit)).unwrap();
+    fn node_global_sweep_allows_only_the_exact_current_static_service_pair() {
+        for (process_id, agent_unit, companion_unit, alternate_unit) in [
+            (
+                71,
+                "cats-noded.service",
+                "cats-controld.service",
+                "cats-worker.service",
+            ),
+            (
+                81,
+                "cats-worker.service",
+                "cats-postgres-url.service",
+                "cats-noded.service",
+            ),
+        ] {
+            let environment = TestEnvironment::new();
+            let executable = environment
+                .proc_root
+                .parent()
+                .unwrap()
+                .join("bin/cats-noded");
+            let control_group = format!("0::/system.slice/{agent_unit}\n");
+            let identity = StaticServiceIdentity::from_process_facts(
+                process_id,
+                executable.clone(),
+                control_group.as_bytes(),
+            )
+            .unwrap();
+            let process = environment.proc_root.join(process_id.to_string());
+            std::fs::create_dir(&process).unwrap();
+            std::os::unix::fs::symlink(&executable, process.join("exe")).unwrap();
+            let mut command_line = executable.as_os_str().as_bytes().to_vec();
+            command_line.push(0);
+            std::fs::write(process.join("cmdline"), &command_line).unwrap();
+            std::fs::write(process.join("cgroup"), &control_group).unwrap();
+            for expected in [agent_unit, companion_unit] {
+                std::fs::create_dir(environment.systemd_root.join(expected)).unwrap();
+            }
+            let process_paths = ProcessPaths {
+                root: environment.proc_root.clone(),
+                binaries: vec![executable.clone()],
+                current_static_service: Some(identity.clone()),
+                supported: true,
+                limits: ProbeLimits::default(),
+            };
+            let scan_systemd = || {
+                let mut budget = 32;
+                scan_cgroup_tree_allowing(
+                    &environment.systemd_root,
+                    CgroupKind::Systemd,
+                    0,
+                    &mut budget,
+                    4,
+                    SystemdUnitAllowances {
+                        managed: &BTreeSet::new(),
+                        static_at_root: &identity.expected_units,
+                    },
+                    &context(),
+                )
+                .unwrap()
+            };
+
+            assert_eq!(scan_systemd(), ProbeFact::Empty);
+            assert_eq!(
+                scan_processes(&process_paths, &context()).unwrap(),
+                ProbeFact::Empty
+            );
+
+            let unknown = environment
+                .systemd_root
+                .join("cats-serving-22222222222222222222222222222222.service");
+            std::fs::create_dir(&unknown).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir(unknown).unwrap();
+
+            let stale_alternate = environment.systemd_root.join(alternate_unit);
+            std::fs::create_dir(&stale_alternate).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir(stale_alternate).unwrap();
+
+            let alternate_slice = environment.systemd_root.join("alternate.slice");
+            std::fs::create_dir(&alternate_slice).unwrap();
+            std::fs::create_dir(alternate_slice.join(agent_unit)).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir_all(alternate_slice).unwrap();
+
+            let duplicate = environment.proc_root.join((process_id + 1).to_string());
+            std::fs::create_dir(&duplicate).unwrap();
+            std::os::unix::fs::symlink(&executable, duplicate.join("exe")).unwrap();
+            std::fs::write(duplicate.join("cmdline"), &command_line).unwrap();
+            assert_eq!(
+                scan_processes(&process_paths, &context()).unwrap(),
+                ProbeFact::Present
+            );
         }
-        let unknown_runtime = environment
-            .systemd_root
-            .join("cats-serving-22222222222222222222222222222222.service");
-        std::fs::create_dir(&unknown_runtime).unwrap();
-
-        // Calibrate the same reserved-namespace probe against a known residue
-        // before trusting the negative result for the production Agent units.
-        let mut budget = 16;
-        assert_eq!(
-            scan_cgroup_tree(
-                &environment.systemd_root,
-                CgroupKind::Systemd,
-                0,
-                &mut budget,
-                4,
-                &context(),
-            )
-            .unwrap(),
-            ProbeFact::Present
-        );
-
-        std::fs::remove_dir(unknown_runtime).unwrap();
-        let mut budget = 16;
-        assert_eq!(
-            scan_cgroup_tree(
-                &environment.systemd_root,
-                CgroupKind::Systemd,
-                0,
-                &mut budget,
-                4,
-                &context(),
-            )
-            .unwrap(),
-            ProbeFact::Empty
-        );
     }
 }
