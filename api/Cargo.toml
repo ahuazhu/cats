@@ -6,10 +6,10 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = []
-# Experimental implementation of docs/specs/node-residue-reclamation-v1.md.
-# The proposal is not part of the accepted Runtime Reconciliation V1 wire and
-# production crates do not enable this feature.
+default = ["proposed-node-residue-reclamation"]
+# Kept as a compatibility feature name while the exact N2 wire is the default
+# production shape. A no-default-features build exercises only the retired
+# pre-N2 decoder and is not a deployable Runtime protocol.
 proposed-node-residue-reclamation = []
 
 [dependencies]

@@ -6,9 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = []
-# Experimental forwarding seam for docs/specs/node-residue-reclamation-v1.md.
-# Production V1 does not enable this feature and retains its frozen A20 wire.
+default = ["proposed-node-residue-reclamation"]
+# Kept as a compatibility feature name while N2 is the default production
+# scanner, A20 wire and residue-authority client shape.
 proposed-node-residue-reclamation = [
     "cats-api/proposed-node-residue-reclamation",
     "cats-storage/proposed-node-residue-reclamation",

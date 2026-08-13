@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = []
+default = ["proposed-node-residue-reclamation"]
 proposed-node-residue-reclamation = [
     "cats-api/proposed-node-residue-reclamation",
     "cats-storage/proposed-node-residue-reclamation",

@@ -190,7 +190,7 @@ pub(crate) use kernel_nbd::{
 pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
 #[cfg(feature = "proposed-node-residue-reclamation")]
-pub use normal_acquire::RuntimeVolumeTransitionHttpClient as ProposedResidueAuthorityHttpClient;
+pub use normal_acquire::RuntimeVolumeTransitionHttpClient as ResidueAuthorityHttpClient;
 pub use normal_acquire::{
     recover_lifecycle_release_from_authority, recover_normal_acquire_from_authority,
     recover_normal_release_from_authority, A19SignedVolumeTransitionTransport,

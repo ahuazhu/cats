@@ -1269,9 +1269,8 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     #[tokio::test]
-    async fn proposed_residue_authority_route_is_not_installed() {
+    async fn production_router_installs_the_residue_authority_route_by_default() {
         let context = Context::new().await;
         let node = context.register("residue", '7').await;
         let response = context
@@ -1283,8 +1282,13 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(decode_runtime_volume_transition_error(&response.bytes().await.unwrap()).is_err());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error =
+            decode_runtime_volume_transition_error(&response.bytes().await.unwrap()).unwrap();
+        assert!(matches!(
+            error.error.as_ref(),
+            RuntimeVolumeTransitionErrorDetail::ContractError { .. }
+        ));
     }
 
     #[tokio::test]
