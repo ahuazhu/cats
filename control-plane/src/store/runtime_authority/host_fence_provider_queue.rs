@@ -165,7 +165,7 @@ fn validate_request_binding(request: &HostFenceAttemptRequest) -> AuthorityTxRes
     Ok(())
 }
 
-fn load_queue_for_update(
+pub(super) fn load_queue_for_update(
     transaction: &mut Transaction<'_>,
     fence_attempt_id: &Id,
 ) -> AuthorityTxResult<Option<HostFenceProviderQueueRecordV1>> {
@@ -182,6 +182,80 @@ fn load_queue_for_update(
         .as_ref()
         .map(decode_queue_row)
         .transpose()
+}
+
+/// Transaction-local queue producer used by the Host-scoped recovery seal.
+///
+/// Keeping the object-writer cutoff and queue insert in the caller's
+/// transaction lets Control add its immutable assigned-set barrier without a
+/// window in which the provider can act on an attempt that has no product
+/// recovery authority. Exact queue replay remains available to the legacy
+/// owner-side seam, but a batch producer must reject an existing queue row
+/// when its corresponding recovery-attempt row is absent.
+pub(super) fn enqueue_host_fence_provider_attempt_in(
+    transaction: &mut Transaction<'_>,
+    request: &HostFenceAttemptRequest,
+) -> AuthorityTxResult<HostFenceProviderQueueRecordV1> {
+    validate_request_binding(request)?;
+    let bytes = canonical_request_bytes(request)?;
+    let digest = request_sha256(&bytes);
+    if let Some(existing) = load_queue_for_update(transaction, &request.binding.fence_attempt_id)? {
+        return exact_replay_or_conflict(existing, request, &digest);
+    }
+
+    lock_current_source(transaction, request)?;
+    // A missing-row SELECT has no PostgreSQL gap lock. The exact NodeIdentity
+    // lock above serializes concurrent attempts for one source, so recheck
+    // after acquiring it before starting a second cutoff or racing the
+    // immutable queue primary key.
+    if let Some(existing) = load_queue_for_update(transaction, &request.binding.fence_attempt_id)? {
+        return exact_replay_or_conflict(existing, request, &digest);
+    }
+    let now = database_now(transaction)?;
+    let authority = begin_object_writer_cutoff_in(
+        transaction,
+        &request.object_writer.writer_authority_id,
+        &request.binding.fence_attempt_id,
+        now,
+    )?;
+    validate_cutoff_authority(request, &authority)?;
+    let inserted = transaction.execute(
+        "INSERT INTO host_fence_provider_queue_v1 (
+            fence_attempt_id, request_bytes, request_sha256,
+            provider, host_partition, host_account_id, host_region,
+            immutable_host_id, node_id, expected_node_boot_id,
+            expected_agent_session_epoch, writer_authority_id,
+            workload_principal_id, object_store_scope_id,
+            network_quarantine_boundary_id, state,
+            claim_generation, renew_generation, enqueued_at_unix_ms
+         ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+            'pending',0,0,$16
+         )",
+        &[
+            &request.binding.fence_attempt_id.as_str(),
+            &bytes,
+            &digest.as_str(),
+            &request.binding.provider_scope.provider.as_str(),
+            &request.binding.provider_scope.partition.as_str(),
+            &request.binding.provider_scope.account_id.as_str(),
+            &request.binding.provider_scope.region.as_str(),
+            &request.binding.immutable_host_id.as_str(),
+            &request.binding.node_id.as_str(),
+            &request.binding.expected_node_boot_id.as_str(),
+            &pg(request.binding.expected_agent_session_epoch.get())?,
+            &request.object_writer.writer_authority_id.as_str(),
+            &request.object_writer.workload_principal_id.as_str(),
+            &request.object_writer.object_store_scope_id.as_str(),
+            &request.network_quarantine_boundary_id.as_str(),
+            &pg(now.get())?,
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(corrupt("Host-fence provider queue insert changed no row"));
+    }
+    load_queue_for_update(transaction, &request.binding.fence_attempt_id)?
+        .ok_or_else(|| corrupt("Host-fence provider queue row disappeared after insert"))
 }
 
 fn exact_replay_or_conflict(
@@ -365,70 +439,7 @@ impl Store {
         request: &HostFenceAttemptRequest,
     ) -> crate::store::Result<HostFenceProviderQueueRecordV1> {
         self.authority_transaction(|transaction| {
-            validate_request_binding(request)?;
-            let bytes = canonical_request_bytes(request)?;
-            let digest = request_sha256(&bytes);
-            if let Some(existing) =
-                load_queue_for_update(transaction, &request.binding.fence_attempt_id)?
-            {
-                return exact_replay_or_conflict(existing, request, &digest);
-            }
-
-            lock_current_source(transaction, request)?;
-            // A missing-row SELECT has no PostgreSQL gap lock. The exact
-            // NodeIdentity lock above serializes concurrent attempts for one
-            // source, so recheck after acquiring it before starting a second
-            // cutoff or racing the immutable queue primary key.
-            if let Some(existing) =
-                load_queue_for_update(transaction, &request.binding.fence_attempt_id)?
-            {
-                return exact_replay_or_conflict(existing, request, &digest);
-            }
-            let now = database_now(transaction)?;
-            let authority = begin_object_writer_cutoff_in(
-                transaction,
-                &request.object_writer.writer_authority_id,
-                &request.binding.fence_attempt_id,
-                now,
-            )?;
-            validate_cutoff_authority(request, &authority)?;
-            let inserted = transaction.execute(
-                "INSERT INTO host_fence_provider_queue_v1 (
-                    fence_attempt_id, request_bytes, request_sha256,
-                    provider, host_partition, host_account_id, host_region,
-                    immutable_host_id, node_id, expected_node_boot_id,
-                    expected_agent_session_epoch, writer_authority_id,
-                    workload_principal_id, object_store_scope_id,
-                    network_quarantine_boundary_id, state,
-                    claim_generation, renew_generation, enqueued_at_unix_ms
-                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                    'pending',0,0,$16
-                 )",
-                &[
-                    &request.binding.fence_attempt_id.as_str(),
-                    &bytes,
-                    &digest.as_str(),
-                    &request.binding.provider_scope.provider.as_str(),
-                    &request.binding.provider_scope.partition.as_str(),
-                    &request.binding.provider_scope.account_id.as_str(),
-                    &request.binding.provider_scope.region.as_str(),
-                    &request.binding.immutable_host_id.as_str(),
-                    &request.binding.node_id.as_str(),
-                    &request.binding.expected_node_boot_id.as_str(),
-                    &pg(request.binding.expected_agent_session_epoch.get())?,
-                    &request.object_writer.writer_authority_id.as_str(),
-                    &request.object_writer.workload_principal_id.as_str(),
-                    &request.object_writer.object_store_scope_id.as_str(),
-                    &request.network_quarantine_boundary_id.as_str(),
-                    &pg(now.get())?,
-                ],
-            )?;
-            if inserted != 1 {
-                return Err(corrupt("Host-fence provider queue insert changed no row"));
-            }
-            load_queue_for_update(transaction, &request.binding.fence_attempt_id)?
-                .ok_or_else(|| corrupt("Host-fence provider queue row disappeared after insert"))
+            enqueue_host_fence_provider_attempt_in(transaction, request)
         })
     }
 
