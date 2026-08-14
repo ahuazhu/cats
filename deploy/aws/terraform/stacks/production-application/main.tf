@@ -30,6 +30,7 @@ resource "terraform_data" "aws_target" {
 module "cats_kubernetes" {
   source = "../../modules/cats-kubernetes"
 
+  namespace                                  = "cats"
   control_plane_image                        = var.control_plane_image
   control_plane_replicas                     = var.control_plane_replicas
   gateway_image                              = var.gateway_image

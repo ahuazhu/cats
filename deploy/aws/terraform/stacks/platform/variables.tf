@@ -333,28 +333,6 @@ variable "metal_worker_ssh_from_instance_connect" {
   default     = true
 }
 
-variable "object_write_gateway_namespace" {
-  description = "Kubernetes namespace containing the repository-owned ObjectWrite Gateway."
-  type        = string
-  default     = "cats"
-
-  validation {
-    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.object_write_gateway_namespace))
-    error_message = "object_write_gateway_namespace must be a DNS-label Kubernetes namespace."
-  }
-}
-
-variable "object_write_gateway_service_account" {
-  description = "Dedicated Kubernetes ServiceAccount whose Pod Identity is the only ChunkStore PutObject principal."
-  type        = string
-  default     = "cats-object-write-gateway"
-
-  validation {
-    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.object_write_gateway_service_account))
-    error_message = "object_write_gateway_service_account must be a DNS-label Kubernetes ServiceAccount name."
-  }
-}
-
 variable "host_fence_provider_namespace" {
   description = "Kubernetes namespace containing the AWS HostFence provider."
   type        = string

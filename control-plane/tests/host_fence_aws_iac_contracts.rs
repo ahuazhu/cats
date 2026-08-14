@@ -77,8 +77,21 @@ fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
         "resource \"aws_eks_pod_identity_association\" \"object_write_gateway\"",
         "# HostFence provider permissions",
     );
-    assert!(association.contains("service_account = var.object_write_gateway_service_account"));
+    assert!(association.contains("namespace       = \"cats\""));
+    assert!(association.contains("service_account = \"cats-object-write-gateway\""));
     assert!(association.contains("role_arn        = aws_iam_role.object_write_gateway.arn"));
+
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    let kubernetes_module = between(&application, "module \"cats_kubernetes\"", "# Public DNS.");
+    assert!(kubernetes_module.contains("namespace                                  = \"cats\""));
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let gateway_service_account = between(
+        &kubernetes,
+        "resource \"kubernetes_service_account_v1\" \"object_write_gateway\"",
+        "# Terraform receives only the immutable Secret name.",
+    );
+    assert!(gateway_service_account.contains("name      = \"cats-object-write-gateway\""));
 }
 
 #[test]
@@ -151,7 +164,7 @@ fn host_fence_mutations_are_exact_targets_and_network_is_secondary_only() {
 }
 
 #[test]
-fn chunkstore_scope_and_service_accounts_are_explicit_validated_inputs() {
+fn chunkstore_scope_and_provider_service_accounts_are_exact() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let prefix = between(
         &variables,
@@ -166,9 +179,9 @@ fn chunkstore_scope_and_service_accounts_are_explicit_validated_inputs() {
     ] {
         assert!(prefix.contains(contract));
     }
+    assert!(!variables.contains("variable \"object_write_gateway_namespace\""));
+    assert!(!variables.contains("variable \"object_write_gateway_service_account\""));
     for input in [
-        "variable \"object_write_gateway_namespace\"",
-        "variable \"object_write_gateway_service_account\"",
         "variable \"host_fence_provider_namespace\"",
         "variable \"host_fence_provider_service_account\"",
     ] {
@@ -261,8 +274,7 @@ fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
         "resource \"aws_efs_mount_target\" \"object_write_spool\"",
         "resource \"aws_efs_access_point\" \"object_write_spool\"",
     );
-    assert!(mount_targets
-        .contains("depends_on = [aws_efs_file_system_policy.object_write_spool]"));
+    assert!(mount_targets.contains("depends_on = [aws_efs_file_system_policy.object_write_spool]"));
 
     let file_system_policy = between(
         &platform,

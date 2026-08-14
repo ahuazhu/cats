@@ -650,8 +650,8 @@ resource "aws_iam_role_policy" "object_write_gateway_chunkstore" {
 
 resource "aws_eks_pod_identity_association" "object_write_gateway" {
   cluster_name    = module.cluster.cluster_name
-  namespace       = var.object_write_gateway_namespace
-  service_account = var.object_write_gateway_service_account
+  namespace       = "cats"
+  service_account = "cats-object-write-gateway"
   role_arn        = aws_iam_role.object_write_gateway.arn
 
   tags = var.tags
