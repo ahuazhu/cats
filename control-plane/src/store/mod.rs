@@ -49,6 +49,13 @@ pub use runtime_authority::host_fence_commit::{
     TrustedHostFenceRecoveryCommitReceiptV1, TrustedHostFenceRecoveryCommitV1,
     TrustedTakeoverAuthorizationV1,
 };
+pub use runtime_authority::host_fence_provider_queue::{
+    HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
+    HostFenceProviderQueueRecordV1, HostFenceProviderQueueStateV1, PgObjectWriteCutoffPort,
+    HOST_FENCE_PROVIDER_EVIDENCE_MAX_BYTES, HOST_FENCE_PROVIDER_LEASE_MAX_MS,
+    HOST_FENCE_PROVIDER_POSTGRES_ROLE, HOST_FENCE_PROVIDER_QUEUE_VERSION_V1,
+    HOST_FENCE_PROVIDER_REQUEST_MAX_BYTES,
+};
 pub use work::WorkLeaseGuard;
 
 use rows::{

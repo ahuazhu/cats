@@ -1116,6 +1116,44 @@ fn advance_terminal_prefix_in(
     Ok(updated)
 }
 
+/// Close one exact writer authority inside a caller-owned transaction.
+///
+/// Host-fence queue admission must make the parent/credential cutoff and the
+/// sealed provider request visible in the same PostgreSQL commit.  Keeping
+/// this narrow transaction-local seam here preserves the object-write lock
+/// order and transition validation without giving the provider worker raw
+/// table access.
+pub(super) fn begin_object_writer_cutoff_in(
+    transaction: &mut Transaction<'_>,
+    writer_authority_id: &Id,
+    fence_attempt_id: &Id,
+    cutoff_effective_at_unix_ms: UnixMillis,
+) -> AuthorityTxResult<ObjectWriteAuthority> {
+    let Some(authority) = load_authority_for_update(transaction, writer_authority_id)? else {
+        return Err(application(ApiError::not_found("ObjectWriteAuthority")));
+    };
+    let credentials = load_authority_credentials_for_update(transaction, writer_authority_id)?;
+    let (updated, retired) = begin_object_writer_cutoff(
+        &authority,
+        &credentials,
+        fence_attempt_id,
+        cutoff_effective_at_unix_ms,
+    )
+    .map_err(|error| application(ApiError::failed_precondition(error.to_string())))?;
+    for credential in &retired {
+        if matches!(credential.state, ObjectWriteCredentialState::Retired { .. })
+            && credentials.iter().any(|stored| {
+                stored.credential.credential_id == credential.credential.credential_id
+                    && matches!(stored.state, ObjectWriteCredentialState::Active)
+            })
+        {
+            persist_retired_credential(transaction, credential)?;
+        }
+    }
+    persist_authority(transaction, &updated)?;
+    Ok(updated)
+}
+
 impl Store {
     pub fn register_object_write_credential(
         &self,
@@ -1476,31 +1514,12 @@ impl Store {
         cutoff_effective_at_unix_ms: UnixMillis,
     ) -> crate::store::Result<ObjectWriteAuthority> {
         self.authority_transaction(|transaction| {
-            let Some(authority) = load_authority_for_update(transaction, writer_authority_id)?
-            else {
-                return Err(application(ApiError::not_found("ObjectWriteAuthority")));
-            };
-            let credentials =
-                load_authority_credentials_for_update(transaction, writer_authority_id)?;
-            let (updated, retired) = begin_object_writer_cutoff(
-                &authority,
-                &credentials,
+            begin_object_writer_cutoff_in(
+                transaction,
+                writer_authority_id,
                 fence_attempt_id,
                 cutoff_effective_at_unix_ms,
             )
-            .map_err(|error| application(ApiError::failed_precondition(error.to_string())))?;
-            for credential in &retired {
-                if matches!(credential.state, ObjectWriteCredentialState::Retired { .. })
-                    && credentials.iter().any(|stored| {
-                        stored.credential.credential_id == credential.credential.credential_id
-                            && matches!(stored.state, ObjectWriteCredentialState::Active)
-                    })
-                {
-                    persist_retired_credential(transaction, credential)?;
-                }
-            }
-            persist_authority(transaction, &updated)?;
-            Ok(updated)
         })
     }
 }

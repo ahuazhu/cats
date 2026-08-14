@@ -187,6 +187,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
                 .map_err(internal)?;
         }
         transaction.batch_execute(SCHEMA).map_err(internal)?;
+        install_host_fence_provider_functions(&mut transaction)?;
         transaction
             .execute(
                 "INSERT INTO control_schema_version (singleton, version) VALUES (TRUE, $1)",
@@ -235,6 +236,225 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
         })?;
     }
     verify_authority_catalog(transaction)?;
+    verify_host_fence_provider_function_catalog(transaction)?;
+    Ok(())
+}
+
+fn quote_identifier(identifier: &str) -> Result<String> {
+    if identifier.is_empty() || identifier.as_bytes().contains(&0) {
+        return Err(ApiError::failed_precondition(
+            "control schema has an invalid PostgreSQL identifier",
+        ));
+    }
+    Ok(format!("\"{}\"", identifier.replace('"', "\"\"")))
+}
+
+fn quote_literal(value: &str) -> Result<String> {
+    if value.as_bytes().contains(&0) {
+        return Err(ApiError::failed_precondition(
+            "control schema has an invalid PostgreSQL literal",
+        ));
+    }
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+fn install_host_fence_provider_functions(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<()> {
+    let schema: String = transaction
+        .query_one("SELECT current_schema()::TEXT", &[])
+        .map_err(internal)?
+        .try_get(0)
+        .map_err(internal)?;
+    let schema_identifier = quote_identifier(&schema)?;
+    let schema_literal = quote_literal(&schema)?;
+    let functions = HOST_FENCE_PROVIDER_FUNCTIONS
+        .replace("__CATS_SCHEMA_IDENT__", &schema_identifier)
+        .replace("__CATS_SCHEMA_LITERAL__", &schema_literal);
+    transaction.batch_execute(&functions).map_err(|error| {
+        let detail = error
+            .as_db_error()
+            .map(|database| {
+                format!(
+                    "{}{}",
+                    database.message(),
+                    database
+                        .position()
+                        .map(|position| format!(" at {position:?}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| error.to_string());
+        internal(format!(
+            "install Host-fence provider PostgreSQL functions: {detail}"
+        ))
+    })
+}
+
+/// The provider process is intentionally limited to a small, immutable
+/// function surface.  Verify the properties which make those functions a
+/// privilege boundary on every stamped-schema startup; a missing REVOKE or a
+/// changed owner must never be silently repaired.
+fn verify_host_fence_provider_function_catalog(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<()> {
+    let public_execute_is_closed: bool = transaction
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                  FROM pg_proc function
+                  JOIN pg_namespace namespace
+                    ON namespace.oid=function.pronamespace
+                  CROSS JOIN LATERAL aclexplode(COALESCE(
+                      function.proacl, acldefault('f', function.proowner)
+                  )) privilege
+                 WHERE namespace.nspname=current_schema()
+                   AND privilege.grantee=0
+                   AND privilege.privilege_type='EXECUTE'
+            )",
+            &[],
+        )
+        .map_err(internal)?
+        .get(0);
+    if !public_execute_is_closed {
+        return Err(partial_catalog_object(
+            "schema-wide PUBLIC function EXECUTE closure",
+        ));
+    }
+    const FUNCTIONS: &[(&str, i16, bool, &str, &str)] = &[
+        (
+            "control_host_fence_provider_frame_v1",
+            1,
+            false,
+            "sql",
+            "b5fef9cc3b79242c39d03d8873917ff435dc0800879c258810e877a8c95a86a0",
+        ),
+        (
+            "control_host_fence_provider_startup_v1",
+            0,
+            true,
+            "plpgsql",
+            "37c3f7be861f1951bb868ae6556eaf732cb3b3f7943d4932d0e056a5493414fb",
+        ),
+        (
+            "control_host_fence_provider_claim_v1",
+            7,
+            true,
+            "plpgsql",
+            "ca7e243833c40c8748da7e7956cc56615d9f90939018fc4c5799cb82ede61d02",
+        ),
+        (
+            "control_host_fence_provider_renew_v1",
+            4,
+            true,
+            "plpgsql",
+            "2cc610961a74fd2e7d74a09920a8d4f984463dba2b88909961d656e0ab1a1e93",
+        ),
+        (
+            "control_host_fence_provider_object_cutoff_v1",
+            2,
+            true,
+            "plpgsql",
+            "9a410a815665459b13ac42144351c65ad4c40d58e6687d9648355938b496297c",
+        ),
+        (
+            "control_host_fence_provider_complete_v1",
+            4,
+            true,
+            "plpgsql",
+            "7114b4a93c12928948245529aab9d31d8c6e177e23b4e54978c3825a7dd17659",
+        ),
+        (
+            "control_host_fence_provider_read_v1",
+            2,
+            true,
+            "plpgsql",
+            "764f366828187b24e75552a4f7ec057d2c195a62c893b126c20d8c0577c3ac9c",
+        ),
+    ];
+    for (name, arguments, security_definer, language, body_sha256) in FUNCTIONS {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_proc function
+                      JOIN pg_namespace namespace
+                        ON namespace.oid=function.pronamespace
+                      JOIN pg_language language ON language.oid=function.prolang
+                     WHERE namespace.nspname=current_schema()
+                       AND function.proname=$1
+                       AND function.pronargs=$2
+                       AND function.prosecdef=$3
+                       AND language.lanname=$4
+                       AND encode(sha256(convert_to(
+                           replace(replace(
+                               function.prosrc,
+                               chr(34) || current_schema() || chr(34),
+                               '__CATS_SCHEMA_IDENT__'
+                           ),
+                           quote_literal(current_schema()),
+                           '__CATS_SCHEMA_LITERAL__'
+                       ), 'UTF8')), 'hex')=$5
+                       AND function.proconfig =
+                           ARRAY['search_path=pg_catalog, pg_temp']::TEXT[]
+                       AND function.proowner=(
+                           SELECT schema.nspowner
+                             FROM pg_namespace schema
+                            WHERE schema.nspname=current_schema()
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM aclexplode(COALESCE(
+                                  function.proacl,
+                                  acldefault('f', function.proowner)
+                             )) privilege
+                            WHERE privilege.grantee=0
+                              AND privilege.privilege_type='EXECUTE'
+                       )
+                )",
+                &[name, arguments, security_definer, language, body_sha256],
+            )
+            .map_err(internal)?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(name));
+        }
+    }
+    let parent_guard_is_safe: bool = transaction
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_proc function
+                  JOIN pg_namespace namespace
+                    ON namespace.oid=function.pronamespace
+                  JOIN pg_language language ON language.oid=function.prolang
+                 WHERE namespace.nspname=current_schema()
+                   AND function.proname='object_write_credential_parent_guard'
+                   AND function.pronargs=0 AND function.prosecdef
+                   AND language.lanname='plpgsql'
+                   AND function.proowner=namespace.nspowner
+                   AND function.proconfig = ARRAY[
+                       'search_path=' || current_schema() || ', pg_catalog, pg_temp'
+                   ]::TEXT[]
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM aclexplode(COALESCE(
+                              function.proacl,
+                              acldefault('f', function.proowner)
+                         )) privilege
+                        WHERE privilege.grantee=0
+                          AND privilege.privilege_type='EXECUTE'
+                   )
+            )",
+            &[],
+        )
+        .map_err(internal)?
+        .get(0);
+    if !parent_guard_is_safe {
+        return Err(partial_catalog_object(
+            "object_write_credential_parent_guard privilege boundary",
+        ));
+    }
     Ok(())
 }
 
@@ -690,6 +910,7 @@ const CONTROL_TABLES: &[&str] = &[
     "hostname_desired_lookups",
     "runtime_operations",
     "trusted_host_fence_recovery_commits_v1",
+    "host_fence_provider_queue_v1",
     "api_idempotency_results",
     "node_identities",
     "agent_registration_attempts",
@@ -1075,6 +1296,11 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
 ];
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "host_fence_provider_queue_v1",
+        "host_fence_provider_queue_v1_pkey",
+        "fence_attempt_id",
+    ),
     ("volume_records", "volume_records_pkey", "volume_id"),
     (
         "route_v2_signing_authority",
@@ -1489,6 +1715,18 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         "route_v2_gateway_credential_lineage_exact_key",
         "credential_id,authority_id,public_key_spki_sha256,state",
         None,
+    ),
+    (
+        "host_fence_provider_queue_v1",
+        "host_fence_provider_queue_claim_token_unique",
+        "claim_attempt_token",
+        Some("(claim_attempt_token IS NOT NULL)"),
+    ),
+    (
+        "host_fence_provider_queue_v1",
+        "host_fence_provider_queue_renew_token_unique",
+        "renew_attempt_token",
+        Some("(renew_attempt_token IS NOT NULL)"),
     ),
 ];
 
@@ -1937,6 +2175,20 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         BEFORE_ROW_DELETE,
         "3930793dad74a3088892fdf5b2391255f8ebd1b2b675e21369cbda0543bef264",
     ),
+    (
+        "host_fence_provider_queue_v1",
+        "host_fence_provider_queue_transition_is_forward_only",
+        "control_host_fence_provider_queue_transition_guard",
+        BEFORE_ROW_UPDATE,
+        "5909f78bfdb0b59bc0792677073c6657987c3888dfed6ddc558a1dcffdc45317",
+    ),
+    (
+        "host_fence_provider_queue_v1",
+        "host_fence_provider_queue_cannot_delete",
+        "control_host_fence_provider_queue_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "f9f88a4724e414eb226d429fdfb1dca313868b2ea5a9d69d467f63a85696d8aa",
+    ),
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -1994,6 +2246,18 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             expected_desired_revision, replacement_desired_revision,
             old_operation_id, recovery_operation_id, committed_at
        FROM trusted_host_fence_recovery_commits_v1 WHERE FALSE",
+    "SELECT fence_attempt_id, request_bytes, request_sha256,
+            provider, host_partition, host_account_id, host_region,
+            immutable_host_id, node_id, expected_node_boot_id,
+            expected_agent_session_epoch, writer_authority_id,
+            workload_principal_id, object_store_scope_id,
+            network_quarantine_boundary_id, state, worker_id,
+            claim_attempt_token, claim_duration_ms, claim_generation,
+            claim_lease_expires_at_unix_ms, renew_attempt_token,
+            renew_duration_ms, renew_generation, renewed_from_unix_ms,
+            renewed_to_unix_ms, evidence_bytes, evidence_sha256,
+            enqueued_at_unix_ms, completed_at_unix_ms
+       FROM host_fence_provider_queue_v1 WHERE FALSE",
     "SELECT authenticated_workspace_id, canonical_route, idempotency_key,
             request_fingerprint, http_status, content_type, response_body,
             created_at
@@ -2095,6 +2359,747 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             policy_sha256, public_key_spki_sha256, scope, lineage_state
        FROM route_v2_gateway_current_credentials WHERE FALSE",
 ];
+
+const HOST_FENCE_PROVIDER_FUNCTIONS: &str = r#"
+-- A PostgreSQL role cannot be denied a privilege inherited through PUBLIC.
+-- Remove that default from the release schema before granting the provider's
+-- exact six-function surface in the deployment role script. Schema owners
+-- retain implicit authority; trigger invocation does not require EXECUTE.
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA __CATS_SCHEMA_IDENT__ FROM PUBLIC;
+
+-- This deferred parent/child invariant is reached by the provider's
+-- SECURITY DEFINER cutoff function. It therefore needs the same fixed owner
+-- and schema-safe lookup context; the provider role still receives no direct
+-- privilege on either object-write table.
+ALTER FUNCTION __CATS_SCHEMA_IDENT__.object_write_credential_parent_guard()
+    SECURITY DEFINER;
+ALTER FUNCTION __CATS_SCHEMA_IDENT__.object_write_credential_parent_guard()
+    SET search_path = __CATS_SCHEMA_IDENT__, pg_catalog, pg_temp;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.object_write_credential_parent_guard() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(value BYTEA)
+RETURNS BYTEA
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $function$
+    SELECT pg_catalog.int8send(pg_catalog.octet_length(value)::BIGINT) || value
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(BYTEA) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_startup_v1()
+RETURNS TABLE(protocol_version BIGINT, schema_name TEXT, expected_role TEXT)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY SELECT 1::BIGINT, __CATS_SCHEMA_LITERAL__::TEXT,
+        'cats_host_fence_provider'::TEXT;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_startup_v1() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_claim_v1(
+    expected_provider TEXT,
+    expected_partition TEXT,
+    expected_account_id TEXT,
+    expected_region TEXT,
+    requested_worker_id TEXT,
+    requested_claim_attempt_token TEXT,
+    requested_lease_duration_ms BIGINT
+)
+RETURNS TABLE(
+    request_bytes BYTEA,
+    request_sha256 TEXT,
+    worker_id TEXT,
+    claim_attempt_token TEXT,
+    claim_generation BIGINT,
+    claim_lease_expires_at_unix_ms BIGINT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    now_ms BIGINT;
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    IF requested_lease_duration_ms NOT BETWEEN 1 AND 60000
+       OR requested_claim_attempt_token !~ '^[0-9a-f]{32}$'
+       OR requested_worker_id !~ '^[A-Za-z0-9._:-]{1,128}$' THEN
+        RAISE EXCEPTION 'invalid Host-fence provider claim'
+            USING ERRCODE = '22023';
+    END IF;
+    -- Lost-response replay of the still-current claim never leases a second
+    -- row or extends the original DB-time deadline.
+    RETURN QUERY
+        SELECT queue.request_bytes, queue.request_sha256, queue.worker_id,
+               queue.claim_attempt_token, queue.claim_generation,
+               queue.claim_lease_expires_at_unix_ms
+          FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+         WHERE queue.provider = expected_provider
+           AND queue.host_partition = expected_partition
+           AND queue.host_account_id = expected_account_id
+           AND queue.host_region = expected_region
+           AND queue.state = 'claimed'
+           AND queue.worker_id = requested_worker_id
+           AND queue.claim_attempt_token = requested_claim_attempt_token
+           AND queue.claim_duration_ms = requested_lease_duration_ms
+           AND queue.claim_lease_expires_at_unix_ms > floor(
+               extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+           )::BIGINT
+         FOR UPDATE;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+         WHERE queue.claim_attempt_token = requested_claim_attempt_token
+    ) THEN
+        RAISE EXCEPTION 'Host-fence provider claim replay is stale or changed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF now_ms > 9223372036854775807 - requested_lease_duration_ms THEN
+        RAISE EXCEPTION 'Host-fence provider lease overflow'
+            USING ERRCODE = '22003';
+    END IF;
+
+    RETURN QUERY
+        WITH candidate AS (
+            SELECT queue.fence_attempt_id
+              FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+             WHERE queue.provider = expected_provider
+               AND queue.host_partition = expected_partition
+               AND queue.host_account_id = expected_account_id
+               AND queue.host_region = expected_region
+               AND (queue.state = 'pending' OR
+                    (queue.state = 'claimed' AND
+                     queue.claim_lease_expires_at_unix_ms <= now_ms))
+             ORDER BY queue.enqueued_at_unix_ms,
+                      queue.fence_attempt_id COLLATE "C"
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+           SET state = 'claimed',
+               worker_id = requested_worker_id,
+               claim_attempt_token = requested_claim_attempt_token,
+               claim_duration_ms = requested_lease_duration_ms,
+               claim_generation = queue.claim_generation + 1,
+               claim_lease_expires_at_unix_ms =
+                   now_ms + requested_lease_duration_ms,
+               renew_attempt_token = NULL,
+               renew_duration_ms = NULL,
+               renew_generation = 0,
+               renewed_from_unix_ms = NULL,
+               renewed_to_unix_ms = NULL
+          FROM candidate
+         WHERE queue.fence_attempt_id = candidate.fence_attempt_id
+        RETURNING queue.request_bytes, queue.request_sha256, queue.worker_id,
+                  queue.claim_attempt_token, queue.claim_generation,
+                  queue.claim_lease_expires_at_unix_ms;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_claim_v1(
+        TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT
+    ) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_renew_v1(
+    requested_fence_attempt_id TEXT,
+    requested_claim_attempt_token TEXT,
+    requested_renew_attempt_token TEXT,
+    requested_lease_duration_ms BIGINT
+)
+RETURNS BIGINT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    now_ms BIGINT;
+    existing_expiry BIGINT;
+    resulting_expiry BIGINT;
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    IF requested_lease_duration_ms NOT BETWEEN 1 AND 60000
+       OR requested_claim_attempt_token !~ '^[0-9a-f]{32}$'
+       OR requested_renew_attempt_token !~ '^[0-9a-f]{32}$' THEN
+        RAISE EXCEPTION 'invalid Host-fence provider renewal'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT queue.claim_lease_expires_at_unix_ms
+      INTO existing_expiry
+      FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+     WHERE queue.fence_attempt_id = requested_fence_attempt_id
+       AND queue.state = 'claimed'
+       AND queue.claim_attempt_token = requested_claim_attempt_token
+       AND queue.renew_attempt_token = requested_renew_attempt_token
+       AND queue.renew_duration_ms = requested_lease_duration_ms
+     FOR UPDATE;
+    IF FOUND THEN
+        RETURN existing_expiry;
+    END IF;
+
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF now_ms > 9223372036854775807 - requested_lease_duration_ms THEN
+        RAISE EXCEPTION 'Host-fence provider lease overflow'
+            USING ERRCODE = '22003';
+    END IF;
+    resulting_expiry := now_ms + requested_lease_duration_ms;
+    UPDATE __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+       SET claim_lease_expires_at_unix_ms = resulting_expiry,
+           renew_attempt_token = requested_renew_attempt_token,
+           renew_duration_ms = requested_lease_duration_ms,
+           renew_generation = queue.renew_generation + 1,
+           renewed_from_unix_ms = now_ms,
+           renewed_to_unix_ms = resulting_expiry
+     WHERE queue.fence_attempt_id = requested_fence_attempt_id
+       AND queue.state = 'claimed'
+       AND queue.claim_attempt_token = requested_claim_attempt_token
+       AND queue.claim_lease_expires_at_unix_ms > now_ms
+       AND resulting_expiry > queue.claim_lease_expires_at_unix_ms
+    RETURNING queue.claim_lease_expires_at_unix_ms INTO existing_expiry;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Host-fence provider claim is stale or expired'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN existing_expiry;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_renew_v1(
+        TEXT,TEXT,TEXT,BIGINT
+    ) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_read_v1(
+    requested_fence_attempt_id TEXT,
+    requested_claim_attempt_token TEXT
+)
+RETURNS TABLE(
+    request_bytes BYTEA,
+    request_sha256 TEXT,
+    enqueued_at_unix_ms BIGINT,
+    state TEXT,
+    worker_id TEXT,
+    claim_attempt_token TEXT,
+    claim_generation BIGINT,
+    claim_lease_expires_at_unix_ms BIGINT,
+    evidence_bytes BYTEA,
+    evidence_sha256 TEXT,
+    completed_at_unix_ms BIGINT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY
+        SELECT queue.request_bytes, queue.request_sha256,
+               queue.enqueued_at_unix_ms, queue.state, queue.worker_id,
+               queue.claim_attempt_token, queue.claim_generation,
+               queue.claim_lease_expires_at_unix_ms, queue.evidence_bytes,
+               queue.evidence_sha256, queue.completed_at_unix_ms
+          FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+         WHERE queue.fence_attempt_id = requested_fence_attempt_id
+           AND queue.state IN ('claimed', 'terminal')
+           AND queue.claim_attempt_token = requested_claim_attempt_token;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_read_v1(TEXT,TEXT) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_object_cutoff_v1(
+    requested_fence_attempt_id TEXT,
+    requested_claim_attempt_token TEXT
+)
+RETURNS TABLE(result_kind TEXT, cutoff_receipt JSONB)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    now_ms BIGINT;
+    queue_row RECORD;
+    authority_row RECORD;
+    attempt_row RECORD;
+    expected_sequence BIGINT;
+    prefix_sequence BIGINT;
+    prefix_sha256 TEXT;
+    hash_input BYTEA;
+    receipt JSONB;
+    cutoff_receipt_id TEXT;
+    terminal_receipt_id TEXT;
+    visibility_receipt_id TEXT;
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    SELECT queue.writer_authority_id, queue.provider, queue.host_partition,
+           queue.host_account_id, queue.host_region, queue.immutable_host_id,
+           queue.node_id, queue.workload_principal_id,
+           queue.object_store_scope_id,
+           queue.claim_lease_expires_at_unix_ms
+      INTO queue_row
+      FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+     WHERE queue.fence_attempt_id = requested_fence_attempt_id
+       AND queue.state = 'claimed'
+       AND queue.claim_attempt_token = requested_claim_attempt_token
+       AND queue.claim_lease_expires_at_unix_ms > now_ms
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Host-fence provider claim is stale or expired'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT authority.record, authority.state, authority.writer_authority_id,
+           authority.host_provider, authority.host_partition,
+           authority.host_account_id, authority.host_region,
+           authority.immutable_host_id, authority.node_id,
+           authority.workload_principal_id, authority.object_store_scope_id,
+           authority.fence_attempt_id, authority.cutoff_effective_at_unix_ms,
+           authority.cutoff_sequence, authority.max_accepted_sequence,
+           authority.terminal_prefix_sequence,
+           authority.terminal_prefix_sha256, authority.cutoff_receipt
+      INTO authority_row
+      FROM __CATS_SCHEMA_IDENT__.object_write_authorities authority
+     WHERE authority.writer_authority_id = queue_row.writer_authority_id
+     FOR UPDATE;
+    IF NOT FOUND OR
+       (authority_row.host_provider, authority_row.host_partition,
+        authority_row.host_account_id, authority_row.host_region,
+        authority_row.immutable_host_id, authority_row.node_id,
+        authority_row.workload_principal_id,
+        authority_row.object_store_scope_id,
+        authority_row.fence_attempt_id)
+       IS DISTINCT FROM
+       (queue_row.provider, queue_row.host_partition,
+        queue_row.host_account_id, queue_row.host_region,
+        queue_row.immutable_host_id, queue_row.node_id,
+        queue_row.workload_principal_id, queue_row.object_store_scope_id,
+        requested_fence_attempt_id) THEN
+        RAISE EXCEPTION 'Host-fence queue/object-writer binding mismatch'
+            USING ERRCODE = '55000';
+    END IF;
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF queue_row.claim_lease_expires_at_unix_ms <= now_ms THEN
+        RAISE EXCEPTION 'Host-fence provider claim expired during object cutoff'
+            USING ERRCODE = '55000';
+    END IF;
+    IF authority_row.state = 'cutoff_complete' THEN
+        RETURN QUERY SELECT 'complete'::TEXT, authority_row.cutoff_receipt;
+        RETURN;
+    END IF;
+    IF authority_row.state <> 'cutoff_pending'
+       OR authority_row.cutoff_sequence <> authority_row.max_accepted_sequence THEN
+        RAISE EXCEPTION 'object-writer cutoff is not pending for this attempt'
+            USING ERRCODE = '55000';
+    END IF;
+
+    prefix_sequence := authority_row.terminal_prefix_sequence;
+    prefix_sha256 := authority_row.terminal_prefix_sha256;
+    expected_sequence := prefix_sequence + 1;
+    FOR attempt_row IN
+        SELECT attempt.accepted_sequence, attempt.request_id,
+               attempt.object_key, attempt.content_sha256,
+               attempt.content_length, attempt.terminal_kind,
+               attempt.put_receipt_id, attempt.put_completed_at_unix_ms,
+               attempt.visibility_receipt_id, attempt.visible_at_unix_ms,
+               attempt.failure_receipt_id, attempt.failed_at_unix_ms
+          FROM __CATS_SCHEMA_IDENT__.object_write_attempts attempt
+         WHERE attempt.writer_authority_id = queue_row.writer_authority_id
+           AND attempt.accepted_sequence > prefix_sequence
+           AND attempt.accepted_sequence <= authority_row.cutoff_sequence
+           AND attempt.state IN ('terminal_visible', 'permanent', 'spool_removed')
+         ORDER BY attempt.accepted_sequence
+         LIMIT 256
+    LOOP
+        IF attempt_row.accepted_sequence <> expected_sequence THEN
+            EXIT;
+        END IF;
+        hash_input :=
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('cats.object-write-terminal-prefix.v1', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(prefix_sha256, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(attempt_row.accepted_sequence)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(attempt_row.request_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(attempt_row.object_key, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(attempt_row.content_sha256, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(attempt_row.content_length));
+        IF attempt_row.terminal_kind = 'succeeded_visible' THEN
+            hash_input := hash_input ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to('succeeded-visible', 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to(attempt_row.put_receipt_id, 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.int8send(attempt_row.put_completed_at_unix_ms)) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to(attempt_row.visibility_receipt_id, 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.int8send(attempt_row.visible_at_unix_ms));
+        ELSIF attempt_row.terminal_kind = 'permanently_failed' THEN
+            hash_input := hash_input ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to('permanently-failed', 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to(attempt_row.failure_receipt_id, 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.int8send(attempt_row.failed_at_unix_ms));
+        ELSE
+            RAISE EXCEPTION 'terminal object-write projection is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+        prefix_sha256 := 'sha256:' ||
+            pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
+        prefix_sequence := attempt_row.accepted_sequence;
+        expected_sequence := prefix_sequence + 1;
+    END LOOP;
+
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF queue_row.claim_lease_expires_at_unix_ms <= now_ms THEN
+        RAISE EXCEPTION 'Host-fence provider claim expired during object cutoff'
+            USING ERRCODE = '55000';
+    END IF;
+
+    authority_row.record := pg_catalog.jsonb_set(
+        pg_catalog.jsonb_set(
+            authority_row.record,
+            '{terminal_prefix_sequence}', pg_catalog.to_jsonb(prefix_sequence), FALSE
+        ),
+        '{terminal_prefix_sha256}', pg_catalog.to_jsonb(prefix_sha256), FALSE
+    );
+    IF prefix_sequence = authority_row.cutoff_sequence THEN
+        hash_input :=
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('cats.object-write-barrier-receipt.v1', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('cutoff', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(authority_row.writer_authority_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(requested_fence_attempt_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_effective_at_unix_ms)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_sequence)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(prefix_sha256, 'UTF8'));
+        cutoff_receipt_id := 'owcut1_' ||
+            pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
+        hash_input :=
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('cats.object-write-barrier-receipt.v1', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('terminal-prefix', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(authority_row.writer_authority_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(requested_fence_attempt_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_effective_at_unix_ms)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_sequence)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(prefix_sha256, 'UTF8'));
+        terminal_receipt_id := 'owterm1_' ||
+            pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
+        hash_input :=
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('cats.object-write-barrier-receipt.v1', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to('successful-visible', 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(authority_row.writer_authority_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(requested_fence_attempt_id, 'UTF8')) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_effective_at_unix_ms)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.int8send(authority_row.cutoff_sequence)) ||
+            __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                pg_catalog.convert_to(prefix_sha256, 'UTF8'));
+        visibility_receipt_id := 'owvis1_' ||
+            pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
+        receipt := pg_catalog.jsonb_build_object(
+            'writer_authority_id', authority_row.writer_authority_id,
+            'fence_attempt_id', requested_fence_attempt_id,
+            'cutoff_receipt_id', cutoff_receipt_id,
+            'cutoff_effective_at_unix_ms', authority_row.cutoff_effective_at_unix_ms,
+            'cutoff_sequence', authority_row.cutoff_sequence,
+            'accepted_put_terminal_receipt_id', terminal_receipt_id,
+            'accepted_puts_terminal_at_unix_ms', now_ms,
+            'terminal_sequence', prefix_sequence,
+            'terminal_prefix_sha256', prefix_sha256,
+            'successful_put_visibility_receipt_id', visibility_receipt_id,
+            'successful_puts_visible_at_unix_ms', now_ms
+        );
+        authority_row.record := pg_catalog.jsonb_set(
+            authority_row.record, '{state}',
+            pg_catalog.jsonb_build_object(
+                'kind', 'cutoff_complete', 'receipt', receipt
+            ), FALSE
+        );
+        UPDATE __CATS_SCHEMA_IDENT__.object_write_authorities authority
+           SET record = authority_row.record,
+               state = 'cutoff_complete',
+               terminal_prefix_sequence = prefix_sequence,
+               terminal_prefix_sha256 = prefix_sha256,
+               cutoff_receipt = receipt
+         WHERE authority.writer_authority_id = authority_row.writer_authority_id;
+        RETURN QUERY SELECT 'complete'::TEXT, receipt;
+    ELSE
+        UPDATE __CATS_SCHEMA_IDENT__.object_write_authorities authority
+           SET record = authority_row.record,
+               terminal_prefix_sequence = prefix_sequence,
+               terminal_prefix_sha256 = prefix_sha256
+         WHERE authority.writer_authority_id = authority_row.writer_authority_id;
+        RETURN QUERY SELECT 'pending'::TEXT, NULL::JSONB;
+    END IF;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_object_cutoff_v1(TEXT,TEXT)
+    FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_host_fence_provider_complete_v1(
+    requested_fence_attempt_id TEXT,
+    requested_claim_attempt_token TEXT,
+    requested_evidence_bytes BYTEA,
+    requested_evidence_sha256 TEXT
+)
+RETURNS TABLE(evidence_bytes BYTEA, evidence_sha256 TEXT, completed_at_unix_ms BIGINT)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    now_ms BIGINT;
+    queue_row RECORD;
+    authority_receipt JSONB;
+    evidence_record JSONB;
+    derived_digest TEXT;
+    evidence_completed_at BIGINT;
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_host_fence_provider' THEN
+        RAISE EXCEPTION 'Host-fence provider PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    IF pg_catalog.octet_length(requested_evidence_bytes) NOT BETWEEN 2 AND 4194304
+       OR requested_evidence_sha256 !~ '^sha256:[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'invalid Host-fence provider evidence envelope'
+            USING ERRCODE = '22023';
+    END IF;
+    derived_digest := 'sha256:' || pg_catalog.encode(
+        pg_catalog.sha256(
+            pg_catalog.convert_to('cats.trusted-host-fence-event.v1', 'UTF8') ||
+            pg_catalog.decode('00', 'hex') || requested_evidence_bytes
+        ), 'hex'
+    );
+    IF derived_digest <> requested_evidence_sha256 THEN
+        RAISE EXCEPTION 'Host-fence provider evidence digest mismatch'
+            USING ERRCODE = '22023';
+    END IF;
+    BEGIN
+        evidence_record := pg_catalog.convert_from(requested_evidence_bytes, 'UTF8')::JSONB;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'Host-fence provider evidence is not JSON'
+            USING ERRCODE = '22023';
+    END;
+    SELECT queue.* INTO queue_row
+      FROM __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+     WHERE queue.fence_attempt_id = requested_fence_attempt_id
+     FOR UPDATE;
+    IF NOT FOUND OR queue_row.claim_attempt_token <> requested_claim_attempt_token THEN
+        RAISE EXCEPTION 'Host-fence provider claim is stale'
+            USING ERRCODE = '55000';
+    END IF;
+    IF queue_row.state = 'terminal' THEN
+        IF queue_row.evidence_bytes = requested_evidence_bytes
+           AND queue_row.evidence_sha256 = requested_evidence_sha256 THEN
+            RETURN QUERY SELECT queue_row.evidence_bytes,
+                queue_row.evidence_sha256, queue_row.completed_at_unix_ms;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'terminal Host-fence evidence replay changed bytes'
+            USING ERRCODE = '55000';
+    END IF;
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF queue_row.state <> 'claimed'
+       OR queue_row.claim_lease_expires_at_unix_ms <= now_ms THEN
+        RAISE EXCEPTION 'Host-fence provider claim is expired'
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT authority.cutoff_receipt INTO authority_receipt
+      FROM __CATS_SCHEMA_IDENT__.object_write_authorities authority
+     WHERE authority.writer_authority_id = queue_row.writer_authority_id
+       AND authority.state = 'cutoff_complete'
+       AND authority.fence_attempt_id = requested_fence_attempt_id
+     FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'object-writer cutoff is not complete'
+            USING ERRCODE = '55000';
+    END IF;
+    now_ms := floor(
+        extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+    )::BIGINT;
+    IF queue_row.claim_lease_expires_at_unix_ms <= now_ms THEN
+        RAISE EXCEPTION 'Host-fence provider claim expired during completion'
+            USING ERRCODE = '55000';
+    END IF;
+    evidence_completed_at := (evidence_record ->> 'completed_at_unix_ms')::BIGINT;
+    IF (evidence_record ->> 'version')::BIGINT IS DISTINCT FROM 1
+       OR evidence_record #>> '{binding,fence_attempt_id}' IS DISTINCT FROM
+            requested_fence_attempt_id
+       OR evidence_record #>> '{binding,provider_scope,provider}' IS DISTINCT FROM
+            queue_row.provider
+       OR evidence_record #>> '{binding,provider_scope,partition}' IS DISTINCT FROM
+            queue_row.host_partition
+       OR evidence_record #>> '{binding,provider_scope,account_id}' IS DISTINCT FROM
+            queue_row.host_account_id
+       OR evidence_record #>> '{binding,provider_scope,region}' IS DISTINCT FROM
+            queue_row.host_region
+       OR evidence_record #>> '{binding,immutable_host_id}' IS DISTINCT FROM
+            queue_row.immutable_host_id
+       OR evidence_record #>> '{binding,node_id}' IS DISTINCT FROM queue_row.node_id
+       OR evidence_record #>> '{binding,expected_node_boot_id}' IS DISTINCT FROM
+            queue_row.expected_node_boot_id
+       OR (evidence_record #>> '{binding,expected_agent_session_epoch}')::BIGINT
+            IS DISTINCT FROM
+            queue_row.expected_agent_session_epoch
+       OR evidence_record #>> '{object_write_cutoff,kind}' IS DISTINCT FROM
+            'principal_cutoff_with_accepted_put_terminal_barrier'
+       OR evidence_record #>> '{object_write_cutoff,binding,fence_attempt_id}'
+            IS DISTINCT FROM
+            requested_fence_attempt_id
+       OR evidence_record #>> '{object_write_cutoff,binding,provider_scope,provider}'
+            IS DISTINCT FROM
+            queue_row.provider
+       OR evidence_record #>> '{object_write_cutoff,binding,provider_scope,partition}'
+            IS DISTINCT FROM
+            queue_row.host_partition
+       OR evidence_record #>> '{object_write_cutoff,binding,provider_scope,account_id}'
+            IS DISTINCT FROM
+            queue_row.host_account_id
+       OR evidence_record #>> '{object_write_cutoff,binding,provider_scope,region}'
+            IS DISTINCT FROM
+            queue_row.host_region
+       OR evidence_record #>> '{object_write_cutoff,binding,immutable_host_id}'
+            IS DISTINCT FROM
+            queue_row.immutable_host_id
+       OR evidence_record #>> '{object_write_cutoff,binding,node_id}' IS DISTINCT FROM
+            queue_row.node_id
+       OR evidence_record #>> '{object_write_cutoff,object_writer,writer_authority_id}'
+            IS DISTINCT FROM
+            queue_row.writer_authority_id
+       OR evidence_record #>> '{object_write_cutoff,object_writer,provider_scope,provider}'
+            IS DISTINCT FROM
+            queue_row.provider
+       OR evidence_record #>> '{object_write_cutoff,object_writer,provider_scope,partition}'
+            IS DISTINCT FROM
+            queue_row.host_partition
+       OR evidence_record #>> '{object_write_cutoff,object_writer,provider_scope,account_id}'
+            IS DISTINCT FROM
+            queue_row.host_account_id
+       OR evidence_record #>> '{object_write_cutoff,object_writer,provider_scope,region}'
+            IS DISTINCT FROM
+            queue_row.host_region
+       OR evidence_record #>> '{object_write_cutoff,object_writer,workload_principal_id}'
+            IS DISTINCT FROM
+            queue_row.workload_principal_id
+       OR evidence_record #>> '{object_write_cutoff,object_writer,object_store_scope_id}'
+            IS DISTINCT FROM
+            queue_row.object_store_scope_id
+       OR evidence_record #>> '{object_write_cutoff,cutoff_receipt_id}' IS DISTINCT FROM
+            authority_receipt ->> 'cutoff_receipt_id'
+       OR (evidence_record #>> '{object_write_cutoff,cutoff_effective_at_unix_ms}')::BIGINT
+            IS DISTINCT FROM
+            (authority_receipt ->> 'cutoff_effective_at_unix_ms')::BIGINT
+       OR (evidence_record #>> '{object_write_cutoff,cutoff_sequence}')::BIGINT
+            IS DISTINCT FROM
+            (authority_receipt ->> 'cutoff_sequence')::BIGINT
+       OR evidence_record #>> '{object_write_cutoff,accepted_put_terminal_receipt_id}'
+            IS DISTINCT FROM
+            authority_receipt ->> 'accepted_put_terminal_receipt_id'
+       OR (evidence_record #>> '{object_write_cutoff,accepted_puts_terminal_at_unix_ms}')::BIGINT
+            IS DISTINCT FROM
+            (authority_receipt ->> 'accepted_puts_terminal_at_unix_ms')::BIGINT
+       OR (evidence_record #>> '{object_write_cutoff,terminal_sequence}')::BIGINT
+            IS DISTINCT FROM
+            (authority_receipt ->> 'terminal_sequence')::BIGINT
+       OR evidence_record #>> '{object_write_cutoff,terminal_prefix_sha256}'
+            IS DISTINCT FROM
+            authority_receipt ->> 'terminal_prefix_sha256'
+       OR evidence_record #>> '{object_write_cutoff,successful_put_visibility_receipt_id}'
+            IS DISTINCT FROM
+            authority_receipt ->> 'successful_put_visibility_receipt_id'
+       OR (evidence_record #>> '{object_write_cutoff,successful_puts_visible_at_unix_ms}')::BIGINT
+            IS DISTINCT FROM
+            (authority_receipt ->> 'successful_puts_visible_at_unix_ms')::BIGINT
+       OR evidence_record #>> '{execution_cutoff,immutable_host_id}' IS DISTINCT FROM
+            queue_row.immutable_host_id
+       OR evidence_record #>> '{network_cutoff,immutable_host_id}' IS DISTINCT FROM
+            queue_row.immutable_host_id
+       OR evidence_record #>> '{network_cutoff,quarantine_policy_id}' IS DISTINCT FROM
+            queue_row.network_quarantine_boundary_id
+       OR evidence_completed_at IS DISTINCT FROM
+            greatest(
+                (evidence_record #>> '{execution_cutoff,observed_at_unix_ms}')::BIGINT,
+                (evidence_record #>> '{network_cutoff,policy_observed_at_unix_ms}')::BIGINT,
+                (evidence_record #>> '{network_cutoff,observed_at_unix_ms}')::BIGINT
+            ) THEN
+        RAISE EXCEPTION 'Host-fence provider evidence does not match the sealed request'
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE __CATS_SCHEMA_IDENT__.host_fence_provider_queue_v1 queue
+       SET state = 'terminal', evidence_bytes = requested_evidence_bytes,
+           evidence_sha256 = requested_evidence_sha256,
+           completed_at_unix_ms = evidence_completed_at
+     WHERE queue.fence_attempt_id = requested_fence_attempt_id;
+    RETURN QUERY SELECT requested_evidence_bytes,
+        requested_evidence_sha256, evidence_completed_at;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_host_fence_provider_complete_v1(
+        TEXT,TEXT,BYTEA,TEXT
+    ) FROM PUBLIC;
+"#;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS control_schema_version (
@@ -3499,6 +4504,220 @@ CREATE CONSTRAINT TRIGGER object_write_credential_parent_open
 AFTER INSERT OR UPDATE ON object_write_credentials
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
 EXECUTE FUNCTION object_write_credential_parent_guard();
+CREATE TABLE IF NOT EXISTS host_fence_provider_queue_v1 (
+    fence_attempt_id TEXT
+        CONSTRAINT host_fence_provider_queue_v1_pkey PRIMARY KEY,
+    request_bytes BYTEA NOT NULL
+        CONSTRAINT host_fence_provider_queue_request_bytes_check
+        CHECK (octet_length(request_bytes) BETWEEN 2 AND 1048576),
+    request_sha256 TEXT NOT NULL
+        CONSTRAINT host_fence_provider_queue_request_digest_check
+        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    provider TEXT NOT NULL,
+    host_partition TEXT NOT NULL,
+    host_account_id TEXT NOT NULL,
+    host_region TEXT NOT NULL,
+    immutable_host_id TEXT NOT NULL,
+    node_id TEXT NOT NULL
+        CONSTRAINT host_fence_provider_queue_node_id_fkey
+        REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    expected_node_boot_id TEXT NOT NULL
+        CONSTRAINT host_fence_provider_queue_boot_id_check
+        CHECK (expected_node_boot_id ~ '^[0-9a-f]{32}$'),
+    expected_agent_session_epoch BIGINT NOT NULL
+        CONSTRAINT host_fence_provider_queue_session_epoch_check
+        CHECK (expected_agent_session_epoch > 0),
+    writer_authority_id TEXT NOT NULL
+        CONSTRAINT host_fence_provider_queue_writer_id_fkey
+        REFERENCES object_write_authorities(writer_authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    workload_principal_id TEXT NOT NULL,
+    object_store_scope_id TEXT NOT NULL,
+    network_quarantine_boundary_id TEXT NOT NULL,
+    state TEXT NOT NULL
+        CONSTRAINT host_fence_provider_queue_state_check
+        CHECK (state IN ('pending', 'claimed', 'terminal')),
+    worker_id TEXT,
+    claim_attempt_token TEXT
+        CONSTRAINT host_fence_provider_queue_claim_token_check
+        CHECK (claim_attempt_token ~ '^[0-9a-f]{32}$'),
+    claim_duration_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_claim_duration_check
+        CHECK (claim_duration_ms BETWEEN 1 AND 60000),
+    claim_generation BIGINT NOT NULL
+        CONSTRAINT host_fence_provider_queue_claim_generation_check
+        CHECK (claim_generation >= 0),
+    claim_lease_expires_at_unix_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_claim_lease_check
+        CHECK (claim_lease_expires_at_unix_ms >= 0),
+    renew_attempt_token TEXT
+        CONSTRAINT host_fence_provider_queue_renew_token_check
+        CHECK (renew_attempt_token ~ '^[0-9a-f]{32}$'),
+    renew_duration_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_renew_duration_check
+        CHECK (renew_duration_ms BETWEEN 1 AND 60000),
+    renew_generation BIGINT NOT NULL
+        CONSTRAINT host_fence_provider_queue_renew_generation_check
+        CHECK (renew_generation >= 0),
+    renewed_from_unix_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_renewed_from_check
+        CHECK (renewed_from_unix_ms >= 0),
+    renewed_to_unix_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_renewed_to_check
+        CHECK (renewed_to_unix_ms > renewed_from_unix_ms),
+    evidence_bytes BYTEA
+        CONSTRAINT host_fence_provider_queue_evidence_bytes_check
+        CHECK (evidence_bytes IS NULL OR
+               octet_length(evidence_bytes) BETWEEN 2 AND 4194304),
+    evidence_sha256 TEXT
+        CONSTRAINT host_fence_provider_queue_evidence_digest_check
+        CHECK (evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    enqueued_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT host_fence_provider_queue_enqueued_time_check
+        CHECK (enqueued_at_unix_ms >= 0),
+    completed_at_unix_ms BIGINT
+        CONSTRAINT host_fence_provider_queue_completed_time_check
+        CHECK (completed_at_unix_ms >= enqueued_at_unix_ms),
+    CONSTRAINT host_fence_provider_queue_request_projection_check CHECK (
+        convert_from(request_bytes, 'UTF8')::jsonb #>> '{binding,fence_attempt_id}' =
+            fence_attempt_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,provider_scope,provider}' = provider
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,provider_scope,partition}' = host_partition
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,provider_scope,account_id}' = host_account_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,provider_scope,region}' = host_region
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,immutable_host_id}' = immutable_host_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>> '{binding,node_id}' = node_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,expected_node_boot_id}' = expected_node_boot_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{binding,expected_agent_session_epoch}' =
+                expected_agent_session_epoch::TEXT
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{object_writer,writer_authority_id}' = writer_authority_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{object_writer,workload_principal_id}' = workload_principal_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{object_writer,object_store_scope_id}' = object_store_scope_id
+        AND convert_from(request_bytes, 'UTF8')::jsonb #>>
+            '{network_quarantine_boundary_id}' = network_quarantine_boundary_id
+    ),
+    CONSTRAINT host_fence_provider_queue_renew_shape_check CHECK (
+        (renew_generation = 0 AND renew_attempt_token IS NULL
+            AND renew_duration_ms IS NULL AND renewed_from_unix_ms IS NULL
+            AND renewed_to_unix_ms IS NULL) OR
+        (renew_generation > 0 AND renew_attempt_token IS NOT NULL
+            AND renew_duration_ms IS NOT NULL AND renewed_from_unix_ms IS NOT NULL
+            AND renewed_to_unix_ms IS NOT NULL
+            AND renewed_to_unix_ms = claim_lease_expires_at_unix_ms)
+    ),
+    CONSTRAINT host_fence_provider_queue_state_shape_check CHECK (
+        (state = 'pending' AND worker_id IS NULL AND claim_attempt_token IS NULL
+            AND claim_duration_ms IS NULL
+            AND claim_generation = 0 AND claim_lease_expires_at_unix_ms IS NULL
+            AND renew_generation = 0 AND evidence_bytes IS NULL
+            AND evidence_sha256 IS NULL AND completed_at_unix_ms IS NULL) OR
+        (state = 'claimed' AND worker_id IS NOT NULL AND claim_attempt_token IS NOT NULL
+            AND claim_duration_ms IS NOT NULL
+            AND claim_generation > 0 AND claim_lease_expires_at_unix_ms IS NOT NULL
+            AND evidence_bytes IS NULL AND evidence_sha256 IS NULL
+            AND completed_at_unix_ms IS NULL) OR
+        (state = 'terminal' AND worker_id IS NOT NULL AND claim_attempt_token IS NOT NULL
+            AND claim_duration_ms IS NOT NULL
+            AND claim_generation > 0 AND claim_lease_expires_at_unix_ms IS NOT NULL
+            AND evidence_bytes IS NOT NULL AND evidence_sha256 IS NOT NULL
+            AND completed_at_unix_ms IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS host_fence_provider_queue_claim_token_unique
+    ON host_fence_provider_queue_v1(claim_attempt_token)
+    WHERE claim_attempt_token IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS host_fence_provider_queue_renew_token_unique
+    ON host_fence_provider_queue_v1(renew_attempt_token)
+    WHERE renew_attempt_token IS NOT NULL;
+CREATE INDEX IF NOT EXISTS host_fence_provider_queue_claim_scan
+    ON host_fence_provider_queue_v1(
+        provider, host_partition, host_account_id, host_region,
+        state, claim_lease_expires_at_unix_ms, enqueued_at_unix_ms,
+        fence_attempt_id COLLATE \"C\"
+    ) WHERE state IN ('pending', 'claimed');
+CREATE OR REPLACE FUNCTION control_host_fence_provider_queue_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.fence_attempt_id, OLD.request_bytes, OLD.request_sha256,
+        OLD.provider, OLD.host_partition, OLD.host_account_id, OLD.host_region,
+        OLD.immutable_host_id, OLD.node_id, OLD.expected_node_boot_id,
+        OLD.expected_agent_session_epoch, OLD.writer_authority_id,
+        OLD.workload_principal_id, OLD.object_store_scope_id,
+        OLD.network_quarantine_boundary_id, OLD.enqueued_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.fence_attempt_id, NEW.request_bytes, NEW.request_sha256,
+        NEW.provider, NEW.host_partition, NEW.host_account_id, NEW.host_region,
+        NEW.immutable_host_id, NEW.node_id, NEW.expected_node_boot_id,
+        NEW.expected_agent_session_epoch, NEW.writer_authority_id,
+        NEW.workload_principal_id, NEW.object_store_scope_id,
+        NEW.network_quarantine_boundary_id, NEW.enqueued_at_unix_ms)
+       OR OLD.state = 'terminal'
+       OR NOT (
+            (OLD.state = 'pending' AND NEW.state = 'claimed'
+                AND NEW.claim_generation = 1)
+            OR (OLD.state = 'claimed' AND NEW.state = 'claimed' AND (
+                (OLD.claim_attempt_token = NEW.claim_attempt_token
+                    AND OLD.worker_id = NEW.worker_id
+                    AND OLD.claim_duration_ms = NEW.claim_duration_ms
+                    AND OLD.claim_generation = NEW.claim_generation
+                    AND OLD.renew_attempt_token IS DISTINCT FROM
+                        NEW.renew_attempt_token
+                    AND NEW.renew_generation = OLD.renew_generation + 1
+                    AND NEW.claim_lease_expires_at_unix_ms >
+                        OLD.claim_lease_expires_at_unix_ms)
+                OR (OLD.claim_lease_expires_at_unix_ms <=
+                        floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                    AND OLD.claim_attempt_token <> NEW.claim_attempt_token
+                    AND NEW.claim_generation = OLD.claim_generation + 1
+                    AND NEW.renew_generation = 0)
+            ))
+            OR (OLD.state = 'claimed' AND NEW.state = 'terminal'
+                AND OLD.worker_id = NEW.worker_id
+                AND OLD.claim_attempt_token = NEW.claim_attempt_token
+                AND OLD.claim_duration_ms = NEW.claim_duration_ms
+                AND OLD.claim_generation = NEW.claim_generation
+                AND OLD.claim_lease_expires_at_unix_ms =
+                    NEW.claim_lease_expires_at_unix_ms
+                AND (OLD.renew_attempt_token, OLD.renew_duration_ms,
+                     OLD.renew_generation, OLD.renewed_from_unix_ms,
+                     OLD.renewed_to_unix_ms)
+                    IS NOT DISTINCT FROM
+                    (NEW.renew_attempt_token, NEW.renew_duration_ms,
+                     NEW.renew_generation, NEW.renewed_from_unix_ms,
+                     NEW.renewed_to_unix_ms))
+       )
+       OR (OLD.evidence_bytes IS NOT NULL AND
+           (OLD.evidence_bytes, OLD.evidence_sha256, OLD.completed_at_unix_ms)
+           IS DISTINCT FROM
+           (NEW.evidence_bytes, NEW.evidence_sha256, NEW.completed_at_unix_ms))
+    THEN
+        RAISE EXCEPTION 'invalid Host-fence provider queue transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_host_fence_provider_queue_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Host-fence provider queue rows cannot be deleted';
+END;
+$$;
+CREATE TRIGGER host_fence_provider_queue_transition_is_forward_only
+BEFORE UPDATE ON host_fence_provider_queue_v1 FOR EACH ROW
+EXECUTE FUNCTION control_host_fence_provider_queue_transition_guard();
+CREATE TRIGGER host_fence_provider_queue_cannot_delete
+BEFORE DELETE ON host_fence_provider_queue_v1 FOR EACH ROW
+EXECUTE FUNCTION control_host_fence_provider_queue_cannot_delete();
 CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
