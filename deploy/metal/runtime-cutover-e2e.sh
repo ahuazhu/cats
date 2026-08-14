@@ -576,6 +576,7 @@ if set(value) != {
     "cases",
     "framework_required_evidence",
     "post_block_path_cases",
+    "qualification_admission_required_evidence",
     "version",
 } or value["version"] != 1:
     raise SystemExit(1)
@@ -610,6 +611,20 @@ framework_names = validate_evidence(value["framework_required_evidence"])
 if value["framework_required_evidence"] != [
     {"filename": "cleanup-receipt.json", "kind": "json"}
 ]:
+    raise SystemExit(1)
+qualification_admission_names = validate_evidence(
+    value["qualification_admission_required_evidence"]
+)
+if value["qualification_admission_required_evidence"] != [
+    {
+        "filename": "production-mutation-qualification-begin.receipt.json",
+        "kind": "json",
+    },
+    {
+        "filename": "production-mutation-qualification-terminal.receipt.json",
+        "kind": "json",
+    },
+] or qualification_admission_names & framework_names:
     raise SystemExit(1)
 cases = value["cases"]
 if not isinstance(cases, list) or not cases:

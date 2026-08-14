@@ -865,6 +865,7 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
             "cases",
             "framework_required_evidence",
             "post_block_path_cases",
+            "qualification_admission_required_evidence",
             "version"
         ]
     );
@@ -872,6 +873,13 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
     assert_eq!(
         catalog["framework_required_evidence"],
         serde_json::json!([{"filename":"cleanup-receipt.json","kind":"json"}])
+    );
+    assert_eq!(
+        catalog["qualification_admission_required_evidence"],
+        serde_json::json!([
+            {"filename":"production-mutation-qualification-begin.receipt.json","kind":"json"},
+            {"filename":"production-mutation-qualification-terminal.receipt.json","kind":"json"}
+        ])
     );
 
     let cases = catalog["cases"].as_array().expect("catalog cases");

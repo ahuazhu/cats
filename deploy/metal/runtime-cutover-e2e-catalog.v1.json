@@ -257,5 +257,15 @@
       ]
     }
   ],
+  "qualification_admission_required_evidence": [
+    {
+      "filename": "production-mutation-qualification-begin.receipt.json",
+      "kind": "json"
+    },
+    {
+      "filename": "production-mutation-qualification-terminal.receipt.json",
+      "kind": "json"
+    }
+  ],
   "version": 1
 }
