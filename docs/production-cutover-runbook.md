@@ -649,8 +649,11 @@ Only after the saved close plan has been reviewed, install an EXIT/INT/TERM clea
 that exact plan. Then apply the reviewed full A23 policy that changes only the exact qualification
 Node from `cordoned` to `schedulable`, using its exact current revision, and run E3. Capture the
 runner status without exiting the operator shell. Whether the runner returns 0, 78 or any failure,
-cleanup first exact-re-cordons the Node and then applies the saved ingress-close plan. Failure of
-the first cleanup action must not suppress the second; both must be attempted and both must succeed:
+cleanup first exact-re-cordons the Node, then applies the saved ingress-close plan, then reruns the
+exact E12 fleet verifier. If the schedulable apply response is ambiguous, cleanup first replays that
+same durable CLI request to a terminal result before it submits the exact next-revision re-cordon.
+Failure of one cleanup action must not suppress the later actions; all three must be attempted and
+all three must succeed:
 
 ```sh
 terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
@@ -668,21 +671,68 @@ terraform -chdir=deploy/aws/terraform/stacks/production-application show \
 
 # Review the JSON now. It must only remove/close qualification ingress. Do not
 # continue until that assertion has an operator approval receipt.
-qualification_node_schedulable=0
+qualification_transition=not_started
+apply_schedulable_policy() {
+  /approved/staged-worker/cats \
+    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+    admin runtime-node policy apply \
+    --node <QUALIFICATION_NODE_ID> \
+    --expected-revision <EXACT_CURRENT_CORDONED_POLICY_REVISION> \
+    --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-schedulable-policy.v1.json \
+    --deployment-id <FRESH_DEPLOYMENT_ID> \
+    --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
+    --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem
+}
+
+exact_re_cordon_policy() {
+  /approved/staged-worker/cats \
+    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+    admin runtime-node policy apply \
+    --node <QUALIFICATION_NODE_ID> \
+    --expected-revision <EXACT_SCHEDULABLE_POLICY_REVISION> \
+    --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json \
+    --deployment-id <FRESH_DEPLOYMENT_ID> \
+    --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
+    --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json || return
+  jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
+    '.version == 1 and .node_id == $node and .outcome == "policy_updated"
+     and .identity_state == "provisioned" and .policy_revision == $revision' \
+    /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json || return
+  jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
+    '.version == 1 and .node_id == $node and .policy_revision == $revision
+     and .scheduling_state == "cordoned"' \
+    /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
+}
+
+run_post_cleanup_e12() {
+  /approved/staged-worker/cats \
+    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+    admin fleet-verify \
+    --expected-node <NODE_1_ID> \
+    --expected-node <NODE_2_ID> \
+    --key-ring /approved/secrets/<CUTOVER_ID>/route-v2-r1/node/public-key-ring.v1.json \
+    --release-commit <FINAL_RELEASE_SHA> \
+    --timeout-seconds 600 \
+    --poll-interval-ms 1000 \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-post-cleanup-fleet-verification.v1.json
+}
+
 cleanup_e3_window() {
   set +e
   re_cordon_status=0
-  if [ "$qualification_node_schedulable" -eq 1 ]; then
-    /approved/staged-worker/cats \
-      --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-      admin runtime-node policy apply \
-      --node <QUALIFICATION_NODE_ID> \
-      --expected-revision <EXACT_SCHEDULABLE_POLICY_REVISION> \
-      --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json \
-      --deployment-id <FRESH_DEPLOYMENT_ID> \
-      --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
-      --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
-      > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json
+  if [ "$qualification_transition" = initiated ]; then
+    apply_schedulable_policy \
+      > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-replay-result.v1.json
+    schedulable_replay_status=$?
+    if [ "$schedulable_replay_status" -eq 0 ]; then
+      qualification_transition=terminal_schedulable
+    else
+      re_cordon_status=$schedulable_replay_status
+    fi
+  fi
+  if [ "$qualification_transition" = terminal_schedulable ]; then
+    exact_re_cordon_policy
     re_cordon_status=$?
   fi
 
@@ -690,8 +740,13 @@ cleanup_e3_window() {
     -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
     > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-apply.txt
   ingress_close_status=$?
+
+  run_post_cleanup_e12
+  fleet_verify_status=$?
   set -e
-  [ "$re_cordon_status" -eq 0 ] && [ "$ingress_close_status" -eq 0 ]
+  [ "$re_cordon_status" -eq 0 ] && \
+    [ "$ingress_close_status" -eq 0 ] && \
+    [ "$fleet_verify_status" -eq 0 ]
 }
 
 abort_e3_window() {
@@ -708,17 +763,16 @@ trap 'abort_e3_window $?' EXIT
 trap 'abort_e3_window 130' INT
 trap 'abort_e3_window 143' TERM
 
-/approved/staged-worker/cats \
-  --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-  admin runtime-node policy apply \
-  --node <QUALIFICATION_NODE_ID> \
-  --expected-revision <EXACT_CURRENT_CORDONED_POLICY_REVISION> \
-  --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-schedulable-policy.v1.json \
-  --deployment-id <FRESH_DEPLOYMENT_ID> \
-  --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
-  --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
+qualification_transition=initiated
+set +e
+apply_schedulable_policy \
   > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-result.v1.json
-qualification_node_schedulable=1
+schedulable_apply_status=$?
+set -e
+if [ "$schedulable_apply_status" -ne 0 ]; then
+  exit "$schedulable_apply_status"
+fi
+qualification_transition=terminal_schedulable
 
 set +e
 deploy/metal/runtime-cutover-e2e.sh <THE_MATCHING_FULL_INVOCATION_BELOW>
@@ -730,25 +784,14 @@ trap - EXIT INT TERM
 
 [ "$cleanup_status" -eq 0 ]
 
-jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
-  '.version == 1 and .node_id == $node and .outcome == "policy_updated"
-   and .identity_state == "provisioned" and .policy_revision == $revision' \
-  /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json
-jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
-  '.version == 1 and .node_id == $node and .policy_revision == $revision
-   and .scheduling_state == "cordoned"' \
-  /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
-
-# Rerun phase 6's exact fleet-verify command after re-cordon. E12 proves
-# empty/session/full-inventory/ring; the signed A23 result+policy above prove cordon.
 case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
 ```
 
 The open plan is applied before the cleanup trap only while every Node remains cordoned; install
 the trap immediately after the live-state close plan is saved and approved, before the A23
-schedulable transition. Clear it only after both cleanup receipts exist. Rerun E12 before accepting
-the block path; E12 proves empty/session/full-inventory/ring, while the latest A23 result and full
-policy above independently prove exact re-cordon.
+schedulable transition. Clear it only after exact re-cordon, ingress-close and post-cleanup E12
+results all exist. E12 proves empty/session/full-inventory/ring, while the latest A23 result and
+full policy above independently prove exact re-cordon.
 Do not continue to the other block path if ingress-close, A23 re-cordon or E12 fails.
 
 **Command — kernel NBD:**
@@ -846,8 +889,10 @@ FLUSH/sync, public Gateway HTTP and WebSocket, an exact `cats-worker.service` re
 AgentSession and fresh session-bound full inventory, post-restart Guest and route/gate evidence,
 durable usage delivery, and exact delete cleanup.
 
-**Retain.** For each block path retain `manifest.json`, `scenario-results.jsonl`, bounded journal,
-`final-inventory.json`, `exit-code` and `SHA256SUMS` through the append-only evidence boundary.
+**Retain.** For each block path retain the schedulable result and any exact replay result, exact
+re-cordon result, ingress-close apply transcript, post-cleanup E12 result, `manifest.json`,
+`scenario-results.jsonl`, bounded journal, `final-inventory.json`, `exit-code` and `SHA256SUMS`
+through the append-only evidence boundary.
 
 **Cancel point.** A failed case still runs bounded diagnostics and cleanup, then exits nonzero.
 The operator trap must restore ingress Closed, exact-re-cordon the qualification Node and rerun E12

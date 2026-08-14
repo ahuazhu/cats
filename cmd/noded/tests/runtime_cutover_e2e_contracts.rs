@@ -483,10 +483,20 @@ fn runner_rejects_labels_that_alias_the_same_scenario_environment_name() {
     let script = r#"
 set -euo pipefail
 source "$1"
-cats_e3_environment_labels_are_unique cats=/one runtime-e3-probe=/two
-if cats_e3_environment_labels_are_unique runtime-e3-probe=/one runtime_e3_probe=/two; then
+cats_e3_environment_labels_are_unique true cats=/one runtime-e3-probe=/two
+if cats_e3_environment_labels_are_unique true runtime-e3-probe=/one runtime_e3_probe=/two; then
   exit 1
 fi
+if cats_e3_environment_labels_are_unique true runtime-e3-probe=/one runtime-e3-probe-sha256=/two; then
+  exit 1
+fi
+if cats_e3_environment_labels_are_unique true runtime-e3-probe=/one runtime_e3_probe_sha256=/two; then
+  exit 1
+fi
+if cats_e3_environment_labels_are_unique true runtime-e3-probe-sha256=/two runtime-e3-probe=/one; then
+  exit 1
+fi
+cats_e3_environment_labels_are_unique false route-key-ring=/one route-key-ring-sha256=/two
 "#;
     let output = Command::new("bash")
         .env_clear()
@@ -496,6 +506,121 @@ fi
         .output()
         .expect("run environment label collision fixture");
     assert_success(&output);
+}
+
+fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) {
+    let stage =
+        fs::read_to_string(output_dir.join("private-stage-path")).expect("read private stage path");
+    assert!(
+        !Path::new(stage.trim()).starts_with(output_dir),
+        "private stage was created inside retained evidence"
+    );
+    assert!(
+        !Path::new(stage.trim()).exists(),
+        "private stage survived exit"
+    );
+    fn assert_tree_has_no_secret(path: &Path, secret: &[u8]) {
+        for entry in fs::read_dir(path).expect("read retained evidence directory") {
+            let entry = entry.expect("read retained evidence entry");
+            if entry
+                .file_type()
+                .expect("read evidence entry type")
+                .is_dir()
+            {
+                assert_tree_has_no_secret(&entry.path(), secret);
+                continue;
+            }
+            let bytes = fs::read(entry.path()).expect("read retained evidence file");
+            assert!(
+                !bytes.windows(secret.len()).any(|window| window == secret),
+                "retained evidence contains control token bytes"
+            );
+        }
+    }
+    assert_tree_has_no_secret(output_dir, secret.as_bytes());
+}
+
+#[test]
+fn runner_removes_private_token_stage_after_failure() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("private-stage-failure");
+    let private_root = fixture.output_dir("private-stage-root-failure");
+    fs::create_dir(&private_root).expect("create private stage root");
+    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
+        .expect("protect private stage root");
+    let runner = fixture.root.join("deploy/metal/runtime-cutover-e2e.sh");
+    let secret = "fixture-control-token-must-not-survive";
+    let script = r#"
+set -euo pipefail
+source "$1"
+mkdir -m 0700 "$2"
+cats_e3_prepare_private_stage "$4"
+printf '%s\n' "$cats_e3_private_stage" >"$2/private-stage-path"
+printf '%s' "$3" >"$cats_e3_private_stage/control-token"
+exit 23
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-private-stage-failure"])
+        .arg(runner)
+        .arg(&output_dir)
+        .arg(secret)
+        .arg(&private_root)
+        .output()
+        .expect("run private stage failure fixture");
+    assert_eq!(output.status.code(), Some(23));
+    assert_private_stage_removed_without_secret(&output_dir, secret);
+}
+
+#[test]
+fn runner_removes_private_token_stage_after_term() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("private-stage-term");
+    let private_root = fixture.output_dir("private-stage-root-term");
+    fs::create_dir(&private_root).expect("create private stage root");
+    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
+        .expect("protect private stage root");
+    let runner = fixture.root.join("deploy/metal/runtime-cutover-e2e.sh");
+    let secret = "fixture-control-token-must-not-survive-term";
+    let script = r#"
+set -euo pipefail
+source "$1"
+mkdir -m 0700 "$2"
+cats_e3_prepare_private_stage "$4"
+printf '%s\n' "$cats_e3_private_stage" >"$2/private-stage-path"
+printf '%s' "$3" >"$cats_e3_private_stage/control-token"
+: >"$2/ready"
+while :; do sleep 1; done
+"#;
+    let mut child = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-private-stage-term"])
+        .arg(runner)
+        .arg(&output_dir)
+        .arg(secret)
+        .arg(&private_root)
+        .spawn()
+        .expect("spawn private stage TERM fixture");
+    for _ in 0..200 {
+        if output_dir.join("ready").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        output_dir.join("ready").exists(),
+        "TERM fixture did not become ready"
+    );
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send TERM to private stage fixture");
+    assert!(signal.success());
+    let status = child.wait().expect("wait for private stage TERM fixture");
+    assert_eq!(status.code(), Some(143));
+    assert_private_stage_removed_without_secret(&output_dir, secret);
 }
 
 fn sha256(path: &Path) -> String {

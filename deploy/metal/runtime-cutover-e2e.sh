@@ -202,15 +202,45 @@ cats_e3_export_qualification_environment() {
 }
 
 cats_e3_environment_labels_are_unique() {
-  local entry label environment_label seen
+  local reserve_sha256=$1 entry label environment_label derived_name seen
+  shift
+  [[ $reserve_sha256 == true || $reserve_sha256 == false ]] || return 1
   seen='|'
   for entry in "$@"; do
     label=${entry%%=*}
     [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
     environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
-    case "$seen" in *"|$environment_label|"*) return 1 ;; esac
-    seen+="$environment_label|"
+    derived_name=$environment_label
+    case "$seen" in *"|$derived_name|"*) return 1 ;; esac
+    seen+="$derived_name|"
+    if [[ $reserve_sha256 == true ]]; then
+      derived_name=${environment_label}_SHA256
+      case "$seen" in *"|$derived_name|"*) return 1 ;; esac
+      seen+="$derived_name|"
+    fi
   done
+}
+
+cats_e3_private_stage=
+cats_e3_cleanup_private_stage() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -n $cats_e3_private_stage ]]; then
+    rm -f -- "$cats_e3_private_stage/control-token" || status=125
+    rmdir -- "$cats_e3_private_stage" || status=125
+    cats_e3_private_stage=
+  fi
+  exit "$status"
+}
+
+cats_e3_prepare_private_stage() {
+  local parent=$1
+  [[ -z $cats_e3_private_stage && $parent == /* && -d $parent && ! -L $parent ]] || return 1
+  cats_e3_private_stage=$(mktemp -d "$parent/.cats-e3-secrets.XXXXXX") || return 1
+  trap cats_e3_cleanup_private_stage EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  chmod 0700 "$cats_e3_private_stage"
 }
 
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
@@ -345,9 +375,9 @@ done
 [[ ${#binary_entries[@]} -gt 0 ]] || fail "at least one --binary is required"
 [[ ${#config_entries[@]} -gt 0 ]] || fail "at least one --config is required"
 [[ ${#key_fingerprint_entries[@]} -gt 0 ]] || fail "at least one --key-fingerprint is required"
-cats_e3_environment_labels_are_unique "${binary_entries[@]}" || \
+cats_e3_environment_labels_are_unique true "${binary_entries[@]}" || \
   fail "binary labels collide after environment normalization"
-cats_e3_environment_labels_are_unique "${config_entries[@]}" || \
+cats_e3_environment_labels_are_unique false "${config_entries[@]}" || \
   fail "config labels collide after environment normalization"
 [[ $EUID -eq 0 ]] || fail "production E3 qualification must run as root"
 
@@ -496,7 +526,7 @@ mkdir -m 0700 "$output_dir"
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$scratch"
 stage=$scratch/stage
-mkdir -m 0700 "$stage" "$stage/binaries" "$stage/configs" "$stage/secrets"
+mkdir -m 0700 "$stage" "$stage/binaries" "$stage/configs"
 results_work=$scratch/scenario-results.jsonl
 journal_work=$scratch/component-journal-summary.txt
 catalog_work=$scratch/scenario-catalog.jsonl
@@ -567,7 +597,9 @@ stage_input scenario-driver "$scenario_driver" "$stage/runtime-cutover-v2-scenar
 stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
 stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
 stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
-token_file=$stage/secrets/control-token
+cats_e3_prepare_private_stage "${token_file_original%/*}" || \
+  fail "create root-only private token stage"
+token_file=$cats_e3_private_stage/control-token
 token_before=$(sha256sum "$token_file_original" | awk '{print $1}')
 [[ $token_before == "$token_file_authority_sha256" ]] || fail "token changed before its private stable-stage copy"
 cp "$token_file_original" "$token_file"
