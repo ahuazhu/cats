@@ -115,6 +115,16 @@ impl SignedUsageSampler {
         Ok(checkpoints)
     }
 
+    fn finalize_shutdown(&mut self) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+        let now = Instant::now();
+        let observed_at_unix_ms = now_unix_ms()?;
+        let mut checkpoints = Vec::new();
+        for meter in self.meters.values_mut().filter(|meter| meter.active) {
+            checkpoints.extend(sample_meter(meter, now, observed_at_unix_ms, true)?);
+        }
+        Ok(checkpoints)
+    }
+
     fn finalize_before_effect(
         &mut self,
         desired: &DesiredRuntimeSpec,
@@ -179,12 +189,11 @@ impl SignedUsageSampler {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let source_epoch = format!(
-            "session:{}:{}:runtime:{}:processes:{}",
-            self.session.agent_instance_id,
-            self.session.agent_session_epoch.get(),
-            runtime_incarnation,
-            process_epoch
+        let source_epoch = signed_source_epoch(
+            &self.session,
+            applied.desired_revision.get(),
+            runtime_incarnation.as_str(),
+            &process_epoch,
         );
         Ok(Some(SignedMeterTarget {
             cat_id: runtime.cat_id.to_string(),
@@ -193,6 +202,19 @@ impl SignedUsageSampler {
             cgroups,
         }))
     }
+}
+
+fn signed_source_epoch(
+    session: &SessionBinding,
+    desired_revision: u64,
+    runtime_incarnation: &str,
+    process_epoch: &str,
+) -> String {
+    format!(
+        "session:{}:{}:desired:{desired_revision}:runtime:{runtime_incarnation}:processes:{process_epoch}",
+        session.agent_instance_id,
+        session.agent_session_epoch.get(),
+    )
 }
 
 fn new_meter(node_id: &str, target: SignedMeterTarget) -> anyhow::Result<SignedMeterState> {
@@ -356,6 +378,15 @@ impl SignedUsagePipeline {
         self.persist(checkpoints)
     }
 
+    fn finalize_shutdown(&self) -> anyhow::Result<()> {
+        let checkpoints = self
+            .sampler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finalize_shutdown()?;
+        self.persist(checkpoints)
+    }
+
     pub(crate) fn finalize_before_effect(
         &self,
         desired: &DesiredRuntimeSpec,
@@ -376,7 +407,7 @@ impl SignedUsagePipeline {
         Ok(())
     }
 
-    async fn deliver_pending(&self) -> anyhow::Result<()> {
+    pub(crate) async fn deliver_pending(&self) -> anyhow::Result<()> {
         deliver_usage_batches(
             &self.client,
             &self.endpoint,
@@ -386,6 +417,14 @@ impl SignedUsagePipeline {
             &self.delivery,
         )
         .await
+    }
+
+    pub(crate) async fn deliver_pending_for_shutdown(&self) -> anyhow::Result<()> {
+        // The periodic lane may be in exponential backoff. Graceful shutdown
+        // gets one immediate bounded attempt; failure still leaves the exact
+        // ordered prefix in the durable spool for the next process.
+        self.delivery.lock().await.retry_not_before = None;
+        self.deliver_pending().await
     }
 }
 
@@ -426,6 +465,10 @@ pub(crate) async fn run_sampler(
             _ = interval.tick() => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    let pipeline = Arc::clone(&pipeline);
+                    tokio::task::spawn_blocking(move || pipeline.finalize_shutdown())
+                        .await
+                        .context("join final signed usage sample")??;
                     return Ok(());
                 }
                 continue;
@@ -461,5 +504,28 @@ pub(crate) async fn run_delivery(
                 "signed usage delivery will retry"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+
+    use super::signed_source_epoch;
+
+    #[test]
+    fn desired_revision_separates_accumulator_epochs_after_counter_reset() {
+        let session = SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(3).unwrap(),
+        };
+        let first = signed_source_epoch(&session, 7, "runtime-a", "vmm:scope:41:99");
+        let next = signed_source_epoch(&session, 8, "runtime-a", "vmm:scope:41:99");
+
+        assert_ne!(first, next);
+        assert!(first.contains(":desired:7:"));
+        assert!(next.contains(":desired:8:"));
     }
 }

@@ -20,7 +20,7 @@ use cats_api::billing::BillingBalance;
 use cats_api::fleet_verification::{decode_fleet_verification_snapshot, FLEET_VERIFICATION_PATH};
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
-    UsageReport, MAX_USAGE_INGEST_BODY_BYTES,
+    UsageReport, MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH,
 };
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition};
 use cats_api::requests::*;
@@ -45,13 +45,9 @@ use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
 
-fn usage_session(node_id: &str) -> SessionBinding {
-    SessionBinding {
-        node_id: Id::new(node_id).unwrap(),
-        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
-        agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
-        agent_session_epoch: Epoch::new(1).unwrap(),
-    }
+struct SignedUsageNode {
+    signer: Ed25519RequestSigner,
+    session: SessionBinding,
 }
 
 async fn reject_unexpected_production_node_call(
@@ -804,19 +800,104 @@ impl Ctx {
         }
     }
 
-    /// [`Self::post_service`] for the endpoints whose response body is asserted.
-    async fn post_service_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    async fn register_usage_node(&self, node_id: &str) -> SignedUsageNode {
+        static NEXT_REGISTRATION: AtomicUsize = AtomicUsize::new(1);
+        let unique = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed) as u128;
+        let signer = Ed25519RequestSigner::from_pkcs8_pem(
+            Id::new(format!("credential_{node_id}")).unwrap(),
+            include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+        )
+        .unwrap();
+        let identity = NodeIdentity {
+            version: ContractVersion::V1,
+            node_id: Id::new(node_id).unwrap(),
+            immutable_host_id: Id::new(format!("host_{node_id}")).unwrap(),
+            credential_id: signer.credential_id().clone(),
+            credential_binding: CredentialBinding::PublicKey {
+                public_key_spki_sha256: signer.public_key_spki_sha256(),
+            },
+            state_path_id: Id::new(format!("state_{node_id}")).unwrap(),
+            state: NodeIdentityState::Provisioned,
+        };
+        cats_control_plane::testsupport::provision_node_identity(
+            &self.cp.state.store,
+            identity.clone(),
+        )
+        .await;
+        let attempt = AgentRegistrationAttempt {
+            version: ContractVersion::V1,
+            node_id: identity.node_id,
+            immutable_host_id: identity.immutable_host_id,
+            node_boot_id: NodeBootId::new(format!("{unique:032x}")).unwrap(),
+            agent_instance_id: RandomId128::new(format!("{:032x}", unique + 1)).unwrap(),
+            registration_attempt_id: RandomId128::new(format!("{:032x}", unique + 2)).unwrap(),
+            guest_config_digest: guest_config_digest(
+                &cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+            )
+            .unwrap(),
+            expected_agent_session_epoch: None,
+        };
+        let body = encode_agent_registration_attempt(&attempt).unwrap();
+        let proof = signer.sign("POST", REGISTRATION_PATH, &body);
+        let response = self
+            .http
+            .post(self.url(REGISTRATION_PATH))
+            .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+            .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+            .header(NODE_SIGNATURE_HEADER, proof.signature)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.bytes().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "AgentSession registration failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let session = decode_agent_session(&body).unwrap();
+        SignedUsageNode {
+            signer,
+            session: SessionBinding {
+                node_id: session.node_id,
+                node_boot_id: session.node_boot_id,
+                agent_instance_id: session.agent_instance_id,
+                agent_session_epoch: session.agent_session_epoch,
+            },
+        }
+    }
+
+    async fn post_signed_usage(
         &self,
-        url: String,
-        body: &B,
-    ) -> T {
+        node: &SignedUsageNode,
+        request: &IngestUsageCheckpointsRequest,
+    ) -> reqwest::Response {
+        let body = serde_json::to_vec(request).unwrap();
+        let proof = node
+            .signer
+            .sign(USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH, &body);
         self.http
-            .post(url)
-            .bearer_auth(SERVICE_TOKEN)
-            .json(body)
+            .post(self.url(USAGE_CHECKPOINTS_PATH))
+            .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+            .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+            .header(NODE_SIGNATURE_HEADER, proof.signature)
+            .body(body)
             .send()
             .await
             .unwrap()
+    }
+
+    async fn post_signed_usage_json(
+        &self,
+        node: &SignedUsageNode,
+        request: &IngestUsageCheckpointsRequest,
+    ) -> IngestUsageCheckpointsResponse {
+        self.post_signed_usage(node, request)
+            .await
             .error_for_status()
             .unwrap()
             .json()
@@ -2860,7 +2941,6 @@ async fn usage_ingestion_rejects_bodies_above_the_explicit_limit() {
     let response = ctx
         .http
         .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
         .header("content-type", "application/json")
         .body(vec![b' '; MAX_USAGE_INGEST_BODY_BYTES + 1])
         .send()
@@ -2873,6 +2953,7 @@ async fn usage_ingestion_rejects_bodies_above_the_explicit_limit() {
 async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metric() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("metered", None).await;
     let cat = ctx.wait_observed("metered", ObservedState::Running).await;
 
@@ -2905,7 +2986,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         ),
     ];
     let request = IngestUsageCheckpointsRequest {
-        session: usage_session("node_a"),
+        session: usage_node.session.clone(),
         node_id: "node_a".to_string(),
         checkpoints,
     };
@@ -2932,15 +3013,11 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             .unwrap(),
         IngestOutcome::Accepted
     );
-    let first: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
-        .await;
+    let first = ctx.post_signed_usage_json(&usage_node, &request).await;
     assert_eq!(first.accepted, 3);
     assert_eq!(first.duplicates, 1);
 
-    let replay: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
-        .await;
+    let replay = ctx.post_signed_usage_json(&usage_node, &request).await;
     assert_eq!(replay.accepted, 0);
     assert_eq!(replay.duplicates, 4);
 
@@ -3028,7 +3105,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     let transitioned = ctx.wait_observed("metered", ObservedState::Suspended).await;
     assert!(transitioned.generation > cat.generation);
     let historical = IngestUsageCheckpointsRequest {
-        session: usage_session("node_a"),
+        session: usage_node.session.clone(),
         node_id: "node_a".to_string(),
         checkpoints: vec![make_checkpoint(
             UsageMetric::CpuUsec,
@@ -3037,26 +3114,18 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             3_600_000_001,
         )],
     };
-    let accepted_historical: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &historical)
-        .await;
+    let accepted_historical = ctx.post_signed_usage_json(&usage_node, &historical).await;
     assert_eq!(accepted_historical.accepted, 1);
 
     let mut future_checkpoint = historical.checkpoints[0].clone();
     future_checkpoint.cat_generation = transitioned.generation + 1;
     future_checkpoint.event_id = deterministic_event_id(&future_checkpoint);
-    let future = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            session: usage_session("node_a"),
-            node_id: "node_a".to_string(),
-            checkpoints: vec![future_checkpoint],
-        })
-        .send()
-        .await
-        .unwrap();
+    let future_request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![future_checkpoint],
+    };
+    let future = ctx.post_signed_usage(&usage_node, &future_request).await;
     assert_eq!(future.status(), StatusCode::CONFLICT);
 
     let deleted = ctx
@@ -3085,23 +3154,19 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let deleted_tail_request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![make_checkpoint(
+            UsageMetric::CpuUsec,
+            3,
+            hour_end + 2_000,
+            3_600_000_002,
+        )],
+    };
     let deleted_tail: IngestUsageCheckpointsResponse = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            session: usage_session("node_a"),
-            node_id: "node_a".to_string(),
-            checkpoints: vec![make_checkpoint(
-                UsageMetric::CpuUsec,
-                3,
-                hour_end + 2_000,
-                3_600_000_002,
-            )],
-        })
-        .send()
+        .post_signed_usage(&usage_node, &deleted_tail_request)
         .await
-        .unwrap()
         .error_for_status()
         .unwrap()
         .json()
@@ -3154,9 +3219,58 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
 }
 
 #[tokio::test]
+async fn frozen_usage_epoch_accepts_the_old_node_tail_after_placement_moves() {
+    let ctx = Ctx::new().await;
+    let _old_node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
+    ctx.create_cat("migrating-meter", None).await;
+    let cat = ctx
+        .wait_observed("migrating-meter", ObservedState::Running)
+        .await;
+
+    let checkpoint = |sequence, observed_at_unix_ms, cumulative_quantity| {
+        let mut checkpoint = CatUsageCheckpoint {
+            event_id: String::new(),
+            source_id: format!("node/node_a/cat/{}", cat.id),
+            source_epoch: "runtime-before-move".to_string(),
+            sequence,
+            observed_at_unix_ms,
+            cat_id: cat.id.clone(),
+            cat_generation: cat.generation,
+            metric: UsageMetric::CpuUsec,
+            cumulative_quantity,
+        };
+        checkpoint.event_id = deterministic_event_id(&checkpoint);
+        checkpoint
+    };
+    let first = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![checkpoint(0, 1_000, 0)],
+    };
+    let accepted = ctx.post_signed_usage_json(&usage_node, &first).await;
+    assert_eq!(accepted.accepted, 1);
+
+    let _new_node = start_stub_node(&ctx.cp, "node_b").await;
+    ctx.cp
+        .state
+        .store
+        .set_placement(&cat.id, Some("node_b"))
+        .unwrap();
+    let tail = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![checkpoint(1, 2_000, 1)],
+    };
+    let accepted_tail = ctx.post_signed_usage_json(&usage_node, &tail).await;
+    assert_eq!(accepted_tail.accepted, 1);
+}
+
+#[tokio::test]
 async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("spender", None).await;
     let cat = ctx.wait_observed("spender", ObservedState::Running).await;
     let checkpoint = |sequence, observed_at_unix_ms, cumulative_quantity| {
@@ -3174,21 +3288,15 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
         checkpoint.event_id = deterministic_event_id(&checkpoint);
         checkpoint
     };
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            session: usage_session("node_a"),
-            node_id: "node_a".to_string(),
-            checkpoints: vec![
-                checkpoint(0, 1_000, 0),
-                checkpoint(1, 720_001_000, 720_000_000_000),
-            ],
-        })
-        .send()
-        .await
-        .unwrap();
+    let request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![
+            checkpoint(0, 1_000, 0),
+            checkpoint(1, 720_001_000, 720_000_000_000),
+        ],
+    };
+    let response = ctx.post_signed_usage(&usage_node, &request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     ctx.action("spender", "suspend").await;
@@ -4762,6 +4870,7 @@ async fn one_backing_off_cat_does_not_delay_another() {
 async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("billable", None).await;
     let cat = ctx.wait_observed("billable", ObservedState::Running).await;
 
@@ -4785,22 +4894,16 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     // checkpoint of its epoch was attributed: nothing will ever make it
     // ingestible. It sits at the head, where it used to block the rest.
     let poison = checkpoint("cat_vanished", 0, 1_000, 0);
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            session: usage_session("node_a"),
-            node_id: "node_a".to_string(),
-            checkpoints: vec![
-                poison.clone(),
-                checkpoint(&cat.id, 0, 1_000, 0),
-                checkpoint(&cat.id, 1, 61_000, 60_000_000),
-            ],
-        })
-        .send()
-        .await
-        .unwrap();
+    let request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![
+            poison.clone(),
+            checkpoint(&cat.id, 0, 1_000, 0),
+            checkpoint(&cat.id, 1, 61_000, 60_000_000),
+        ],
+    };
+    let response = ctx.post_signed_usage(&usage_node, &request).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,

@@ -19,8 +19,12 @@ pub const USAGE_CHECKPOINTS_PATH: &str = "/v1/internal/usage/checkpoints";
 /// put an otherwise valid checkpoint batch on the boundary.
 pub const MAX_USAGE_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Independent cardinality defense for a syntactically small request.
-pub const MAX_USAGE_CHECKPOINTS_PER_REQUEST: usize = 10_000;
+/// Independent cardinality defense for a syntactically small request. The
+/// durable producer drains larger backlogs as consecutive ordered batches.
+/// 256 carries one two-metric sample round for 128 active runtimes while
+/// preventing one request from monopolizing an ingestion worker with an
+/// arbitrarily large source-attribution loop.
+pub const MAX_USAGE_CHECKPOINTS_PER_REQUEST: usize = 256;
 
 /// Canonical V1 meter definitions. Their units are immutable once emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

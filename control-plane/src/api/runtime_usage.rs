@@ -195,9 +195,20 @@ pub(super) async fn ingest(State(state): State<AppState>, request: Request<Body>
     if authenticated_node != request.session.node_id {
         return conflict("usage checkpoint identity does not match its AgentSession");
     }
-    drop(_global_permit);
+    let _node_permit = match state.runtime_spine_admission.try_node(&authenticated_node) {
+        Ok(permit) => permit,
+        Err(_) => return unavailable("usage checkpoint Node admission is saturated"),
+    };
 
-    ingest_authenticated(&state, request).await
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        ingest_authenticated(&state, request),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => deadline_exceeded(),
+    }
 }
 
 async fn ingest_authenticated(
@@ -235,78 +246,62 @@ async fn ingest_authenticated(
             }
             Err(_) => return internal(),
         };
-        let attribution = match cat {
-            Some(cat) => {
-                if cat.node_id.as_str() != request.node_id {
-                    return conflict(format!(
-                        "node {} does not own Cat {}",
-                        request.node_id, checkpoint.cat_id
-                    ));
-                }
-                let generation = match u64::try_from(checkpoint.cat_generation) {
-                    Ok(generation) => generation,
-                    Err(_) => return invalid("checkpoint Cat generation must be nonnegative"),
-                };
-                if generation > cat.desired_revision.get() {
-                    return conflict(format!(
-                        "Cat {} checkpoint generation {} is newer than current {}",
-                        checkpoint.cat_id,
-                        checkpoint.cat_generation,
-                        cat.desired_revision.get()
-                    ));
-                }
-                if let Some(attribution) = frozen_attribution {
-                    if !cat_attribution_matches(
-                        &attribution,
-                        &checkpoint.cat_id,
-                        Some(cat.workspace_id.as_str()),
-                    ) {
-                        return conflict(
-                            "stored source-epoch attribution does not match current Cat ownership",
-                        );
-                    }
-                    attribution
-                } else {
-                    let workspace_id = cat.workspace_id.to_string();
-                    let billing_account_id =
-                        match super::billing_account_id_for_workspace(state, &workspace_id).await {
-                            Ok(account) => account,
-                            Err(error) => return api_error(error),
-                        };
-                    UsageAttribution {
-                        billing_account_id,
-                        workspace_id,
-                        resource_type: "cat".to_owned(),
-                        resource_id: checkpoint.cat_id.clone(),
-                        attributed_cat_id: Some(checkpoint.cat_id.clone()),
-                    }
-                }
+        let generation = match u64::try_from(checkpoint.cat_generation) {
+            Ok(generation) => generation,
+            Err(_) => return invalid("checkpoint Cat generation must be nonnegative"),
+        };
+        if let Some(cat) = cat.as_ref() {
+            if generation > cat.desired_revision.get() {
+                return conflict(format!(
+                    "Cat {} checkpoint generation {} is newer than current {}",
+                    checkpoint.cat_id,
+                    checkpoint.cat_generation,
+                    cat.desired_revision.get()
+                ));
             }
-            None => {
-                let Some(attribution) = frozen_attribution else {
-                    let reason = format!(
-                        "no frozen attribution exists for deleted Cat {} source epoch",
-                        checkpoint.cat_id
-                    );
-                    tracing::warn!(
-                        event = %checkpoint.event_id,
-                        cat = %checkpoint.cat_id,
-                        source_epoch = %checkpoint.source_epoch,
-                        "rejecting an unattributable usage checkpoint; its usage is not billed"
-                    );
-                    rejected.push(RejectedCheckpoint {
-                        event_id: checkpoint.event_id,
-                        reason,
-                    });
-                    continue;
-                };
-                if !cat_attribution_matches(&attribution, &checkpoint.cat_id, None) {
-                    return conflict(
-                        "stored source-epoch attribution does not match checkpoint Cat",
-                    );
-                }
-                attribution
+        }
+        let attribution = if let Some(attribution) = frozen_attribution {
+            let workspace_id = cat.as_ref().map(|cat| cat.workspace_id.as_str());
+            if !cat_attribution_matches(&attribution, &checkpoint.cat_id, workspace_id) {
+                return conflict("stored source-epoch attribution does not match checkpoint Cat");
             }
+            attribution
+        } else if let Some(cat) = cat {
+            if cat.node_id.as_str() != request.node_id {
+                return conflict(format!(
+                    "node {} does not own Cat {}",
+                    request.node_id, checkpoint.cat_id
+                ));
+            }
+            let workspace_id = cat.workspace_id.to_string();
+            let billing_account_id =
+                match super::billing_account_id_for_workspace(state, &workspace_id).await {
+                    Ok(account) => account,
+                    Err(error) => return api_error(error),
+                };
+            UsageAttribution {
+                billing_account_id,
+                workspace_id,
+                resource_type: "cat".to_owned(),
+                resource_id: checkpoint.cat_id.clone(),
+                attributed_cat_id: Some(checkpoint.cat_id.clone()),
+            }
+        } else {
+            let reason = format!(
+                "no frozen attribution exists for deleted Cat {} source epoch",
+                checkpoint.cat_id
+            );
+            tracing::warn!(
+                event = %checkpoint.event_id,
+                cat = %checkpoint.cat_id,
+                source_epoch = %checkpoint.source_epoch,
+                "rejecting an unattributable usage checkpoint; its usage is not billed"
+            );
+            rejected.push(RejectedCheckpoint {
+                event_id: checkpoint.event_id,
+                reason,
+            });
+            continue;
         };
         let value = AttributedCheckpoint {
             attribution,

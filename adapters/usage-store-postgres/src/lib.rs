@@ -8,7 +8,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc as std_mpsc;
+
+use tokio::sync::mpsc as tokio_mpsc;
 
 use cats_api::metering::UsageMetric;
 use cats_metering::{
@@ -25,6 +27,10 @@ use postgres_native_tls::MakeTlsConnector;
 
 pub const DEFAULT_SCHEMA: &str = "cats_usage";
 pub const DEFAULT_WORKERS: usize = 4;
+// One slot for each globally admitted signed-runtime request is sufficient
+// even if all of them select the same worker. Other callers then backpressure
+// instead of growing synchronous database work without a bound.
+const JOBS_PER_WORKER: usize = 64;
 
 /// A job receives the connection or the reason there is not one. Dropping it
 /// unrun would reach the caller as "operation was canceled", which is the kind
@@ -74,7 +80,7 @@ impl DsnSource {
 /// clients. Callers await a Tokio oneshot, so database I/O never blocks an
 /// async control-plane executor thread.
 pub struct PostgresUsageStore {
-    workers: Vec<mpsc::Sender<Job>>,
+    workers: Vec<tokio_mpsc::Sender<Job>>,
     next_worker: AtomicUsize,
     schema: String,
 }
@@ -128,11 +134,18 @@ impl PostgresUsageStore {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         self.workers[index]
             .send(Box::new(move |client| {
+                // A request that timed out while this job waited in the
+                // bounded queue has dropped its receiver. Do not perform its
+                // database effect after cancellation.
+                if result_tx.is_closed() {
+                    return;
+                }
                 let _ = result_tx.send(match client {
                     Ok(client) => operation(client),
                     Err(error) => Err(error),
                 });
             }))
+            .await
             .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited".to_string()))?;
         result_rx.await.map_err(|_| {
             MeteringError::Store("PostgreSQL usage operation was canceled".to_string())
@@ -774,9 +787,9 @@ fn spawn_worker(
     ca_file: Option<String>,
     schema: String,
     worker_index: usize,
-) -> Result<mpsc::Sender<Job>> {
-    let (jobs, receiver) = mpsc::channel::<Job>();
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+) -> Result<tokio_mpsc::Sender<Job>> {
+    let (jobs, mut receiver) = tokio_mpsc::channel::<Job>(JOBS_PER_WORKER);
+    let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(format!("cats-postgres-usage-{worker_index}"))
         .spawn(move || {
@@ -790,7 +803,7 @@ fn spawn_worker(
                     return;
                 }
             };
-            for job in receiver {
+            while let Some(job) = receiver.blocking_recv() {
                 // This worker previously had no reconnect at all: a dropped
                 // connection left it running every later job against a dead
                 // client, so usage ingestion stayed broken until the process
@@ -1662,7 +1675,7 @@ mod tests {
     /// says nothing about the credential that actually failed.
     #[test]
     fn a_worker_without_a_connection_reports_the_reason() {
-        let (jobs, receiver) = mpsc::channel::<Job>();
+        let (jobs, receiver) = std_mpsc::channel::<Job>();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         jobs.send(Box::new(move |client| {
             let _ = result_tx.send(match client {

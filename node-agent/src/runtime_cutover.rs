@@ -51,6 +51,7 @@ use crate::signed_usage::{
 };
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const FINAL_USAGE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
@@ -768,7 +769,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 &mut runner,
                 &runner_readiness,
                 deadline_policy,
-                runner_usage_pipeline,
+                runner_usage_pipeline.clone(),
                 #[cfg(test)]
                 observation_barrier_for_test,
             ) => (result, false),
@@ -790,6 +791,24 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                         run_result = Err(error);
                     }
                 }
+            }
+        }
+        if let Some(pipeline) = runner_usage_pipeline.as_ref() {
+            match tokio::time::timeout(
+                FINAL_USAGE_DELIVERY_TIMEOUT,
+                pipeline.deliver_pending_for_shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    error = format!("{error:#}"),
+                    "final signed usage delivery failed; durable spool retained"
+                ),
+                Err(_) => tracing::warn!(
+                    timeout_ms = FINAL_USAGE_DELIVERY_TIMEOUT.as_millis(),
+                    "final signed usage delivery timed out; durable spool retained"
+                ),
             }
         }
         let shutdown_result = runner.shutdown().await;
