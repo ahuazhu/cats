@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::RequestId as _;
 use aws_sdk_s3::primitives::ByteStream;
@@ -31,6 +32,14 @@ const SPOOL_FILE_SUFFIX: &str = ".body";
 const SPOOL_READ_BUFFER_BYTES: usize = 64 * 1024;
 const CONTENT_SHA256_METADATA: &str = "cats-content-sha256";
 const CONTENT_LENGTH_METADATA: &str = "cats-content-length";
+
+fn put_retry_config() -> RetryConfig {
+    // The outer accepted-write state machine performs HEAD discovery before
+    // every conditional PUT retry. An SDK-internal retry would reopen the EFS
+    // path without rerunning validate_spool_file, so one adapter invocation is
+    // deliberately one provider request attempt.
+    RetryConfig::disabled()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsObjectWriteConfig {
@@ -563,7 +572,15 @@ impl ExactS3Api for SdkExactS3Api {
             for (key, value) in &request.metadata {
                 put = put.metadata(key, value);
             }
-            let output = Box::pin(mutate_with_deadline(put.send(), deadline)).await?;
+            let output = Box::pin(mutate_with_deadline(
+                put.customize()
+                    .config_override(
+                        aws_sdk_s3::config::Builder::new().retry_config(put_retry_config()),
+                    )
+                    .send(),
+                deadline,
+            ))
+            .await?;
             let checksum_sha256 = output
                 .checksum_sha256()
                 .ok_or(S3CallError::InvalidResponse)?
@@ -1117,6 +1134,11 @@ mod tests {
             ),
             Err(ObjectWriteDownstreamError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn conditional_put_retries_are_owned_by_the_validating_outer_state_machine() {
+        assert_eq!(put_retry_config().max_attempts(), 1);
     }
 
     #[test]
