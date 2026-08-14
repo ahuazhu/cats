@@ -49,6 +49,13 @@ absolute, private locations and must be created outside the checkout:
   never copied into evidence;
 - `/approved/release/<FINAL_RELEASE_SHA>/` — exact immutable release artifacts.
 
+Prepare the dedicated operator execution Host with the release-bound verification toolchain before
+any phase that consumes it (E3 qualification and the reset proof set):
+`sudo deploy/aws/install-operator-tools.sh --bundle /approved/release/<FINAL_RELEASE_SHA>/cats-worker.tar.zst --bundle-sha256 <WORKER_BUNDLE_SHA256> --trust-file /approved/cutover/<CUTOVER_ID>/production-cutover-operator-trust.v1.json`
+installs exactly `/opt/cats/bin/cats`, both usage verifiers and
+`/etc/cats/production-cutover-operator-trust.v1.json`; it never installs a worker unit, VMM, Guest
+payload or node identity.
+
 Before the window, review and freeze the literal AWS account, partition, region, EKS cluster,
 Kubernetes context/namespace, old/fresh Control schemas, old/fresh ChunkStore prefixes, the current
 Usage schema/stream/table/archive reused only by the closed candidate, expected Node IDs and
