@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    generate_pkcs8_v2_pem, list_directory_names, open_directory_nofollow, open_file_at,
-    publish_user_file_idempotent, read_regular_at, read_stable_file, read_user_file, report,
-    set_file_mode, sync_directory, validate_directory, validate_regular_metadata,
+    effective_uid, generate_pkcs8_v2_pem, list_directory_names, open_directory_nofollow,
+    open_file_at, publish_user_file_idempotent, read_regular_at, read_stable_file, read_user_file,
+    report, set_file_mode, sync_directory, validate_directory, validate_regular_metadata,
     write_new_file_at, Cli, RuntimeProvisionerRouteV2R1Command,
 };
 use crate::stable_unix_fs::{c_os_name, mkdir_at};
@@ -1928,13 +1928,42 @@ fn load_staged_rotation_trust(
     trust_path: &Path,
 ) -> Result<(RouteV2RotationOperatorTrust, Vec<u8>)> {
     // The release artifact is public 0644, while the qualification runner
-    // stages every config below its root-only 0700 directory as 0600. Both
-    // are owner-controlled and non-writable by group/other; the exact bytes,
-    // release SHA and digest remain the authority.
-    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0, false)?;
+    // stages every config below its root-only 0700 directory as 0600. No
+    // other mode is an admitted representation of this trust root.
+    let trust_bytes = read_staged_rotation_trust_file(trust_path)?;
     let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
         .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
     Ok((trust, trust_bytes))
+}
+
+fn read_staged_rotation_trust_file(path: &Path) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "staged Route rotation trust path must be absolute"
+    );
+    let parent = open_directory_nofollow(
+        path.parent()
+            .context("staged Route rotation trust path has no parent")?,
+    )?;
+    validate_directory(
+        &parent,
+        effective_uid(),
+        None,
+        "staged Route rotation trust parent",
+    )?;
+    let name = c_os_name(
+        path.file_name()
+            .context("staged Route rotation trust path has no basename")?,
+    )?;
+    let file = open_file_at(&parent, &name, libc::O_RDONLY, 0)
+        .with_context(|| format!("open staged Route rotation trust {}", path.display()))?;
+    let mode = file.metadata()?.mode() & 0o7777;
+    anyhow::ensure!(
+        matches!(mode, 0o600 | 0o644),
+        "staged Route rotation trust must have exact mode 0600 or 0644"
+    );
+    validate_regular_metadata(&file, effective_uid(), mode, "staged Route rotation trust")?;
+    read_stable_file(&file, MAX_JSON_BYTES)
 }
 
 fn validate_staged_rotation_lineage(bundle: &RotationRecoveryCommandBundle) -> Result<()> {
