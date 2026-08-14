@@ -68,7 +68,7 @@ Each initial cordoned A23 policy also carries the operator-reviewed canonical
 that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
 Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
 The matching Control rollout requires exact clean-slate Store authority schema version 15; every earlier version is
-rejected rather than altered in place, so create or recreate the empty version-14 schema before any new Control
+rejected rather than altered in place, so create or recreate the empty version-15 schema before any new Control
 replica starts.
 
 The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
