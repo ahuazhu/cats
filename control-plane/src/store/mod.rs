@@ -433,7 +433,7 @@ fn drop_on_executor<T: Send + 'static>(
     }
 }
 
-fn drop_on_normal_executor(value: Client) {
+fn drop_on_normal_executor<T: Send + 'static>(value: T) {
     drop_on_executor(value, control_store_executor, metrics::ExecutorKind::Normal);
 }
 

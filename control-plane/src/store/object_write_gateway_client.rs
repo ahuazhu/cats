@@ -5,6 +5,7 @@
 //! login, schema, protocol, and closed function catalog before it is admitted
 //! to the bounded synchronous lane below.
 
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,7 +57,7 @@ const OBJECT_WRITE_GATEWAY_POSTGRES_IN_FLIGHT: usize =
 /// surface and refuses startup until E13 installs the twelfth qualification
 /// lock routine and closes the final catalog.
 pub struct ObjectWriteGatewayClient {
-    connection: Mutex<Option<Client>>,
+    connection: Mutex<Option<OffRuntimeOwned<Client>>>,
     dsn: DsnSource,
     ca_file: Option<String>,
     expected_schema: String,
@@ -90,6 +91,7 @@ impl ObjectWriteGatewayClient {
         let execution = executor
             .try_execute(move || {
                 connect_verified_client(&startup_dsn, startup_ca.as_deref(), &startup_schema)
+                    .map(OffRuntimeOwned::new)
             })
             .map_err(map_submit_error)?;
         let connection = execution.await.map_err(map_execution_error)??;
@@ -140,13 +142,13 @@ impl ObjectWriteGatewayClient {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.as_ref().is_none_or(Client::is_closed) {
+        if guard.as_ref().is_none_or(|client| client.is_closed()) {
             drop(guard.take());
-            *guard = Some(connect_verified_client(
+            *guard = Some(OffRuntimeOwned::new(connect_verified_client(
                 &self.dsn,
                 self.ca_file.as_deref(),
                 &self.expected_schema,
-            )?);
+            )?));
         }
         let client = guard
             .as_mut()
@@ -500,13 +502,74 @@ impl ObjectWriteGatewayClient {
     }
 }
 
+/// A synchronous owner that can cross an async boundary without ever running
+/// its destructor on a Tokio worker. `postgres::Client` owns a private runtime
+/// whose destructor blocks; cancellation therefore schedules the final drop
+/// on the permanently bounded control PostgreSQL executor.
+struct OffRuntimeOwned<T: Send + 'static> {
+    value: Option<T>,
+}
+
+impl<T: Send + 'static> OffRuntimeOwned<T> {
+    fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+}
+
+impl<T: Send + 'static> Deref for OffRuntimeOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .as_ref()
+            .expect("off-runtime owner retains its value until drop")
+    }
+}
+
+impl<T: Send + 'static> DerefMut for OffRuntimeOwned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+            .as_mut()
+            .expect("off-runtime owner retains its value until drop")
+    }
+}
+
+impl<T: Send + 'static> Drop for OffRuntimeOwned<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            super::drop_on_normal_executor(value);
+        }
+    }
+}
+
+struct QualificationSession {
+    client: Client,
+    // Keep the connection budget until the off-runtime destructor has
+    // actually closed the PostgreSQL session and released its transaction
+    // locks, not merely until an async guard has queued that destructor.
+    _admission: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Deref for QualificationSession {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl DerefMut for QualificationSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 struct PostgresQualificationTransaction {
-    client: Option<Client>,
+    client: Option<OffRuntimeOwned<QualificationSession>>,
     schema_name: String,
     request: ObjectWriteQualificationAuthorizationRequestV1,
     request_canonical: Vec<u8>,
     absolute_deadline: Instant,
-    _admission: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct PostgresQualificationRequestGuard {
@@ -553,6 +616,7 @@ impl QualificationFaultRequestGuard for PostgresQualificationRequestGuard {
                 sealed_request,
                 head_evidence,
                 QualificationUnprovenSource::IssuedVisibility,
+                None,
             )
             .await
         })
@@ -659,7 +723,6 @@ impl QualificationFaultAuthorizationGuard for PostgresQualificationAuthorization
             let schema_name = transaction.schema_name;
             let request_canonical = transaction.request_canonical;
             let absolute_deadline = transaction.absolute_deadline;
-            let _admission = transaction._admission;
             tokio::task::spawn_blocking(move || {
                 configure_qualification_transaction_deadline(&mut client, absolute_deadline)?;
                 let successful_put_canonical = serde_json::to_vec(&successful_put)
@@ -696,14 +759,15 @@ impl QualificationFaultAuthorizationGuard for PostgresQualificationAuthorization
                     || response_loss.authorization != expected_authorization
                     || response_loss.successful_put != successful_put
                     || !attempt_contains_response_loss(&attempt, &response_loss)
-                    || Instant::now() >= absolute_deadline
                 {
                     rollback_qualification_transaction(&mut client);
                     return Err(QualificationFaultAuthorityError::InvalidEvidence);
                 }
-                client
-                    .batch_execute("COMMIT")
-                    .map_err(|_| QualificationFaultAuthorityError::Unavailable)?;
+                commit_qualification_transaction(
+                    &mut client,
+                    absolute_deadline,
+                    Some(expected_authorization.qualification_expires_at_unix_ms),
+                )?;
                 Ok(*response_loss)
             })
             .await
@@ -719,12 +783,16 @@ impl QualificationFaultAuthorizationGuard for PostgresQualificationAuthorization
     where
         Self: 'a,
     {
-        let Self { transaction, .. } = *self;
+        let Self {
+            transaction,
+            authorization,
+        } = *self;
         commit_qualification_unproven(
             transaction,
             sealed_request,
             head_evidence,
             QualificationUnprovenSource::AuthorizedPrecondition,
+            Some(authorization.qualification_expires_at_unix_ms),
         )
     }
 }
@@ -750,8 +818,11 @@ impl QualificationFaultAuthority for ObjectWriteGatewayClient {
             let ca_file = self.ca_file.clone();
             let schema_name = self.expected_schema.clone();
             let guard = tokio::task::spawn_blocking(move || {
-                let mut client = connect_verified_client(&dsn, ca_file.as_deref(), &schema_name)
-                    .map_err(map_api_qualification_error)?;
+                let mut client = OffRuntimeOwned::new(QualificationSession {
+                    client: connect_verified_client(&dsn, ca_file.as_deref(), &schema_name)
+                        .map_err(map_api_qualification_error)?,
+                    _admission: admission,
+                });
                 client
                     .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
                     .map_err(|error| map_qualification_postgres_error(&error))?;
@@ -793,7 +864,6 @@ impl QualificationFaultAuthority for ObjectWriteGatewayClient {
                         request: expected_request,
                         request_canonical,
                         absolute_deadline,
-                        _admission: admission,
                     },
                     durable_resolution: resolution.map(|resolution| resolution.into_durable()),
                 })
@@ -841,6 +911,7 @@ fn commit_qualification_unproven<'a>(
     sealed_request: ObjectWriteQualificationSealedRequestV1,
     head_evidence: ObjectWriteQualificationHeadEvidenceV1,
     source: QualificationUnprovenSource,
+    qualification_expires_at: Option<UnixMillis>,
 ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationUnprovenVisibleReceiptV1> {
     Box::pin(async move {
         if transaction.request != sealed_request.authorization_request {
@@ -853,7 +924,6 @@ fn commit_qualification_unproven<'a>(
         let schema_name = transaction.schema_name;
         let request_id = transaction.request.request_id.to_string();
         let absolute_deadline = transaction.absolute_deadline;
-        let _admission = transaction._admission;
         tokio::task::spawn_blocking(move || {
             configure_qualification_transaction_deadline(&mut client, absolute_deadline)?;
             let intent = QualificationUnprovenVisibleIntent {
@@ -886,10 +956,7 @@ fn commit_qualification_unproven<'a>(
                 rollback_qualification_transaction(&mut client);
                 return Err(QualificationFaultAuthorityError::InvalidEvidence);
             };
-            if receipt.sealed_request != sealed_request
-                || receipt.head_evidence != head_evidence
-                || Instant::now() >= absolute_deadline
-            {
+            if receipt.sealed_request != sealed_request || receipt.head_evidence != head_evidence {
                 rollback_qualification_transaction(&mut client);
                 return Err(QualificationFaultAuthorityError::InvalidEvidence);
             }
@@ -897,9 +964,11 @@ fn commit_qualification_unproven<'a>(
                 .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
             let receipt = decode_object_write_qualification_unproven_visible_receipt(&canonical)
                 .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
-            client
-                .batch_execute("COMMIT")
-                .map_err(|_| QualificationFaultAuthorityError::Unavailable)?;
+            commit_qualification_transaction(
+                &mut client,
+                absolute_deadline,
+                qualification_expires_at,
+            )?;
             Ok(receipt)
         })
         .await
@@ -1165,7 +1234,32 @@ fn configure_qualification_transaction_deadline(
     let remaining = absolute_deadline
         .checked_duration_since(Instant::now())
         .ok_or(QualificationFaultAuthorityError::DeadlineExceeded)?;
-    let milliseconds = remaining.as_millis().clamp(1, i64::MAX as u128) as i64;
+    let milliseconds = qualification_timeout_millis(remaining)?;
+    set_qualification_transaction_timeouts(client, milliseconds)
+}
+
+fn configure_qualification_commit_deadline(
+    client: &mut Client,
+    absolute_deadline: Instant,
+) -> Result<(), QualificationFaultAuthorityError> {
+    let remaining = absolute_deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(QualificationFaultAuthorityError::DeadlineExceeded)?;
+    let milliseconds = qualification_commit_timeout_millis(remaining)?;
+    set_qualification_transaction_timeouts(client, milliseconds)?;
+    let remaining_after_configuration = absolute_deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(QualificationFaultAuthorityError::DeadlineExceeded)?;
+    if remaining_after_configuration.as_millis() <= milliseconds as u128 {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
+fn set_qualification_transaction_timeouts(
+    client: &mut Client,
+    milliseconds: i64,
+) -> Result<(), QualificationFaultAuthorityError> {
     let timeout = format!("{milliseconds}ms");
     client
         .query_one(
@@ -1175,6 +1269,79 @@ fn configure_qualification_transaction_deadline(
             &[&timeout],
         )
         .map_err(|error| map_qualification_postgres_error(&error))?;
+    Ok(())
+}
+
+fn qualification_timeout_millis(
+    remaining: Duration,
+) -> Result<i64, QualificationFaultAuthorityError> {
+    let milliseconds = remaining.as_millis();
+    if milliseconds == 0 {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
+    Ok(milliseconds.min(i64::MAX as u128) as i64)
+}
+
+fn qualification_commit_timeout_millis(
+    remaining: Duration,
+) -> Result<i64, QualificationFaultAuthorityError> {
+    let milliseconds = qualification_timeout_millis(remaining)? / 2;
+    if milliseconds == 0 {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
+    Ok(milliseconds)
+}
+
+/// Recheck both clocks after the resolution routine has returned, then give
+/// COMMIT only the newly measured remainder. A successful COMMIT whose reply
+/// arrives after the sealed bound is deliberately reported as ambiguous; the
+/// next request discovers the durable resolution under the request lock.
+fn commit_qualification_transaction(
+    client: &mut Client,
+    absolute_deadline: Instant,
+    qualification_expires_at: Option<UnixMillis>,
+) -> Result<(), QualificationFaultAuthorityError> {
+    let mut commit_deadline = absolute_deadline;
+    if let Some(qualification_expires_at) = qualification_expires_at {
+        if let Err(error) = configure_qualification_transaction_deadline(client, commit_deadline) {
+            rollback_qualification_transaction(client);
+            return Err(error);
+        }
+        let database_clock_anchor = Instant::now();
+        let database_now = match qualification_database_now(client) {
+            Ok(database_now) => database_now,
+            Err(error) => {
+                rollback_qualification_transaction(client);
+                return Err(error);
+            }
+        };
+        commit_deadline = match clamp_qualification_deadline(
+            commit_deadline,
+            qualification_expires_at,
+            database_now,
+            database_clock_anchor,
+        ) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                rollback_qualification_transaction(client);
+                return Err(error);
+            }
+        };
+    }
+    if let Err(error) = configure_qualification_commit_deadline(client, commit_deadline) {
+        rollback_qualification_transaction(client);
+        return Err(error);
+    }
+    if Instant::now() >= commit_deadline {
+        rollback_qualification_transaction(client);
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
+    client
+        .batch_execute("COMMIT")
+        .map_err(|error| map_qualification_postgres_error(&error))?;
+    if Instant::now() >= commit_deadline {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
     Ok(())
 }
 
@@ -1771,7 +1938,38 @@ fn map_gateway_postgres_error(error: postgres::Error) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::qualification_request_lock_key;
+    use std::time::Duration;
+
+    use super::{
+        qualification_commit_timeout_millis, qualification_request_lock_key,
+        qualification_timeout_millis, OffRuntimeOwned,
+    };
+
+    struct RuntimeSensitiveDrop(Option<tokio::sync::oneshot::Sender<bool>>);
+
+    impl Drop for RuntimeSensitiveDrop {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(tokio::runtime::Handle::try_current().is_err());
+            }
+        }
+    }
+
+    struct BlockingSessionDrop {
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        entered: Option<tokio::sync::oneshot::Sender<bool>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Drop for BlockingSessionDrop {
+        fn drop(&mut self) {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(tokio::runtime::Handle::try_current().is_err());
+            }
+            let _ = self.release.recv_timeout(Duration::from_secs(2));
+            drop(self.permit.take());
+        }
+    }
 
     #[test]
     fn qualification_request_advisory_key_is_domain_separated_and_fixed() {
@@ -1782,5 +1980,62 @@ mod tests {
         );
         assert!(qualification_request_lock_key(&format!("sha256:{}", "A".repeat(64))).is_err());
         assert!(qualification_request_lock_key("sha256:00").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_guard_owner_is_destroyed_off_the_async_runtime() {
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        drop(OffRuntimeOwned::new(RuntimeSensitiveDrop(Some(dropped))));
+        assert!(tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .expect("off-runtime destructor did not run")
+            .expect("off-runtime destructor lost its observation"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guard_capacity_is_held_until_the_off_runtime_session_is_closed() {
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = capacity
+            .clone()
+            .try_acquire_owned()
+            .expect("fixture capacity is available");
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        drop(OffRuntimeOwned::new(BlockingSessionDrop {
+            permit: Some(permit),
+            entered: Some(entered),
+            release: released,
+        }));
+        assert!(tokio::time::timeout(Duration::from_secs(2), observed)
+            .await
+            .expect("off-runtime destructor did not start")
+            .expect("off-runtime destructor lost its observation"));
+        assert!(capacity.clone().try_acquire_owned().is_err());
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+        .expect("blocking session destructor stopped the Tokio heartbeat");
+        release.send(()).expect("release blocking destructor");
+        let _permit = tokio::time::timeout(Duration::from_secs(2), capacity.acquire_owned())
+            .await
+            .expect("off-runtime destructor did not release capacity")
+            .expect("fixture semaphore remained open");
+    }
+
+    #[test]
+    fn qualification_timeout_never_extends_a_sub_millisecond_remainder() {
+        assert!(qualification_timeout_millis(Duration::ZERO).is_err());
+        assert!(qualification_timeout_millis(Duration::from_micros(999)).is_err());
+        assert_eq!(
+            qualification_timeout_millis(Duration::from_millis(1)).unwrap(),
+            1
+        );
+        assert!(qualification_commit_timeout_millis(Duration::from_millis(1)).is_err());
+        assert_eq!(
+            qualification_commit_timeout_millis(Duration::from_millis(2)).unwrap(),
+            1
+        );
     }
 }
