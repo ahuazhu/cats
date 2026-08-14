@@ -197,7 +197,7 @@ resource "kubernetes_persistent_volume_v1" "object_write_spool" {
     access_modes                     = ["ReadWriteMany"]
     persistent_volume_reclaim_policy = "Retain"
     storage_class_name               = ""
-    mount_options                    = ["tls"]
+    mount_options                    = ["tls", "iam"]
 
     persistent_volume_source {
       csi {

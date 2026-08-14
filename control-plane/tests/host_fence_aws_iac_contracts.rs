@@ -256,6 +256,52 @@ fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
     assert!(platform.contains("for_each = toset(module.network.private_subnet_ids)"));
     assert!(platform.contains("resource \"aws_efs_backup_policy\" \"object_write_spool\""));
 
+    let file_system_policy = between(
+        &platform,
+        "data \"aws_iam_policy_document\" \"object_write_spool_client\"",
+        "resource \"aws_efs_file_system_policy\" \"object_write_spool\"",
+    );
+    for contract in [
+        "DenyUnencryptedClientAccess",
+        "DenyClientAccessOutsideExactAccessPoint",
+        "DenyClientAccessOutsideExactNodeRole",
+        "DenyClientRootAccess",
+        "AllowExactNodeRoleThroughAccessPoint",
+        "elasticfilesystem:AccessPointArn",
+        "elasticfilesystem:AccessedViaMountTarget",
+        "aws:SecureTransport",
+        "module.cluster.node_role_arn",
+        "aws_efs_access_point.object_write_spool.arn",
+        "\"elasticfilesystem:ClientMount\"",
+        "\"elasticfilesystem:ClientWrite\"",
+    ] {
+        assert!(
+            file_system_policy.contains(contract),
+            "missing EFS client authority boundary: {contract}"
+        );
+    }
+    assert!(platform.contains("resource \"aws_efs_file_system_policy\" \"object_write_spool\""));
+
+    let node_client = between(
+        &platform,
+        "data \"aws_iam_policy_document\" \"object_write_spool_node_client\"",
+        "resource \"aws_iam_role_policy\" \"object_write_spool_node_client\"",
+    );
+    for contract in [
+        "MountAndWriteExactObjectWriteSpool",
+        "elasticfilesystem:AccessPointArn",
+        "elasticfilesystem:AccessedViaMountTarget",
+        "aws_efs_file_system.object_write_spool.arn",
+        "aws_efs_access_point.object_write_spool.arn",
+    ] {
+        assert!(
+            node_client.contains(contract),
+            "missing exact node-side EFS client authority: {contract}"
+        );
+    }
+    assert!(!node_client.contains("elasticfilesystem:ClientRootAccess"));
+    assert!(platform.contains("role   = module.cluster.node_role_name"));
+
     let nfs = between(
         &platform,
         "resource \"aws_vpc_security_group_ingress_rule\" \"object_write_spool_nfs\"",
@@ -290,7 +336,7 @@ fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
     for contract in [
         "access_modes                     = [\"ReadWriteMany\"]",
         "persistent_volume_reclaim_policy = \"Retain\"",
-        "mount_options                    = [\"tls\"]",
+        "mount_options                    = [\"tls\", \"iam\"]",
         "driver        = \"efs.csi.aws.com\"",
         "${var.object_write_spool_file_system_id}::${var.object_write_spool_access_point_id}",
         "encryptInTransit = \"true\"",

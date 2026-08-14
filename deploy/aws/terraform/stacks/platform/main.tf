@@ -742,6 +742,166 @@ resource "aws_efs_access_point" "object_write_spool" {
   })
 }
 
+# EFS has anonymous full NFS access by default when no file-system policy is
+# present. The cluster security group is therefore only a transport boundary,
+# not sufficient protection for the accepted-write recovery authority. Force
+# every mount through IAM, TLS, the one immutable access point and the exact
+# EKS Auto Mode node role. The access point maps every request to UID/GID 10001;
+# no client receives ClientRootAccess.
+data "aws_iam_policy_document" "object_write_spool_client" {
+  statement {
+    sid    = "DenyUnencryptedClientAccess"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientAccessOutsideExactAccessPoint"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnNotEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientAccessOutsideExactNodeRole"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnNotEquals"
+      variable = "aws:PrincipalArn"
+      values   = [module.cluster.node_role_arn]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientRootAccess"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions   = ["elasticfilesystem:ClientRootAccess"]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+  }
+
+  statement {
+    sid    = "AllowExactNodeRoleThroughAccessPoint"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [module.cluster.node_role_arn]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "elasticfilesystem:AccessedViaMountTarget"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_efs_file_system_policy" "object_write_spool" {
+  file_system_id                     = aws_efs_file_system.object_write_spool.id
+  policy                             = data.aws_iam_policy_document.object_write_spool_client.json
+  bypass_policy_lockout_safety_check = false
+}
+
+data "aws_iam_policy_document" "object_write_spool_node_client" {
+  statement {
+    sid    = "MountAndWriteExactObjectWriteSpool"
+    effect = "Allow"
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "elasticfilesystem:AccessedViaMountTarget"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "object_write_spool_node_client" {
+  name   = "exact-object-write-spool-client"
+  role   = module.cluster.node_role_name
+  policy = data.aws_iam_policy_document.object_write_spool_node_client.json
+}
+
 # Static provisioning needs discovery only. In particular this role cannot
 # create/delete access points or touch an EFS file; Terraform owns the sole
 # access point above and the mount itself is constrained by its POSIX root.
