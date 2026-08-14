@@ -637,18 +637,22 @@ the exact worker installation. Its worker bundle and member set must match the a
 Every binary, config, non-secret coordinate and key fingerprint below is explicit; each output
 directory is absolute and does not yet exist. The control token is one root-owned mode-0600 file
 passed by path, never argv content or manifest data. Before either invocation, while every Node is
-still cordoned, save and review only `qualification-ingress-open.tfplan`; it must change only
-`enable_public_ingress=false -> true`. Apply that open plan while the qualification Node is still
-cordoned. Immediately restore `enable_public_ingress=false` in the reviewed input, plan against the
-now-open live state, and save and review `qualification-ingress-close.tfplan`. It must only remove
-or close the qualification ingress. A close plan made against the earlier Closed state is invalid.
+still cordoned, save and review `qualification-ingress-open.tfplan`; it must change only
+`enable_public_ingress=false -> true`. Also save and review the complete
+`qualification-ingress-close.tfvars` with that one value fixed false and every other input
+byte-identical. Install the early cleanup guard below, mark the open effect initiated, and only then
+apply the open plan. Immediately plan against the now-open live state and save and review
+`qualification-ingress-close.tfplan`. It must only remove or close qualification ingress. A close
+plan made against the earlier Closed state is invalid.
 Retain `terraform show -json` for both plans; pass those two JSON files as the required runner
 configs. Run both block paths against the same release and scenario oracle.
 
-Only after the saved close plan has been reviewed, install an EXIT/INT/TERM cleanup trap that uses
-that exact plan. Then apply the reviewed full A23 policy that changes only the exact qualification
-Node from `cordoned` to `schedulable`, using its exact current revision, and run E3. Capture the
-runner status without exiting the operator shell. Whether the runner returns 0, 78 or any failure,
+Install the EXIT/INT/TERM guard before the ingress-open effect. Until the saved close plan is
+reviewed, it uses only the pre-approved false tfvars and exact targeted resource set below, and
+rejects every non-no-op managed change outside that set before apply. Approval atomically switches
+the guard to the saved close plan. Then apply the reviewed full A23 policy that changes only the
+exact qualification Node from `cordoned` to `schedulable`, using its exact current revision, and run
+E3. Capture the runner status without exiting the operator shell. Whether the runner returns 0, 78 or any failure,
 cleanup first exact-re-cordons the Node, then applies the saved ingress-close plan, then reruns the
 exact E12 fleet verifier. If the schedulable apply response is ambiguous, cleanup first replays that
 same durable CLI request to a terminal result before it submits the exact next-revision re-cordon.
@@ -656,6 +660,89 @@ Failure of one cleanup action must not suppress the later actions; all three mus
 all three must succeed:
 
 ```sh
+set -euo pipefail
+test "$(git rev-parse HEAD)" = <FINAL_RELEASE_SHA>
+test "$(git hash-object deploy/metal/runtime-cutover-e3-window.sh)" = \
+  "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-e3-window.sh)"
+. deploy/metal/runtime-cutover-e3-window.sh
+
+cats_e3_window_emergency_close() {
+  terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
+    -input=false \
+    -var-file=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfvars \
+    -target=module.cats_kubernetes.kubernetes_namespace_v1.cats \
+    -target=module.cats_kubernetes.kubernetes_manifest.ingress_class_params \
+    -target=module.cats_kubernetes.kubernetes_ingress_class_v1.public \
+    -target=module.cats_kubernetes.kubernetes_ingress_v1.public \
+    -target=aws_route53_record.public \
+    -out=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan || return
+  terraform -chdir=deploy/aws/terraform/stacks/production-application show \
+    -json /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
+  jq -e '
+    def resources:
+      [.root_module | recurse(.child_modules[]?) | .resources[]?];
+    def is_public_ingress_address:
+      . == "module.cats_kubernetes.kubernetes_manifest.ingress_class_params[\"enabled\"]"
+      or . == "module.cats_kubernetes.kubernetes_ingress_class_v1.public[0]"
+      or . == "module.cats_kubernetes.kubernetes_ingress_v1.public[0]"
+      or (startswith("aws_route53_record.public[") and endswith("]"));
+    (.prior_state.values | resources) as $prior
+    | (.planned_values | resources) as $planned
+    | [.resource_changes[]?
+        | select(.mode == "managed" and .change.actions != ["no-op"])] as $changes
+    | ([.resource_changes[]?
+        | select(.mode == "managed")
+        | .change.after_unknown | .. | booleans]
+      | all(. == false))
+    and ([$planned[]
+      | select(.address == "module.cats_kubernetes.kubernetes_namespace_v1.cats")
+      | .values.metadata[0].labels["cats.run/ingress"]] == ["disabled"])
+    and ([$planned[] | select(.address | is_public_ingress_address)] | length == 0)
+    and (($changes | length) != 0
+      or (([$prior[]
+          | select(.address == "module.cats_kubernetes.kubernetes_namespace_v1.cats")
+          | .values.metadata[0].labels["cats.run/ingress"]] == ["disabled"])
+        and ([$prior[] | select(.address | is_public_ingress_address)] | length == 0)))
+    and all($changes[];
+      if .address == "module.cats_kubernetes.kubernetes_namespace_v1.cats" then
+        .change.actions == ["update"]
+        and .change.before.metadata[0].labels["cats.run/ingress"] == "enabled"
+        and .change.after.metadata[0].labels["cats.run/ingress"] == "disabled"
+        and ((.change.before
+          | setpath(["metadata",0,"labels","cats.run/ingress"]; "disabled")) == .change.after)
+      elif (.address | is_public_ingress_address) then
+        .change.actions == ["delete"] and .change.after == null
+      else false end)
+    ' \
+    /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
+  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
+    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-apply.txt
+}
+
+cats_e3_window_saved_close() {
+  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
+    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-apply.txt
+}
+
+cats_e3_window_run_e12() {
+  /approved/staged-worker/cats \
+    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+    admin fleet-verify \
+    --expected-node <NODE_1_ID> \
+    --expected-node <NODE_2_ID> \
+    --key-ring /approved/secrets/<CUTOVER_ID>/route-v2-r1/node/public-key-ring.v1.json \
+    --release-commit <FINAL_RELEASE_SHA> \
+    --timeout-seconds 600 \
+    --poll-interval-ms 1000 \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-post-cleanup-fleet-verification.v1.json
+}
+
+<VERIFY_EXACT_FALSE_TFVARS_APPROVAL_RECEIPT>
+cats_e3_window_install_guard
+ingress_open_initiated=1
 terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
   -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-open.tfplan \
   > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-open-apply.txt
@@ -671,7 +758,9 @@ terraform -chdir=deploy/aws/terraform/stacks/production-application show \
 
 # Review the JSON now. It must only remove/close qualification ingress. Do not
 # continue until that assertion has an operator approval receipt.
-qualification_transition=not_started
+<VERIFY_EXACT_CLOSE_PLAN_APPROVAL_RECEIPT>
+cats_e3_window_use_saved_close
+
 apply_schedulable_policy() {
   /approved/staged-worker/cats \
     --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
@@ -684,7 +773,12 @@ apply_schedulable_policy() {
     --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem
 }
 
-exact_re_cordon_policy() {
+cats_e3_window_apply_schedulable_policy() {
+  apply_schedulable_policy \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-replay-result.v1.json
+}
+
+cats_e3_window_exact_re_cordon() {
   /approved/staged-worker/cats \
     --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
     admin runtime-node policy apply \
@@ -705,64 +799,6 @@ exact_re_cordon_policy() {
     /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
 }
 
-run_post_cleanup_e12() {
-  /approved/staged-worker/cats \
-    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-    admin fleet-verify \
-    --expected-node <NODE_1_ID> \
-    --expected-node <NODE_2_ID> \
-    --key-ring /approved/secrets/<CUTOVER_ID>/route-v2-r1/node/public-key-ring.v1.json \
-    --release-commit <FINAL_RELEASE_SHA> \
-    --timeout-seconds 600 \
-    --poll-interval-ms 1000 \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-post-cleanup-fleet-verification.v1.json
-}
-
-cleanup_e3_window() {
-  set +e
-  re_cordon_status=0
-  if [ "$qualification_transition" = initiated ]; then
-    apply_schedulable_policy \
-      > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-replay-result.v1.json
-    schedulable_replay_status=$?
-    if [ "$schedulable_replay_status" -eq 0 ]; then
-      qualification_transition=terminal_schedulable
-    else
-      re_cordon_status=$schedulable_replay_status
-    fi
-  fi
-  if [ "$qualification_transition" = terminal_schedulable ]; then
-    exact_re_cordon_policy
-    re_cordon_status=$?
-  fi
-
-  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
-    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-apply.txt
-  ingress_close_status=$?
-
-  run_post_cleanup_e12
-  fleet_verify_status=$?
-  set -e
-  [ "$re_cordon_status" -eq 0 ] && \
-    [ "$ingress_close_status" -eq 0 ] && \
-    [ "$fleet_verify_status" -eq 0 ]
-}
-
-abort_e3_window() {
-  window_status=$1
-  trap - EXIT INT TERM
-  cleanup_status=0
-  cleanup_e3_window || cleanup_status=$?
-  if [ "$cleanup_status" -ne 0 ]; then
-    exit "$cleanup_status"
-  fi
-  exit "$window_status"
-}
-trap 'abort_e3_window $?' EXIT
-trap 'abort_e3_window 130' INT
-trap 'abort_e3_window 143' TERM
-
 qualification_transition=initiated
 set +e
 apply_schedulable_policy \
@@ -778,20 +814,20 @@ set +e
 deploy/metal/runtime-cutover-e2e.sh <THE_MATCHING_FULL_INVOCATION_BELOW>
 e3_status=$?
 cleanup_status=0
-cleanup_e3_window || cleanup_status=$?
+cats_e3_window_finish || cleanup_status=$?
 set -e
-trap - EXIT INT TERM
 
 [ "$cleanup_status" -eq 0 ]
 
 case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
 ```
 
-The open plan is applied before the cleanup trap only while every Node remains cordoned; install
-the trap immediately after the live-state close plan is saved and approved, before the A23
-schedulable transition. Clear it only after exact re-cordon, ingress-close and post-cleanup E12
-results all exist. E12 proves empty/session/full-inventory/ring, while the latest A23 result and
-full policy above independently prove exact re-cordon.
+The early guard is live before `ingress_open_initiated=1`, which itself precedes the open effect, so
+an ambiguous open response also takes the emergency close path. The saved-plan switch is one shell
+assignment after approval; every earlier failure remains on the targeted emergency close. Clear the
+guard only after exact re-cordon, ingress-close and post-cleanup E12 results all exist. E12 proves
+empty/session/full-inventory/ring, while the latest A23 result and full policy independently prove
+exact re-cordon.
 Do not continue to the other block path if ingress-close, A23 re-cordon or E12 fails.
 
 **Command — kernel NBD:**
@@ -890,7 +926,8 @@ AgentSession and fresh session-bound full inventory, post-restart Guest and rout
 durable usage delivery, and exact delete cleanup.
 
 **Retain.** For each block path retain the schedulable result and any exact replay result, exact
-re-cordon result, ingress-close apply transcript, post-cleanup E12 result, `manifest.json`,
+re-cordon result, any emergency close plan/JSON/apply transcript, saved ingress-close apply
+transcript, post-cleanup E12 result, `manifest.json`,
 `scenario-results.jsonl`, bounded journal, `final-inventory.json`, `exit-code` and `SHA256SUMS`
 through the append-only evidence boundary.
 

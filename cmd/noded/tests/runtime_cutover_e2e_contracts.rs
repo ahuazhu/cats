@@ -623,6 +623,90 @@ while :; do sleep 1; done
     assert_private_stage_removed_without_secret(&output_dir, secret);
 }
 
+#[test]
+fn operator_e3_window_closes_and_verifies_every_early_failure_or_term() {
+    let root = workspace_root();
+    let library = root.join("deploy/metal/runtime-cutover-e3-window.sh");
+    let fixture = root.join("deploy/metal/tests/runtime-cutover-e3-window-fixture.sh");
+    let temp = tempfile::tempdir().expect("E3 window fixture");
+    for checkpoint in ["open", "plan", "show", "before-switch"] {
+        for (failure_mode, expected_status) in [("failure", 23), ("term", 143)] {
+            let trace = temp
+                .path()
+                .join(format!("{checkpoint}-{failure_mode}.trace"));
+            let output = Command::new("bash")
+                .arg(&fixture)
+                .arg(&library)
+                .arg(&trace)
+                .arg(checkpoint)
+                .arg(failure_mode)
+                .output()
+                .expect("run E3 window failure fixture");
+            assert_eq!(
+                output.status.code(),
+                Some(expected_status),
+                "wrong status at {checkpoint}/{failure_mode}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let events = fs::read_to_string(trace).expect("read E3 window trace");
+            assert!(
+                events.ends_with("emergency-close\ne12\n"),
+                "cleanup order changed at {checkpoint}/{failure_mode}: {events}"
+            );
+            assert!(!events.contains("saved-close"));
+            assert!(!events.contains("re-cordon"));
+        }
+    }
+
+    let trace = temp.path().join("after-switch.trace");
+    let output = Command::new("bash")
+        .arg(&fixture)
+        .arg(&library)
+        .arg(&trace)
+        .arg("after-switch")
+        .arg("failure")
+        .output()
+        .expect("run saved-plan E3 window fixture");
+    assert_eq!(output.status.code(), Some(23));
+    let events = fs::read_to_string(trace).expect("read saved-plan E3 window trace");
+    assert!(events.ends_with("saved-close\ne12\n"));
+    assert!(!events.contains("emergency-close"));
+}
+
+#[test]
+fn runbook_installs_the_allowlisted_early_guard_before_public_ingress() {
+    let runbook = fs::read_to_string(workspace_root().join("docs/production-cutover-runbook.md"))
+        .expect("read production cutover runbook");
+    for target in [
+        "-target=module.cats_kubernetes.kubernetes_namespace_v1.cats",
+        "-target=module.cats_kubernetes.kubernetes_manifest.ingress_class_params",
+        "-target=module.cats_kubernetes.kubernetes_ingress_class_v1.public",
+        "-target=module.cats_kubernetes.kubernetes_ingress_v1.public",
+        "-target=aws_route53_record.public",
+    ] {
+        assert!(
+            runbook.contains(target),
+            "missing emergency target {target}"
+        );
+    }
+    assert!(runbook.contains("select(.mode == \"managed\" and .change.actions != [\"no-op\"])"));
+    for gate in [
+        ".prior_state.values | resources",
+        ".planned_values | resources",
+        ".change.after_unknown | .. | booleans",
+        ".change.actions == [\"delete\"] and .change.after == null",
+        ".values.metadata[0].labels[\"cats.run/ingress\"]] == [\"disabled\"]",
+    ] {
+        assert!(runbook.contains(gate), "missing emergency plan gate {gate}");
+    }
+    let guard = runbook.find("cats_e3_window_install_guard").unwrap();
+    let initiated = runbook.find("\ningress_open_initiated=1\n").unwrap();
+    let open = runbook
+        .find("-qualification-ingress-open.tfplan \\")
+        .unwrap();
+    assert!(guard < initiated && initiated < open);
+}
+
 fn sha256(path: &Path) -> String {
     let output = Command::new("sha256sum")
         .arg(path)
