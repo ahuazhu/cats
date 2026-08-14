@@ -46,8 +46,9 @@ record并可由fresh target接替。因此Cat row删除和clean-slate reset不�
 6. Cat删除/open reset前置只消费exact source terminal receipt，不消费Node outbox、HTTP ACK、日志或query
    interval。Control内消费者必须把Cat、source epoch、Desired revision和runtime incarnation逐字段绑定；receipt
    不形成第二份lifecycle或billing authority。
-7. 旧target退休使用[规格](../specs/usage-terminal-authority-v1.md)冻结的per-shard marker。producer closed set
-   全部已有source receipt后，coordinator为固定old target的每个open shard写deterministic marker；同marker响应
+7. 旧target退休使用[规格](../specs/usage-terminal-authority-v1.md)冻结的per-shard marker。两个block-path
+   qualification均已结束、各自run-bound source closed set均已有receipt且全局集合完成严格并集后，coordinator才为
+   固定old target的每个open shard写deterministic marker；同marker响应
    丢失可产生相同payload的无害重复。Projector按普通raw对象顺序archive/project marker并最后推进DynamoDB。
    只有全部marker projection与consistent-read shard checkpoint闭合、source closed set无缺项且live target
    identity匹配，才能生成immutable `UsageTargetTerminalReceipt`。
@@ -57,6 +58,14 @@ record并可由fresh target接替。因此Cat row删除和clean-slate reset不�
    新operation。
 9. 本合同复用A19 Node生产认证和现有projector leader fence；不增加第二个Node bearer、admin签名或billing
    writer。global reset只消费immutable target receipt和既有maintenance authority，不能借此生产usage。
+10. `kernel-nbd`与`vhost-user`不是两次target retirement。每个block-path只运行
+    `usage-source-terminal-receipts`并持久化本run的live pair和严格排序source receipt expectation集合；它不得调用
+    target begin/complete。两个passed qualification manifest均已绑定各自case evidence、同release/catalog/target
+    config后，release-bound global finalizer才取两集合的exact union并执行唯一一次target begin/complete。其
+    `terminal_epoch_id`固定为domain、kernel manifest SHA、vhost manifest SHA、expected-targets file SHA与union
+    source-set SHA五个UTF-8字段分别加u64 big-endian长度前缀后的SHA-256前32位lowerhex；不含block path或run ID。
+    request journal和最终manifest均no-replace exact replay，避免第一条path提前永久关闭old ingress，也避免response
+    loss重建creation time或另一operation。
 
 ## 切换
 

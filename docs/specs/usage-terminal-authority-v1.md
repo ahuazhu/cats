@@ -74,6 +74,8 @@ response的有序batch，不改变event bytes。
 
 global request以唯一`terminal_epoch_id`持久化，并含：release commit/artifact digest、old/fresh
 `UsageTargetBinding`、按`source_id,source_epoch`排序的完整source terminal receipt key+digest集合及其集合digest。
+集合digest不是任意JSON object key排序：它固定对typed array的compact bytes计算，每个member字段声明顺序恰为
+`source_id,source_epoch,receipt_sha256`，且无末尾LF；文件级evidence仍独立使用递归key-sort canonical JSON。
 target binding固定AWS account/region、usage schema、Kinesis name+ARN、DynamoDB checkpoint table name+ARN、
 archive bucket name+ARN。old/fresh四项必须逐项不同，archive均验证Object Lock，fresh schema为空且总schema
 version恰为16。
@@ -99,6 +101,50 @@ journal外，它还必须读取manifest绑定的root-only `usage-terminal-target
 比较old/fresh完整target和shard集合。verification receipt除binary/release/bundle/request/receipt digest外固定包含
 `expected_targets_file_sha256`与不含末尾LF的canonical `target_binding_sha256`。因此proof目录内自带一份内部自洽但
 属于foreign target的request/receipt不能授权reset；Python不得重构ARN或复制Rust target语义。
+
+### 3.1 Two-path qualification与唯一global finalizer
+
+每个block-path的catalog case固定为`usage-source-terminal-receipts`。它在delete-cleanup以及该run的
+EndQualification/Closed drain之后只读发现本run source finals，不能调用target-terminal begin/complete。case-specific
+闭集恰为：
+
+- `usage-live-delivery-receipt.json`：run start/Cat/window内已经产生的完整非零CPU/memory pair；
+- `usage-source-terminal-receipts.json`：kind固定`cats.usage-source-terminal-receipts.v1`，并逐字段绑定
+  block path、run ID、Cat/Workspace、run window、release/bundle/catalog，以及严格排序的typed source expectation集合
+  和上述semantic集合digest。
+
+两个distinct passed qualification目录都必须保留exact `manifest.json`、`case-evidence.jsonl`、
+`qualification-catalog.v1.json`和覆盖完整run artifact closed set的`SHA256SUMS`。只有release-bound
+`deploy/metal/runtime-cutover-usage-terminal-finalize.sh`可以消费这两个固定目录；它还逐byte绑定同一approved release
+manifest、installer receipt、catalog与root-only `usage-terminal-targets`。两份source set按
+`source_id,source_epoch`取严格排序并集；同key同digest只保留一次，不同digest拒绝。
+
+global `terminal_epoch_id`固定为以下五帧的SHA-256前32位lowerhex，且不能全零：
+
+```text
+u64be(len(domain)) || "cats.usage-target-terminal-epoch.v1" ||
+u64be(len(kernel_manifest_sha256)) || kernel_manifest_sha256 ||
+u64be(len(vhost_manifest_sha256)) || vhost_manifest_sha256 ||
+u64be(len(expected_targets_file_sha256)) || expected_targets_file_sha256 ||
+u64be(len(union_source_set_sha256)) || union_source_set_sha256
+```
+
+这里digest字符串均含`sha256:`前缀；不加入单一block path或global run ID。finalizer以mode0400 no-replace文件发布
+`usage-target-terminal-request.json`。重跑必须先读取并逐字段复用该journal的原`created_at_unix_ms`；begin或complete
+response loss只重发同一文件。target terminal后调用固定安装路径
+`/opt/cats/bin/cats-usage-terminal-receipt-verifier`，其verification receipt exact 11-key closed shape为：
+
+```text
+binary_sha256, expected_request_file_sha256, expected_targets_file_sha256,
+kind, release_commit, target_binding_sha256, target_receipt_file_sha256,
+target_request_sha256, validated, version, worker_bundle_sha256
+```
+
+global成功目录只有七个evidence文件加`SHA256SUMS`：`case-evidence.jsonl`、
+`qualification-catalog.v1.json`、`usage-global-terminal-finalization.manifest.json`、
+`usage-target-terminal-receipt.json`、`usage-target-terminal-request.json`、
+`usage-target-terminal-verification.receipt.json`、`usage-terminal-targets.json`。checksum文件按上述文件名bytewise排序，
+不含自身且拒绝extra。global case evidence恰为request、target receipt、verification receipt三个canonical JSON wrapper。
 
 ## 4. DDL closed set
 
@@ -128,6 +174,12 @@ journal外，它还必须读取manifest绑定的root-only `usage-terminal-target
 - exact per-event ACK的缺项、错序、foreign/rejected/count漂移都保留Node outbox。
 - marker PutRecord response loss产生相同marker；reshard、任一source未terminal、DDB checkpoint落后、old/fresh
   overlap、target ARN变化或S3 receipt冲突均零target receipt。
-- qualification case ID固定`usage-final-terminal-receipt`，case-specific artifact闭集为
-  `usage-live-delivery-receipt.json`、`usage-source-terminal-receipt.json`、
-  `usage-target-terminal-receipt.json`。
+- 两个block-path分别只能生成source case闭集；第一条path不得调用target begin。只有两个passed manifest/evidence的
+  exact union可生成一个global target request/receipt/11-key verification，response loss重跑仍复用原request bytes。
+- Rust typed source-set golden bytes固定为以下单行compact JSON（无末尾LF），digest固定
+  `sha256:1ecc587146a29898f40be96fb88679c68106813997ce5778fc046c86388e2ec1`。input member字段重排不改变digest，
+  missing/extra字段拒绝：
+
+```json
+[{"source_id":"node/node-a/cat/cat-a","source_epoch":"epoch-a","receipt_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},{"source_id":"node/node-b/cat/cat-b","source_epoch":"epoch-b","receipt_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}]
+```
