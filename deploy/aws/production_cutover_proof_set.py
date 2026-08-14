@@ -76,12 +76,44 @@ QUALIFICATION_FINAL_FLEET_FILE = (
 QUALIFICATION_CLEANUP_INVENTORY_FILE = (
     "production-mutation-qualification-cleanup-inventory.receipt.json"
 )
+QUALIFICATION_PRODUCT_INVENTORY_FILE = (
+    "production-mutation-qualification-product-inventory.receipt.json"
+)
 QUALIFICATION_FINAL_FLEET_KIND = (
     "cats.production-mutation-qualification-final-fleet-closed.v1"
 )
 QUALIFICATION_CLEANUP_INVENTORY_KIND = (
     "cats.production-mutation-qualification-cleanup-inventory.v1"
 )
+QUALIFICATION_PRODUCT_INVENTORY_KIND = (
+    "cats.production-mutation-qualification-product-inventory.v1"
+)
+QUALIFICATION_COMPONENT_JOURNAL_FILE = "component-journal-summary.txt"
+QUALIFICATION_EXIT_CODE_FILE = "exit-code"
+QUALIFICATION_FINAL_INVENTORY_FILE = "final-inventory.json"
+QUALIFICATION_RUNTIME_STATE_FILE = "runtime-state.json"
+QUALIFICATION_SCENARIO_RESULTS_FILE = "scenario-results.jsonl"
+QUALIFICATION_PROOF_LOGICAL_FILES = {
+    "manifest": "manifest.json",
+    "case_evidence": "case-evidence.jsonl",
+    "qualification_catalog": "qualification-catalog.v1.json",
+    "sha256sums": "SHA256SUMS",
+    "component_journal_summary": QUALIFICATION_COMPONENT_JOURNAL_FILE,
+    "exit_code": QUALIFICATION_EXIT_CODE_FILE,
+    "final_inventory": QUALIFICATION_FINAL_INVENTORY_FILE,
+    "runtime_state": QUALIFICATION_RUNTIME_STATE_FILE,
+    "scenario_results": QUALIFICATION_SCENARIO_RESULTS_FILE,
+    "qualification_begin": QUALIFICATION_BEGIN_FILE,
+    "qualification_terminal": QUALIFICATION_TERMINAL_FILE,
+    "qualification_begin_pending": QUALIFICATION_BEGIN_PENDING_FILE,
+    "qualification_begin_command_receipt": QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE,
+    "qualification_close_pending": QUALIFICATION_CLOSE_PENDING_FILE,
+    "qualification_close_command_receipt": QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE,
+    "qualification_final_state": QUALIFICATION_FINAL_STATE_FILE,
+    "qualification_final_fleet": QUALIFICATION_FINAL_FLEET_FILE,
+    "qualification_product_inventory": QUALIFICATION_PRODUCT_INVENTORY_FILE,
+    "qualification_cleanup_inventory": QUALIFICATION_CLEANUP_INVENTORY_FILE,
+}
 USAGE_SOURCE_TERMINAL_SET_KIND = (
     "cats.usage-source-terminal-receipts.v1"
 )
@@ -192,6 +224,10 @@ def fields(value: Any, expected: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != expected:
         raise ProofSetError(f"{label} does not have its exact closed field set")
     return value
+
+
+def version_one(value: Any) -> bool:
+    return type(value) is int and value == 1
 
 
 def identifier(value: Any, label: str) -> str:
@@ -628,7 +664,7 @@ def _validate_source_receipt(value: Any, release: dict[str, Any]) -> None:
         "source receipt",
     )
     if (
-        value["schema_version"] != 1
+        not version_one(value["schema_version"])
         or value["source_sha"] != release["source_commit_sha"]
         or value["manifest_sha256"] != release["source_manifest_sha256"]
         or value["bundle_sha256"] != release["source_bundle_sha256"]
@@ -675,10 +711,11 @@ def _validate_build_receipt(value: Any, release: dict[str, Any]) -> None:
     if not isinstance(value, dict) or not required.issubset(value):
         raise ProofSetError("build receipt omits required frozen-build fields")
     if (
-        value["schema_version"] != 1
+        not version_one(value["schema_version"])
         or value["source_sha"] != release["source_commit_sha"]
         or value["manifest_sha256"] != release["source_manifest_sha256"]
         or value["bundle_sha256"] != release["source_bundle_sha256"]
+        or type(value["exit_status"]) is not int
         or value["exit_status"] != 0
         or value["build_kind"] != "manual-release-export-images"
         or value["aws_environment_forwarded"] is not False
@@ -697,7 +734,7 @@ def _validate_release_manifest(value: Any, release: dict[str, Any]) -> tuple[str
         {"artifacts", "build_inputs", "guest_runtime", "source", "version"},
         "release manifest",
     )
-    if value["version"] != 1:
+    if not version_one(value["version"]):
         raise ProofSetError("release manifest version is not 1")
     source = fields(value["source"], {"commit", "fingerprint", "tree"}, "release source")
     if source["commit"] != release["source_commit_sha"]:
@@ -760,7 +797,7 @@ def _validate_usage_verification_projection(
     )
     if (
         value["kind"] != USAGE_TERMINAL_VERIFICATION_KIND
-        or value["version"] != 1
+        or not version_one(value["version"])
         or value["validated"] is not True
         or value["release_commit"] != context.release_commit
         or value["worker_bundle_sha256"] != context.worker_bundle_sha256
@@ -783,7 +820,7 @@ def _validate_usage_verification_projection(
         {"version", "old_target", "fresh_target", "shards"},
         "E9 expected targets",
     )
-    if targets["version"] != 1:
+    if not version_one(targets["version"]):
         raise ProofSetError("E9 expected-targets version drifted")
     expected_binding_sha256 = "sha256:" + hashlib.sha256(
         canonical_json(targets)
@@ -846,6 +883,7 @@ def _validate_qualification_admission(
             "final_admission_state_sha256",
             "final_closed_revision",
             "fleet_closed_receipt_sha256",
+            "product_inventory_receipt_sha256",
             "cleanup_inventory_receipt_sha256",
             "active_guard_count",
             "product_resource_count",
@@ -854,9 +892,11 @@ def _validate_qualification_admission(
         },
         "Qualification terminal receipt",
     )
-    if begin["kind"] != QUALIFICATION_BEGIN_KIND or begin["version"] != 1:
+    if begin["kind"] != QUALIFICATION_BEGIN_KIND or not version_one(begin["version"]):
         raise ProofSetError("Qualification Begin receipt kind/version drifted")
-    if terminal["kind"] != QUALIFICATION_TERMINAL_KIND or terminal["version"] != 1:
+    if terminal["kind"] != QUALIFICATION_TERMINAL_KIND or not version_one(
+        terminal["version"]
+    ):
         raise ProofSetError("Qualification terminal receipt kind/version drifted")
     identifier(begin["qualification_id"], "Qualification ID")
     identifier(begin["workspace_id"], "Qualification Workspace ID")
@@ -885,6 +925,10 @@ def _validate_qualification_admission(
         (terminal["close_command_receipt_sha256"], "Qualification close command receipt"),
         (terminal["final_admission_state_sha256"], "Qualification final state"),
         (terminal["fleet_closed_receipt_sha256"], "Qualification final fleet"),
+        (
+            terminal["product_inventory_receipt_sha256"],
+            "Qualification product inventory",
+        ),
         (terminal["cleanup_inventory_receipt_sha256"], "Qualification cleanup inventory"),
     ]:
         digest(value, label)
@@ -919,8 +963,11 @@ def _validate_qualification_admission(
             ("emergency_close", "emergency_closed"),
         }
         or terminal["active_guard_count"] != 0
+        or isinstance(terminal["active_guard_count"], bool)
         or terminal["product_resource_count"] != 0
+        or isinstance(terminal["product_resource_count"], bool)
         or terminal["residue_count"] != 0
+        or isinstance(terminal["residue_count"], bool)
     ):
         raise ProofSetError("Qualification terminal receipt is not the exact Closed successor")
     integer(begin["qualification_expires_at_unix_ms"], "Qualification expiry", minimum=1)
@@ -955,7 +1002,7 @@ def _validate_fleet(value: Any, release_commit: str, now_ms: int) -> None:
         },
         "fleet Closed evidence",
     )
-    if value["version"] != 1 or value["release_commit_sha"] != release_commit:
+    if not version_one(value["version"]) or value["release_commit_sha"] != release_commit:
         raise ProofSetError("fleet evidence release binding drifted")
     expected_nodes = value["expected_nodes"]
     if (
@@ -997,7 +1044,7 @@ def _validate_fleet(value: Any, release_commit: str, now_ms: int) -> None:
     )
     evaluated = integer(snapshot["evaluated_at_unix_ms"], "fleet evaluated time")
     if (
-        snapshot["version"] != 1
+        not version_one(snapshot["version"])
         or snapshot["control_release_commit_sha"] != release_commit
         or evaluated > now_ms
         or now_ms - evaluated >= FLEET_MAX_AGE_MS
@@ -1094,7 +1141,7 @@ def _validate_fleet(value: Any, release_commit: str, now_ms: int) -> None:
             "fleet inventory attestation",
         )
         if (
-            session["version"] != 1
+            not version_one(session["version"])
             or node["node_id"] != session["node_id"]
             or session["guest_config_digest"] != snapshot["approved_guest_config_digest"]
             or integer(session["lease_deadline_unix_ms"], "session lease") <= evaluated
@@ -1107,7 +1154,7 @@ def _validate_fleet(value: Any, release_commit: str, now_ms: int) -> None:
                     "agent_session_epoch",
                 )
             )
-            or attestation["version"] != 1
+            or not version_one(attestation["version"])
             or attestation["node_id"] != node["node_id"]
             or attestation["agent_session_epoch"] != source["agent_session_epoch"]
         ):
@@ -1168,7 +1215,7 @@ def _validate_persistent_disk(value: Any, block_path: str) -> None:
         "V5 persistent-disk receipt",
     )
     if (
-        value["version"] != 1
+        not version_one(value["version"])
         or value["proof"] != "persistent_disk_attach_initialize_restart_detach"
         or value["block_path"] != block_path
     ):
@@ -1219,7 +1266,7 @@ def _validate_persistent_disk(value: Any, block_path: str) -> None:
     )
     if (
         first["ambiguous_response_discovered"] is not True
-        or first["mkfs_invocations"] != 1
+        or not version_one(first["mkfs_invocations"])
         or first["fault_action"] != "drop_validated_format_response_once"
         or first["consumed"] is not True
         or not isinstance(first["artifact_sha256"], str)
@@ -1417,7 +1464,7 @@ def _validate_usage_source_terminal_set(
     )
     if (
         value["kind"] != USAGE_SOURCE_TERMINAL_SET_KIND
-        or value["version"] != 1
+        or not version_one(value["version"])
         or value["block_path"] != block_path
         or value["run_id"] != run_id
         or value["workspace_id"] != workspace_id
@@ -1506,7 +1553,7 @@ def _validate_global_usage_finalization(
     )
     if (
         value["kind"] != USAGE_GLOBAL_FINALIZATION_KIND
-        or value["version"] != 1
+        or not version_one(value["version"])
         or value["outcome"] != "terminal"
         or value["release_commit"] != context.release_commit
         or value["worker_bundle_sha256"] != context.worker_bundle_sha256
@@ -1598,7 +1645,7 @@ def _validate_global_usage_finalization(
         "E9 global target request sources",
     )
     if (
-        request["contract_version"] != 1
+        not version_one(request["contract_version"])
         or request["release_commit"] != context.release_commit
         or request["artifact_sha256"]
         != context.worker_bundle_sha256.removeprefix("sha256:")
@@ -1635,17 +1682,27 @@ def _validate_sha256sums(
         text = data.decode("ascii")
     except UnicodeDecodeError as error:
         raise ProofSetError(f"{label} is not ASCII") from error
-    if not text.endswith("\n"):
-        raise ProofSetError(f"{label} has no terminal LF")
-    observed: dict[str, str] = {}
-    for line in text.splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9_.-]{0,127})", line)
-        if match is None or match.group(2) in observed:
-            raise ProofSetError(f"{label} has a malformed or duplicate entry")
-        observed[match.group(2)] = "sha256:" + match.group(1)
-    for name, verified in expected.items():
-        if observed.get(name) != verified.sha256:
-            raise ProofSetError(f"{label} does not close {name}")
+    expected_names = sorted(expected)
+    lines = text.splitlines(keepends=True)
+    if len(lines) != len(expected_names) or any(
+        not line.endswith("\n") for line in lines
+    ):
+        raise ProofSetError(f"{label} is not its exact line set")
+    observed_names: list[str] = []
+    for line in lines:
+        match = re.fullmatch(
+            r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9_.-]{0,127})\n",
+            line,
+        )
+        if match is None:
+            raise ProofSetError(f"{label} has a malformed entry")
+        name = match.group(2)
+        observed_names.append(name)
+        verified = expected.get(name)
+        if verified is None or verified.sha256 != "sha256:" + match.group(1):
+            raise ProofSetError(f"{label} contains a foreign digest")
+    if observed_names != expected_names:
+        raise ProofSetError(f"{label} is not the exact C-sorted file set")
 
 
 def _validate_global_sha256sums(
@@ -1719,6 +1776,7 @@ def _validate_qualification_final_support(
     *,
     final_state: VerifiedFile,
     final_fleet: VerifiedFile,
+    product_inventory: VerifiedFile,
     cleanup_inventory: VerifiedFile,
     begin: dict[str, Any],
     terminal: dict[str, Any],
@@ -1751,7 +1809,7 @@ def _validate_qualification_final_support(
         canonical_json({"kind": "qualification", "binding": binding})
     ).hexdigest()
     if (
-        state["version"] != 1
+        not version_one(state["version"])
         or state["mode"] != "closed"
         or state["revision"] != terminal["final_closed_revision"]
         or state["last_command_id"] != terminal["close_command_id"]
@@ -1801,7 +1859,7 @@ def _validate_qualification_final_support(
     expected_nodes = fleet["expected_node_ids"]
     if (
         fleet["kind"] != QUALIFICATION_FINAL_FLEET_KIND
-        or fleet["version"] != 1
+        or not version_one(fleet["version"])
         or fleet["qualification_id"] != begin["qualification_id"]
         or fleet["workspace_id"] != begin["workspace_id"]
         or fleet["source_commit_sha"] != context.release_commit
@@ -1831,6 +1889,92 @@ def _validate_qualification_final_support(
         minimum=1,
     )
 
+    product = fields(
+        decode_json(
+            product_inventory.data,
+            "Qualification product inventory receipt",
+        ),
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "release_id",
+            "source_commit_sha",
+            "qualification_catalog_sha256",
+            "binding_sha256",
+            "close_kind",
+            "close_command_id",
+            "close_request_sha256",
+            "close_command_receipt_sha256",
+            "closed_revision",
+            "evaluated_at_unix_ms",
+            "complete",
+            "counts",
+            "product_resource_count",
+        },
+        "Qualification product inventory receipt",
+    )
+    if (
+        product["kind"] != QUALIFICATION_PRODUCT_INVENTORY_KIND
+        or not version_one(product["version"])
+        or product["qualification_id"] != begin["qualification_id"]
+        or product["workspace_id"] != begin["workspace_id"]
+        or product["release_id"] != begin["release_id"]
+        or product["source_commit_sha"] != context.release_commit
+        or product["qualification_catalog_sha256"]
+        != context.qualification_catalog_sha256
+        or product["binding_sha256"] != begin["binding_sha256"]
+        or product["close_kind"] != terminal["close_kind"]
+        or product["close_command_id"] != terminal["close_command_id"]
+        or product["close_request_sha256"] != terminal["close_request_sha256"]
+        or product["close_command_receipt_sha256"]
+        != terminal["close_command_receipt_sha256"]
+        or product["closed_revision"] != terminal["final_closed_revision"]
+        or product["complete"] is not True
+    ):
+        raise ProofSetError("Qualification product inventory binding drifted")
+    counts = fields(
+        product["counts"],
+        {
+            "current_cat_count",
+            "root_disk_count",
+            "persistent_disk_count",
+            "disk_snapshot_count",
+            "endpoint_count",
+            "hostname_desired_lookup_count",
+            "pending_runtime_operation_count",
+            "deleted_cat_tombstone_count",
+            "terminal_runtime_operation_history_count",
+            "api_idempotency_receipt_count",
+        },
+        "Qualification product inventory counts",
+    )
+    for name, count in counts.items():
+        if integer(count, f"Qualification product inventory {name}") > 2**63 - 1:
+            raise ProofSetError(
+                f"Qualification product inventory {name} exceeds PostgreSQL bigint"
+            )
+    current_names = (
+        "current_cat_count",
+        "root_disk_count",
+        "persistent_disk_count",
+        "disk_snapshot_count",
+        "endpoint_count",
+        "hostname_desired_lookup_count",
+        "pending_runtime_operation_count",
+    )
+    if product["product_resource_count"] != sum(counts[name] for name in current_names):
+        raise ProofSetError("Qualification product inventory total drifted")
+    _zero(product["product_resource_count"], "Qualification current product inventory")
+    product_evaluated = integer(
+        product["evaluated_at_unix_ms"],
+        "Qualification product inventory time",
+        minimum=1,
+    )
+    if product_evaluated < state["updated_at_unix_ms"]:
+        raise ProofSetError("Qualification product inventory predates Closed")
+
     cleanup = fields(
         decode_json(
             cleanup_inventory.data,
@@ -1845,6 +1989,7 @@ def _validate_qualification_final_support(
             "block_path",
             "evaluated_at_unix_ms",
             "complete",
+            "product_inventory_receipt_sha256",
             "product_resource_count",
             "desired_runtime_count",
             "current_runtime_observation_count",
@@ -1855,7 +2000,7 @@ def _validate_qualification_final_support(
     )
     if (
         cleanup["kind"] != QUALIFICATION_CLEANUP_INVENTORY_KIND
-        or cleanup["version"] != 1
+        or not version_one(cleanup["version"])
         or cleanup["qualification_id"] != begin["qualification_id"]
         or cleanup["workspace_id"] != begin["workspace_id"]
         or cleanup["source_commit_sha"] != context.release_commit
@@ -1863,6 +2008,11 @@ def _validate_qualification_final_support(
         or cleanup["complete"] is not True
     ):
         raise ProofSetError("Qualification cleanup inventory binding drifted")
+    if (
+        cleanup["product_inventory_receipt_sha256"] != product_inventory.sha256
+        or cleanup["product_resource_count"] != product["product_resource_count"]
+    ):
+        raise ProofSetError("Qualification cleanup rebound the product inventory")
     for counter in (
         "product_resource_count",
         "desired_runtime_count",
@@ -1876,6 +2026,8 @@ def _validate_qualification_final_support(
         "Qualification cleanup time",
         minimum=1,
     )
+    if cleanup_evaluated < product_evaluated or fleet_evaluated < product_evaluated:
+        raise ProofSetError("Qualification cleanup/Fleet predates product inventory")
     if terminal["completed_at_unix_ms"] != max(
         fleet_evaluated,
         cleanup_evaluated,
@@ -1930,21 +2082,7 @@ def _validate_qualification(
     worker_bundle_sha256: str,
     admission_verifier: QualificationAdmissionVerifier,
 ) -> tuple[QualifiedRun, str]:
-    reference_names = {
-        "manifest",
-        "case_evidence",
-        "qualification_catalog",
-        "sha256sums",
-        "qualification_begin",
-        "qualification_terminal",
-        "qualification_begin_pending",
-        "qualification_begin_command_receipt",
-        "qualification_close_pending",
-        "qualification_close_command_receipt",
-        "qualification_final_state",
-        "qualification_final_fleet",
-        "qualification_cleanup_inventory",
-    }
+    reference_names = set(QUALIFICATION_PROOF_LOGICAL_FILES)
     value = fields(
         value,
         reference_names,
@@ -1954,6 +2092,16 @@ def _validate_qualification(
         name: ProofReference.parse(reference, f"qualification.{block_path}.{name}")
         for name, reference in value.items()
     }
+    expected_staged_names = {
+        name: f"{block_path}-{logical_name}"
+        for name, logical_name in QUALIFICATION_PROOF_LOGICAL_FILES.items()
+    }
+    if {
+        name: reference.file for name, reference in refs.items()
+    } != expected_staged_names:
+        raise ProofSetError(
+            f"{block_path} qualification references do not use exact staged names"
+        )
     manifest_file = directory.read_reference(refs["manifest"], f"{block_path} manifest")
     manifest = decode_json(
         manifest_file.data, f"{block_path} manifest", canonical_lf=True
@@ -1970,8 +2118,9 @@ def _validate_qualification(
         else None
     )
     if (
-        manifest.get("version") != 1
+        not version_one(manifest.get("version"))
         or manifest.get("state") != "passed"
+        or type(manifest.get("exit_code")) is not int
         or manifest.get("exit_code") != 0
         or manifest.get("schema_version") != 16
         or manifest.get("block_path") != block_path
@@ -2010,15 +2159,41 @@ def _validate_qualification(
         minimum=1,
     )
 
+    support_names = {
+        "qualification_begin",
+        "qualification_terminal",
+        "qualification_begin_pending",
+        "qualification_begin_command_receipt",
+        "qualification_close_pending",
+        "qualification_close_command_receipt",
+        "qualification_final_state",
+        "qualification_final_fleet",
+        "qualification_product_inventory",
+        "qualification_cleanup_inventory",
+    }
     support = {
         name: directory.read_reference(
             refs[name],
             f"{block_path} {name.replace('_', ' ')}",
         )
-        for name in reference_names
-        if name
-        not in {"manifest", "case_evidence", "qualification_catalog", "sha256sums"}
+        for name in support_names
     }
+    base_references = {
+        QUALIFICATION_COMPONENT_JOURNAL_FILE: "component_journal_summary",
+        QUALIFICATION_EXIT_CODE_FILE: "exit_code",
+        QUALIFICATION_FINAL_INVENTORY_FILE: "final_inventory",
+        QUALIFICATION_RUNTIME_STATE_FILE: "runtime_state",
+        QUALIFICATION_SCENARIO_RESULTS_FILE: "scenario_results",
+    }
+    base_files = {
+        filename: directory.read_reference(
+            refs[reference_name],
+            f"{block_path} {filename}",
+        )
+        for filename, reference_name in base_references.items()
+    }
+    if base_files[QUALIFICATION_EXIT_CODE_FILE].data != b"0\n":
+        raise ProofSetError(f"{block_path} qualification exit-code is not zero")
     begin_file = support["qualification_begin"]
     terminal_file = support["qualification_terminal"]
     begin_receipt = decode_json(begin_file.data, f"{block_path} Qualification Begin")
@@ -2051,6 +2226,8 @@ def _validate_qualification(
         != support["qualification_final_state"].sha256
         or terminal_receipt["fleet_closed_receipt_sha256"]
         != support["qualification_final_fleet"].sha256
+        or terminal_receipt["product_inventory_receipt_sha256"]
+        != support["qualification_product_inventory"].sha256
         or terminal_receipt["cleanup_inventory_receipt_sha256"]
         != support["qualification_cleanup_inventory"].sha256
     ):
@@ -2064,6 +2241,7 @@ def _validate_qualification(
     _validate_qualification_final_support(
         final_state=support["qualification_final_state"],
         final_fleet=support["qualification_final_fleet"],
+        product_inventory=support["qualification_product_inventory"],
         cleanup_inventory=support["qualification_cleanup_inventory"],
         begin=begin_receipt,
         terminal=terminal_receipt,
@@ -2164,6 +2342,9 @@ def _validate_qualification(
         ],
         QUALIFICATION_FINAL_STATE_FILE: support["qualification_final_state"],
         QUALIFICATION_FINAL_FLEET_FILE: support["qualification_final_fleet"],
+        QUALIFICATION_PRODUCT_INVENTORY_FILE: support[
+            "qualification_product_inventory"
+        ],
         QUALIFICATION_CLEANUP_INVENTORY_FILE: support[
             "qualification_cleanup_inventory"
         ],
@@ -2171,6 +2352,7 @@ def _validate_qualification(
     _validate_sha256sums(
         sums_file.data,
         {
+            **base_files,
             "manifest.json": manifest_file,
             "case-evidence.jsonl": evidence_file,
             "qualification-catalog.v1.json": catalog_file,
@@ -2224,7 +2406,7 @@ def _validate_host_coverage(
 ) -> None:
     inventory = fields(inventory, {"version", "hosts"}, "old Host inventory")
     coverage = fields(coverage, {"version", "hosts"}, "old Host coverage")
-    if inventory["version"] != 1 or coverage["version"] != 1:
+    if not version_one(inventory["version"]) or not version_one(coverage["version"]):
         raise ProofSetError("old Host inventory/coverage version drifted")
     expected: list[tuple[str, tuple[str, ...]]] = []
     for entry in inventory["hosts"]:
@@ -2314,7 +2496,7 @@ def verify(
             PROOF_SET_FIELDS,
             "production cutover proof set",
         )
-        if value["kind"] != PROOF_SET_KIND or value["version"] != 1:
+        if value["kind"] != PROOF_SET_KIND or not version_one(value["version"]):
             raise ProofSetError("unsupported production cutover proof-set kind/version")
         identifier(value["cutover_id"], "cutover ID")
         if value["reset_id"] != expected_reset_id:

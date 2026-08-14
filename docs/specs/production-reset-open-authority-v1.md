@@ -112,13 +112,21 @@ ProofFileV1 { file: direct-child name, sha256: Sha256Digest, size_bytes: u64 > 0
 
 RunnerBundleProofV1 {
   manifest, case_evidence, qualification_catalog, sha256sums: ProofFileV1,
+  component_journal_summary, exit_code, final_inventory,
+  runtime_state, scenario_results: ProofFileV1,
   qualification_begin, qualification_terminal: ProofFileV1,
   qualification_begin_pending, qualification_begin_command_receipt: ProofFileV1,
   qualification_close_pending, qualification_close_command_receipt: ProofFileV1,
   qualification_final_state, qualification_final_fleet,
-  qualification_cleanup_inventory: ProofFileV1
+  qualification_product_inventory, qualification_cleanup_inventory: ProofFileV1
 }
 ```
+
+Every block-path descriptor therefore contains exactly 19 actual-file references. `SHA256SUMS`
+contains exactly the other 18 logical runner filenames in C byte order, with no missing, duplicate,
+foreign or self row, and every row is checked against the bytes named by its proof reference. The
+flat proof directory stages each member as `<block-path>-<logical-runner-filename>`; arbitrary aliases
+are rejected, while checksum rows retain the unprefixed logical filename.
 
 `FreshTargetsV1` contains exactly the fresh Control schema, Usage schema, versioned ChunkStore
 bucket/exact trailing-slash prefix, Kinesis stream, DynamoDB checkpoint table and immutable Usage
@@ -435,10 +443,13 @@ production-mutation-admission.py qualification-begin COMMON-SIGNED-ARGS
 ... run cases and exact cleanup ...
 production-mutation-admission.py qualification-close COMMON-SIGNED-ARGS \
   --close-kind end_qualification
-... obtain only read-only post-close Fleet and cleanup evidence ...
+production-mutation-admission.py qualification-product-inventory COMMON-VERIFY-ARGS \
+  --close-kind end_qualification
+... obtain only read-only post-close Fleet/E12 evidence and assemble cleanup ...
 production-mutation-admission.py qualification-terminalize COMMON-VERIFY-ARGS \
   --close-kind end_qualification \
   --fleet-closed-receipt ABS/production-mutation-qualification-final-fleet-closed.receipt.json \
+  --product-inventory-receipt ABS/production-mutation-qualification-product-inventory.receipt.json \
   --cleanup-inventory-receipt ABS/production-mutation-qualification-cleanup-inventory.receipt.json
 ```
 
@@ -450,7 +461,9 @@ can only exact-replay/discover the durable close and assemble evidence. The fina
 is `cats.production-mutation-qualification-final-fleet-closed.v1`; the cleanup wrapper kind is
 `cats.production-mutation-qualification-cleanup-inventory.v1`. Both bind run/Workspace/source/raw
 block path, are evaluated after the close commit, are complete, and carry exact zero runtime/guard/
-residue (plus product-resource zero for cleanup) projections.
+residue projections. The cleanup wrapper additionally carries
+`product_inventory_receipt_sha256` and copies the Control oracle's zero `product_resource_count`;
+Fleet and cleanup evaluation times cannot predate that oracle.
 
 The runner's failure/cancellation trap never invents cleanup. It finishes only explicitly allowed
 run-bound cleanup, invokes `qualification-close --close-kind emergency_close`, then obtains the same

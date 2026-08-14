@@ -44,6 +44,9 @@ from urllib.parse import urlsplit
 COMMAND_PATH = "/v1/admin/production/mutation-admission-commands"
 DISCOVERY_PATH = "/v1/admin/production/mutation-admission-command-discoveries"
 STATE_PATH = "/v1/admin/production/mutation-admission-state-discoveries"
+PRODUCT_INVENTORY_PATH = (
+    "/v1/admin/production/qualification-product-inventory-discoveries"
+)
 CREDENTIAL_HEADER = "cats-production-cutover-credential-id"
 SIGNATURE_HEADER = "cats-production-cutover-signature"
 CONTENT_TYPE = "application/json"
@@ -84,6 +87,9 @@ QUALIFICATION_FINAL_FLEET_FILE = (
 QUALIFICATION_CLEANUP_INVENTORY_FILE = (
     "production-mutation-qualification-cleanup-inventory.receipt.json"
 )
+QUALIFICATION_PRODUCT_INVENTORY_FILE = (
+    "production-mutation-qualification-product-inventory.receipt.json"
+)
 QUALIFICATION_BEGIN_RECEIPT_KIND = (
     "cats.production-mutation-qualification-begin-receipt.v1"
 )
@@ -92,6 +98,9 @@ QUALIFICATION_TERMINAL_RECEIPT_KIND = (
 )
 QUALIFICATION_CLEANUP_INVENTORY_KIND = (
     "cats.production-mutation-qualification-cleanup-inventory.v1"
+)
+QUALIFICATION_PRODUCT_INVENTORY_KIND = (
+    "cats.production-mutation-qualification-product-inventory.v1"
 )
 QUALIFICATION_FINAL_FLEET_KIND = (
     "cats.production-mutation-qualification-final-fleet-closed.v1"
@@ -208,6 +217,10 @@ def require_string(value: Any, pattern: re.Pattern[str], label: str) -> str:
     if not isinstance(value, str) or pattern.fullmatch(value) is None:
         raise AdmissionError(f"{label} is invalid")
     return value
+
+
+def version_one(value: Any) -> bool:
+    return type(value) is int and value == 1
 
 
 def sha256(data: bytes) -> str:
@@ -474,7 +487,9 @@ def validate_trust(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         },
         "cutover trust bundle",
     )
-    if trust["version"] != 1 or trust["signature_threshold"] != 1:
+    if not version_one(trust["version"]) or not version_one(
+        trust["signature_threshold"]
+    ):
         raise AdmissionError("unsupported cutover trust version or threshold")
     for field in ("deployment_id", "release_id"):
         require_string(trust[field], ID, f"trust.{field}")
@@ -667,7 +682,7 @@ def validate_command(value: Any) -> dict[str, Any]:
         },
         "production admission command",
     )
-    if command["version"] != 1:
+    if not version_one(command["version"]):
         raise AdmissionError("unsupported command version")
     require_string(command["command_id"], RANDOM_ID, "command_id")
     issued = command["issued_at_unix_ms"]
@@ -843,7 +858,7 @@ def load_pending(path: Path, trust_path: Path) -> tuple[dict[str, Any], bytes, d
     if canonical_json(pending, newline=True) != pending_bytes:
         raise AdmissionError("pending command is not canonical")
     if (
-        pending["version"] != 1
+        not version_one(pending["version"])
         or pending["method"] != "POST"
         or pending["target"] != COMMAND_PATH
         or pending["discovery_target"] != DISCOVERY_PATH
@@ -937,7 +952,7 @@ def validate_receipt(
     )
     if canonical_json(receipt) != result.body:
         raise AdmissionError("admission receipt is not canonical Cats JSON")
-    if receipt["version"] != 1 or receipt["command"] != command:
+    if not version_one(receipt["version"]) or receipt["command"] != command:
         raise AdmissionError("admission receipt does not bind the exact command")
     if receipt["request_sha256"] != sha256(body):
         raise AdmissionError("admission receipt request digest does not match")
@@ -994,7 +1009,7 @@ def validate_state(value: Any) -> dict[str, Any]:
         "admission state",
     )
     if (
-        state["version"] != 1
+        not version_one(state["version"])
         or not isinstance(state["revision"], int)
         or isinstance(state["revision"], bool)
         or state["revision"] <= 0
@@ -1252,9 +1267,10 @@ def validate_qualification_authority_inputs(
         },
         "Qualification cell manifest",
     )
-    if cell["kind"] != "cats.production-qualification-cell-manifest.v1" or cell[
-        "version"
-    ] != 1:
+    if (
+        cell["kind"] != "cats.production-qualification-cell-manifest.v1"
+        or not version_one(cell["version"])
+    ):
         raise AdmissionError("Qualification cell manifest kind/version drifted")
     for field in (
         "qualification_id",
@@ -1297,7 +1313,7 @@ def validate_qualification_authority_inputs(
     except (KeyError, TypeError) as error:
         raise AdmissionError("manual release manifest shape is unavailable") from error
     if (
-        release.get("version") != 1
+        not version_one(release.get("version"))
         or not isinstance(release_source, dict)
         or release_source.get("commit") != binding["source_commit_sha"]
         or not isinstance(worker, dict)
@@ -1423,6 +1439,112 @@ def qualification_begin(args: argparse.Namespace) -> tuple[Path, str]:
     return path, sha256(payload)
 
 
+def validate_product_inventory(
+    value: Any,
+    binding: dict[str, Any],
+    close_receipt: dict[str, Any],
+    close_receipt_sha256: str,
+    close_kind: str,
+) -> dict[str, Any]:
+    value = require_fields(
+        value,
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "release_id",
+            "source_commit_sha",
+            "qualification_catalog_sha256",
+            "binding_sha256",
+            "close_kind",
+            "close_command_id",
+            "close_request_sha256",
+            "close_command_receipt_sha256",
+            "closed_revision",
+            "evaluated_at_unix_ms",
+            "complete",
+            "counts",
+            "product_resource_count",
+        },
+        "Qualification product inventory",
+    )
+    command = close_receipt["command"]
+    state = validate_applied_qualification_receipt(
+        close_receipt,
+        binding,
+        close_kind,
+    )
+    if (
+        value["kind"] != QUALIFICATION_PRODUCT_INVENTORY_KIND
+        or not version_one(value["version"])
+        or value["qualification_id"] != binding["qualification_id"]
+        or value["workspace_id"] != binding["workspace_id"]
+        or value["release_id"] != binding["release_id"]
+        or value["source_commit_sha"] != binding["source_commit_sha"]
+        or value["qualification_catalog_sha256"]
+        != binding["qualification_catalog_sha256"]
+        or value["binding_sha256"] != qualification_binding_sha256(binding)
+        or value["close_kind"] != close_kind
+        or value["close_command_id"] != command["command_id"]
+        or value["close_request_sha256"] != close_receipt["request_sha256"]
+        or value["close_command_receipt_sha256"] != close_receipt_sha256
+        or value["closed_revision"] != state["revision"]
+        or value["complete"] is not True
+    ):
+        raise AdmissionError("Qualification product inventory binding drifted")
+    evaluated = value["evaluated_at_unix_ms"]
+    if (
+        not isinstance(evaluated, int)
+        or isinstance(evaluated, bool)
+        or evaluated < close_receipt["committed_at_unix_ms"]
+    ):
+        raise AdmissionError("Qualification product inventory time is invalid")
+    counts = require_fields(
+        value["counts"],
+        {
+            "current_cat_count",
+            "root_disk_count",
+            "persistent_disk_count",
+            "disk_snapshot_count",
+            "endpoint_count",
+            "hostname_desired_lookup_count",
+            "pending_runtime_operation_count",
+            "deleted_cat_tombstone_count",
+            "terminal_runtime_operation_history_count",
+            "api_idempotency_receipt_count",
+        },
+        "Qualification product inventory counts",
+    )
+    for name, count in counts.items():
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            or count > 2**63 - 1
+        ):
+            raise AdmissionError(f"Qualification product inventory {name} is invalid")
+    current_fields = (
+        "current_cat_count",
+        "root_disk_count",
+        "persistent_disk_count",
+        "disk_snapshot_count",
+        "endpoint_count",
+        "hostname_desired_lookup_count",
+        "pending_runtime_operation_count",
+    )
+    product_resource_count = value["product_resource_count"]
+    if (
+        not isinstance(product_resource_count, int)
+        or isinstance(product_resource_count, bool)
+        or product_resource_count < 0
+        or product_resource_count > 2**63 - 1
+        or product_resource_count != sum(counts[name] for name in current_fields)
+    ):
+        raise AdmissionError("Qualification product inventory total drifted")
+    return value
+
+
 def validate_cleanup_inventory(
     value: Any,
     binding: dict[str, Any],
@@ -1439,6 +1561,7 @@ def validate_cleanup_inventory(
             "block_path",
             "evaluated_at_unix_ms",
             "complete",
+            "product_inventory_receipt_sha256",
             "product_resource_count",
             "desired_runtime_count",
             "current_runtime_observation_count",
@@ -1449,7 +1572,7 @@ def validate_cleanup_inventory(
     )
     if (
         value["kind"] != QUALIFICATION_CLEANUP_INVENTORY_KIND
-        or value["version"] != 1
+        or not version_one(value["version"])
         or value["qualification_id"] != binding["qualification_id"]
         or value["workspace_id"] != binding["workspace_id"]
         or value["source_commit_sha"] != binding["source_commit_sha"]
@@ -1463,6 +1586,11 @@ def validate_cleanup_inventory(
         or value["evaluated_at_unix_ms"] <= 0
     ):
         raise AdmissionError("Qualification cleanup inventory time is invalid")
+    require_string(
+        value["product_inventory_receipt_sha256"],
+        SHA256,
+        "Qualification cleanup product inventory digest",
+    )
     for field in (
         "product_resource_count",
         "desired_runtime_count",
@@ -1502,7 +1630,7 @@ def validate_qualification_final_fleet(
     )
     if (
         value["kind"] != QUALIFICATION_FINAL_FLEET_KIND
-        or value["version"] != 1
+        or not version_one(value["version"])
         or value["qualification_id"] != binding["qualification_id"]
         or value["workspace_id"] != binding["workspace_id"]
         or value["source_commit_sha"] != binding["source_commit_sha"]
@@ -1660,12 +1788,112 @@ def qualification_close(args: argparse.Namespace) -> tuple[Path, str]:
     return state_path, sha256(state_raw)
 
 
+def qualification_product_inventory(args: argparse.Namespace) -> tuple[Path, str]:
+    binding = validate_qualification_authority_inputs(args)
+    load_qualification_begin_for_close(args, binding)
+    close_pending = qualification_pending_path(
+        args.state_directory,
+        binding,
+        args.close_kind,
+    )
+    if not close_pending.exists() or close_pending.is_symlink():
+        raise AdmissionError("Qualification close pending authority is unavailable")
+    close_receipt, _close_raw, close_receipt_sha256 = settle_qualification_pending(
+        close_pending,
+        args,
+    )
+    validate_applied_qualification_receipt(
+        close_receipt,
+        binding,
+        args.close_kind,
+    )
+    pending, body, _command = load_pending(close_pending, args.trust_file)
+    path = args.evidence_directory / QUALIFICATION_PRODUCT_INVENTORY_FILE
+    if path.exists() or path.is_symlink():
+        value, raw = read_canonical_evidence(
+            path,
+            "Qualification product inventory receipt",
+            private=True,
+        )
+        value = validate_product_inventory(
+            value,
+            binding,
+            close_receipt,
+            close_receipt_sha256,
+            args.close_kind,
+        )
+        if value["product_resource_count"] != 0:
+            raise AdmissionError("durable Qualification product inventory is not zero")
+        return path, sha256(raw)
+
+    cancellation = Cancellation()
+    prior_handlers: dict[int, Any] = {}
+    for signal_number in (signal.SIGINT, signal.SIGTERM):
+        prior_handlers[signal_number] = signal.signal(
+            signal_number,
+            cancellation.handler,
+        )
+    deadline = time.monotonic() + args.resolution_timeout_seconds
+    last_error: AdmissionError | None = None
+    try:
+        while time.monotonic() < deadline:
+            if cancellation.requested:
+                raise AdmissionError("Qualification product inventory was cancelled")
+            try:
+                result = post_exact(
+                    pending["origin"],
+                    PRODUCT_INVENTORY_PATH,
+                    pending,
+                    body,
+                )
+            except AdmissionError as error:
+                last_error = error
+                time.sleep(0.25)
+                continue
+            if cancellation.requested:
+                raise AdmissionError("Qualification product inventory was cancelled")
+            if result.status != 200:
+                if result.status in {404, 409}:
+                    validate_json_response(result)
+                raise AdmissionError(
+                    f"product inventory discovery returned unexpected HTTP {result.status}"
+                )
+            validate_json_response(result)
+            value = decode_json(result.body, "Qualification product inventory receipt")
+            if canonical_json(value) != result.body:
+                raise AdmissionError(
+                    "Qualification product inventory receipt is not canonical Cats JSON"
+                )
+            value = validate_product_inventory(
+                value,
+                binding,
+                close_receipt,
+                close_receipt_sha256,
+                args.close_kind,
+            )
+            if value["product_resource_count"] != 0:
+                raise AdmissionError("Qualification current product inventory is not zero")
+            write_atomic(path, result.body)
+            return path, sha256(result.body)
+        if last_error is not None:
+            raise AdmissionError(
+                "product inventory remains unavailable after bounded read-only replay"
+            ) from last_error
+        raise AdmissionError("product inventory did not complete before its deadline")
+    finally:
+        for signal_number, handler in prior_handlers.items():
+            signal.signal(signal_number, handler)
+
+
 def qualification_terminalize(args: argparse.Namespace) -> tuple[Path, str]:
     binding = validate_qualification_authority_inputs(args)
     if (
         args.fleet_closed_receipt.parent != args.evidence_directory
+        or args.product_inventory_receipt.parent != args.evidence_directory
         or args.cleanup_inventory_receipt.parent != args.evidence_directory
         or args.fleet_closed_receipt.name != QUALIFICATION_FINAL_FLEET_FILE
+        or args.product_inventory_receipt.name
+        != QUALIFICATION_PRODUCT_INVENTORY_FILE
         or args.cleanup_inventory_receipt.name
         != QUALIFICATION_CLEANUP_INVENTORY_FILE
     ):
@@ -1684,18 +1912,39 @@ def qualification_terminalize(args: argparse.Namespace) -> tuple[Path, str]:
         "Qualification final Fleet Closed receipt",
         private=True,
     )
+    product_inventory, product_inventory_raw = read_canonical_evidence(
+        args.product_inventory_receipt,
+        "Qualification product inventory receipt",
+        private=True,
+    )
     cleanup, cleanup_raw = read_canonical_evidence(
         args.cleanup_inventory_receipt,
         "Qualification cleanup inventory receipt",
         private=True,
     )
     fleet = validate_qualification_final_fleet(fleet, binding, args.block_path)
+    product_inventory = validate_product_inventory(
+        product_inventory,
+        binding,
+        receipt,
+        receipt_sha256,
+        args.close_kind,
+    )
     cleanup = validate_cleanup_inventory(cleanup, binding, args.block_path)
     if (
-        cleanup["evaluated_at_unix_ms"] < receipt["committed_at_unix_ms"]
-        or fleet["evaluated_at_unix_ms"] < receipt["committed_at_unix_ms"]
+        product_inventory["product_resource_count"] != 0
+        or cleanup["product_inventory_receipt_sha256"]
+        != sha256(product_inventory_raw)
+        or cleanup["product_resource_count"]
+        != product_inventory["product_resource_count"]
+        or cleanup["evaluated_at_unix_ms"]
+        < product_inventory["evaluated_at_unix_ms"]
+        or fleet["evaluated_at_unix_ms"]
+        < product_inventory["evaluated_at_unix_ms"]
     ):
-        raise AdmissionError("Qualification terminal evidence predates close linearization")
+        raise AdmissionError(
+            "Qualification terminal evidence does not follow the product inventory oracle"
+        )
     completed = max(
         cleanup["evaluated_at_unix_ms"],
         fleet["evaluated_at_unix_ms"],
@@ -1733,6 +1982,7 @@ def qualification_terminalize(args: argparse.Namespace) -> tuple[Path, str]:
         "final_admission_state_sha256": sha256(state_payload),
         "final_closed_revision": state["revision"],
         "fleet_closed_receipt_sha256": sha256(fleet_raw),
+        "product_inventory_receipt_sha256": sha256(product_inventory_raw),
         "cleanup_inventory_receipt_sha256": sha256(cleanup_raw),
         "active_guard_count": cleanup["active_guard_count"],
         "product_resource_count": cleanup["product_resource_count"],
@@ -1843,6 +2093,16 @@ def parser() -> argparse.ArgumentParser:
         required=True,
         choices=("end_qualification", "emergency_close"),
     )
+    qualification_inventory_parser = commands.add_parser(
+        "qualification-product-inventory",
+        help="publish the canonical post-close Control product inventory",
+    )
+    add_qualification_hook_arguments(qualification_inventory_parser, signing=False)
+    qualification_inventory_parser.add_argument(
+        "--close-kind",
+        required=True,
+        choices=("end_qualification", "emergency_close"),
+    )
     qualification_terminal_parser = commands.add_parser(
         "qualification-terminalize",
         help="bind post-close Fleet/cleanup evidence into the terminal framework receipt",
@@ -1855,6 +2115,11 @@ def parser() -> argparse.ArgumentParser:
     )
     qualification_terminal_parser.add_argument(
         "--fleet-closed-receipt",
+        required=True,
+        type=Path,
+    )
+    qualification_terminal_parser.add_argument(
+        "--product-inventory-receipt",
         required=True,
         type=Path,
     )
@@ -1888,6 +2153,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:
                 raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
             path, digest = qualification_close(args)
+            value = {"receipt": str(path), "sha256": digest}
+        elif args.command == "qualification-product-inventory":
+            if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:
+                raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
+            path, digest = qualification_product_inventory(args)
             value = {"receipt": str(path), "sha256": digest}
         else:
             if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:

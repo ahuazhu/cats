@@ -168,6 +168,14 @@ def validate_with_request(request_value: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    if not PROOF.version_one(1) or PROOF.version_one(True):
+        raise AssertionError("closed contract version accepted a JSON boolean")
+    if (
+        len(PROOF.QUALIFICATION_PROOF_LOGICAL_FILES) != 19
+        or len(set(PROOF.QUALIFICATION_PROOF_LOGICAL_FILES.values())) != 19
+        or PROOF.QUALIFICATION_PROOF_LOGICAL_FILES["sha256sums"] != "SHA256SUMS"
+    ):
+        raise AssertionError("per-run qualification exact19 mapping drifted")
     expected_typed_digest = (
         "sha256:1ecc587146a29898f40be96fb88679c68106813997ce5778fc046c86388e2ec1"
     )
@@ -226,6 +234,37 @@ def main() -> int:
         except PROOF.ProofSetError:
             continue
         raise AssertionError("foreign global Usage request was accepted")
+
+    checksum_files = {
+        "a.txt": opaque("staged-a", "a"),
+        "b.txt": opaque("staged-b", "b"),
+    }
+    checksum_lines = [
+        f"{checksum_files[name].sha256.removeprefix('sha256:')}  {name}\n"
+        for name in sorted(checksum_files)
+    ]
+    PROOF._validate_sha256sums(
+        "".join(checksum_lines).encode("ascii"),
+        checksum_files,
+        "fixture SHA256SUMS",
+    )
+    foreign_line = f"{'f' * 64}  foreign.txt\n"
+    checksum_failures = (
+        checksum_lines[:1],
+        checksum_lines + [foreign_line],
+        list(reversed(checksum_lines)),
+        [f"{'f' * 64}  a.txt\n", checksum_lines[1]],
+    )
+    for lines in checksum_failures:
+        try:
+            PROOF._validate_sha256sums(
+                "".join(lines).encode("ascii"),
+                checksum_files,
+                "fixture SHA256SUMS",
+            )
+        except PROOF.ProofSetError:
+            continue
+        raise AssertionError("non-closed per-run SHA256SUMS was accepted")
     return 0
 
 
