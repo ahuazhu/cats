@@ -22,6 +22,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::gateway_identity::lock_route_v2_machine_authority_shared;
+use super::host_fence_recovery_batch::require_product_mutation_unblocked_in;
 use super::pg_codec::PgBigInt;
 use super::product_rows::load_assigned_desired_for_update;
 use super::route_signing_authority::node_acks_current_published_ring_in;
@@ -663,6 +664,9 @@ fn apply_runtime_node_authority_in(
         return Err(corrupt(
             "NodeIdentity and placement policy presence diverged",
         ));
+    }
+    if identity.is_some() {
+        require_product_mutation_unblocked_in(transaction, &apply.node_id)?;
     }
     let committed_at = database_now(transaction)?;
     let stored_outcome = match &apply.mutation {

@@ -26,17 +26,11 @@ fn corrupt(message: impl Into<String>) -> AuthorityTransactionError {
 /// takes the same lock before inserting its barrier.  Exact mutation replay
 /// is resolved before calling this helper, so rejecting here never hides a
 /// previously committed response.
-pub(super) fn require_product_mutation_unblocked_in(
+pub(in crate::store) fn require_product_mutation_unblocked_in(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<()> {
-    let rows = transaction.query(
-        "SELECT fence_attempt_id
-           FROM trusted_host_fence_recovery_attempts_v1
-          WHERE node_id=$1 AND state IN ('provider_pending', 'provider_terminal')
-          ORDER BY fence_attempt_id COLLATE \"C\" LIMIT 2 FOR UPDATE",
-        &[&node_id.as_str()],
-    )?;
+    let rows = load_active_attempts(transaction, node_id, "FOR UPDATE")?;
     if rows.len() > 1 {
         return Err(corrupt(
             "more than one active Host recovery attempt exists for one Node",
@@ -48,4 +42,36 @@ pub(super) fn require_product_mutation_unblocked_in(
         )));
     }
     Ok(())
+}
+
+/// Observation and heartbeat ingestion deliberately do not call this read.
+/// Placement and Route admission do: an active recovery attempt is a closed
+/// server-side source gate even before provider network isolation finishes.
+pub(super) fn product_admission_is_blocked_in(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<bool> {
+    let rows = load_active_attempts(transaction, node_id, "")?;
+    if rows.len() > 1 {
+        return Err(corrupt(
+            "more than one active Host recovery attempt exists for one Node",
+        ));
+    }
+    Ok(!rows.is_empty())
+}
+
+fn load_active_attempts(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    lock: &str,
+) -> AuthorityTxResult<Vec<postgres::Row>> {
+    let sql = format!(
+        "SELECT fence_attempt_id
+           FROM trusted_host_fence_recovery_attempts_v1
+          WHERE node_id=$1 AND state IN ('provider_pending', 'provider_terminal')
+          ORDER BY fence_attempt_id COLLATE \"C\" LIMIT 2 {lock}"
+    );
+    transaction
+        .query(&sql, &[&node_id.as_str()])
+        .map_err(Into::into)
 }

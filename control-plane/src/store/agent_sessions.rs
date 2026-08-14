@@ -558,6 +558,11 @@ fn register_agent_session_in(
         ));
     }
 
+    crate::store::runtime_authority::host_fence_recovery_batch::require_product_mutation_unblocked_in(
+        transaction,
+        &identity.node_id,
+    )?;
+
     if identity.state != NodeIdentityState::Provisioned {
         return Ok(identity_rejected());
     }
