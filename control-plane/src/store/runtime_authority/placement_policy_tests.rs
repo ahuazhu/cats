@@ -3,6 +3,7 @@
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
+use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, guest_config_digest, runtime_provisioner_active_set_digest,
     AllocatableMemoryBytes, AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion,
@@ -16,6 +17,7 @@ use cats_api::runtime_reconciliation::{
     RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
 };
 
+use super::host_fence_recovery_batch_tests::active_host_recovery_fixture;
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
 use super::route_signing_authority_tests::install_initial_signer_for_test;
 use super::runtime_spine_tests::{
@@ -144,6 +146,35 @@ fn provision(apply_id: u128) -> RuntimeNodeAuthorityApply {
             placement_policy: Box::new(policy(1, RuntimeSchedulingState::Cordoned, 16 << 30)),
         },
     }
+}
+
+fn provision_on_host(
+    apply_id: u128,
+    node_id: &str,
+    immutable_host_id: &str,
+    provider_scope: cats_api::runtime_reconciliation::ProviderScope,
+) -> RuntimeNodeAuthorityApply {
+    let mut apply = provision(apply_id);
+    apply.node_id = id(node_id);
+    let RuntimeNodeAuthorityMutation::Provision {
+        node_identity,
+        placement_policy,
+    } = &mut apply.mutation
+    else {
+        unreachable!();
+    };
+    node_identity.node_id = id(node_id);
+    node_identity.provider_scope = provider_scope;
+    node_identity.immutable_host_id = id(immutable_host_id);
+    node_identity.credential_id = Id::new(format!("credential-{node_id}")).unwrap();
+    node_identity.credential_binding = CredentialBinding::PublicKey {
+        public_key_spki_sha256: digest(u8::try_from(apply_id).unwrap()),
+    };
+    node_identity.state_path_id = Id::new(format!("state-path-{node_id}")).unwrap();
+    placement_policy.node_id = id(node_id);
+    placement_policy.node_transport_target =
+        NodeTransportTarget::new(format!("https://{node_id}.internal:7301")).unwrap();
+    apply
 }
 
 fn update(
@@ -1118,4 +1149,80 @@ fn concurrent_host_state_reuse_has_one_applied_winner_and_one_durable_rejection(
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn active_recovery_seals_fresh_provision_on_the_same_physical_host_only() {
+    let fixture = active_host_recovery_fixture("host-recovery-provision-barrier");
+    let store = &fixture.fixture.store;
+    let provisioner = credential("host_recovery_provisioner", SPKI_A);
+    store
+        .install_runtime_provisioner_trust_bundle(&trust(1, vec![provisioner.clone()], None))
+        .unwrap();
+    let actor = principal(&provisioner);
+    let source_scope = fixture.fixture.old_identity.provider_scope.clone();
+    let source_host = fixture
+        .fixture
+        .old_identity
+        .immutable_host_id
+        .as_str()
+        .to_owned();
+
+    // This is a fresh Node ID and a fresh state path, so a Node-scoped or
+    // Host/state-path-scoped barrier cannot catch it.  The physical Host
+    // recovery barrier must reject it before any apply or authority row is
+    // written.
+    let same_host = provision_on_host(
+        80,
+        "node-recovery-bypass",
+        &source_host,
+        source_scope.clone(),
+    );
+    let error = store
+        .apply_runtime_node_authority(&actor, &same_host)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    store
+        .with(|client| {
+            for (table, column) in [
+                ("node_identities", "node_id"),
+                ("runtime_node_placement_policies", "node_id"),
+                ("runtime_node_credential_lineage", "node_id"),
+            ] {
+                let count = client
+                    .query_one(
+                        &format!("SELECT count(*) FROM {table} WHERE {column}=$1"),
+                        &[&same_host.node_id.as_str()],
+                    )?
+                    .get::<_, i64>(0);
+                assert_eq!(count, 0, "{table} changed for rejected same-Host provision");
+            }
+            assert_eq!(
+                client
+                    .query_one(
+                        "SELECT count(*) FROM runtime_node_authority_apply_records
+                          WHERE apply_id=$1",
+                        &[&same_host.apply_id.as_str()],
+                    )?
+                    .get::<_, i64>(0),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    // The scope key is exact: recovery of one immutable Host must not stop
+    // normal provisioning on another Host in the same provider scope.
+    let other_host = provision_on_host(
+        81,
+        "node-other-physical-host",
+        "host-other-physical-host",
+        source_scope,
+    );
+    assert_applied(
+        store
+            .apply_runtime_node_authority(&actor, &other_host)
+            .unwrap(),
+        RuntimeNodeAuthorityOutcome::Provisioned,
+    );
 }

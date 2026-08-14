@@ -23,9 +23,9 @@ use cats_api::runtime_reconciliation::{
     decode_desired_read_snapshot, decode_node_observation, encode_desired_read_snapshot,
     encode_node_observation, encode_operation, spec_digest, AgentSession, AuthorizationState,
     ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, Id, NodeIdentity,
-    NodeIdentityState, Operation, OperationFailure, OperationPhase, OperationTerminal, Revision,
-    SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire, VolumeAdminState, VolumeAuthorization,
-    WireU64,
+    NodeIdentityState, Operation, OperationFailure, OperationPhase, OperationTerminal,
+    ProviderScope, Revision, SessionBinding, Sha256Digest, UnixMillis, VolumeAcquire,
+    VolumeAdminState, VolumeAuthorization, WireU64,
 };
 use cats_storage::authority::{
     validate_authorization_record, validate_volume_record, VolumeOwnerBinding,
@@ -1338,6 +1338,11 @@ fn begin_attempt_in(
     let identity = load_identity_by_node_for_update(transaction, &apply.source_node_id)?
         .ok_or_else(|| conflict("Host recovery source NodeIdentity is absent"))?;
     validate_source_identity(&identity, apply, authority_bindings)?;
+    require_host_recovery_unblocked_in(
+        transaction,
+        &identity.provider_scope,
+        &identity.immutable_host_id,
+    )?;
     require_active_credential_lineage(transaction, &identity)?;
     let session = load_current_session_for_update(transaction, &identity.node_id)?
         .ok_or_else(|| conflict("Host recovery source has no current AgentSession"))?;
@@ -2647,6 +2652,59 @@ impl Store {
     ) -> crate::store::Result<Option<HostLossRecoveryDiscoveryResultV1>> {
         self.authority_transaction(|transaction| public_discovery_result_in(transaction, discovery))
     }
+}
+
+/// Serialize Host-scoped recovery with fresh Node provisioning, including
+/// the missing-row case where no `node_identities` row can provide a lock.
+/// The exact provider tuple is part of the key; an immutable Host ID is not a
+/// globally meaningful provider identifier on its own.
+pub(in crate::store) fn require_host_recovery_unblocked_in(
+    transaction: &mut Transaction<'_>,
+    provider_scope: &ProviderScope,
+    immutable_host_id: &Id,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':host-recovery-source:' ||
+            jsonb_build_array(
+                $1::TEXT,$2::TEXT,$3::TEXT,$4::TEXT,$5::TEXT
+            )::TEXT,
+            0::BIGINT))",
+        &[
+            &provider_scope.provider.as_str(),
+            &provider_scope.partition.as_str(),
+            &provider_scope.account_id.as_str(),
+            &provider_scope.region.as_str(),
+            &immutable_host_id.as_str(),
+        ],
+    )?;
+    let rows = transaction.query(
+        "SELECT fence_attempt_id, node_id
+           FROM trusted_host_fence_recovery_attempts_v1
+          WHERE provider=$1 AND host_partition=$2
+            AND host_account_id=$3 AND host_region=$4
+            AND immutable_host_id=$5
+            AND state IN ('provider_pending', 'provider_terminal', 'blocked')
+          ORDER BY fence_attempt_id COLLATE \"C\" LIMIT 2 FOR UPDATE",
+        &[
+            &provider_scope.provider.as_str(),
+            &provider_scope.partition.as_str(),
+            &provider_scope.account_id.as_str(),
+            &provider_scope.region.as_str(),
+            &immutable_host_id.as_str(),
+        ],
+    )?;
+    if rows.len() > 1 {
+        return Err(corrupt(
+            "more than one active Host recovery attempt exists for one immutable Host",
+        ));
+    }
+    if !rows.is_empty() {
+        return Err(application(ApiError::conflict(
+            "immutable Host is sealed by an active recovery attempt",
+        )));
+    }
+    Ok(())
 }
 
 /// Requires the caller to hold this Node's `node_identities` row lock.

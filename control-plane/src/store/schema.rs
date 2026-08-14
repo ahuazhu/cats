@@ -1573,6 +1573,12 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
+        "node_identities",
+        "node_identity_one_provisioned_per_host",
+        "host_provider,host_partition,host_account_id,host_region,immutable_host_id",
+        Some("(state = 'provisioned'::text)"),
+    ),
+    (
         "object_write_authorities",
         "object_write_one_open_authority_per_host",
         "host_provider,host_partition,host_account_id,host_region,immutable_host_id",
@@ -3945,6 +3951,11 @@ CREATE TABLE IF NOT EXISTS node_identities (
             AND credential_lineage_state IS NULL)
     ) IS TRUE)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS node_identity_one_provisioned_per_host
+    ON node_identities(
+        host_provider, host_partition, host_account_id, host_region,
+        immutable_host_id
+    ) WHERE state = 'provisioned';
 CREATE TABLE IF NOT EXISTS runtime_node_credential_lineage (
     credential_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL REFERENCES node_identities(node_id)

@@ -147,12 +147,12 @@ fn expected_cat(desired: &DesiredRuntimeSpec) -> HostLossRecoveryExpectedAssigne
     }
 }
 
-struct BatchFixture {
-    fixture: RecoveryFixture,
+pub(super) struct BatchFixture {
+    pub(super) fixture: RecoveryFixture,
     second_desired: DesiredRuntimeSpec,
     second_operation: cats_api::runtime_reconciliation::Operation,
-    bindings: HostFenceAuthorityBindingsV1,
-    apply: HostLossRecoveryApplyV1,
+    pub(super) bindings: HostFenceAuthorityBindingsV1,
+    pub(super) apply: HostLossRecoveryApplyV1,
 }
 
 fn batch_fixture(slug: &str) -> BatchFixture {
@@ -181,6 +181,20 @@ fn batch_fixture(slug: &str) -> BatchFixture {
         bindings,
         apply,
     }
+}
+
+pub(super) fn active_host_recovery_fixture(slug: &str) -> BatchFixture {
+    let fixture = batch_fixture(slug);
+    fixture
+        .fixture
+        .store
+        .begin_trusted_host_fence_recovery_attempt_v1(
+            &principal(),
+            &fixture.apply,
+            &fixture.bindings,
+        )
+        .unwrap();
+    fixture
 }
 
 fn recovery_binding(fixture: &BatchFixture, fence_attempt_id: Id) -> HostFenceBinding {
@@ -361,12 +375,17 @@ fn two_cat_begin_is_one_sealed_attempt_and_exact_response_loss_replay() {
 fn two_open_writer_parents_reject_before_queue_or_cutoff() {
     let fixture = batch_fixture("host-recovery-two-open-writers");
     // The clean v16 catalog prevents this state. Dropping only the isolated
-    // fixture index characterizes the Store's fail-closed behavior for a
+    // fixture indexes characterizes the Store's fail-closed behavior for a
     // preexisting/corrupt catalog instead of relying on DDL alone.
     fixture
         .fixture
         .store
-        .with(|client| client.batch_execute("DROP INDEX object_write_one_open_authority_per_host"))
+        .with(|client| {
+            client.batch_execute(
+                "DROP INDEX object_write_one_open_authority_per_host;
+                 DROP INDEX node_identity_one_provisioned_per_host;",
+            )
+        })
         .unwrap();
     let mut foreign_scope = fixture.bindings.provider_scope.clone();
     foreign_scope.region = id("foreign-region");
