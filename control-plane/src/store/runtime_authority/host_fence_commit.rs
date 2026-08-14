@@ -29,8 +29,9 @@ use sha2::{Digest, Sha256};
 
 use super::product::HostnameDesiredLookup;
 use super::product_rows::{
-    insert_operation, load_cat_by_id_for_update, load_desired_for_update,
-    load_operation_for_update, load_pending_operation_by_cat_for_update, update_operation,
+    insert_operation, load_assigned_desired_for_update, load_cat_by_id_for_update,
+    load_desired_for_update, load_operation_for_update, load_pending_operation_by_cat_for_update,
+    update_operation,
 };
 use super::rows::{database_now, load_stored_volume_for_update};
 use crate::store::agent_sessions::{
@@ -639,6 +640,12 @@ fn lock_fresh_preconditions(
     }
 
     let expected = &request.expected_current_desired;
+    let assigned = load_assigned_desired_for_update(transaction, &request.expected_old_node_id)?;
+    if assigned.len() != 1 || assigned.first() != Some(expected) {
+        return Err(conflict(
+            "single-Cat Host recovery cannot cover the exact assigned set",
+        ));
+    }
     let cat = load_cat_by_id_for_update(transaction, &expected.cat_id)?
         .ok_or_else(|| corrupt("recovery Desired has no immutable Cat row"))?;
     if cat.workspace_id != expected.workspace_id {

@@ -788,23 +788,41 @@ fn terminal_fence_recovery_commits_once_and_exact_replay_returns_the_receipt() {
 }
 
 #[test]
-fn singular_recovery_can_partially_recover_a_two_cat_node() {
+fn singular_recovery_rejects_a_two_cat_node_without_partial_writes() {
     let fixture = recovery_fixture("host-recovery-two-cat-characterization");
     let second = add_second_recovery_cat(&fixture);
 
-    fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap();
     let error = fixture
         .store
-        .commit_trusted_host_fence_recovery_v1(&second)
+        .commit_trusted_host_fence_recovery_v1(&fixture.request)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
 
     fixture
         .store
         .authority_transaction(|transaction| {
+            assert_eq!(
+                load_desired_for_update(
+                    transaction,
+                    &fixture.request.expected_current_desired.cat_id,
+                )?
+                .unwrap(),
+                fixture.request.expected_current_desired
+            );
+            assert_eq!(
+                load_operation_for_update(
+                    transaction,
+                    &fixture.request.expected_old_operation.operation_id,
+                )?
+                .unwrap(),
+                fixture.request.expected_old_operation
+            );
+            assert!(load_operation_for_update(
+                transaction,
+                &fixture.request.recovery_operation.operation_id,
+            )?
+            .is_none());
             assert_eq!(
                 load_desired_for_update(transaction, &second.expected_current_desired.cat_id)?
                     .unwrap(),
