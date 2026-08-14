@@ -45,10 +45,6 @@ pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
-pub use runtime_authority::host_fence_commit::{
-    TrustedHostFenceRecoveryCommitReceiptV1, TrustedHostFenceRecoveryCommitV1,
-    TrustedTakeoverAuthorizationV1,
-};
 pub use runtime_authority::host_fence_provider_queue::{
     HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
     HostFenceProviderQueueRecordV1, HostFenceProviderQueueStateV1, PgObjectWriteCutoffPort,

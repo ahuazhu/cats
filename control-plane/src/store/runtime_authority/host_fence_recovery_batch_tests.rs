@@ -161,7 +161,7 @@ fn batch_fixture(slug: &str) -> BatchFixture {
     let bindings = authority_bindings(&fixture.old_identity);
     insert_open_writer(&fixture, &bindings);
     let mut expected_assigned = vec![
-        expected_cat(&fixture.request.expected_current_desired),
+        expected_cat(&fixture.current_desired),
         expected_cat(&second.expected_current_desired),
     ];
     expected_assigned.sort_by(|left, right| left.cat_id.as_str().cmp(right.cat_id.as_str()));
@@ -494,12 +494,9 @@ fn terminal_unsafe_attempt_blocks_both_cats_with_zero_recovery_writes() {
         .store
         .authority_transaction(|transaction| {
             assert_eq!(
-                load_desired_for_update(
-                    transaction,
-                    &fixture.fixture.request.expected_current_desired.cat_id,
-                )?
-                .unwrap(),
-                fixture.fixture.request.expected_current_desired
+                load_desired_for_update(transaction, &fixture.fixture.current_desired.cat_id,)?
+                    .unwrap(),
+                fixture.fixture.current_desired
             );
             assert_eq!(
                 load_desired_for_update(transaction, &fixture.second_desired.cat_id)?.unwrap(),
@@ -508,10 +505,10 @@ fn terminal_unsafe_attempt_blocks_both_cats_with_zero_recovery_writes() {
             assert_eq!(
                 load_operation_for_update(
                     transaction,
-                    &fixture.fixture.request.expected_old_operation.operation_id,
+                    &fixture.fixture.expected_old_operation.operation_id,
                 )?
                 .unwrap(),
-                fixture.fixture.request.expected_old_operation
+                fixture.fixture.expected_old_operation
             );
             assert_eq!(
                 load_operation_for_update(transaction, &fixture.second_operation.operation_id)?
@@ -526,7 +523,7 @@ fn terminal_unsafe_attempt_blocks_both_cats_with_zero_recovery_writes() {
             Ok(())
         })
         .unwrap();
-    let authority_counts: (i64, i64, i64, String, i64) = fixture
+    let authority_counts: (i64, i64, String, i64) = fixture
         .fixture
         .store
         .with(|client| {
@@ -535,15 +532,14 @@ fn terminal_unsafe_attempt_blocks_both_cats_with_zero_recovery_writes() {
                     "SELECT
                         (SELECT count(*) FROM host_fence_events),
                         (SELECT count(*) FROM volume_authorizations),
-                        (SELECT count(*) FROM trusted_host_fence_recovery_commits_v1),
                         (SELECT state FROM node_identities WHERE node_id=$1),
                         (SELECT count(*) FROM current_agent_sessions WHERE node_id=$1)",
                     &[&fixture.fixture.old_identity.node_id.as_str()],
                 )
-                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         })
         .unwrap();
-    assert_eq!(authority_counts, (0, 0, 0, "provisioned".into(), 1));
+    assert_eq!(authority_counts, (0, 0, "provisioned".into(), 1));
 
     let exact_apply_replay = fixture
         .fixture

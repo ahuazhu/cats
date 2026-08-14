@@ -1,49 +1,24 @@
 use cats_api::agent_registration::AuthenticatedNodeCredential;
-use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    encode_desired_runtime_spec, guest_config_digest, spec_digest, AgentRegistrationAttempt,
-    AgentSession, AsciiText, AssignedKind, AssignedPlacement, AuthorizationRecord,
-    AuthorizationState, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind, Epoch,
-    FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt, Id, Ipv4Address,
-    IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
-    NormalAcquireRequest, Operation, OperationFailure, OperationPhase, OperationTerminal,
-    ProviderScope, RandomId128, RemoteHead, Revision, RuntimeConfig, RuntimeTarget,
-    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState,
-    VolumeAuthorization, VolumeDisposition, VolumeDurability, VolumeIntent, VolumeRecord,
-    VolumeTakeoverAuthorization, WireU64,
+    guest_config_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AsciiText,
+    AssignedKind, AssignedPlacement, ContractVersion, CredentialBinding, DesiredRuntimeSpec,
+    DiskKind, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt, Id,
+    Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeBootId, NodeIdentity,
+    NodeIdentityState, NormalAcquireRequest, Operation, OperationPhase, ProviderScope, RandomId128,
+    RemoteHead, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest,
+    UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeDisposition, VolumeDurability,
+    VolumeIntent, VolumeRecord,
 };
 use cats_storage::authority::{normal_acquire, VolumeOwnerBinding};
-use cats_storage::host_fence::{
-    host_fence_effect_token, host_fence_provider_attempt_id, HostExecutionCutoffEvidence,
-    HostFenceBinding, HostFenceProviderEvidence, ObjectWriteCutoffEvidence,
-    ObjectWriterFenceTarget, QuarantinedNetworkInterfaceEvidence, WorkloadNetworkCutoffEvidence,
-    HOST_FENCE_PROVIDER_EVIDENCE_VERSION,
-};
-use cats_storage::trusted_host_fence::{trusted_host_fence_event_v1, TrustedHostFenceEventV1};
 
-use super::host_fence_commit::{TrustedHostFenceRecoveryCommitV1, TrustedTakeoverAuthorizationV1};
 use super::product::CatRecord;
-use super::product_rows::{
-    insert_cat, insert_desired, insert_operation, load_desired_for_update,
-    load_operation_for_update, update_operation,
-};
-use super::rows::{
-    database_now, insert_volume, load_authorization_for_update, load_stored_volume_for_update,
-    update_volume, update_volume_owner,
-};
-use crate::store::agent_sessions::{
-    load_current_session_for_update, load_identity_by_node_for_update,
-    lock_exact_credential_lineage, AgentRegistrationOutcome, AgentSessionRegistrationPolicy,
-    CredentialLineageState,
-};
+use super::product_rows::{insert_cat, insert_desired, insert_operation};
+use super::rows::{database_now, insert_volume, update_volume_owner};
+use crate::store::agent_sessions::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy};
 use crate::store::Store;
 
 fn id(value: impl Into<String>) -> Id {
     Id::new(value).unwrap()
-}
-
-fn text(value: &str) -> AsciiText {
-    AsciiText::new(value).unwrap()
 }
 
 fn random_id(value: u128) -> RandomId128 {
@@ -139,131 +114,6 @@ fn register_old_session(store: &Store, identity: &NodeIdentity) -> AgentSession 
     }
 }
 
-fn framed(values: &[&[u8]]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for value in values {
-        bytes.extend_from_slice(&u64::try_from(value.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(value);
-    }
-    bytes
-}
-
-fn terminal_event(
-    old_identity: &NodeIdentity,
-    session: &AgentSession,
-    committed_at: UnixMillis,
-) -> TrustedHostFenceEventV1 {
-    let binding = HostFenceBinding {
-        provider_scope: old_identity.provider_scope.clone(),
-        immutable_host_id: old_identity.immutable_host_id.clone(),
-        node_id: old_identity.node_id.clone(),
-        expected_node_boot_id: session.node_boot_id.clone(),
-        expected_agent_session_epoch: session.agent_session_epoch,
-        fence_attempt_id: id("fence-attempt-1"),
-    };
-    let writer = ObjectWriterFenceTarget {
-        writer_authority_id: id("writer-authority-1"),
-        provider_scope: old_identity.provider_scope.clone(),
-        workload_principal_id: text("workload-principal-1"),
-        object_store_scope_id: text("object-store-scope-1"),
-    };
-    let object_target = framed(&[
-        writer.writer_authority_id.as_str().as_bytes(),
-        writer.provider_scope.provider.as_str().as_bytes(),
-        writer.provider_scope.partition.as_str().as_bytes(),
-        writer.provider_scope.account_id.as_str().as_bytes(),
-        writer.provider_scope.region.as_str().as_bytes(),
-        writer.workload_principal_id.as_str().as_bytes(),
-        writer.object_store_scope_id.as_str().as_bytes(),
-    ]);
-    let boundary = text("quarantine-boundary-1");
-    let interface_id = id("interface-1");
-    let evidence = HostFenceProviderEvidence {
-        version: HOST_FENCE_PROVIDER_EVIDENCE_VERSION,
-        binding: binding.clone(),
-        object_write_cutoff:
-            ObjectWriteCutoffEvidence::PrincipalCutoffWithAcceptedPutTerminalBarrier {
-                binding: binding.clone(),
-                object_writer: writer,
-                effect_token: host_fence_effect_token(
-                    &binding,
-                    b"object-write-cutoff",
-                    &object_target,
-                )
-                .unwrap(),
-                provider_attempt_id: host_fence_provider_attempt_id(
-                    &binding,
-                    b"object-write-cutoff",
-                    &object_target,
-                )
-                .unwrap(),
-                cutoff_receipt_id: text("cutoff-receipt-1"),
-                cutoff_effective_at_unix_ms: before(committed_at, 40),
-                cutoff_sequence: WireU64::new(4).unwrap(),
-                accepted_put_terminal_receipt_id: text("terminal-receipt-1"),
-                accepted_puts_terminal_at_unix_ms: before(committed_at, 30),
-                terminal_sequence: WireU64::new(4).unwrap(),
-                terminal_prefix_sha256: Sha256Digest::from_bytes([4; 32]),
-                successful_put_visibility_receipt_id: text("visibility-receipt-1"),
-                successful_puts_visible_at_unix_ms: before(committed_at, 20),
-            },
-        execution_cutoff: HostExecutionCutoffEvidence::HostDestroyed {
-            immutable_host_id: binding.immutable_host_id.clone(),
-            effect_token: host_fence_effect_token(
-                &binding,
-                b"host-execution-cutoff",
-                binding.immutable_host_id.as_str().as_bytes(),
-            )
-            .unwrap(),
-            provider_attempt_id: host_fence_provider_attempt_id(
-                &binding,
-                b"host-execution-cutoff",
-                binding.immutable_host_id.as_str().as_bytes(),
-            )
-            .unwrap(),
-            authoritative_observation_id: text("execution-observation-1"),
-            observed_at_unix_ms: before(committed_at, 10),
-        },
-        network_cutoff: WorkloadNetworkCutoffEvidence::WorkloadInterfacesQuarantined {
-            immutable_host_id: binding.immutable_host_id.clone(),
-            quarantine_policy_id: id(boundary.as_str()),
-            boundary_effect_token: host_fence_effect_token(
-                &binding,
-                b"network-boundary-cutoff",
-                boundary.as_str().as_bytes(),
-            )
-            .unwrap(),
-            boundary_provider_attempt_id: host_fence_provider_attempt_id(
-                &binding,
-                b"network-boundary-cutoff",
-                boundary.as_str().as_bytes(),
-            )
-            .unwrap(),
-            policy_observation_id: text("policy-observation-1"),
-            policy_observed_at_unix_ms: before(committed_at, 10),
-            interfaces: vec![QuarantinedNetworkInterfaceEvidence {
-                interface_id: interface_id.clone(),
-                effect_token: host_fence_effect_token(
-                    &binding,
-                    b"network-interface-cutoff",
-                    interface_id.as_str().as_bytes(),
-                )
-                .unwrap(),
-                provider_attempt_id: host_fence_provider_attempt_id(
-                    &binding,
-                    b"network-interface-cutoff",
-                    interface_id.as_str().as_bytes(),
-                )
-                .unwrap(),
-            }],
-            authoritative_observation_id: text("network-observation-1"),
-            observed_at_unix_ms: before(committed_at, 10),
-        },
-        completed_at_unix_ms: before(committed_at, 10),
-    };
-    trusted_host_fence_event_v1(evidence, committed_at).unwrap()
-}
-
 fn blank_head() -> RemoteHead {
     RemoteHead {
         generation: generation(0),
@@ -333,10 +183,16 @@ fn desired(
 
 pub(super) struct RecoveryFixture {
     pub(super) store: Store,
-    pub(super) request: TrustedHostFenceRecoveryCommitV1,
+    pub(super) current_desired: DesiredRuntimeSpec,
+    pub(super) expected_old_operation: Operation,
     pub(super) current_volume: VolumeRecord,
     pub(super) old_identity: NodeIdentity,
     pub(super) old_session: AgentSession,
+}
+
+pub(super) struct RecoveryCatFixture {
+    pub(super) expected_current_desired: DesiredRuntimeSpec,
+    pub(super) expected_old_operation: Operation,
 }
 
 pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
@@ -378,36 +234,6 @@ pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
         &current_volume,
         &transition_id,
     );
-    let event = terminal_event(&old_identity, &session, now);
-    let authorization_id = id("takeover-authorization-1");
-    let new_attachment_id = id("attachment-new");
-    let mut replacement_desired = current_desired.clone();
-    replacement_desired.desired_revision = revision(2);
-    replacement_desired.placement.node_id = new_identity.node_id.clone();
-    replacement_desired.placement.placement_epoch = epoch(2);
-    replacement_desired.volumes[0].attachment_id = new_attachment_id.clone();
-    replacement_desired.volumes[0].acquire = VolumeAcquire::Takeover {
-        authorization_id: authorization_id.clone(),
-    };
-    replacement_desired.spec_digest = spec_digest(&replacement_desired).unwrap();
-
-    let authorization = AuthorizationRecord {
-        authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
-            authorization_id,
-            authorized_node_id: new_identity.node_id.clone(),
-            host_fence_event_id: event.event_id.clone(),
-            volume_id: current_volume.volume_id.clone(),
-            expected_attachment_id: current_volume.lease_owner.clone().unwrap(),
-            expected_epoch: current_volume.lease_epoch,
-            expected_head: current_volume.head.clone(),
-            new_attachment_id,
-            desired_revision: replacement_desired.desired_revision,
-            new_placement_epoch: replacement_desired.placement.placement_epoch,
-            lease_duration_ms: 60_000,
-            not_after: time(now.get().checked_add(60_000).unwrap()),
-        }),
-        state: AuthorizationState::Unconsumed,
-    };
     let operation_created = before(now, 1);
     let expected_old_operation = Operation {
         version: ContractVersion::V1,
@@ -422,31 +248,6 @@ pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
         terminal: None,
         created_at_unix_ms: operation_created,
         updated_at_unix_ms: operation_created,
-    };
-    let mut settled_old_operation = expected_old_operation.clone();
-    settled_old_operation.phase = OperationPhase::Failed;
-    settled_old_operation.terminal = Some(OperationTerminal::Failed {
-        error: Box::new(OperationFailure::HostLost {
-            node_id: old_identity.node_id.clone(),
-            agent_session_epoch: session.agent_session_epoch,
-            host_fence_event_id: event.event_id.clone(),
-        }),
-        completed_at_unix_ms: now,
-    });
-    settled_old_operation.updated_at_unix_ms = now;
-    let recovery_operation = Operation {
-        version: ContractVersion::V1,
-        operation_id: id("operation-recovery"),
-        workspace_id: workspace_id.clone(),
-        cat_id: replacement_desired.cat_id.clone(),
-        desired_revision: replacement_desired.desired_revision,
-        desired_spec_digest: replacement_desired.spec_digest.clone(),
-        placement: replacement_desired.placement.clone(),
-        target: replacement_desired.target,
-        phase: OperationPhase::Pending,
-        terminal: None,
-        created_at_unix_ms: now,
-        updated_at_unix_ms: now,
     };
 
     store
@@ -478,30 +279,15 @@ pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
 
     RecoveryFixture {
         store,
-        request: TrustedHostFenceRecoveryCommitV1 {
-            terminal_event: event,
-            expected_old_node_id: old_identity.node_id.clone(),
-            expected_old_node_boot_id: session.node_boot_id.clone(),
-            expected_old_agent_session_epoch: session.agent_session_epoch,
-            expected_current_desired: current_desired,
-            takeover_authorizations: vec![TrustedTakeoverAuthorizationV1 {
-                expected_current_volume: current_volume.clone(),
-                authorization,
-            }],
-            replacement_desired,
-            expected_old_operation,
-            settled_old_operation,
-            recovery_operation,
-        },
+        current_desired,
+        expected_old_operation,
         current_volume,
         old_identity,
         old_session: session,
     }
 }
 
-pub(super) fn add_second_recovery_cat(
-    fixture: &RecoveryFixture,
-) -> TrustedHostFenceRecoveryCommitV1 {
+pub(super) fn add_second_recovery_cat(fixture: &RecoveryFixture) -> RecoveryCatFixture {
     let now = fixture.store.authority_transaction(database_now).unwrap();
     let mut blank = fixture.current_volume.clone();
     blank.volume_id = id("volume-root-second");
@@ -523,7 +309,7 @@ pub(super) fn add_second_recovery_cat(
     };
     let (current_volume, _) = normal_acquire(&blank, &normal_request, before(now, 1)).unwrap();
 
-    let mut current_desired = fixture.request.expected_current_desired.clone();
+    let mut current_desired = fixture.current_desired.clone();
     current_desired.cat_id = id("cat-host-recovery-second");
     current_desired.volumes[0].volume_intent_id = id("intent-root-second");
     current_desired.volumes[0].disk_id = id("disk-root-second");
@@ -536,54 +322,10 @@ pub(super) fn add_second_recovery_cat(
     };
     current_desired.spec_digest = spec_digest(&current_desired).unwrap();
 
-    let mut replacement_desired = current_desired.clone();
-    replacement_desired.desired_revision = revision(2);
-    replacement_desired.placement = fixture.request.replacement_desired.placement.clone();
-    replacement_desired.volumes[0].attachment_id = id("attachment-new-second");
-    replacement_desired.volumes[0].acquire = VolumeAcquire::Takeover {
-        authorization_id: id("takeover-authorization-second"),
-    };
-    replacement_desired.spec_digest = spec_digest(&replacement_desired).unwrap();
-
-    let authorization = AuthorizationRecord {
-        authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
-            authorization_id: id("takeover-authorization-second"),
-            authorized_node_id: replacement_desired.placement.node_id.clone(),
-            host_fence_event_id: fixture.request.terminal_event.event_id.clone(),
-            volume_id: current_volume.volume_id.clone(),
-            expected_attachment_id: current_volume.lease_owner.clone().unwrap(),
-            expected_epoch: current_volume.lease_epoch,
-            expected_head: current_volume.head.clone(),
-            new_attachment_id: replacement_desired.volumes[0].attachment_id.clone(),
-            desired_revision: replacement_desired.desired_revision,
-            new_placement_epoch: replacement_desired.placement.placement_epoch,
-            lease_duration_ms: 60_000,
-            not_after: time(now.get().checked_add(60_000).unwrap()),
-        }),
-        state: AuthorizationState::Unconsumed,
-    };
-
-    let mut expected_old_operation = fixture.request.expected_old_operation.clone();
+    let mut expected_old_operation = fixture.expected_old_operation.clone();
     expected_old_operation.operation_id = id("operation-old-second");
     expected_old_operation.cat_id = current_desired.cat_id.clone();
     expected_old_operation.desired_spec_digest = current_desired.spec_digest.clone();
-
-    let mut settled_old_operation = expected_old_operation.clone();
-    settled_old_operation.phase = OperationPhase::Failed;
-    settled_old_operation.terminal = Some(OperationTerminal::Failed {
-        error: Box::new(OperationFailure::HostLost {
-            node_id: fixture.old_identity.node_id.clone(),
-            agent_session_epoch: fixture.old_session.agent_session_epoch,
-            host_fence_event_id: fixture.request.terminal_event.event_id.clone(),
-        }),
-        completed_at_unix_ms: now,
-    });
-    settled_old_operation.updated_at_unix_ms = now;
-
-    let mut recovery_operation = fixture.request.recovery_operation.clone();
-    recovery_operation.operation_id = id("operation-recovery-second");
-    recovery_operation.cat_id = replacement_desired.cat_id.clone();
-    recovery_operation.desired_spec_digest = replacement_desired.spec_digest.clone();
 
     fixture
         .store
@@ -613,419 +355,23 @@ pub(super) fn add_second_recovery_cat(
         })
         .unwrap();
 
-    TrustedHostFenceRecoveryCommitV1 {
-        terminal_event: fixture.request.terminal_event.clone(),
-        expected_old_node_id: fixture.request.expected_old_node_id.clone(),
-        expected_old_node_boot_id: fixture.request.expected_old_node_boot_id.clone(),
-        expected_old_agent_session_epoch: fixture.request.expected_old_agent_session_epoch,
+    RecoveryCatFixture {
         expected_current_desired: current_desired,
-        takeover_authorizations: vec![TrustedTakeoverAuthorizationV1 {
-            expected_current_volume: current_volume,
-            authorization,
-        }],
-        replacement_desired,
         expected_old_operation,
-        settled_old_operation,
-        recovery_operation,
     }
 }
 
-fn output_counts(store: &Store) -> (i64, i64, i64) {
-    store
-        .with(|client| {
-            client
-                .query_one(
-                    "SELECT
-                        (SELECT count(*) FROM host_fence_events WHERE state='terminal_v1'),
-                        (SELECT count(*) FROM volume_authorizations WHERE kind='takeover'),
-                        (SELECT count(*) FROM trusted_host_fence_recovery_commits_v1)",
-                    &[],
-                )
-                .map(|row| (row.get(0), row.get(1), row.get(2)))
-        })
-        .unwrap()
-}
-
-fn assert_no_recovery_writes(fixture: &RecoveryFixture) {
-    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
-    fixture
-        .store
-        .authority_transaction(|transaction| {
-            assert_eq!(
-                load_desired_for_update(
-                    transaction,
-                    &fixture.request.expected_current_desired.cat_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_current_desired
-            );
-            assert_eq!(
-                load_operation_for_update(
-                    transaction,
-                    &fixture.request.expected_old_operation.operation_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_old_operation
-            );
-            assert!(load_operation_for_update(
-                transaction,
-                &fixture.request.recovery_operation.operation_id,
-            )?
-            .is_none());
-            Ok(())
-        })
-        .unwrap();
+fn singular_shape_covers_complete_assigned_set(singular_cat: &Id, assigned: &[Id]) -> bool {
+    assigned.len() == 1 && assigned.first() == Some(singular_cat)
 }
 
 #[test]
-fn terminal_fence_recovery_commits_once_and_exact_replay_returns_the_receipt() {
-    let fixture = recovery_fixture("host-recovery-success");
-    let first = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap();
-    let replay = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap();
-    assert_eq!(replay, first);
-    assert_eq!(output_counts(&fixture.store), (1, 1, 1));
-
-    let mut conflicting_replay = fixture.request.clone();
-    conflicting_replay.recovery_operation.operation_id = id("operation-recovery-other");
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&conflicting_replay)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(output_counts(&fixture.store), (1, 1, 1));
-
-    fixture
-        .store
-        .authority_transaction(|transaction| {
-            let retired = load_identity_by_node_for_update(
-                transaction,
-                &fixture.request.expected_old_node_id,
-            )?
-            .unwrap();
-            assert_eq!(retired.state, NodeIdentityState::Retired);
-            assert_eq!(
-                lock_exact_credential_lineage(transaction, &retired)?,
-                Some(CredentialLineageState::Retired)
-            );
-            assert!(load_current_session_for_update(
-                transaction,
-                &fixture.request.expected_old_node_id,
-            )?
-            .is_none());
-            Ok(())
-        })
-        .unwrap();
-
-    fixture
-        .store
-        .authority_transaction(|transaction| {
-            let desired =
-                load_desired_for_update(transaction, &fixture.request.replacement_desired.cat_id)?
-                    .unwrap();
-            let old_operation = load_operation_for_update(
-                transaction,
-                &fixture.request.expected_old_operation.operation_id,
-            )?
-            .unwrap();
-            let recovery_operation = load_operation_for_update(
-                transaction,
-                &fixture.request.recovery_operation.operation_id,
-            )?
-            .unwrap();
-            let authorization = load_authorization_for_update(
-                transaction,
-                &match &fixture.request.takeover_authorizations[0]
-                    .authorization
-                    .authorization
-                {
-                    VolumeAuthorization::Takeover(value) => value.authorization_id.clone(),
-                    VolumeAuthorization::DisposableRootDelete(_) => unreachable!(),
-                },
-            )?
-            .unwrap();
-            let volume =
-                load_stored_volume_for_update(transaction, &fixture.current_volume.volume_id)?
-                    .unwrap();
-            assert_eq!(desired, fixture.request.replacement_desired);
-            assert_eq!(old_operation, fixture.request.settled_old_operation);
-            assert_eq!(recovery_operation, fixture.request.recovery_operation);
-            assert_eq!(
-                authorization,
-                fixture.request.takeover_authorizations[0].authorization
-            );
-            assert_eq!(volume.record, fixture.current_volume);
-            assert_eq!(
-                volume.owner_binding.unwrap().owner_node_id,
-                fixture.request.expected_old_node_id
-            );
-            Ok(())
-        })
-        .unwrap();
-
-    let rejoin = fixture.store.with(|client| {
-        client.execute(
-            "UPDATE host_fence_events SET state='rejoined' WHERE event_id=$1",
-            &[&fixture.request.terminal_event.event_id.as_str()],
-        )
-    });
-    assert_eq!(rejoin.unwrap_err().code, ErrorCode::Conflict);
-    let state: String = fixture
-        .store
-        .with(|client| {
-            client
-                .query_one(
-                    "SELECT state FROM host_fence_events WHERE event_id=$1",
-                    &[&fixture.request.terminal_event.event_id.as_str()],
-                )
-                .map(|row| row.get(0))
-        })
-        .unwrap();
-    assert_eq!(state, "terminal_v1");
-}
-
-#[test]
-fn singular_recovery_rejects_a_two_cat_node_without_partial_writes() {
-    let fixture = recovery_fixture("host-recovery-two-cat-characterization");
-    let second = add_second_recovery_cat(&fixture);
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
-
-    fixture
-        .store
-        .authority_transaction(|transaction| {
-            assert_eq!(
-                load_desired_for_update(
-                    transaction,
-                    &fixture.request.expected_current_desired.cat_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_current_desired
-            );
-            assert_eq!(
-                load_operation_for_update(
-                    transaction,
-                    &fixture.request.expected_old_operation.operation_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_old_operation
-            );
-            assert!(load_operation_for_update(
-                transaction,
-                &fixture.request.recovery_operation.operation_id,
-            )?
-            .is_none());
-            assert_eq!(
-                load_desired_for_update(transaction, &second.expected_current_desired.cat_id)?
-                    .unwrap(),
-                second.expected_current_desired
-            );
-            assert_eq!(
-                load_operation_for_update(
-                    transaction,
-                    &second.expected_old_operation.operation_id
-                )?
-                .unwrap(),
-                second.expected_old_operation
-            );
-            assert!(load_operation_for_update(
-                transaction,
-                &second.recovery_operation.operation_id,
-            )?
-            .is_none());
-            Ok(())
-        })
-        .unwrap();
-}
-
-#[test]
-fn stale_node_owner_binding_rejects_the_whole_recovery_without_side_effects() {
-    let fixture = recovery_fixture("host-recovery-stale-owner");
-    fixture
-        .store
-        .authority_transaction(|transaction| {
-            update_volume_owner(
-                transaction,
-                &fixture.current_volume,
-                Some(&VolumeOwnerBinding {
-                    volume_id: fixture.current_volume.volume_id.clone(),
-                    owner_node_id: id("node-foreign"),
-                    attachment_id: fixture.current_volume.lease_owner.clone().unwrap(),
-                    attachment_epoch: fixture.current_volume.lease_epoch,
-                }),
-            )
-        })
-        .unwrap();
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_no_recovery_writes(&fixture);
-}
-
-#[test]
-fn replaced_source_session_rejects_the_whole_recovery_without_side_effects() {
-    let fixture = recovery_fixture("host-recovery-stale-session");
-    let authenticated = AuthenticatedNodeCredential::new(
-        fixture.old_identity.credential_id.clone(),
-        fixture.old_identity.credential_binding.clone(),
-    );
-    let policy = AgentSessionRegistrationPolicy::from_release_receipt(&runtime_release()).unwrap();
-    let replacement_attempt = AgentRegistrationAttempt {
-        version: ContractVersion::V1,
-        node_id: fixture.old_identity.node_id.clone(),
-        immutable_host_id: fixture.old_identity.immutable_host_id.clone(),
-        node_boot_id: boot_id(4),
-        agent_instance_id: random_id(5),
-        registration_attempt_id: random_id(6),
-        guest_config_digest: policy.approved_guest_config_digest().clone(),
-        expected_agent_session_epoch: Some(fixture.old_session.agent_session_epoch),
-    };
-    let AgentRegistrationOutcome::Registered(replacement_session) = fixture
-        .store
-        .register_agent_session(&authenticated, &replacement_attempt, &policy)
-        .unwrap()
-    else {
-        panic!("replacement source session was rejected")
-    };
-    assert!(replacement_session.agent_session_epoch > fixture.old_session.agent_session_epoch);
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_no_recovery_writes(&fixture);
-}
-
-#[test]
-fn retired_source_identity_rejects_the_whole_recovery_without_side_effects() {
-    let fixture = recovery_fixture("host-recovery-stale-identity");
-    fixture
-        .store
-        .retire_node_identity(&fixture.old_identity.node_id)
-        .unwrap();
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_no_recovery_writes(&fixture);
-}
-
-#[test]
-fn stale_head_desired_or_operation_rejects_without_recovery_writes() {
-    for drift in ["head", "desired", "operation"] {
-        let fixture = recovery_fixture(&format!("host-recovery-stale-{drift}"));
-        match drift {
-            "head" => {
-                let mut advanced = fixture.current_volume.clone();
-                advanced.head = RemoteHead {
-                    generation: generation(1),
-                    root_hash: Some(Sha256Digest::from_bytes([41; 32])),
-                    root_object_id: Some(text("roots/1")),
-                };
-                fixture
-                    .store
-                    .authority_transaction(|transaction| update_volume(transaction, &advanced))
-                    .unwrap();
-            }
-            "desired" => {
-                let desired = &fixture.request.replacement_desired;
-                let json =
-                    String::from_utf8(encode_desired_runtime_spec(desired).unwrap()).unwrap();
-                let changed = fixture
-                    .store
-                    .with(|client| {
-                        client.execute(
-                            "UPDATE desired_runtime_specs SET
-                                record=$2::TEXT::jsonb, desired_revision=$3,
-                                spec_digest=$4, node_id=$5, placement_epoch=$6
-                              WHERE cat_id=$1",
-                            &[
-                                &desired.cat_id.as_str(),
-                                &json,
-                                &i64::try_from(desired.desired_revision.get()).unwrap(),
-                                &desired.spec_digest.as_str(),
-                                &desired.placement.node_id.as_str(),
-                                &i64::try_from(desired.placement.placement_epoch.get()).unwrap(),
-                            ],
-                        )
-                    })
-                    .unwrap();
-                assert_eq!(changed, 1);
-            }
-            "operation" => {
-                let mut changed = fixture.request.expected_old_operation.clone();
-                changed.updated_at_unix_ms =
-                    time(changed.updated_at_unix_ms.get().checked_add(1).unwrap());
-                fixture
-                    .store
-                    .authority_transaction(|transaction| update_operation(transaction, &changed))
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
-
-        let error = fixture
-            .store
-            .commit_trusted_host_fence_recovery_v1(&fixture.request)
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Conflict, "wrong result for {drift}");
-        assert_eq!(output_counts(&fixture.store), (0, 0, 0));
-    }
-}
-
-#[test]
-fn already_expired_takeover_deadline_rejects_before_any_recovery_write() {
-    let mut fixture = recovery_fixture("host-recovery-expired-authorization");
-    let VolumeAuthorization::Takeover(authorization) = &mut fixture.request.takeover_authorizations
-        [0]
-    .authorization
-    .authorization
-    else {
-        unreachable!()
-    };
-    authorization.not_after = fixture.request.terminal_event.committed_at_unix_ms;
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
-    assert_no_recovery_writes(&fixture);
-}
-
-#[test]
-fn provisional_object_cutoff_is_rejected_before_any_authority_row_is_written() {
-    let mut fixture = recovery_fixture("host-recovery-provisional");
-    let ObjectWriteCutoffEvidence::PrincipalCutoffWithAcceptedPutTerminalBarrier {
-        terminal_sequence,
-        ..
-    } = &mut fixture
-        .request
-        .terminal_event
-        .provider_evidence
-        .object_write_cutoff;
-    *terminal_sequence = WireU64::new(3).unwrap();
-
-    let error = fixture
-        .store
-        .commit_trusted_host_fence_recovery_v1(&fixture.request)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::FailedPrecondition);
-    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
+fn singular_recovery_shape_cannot_cover_a_two_cat_host() {
+    // This is deliberately a pure structural characterization. There is no
+    // singular production request type, decoder, Store writer, or DDL table.
+    let first = id("cat-first");
+    let assigned = vec![first.clone(), id("cat-second")];
+    assert!(!singular_shape_covers_complete_assigned_set(
+        &first, &assigned
+    ));
 }

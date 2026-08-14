@@ -909,7 +909,6 @@ const CONTROL_TABLES: &[&str] = &[
     "desired_runtime_specs",
     "hostname_desired_lookups",
     "runtime_operations",
-    "trusted_host_fence_recovery_commits_v1",
     "host_fence_provider_queue_v1",
     "trusted_host_fence_recovery_attempts_v1",
     "trusted_host_fence_recovery_attempt_cats_v1",
@@ -2304,11 +2303,6 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             desired_spec_digest, node_id, placement_epoch, target, phase,
             terminal_kind, created_at, updated_at
        FROM runtime_operations WHERE FALSE",
-    "SELECT event_id, event_state, record, canonical_record, request_sha256, old_node_id,
-            old_node_boot_id, old_agent_session_epoch, cat_id,
-            expected_desired_revision, replacement_desired_revision,
-            old_operation_id, recovery_operation_id, committed_at
-       FROM trusted_host_fence_recovery_commits_v1 WHERE FALSE",
     "SELECT fence_attempt_id, request_bytes, request_sha256,
             provider, host_partition, host_account_id, host_region,
             immutable_host_id, node_id, expected_node_boot_id,
@@ -3845,40 +3839,6 @@ ON runtime_operations(
         (record->>'workspace_id') COLLATE \"C\"
     AND operation_id COLLATE \"C\" IS DISTINCT FROM
         (record->>'operation_id') COLLATE \"C\";
-CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_commits_v1 (
-    event_id TEXT PRIMARY KEY,
-    event_state TEXT NOT NULL DEFAULT 'terminal_v1'
-        CHECK (event_state = 'terminal_v1'),
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
-    canonical_record BYTEA NOT NULL
-        CHECK (octet_length(canonical_record) BETWEEN 2 AND 8388608),
-    request_sha256 TEXT NOT NULL
-        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    old_node_id TEXT NOT NULL,
-    old_node_boot_id TEXT NOT NULL,
-    old_agent_session_epoch BIGINT NOT NULL CHECK (old_agent_session_epoch > 0),
-    cat_id TEXT NOT NULL,
-    expected_desired_revision BIGINT NOT NULL CHECK (expected_desired_revision > 0),
-    replacement_desired_revision BIGINT NOT NULL
-        CHECK (replacement_desired_revision > expected_desired_revision),
-    old_operation_id TEXT NOT NULL UNIQUE,
-    recovery_operation_id TEXT NOT NULL UNIQUE,
-    committed_at BIGINT NOT NULL CHECK (committed_at >= 0),
-    UNIQUE (cat_id, expected_desired_revision),
-    UNIQUE (cat_id, replacement_desired_revision),
-    FOREIGN KEY (event_id, event_state)
-        REFERENCES host_fence_events(event_id, state)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    FOREIGN KEY (cat_id)
-        REFERENCES desired_runtime_specs(cat_id)
-        DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (old_operation_id)
-        REFERENCES runtime_operations(operation_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    FOREIGN KEY (recovery_operation_id)
-        REFERENCES runtime_operations(operation_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT
-);
 CREATE TABLE IF NOT EXISTS api_idempotency_results (
     authenticated_workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     canonical_route TEXT NOT NULL CHECK (
