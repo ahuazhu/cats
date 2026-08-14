@@ -1305,8 +1305,15 @@ dependencies = [
  "cats-object-store-file",
  "cats-storage",
  "clap",
+ "futures-util",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing-subscriber",
 ]
 
