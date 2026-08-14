@@ -28,6 +28,13 @@ USAGE_TERMINAL_VERIFIER = Path(
 )
 USAGE_TERMINAL_REQUEST_FILE = "usage-target-terminal-request.json"
 USAGE_TERMINAL_RECEIPT_FILE = "usage-target-terminal-receipt.json"
+USAGE_TERMINAL_TARGETS_FILE = "usage-terminal-targets.json"
+USAGE_GLOBAL_FINALIZATION_FILE = (
+    "usage-global-terminal-finalization.manifest.json"
+)
+USAGE_GLOBAL_FINALIZATION_KIND = (
+    "cats.usage-global-terminal-finalization.v1"
+)
 USAGE_TERMINAL_VERIFICATION_FILE = (
     "usage-target-terminal-verification.receipt.json"
 )
@@ -38,6 +45,42 @@ USAGE_TERMINAL_SUCCESS_STDOUT = "Usage terminal receipt verified\n"
 QUALIFICATION_BEGIN_KIND = "cats.production-mutation-qualification-begin-receipt.v1"
 QUALIFICATION_TERMINAL_KIND = (
     "cats.production-mutation-qualification-terminal-receipt.v1"
+)
+QUALIFICATION_BEGIN_FILE = (
+    "production-mutation-qualification-begin.receipt.json"
+)
+QUALIFICATION_TERMINAL_FILE = (
+    "production-mutation-qualification-terminal.receipt.json"
+)
+QUALIFICATION_BEGIN_PENDING_FILE = (
+    "production-mutation-qualification-begin.pending.json"
+)
+QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-begin.command-receipt.json"
+)
+QUALIFICATION_CLOSE_PENDING_FILE = (
+    "production-mutation-qualification-close.pending.json"
+)
+QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-close.command-receipt.json"
+)
+QUALIFICATION_FINAL_STATE_FILE = (
+    "production-mutation-qualification-final-admission-state.json"
+)
+QUALIFICATION_FINAL_FLEET_FILE = (
+    "production-mutation-qualification-final-fleet-closed.receipt.json"
+)
+QUALIFICATION_CLEANUP_INVENTORY_FILE = (
+    "production-mutation-qualification-cleanup-inventory.receipt.json"
+)
+QUALIFICATION_FINAL_FLEET_KIND = (
+    "cats.production-mutation-qualification-final-fleet-closed.v1"
+)
+QUALIFICATION_CLEANUP_INVENTORY_KIND = (
+    "cats.production-mutation-qualification-cleanup-inventory.v1"
+)
+USAGE_SOURCE_TERMINAL_SET_KIND = (
+    "cats.usage-source-terminal-receipts.v1"
 )
 MAX_PROOF_SET_BYTES = 2 * 1024 * 1024
 MAX_PROOF_FILE_BYTES = 16 * 1024 * 1024
@@ -77,6 +120,29 @@ PROOF_SET_FIELDS = {
     "old",
     "fresh",
     "proofs",
+}
+QUALIFICATION_BINDING_FIELDS = {
+    "qualification_id",
+    "deployment_id",
+    "release_id",
+    "source_commit_sha",
+    "control_schema_version",
+    "source_manifest_sha256",
+    "source_bundle_sha256",
+    "build_receipt_sha256",
+    "release_manifest_sha256",
+    "worker_bundle_sha256",
+    "qualification_catalog_sha256",
+    "qualification_cell_manifest_sha256",
+    "aws_partition",
+    "aws_account_id",
+    "aws_region",
+    "cell_id",
+    "cell_namespace",
+    "cats_account_id",
+    "workspace_id",
+    "allowed_mutation_classes",
+    "qualification_expires_at_unix_ms",
 }
 
 
@@ -309,6 +375,7 @@ class ProofDirectory:
 
 @dataclasses.dataclass(frozen=True)
 class ProducerContext:
+    release_id: str
     release_commit: str
     release_manifest_sha256: str
     worker_bundle_sha256: str
@@ -317,6 +384,20 @@ class ProducerContext:
     qualification_catalog_sha256: str
     old_targets: dict[str, Any]
     fresh_targets: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class QualifiedRun:
+    block_path: str
+    run_id: str
+    workspace_id: str
+    manifest_sha256: str
+    case_evidence_sha256: str
+    qualification_terminal_sha256: str
+    qualification_completed_at_unix_ms: int
+    expected_targets_file_sha256: str
+    source_terminal_set_sha256: str
+    sources: tuple[tuple[str, str, str], ...]
 
 
 class RouteV2QualificationVerifier(Protocol):
@@ -334,9 +415,12 @@ class UsageTargetTerminalVerifier(Protocol):
 
     def verify(
         self,
+        finalization_manifest: VerifiedFile,
+        expected_targets: VerifiedFile,
         receipt: VerifiedFile,
         expected_request: VerifiedFile,
         verification_receipt: VerifiedFile,
+        qualified_runs: tuple[QualifiedRun, QualifiedRun],
         context: ProducerContext,
     ) -> None: ...
 
@@ -347,6 +431,18 @@ class HostFenceTerminalVerifier(Protocol):
 
 class LocalPositiveStopVerifier(Protocol):
     def verify(self, receipt: VerifiedFile, expected: dict[str, Any]) -> None: ...
+
+
+class QualificationAdmissionVerifier(Protocol):
+    def verify(
+        self,
+        begin_pending: VerifiedFile,
+        begin_command_receipt: VerifiedFile,
+        close_pending: VerifiedFile,
+        close_command_receipt: VerifiedFile,
+        final_state: VerifiedFile,
+        context: ProducerContext,
+    ) -> None: ...
 
 
 class _UnavailableRouteV2Verifier:
@@ -363,9 +459,12 @@ class _UnavailableRouteV2Verifier:
 class _UnavailableUsageVerifier:
     def verify(
         self,
+        _finalization_manifest: VerifiedFile,
+        _expected_targets: VerifiedFile,
         _receipt: VerifiedFile,
         _expected_request: VerifiedFile,
         _verification_receipt: VerifiedFile,
+        _qualified_runs: tuple[QualifiedRun, QualifiedRun],
         _context: ProducerContext,
     ) -> None:
         raise ProofSetError("E9 target-terminal verifier is not wired to its Rust binary")
@@ -383,11 +482,29 @@ class _UnavailableLocalPositiveStopVerifier:
         )
 
 
+class _UnavailableQualificationAdmissionVerifier:
+    def verify(
+        self,
+        _begin_pending: VerifiedFile,
+        _begin_command_receipt: VerifiedFile,
+        _close_pending: VerifiedFile,
+        _close_command_receipt: VerifiedFile,
+        _final_state: VerifiedFile,
+        _context: ProducerContext,
+    ) -> None:
+        raise ProofSetError(
+            "Qualification admission live-discovery verifier is not wired"
+        )
+
+
 UNAVAILABLE_ROUTE_V2_VERIFIER: RouteV2QualificationVerifier = _UnavailableRouteV2Verifier()
 UNAVAILABLE_USAGE_VERIFIER: UsageTargetTerminalVerifier = _UnavailableUsageVerifier()
 UNAVAILABLE_HOST_FENCE_VERIFIER: HostFenceTerminalVerifier = _UnavailableHostFenceVerifier()
 UNAVAILABLE_LOCAL_POSITIVE_STOP_VERIFIER: LocalPositiveStopVerifier = (
     _UnavailableLocalPositiveStopVerifier()
+)
+UNAVAILABLE_QUALIFICATION_ADMISSION_VERIFIER: QualificationAdmissionVerifier = (
+    _UnavailableQualificationAdmissionVerifier()
 )
 
 
@@ -409,7 +526,6 @@ class VerifiedProofSet:
     old_host_coverage_sha256: str
     kernel_nbd_qualification_bundle_sha256: str
     vhost_user_qualification_bundle_sha256: str
-    qualification_terminal_sha256: str
 
     def admission_binding(self, reset_complete_receipt_sha256: str) -> dict[str, Any]:
         release = self.value["release"]
@@ -619,15 +735,18 @@ def _validate_usage_verification_projection(
     *,
     receipt: VerifiedFile,
     expected_request: VerifiedFile,
+    expected_targets: VerifiedFile,
     context: ProducerContext,
-) -> None:
+) -> dict[str, Any]:
     value = fields(
         value,
         {
             "binary_sha256",
             "expected_request_file_sha256",
+            "expected_targets_file_sha256",
             "kind",
             "release_commit",
+            "target_binding_sha256",
             "target_receipt_file_sha256",
             "target_request_sha256",
             "validated",
@@ -645,10 +764,30 @@ def _validate_usage_verification_projection(
         or value["binary_sha256"]
         != context.usage_terminal_verifier_binary_sha256
         or value["expected_request_file_sha256"] != expected_request.sha256
+        or value["expected_targets_file_sha256"] != expected_targets.sha256
         or value["target_receipt_file_sha256"] != receipt.sha256
     ):
         raise ProofSetError("E9 terminal verification projection drifted")
     digest(value["target_request_sha256"], "E9 target request digest")
+    digest(value["target_binding_sha256"], "E9 target binding digest")
+    targets = decode_json(
+        expected_targets.data,
+        "E9 expected targets",
+        canonical_lf=True,
+    )
+    fields(
+        targets,
+        {"version", "old_target", "fresh_target", "shards"},
+        "E9 expected targets",
+    )
+    if targets["version"] != 1:
+        raise ProofSetError("E9 expected-targets version drifted")
+    expected_binding_sha256 = "sha256:" + hashlib.sha256(
+        canonical_json(targets)
+    ).hexdigest()
+    if value["target_binding_sha256"] != expected_binding_sha256:
+        raise ProofSetError("E9 expected-targets semantic binding drifted")
+    return value
 
 
 def _validate_qualification_admission(
@@ -1179,6 +1318,263 @@ def _jsonl(data: bytes, label: str) -> list[dict[str, Any]]:
     return values
 
 
+def _usage_sources(
+    value: Any,
+    label: str,
+) -> tuple[tuple[str, str, str], ...]:
+    if not isinstance(value, list) or not value:
+        raise ProofSetError(f"{label} is not a nonempty source set")
+    result: list[tuple[str, str, str]] = []
+    for index, item in enumerate(value):
+        item = fields(
+            item,
+            {"source_id", "source_epoch", "receipt_sha256"},
+            f"{label}[{index}]",
+        )
+        source_id = item["source_id"]
+        source_epoch = item["source_epoch"]
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or len(source_id) > 2_048
+            or not isinstance(source_epoch, str)
+            or not source_epoch
+            or len(source_epoch) > 2_048
+        ):
+            raise ProofSetError(f"{label} contains an unbounded source identity")
+        result.append(
+            (
+                source_id,
+                source_epoch,
+                digest(item["receipt_sha256"], f"{label} receipt digest"),
+            )
+        )
+    keys = [(source_id, source_epoch) for source_id, source_epoch, _digest in result]
+    if keys != sorted(set(keys)):
+        raise ProofSetError(f"{label} is not strict sorted and unique")
+    return tuple(result)
+
+
+def _usage_sources_json(
+    value: tuple[tuple[str, str, str], ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "source_id": source_id,
+            "source_epoch": source_epoch,
+            "receipt_sha256": receipt_sha256,
+        }
+        for source_id, source_epoch, receipt_sha256 in value
+    ]
+
+
+def _usage_source_set_sha256(
+    value: tuple[tuple[str, str, str], ...],
+) -> str:
+    return "sha256:" + hashlib.sha256(
+        canonical_json(_usage_sources_json(value))
+    ).hexdigest()
+
+
+def _validate_usage_source_terminal_set(
+    value: Any,
+    *,
+    block_path: str,
+    run_id: str,
+    workspace_id: str,
+    context: ProducerContext,
+) -> tuple[str, tuple[tuple[str, str, str], ...]]:
+    value = fields(
+        value,
+        {
+            "block_path",
+            "cat_id",
+            "kind",
+            "qualification_catalog_sha256",
+            "release_commit",
+            "run_id",
+            "run_window_from_unix_ms",
+            "run_window_to_unix_ms",
+            "source_set_sha256",
+            "sources",
+            "version",
+            "worker_bundle_sha256",
+            "workspace_id",
+        },
+        f"{block_path} Usage source terminal set",
+    )
+    if (
+        value["kind"] != USAGE_SOURCE_TERMINAL_SET_KIND
+        or value["version"] != 1
+        or value["block_path"] != block_path
+        or value["run_id"] != run_id
+        or value["workspace_id"] != workspace_id
+        or value["release_commit"] != context.release_commit
+        or value["worker_bundle_sha256"] != context.worker_bundle_sha256
+        or value["qualification_catalog_sha256"]
+        != context.qualification_catalog_sha256
+    ):
+        raise ProofSetError(f"{block_path} Usage source terminal binding drifted")
+    identifier(value["cat_id"], f"{block_path} Usage Cat ID")
+    started = integer(
+        value["run_window_from_unix_ms"],
+        f"{block_path} Usage window start",
+        minimum=1,
+    )
+    ended = integer(
+        value["run_window_to_unix_ms"],
+        f"{block_path} Usage window end",
+        minimum=started + 1,
+    )
+    if ended <= started:
+        raise ProofSetError(f"{block_path} Usage window is empty")
+    sources = _usage_sources(value["sources"], f"{block_path} Usage sources")
+    source_set_sha256 = _usage_source_set_sha256(sources)
+    if value["source_set_sha256"] != source_set_sha256:
+        raise ProofSetError(f"{block_path} Usage source-set digest drifted")
+    return source_set_sha256, sources
+
+
+def _usage_terminal_epoch_id(
+    qualified_runs: tuple[QualifiedRun, QualifiedRun],
+    expected_targets_sha256: str,
+    source_set_sha256: str,
+) -> str:
+    hasher = hashlib.sha256()
+    for value in (
+        "cats.usage-target-terminal-epoch.v1",
+        qualified_runs[0].manifest_sha256,
+        qualified_runs[1].manifest_sha256,
+        expected_targets_sha256,
+        source_set_sha256,
+    ):
+        raw = value.encode("utf-8")
+        hasher.update(len(raw).to_bytes(8, "big"))
+        hasher.update(raw)
+    result = hasher.hexdigest()[:32]
+    if result == "0" * 32:
+        raise ProofSetError("E9 terminal epoch derived the reserved zero ID")
+    return result
+
+
+def _validate_global_usage_finalization(
+    value: Any,
+    *,
+    finalization_manifest: VerifiedFile,
+    expected_targets: VerifiedFile,
+    expected_request: VerifiedFile,
+    receipt: VerifiedFile,
+    verification_file: VerifiedFile,
+    verification: dict[str, Any],
+    qualified_runs: tuple[QualifiedRun, QualifiedRun],
+    context: ProducerContext,
+) -> None:
+    value = fields(
+        value,
+        {
+            "kind",
+            "version",
+            "outcome",
+            "release_commit",
+            "worker_bundle_sha256",
+            "qualification_catalog_sha256",
+            "expected_targets_file_sha256",
+            "target_binding_sha256",
+            "block_runs",
+            "sources",
+            "source_set_sha256",
+            "terminal_epoch_id",
+            "target_request_sha256",
+            "target_request_file_sha256",
+            "target_receipt_file_sha256",
+            "target_verification_file_sha256",
+            "completed_at_unix_ms",
+        },
+        "E9 global terminal finalization manifest",
+    )
+    if (
+        value["kind"] != USAGE_GLOBAL_FINALIZATION_KIND
+        or value["version"] != 1
+        or value["outcome"] != "terminal"
+        or value["release_commit"] != context.release_commit
+        or value["worker_bundle_sha256"] != context.worker_bundle_sha256
+        or value["qualification_catalog_sha256"]
+        != context.qualification_catalog_sha256
+        or value["expected_targets_file_sha256"] != expected_targets.sha256
+        or value["target_binding_sha256"] != verification["target_binding_sha256"]
+        or value["target_request_sha256"] != verification["target_request_sha256"]
+        or value["target_request_file_sha256"] != expected_request.sha256
+        or value["target_receipt_file_sha256"] != receipt.sha256
+        or value["target_verification_file_sha256"] != verification_file.sha256
+        or any(
+            qualified.expected_targets_file_sha256 != expected_targets.sha256
+            for qualified in qualified_runs
+        )
+    ):
+        raise ProofSetError("E9 global terminal finalization binding drifted")
+    block_runs = value["block_runs"]
+    if not isinstance(block_runs, list) or len(block_runs) != 2:
+        raise ProofSetError("E9 global finalizer does not bind exactly two runs")
+    for index, qualified in enumerate(qualified_runs):
+        run = fields(
+            block_runs[index],
+            {
+                "block_path",
+                "run_id",
+                "qualification_manifest_sha256",
+                "case_evidence_sha256",
+                "source_terminal_set_sha256",
+            },
+            f"E9 global block run {index}",
+        )
+        if run != {
+            "block_path": qualified.block_path,
+            "run_id": qualified.run_id,
+            "qualification_manifest_sha256": qualified.manifest_sha256,
+            "case_evidence_sha256": qualified.case_evidence_sha256,
+            "source_terminal_set_sha256": qualified.source_terminal_set_sha256,
+        }:
+            raise ProofSetError("E9 global finalizer rebound a qualified block run")
+
+    union: dict[tuple[str, str], str] = {}
+    for qualified in qualified_runs:
+        for source_id, source_epoch, receipt_sha256 in qualified.sources:
+            key = (source_id, source_epoch)
+            prior = union.get(key)
+            if prior is not None and prior != receipt_sha256:
+                raise ProofSetError("E9 per-run source sets conflict on one source epoch")
+            union[key] = receipt_sha256
+    expected_sources = tuple(
+        (source_id, source_epoch, receipt_sha256)
+        for (source_id, source_epoch), receipt_sha256 in sorted(union.items())
+    )
+    sources = _usage_sources(value["sources"], "E9 global Usage sources")
+    if sources != expected_sources:
+        raise ProofSetError("E9 global source set is not the exact two-run union")
+    source_set_sha256 = _usage_source_set_sha256(sources)
+    if value["source_set_sha256"] != source_set_sha256:
+        raise ProofSetError("E9 global source-set digest drifted")
+    expected_epoch = _usage_terminal_epoch_id(
+        qualified_runs,
+        expected_targets.sha256,
+        source_set_sha256,
+    )
+    if value["terminal_epoch_id"] != expected_epoch:
+        raise ProofSetError("E9 terminal epoch is not the exact global derivation")
+    completed = integer(
+        value["completed_at_unix_ms"],
+        "E9 global completion time",
+        minimum=1,
+    )
+    if completed < max(
+        qualified.qualification_completed_at_unix_ms
+        for qualified in qualified_runs
+    ):
+        raise ProofSetError("E9 global finalization predates Qualification Closed")
+    if finalization_manifest.name != USAGE_GLOBAL_FINALIZATION_FILE:
+        raise ProofSetError("E9 global finalization filename drifted")
+
+
 def _validate_sha256sums(
     data: bytes,
     expected: dict[str, VerifiedFile],
@@ -1201,16 +1597,239 @@ def _validate_sha256sums(
             raise ProofSetError(f"{label} does not close {name}")
 
 
+def _validate_qualification_final_support(
+    *,
+    final_state: VerifiedFile,
+    final_fleet: VerifiedFile,
+    cleanup_inventory: VerifiedFile,
+    begin: dict[str, Any],
+    terminal: dict[str, Any],
+    block_path: str,
+    context: ProducerContext,
+) -> None:
+    state = fields(
+        decode_json(final_state.data, "Qualification final admission state"),
+        {
+            "version",
+            "revision",
+            "mode",
+            "binding",
+            "last_command_id",
+            "updated_at_unix_ms",
+        },
+        "Qualification final admission state",
+    )
+    state_binding = fields(
+        state["binding"],
+        {"kind", "binding"},
+        "Qualification final state binding",
+    )
+    binding = fields(
+        state_binding["binding"],
+        QUALIFICATION_BINDING_FIELDS,
+        "Qualification final binding",
+    )
+    expected_binding_digest = "sha256:" + hashlib.sha256(
+        canonical_json({"kind": "qualification", "binding": binding})
+    ).hexdigest()
+    if (
+        state["version"] != 1
+        or state["mode"] != "closed"
+        or state["revision"] != terminal["final_closed_revision"]
+        or state["last_command_id"] != terminal["close_command_id"]
+        or state_binding["kind"] != "qualification"
+        or binding["qualification_id"] != begin["qualification_id"]
+        or binding["workspace_id"] != begin["workspace_id"]
+        or binding["release_id"] != begin["release_id"]
+        or binding["source_commit_sha"] != context.release_commit
+        or binding["control_schema_version"] != 16
+        or binding["worker_bundle_sha256"] != context.worker_bundle_sha256
+        or binding["release_manifest_sha256"] != context.release_manifest_sha256
+        or binding["qualification_catalog_sha256"]
+        != context.qualification_catalog_sha256
+        or binding["allowed_mutation_classes"]
+        != begin["allowed_mutation_classes"]
+        or binding["qualification_expires_at_unix_ms"]
+        != begin["qualification_expires_at_unix_ms"]
+        or expected_binding_digest != begin["binding_sha256"]
+    ):
+        raise ProofSetError("Qualification final state binding drifted")
+    integer(
+        state["updated_at_unix_ms"],
+        "Qualification final state update time",
+        minimum=1,
+    )
+
+    fleet = fields(
+        decode_json(final_fleet.data, "Qualification final Fleet Closed receipt"),
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "source_commit_sha",
+            "block_path",
+            "evaluated_at_unix_ms",
+            "complete",
+            "expected_node_ids",
+            "desired_runtime_count",
+            "current_runtime_observation_count",
+            "active_guard_count",
+            "residue_count",
+            "fleet_verification_receipt_sha256",
+        },
+        "Qualification final Fleet Closed receipt",
+    )
+    expected_nodes = fleet["expected_node_ids"]
+    if (
+        fleet["kind"] != QUALIFICATION_FINAL_FLEET_KIND
+        or fleet["version"] != 1
+        or fleet["qualification_id"] != begin["qualification_id"]
+        or fleet["workspace_id"] != begin["workspace_id"]
+        or fleet["source_commit_sha"] != context.release_commit
+        or fleet["block_path"] != block_path
+        or fleet["complete"] is not True
+        or not isinstance(expected_nodes, list)
+        or not expected_nodes
+        or expected_nodes != sorted(set(expected_nodes))
+    ):
+        raise ProofSetError("Qualification final Fleet binding drifted")
+    for node_id in expected_nodes:
+        identifier(node_id, "Qualification final Fleet Node ID")
+    digest(
+        fleet["fleet_verification_receipt_sha256"],
+        "Qualification final Fleet authority",
+    )
+    for counter in (
+        "desired_runtime_count",
+        "current_runtime_observation_count",
+        "active_guard_count",
+        "residue_count",
+    ):
+        _zero(fleet[counter], f"Qualification final Fleet {counter}")
+    fleet_evaluated = integer(
+        fleet["evaluated_at_unix_ms"],
+        "Qualification final Fleet time",
+        minimum=1,
+    )
+
+    cleanup = fields(
+        decode_json(
+            cleanup_inventory.data,
+            "Qualification cleanup inventory receipt",
+        ),
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "source_commit_sha",
+            "block_path",
+            "evaluated_at_unix_ms",
+            "complete",
+            "product_resource_count",
+            "desired_runtime_count",
+            "current_runtime_observation_count",
+            "active_guard_count",
+            "residue_count",
+        },
+        "Qualification cleanup inventory receipt",
+    )
+    if (
+        cleanup["kind"] != QUALIFICATION_CLEANUP_INVENTORY_KIND
+        or cleanup["version"] != 1
+        or cleanup["qualification_id"] != begin["qualification_id"]
+        or cleanup["workspace_id"] != begin["workspace_id"]
+        or cleanup["source_commit_sha"] != context.release_commit
+        or cleanup["block_path"] != block_path
+        or cleanup["complete"] is not True
+    ):
+        raise ProofSetError("Qualification cleanup inventory binding drifted")
+    for counter in (
+        "product_resource_count",
+        "desired_runtime_count",
+        "current_runtime_observation_count",
+        "active_guard_count",
+        "residue_count",
+    ):
+        _zero(cleanup[counter], f"Qualification cleanup {counter}")
+    cleanup_evaluated = integer(
+        cleanup["evaluated_at_unix_ms"],
+        "Qualification cleanup time",
+        minimum=1,
+    )
+    if terminal["completed_at_unix_ms"] != max(
+        fleet_evaluated,
+        cleanup_evaluated,
+    ):
+        raise ProofSetError("Qualification terminal completion time drifted")
+
+
+def _qualification_manifest_evidence(
+    manifest: dict[str, Any],
+    begin_file: VerifiedFile,
+    terminal_file: VerifiedFile,
+    block_path: str,
+) -> None:
+    expected = [
+        {
+            "filename": QUALIFICATION_BEGIN_FILE,
+            "kind": "json",
+            "sha256": begin_file.sha256,
+            "size_bytes": begin_file.size_bytes,
+        },
+        {
+            "filename": QUALIFICATION_TERMINAL_FILE,
+            "kind": "json",
+            "sha256": terminal_file.sha256,
+            "size_bytes": terminal_file.size_bytes,
+        },
+    ]
+    if manifest.get("qualification_admission_required_evidence") != expected:
+        raise ProofSetError(
+            f"{block_path} manifest does not bind its exact admission evidence"
+        )
+
+
+def _qualification_catalog_admission(value: Any, block_path: str) -> None:
+    if not isinstance(value, dict):
+        raise ProofSetError(f"{block_path} qualification catalog is not an object")
+    expected = [
+        {"filename": QUALIFICATION_BEGIN_FILE, "kind": "json"},
+        {"filename": QUALIFICATION_TERMINAL_FILE, "kind": "json"},
+    ]
+    if value.get("qualification_admission_required_evidence") != expected:
+        raise ProofSetError(
+            f"{block_path} catalog does not require exact admission evidence"
+        )
+
+
 def _validate_qualification(
     directory: ProofDirectory,
     value: Any,
     block_path: str,
     context: ProducerContext,
     worker_bundle_sha256: str,
-) -> str:
+    admission_verifier: QualificationAdmissionVerifier,
+) -> tuple[QualifiedRun, str]:
+    reference_names = {
+        "manifest",
+        "case_evidence",
+        "qualification_catalog",
+        "sha256sums",
+        "qualification_begin",
+        "qualification_terminal",
+        "qualification_begin_pending",
+        "qualification_begin_command_receipt",
+        "qualification_close_pending",
+        "qualification_close_command_receipt",
+        "qualification_final_state",
+        "qualification_final_fleet",
+        "qualification_cleanup_inventory",
+    }
     value = fields(
         value,
-        {"manifest", "case_evidence", "qualification_catalog", "sha256sums"},
+        reference_names,
         f"{block_path} qualification",
     )
     refs = {
@@ -1221,11 +1840,19 @@ def _validate_qualification(
     manifest = decode_json(
         manifest_file.data, f"{block_path} manifest", canonical_lf=True
     )
+    if not isinstance(manifest, dict):
+        raise ProofSetError(f"{block_path} manifest is not an object")
     release_manifest = manifest.get("release_manifest", {})
     installer = manifest.get("installer_receipt", {})
+    run_id = manifest.get("run_id")
+    qualification_scope = manifest.get("qualification", {})
+    workspace_id = (
+        qualification_scope.get("workspace_id")
+        if isinstance(qualification_scope, dict)
+        else None
+    )
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("version") != 1
+        manifest.get("version") != 1
         or manifest.get("state") != "passed"
         or manifest.get("exit_code") != 0
         or manifest.get("schema_version") != 16
@@ -1238,11 +1865,113 @@ def _validate_qualification(
         != context.qualification_catalog_sha256
     ):
         raise ProofSetError(f"{block_path} qualification is not exact-release passed")
+    run_id = identifier(run_id, f"{block_path} qualification run ID")
+    workspace_id = identifier(workspace_id, f"{block_path} qualification Workspace ID")
+    configs = manifest.get("configs")
+    if not isinstance(configs, list):
+        raise ProofSetError(f"{block_path} manifest config set is unavailable")
+    usage_target_configs = [
+        item
+        for item in configs
+        if isinstance(item, dict) and item.get("label") == "usage-terminal-targets"
+    ]
+    if len(usage_target_configs) != 1:
+        raise ProofSetError(f"{block_path} has no unique E9 expected-target config")
+    usage_target_config = fields(
+        usage_target_configs[0],
+        {"label", "path", "staged_path", "sha256", "size_bytes"},
+        f"{block_path} E9 expected-target config",
+    )
+    config_sha256 = usage_target_config["sha256"]
+    if not isinstance(config_sha256, str) or RAW_SHA256.fullmatch(config_sha256) is None:
+        raise ProofSetError(f"{block_path} E9 expected-target config digest drifted")
+    expected_targets_file_sha256 = "sha256:" + config_sha256
+    integer(
+        usage_target_config["size_bytes"],
+        f"{block_path} E9 expected-target config size",
+        minimum=1,
+    )
+
+    support = {
+        name: directory.read_reference(
+            refs[name],
+            f"{block_path} {name.replace('_', ' ')}",
+        )
+        for name in reference_names
+        if name
+        not in {"manifest", "case_evidence", "qualification_catalog", "sha256sums"}
+    }
+    begin_file = support["qualification_begin"]
+    terminal_file = support["qualification_terminal"]
+    begin_receipt = decode_json(begin_file.data, f"{block_path} Qualification Begin")
+    terminal_receipt = decode_json(
+        terminal_file.data,
+        f"{block_path} Qualification terminal",
+    )
+    if (
+        canonical_json(begin_receipt) != begin_file.data
+        or canonical_json(terminal_receipt) != terminal_file.data
+    ):
+        raise ProofSetError(f"{block_path} Qualification framework JSON is not canonical")
+    _validate_qualification_admission(
+        begin_receipt,
+        terminal_receipt,
+        release_id=context.release_id,
+        release_commit=context.release_commit,
+        qualification_catalog_sha256=context.qualification_catalog_sha256,
+    )
+    if (
+        begin_receipt["qualification_id"] != run_id
+        or begin_receipt["workspace_id"] != workspace_id
+        or terminal_receipt["terminal_outcome"] != "qualified_closed"
+        or terminal_receipt["close_kind"] != "end_qualification"
+        or begin_receipt["begin_command_receipt_sha256"]
+        != support["qualification_begin_command_receipt"].sha256
+        or terminal_receipt["close_command_receipt_sha256"]
+        != support["qualification_close_command_receipt"].sha256
+        or terminal_receipt["final_admission_state_sha256"]
+        != support["qualification_final_state"].sha256
+        or terminal_receipt["fleet_closed_receipt_sha256"]
+        != support["qualification_final_fleet"].sha256
+        or terminal_receipt["cleanup_inventory_receipt_sha256"]
+        != support["qualification_cleanup_inventory"].sha256
+    ):
+        raise ProofSetError(f"{block_path} Qualification admission support drifted")
+    _qualification_manifest_evidence(
+        manifest,
+        begin_file,
+        terminal_file,
+        block_path,
+    )
+    _validate_qualification_final_support(
+        final_state=support["qualification_final_state"],
+        final_fleet=support["qualification_final_fleet"],
+        cleanup_inventory=support["qualification_cleanup_inventory"],
+        begin=begin_receipt,
+        terminal=terminal_receipt,
+        block_path=block_path,
+        context=context,
+    )
+    admission_verifier.verify(
+        support["qualification_begin_pending"],
+        support["qualification_begin_command_receipt"],
+        support["qualification_close_pending"],
+        support["qualification_close_command_receipt"],
+        support["qualification_final_state"],
+        context,
+    )
     catalog_file = directory.read_reference(
         refs["qualification_catalog"], f"{block_path} qualification catalog"
     )
     if catalog_file.sha256 != context.qualification_catalog_sha256:
         raise ProofSetError(f"{block_path} qualification catalog drifted")
+    _qualification_catalog_admission(
+        decode_json(
+            catalog_file.data,
+            f"{block_path} qualification catalog",
+        ),
+        block_path,
+    )
     evidence_file = directory.read_reference(
         refs["case_evidence"], f"{block_path} case evidence"
     )
@@ -1273,17 +2002,81 @@ def _validate_qualification(
     ):
         raise ProofSetError("V5 embedded evidence digest/size drifted")
     _validate_persistent_disk(entry["content"], block_path)
+    usage_matches = [
+        item
+        for item in entries
+        if item.get("case_id") == "usage-source-terminal-receipts"
+        and item.get("filename") == "usage-source-terminal-receipts.json"
+    ]
+    if len(usage_matches) != 1:
+        raise ProofSetError(
+            f"{block_path} has no unique Usage source-terminal evidence"
+        )
+    usage_entry = fields(
+        usage_matches[0],
+        {"case_id", "filename", "kind", "sha256", "size_bytes", "content"},
+        f"{block_path} Usage source-terminal evidence",
+    )
+    usage_content_bytes = canonical_json(usage_entry["content"], newline=True)
+    if (
+        usage_entry["kind"] != "json"
+        or usage_entry["sha256"]
+        != "sha256:" + hashlib.sha256(usage_content_bytes).hexdigest()
+        or usage_entry["size_bytes"] != len(usage_content_bytes)
+    ):
+        raise ProofSetError(f"{block_path} Usage evidence digest/size drifted")
+    source_set_sha256, sources = _validate_usage_source_terminal_set(
+        usage_entry["content"],
+        block_path=block_path,
+        run_id=run_id,
+        workspace_id=workspace_id,
+        context=context,
+    )
     sums_file = directory.read_reference(refs["sha256sums"], f"{block_path} SHA256SUMS")
+    checksum_support = {
+        QUALIFICATION_BEGIN_FILE: begin_file,
+        QUALIFICATION_TERMINAL_FILE: terminal_file,
+        QUALIFICATION_BEGIN_PENDING_FILE: support["qualification_begin_pending"],
+        QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE: support[
+            "qualification_begin_command_receipt"
+        ],
+        QUALIFICATION_CLOSE_PENDING_FILE: support["qualification_close_pending"],
+        QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE: support[
+            "qualification_close_command_receipt"
+        ],
+        QUALIFICATION_FINAL_STATE_FILE: support["qualification_final_state"],
+        QUALIFICATION_FINAL_FLEET_FILE: support["qualification_final_fleet"],
+        QUALIFICATION_CLEANUP_INVENTORY_FILE: support[
+            "qualification_cleanup_inventory"
+        ],
+    }
     _validate_sha256sums(
         sums_file.data,
         {
             "manifest.json": manifest_file,
             "case-evidence.jsonl": evidence_file,
             "qualification-catalog.v1.json": catalog_file,
+            **checksum_support,
         },
         f"{block_path} SHA256SUMS",
     )
-    return sums_file.sha256
+    return (
+        QualifiedRun(
+            block_path=block_path,
+            run_id=run_id,
+            workspace_id=workspace_id,
+            manifest_sha256=manifest_file.sha256,
+            case_evidence_sha256=evidence_file.sha256,
+            qualification_terminal_sha256=terminal_file.sha256,
+            qualification_completed_at_unix_ms=terminal_receipt[
+                "completed_at_unix_ms"
+            ],
+            expected_targets_file_sha256=expected_targets_file_sha256,
+            source_terminal_set_sha256=source_set_sha256,
+            sources=sources,
+        ),
+        sums_file.sha256,
+    )
 
 
 def _validate_local_positive_stop(
@@ -1387,6 +2180,9 @@ def verify(
     host_fence_verifier: HostFenceTerminalVerifier = UNAVAILABLE_HOST_FENCE_VERIFIER,
     local_positive_stop_verifier: LocalPositiveStopVerifier = (
         UNAVAILABLE_LOCAL_POSITIVE_STOP_VERIFIER
+    ),
+    qualification_admission_verifier: QualificationAdmissionVerifier = (
+        UNAVAILABLE_QUALIFICATION_ADMISSION_VERIFIER
     ),
     now: dt.datetime | None = None,
 ) -> VerifiedProofSet:
@@ -1525,25 +2321,32 @@ def verify(
         if fresh_targets != expected_fresh_targets:
             raise ProofSetError("proof-set fresh targets differ from reset invocation")
         context = ProducerContext(
-            expected_release_commit,
-            release["artifact_sha256"],
-            worker_bundle_sha256,
-            usage_terminal_verifier_binary_sha256,
-            release["qualification_manifest_sha256"],
-            release["qualification_catalog_sha256"],
-            old_targets,
-            fresh_targets,
+            release_id=release["release_id"],
+            release_commit=expected_release_commit,
+            release_manifest_sha256=release["artifact_sha256"],
+            worker_bundle_sha256=worker_bundle_sha256,
+            usage_terminal_verifier_binary_sha256=(
+                usage_terminal_verifier_binary_sha256
+            ),
+            qualification_manifest_sha256=release[
+                "qualification_manifest_sha256"
+            ],
+            qualification_catalog_sha256=release[
+                "qualification_catalog_sha256"
+            ],
+            old_targets=old_targets,
+            fresh_targets=fresh_targets,
         )
 
         proofs = fields(
             value["proofs"],
             {
-                "qualification_admission_begin",
-                "qualification_admission_terminal",
                 "fleet_closed",
                 "route_v2_rotation_qualification_receipt",
                 "route_v2_rotation_qualification_node_ack_sets",
                 "route_v2_rotation_qualification_transcript",
+                "usage_global_finalization_manifest",
+                "usage_terminal_targets",
                 "usage_terminal_request",
                 "usage_terminal_receipt",
                 "usage_terminal_verification",
@@ -1559,7 +2362,11 @@ def verify(
             if name != "qualification"
         }
         if (
-            proof_refs["usage_terminal_request"].file
+            proof_refs["usage_global_finalization_manifest"].file
+            != USAGE_GLOBAL_FINALIZATION_FILE
+            or proof_refs["usage_terminal_targets"].file
+            != USAGE_TERMINAL_TARGETS_FILE
+            or proof_refs["usage_terminal_request"].file
             != USAGE_TERMINAL_REQUEST_FILE
             or proof_refs["usage_terminal_receipt"].file
             != USAGE_TERMINAL_RECEIPT_FILE
@@ -1567,28 +2374,6 @@ def verify(
             != USAGE_TERMINAL_VERIFICATION_FILE
         ):
             raise ProofSetError("E9 proof files do not use their canonical names")
-        begin_file = directory.read_reference(
-            proof_refs["qualification_admission_begin"], "Qualification Begin receipt"
-        )
-        terminal_file = directory.read_reference(
-            proof_refs["qualification_admission_terminal"],
-            "Qualification terminal receipt",
-        )
-        begin_receipt = decode_json(begin_file.data, "Qualification Begin receipt")
-        terminal_receipt = decode_json(
-            terminal_file.data, "Qualification terminal receipt"
-        )
-        _validate_qualification_admission(
-            begin_receipt,
-            terminal_receipt,
-            release_id=release["release_id"],
-            release_commit=expected_release_commit,
-            qualification_catalog_sha256=release["qualification_catalog_sha256"],
-        )
-        if terminal_receipt["terminal_outcome"] != "qualified_closed":
-            raise ProofSetError(
-                "emergency-closed Qualification cannot authorize reset or final Open"
-            )
         fleet_file = directory.read_reference(proof_refs["fleet_closed"], "fleet Closed proof")
         _validate_fleet(
             decode_json(fleet_file.data, "fleet Closed proof"),
@@ -1608,6 +2393,39 @@ def verify(
             "G3 rotation qualification transcript",
         )
         route_v2_verifier.verify(route_receipt, route_acks, route_transcript, context)
+        qualification = fields(
+            proofs["qualification"], {"kernel_nbd", "vhost_user"}, "qualification proofs"
+        )
+        kernel_run, kernel_bundle = _validate_qualification(
+            directory,
+            qualification["kernel_nbd"],
+            "kernel-nbd",
+            context,
+            worker_bundle_sha256,
+            qualification_admission_verifier,
+        )
+        vhost_run, vhost_bundle = _validate_qualification(
+            directory,
+            qualification["vhost_user"],
+            "vhost-user",
+            context,
+            worker_bundle_sha256,
+            qualification_admission_verifier,
+        )
+        if (
+            kernel_run.run_id == vhost_run.run_id
+            or kernel_run.manifest_sha256 == vhost_run.manifest_sha256
+        ):
+            raise ProofSetError("qualification block paths reused one runner identity")
+        qualified_runs = (kernel_run, vhost_run)
+        usage_finalization_file = directory.read_reference(
+            proof_refs["usage_global_finalization_manifest"],
+            "E9 global terminal finalization manifest",
+        )
+        usage_targets_file = directory.read_reference(
+            proof_refs["usage_terminal_targets"],
+            "E9 expected targets",
+        )
         usage_request_file = directory.read_reference(
             proof_refs["usage_terminal_request"], "E9 target-terminal request"
         )
@@ -1618,7 +2436,7 @@ def verify(
             proof_refs["usage_terminal_verification"],
             "E9 target-terminal verification receipt",
         )
-        _validate_usage_verification_projection(
+        usage_verification = _validate_usage_verification_projection(
             decode_json(
                 usage_verification_file.data,
                 "E9 target-terminal verification receipt",
@@ -1626,12 +2444,31 @@ def verify(
             ),
             receipt=usage_file,
             expected_request=usage_request_file,
+            expected_targets=usage_targets_file,
+            context=context,
+        )
+        _validate_global_usage_finalization(
+            decode_json(
+                usage_finalization_file.data,
+                "E9 global terminal finalization manifest",
+                canonical_lf=True,
+            ),
+            finalization_manifest=usage_finalization_file,
+            expected_targets=usage_targets_file,
+            expected_request=usage_request_file,
+            receipt=usage_file,
+            verification_file=usage_verification_file,
+            verification=usage_verification,
+            qualified_runs=qualified_runs,
             context=context,
         )
         usage_verifier.verify(
+            usage_finalization_file,
+            usage_targets_file,
             usage_file,
             usage_request_file,
             usage_verification_file,
+            qualified_runs,
             context,
         )
         inventory_file = directory.read_reference(
@@ -1646,23 +2483,6 @@ def verify(
             decode_json(coverage_file.data, "old Host coverage", canonical_lf=True),
             host_fence_verifier,
             local_positive_stop_verifier,
-        )
-        qualification = fields(
-            proofs["qualification"], {"kernel_nbd", "vhost_user"}, "qualification proofs"
-        )
-        kernel_bundle = _validate_qualification(
-            directory,
-            qualification["kernel_nbd"],
-            "kernel-nbd",
-            context,
-            worker_bundle_sha256,
-        )
-        vhost_bundle = _validate_qualification(
-            directory,
-            qualification["vhost_user"],
-            "vhost-user",
-            context,
-            worker_bundle_sha256,
         )
         return VerifiedProofSet(
             value=value,
@@ -1682,5 +2502,4 @@ def verify(
             old_host_coverage_sha256=coverage_file.sha256,
             kernel_nbd_qualification_bundle_sha256=kernel_bundle,
             vhost_user_qualification_bundle_sha256=vhost_bundle,
-            qualification_terminal_sha256=terminal_file.sha256,
         )

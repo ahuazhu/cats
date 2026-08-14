@@ -87,12 +87,12 @@ ProductionCutoverProofSetV1 {
     targets: FreshTargetsV1
   },
   proofs: {
-    qualification_admission_begin: ProofFileV1,
-    qualification_admission_terminal: ProofFileV1,
     fleet_closed: ProofFileV1,
     route_v2_rotation_qualification_receipt: ProofFileV1,
     route_v2_rotation_qualification_node_ack_sets: ProofFileV1,
     route_v2_rotation_qualification_transcript: ProofFileV1,
+    usage_global_finalization_manifest: ProofFileV1,
+    usage_terminal_targets: ProofFileV1,
     usage_terminal_request: ProofFileV1,
     usage_terminal_receipt: ProofFileV1,
     usage_terminal_verification: ProofFileV1,
@@ -106,6 +106,15 @@ ProductionCutoverProofSetV1 {
 }
 
 ProofFileV1 { file: direct-child name, sha256: Sha256Digest, size_bytes: u64 > 0 }
+
+RunnerBundleProofV1 {
+  manifest, case_evidence, qualification_catalog, sha256sums: ProofFileV1,
+  qualification_begin, qualification_terminal: ProofFileV1,
+  qualification_begin_pending, qualification_begin_command_receipt: ProofFileV1,
+  qualification_close_pending, qualification_close_command_receipt: ProofFileV1,
+  qualification_final_state, qualification_final_fleet,
+  qualification_cleanup_inventory: ProofFileV1
+}
 ```
 
 `FreshTargetsV1` contains exactly the fresh Control schema, Usage schema, versioned ChunkStore
@@ -152,25 +161,35 @@ AWS rollout details or a single phase receipt as terminal qualification evidence
 
 ### 3.3 E9 final Usage terminal
 
-The exact files are `usage-target-terminal-request.json`,
-`usage-target-terminal-receipt.json` and
-`usage-target-terminal-verification.receipt.json`. Python does not duplicate E9's archive/barrier
-oracle. It invokes the release-bound Rust worker member exactly as follows and compares the newly
-produced canonical verification receipt byte-for-byte with the referenced proof file:
+Each block-path bundle first closes its unique `usage-source-terminal-receipts.json` evidence and
+its own Qualification Begin→End→Closed chain. Only after both bundles are terminal does the
+run-wide finalizer create `usage-global-terminal-finalization.manifest.json`,
+`usage-target-terminal-request.json`, `usage-target-terminal-receipt.json` and
+`usage-target-terminal-verification.receipt.json`. The global manifest binds the ordered
+`kernel-nbd` and `vhost-user` manifest/case-evidence/source-set digests, the exact union of their
+source epochs, the manifest-bound `usage-terminal-targets.json`, and every final target artifact.
+There is no per-block target-terminal effect.
+
+Python closes these outer identities but does not duplicate E9's archive/barrier oracle. It invokes
+the release-bound Rust worker member exactly as follows and compares the newly produced canonical
+verification receipt byte-for-byte with the referenced proof file:
 
 ```text
 /opt/cats/bin/cats-usage-terminal-receipt-verifier
   --receipt-file ABS/usage-target-terminal-receipt.json
   --expected-request-file ABS/usage-target-terminal-request.json
+  --expected-targets-file ABS/usage-terminal-targets.json
+  --expected-targets-sha256 sha256:64lowerhex
   --release-commit 40lowerhex
   --worker-bundle-sha256 sha256:64lowerhex
   --receipt-out ABS/usage-target-terminal-verification.receipt.json
 ```
 
 Only exit 0 and stdout exactly `Usage terminal receipt verified\n` pass. The tool calls the canonical
-Rust target-terminal validator, requires exact request equality and release/worker binding, and emits
-kind `cats.usage-terminal-receipt-verification.v1`. A pre-existing JSON projection, a Python-only
-field check, absent source receipt, incomplete shard barrier or provisional marker fails closed.
+Rust target-terminal validator, requires exact request/target equality and release/worker binding,
+and emits kind `cats.usage-terminal-receipt-verification.v1` with the expected-target file and
+semantic target-binding digests. A pre-existing JSON projection, a Python-only field check, absent
+source receipt, incomplete shard barrier or provisional marker fails closed.
 
 ### 3.4 Old Host coverage and V3
 
@@ -206,14 +225,20 @@ or extra coverage fails closed.
 ### 3.5 V5 qualification
 
 Each `RunnerBundleProofV1` contains exact `manifest.json`, `case-evidence.jsonl`,
-`qualification-catalog.v1.json` and `SHA256SUMS` references. The manifest must be terminal `passed`,
-`exit_code=0`, have the exact raw block path (`kernel-nbd` or `vhost-user`), schema,
+`qualification-catalog.v1.json`, `SHA256SUMS` and its own Qualification admission support files.
+The manifest's ordered `qualification_admission_required_evidence` closes the canonical Begin and
+terminal framework receipts; `SHA256SUMS` also closes both pending commands, both Store receipts,
+the final Closed state and the final Fleet/cleanup receipts. The catalog carries the same ordered
+Begin/terminal filenames and JSON kinds as a run-wide required evidence closed set. The manifest
+must be terminal `passed`, have `exit_code=0`, the exact raw block path (`kernel-nbd` or
+`vhost-user`), schema,
 release/build/installer/catalog identities and a checksum-closed output set. The unique embedded
 `volume-init-matrix/persistent-disk-receipt.json` evidence proves:
 fresh cell/target identity; Persistent create→Cold attach→first-format→`R==L` Initialized→mounted
 Ready→Cold drain/release→detach; Agent crash/restart adoption; stale epoch/ABA rejection; and final
-Closed gates, zero guards, complete inventory with no unknown residue. Both block paths are required;
-one path, skipped/deferred cases, edited JSONL or a reused run ID fails closed.
+Closed gates, zero guards, complete inventory with no unknown residue. Its unique Usage source-set
+evidence binds the same run/workspace/release/catalog. Both block paths are required; one path,
+skipped/deferred cases, edited JSONL or a reused run ID fails closed.
 
 ## 4. Reset plan and forward-only journal
 
