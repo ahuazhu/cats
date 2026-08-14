@@ -34,7 +34,8 @@ const STATE_COLUMNS: &str = "
     revision, mode, binding::text AS binding_json, binding_sha256,
     reset_id, deployment_id, release_id, source_commit_sha,
     control_schema_version, source_manifest_sha256, source_bundle_sha256,
-    release_manifest_sha256, proof_set_sha256, fresh_targets_sha256,
+    release_manifest_sha256, qualification_manifest_sha256,
+    qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
     reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
     route_signing_command_receipt_sha256,
     route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
@@ -50,7 +51,8 @@ const COMMAND_COLUMNS: &str = "
     issued_at_unix_ms, expires_at_unix_ms, expected_revision,
     target_mode, binding_sha256, reset_id, deployment_id, release_id,
     source_commit_sha, control_schema_version, source_manifest_sha256,
-    source_bundle_sha256, release_manifest_sha256, proof_set_sha256,
+    source_bundle_sha256, release_manifest_sha256,
+    qualification_manifest_sha256, qualification_catalog_sha256, proof_set_sha256,
     fresh_targets_sha256, reset_complete_receipt_sha256,
     fleet_closed_receipt_sha256, route_signing_command_receipt_sha256,
     route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
@@ -424,7 +426,8 @@ fn insert_command_receipt(
             expected_revision, target_mode, binding_sha256, reset_id,
             deployment_id, release_id, source_commit_sha, control_schema_version,
             source_manifest_sha256, source_bundle_sha256,
-            release_manifest_sha256, proof_set_sha256, fresh_targets_sha256,
+            release_manifest_sha256, qualification_manifest_sha256,
+            qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
             reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
             route_signing_command_receipt_sha256,
             route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
@@ -435,7 +438,7 @@ fn insert_command_receipt(
             $1,$2::TEXT::jsonb,$3,$4::TEXT::jsonb,'production_cutover_operator',
             $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-            $35::TEXT::jsonb,$36,$37,$38,$39)",
+            $35,$36,$37::TEXT::jsonb,$38,$39,$40,$41)",
         &[
             &receipt.command.command_id.as_str(),
             &command_json,
@@ -461,6 +464,8 @@ fn insert_command_receipt(
             &binding.source_manifest_sha256.as_str(),
             &binding.source_bundle_sha256.as_str(),
             &binding.release_manifest_sha256.as_str(),
+            &binding.qualification_manifest_sha256.as_str(),
+            &binding.qualification_catalog_sha256.as_str(),
             &binding.proof_set_sha256.as_str(),
             &binding.fresh_targets_sha256.as_str(),
             &binding.reset_complete_receipt_sha256.as_str(),
@@ -505,15 +510,16 @@ fn update_state(
             binding_sha256=$5, reset_id=$6, deployment_id=$7, release_id=$8,
             source_commit_sha=$9, control_schema_version=$10,
             source_manifest_sha256=$11, source_bundle_sha256=$12,
-            release_manifest_sha256=$13, proof_set_sha256=$14,
-            fresh_targets_sha256=$15, reset_complete_receipt_sha256=$16,
-            fleet_closed_receipt_sha256=$17,
-            route_signing_command_receipt_sha256=$18,
-            route_ring_delivery_receipt_sha256=$19,
-            usage_terminal_receipt_sha256=$20, old_host_coverage_sha256=$21,
-            kernel_nbd_qualification_bundle_sha256=$22,
-            vhost_user_qualification_bundle_sha256=$23,
-            last_command_id=$24, updated_at_unix_ms=$25
+            release_manifest_sha256=$13, qualification_manifest_sha256=$14,
+            qualification_catalog_sha256=$15, proof_set_sha256=$16,
+            fresh_targets_sha256=$17, reset_complete_receipt_sha256=$18,
+            fleet_closed_receipt_sha256=$19,
+            route_signing_command_receipt_sha256=$20,
+            route_ring_delivery_receipt_sha256=$21,
+            usage_terminal_receipt_sha256=$22, old_host_coverage_sha256=$23,
+            kernel_nbd_qualification_bundle_sha256=$24,
+            vhost_user_qualification_bundle_sha256=$25,
+            last_command_id=$26, updated_at_unix_ms=$27
           WHERE singleton AND revision=$1",
         &[
             &current_revision,
@@ -529,6 +535,8 @@ fn update_state(
             &binding.source_manifest_sha256.as_str(),
             &binding.source_bundle_sha256.as_str(),
             &binding.release_manifest_sha256.as_str(),
+            &binding.qualification_manifest_sha256.as_str(),
+            &binding.qualification_catalog_sha256.as_str(),
             &binding.proof_set_sha256.as_str(),
             &binding.fresh_targets_sha256.as_str(),
             &binding.reset_complete_receipt_sha256.as_str(),
@@ -570,6 +578,10 @@ fn validate_binding_projection(
         && text(row, "source_manifest_sha256")? == binding.source_manifest_sha256.as_str()
         && text(row, "source_bundle_sha256")? == binding.source_bundle_sha256.as_str()
         && text(row, "release_manifest_sha256")? == binding.release_manifest_sha256.as_str()
+        && text(row, "qualification_manifest_sha256")?
+            == binding.qualification_manifest_sha256.as_str()
+        && text(row, "qualification_catalog_sha256")?
+            == binding.qualification_catalog_sha256.as_str()
         && text(row, "proof_set_sha256")? == binding.proof_set_sha256.as_str()
         && text(row, "fresh_targets_sha256")? == binding.fresh_targets_sha256.as_str()
         && text(row, "reset_complete_receipt_sha256")?
@@ -690,16 +702,18 @@ mod tests {
             source_manifest_sha256: digest('0'),
             source_bundle_sha256: digest('1'),
             release_manifest_sha256: digest('2'),
-            proof_set_sha256: digest('3'),
-            fresh_targets_sha256: digest('4'),
-            reset_complete_receipt_sha256: digest('5'),
-            fleet_closed_receipt_sha256: digest('6'),
-            route_signing_command_receipt_sha256: digest('7'),
-            route_ring_delivery_receipt_sha256: digest('8'),
-            usage_terminal_receipt_sha256: digest('9'),
-            old_host_coverage_sha256: digest('a'),
-            kernel_nbd_qualification_bundle_sha256: digest('b'),
-            vhost_user_qualification_bundle_sha256: digest('c'),
+            qualification_manifest_sha256: digest('3'),
+            qualification_catalog_sha256: digest('4'),
+            proof_set_sha256: digest('5'),
+            fresh_targets_sha256: digest('6'),
+            reset_complete_receipt_sha256: digest('7'),
+            fleet_closed_receipt_sha256: digest('8'),
+            route_signing_command_receipt_sha256: digest('9'),
+            route_ring_delivery_receipt_sha256: digest('a'),
+            usage_terminal_receipt_sha256: digest('b'),
+            old_host_coverage_sha256: digest('c'),
+            kernel_nbd_qualification_bundle_sha256: digest('d'),
+            vhost_user_qualification_bundle_sha256: digest('e'),
         }
     }
 

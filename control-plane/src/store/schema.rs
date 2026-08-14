@@ -2786,6 +2786,12 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
     release_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_release_manifest_ck
         CHECK (release_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_manifest_sha256 TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_manifest_ck
+        CHECK (qualification_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_catalog_sha256 TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_catalog_ck
+        CHECK (qualification_catalog_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     proof_set_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_proof_set_ck
         CHECK (proof_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -2871,6 +2877,12 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
     release_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_release_manifest_ck
         CHECK (release_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_manifest_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_manifest_ck
+        CHECK (qualification_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_catalog_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_catalog_ck
+        CHECK (qualification_catalog_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     proof_set_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_proof_set_ck
         CHECK (proof_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -2901,7 +2913,8 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
     vhost_user_qualification_bundle_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_vhost_user_ck
         CHECK (vhost_user_qualification_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    last_command_id TEXT NULL UNIQUE,
+    last_command_id TEXT NULL
+        CONSTRAINT production_mutation_admission_last_command_key UNIQUE,
     updated_at_unix_ms BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_time_ck
         CHECK (updated_at_unix_ms >= 0),
@@ -2910,7 +2923,10 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND deployment_id IS NULL AND release_id IS NULL
             AND source_commit_sha IS NULL AND control_schema_version IS NULL
             AND source_manifest_sha256 IS NULL AND source_bundle_sha256 IS NULL
-            AND release_manifest_sha256 IS NULL AND proof_set_sha256 IS NULL
+            AND release_manifest_sha256 IS NULL
+            AND qualification_manifest_sha256 IS NULL
+            AND qualification_catalog_sha256 IS NULL
+            AND proof_set_sha256 IS NULL
             AND fresh_targets_sha256 IS NULL
             AND reset_complete_receipt_sha256 IS NULL
             AND fleet_closed_receipt_sha256 IS NULL
@@ -2929,6 +2945,8 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND source_manifest_sha256 IS NOT NULL
             AND source_bundle_sha256 IS NOT NULL
             AND release_manifest_sha256 IS NOT NULL
+            AND qualification_manifest_sha256 IS NOT NULL
+            AND qualification_catalog_sha256 IS NOT NULL
             AND proof_set_sha256 IS NOT NULL AND fresh_targets_sha256 IS NOT NULL
             AND reset_complete_receipt_sha256 IS NOT NULL
             AND fleet_closed_receipt_sha256 IS NOT NULL
@@ -2949,6 +2967,7 @@ INSERT INTO production_mutation_admission (
     singleton, revision, mode, binding, binding_sha256, reset_id,
     deployment_id, release_id, source_commit_sha, control_schema_version,
     source_manifest_sha256, source_bundle_sha256, release_manifest_sha256,
+    qualification_manifest_sha256, qualification_catalog_sha256,
     proof_set_sha256, fresh_targets_sha256, reset_complete_receipt_sha256,
     fleet_closed_receipt_sha256, route_signing_command_receipt_sha256,
     route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
@@ -2958,7 +2977,7 @@ INSERT INTO production_mutation_admission (
 ) VALUES (
     TRUE, 1, 'closed', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, 0
+    NULL, NULL, NULL, NULL, NULL, NULL, 0
 );
 CREATE TABLE IF NOT EXISTS node_identities (
     node_id TEXT PRIMARY KEY,
@@ -4116,6 +4135,10 @@ BEGIN
                 AND NEW.source_manifest_sha256 = OLD.source_manifest_sha256
                 AND NEW.source_bundle_sha256 = OLD.source_bundle_sha256
                 AND NEW.release_manifest_sha256 = OLD.release_manifest_sha256
+                AND NEW.qualification_manifest_sha256 =
+                    OLD.qualification_manifest_sha256
+                AND NEW.qualification_catalog_sha256 =
+                    OLD.qualification_catalog_sha256
                 AND NEW.proof_set_sha256 = OLD.proof_set_sha256
                 AND NEW.fresh_targets_sha256 = OLD.fresh_targets_sha256
                 AND NEW.reset_complete_receipt_sha256 = OLD.reset_complete_receipt_sha256
