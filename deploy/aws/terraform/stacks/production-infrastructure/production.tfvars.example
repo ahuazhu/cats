@@ -5,7 +5,8 @@ expected_aws_partition   = "aws"
 eks_cluster_name         = "REPLACE_WITH_PRODUCTION_EKS_CLUSTER"
 usage_archive_bucket_name = "REPLACE_WITH_GLOBALLY_UNIQUE_CATS_USAGE_BUCKET"
 chunkstore_bucket_name     = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
-chunkstore_prefix          = "cats"
+chunkstore_prefix          = "cats-fresh"
+control_postgres_schema    = "cats_fresh"
 
 # Start with one provisioned shard. Scale only from CloudWatch throughput and
 # throttling measurements.

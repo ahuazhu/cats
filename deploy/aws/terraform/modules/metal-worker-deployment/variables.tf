@@ -70,6 +70,16 @@ variable "chunkstore_prefix" {
   }
 }
 
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* PostgreSQL schema shared by controld, noded and every blockd."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
+}
+
 variable "worker_bundle_path" {
   description = "Absolute local path to the reviewed linux/amd64 worker tar.zst bundle."
   type        = string
@@ -223,7 +233,8 @@ variable "worker_managed_environment" {
     deployment, unlike worker_base_environment which only seeds a host that has
     no file yet. Use it for values that must reach an existing host --
     CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
-    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP.
+    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP. CATS_POSTGRES_SCHEMA
+    comes only from control_postgres_schema.
     CATS_POSTGRES_SECRET_ARN is added automatically from
     database_master_user_secret_arn.
   EOT
@@ -245,13 +256,14 @@ variable "worker_managed_environment" {
         "CATS_CHUNKSTORE_PREFIX",
         "CATS_POSTGRES_URL",
         "CATS_POSTGRES_SECRET_ARN",
+        "CATS_POSTGRES_SCHEMA",
         "CATS_METERING_CGROUP_ROOT",
         "CATS_NODE_ID",
         "CATS_NODE_ADVERTISE_URL",
         "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX comes only from chunkstore_prefix; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
   }
 
   validation {
@@ -310,9 +322,9 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_AUTH_TOKEN", "CATS_CHUNKSTORE_PREFIX", "CATS_POSTGRES_URL"]),
+      toset(["CATS_AUTH_TOKEN", "CATS_CHUNKSTORE_PREFIX", "CATS_POSTGRES_SCHEMA", "CATS_POSTGRES_URL"]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX comes only from chunkstore_prefix; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
   }
 
   # Everything in this map reaches every fresh host identically, and a second

@@ -89,6 +89,16 @@ check "usage_delivery_configuration" {
   }
 }
 
+check "control_postgres_search_path" {
+  assert {
+    condition = (
+      length(regexall("(^|[?&])options=", var.storage_postgres_url)) == 1 &&
+      length(regexall("(^|[?&])options=-csearch_path%3D${var.control_postgres_schema}(&|$)", var.storage_postgres_url)) == 1
+    )
+    error_message = "storage_postgres_url must select exactly control_postgres_schema through one canonical options=-csearch_path%3D<schema> query item."
+  }
+}
+
 check "stripe_configuration" {
   assert {
     condition = !var.stripe_enabled || (

@@ -18,7 +18,10 @@ locals {
       for key in sort(keys(var.worker_base_environment)) :
       "${key}=${var.worker_base_environment[key]}"
     ],
-    ["CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}"],
+    [
+      "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
+      "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
+    ],
   ))
 
   # Non-secret configuration Terraform owns outright, merged onto an existing
@@ -32,7 +35,10 @@ locals {
       for key in sort(keys(var.worker_managed_environment)) :
       "${key}=${var.worker_managed_environment[key]}"
     ],
-    ["CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}"],
+    [
+      "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
+      "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
+    ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
     ],

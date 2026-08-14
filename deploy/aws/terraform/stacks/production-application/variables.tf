@@ -121,6 +121,16 @@ variable "storage_postgres_url" {
   sensitive   = true
 }
 
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* schema selected as search_path by controld, noded and every blockd."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
+}
+
 variable "storage_postgres_session_setup" {
   description = "Where ChunkStore PostgreSQL session timeouts are established. Use server-verified only with an RDS Proxy initialization query."
   type        = string
@@ -163,7 +173,11 @@ variable "usage_postgres_url" {
 variable "usage_postgres_schema" {
   description = "Independent PostgreSQL schema for usage metering."
   type        = string
-  default     = "cats_usage"
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.usage_postgres_schema)) && length(var.usage_postgres_schema) <= 63
+    error_message = "usage_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
 }
 
 variable "usage_postgres_workers" {

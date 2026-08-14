@@ -56,6 +56,7 @@ jobs:
       # silently point at a different object namespace than blockd.
       CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}
       CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}
+      CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}
       # Opaque names only. The Secrets are created by the root-only Route v2
       # credential workflow and must be immutable with closed key sets.
       ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME: ${{ vars.ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME }}
@@ -216,6 +217,7 @@ jobs:
             PRODUCTION_TFVARS_B64 \
             CHUNKSTORE_BUCKET_NAME \
             CHUNKSTORE_PREFIX \
+            CONTROL_POSTGRES_SCHEMA \
             RDS_MASTER_USER_SECRET_ARN \
             ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME \
             ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME \
@@ -227,6 +229,11 @@ jobs:
               exit 1
             fi
           done
+          [[ "$CONTROL_POSTGRES_SCHEMA" =~ ^cats_[a-z0-9_]+$ ]] &&
+            (( ${#CONTROL_POSTGRES_SCHEMA} <= 63 )) || {
+              echo "::error::CONTROL_POSTGRES_SCHEMA must be one lowercase cats_* PostgreSQL identifier"
+              exit 1
+            }
 
           printf '%s' "$PRODUCTION_TFVARS_B64" \
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
@@ -362,10 +369,14 @@ jobs:
             "$RUNNER_TEMP/live-secret.json" \
             "$RUNNER_TEMP/master-user-secret.json" \
             "${postgres_host_args[@]}" \
+            --schema "CATS_POSTGRES_URL=$CONTROL_POSTGRES_SCHEMA" \
             CATS_POSTGRES_URL \
             CATS_USAGE_POSTGRES_URL \
             > "$RUNNER_TEMP/rotated-urls.json"
           chmod 600 "$RUNNER_TEMP/rotated-urls.json"
+          jq -erj '.CATS_POSTGRES_URL' "$RUNNER_TEMP/rotated-urls.json" \
+            > "$RUNNER_TEMP/proposed-control-postgres-url"
+          chmod 600 "$RUNNER_TEMP/proposed-control-postgres-url"
 
           for key in \
             CATS_POSTGRES_URL \
@@ -422,6 +433,7 @@ jobs:
             "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/route-grant-public.pem" \
             "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
+            "$RUNNER_TEMP/proposed-control-postgres-url" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility
@@ -438,20 +450,31 @@ jobs:
             exit 1
           fi
 
-          # The control store lives in PostgreSQL. Query its stamped version
-          # from inside the cluster (the runner cannot reach RDS) through a
-          # one-off pod that reads the DSN from the same Secret the control
-          # plane uses, so no credential leaves the cluster. A fresh database
-          # has no version table yet and is always compatible; anything else
-          # that prevents reading the version fails the gate closed.
+          # The control store lives in PostgreSQL. Probe the proposed fresh
+          # DSN, not the live Pod's old Secret. The
+          # runner turns the local root-only file into a short-lived Kubernetes
+          # Secret so the credential never enters argv or a Pod manifest.
           probe="control-schema-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          selected_schema="$(
+            deploy/aws/run-postgres-probe.sh \
+              "$RUNNER_TEMP/kubeconfig" \
+              cats \
+              "${probe}-target" \
+              "SELECT current_schema()" \
+              "$RUNNER_TEMP/proposed-control-postgres-url"
+          )"
+          if [[ "$selected_schema" != "$CONTROL_POSTGRES_SCHEMA" ]]; then
+            echo "::error::Proposed Control DSN selected schema ${selected_schema:-<none>} instead of $CONTROL_POSTGRES_SCHEMA"
+            exit 1
+          fi
           set +e
           query_output="$(
             deploy/aws/run-postgres-probe.sh \
               "$RUNNER_TEMP/kubeconfig" \
               cats \
               "$probe" \
-              "SELECT version FROM control_schema_version"
+              "SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version" \
+              "$RUNNER_TEMP/proposed-control-postgres-url"
           )"
           query_status=$?
           set -e
@@ -462,7 +485,9 @@ jobs:
               echo "::error::Control database schema $actual_schema does not exactly match build schema $required_schema. Recreate the database with the reviewed clean-slate cutover runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
-          elif (( query_status != 0 )) && [[ "$query_output" == *'relation "control_schema_version" does not exist'* ]]; then
+          elif (( query_status != 0 )) && \
+            [[ "$query_output" == *'does not exist'* ]] && \
+            [[ "$query_output" == *"${CONTROL_POSTGRES_SCHEMA}.control_schema_version"* ]]; then
             echo "Control database has no stamped schema yet; the new Pod creates version $required_schema."
           else
             echo "::error::Could not read the control database schema version (probe exit $query_status): $query_output"
@@ -536,6 +561,7 @@ jobs:
             -var="route_v2_gateway_artifact_secret_name=$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
             -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
             -var="chunkstore_prefix=$CHUNKSTORE_PREFIX" \
+            -var="control_postgres_schema=$CONTROL_POSTGRES_SCHEMA" \
             -var="credential_refresher_image=$REFRESHER_REF" \
             -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
 

@@ -43,6 +43,7 @@ module "cats_kubernetes" {
   route_grant_public_key_pem            = var.route_grant_public_key_pem
   runtime_provisioner_trust_bundle_json = var.runtime_provisioner_trust_bundle_json
   storage_postgres_url                  = var.storage_postgres_url
+  control_postgres_schema               = var.control_postgres_schema
   storage_postgres_session_setup        = var.storage_postgres_session_setup
   chunkstore_bucket_name                = var.chunkstore_bucket_name
   chunkstore_region                     = var.aws_region

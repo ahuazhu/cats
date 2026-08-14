@@ -189,6 +189,16 @@ variable "storage_postgres_url" {
   }
 }
 
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* schema selected as search_path by every control metadata client."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
+}
+
 variable "storage_postgres_session_setup" {
   description = "Where ChunkStore PostgreSQL session timeouts are established. server-verified avoids client SET statements that pin RDS Proxy sessions."
   type        = string

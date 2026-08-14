@@ -797,7 +797,7 @@ fn control_plane_image_manifest_access_is_exact_and_read_only() {
 }
 
 #[test]
-fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
+fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     let reset_runbook = read_workspace_file("deploy/aws/production-clean-slate-reset.md");
     assert!(
         reset_runbook.contains("--fresh-chunkstore-prefix cats-fresh"),
@@ -811,10 +811,15 @@ fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
         2,
         "one reviewed infrastructure input must feed both usage IAM and the worker deployment"
     );
+    assert!(infrastructure
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>()
+            == ["control_postgres_schema", "=", "var.control_postgres_schema"]));
 
     let worker_variables =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
     assert!(worker_variables.contains("variable \"chunkstore_prefix\""));
+    assert!(worker_variables.contains("variable \"control_postgres_schema\""));
     assert_eq!(
         worker_variables
             .matches("\"CATS_CHUNKSTORE_PREFIX\"")
@@ -832,6 +837,13 @@ fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
         2,
         "both a fresh seed and an existing worker environment must receive the exact prefix"
     );
+    assert_eq!(
+        worker_module
+            .matches("CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}")
+            .count(),
+        2,
+        "both a fresh seed and an existing worker environment must receive the exact schema"
+    );
 
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("--object-store-option prefix=${CATS_CHUNKSTORE_PREFIX}"));
@@ -840,6 +852,10 @@ fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     assert!(workflow.contains("CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}"));
     assert!(workflow.contains("-var=\"chunkstore_prefix=$CHUNKSTORE_PREFIX\""));
+    assert!(workflow.contains("CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}"));
+    assert!(workflow.contains("--schema \"CATS_POSTGRES_URL=$CONTROL_POSTGRES_SCHEMA\""));
+    assert!(workflow.contains("-var=\"control_postgres_schema=$CONTROL_POSTGRES_SCHEMA\""));
+    assert!(workflow.contains("${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
 
     for variables_path in [
         "deploy/aws/terraform/stacks/production-infrastructure/variables.tf",
@@ -863,16 +879,44 @@ fn production_chunkstore_prefix_is_one_exact_control_and_worker_input() {
         ] {
             assert!(prefix.contains(canonical_guard));
         }
+
+        let schema = variables
+            .split_once("variable \"control_postgres_schema\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(section, _)| section)
+            .expect("production control_postgres_schema variable");
+        assert!(
+            !schema.contains("default"),
+            "{variables_path} must require the reviewed fresh schema"
+        );
+        assert!(schema.contains("^cats_[a-z0-9_]+$"));
     }
 
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
     assert!(application.contains("chunkstore_prefix                     = var.chunkstore_prefix"));
+    assert!(application
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>()
+            == ["control_postgres_schema", "=", "var.control_postgres_schema"]));
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     assert!(kubernetes.contains("prefix=${var.chunkstore_prefix}"));
+    assert!(kubernetes.contains(
+        "options=-csearch_path%3D${var.control_postgres_schema}"
+    ));
 
     let manual_environment = read_workspace_file("deploy/aws/metal/worker.env.example");
     assert!(manual_environment.contains("CATS_CHUNKSTORE_PREFIX=cats"));
+    assert!(manual_environment.contains("CATS_POSTGRES_SCHEMA=cats_fresh"));
+    let renderer = read_workspace_file("deploy/aws/metal/render-postgres-url.sh");
+    assert!(renderer.contains(
+        "options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"
+    ));
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("url-file=/run/cats/postgres-url"));
+    let root_provision =
+        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
+    assert!(root_provision.contains("url-file=/run/cats/postgres-url"));
     let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
     assert!(verifier.contains("\"cats-worker.service\""));
 }
@@ -1007,8 +1051,14 @@ fn production_schema_probe_fails_closed() {
 
     assert!(probe.contains("query_status=$?"));
     assert!(probe.contains("deploy/aws/run-postgres-probe.sh"));
-    assert!(probe.contains("SELECT version FROM control_schema_version"));
+    assert!(probe.contains("SELECT current_schema()"));
+    assert!(probe.contains(
+        "SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version"
+    ));
+    assert!(probe.contains("$RUNNER_TEMP/proposed-control-postgres-url"));
     assert!(runner.contains("-v ON_ERROR_STOP=1"));
+    assert!(runner.contains("create secret generic \"$runtime_secret\""));
+    assert!(runner.contains("--from-file=\"CATS_POSTGRES_URL=$postgres_url_file\""));
     assert!(runner.contains("logs \"$probe\" --container=psql"));
     assert!(runner.contains("state.terminated.exitCode"));
     assert!(
@@ -1018,7 +1068,8 @@ fn production_schema_probe_fails_closed() {
             .any(|line| line.contains("--attach")),
         "the schema probe must not attach to the short-lived container"
     );
-    assert!(probe.contains(r#"relation "control_schema_version" does not exist"#));
+    assert!(probe.contains("*'does not exist'*"));
+    assert!(probe.contains("${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
     assert!(
         !probe.contains("2>/dev/null || true"),
         "database, cluster and scheduling failures must not look like a fresh schema"
@@ -2858,7 +2909,7 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
     std::fs::write(
         &live,
         r#"{
-          "CATS_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full",
+          "CATS_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full&options=-csearch_path%3Dcats_old",
           "CATS_USAGE_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full"
         }"#,
     )
@@ -2871,6 +2922,8 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
         .args([
             "--host",
             "CATS_POSTGRES_URL=cats-production-proxy.proxy.example",
+            "--schema",
+            "CATS_POSTGRES_URL=cats_fresh_cutover",
             "CATS_POSTGRES_URL",
             "CATS_USAGE_POSTGRES_URL",
         ])
@@ -2884,7 +2937,7 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
     let rewritten: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         rewritten["CATS_POSTGRES_URL"],
-        "postgresql://cats:n%40w%3Ap%2Fss@cats-production-proxy.proxy.example:5432/cats?sslmode=verify-full"
+        "postgresql://cats:n%40w%3Ap%2Fss@cats-production-proxy.proxy.example:5432/cats?sslmode=verify-full&options=-csearch_path%3Dcats_fresh_cutover"
     );
     assert_eq!(
         rewritten["CATS_USAGE_POSTGRES_URL"],
@@ -2897,6 +2950,8 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
         .args([
             "--host",
             "CATS_POSTGRES_URL=https://attacker.example",
+            "--schema",
+            "CATS_POSTGRES_URL=cats_fresh_cutover",
             "CATS_POSTGRES_URL",
         ])
         .output()

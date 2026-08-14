@@ -79,6 +79,16 @@ variable "chunkstore_prefix" {
   }
 }
 
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* PostgreSQL schema shared by controld, noded and every blockd."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
+}
+
 variable "usage_archive_object_lock_days" {
   description = "Default governance retention for archived raw usage objects."
   type        = number
@@ -187,7 +197,8 @@ variable "worker_managed_environment" {
     Non-secret worker.env entries Terraform rewrites on every deployment, so
     they reach a host that already has the file. Carries the non-secret half of
     the DSN: CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
-    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP.
+    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP. The exact search_path
+    comes only from the separate required control_postgres_schema input.
   EOT
   type        = map(string)
   default     = {}
