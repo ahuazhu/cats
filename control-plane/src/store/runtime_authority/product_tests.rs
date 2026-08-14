@@ -1256,7 +1256,7 @@ async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn graceful_singleton_shutdown_waits_for_exact_resolution_and_lock_release() {
+async fn cancelled_singleton_shutdown_can_rejoin_exact_resolution_and_lock_release() {
     let (url, setup, _unused, workspace) = stores();
     let mut create = request(&workspace, "billing-commit-loss", 87, "billing-loss-create");
     let (_identity, _policy, release) = prepare_mutation_node(&setup, &mut create, 87);
@@ -1340,9 +1340,23 @@ async fn graceful_singleton_shutdown_waits_for_exact_resolution_and_lock_release
         0,
         "standby must not acquire while graceful shutdown resolves an ambiguous COMMIT"
     );
-    tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+    drop(shutdown);
+
+    let mut resumed_shutdown = Box::pin(leader_task.shutdown());
+    tokio::select! {
+        result = &mut resumed_shutdown => {
+            panic!("a retried shutdown lost the in-progress singleton join: {result:?}");
+        }
+        () = tokio::time::sleep(Duration::from_millis(400)) => {}
+    }
+    assert_eq!(
+        standby_starts.load(Ordering::SeqCst),
+        0,
+        "cancelling a shutdown waiter must not release leadership before exact resolution"
+    );
+    tokio::time::timeout(Duration::from_secs(5), &mut resumed_shutdown)
         .await
-        .expect("graceful shutdown should return after exact resolution")
+        .expect("retried shutdown should return after exact resolution")
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while standby_starts.load(Ordering::SeqCst) == 0 {

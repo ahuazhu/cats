@@ -715,7 +715,7 @@ pub struct Handle {
 /// Joinable ownership of one elected background role.
 pub struct ManagedSingletonTask {
     shutdown: tokio::sync::watch::Sender<bool>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ManagedSingletonTask {
@@ -728,15 +728,16 @@ impl ManagedSingletonTask {
     /// PostgreSQL advisory-lock release to complete.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
-        let task = self
-            .task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(task) = task {
-            task.await.context("singleton election task failed")?;
-        }
-        Ok(())
+        let mut task = self.task.lock().await;
+        let result = match task.as_mut() {
+            Some(task) => task.await.context("singleton election task failed"),
+            None => Ok(()),
+        };
+        // Keep the handle in the slot while awaiting it. If this shutdown
+        // future is cancelled, a later call can resume the same join instead
+        // of mistaking a detached cleanup for a completed one.
+        task.take();
+        result
     }
 }
 
@@ -966,7 +967,7 @@ where
     ));
     ManagedSingletonTask {
         shutdown,
-        task: Mutex::new(Some(task)),
+        task: tokio::sync::Mutex::new(Some(task)),
     }
 }
 
