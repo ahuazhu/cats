@@ -674,7 +674,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::time::{Duration, Instant};
 
-    use cats_api::object_write_gateway::ObjectWriteImmutableKey;
+    use cats_api::object_write_gateway::{ObjectWriteCredentialReference, ObjectWriteImmutableKey};
     use cats_api::runtime_reconciliation::{
         AsciiText, Id, ProviderScope, Sha256Digest, UnixMillis, WireU64,
     };
@@ -693,6 +693,10 @@ mod tests {
         ObjectWriteIngress {
             writer_authority_id: id("writer_a"),
             request_id: Sha256Digest::from_bytes(Sha256::digest(b"request-a").into()),
+            credential: ObjectWriteCredentialReference {
+                credential_id: id("credential_a"),
+                public_key_spki_sha256: Sha256Digest::from_bytes([7_u8; 32]),
+            },
             volume_id: id("volume_a"),
             key: ObjectWriteImmutableKey::VolumeMap,
             target: ObjectWriteTarget {
@@ -707,6 +711,7 @@ mod tests {
             },
             content_sha256: Sha256Digest::from_bytes(Sha256::digest(body).into()),
             content_length: WireU64::new(body.len() as u64).unwrap(),
+            qualification_fault: None,
             receiving_started_at_unix_ms: UnixMillis::new(1).unwrap(),
         }
     }

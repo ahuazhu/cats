@@ -7,9 +7,10 @@
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ApiError;
 use cats_api::object_write_gateway::{
-    ObjectWriteCredentialReference, ObjectWriteCredentialRegistration,
-    ObjectWriteCredentialRegistrationReceipt, ObjectWriteImmutableKey,
-    ObjectWriteIngressDescriptor,
+    encode_object_write_qualification_head_evidence, ObjectWriteCredentialReference,
+    ObjectWriteCredentialRegistration, ObjectWriteCredentialRegistrationReceipt,
+    ObjectWriteImmutableKey, ObjectWriteIngressDescriptor,
+    ObjectWriteQualificationUnprovenReasonV1,
 };
 use cats_api::runtime_reconciliation::{
     AsciiText, ContractVersion, CredentialBinding, Id, NodeIdentityState, Sha256Digest, UnixMillis,
@@ -204,6 +205,7 @@ fn accepted_state(attempt: &ObjectPutAttempt) -> &'static str {
     match &attempt.state {
         ObjectPutState::AcceptedSpooled { .. } => "accepted_spooled",
         ObjectPutState::ProviderIssued { .. } => "provider_issued",
+        ObjectPutState::QualificationResponseLost { .. } => "qualification_response_lost",
         ObjectPutState::Terminal { outcome, spool } => {
             if matches!(spool, TerminalObjectWriteSpool::Removed { .. }) {
                 "spool_removed"
@@ -211,6 +213,9 @@ fn accepted_state(attempt: &ObjectPutAttempt) -> &'static str {
                 match outcome {
                     ObjectPutTerminalState::SucceededVisible { .. } => "terminal_visible",
                     ObjectPutTerminalState::PermanentlyFailed { .. } => "permanent",
+                    ObjectPutTerminalState::QualificationUnprovenVisible { .. } => {
+                        "qualification_unproven_visible"
+                    }
                 }
             }
         }
@@ -560,12 +565,16 @@ fn persist_terminal_attempt(
         visible_at,
         failure_receipt,
         failed_at,
+        qualification_unproven_reason,
+        qualification_head_evidence,
+        qualification_unproven_at,
     ) = match outcome {
         ObjectPutTerminalState::SucceededVisible {
             put_receipt_id,
             put_completed_at_unix_ms,
             visibility_receipt_id,
             visible_at_unix_ms,
+            qualification_ambiguity: _,
         } => (
             "terminal_visible",
             "succeeded_visible",
@@ -573,6 +582,9 @@ fn persist_terminal_attempt(
             Some(pg(put_completed_at_unix_ms.get())?),
             Some(visibility_receipt_id.as_str()),
             Some(pg(visible_at_unix_ms.get())?),
+            None,
+            None,
+            None,
             None,
             None,
         ),
@@ -588,6 +600,29 @@ fn persist_terminal_attempt(
             None,
             Some(failure_receipt_id.as_str()),
             Some(pg(failed_at_unix_ms.get())?),
+            None,
+            None,
+            None,
+        ),
+        ObjectPutTerminalState::QualificationUnprovenVisible { receipt } => (
+            "qualification_unproven_visible",
+            "qualification_unproven_visible",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(match receipt.reason {
+                ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent => {
+                    "response_loss_receipt_absent"
+                }
+            }),
+            Some(
+                encode_object_write_qualification_head_evidence(&receipt.head_evidence)
+                    .map_err(|_| corrupt("invalid qualification HEAD evidence"))?,
+            ),
+            Some(pg(receipt.resolved_at_unix_ms.get())?),
         ),
     };
     let changed = transaction.execute(
@@ -595,7 +630,10 @@ fn persist_terminal_attempt(
             SET record=$2::TEXT::jsonb, state=$3, terminal_kind=$4,
                 put_receipt_id=$5, put_completed_at_unix_ms=$6,
                 visibility_receipt_id=$7, visible_at_unix_ms=$8,
-                failure_receipt_id=$9, failed_at_unix_ms=$10
+                failure_receipt_id=$9, failed_at_unix_ms=$10,
+                qualification_unproven_reason=$11,
+                qualification_head_evidence_canonical=$12,
+                qualification_unproven_at_unix_ms=$13
           WHERE request_id=$1 AND state='provider_issued'",
         &[
             &attempt.descriptor.request_id.as_str(),
@@ -608,6 +646,9 @@ fn persist_terminal_attempt(
             &visible_at,
             &failure_receipt,
             &failed_at,
+            &qualification_unproven_reason,
+            &qualification_head_evidence,
+            &qualification_unproven_at,
         ],
     )?;
     if changed != 1 {
@@ -642,7 +683,9 @@ fn persist_spool_removed(
         "UPDATE object_write_attempts
             SET record=$2::TEXT::jsonb, state='spool_removed',
                 spool_removal_receipt_id=$3, spool_removed_at_unix_ms=$4
-          WHERE request_id=$1 AND state IN ('terminal_visible', 'permanent')",
+          WHERE request_id=$1 AND state IN (
+              'terminal_visible', 'permanent', 'qualification_unproven_visible'
+          )",
         &[
             &attempt.descriptor.request_id.as_str(),
             &record,
@@ -1081,7 +1124,10 @@ fn advance_terminal_prefix_in(
            FROM object_write_attempts
           WHERE writer_authority_id=$1
             AND accepted_sequence > $2
-            AND state IN ('terminal_visible', 'permanent', 'spool_removed')
+            AND state IN (
+                'terminal_visible', 'permanent',
+                'qualification_unproven_visible', 'spool_removed'
+            )
           ORDER BY accepted_sequence
           LIMIT $3",
         &[
@@ -1199,7 +1245,8 @@ impl Store {
                 StoredObjectWriteAttempt::Accepted(attempt) => {
                     let embedded = match &attempt.state {
                         ObjectPutState::AcceptedSpooled { spool }
-                        | ObjectPutState::ProviderIssued { spool, .. } => spool,
+                        | ObjectPutState::ProviderIssued { spool, .. }
+                        | ObjectPutState::QualificationResponseLost { spool, .. } => spool,
                         ObjectPutState::Terminal { spool, .. } => match spool {
                             TerminalObjectWriteSpool::Retained { spool }
                             | TerminalObjectWriteSpool::Removed { spool, .. } => spool,
@@ -1445,7 +1492,8 @@ impl Store {
                          ON authority.writer_authority_id=attempt.writer_authority_id
                       WHERE attempt.state IN (
                         'accepted_spooled', 'provider_issued',
-                        'terminal_visible', 'permanent'
+                        'qualification_response_lost', 'terminal_visible',
+                        'permanent', 'qualification_unproven_visible'
                       )
                         AND ($1::TEXT IS NULL
                              OR attempt.request_id COLLATE \"C\" > $1 COLLATE \"C\")
