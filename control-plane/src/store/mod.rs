@@ -19,6 +19,7 @@ mod executor;
 mod leadership;
 mod metrics;
 mod nodes;
+mod object_write_gateway_client;
 mod oci;
 mod operations;
 mod rows;
@@ -43,6 +44,10 @@ mod agent_session_tests;
 
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
+pub use object_write_gateway_client::{
+    ObjectWriteGatewayClient, OBJECT_WRITE_GATEWAY_POSTGRES_ROLE,
+    OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1,
+};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
 pub use runtime_authority::host_fence_provider_queue::{

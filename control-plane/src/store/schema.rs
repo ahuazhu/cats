@@ -188,6 +188,7 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
         }
         transaction.batch_execute(SCHEMA).map_err(internal)?;
         install_host_fence_provider_functions(&mut transaction)?;
+        install_object_write_gateway_functions(&mut transaction)?;
         transaction
             .execute(
                 "INSERT INTO control_schema_version (singleton, version) VALUES (TRUE, $1)",
@@ -237,6 +238,7 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
     }
     verify_authority_catalog(transaction)?;
     verify_host_fence_provider_function_catalog(transaction)?;
+    verify_object_write_gateway_function_catalog(transaction)?;
     Ok(())
 }
 
@@ -289,6 +291,393 @@ fn install_host_fence_provider_functions(
             "install Host-fence provider PostgreSQL functions: {detail}"
         ))
     })
+}
+
+const OBJECT_WRITE_GATEWAY_FUNCTIONS: &str = include_str!("object_write_gateway_functions.sql");
+
+#[derive(Clone, Copy)]
+struct ObjectWriteGatewayFunction {
+    name: &'static str,
+    identity_arguments: &'static str,
+    result: &'static str,
+    security_definer: bool,
+    strict: bool,
+    volatility: &'static str,
+    language: &'static str,
+    gateway_execute: bool,
+}
+
+const OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG: &[ObjectWriteGatewayFunction] = &[
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_accept_v1",
+        identity_arguments: "requested_request_id text",
+        result: "TABLE(record_json text, authority_json text, accepted boolean)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_begin_ingress_v1",
+        identity_arguments: "requested_attachment jsonb, requested_descriptor jsonb",
+        result: "TABLE(record_json text, authority_json text, accepted boolean)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_frame_v1",
+        identity_arguments: "value bytea",
+        result: "bytea",
+        security_definer: false,
+        strict: true,
+        volatility: "i",
+        language: "sql",
+        gateway_execute: false,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_provider_issued_v1",
+        identity_arguments: "requested_request_id text",
+        result: "TABLE(record_json text, authority_json text)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_qualification_head_canonical_v1",
+        identity_arguments: "value jsonb",
+        result: "bytea",
+        security_definer: false,
+        strict: true,
+        volatility: "i",
+        language: "plpgsql",
+        gateway_execute: false,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_qualification_response_lost_v1",
+        identity_arguments:
+            "p_request_canonical bytea, p_successful_put_canonical bytea",
+        result: "TABLE(found boolean, attempt_canonical bytea, authorization_canonical bytea, response_loss_canonical bytea)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_recover_accepted_v1",
+        identity_arguments: "requested_after_request_id text",
+        result: "TABLE(request_id text, state text, record_json text, authority_json text)",
+        security_definer: true,
+        strict: false,
+        volatility: "s",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_recover_ingress_v1",
+        identity_arguments: "requested_after_request_id text",
+        result: "TABLE(request_id text, state text, record_json text)",
+        security_definer: true,
+        strict: false,
+        volatility: "s",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_register_v1",
+        identity_arguments: "requested_node_credential_id text, requested_node_public_key_sha256 text, requested_attachment jsonb, requested_registration jsonb",
+        result: "jsonb",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_spool_durable_v1",
+        identity_arguments: "requested_request_id text, requested_spool jsonb",
+        result: "TABLE(record_json text, authority_json text, accepted boolean)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_spool_removed_v1",
+        identity_arguments: "requested_request_id text, requested_removal_receipt_id text",
+        result: "TABLE(record_json text, authority_json text)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_startup_v1",
+        identity_arguments: "",
+        result: "TABLE(protocol_version bigint, schema_version bigint, schema_name text, expected_role text, routine_count bigint, contract_sha256 text, catalog_sha256 text, qualification_lock_available boolean)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_terminal_v1",
+        identity_arguments: "requested_request_id text, requested_outcome_canonical bytea",
+        result: "TABLE(record_json text, authority_json text)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+];
+
+fn object_write_gateway_function_body(name: &str) -> Result<&'static str> {
+    let declaration = format!("CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.{name}(");
+    let function = OBJECT_WRITE_GATEWAY_FUNCTIONS
+        .find(&declaration)
+        .ok_or_else(|| internal(format!("missing object-write function source for {name}")))?;
+    let source = &OBJECT_WRITE_GATEWAY_FUNCTIONS[function..];
+    let body_start = source
+        .find("AS $function$")
+        .map(|offset| offset + "AS $function$".len())
+        .ok_or_else(|| internal(format!("missing object-write function body for {name}")))?;
+    let body = &source[body_start..];
+    let body_end = body.find("$function$;").ok_or_else(|| {
+        internal(format!(
+            "unterminated object-write function body for {name}"
+        ))
+    })?;
+    Ok(&body[..body_end])
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+pub(super) fn object_write_gateway_contract_sha256() -> Result<String> {
+    let mut lines = Vec::new();
+    for function in OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG
+        .iter()
+        .filter(|function| function.gateway_execute)
+    {
+        lines.push(format!(
+            "{}\0{}\0{}",
+            function.name, function.identity_arguments, function.result
+        ));
+    }
+    Ok(sha256_text(&format!(
+        "cats.control-object-write-gateway-contract.v1\n{}",
+        lines.join("\n")
+    )))
+}
+
+pub(super) fn object_write_gateway_catalog_sha256() -> Result<String> {
+    let mut lines = Vec::new();
+    for function in OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG {
+        let body_sha256 = sha256_text(object_write_gateway_function_body(function.name)?)
+            .strip_prefix("sha256:")
+            .ok_or_else(|| internal("object-write function digest lost its prefix"))?
+            .to_string();
+        lines.push(format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0search_path=pg_catalog, pg_temp\0true\0true\0{}\0{}",
+            function.name,
+            function.identity_arguments,
+            function.result,
+            function.security_definer,
+            function.strict,
+            function.volatility,
+            function.language,
+            function.gateway_execute,
+            body_sha256,
+        ));
+    }
+    Ok(sha256_text(&lines.join("\n")))
+}
+
+pub(super) fn object_write_gateway_catalog_function_names() -> Vec<&'static str> {
+    OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG
+        .iter()
+        .map(|function| function.name)
+        .collect()
+}
+
+pub(super) fn object_write_gateway_catalog_function_count() -> usize {
+    OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG.len()
+}
+
+fn install_object_write_gateway_functions(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<()> {
+    let schema: String = transaction
+        .query_one("SELECT current_schema()::TEXT", &[])
+        .map_err(internal)?
+        .try_get(0)
+        .map_err(internal)?;
+    let schema_identifier = quote_identifier(&schema)?;
+    let schema_literal = quote_literal(&schema)?;
+    let contract_sha256 = object_write_gateway_contract_sha256()?;
+    let contract_hex = contract_sha256
+        .strip_prefix("sha256:")
+        .ok_or_else(|| internal("object-write contract digest lost its prefix"))?;
+    let functions = OBJECT_WRITE_GATEWAY_FUNCTIONS
+        .replace("__CATS_SCHEMA_IDENT__", &schema_identifier)
+        .replace("__CATS_SCHEMA_LITERAL__", &schema_literal)
+        .replace(
+            "__CATS_OBJECT_WRITE_GATEWAY_CONTRACT_SHA256_VALUE__",
+            contract_hex,
+        );
+    transaction.batch_execute(&functions).map_err(|error| {
+        let detail = error
+            .as_db_error()
+            .map(|database| {
+                format!(
+                    "{}{}",
+                    database.message(),
+                    database
+                        .position()
+                        .map(|position| format!(" at {position:?}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| error.to_string());
+        internal(format!(
+            "install object-write gateway PostgreSQL functions: {detail}"
+        ))
+    })?;
+    transaction
+        .batch_execute(&format!(
+            "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema_identifier} FROM PUBLIC"
+        ))
+        .map_err(|error| {
+            internal(format!(
+                "close object-write gateway PUBLIC function surface: {error}"
+            ))
+        })
+}
+
+fn verify_object_write_gateway_function_catalog(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<()> {
+    let contract_sha256 = object_write_gateway_contract_sha256()?;
+    let contract_hex = contract_sha256
+        .strip_prefix("sha256:")
+        .ok_or_else(|| internal("object-write contract digest lost its prefix"))?;
+    let names: Vec<&str> = OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG
+        .iter()
+        .map(|function| function.name)
+        .collect();
+    let count: i64 = transaction
+        .query_one(
+            "SELECT COUNT(*)
+               FROM pg_proc function
+               JOIN pg_namespace namespace ON namespace.oid=function.pronamespace
+              WHERE namespace.nspname=current_schema()
+                AND function.proname=ANY($1::TEXT[])",
+            &[&names],
+        )
+        .map_err(internal)?
+        .get(0);
+    if usize::try_from(count).ok() != Some(OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG.len()) {
+        return Err(partial_catalog_object(
+            "object-write gateway exact function inventory",
+        ));
+    }
+    for function in OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG {
+        let body_sha256 = sha256_text(object_write_gateway_function_body(function.name)?)
+            .strip_prefix("sha256:")
+            .ok_or_else(|| internal("object-write function digest lost its prefix"))?
+            .to_string();
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_proc function
+                      JOIN pg_namespace namespace
+                        ON namespace.oid=function.pronamespace
+                      JOIN pg_language language ON language.oid=function.prolang
+                     WHERE namespace.nspname=current_schema()
+                       AND function.proname=$1
+                       AND pg_get_function_identity_arguments(function.oid)=$2
+                       AND pg_get_function_result(function.oid)=$3
+                       AND function.prosecdef=$4
+                       AND function.proisstrict=$5
+                       AND function.provolatile::TEXT=$6
+                       AND language.lanname=$7
+                       AND function.proconfig =
+                           ARRAY['search_path=pg_catalog, pg_temp']::TEXT[]
+                       AND function.proowner=namespace.nspowner
+                       AND encode(sha256(convert_to(
+                           replace(replace(replace(
+                               function.prosrc,
+                               chr(34) || current_schema() || chr(34),
+                               '__CATS_SCHEMA_IDENT__'
+                           ), quote_literal(current_schema()),
+                              '__CATS_SCHEMA_LITERAL__'),
+                              $8, '__CATS_OBJECT_WRITE_GATEWAY_CONTRACT_SHA256_VALUE__'
+                           ), 'UTF8')), 'hex')=$9
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM aclexplode(COALESCE(
+                                  function.proacl,
+                                  acldefault('f', function.proowner)
+                             )) privilege
+                            WHERE privilege.grantee=0
+                              AND privilege.privilege_type='EXECUTE'
+                       )
+                )",
+                &[
+                    &function.name,
+                    &function.identity_arguments,
+                    &function.result,
+                    &function.security_definer,
+                    &function.strict,
+                    &function.volatility,
+                    &function.language,
+                    &contract_hex,
+                    &body_sha256,
+                ],
+            )
+            .map_err(internal)?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(function.name));
+        }
+    }
+    let public_execute_is_closed: bool = transaction
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                  FROM pg_proc function
+                  JOIN pg_namespace namespace
+                    ON namespace.oid=function.pronamespace
+                  CROSS JOIN LATERAL aclexplode(COALESCE(
+                      function.proacl,
+                      acldefault('f', function.proowner)
+                  )) privilege
+                 WHERE namespace.nspname=current_schema()
+                   AND privilege.grantee=0
+                   AND privilege.privilege_type='EXECUTE'
+            )",
+            &[],
+        )
+        .map_err(internal)?
+        .get(0);
+    if !public_execute_is_closed {
+        return Err(partial_catalog_object(
+            "object-write gateway PUBLIC function privilege closure",
+        ));
+    }
+    Ok(())
 }
 
 /// The provider process is intentionally limited to a small, immutable
@@ -355,7 +744,7 @@ fn verify_host_fence_provider_function_catalog(
             2,
             true,
             "plpgsql",
-            "9a410a815665459b13ac42144351c65ad4c40d58e6687d9648355938b496297c",
+            "e9a94b7a38573e85ea139a13706d691a92bdf4f5f3a8a1804a5742425ce5f3ea",
         ),
         (
             "control_host_fence_provider_complete_v1",
@@ -926,6 +1315,9 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_provisioner_deployment_identity",
     "runtime_provisioner_trust_revisions",
     "runtime_provisioner_credential_lineage",
+    "object_write_authorities",
+    "object_write_credentials",
+    "object_write_attempts",
     "route_v2_gateway_identity_authority",
     "route_v2_gateway_identity_revisions",
     "route_v2_gateway_credential_lineage",
@@ -2394,6 +2786,56 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             public_key_spki_sha256, state, first_committed_at_unix_ms,
             retired_at_unix_ms
        FROM runtime_provisioner_credential_lineage WHERE FALSE",
+    "SELECT writer_authority_id, record, host_provider, host_partition,
+            host_account_id, host_region, immutable_host_id, node_id,
+            object_provider, object_partition, object_account_id,
+            object_region, workload_principal_id, object_store_scope_id,
+            state, max_accepted_sequence, terminal_prefix_sequence,
+            terminal_prefix_sha256, fence_attempt_id,
+            cutoff_effective_at_unix_ms, cutoff_sequence, cutoff_receipt
+       FROM object_write_authorities WHERE FALSE",
+    "SELECT credential_id, record, public_key_spki,
+            public_key_spki_sha256, writer_authority_id, host_provider,
+            host_partition, host_account_id, host_region,
+            immutable_host_id, node_id, node_boot_id, agent_instance_id,
+            agent_session_epoch, volume_id, attachment_id,
+            attachment_epoch, private_artifact_id,
+            private_file_fsync_receipt_id,
+            private_directory_fsync_receipt_id, registered_at_unix_ms,
+            state, retirement_kind, retirement_transition_id,
+            retirement_receipt_id, retired_at_unix_ms
+       FROM object_write_credentials WHERE FALSE",
+    "SELECT request_id, record, writer_authority_id, credential_id,
+            volume_id, key_kind, object_provider, object_partition,
+            object_account_id, object_region, object_store_scope_id,
+            object_key, content_sha256, content_length,
+            receiving_started_at_unix_ms, state, spool_id,
+            spool_file_fsync_receipt_id, spool_directory_fsync_receipt_id,
+            spool_durable_at_unix_ms, rejection_kind,
+            rejection_receipt_id, rejected_at_unix_ms,
+            accepted_sequence, accepted_at_unix_ms, provider_attempt_id,
+            provider_issued_at_unix_ms, qualification_request_canonical,
+            qualification_authorization_canonical,
+            qualification_successful_put_canonical,
+            qualification_response_loss_canonical,
+            qualification_response_lost_attempt_canonical,
+            qualification_response_loss_sha256,
+            qualification_injection_receipt_id,
+            qualification_injected_at_unix_ms,
+            qualification_visibility_head_canonical,
+            qualification_unproven_intent_canonical,
+            qualification_unproven_sealed_request_canonical,
+            qualification_unproven_receipt_canonical,
+            qualification_unproven_attempt_canonical,
+            qualification_unproven_resolution_receipt_id,
+            terminal_kind, put_receipt_id,
+            put_completed_at_unix_ms, visibility_receipt_id,
+            visible_at_unix_ms, failure_receipt_id, failed_at_unix_ms,
+            qualification_unproven_reason,
+            qualification_head_evidence_canonical,
+            qualification_unproven_at_unix_ms,
+            spool_removal_receipt_id, spool_removed_at_unix_ms
+       FROM object_write_attempts WHERE FALSE",
     "SELECT singleton, deployment_id, current_signer_revision,
             current_signer_reference_sha256, signer_state, active_kid,
             public_key_ring_version, public_key_ring_digest,
@@ -2720,6 +3162,9 @@ DECLARE
     expected_sequence BIGINT;
     prefix_sequence BIGINT;
     prefix_sha256 TEXT;
+    authorization_sha256 TEXT;
+    ambiguity_sha256 TEXT;
+    ambiguity_canonical BYTEA;
     hash_input BYTEA;
     receipt JSONB;
     cutoff_receipt_id TEXT;
@@ -2805,12 +3250,23 @@ BEGIN
                attempt.content_length, attempt.terminal_kind,
                attempt.put_receipt_id, attempt.put_completed_at_unix_ms,
                attempt.visibility_receipt_id, attempt.visible_at_unix_ms,
-               attempt.failure_receipt_id, attempt.failed_at_unix_ms
+               attempt.failure_receipt_id, attempt.failed_at_unix_ms,
+               attempt.qualification_authorization_canonical,
+               attempt.qualification_response_loss_canonical,
+               attempt.qualification_injection_receipt_id,
+               attempt.qualification_visibility_head_canonical,
+               attempt.qualification_unproven_reason,
+               attempt.qualification_head_evidence_canonical,
+               attempt.qualification_unproven_receipt_canonical,
+               attempt.record
           FROM __CATS_SCHEMA_IDENT__.object_write_attempts attempt
          WHERE attempt.writer_authority_id = queue_row.writer_authority_id
            AND attempt.accepted_sequence > prefix_sequence
            AND attempt.accepted_sequence <= authority_row.cutoff_sequence
-           AND attempt.state IN ('terminal_visible', 'permanent', 'spool_removed')
+           AND attempt.state IN (
+               'terminal_visible', 'permanent',
+               'qualification_unproven_visible', 'spool_removed'
+           )
          ORDER BY attempt.accepted_sequence
          LIMIT 256
     LOOP
@@ -2844,6 +3300,35 @@ BEGIN
                     pg_catalog.convert_to(attempt_row.visibility_receipt_id, 'UTF8')) ||
                 __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
                     pg_catalog.int8send(attempt_row.visible_at_unix_ms));
+            IF attempt_row.record #> '{state,outcome,qualification_ambiguity}'
+                    IS DISTINCT FROM 'null'::JSONB THEN
+                authorization_sha256 := 'sha256:' || pg_catalog.encode(
+                    pg_catalog.sha256(
+                        __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                            pg_catalog.convert_to(
+                                'cats.object-write-qualification-authorization.v1', 'UTF8')) ||
+                        __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                            attempt_row.qualification_authorization_canonical)
+                    ), 'hex');
+                ambiguity_canonical := pg_catalog.convert_to(
+                    '{"version":1,"response_loss":' || pg_catalog.convert_from(
+                        attempt_row.qualification_response_loss_canonical, 'UTF8') ||
+                    ',"head":' || pg_catalog.convert_from(
+                        attempt_row.qualification_visibility_head_canonical, 'UTF8') || '}',
+                    'UTF8');
+                ambiguity_sha256 := 'sha256:' || pg_catalog.encode(
+                    pg_catalog.sha256(ambiguity_canonical), 'hex');
+                hash_input := hash_input ||
+                    __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                        pg_catalog.convert_to('qualification-ambiguity', 'UTF8')) ||
+                    __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                        pg_catalog.convert_to(authorization_sha256, 'UTF8')) ||
+                    __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                        pg_catalog.convert_to(
+                            attempt_row.qualification_injection_receipt_id, 'UTF8')) ||
+                    __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                        pg_catalog.convert_to(ambiguity_sha256, 'UTF8'));
+            END IF;
         ELSIF attempt_row.terminal_kind = 'permanently_failed' THEN
             hash_input := hash_input ||
                 __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
@@ -2852,6 +3337,17 @@ BEGIN
                     pg_catalog.convert_to(attempt_row.failure_receipt_id, 'UTF8')) ||
                 __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
                     pg_catalog.int8send(attempt_row.failed_at_unix_ms));
+        ELSIF attempt_row.terminal_kind = 'qualification_unproven_visible' THEN
+            IF attempt_row.qualification_unproven_reason
+                    IS DISTINCT FROM 'response_loss_receipt_absent' THEN
+                RAISE EXCEPTION 'unproven object-write projection is invalid'
+                    USING ERRCODE = '55000';
+            END IF;
+            hash_input := hash_input ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    pg_catalog.convert_to('qualification-unproven-visible', 'UTF8')) ||
+                __CATS_SCHEMA_IDENT__.control_host_fence_provider_frame_v1(
+                    attempt_row.qualification_unproven_receipt_canonical);
         ELSE
             RAISE EXCEPTION 'terminal object-write projection is invalid'
                 USING ERRCODE = '55000';
@@ -4187,8 +4683,9 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
     state TEXT NOT NULL
         CONSTRAINT object_write_attempts_state_check CHECK (state IN (
         'receiving', 'durable_spooled', 'rejected_before_accept',
-        'accepted_spooled', 'provider_issued', 'terminal_visible',
-        'permanent', 'spool_removed'
+        'accepted_spooled', 'provider_issued', 'qualification_response_lost',
+        'terminal_visible', 'permanent', 'qualification_unproven_visible',
+        'spool_removed'
     )),
     spool_id TEXT
         CONSTRAINT object_write_attempts_spool_id_check
@@ -4218,9 +4715,35 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
     provider_issued_at_unix_ms BIGINT
         CONSTRAINT object_write_attempts_provider_issued_time_check
         CHECK (provider_issued_at_unix_ms >= accepted_at_unix_ms),
+    qualification_request_canonical BYTEA,
+    qualification_authorization_canonical BYTEA,
+    qualification_successful_put_canonical BYTEA,
+    qualification_response_loss_canonical BYTEA,
+    qualification_response_lost_attempt_canonical BYTEA,
+    qualification_response_loss_sha256 TEXT
+        CONSTRAINT object_write_attempts_qualification_response_loss_sha256_check
+        CHECK (qualification_response_loss_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_injection_receipt_id TEXT
+        CONSTRAINT object_write_attempts_qualification_injection_receipt_id_check
+        CHECK (qualification_injection_receipt_id ~ '^owqinj1_[0-9a-f]{64}$'),
+    qualification_injected_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_qualification_injected_time_check
+        CHECK (qualification_injected_at_unix_ms >= provider_issued_at_unix_ms),
+    qualification_visibility_head_canonical BYTEA,
+    qualification_unproven_intent_canonical BYTEA,
+    qualification_unproven_sealed_request_canonical BYTEA,
+    qualification_unproven_receipt_canonical BYTEA,
+    qualification_unproven_attempt_canonical BYTEA,
+    qualification_unproven_resolution_receipt_id TEXT
+        CONSTRAINT object_write_attempts_qualification_unproven_receipt_id_check
+        CHECK (qualification_unproven_resolution_receipt_id
+            ~ '^owqunp1_[0-9a-f]{64}$'),
     terminal_kind TEXT
         CONSTRAINT object_write_attempts_terminal_kind_check
-        CHECK (terminal_kind IN ('succeeded_visible', 'permanently_failed')),
+        CHECK (terminal_kind IN (
+            'succeeded_visible', 'permanently_failed',
+            'qualification_unproven_visible'
+        )),
     put_receipt_id TEXT,
     put_completed_at_unix_ms BIGINT
         CONSTRAINT object_write_attempts_put_completed_time_check
@@ -4233,10 +4756,21 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
     failed_at_unix_ms BIGINT
         CONSTRAINT object_write_attempts_failed_time_check
         CHECK (failed_at_unix_ms >= provider_issued_at_unix_ms),
+    qualification_unproven_reason TEXT
+        CONSTRAINT object_write_attempts_qualification_unproven_reason_check
+        CHECK (qualification_unproven_reason = 'response_loss_receipt_absent'),
+    qualification_head_evidence_canonical BYTEA,
+    qualification_unproven_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_qualification_unproven_time_check
+        CHECK (qualification_unproven_at_unix_ms >= provider_issued_at_unix_ms),
     spool_removal_receipt_id TEXT,
     spool_removed_at_unix_ms BIGINT
         CONSTRAINT object_write_attempts_spool_removed_time_check CHECK (
-        spool_removed_at_unix_ms >= COALESCE(visible_at_unix_ms, failed_at_unix_ms)
+        spool_removed_at_unix_ms >= COALESCE(
+            visible_at_unix_ms,
+            failed_at_unix_ms,
+            qualification_unproven_at_unix_ms
+        )
     ),
     CONSTRAINT object_write_attempts_phase_shape_check CHECK (
         (state = 'receiving' AND spool_id IS NULL AND accepted_sequence IS NULL) OR
@@ -4252,7 +4786,9 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
             AND rejection_kind IS NOT NULL
             AND rejection_receipt_id IS NOT NULL AND rejected_at_unix_ms IS NOT NULL
             AND accepted_sequence IS NULL AND provider_attempt_id IS NULL) OR
-        (state IN ('accepted_spooled', 'provider_issued', 'terminal_visible', 'permanent', 'spool_removed')
+        (state IN ('accepted_spooled', 'provider_issued', 'qualification_response_lost',
+                   'terminal_visible', 'permanent', 'qualification_unproven_visible',
+                   'spool_removed')
             AND spool_id IS NOT NULL
             AND spool_file_fsync_receipt_id IS NOT NULL
             AND spool_directory_fsync_receipt_id IS NOT NULL
@@ -4262,23 +4798,94 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
             AND accepted_at_unix_ms IS NOT NULL AND provider_attempt_id IS NOT NULL)
     ),
     CONSTRAINT object_write_attempts_provider_issue_shape_check
-    CHECK ((state IN ('provider_issued', 'terminal_visible', 'permanent', 'spool_removed'))
+    CHECK ((state IN ('provider_issued', 'qualification_response_lost',
+                      'terminal_visible', 'permanent',
+                      'qualification_unproven_visible', 'spool_removed'))
         = (provider_issued_at_unix_ms IS NOT NULL)),
+    CONSTRAINT object_write_attempts_qualification_shape_check CHECK (
+        ((state = 'qualification_response_lost' OR (
+            state IN ('terminal_visible', 'spool_removed')
+            AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
+            AND record #> '{state,outcome,qualification_ambiguity}' IS NOT NULL
+            AND record #> '{state,outcome,qualification_ambiguity}' <> 'null'::JSONB
+        )) AND
+            qualification_request_canonical IS NOT NULL
+            AND qualification_authorization_canonical IS NOT NULL
+            AND qualification_successful_put_canonical IS NOT NULL
+            AND qualification_response_loss_canonical IS NOT NULL
+            AND qualification_response_lost_attempt_canonical IS NOT NULL
+            AND qualification_response_loss_sha256 IS NOT NULL
+            AND qualification_injection_receipt_id IS NOT NULL
+            AND qualification_injected_at_unix_ms IS NOT NULL
+        ) OR
+        (NOT (state = 'qualification_response_lost' OR (
+            state IN ('terminal_visible', 'spool_removed')
+            AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
+            AND record #> '{state,outcome,qualification_ambiguity}' IS NOT NULL
+            AND record #> '{state,outcome,qualification_ambiguity}' <> 'null'::JSONB
+        )) AND
+            qualification_authorization_canonical IS NULL
+            AND qualification_successful_put_canonical IS NULL
+            AND qualification_response_loss_canonical IS NULL
+            AND qualification_response_lost_attempt_canonical IS NULL
+            AND qualification_response_loss_sha256 IS NULL
+            AND qualification_injection_receipt_id IS NULL
+            AND qualification_injected_at_unix_ms IS NULL
+            AND ((terminal_kind = 'qualification_unproven_visible')
+                = (qualification_request_canonical IS NOT NULL))
+        )
+    ),
     CONSTRAINT object_write_attempts_visible_terminal_shape_check
-    CHECK ((terminal_kind = 'succeeded_visible') =
-        (put_receipt_id IS NOT NULL AND put_completed_at_unix_ms IS NOT NULL
-         AND visibility_receipt_id IS NOT NULL AND visible_at_unix_ms IS NOT NULL)),
+    CHECK ((terminal_kind = 'succeeded_visible'
+            AND put_receipt_id IS NOT NULL AND put_completed_at_unix_ms IS NOT NULL
+            AND visibility_receipt_id IS NOT NULL AND visible_at_unix_ms IS NOT NULL) OR
+           (terminal_kind IS DISTINCT FROM 'succeeded_visible'
+            AND put_receipt_id IS NULL AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL)),
+    CONSTRAINT object_write_attempts_qualification_visibility_head_shape_check CHECK (
+        ((state IN ('terminal_visible', 'spool_removed')
+          AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
+          AND record #> '{state,outcome,qualification_ambiguity}' IS NOT NULL
+          AND record #> '{state,outcome,qualification_ambiguity}' <> 'null'::JSONB)
+            = (qualification_visibility_head_canonical IS NOT NULL)
+    ),
     CONSTRAINT object_write_attempts_failure_terminal_shape_check
-    CHECK ((terminal_kind = 'permanently_failed') =
-        (failure_receipt_id IS NOT NULL AND failed_at_unix_ms IS NOT NULL)),
+    CHECK ((terminal_kind = 'permanently_failed'
+            AND failure_receipt_id IS NOT NULL AND failed_at_unix_ms IS NOT NULL) OR
+           (terminal_kind IS DISTINCT FROM 'permanently_failed'
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL)),
+    CONSTRAINT object_write_attempts_qualification_unproven_shape_check
+    CHECK ((terminal_kind = 'qualification_unproven_visible'
+            AND qualification_request_canonical IS NOT NULL
+            AND qualification_unproven_intent_canonical IS NOT NULL
+            AND qualification_unproven_sealed_request_canonical IS NOT NULL
+            AND qualification_unproven_receipt_canonical IS NOT NULL
+            AND qualification_unproven_attempt_canonical IS NOT NULL
+            AND qualification_unproven_resolution_receipt_id IS NOT NULL
+            AND qualification_unproven_reason IS NOT NULL
+            AND qualification_head_evidence_canonical IS NOT NULL
+            AND qualification_unproven_at_unix_ms IS NOT NULL) OR
+           (terminal_kind IS DISTINCT FROM 'qualification_unproven_visible'
+            AND qualification_unproven_intent_canonical IS NULL
+            AND qualification_unproven_sealed_request_canonical IS NULL
+            AND qualification_unproven_receipt_canonical IS NULL
+            AND qualification_unproven_attempt_canonical IS NULL
+            AND qualification_unproven_resolution_receipt_id IS NULL
+            AND qualification_unproven_reason IS NULL
+            AND qualification_head_evidence_canonical IS NULL
+            AND qualification_unproven_at_unix_ms IS NULL)),
     CONSTRAINT object_write_attempts_spool_removal_shape_check
     CHECK ((state = 'spool_removed') =
         (spool_removal_receipt_id IS NOT NULL AND spool_removed_at_unix_ms IS NOT NULL)),
     CONSTRAINT object_write_attempts_terminal_state_shape_check CHECK (
+        (state = 'qualification_response_lost' AND terminal_kind IS NULL) OR
         (state = 'terminal_visible' AND terminal_kind = 'succeeded_visible') OR
         (state = 'permanent' AND terminal_kind = 'permanently_failed') OR
+        (state = 'qualification_unproven_visible'
+            AND terminal_kind = 'qualification_unproven_visible') OR
         (state = 'spool_removed' AND terminal_kind IS NOT NULL) OR
-        (state NOT IN ('terminal_visible', 'permanent', 'spool_removed')
+        (state NOT IN ('qualification_response_lost', 'terminal_visible', 'permanent',
+                       'qualification_unproven_visible', 'spool_removed')
             AND terminal_kind IS NULL)
     ),
     CONSTRAINT object_write_attempts_unused_fields_check CHECK (
@@ -4326,7 +4933,16 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
             AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
             AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
             AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
-        (state IN ('terminal_visible', 'permanent')
+        (state = 'qualification_response_lost'
+            AND terminal_kind IS NULL
+            AND put_receipt_id IS NULL AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND qualification_unproven_reason IS NULL
+            AND qualification_head_evidence_canonical IS NULL
+            AND qualification_unproven_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state IN ('terminal_visible', 'permanent', 'qualification_unproven_visible')
             AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
         state = 'spool_removed'
     ),
@@ -4362,6 +4978,8 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
                 AND record #>> '{state,kind}' = 'accepted_spooled') OR
             (state = 'provider_issued'
                 AND record #>> '{state,kind}' = 'provider_issued') OR
+            (state = 'qualification_response_lost'
+                AND record #>> '{state,kind}' = 'qualification_response_lost') OR
             (state = 'terminal_visible'
                 AND record #>> '{state,kind}' = 'terminal'
                 AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
@@ -4369,6 +4987,11 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
             (state = 'permanent'
                 AND record #>> '{state,kind}' = 'terminal'
                 AND record #>> '{state,outcome,kind}' = 'permanently_failed'
+                AND record #>> '{state,spool,kind}' = 'retained') OR
+            (state = 'qualification_unproven_visible'
+                AND record #>> '{state,kind}' = 'terminal'
+                AND record #>> '{state,outcome,kind}' =
+                    'qualification_unproven_visible'
                 AND record #>> '{state,spool,kind}' = 'retained') OR
             (state = 'spool_removed'
                 AND record #>> '{state,kind}' = 'terminal'
@@ -4479,8 +5102,13 @@ BEGIN
                 AND NEW.state IN ('rejected_before_accept', 'accepted_spooled'))
             OR (OLD.state = 'accepted_spooled' AND NEW.state = 'provider_issued')
             OR (OLD.state = 'provider_issued'
-                AND NEW.state IN ('terminal_visible', 'permanent'))
-            OR (OLD.state IN ('terminal_visible', 'permanent')
+                AND NEW.state IN ('qualification_response_lost',
+                                  'terminal_visible', 'permanent',
+                                  'qualification_unproven_visible'))
+            OR (OLD.state = 'qualification_response_lost'
+                AND NEW.state = 'terminal_visible')
+            OR (OLD.state IN ('terminal_visible', 'permanent',
+                              'qualification_unproven_visible')
                 AND NEW.state = 'spool_removed'))
        OR (OLD.spool_id IS NOT NULL AND
            (OLD.spool_id, OLD.spool_file_fsync_receipt_id,
@@ -4497,6 +5125,27 @@ BEGIN
        OR (OLD.provider_issued_at_unix_ms IS NOT NULL
            AND OLD.provider_issued_at_unix_ms IS DISTINCT FROM
                NEW.provider_issued_at_unix_ms)
+       OR (OLD.qualification_response_loss_canonical IS NOT NULL AND
+           (OLD.qualification_request_canonical,
+            OLD.qualification_authorization_canonical,
+            OLD.qualification_successful_put_canonical,
+            OLD.qualification_response_loss_canonical,
+            OLD.qualification_response_lost_attempt_canonical,
+            OLD.qualification_response_loss_sha256,
+            OLD.qualification_injection_receipt_id,
+            OLD.qualification_injected_at_unix_ms)
+           IS DISTINCT FROM
+           (NEW.qualification_request_canonical,
+            NEW.qualification_authorization_canonical,
+            NEW.qualification_successful_put_canonical,
+            NEW.qualification_response_loss_canonical,
+            NEW.qualification_response_lost_attempt_canonical,
+            NEW.qualification_response_loss_sha256,
+            NEW.qualification_injection_receipt_id,
+            NEW.qualification_injected_at_unix_ms))
+       OR (OLD.qualification_visibility_head_canonical IS NOT NULL
+           AND OLD.qualification_visibility_head_canonical IS DISTINCT FROM
+               NEW.qualification_visibility_head_canonical)
        OR (OLD.terminal_kind IS NOT NULL AND
            (OLD.terminal_kind, OLD.put_receipt_id,
             OLD.put_completed_at_unix_ms, OLD.visibility_receipt_id,
@@ -4507,6 +5156,26 @@ BEGIN
             NEW.put_completed_at_unix_ms, NEW.visibility_receipt_id,
             NEW.visible_at_unix_ms, NEW.failure_receipt_id,
             NEW.failed_at_unix_ms))
+       OR (OLD.qualification_unproven_reason IS NOT NULL AND
+           (OLD.qualification_request_canonical,
+            OLD.qualification_unproven_intent_canonical,
+            OLD.qualification_unproven_sealed_request_canonical,
+            OLD.qualification_unproven_receipt_canonical,
+            OLD.qualification_unproven_attempt_canonical,
+            OLD.qualification_unproven_resolution_receipt_id,
+            OLD.qualification_unproven_reason,
+            OLD.qualification_head_evidence_canonical,
+            OLD.qualification_unproven_at_unix_ms)
+           IS DISTINCT FROM
+           (NEW.qualification_request_canonical,
+            NEW.qualification_unproven_intent_canonical,
+            NEW.qualification_unproven_sealed_request_canonical,
+            NEW.qualification_unproven_receipt_canonical,
+            NEW.qualification_unproven_attempt_canonical,
+            NEW.qualification_unproven_resolution_receipt_id,
+            NEW.qualification_unproven_reason,
+            NEW.qualification_head_evidence_canonical,
+            NEW.qualification_unproven_at_unix_ms))
     THEN
         RAISE EXCEPTION 'invalid object-write attempt transition';
     END IF;
@@ -5961,3 +6630,238 @@ BEGIN
 END;
 $$;
 ";
+
+#[cfg(test)]
+mod object_write_gateway_catalog_tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        object_write_gateway_catalog_sha256, object_write_gateway_contract_sha256,
+        object_write_gateway_function_body, ObjectWriteGatewayFunction,
+        HOST_FENCE_PROVIDER_FUNCTIONS, OBJECT_WRITE_GATEWAY_FUNCTIONS,
+        OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG, SCHEMA,
+    };
+
+    const ROLE_INSTALLER: &str =
+        include_str!("../../../deploy/postgres/object-write-gateway-role-v1.sql");
+    const CLIENT_SOURCE: &str = include_str!("object_write_gateway_client.rs");
+    const DAEMON_SOURCE: &str = include_str!("../../../cmd/object-write-gatewayd/src/main.rs");
+    const SERVICE_SOURCE: &str = include_str!("../object_write_gateway/mod.rs");
+
+    #[test]
+    fn precomposition_surface_is_exact_and_honestly_unavailable() {
+        let executable: BTreeSet<_> = OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG
+            .iter()
+            .filter(|function| function.gateway_execute)
+            .map(|function| function.name)
+            .collect();
+        let expected = BTreeSet::from([
+            "control_object_write_gateway_accept_v1",
+            "control_object_write_gateway_begin_ingress_v1",
+            "control_object_write_gateway_provider_issued_v1",
+            "control_object_write_gateway_qualification_response_lost_v1",
+            "control_object_write_gateway_recover_accepted_v1",
+            "control_object_write_gateway_recover_ingress_v1",
+            "control_object_write_gateway_register_v1",
+            "control_object_write_gateway_spool_durable_v1",
+            "control_object_write_gateway_spool_removed_v1",
+            "control_object_write_gateway_startup_v1",
+            "control_object_write_gateway_terminal_v1",
+        ]);
+        assert_eq!(executable, expected);
+        assert!(!OBJECT_WRITE_GATEWAY_FUNCTIONS
+            .contains("CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_object_write_gateway_qualification_lock_v1"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("11::BIGINT"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("qualification_lock_available BOOLEAN"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("pg_catalog.convert_to(catalog_input"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("        FALSE;"));
+        assert!(object_write_gateway_contract_sha256()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(object_write_gateway_catalog_sha256()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn every_installed_routine_has_closed_identity_and_source_attestation() {
+        for function in OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG {
+            let ObjectWriteGatewayFunction {
+                name,
+                identity_arguments,
+                result,
+                security_definer,
+                gateway_execute,
+                ..
+            } = function;
+            let body = object_write_gateway_function_body(name).unwrap();
+            assert!(!identity_arguments.contains("VARIADIC"));
+            assert!(!result.is_empty());
+            if *security_definer {
+                assert!(body
+                    .contains("session_user::TEXT IS DISTINCT FROM 'cats_object_write_gateway'"));
+            }
+            let listed_by_startup = OBJECT_WRITE_GATEWAY_FUNCTIONS
+                .split("RETURN QUERY SELECT")
+                .next()
+                .unwrap()
+                .contains(&format!("'{name}'"));
+            assert!(listed_by_startup, "startup omitted {name}");
+            if *gateway_execute {
+                assert!(ROLE_INSTALLER.contains(&format!(".{name}(")));
+            }
+        }
+        assert_eq!(
+            ROLE_INSTALLER.matches("GRANT EXECUTE ON FUNCTION").count(),
+            11
+        );
+        assert!(!ROLE_INSTALLER.contains("control_object_write_gateway_qualification_lock_v1"));
+    }
+
+    #[test]
+    fn every_physical_dial_checks_identity_prosrc_and_ambient_privileges() {
+        for required in [
+            "current_user::TEXT, session_user::TEXT, current_schema()::TEXT",
+            "verify_direct_routine_catalog(",
+            "pg_get_function_identity_arguments(function.oid)",
+            "pg_get_function_result(function.oid)",
+            "function.prosecdef::TEXT",
+            "function.prosrc",
+            "function.proconfig",
+            "function.proowner=namespace.nspowner",
+            "has_function_privilege(",
+            "has_database_privilege(session_user, current_database(), 'TEMPORARY')",
+            "has_any_column_privilege",
+            "has_sequence_privilege",
+        ] {
+            assert!(
+                CLIENT_SOURCE.contains(required),
+                "missing dial probe: {required}"
+            );
+        }
+        assert!(CLIENT_SOURCE.contains("connect_verified_client(\n                &self.dsn"));
+    }
+
+    #[test]
+    fn production_gateway_has_no_store_or_raw_object_table_fallback() {
+        assert!(!DAEMON_SOURCE.contains("Store::"));
+        assert!(!DAEMON_SOURCE.contains("use cats_control_plane::store::{DsnSource, Store}"));
+        assert!(!SERVICE_SOURCE.contains("Arc<Store>"));
+        for table in [
+            "object_write_authorities",
+            "object_write_credentials",
+            "object_write_attempts",
+            "control_schema_version",
+            "schema_migrations",
+        ] {
+            assert!(!CLIENT_SOURCE.contains(&format!("FROM {table}")));
+            assert!(!CLIENT_SOURCE.contains(&format!("UPDATE {table}")));
+            assert!(!CLIENT_SOURCE.contains(&format!("INSERT INTO {table}")));
+            assert!(!CLIENT_SOURCE.contains(&format!("DELETE FROM {table}")));
+        }
+        assert!(ROLE_INSTALLER.contains("REVOKE ALL ON ALL TABLES"));
+        assert!(ROLE_INSTALLER.contains("REVOKE ALL ON ALL SEQUENCES"));
+        assert!(ROLE_INSTALLER.contains("REVOKE ALL ON ALL FUNCTIONS"));
+        assert!(ROLE_INSTALLER
+            .contains("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA :\"control_schema\" FROM PUBLIC"));
+        assert!(!ROLE_INSTALLER.contains("GRANT SELECT"));
+        assert!(!ROLE_INSTALLER.contains("GRANT INSERT"));
+        assert!(!ROLE_INSTALLER.contains("GRANT UPDATE"));
+        assert!(!ROLE_INSTALLER.contains("GRANT DELETE"));
+    }
+
+    #[test]
+    fn qualification_request_identity_binds_credential_before_fault() {
+        let body =
+            object_write_gateway_function_body("control_object_write_gateway_begin_ingress_v1")
+                .unwrap();
+        let hash = &body[body.find("hash_input :=").unwrap()..body.find("request_id :=").unwrap()];
+        assert!(
+            hash.find("'cats.object-write-request.v1'").unwrap()
+                < hash.find("pg_catalog.int8send(content_length)").unwrap()
+        );
+        let qualification_hash = &hash[hash.find("hash_input := hash_input ||").unwrap()..];
+        let ordered = [
+            "'qualification-credential'",
+            "requested_attachment #>> '{credential_id}'",
+            "requested_attachment #>> '{public_key_spki_sha256}'",
+            "'qualification-fault:successful-put-response-loss'",
+            "'{qualification_fault,qualification_id}'",
+            "'{qualification_fault,fault_id}'",
+            "'{qualification_fault,qualification_catalog_sha256}'",
+        ];
+        let mut prior = 0;
+        for marker in ordered {
+            let position = qualification_hash
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker}"));
+            assert!(position >= prior, "request identity reordered {marker}");
+            prior = position;
+        }
+        assert_eq!(
+            qualification_hash
+                .matches("'qualification-credential'")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn qualification_resolution_is_serialized_before_discovery() {
+        let response = object_write_gateway_function_body(
+            "control_object_write_gateway_qualification_response_lost_v1",
+        )
+        .unwrap();
+        assert!(
+            response.find("pg_catalog.pg_advisory_xact_lock(").unwrap()
+                < response
+                    .find("FROM __CATS_SCHEMA_IDENT__.object_write_attempts")
+                    .unwrap()
+        );
+
+        let lock_request = &CLIENT_SOURCE[CLIENT_SOURCE
+            .find("impl QualificationFaultAuthority for ObjectWriteGatewayClient")
+            .unwrap()..];
+        assert!(
+            lock_request.find("lock_qualification_request(").unwrap()
+                < lock_request
+                    .find("query_qualification_response_loss(")
+                    .unwrap()
+        );
+        assert!(lock_request.contains("BEGIN ISOLATION LEVEL READ COMMITTED"));
+    }
+
+    #[test]
+    fn qualified_terminals_are_sealed_and_prefix_the_full_receipt() {
+        for required in [
+            "qualified object-write terminal requires a sealed authority capability",
+            "qualification_unproven_visible_intent",
+            "qualification_unproven_receipt_canonical",
+        ] {
+            assert!(
+                CLIENT_SOURCE.contains(required)
+                    || OBJECT_WRITE_GATEWAY_FUNCTIONS.contains(required)
+                    || SCHEMA.contains(required),
+                "missing qualification seal: {required}"
+            );
+        }
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains(
+            "control_object_write_gateway_frame_v1(\n                    prefix_row.qualification_unproven_receipt_canonical)"
+        ));
+        let host_prefix = &HOST_FENCE_PROVIDER_FUNCTIONS[HOST_FENCE_PROVIDER_FUNCTIONS
+            .find("ELSIF attempt_row.terminal_kind = 'qualification_unproven_visible'")
+            .unwrap()..];
+        assert!(host_prefix.contains("control_host_fence_provider_frame_v1("));
+        assert!(host_prefix.contains("attempt_row.qualification_unproven_receipt_canonical"));
+        for column in [
+            "qualification_unproven_intent_canonical",
+            "qualification_unproven_sealed_request_canonical",
+            "qualification_unproven_receipt_canonical",
+            "qualification_unproven_attempt_canonical",
+            "qualification_unproven_resolution_receipt_id",
+        ] {
+            assert!(SCHEMA.contains(&format!("OLD.{column}")));
+            assert!(SCHEMA.contains(&format!("NEW.{column}")));
+        }
+    }
+}
