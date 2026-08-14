@@ -19,14 +19,16 @@ use cats_api::error::{ApiError, ErrorCode};
 use cats_api::production_mutation_admission::{
     decode_production_mutation_admission_command,
     encode_production_mutation_admission_command_receipt,
-    encode_production_mutation_admission_state, verify_production_mutation_admission_command,
+    encode_production_mutation_admission_state,
+    encode_production_qualification_product_inventory_receipt,
+    verify_production_mutation_admission_command,
     verify_production_mutation_admission_command_discovery, ProductionCutoverOperatorPrincipal,
     ProductionMutationAdmissionStoredOutcome, PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER,
     PRODUCTION_CUTOVER_SIGNATURE_HEADER, PRODUCTION_MUTATION_ADMISSION_COMMANDS_PATH,
     PRODUCTION_MUTATION_ADMISSION_DISCOVERY_PATH,
     PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
     PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
-    PRODUCTION_MUTATION_ADMISSION_STATE_PATH,
+    PRODUCTION_MUTATION_ADMISSION_STATE_PATH, PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH,
 };
 use cats_api::runtime_node_authority::{
     verify_runtime_node_authority_request, NODE_AUTHORITY_APPLY_ID_HEADER,
@@ -43,7 +45,10 @@ use cats_api::runtime_reconciliation::{
 
 use crate::server::AppState;
 use crate::store::runtime_authority::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
-use crate::store::runtime_authority::production_mutation_admission::ProductionMutationAdmissionCommandStoreOutcome;
+use crate::store::runtime_authority::production_mutation_admission::{
+    ProductionMutationAdmissionCommandStoreOutcome,
+    ProductionQualificationProductInventoryStoreOutcome,
+};
 use crate::store::AuthorityRequestContext;
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
@@ -1098,6 +1103,128 @@ pub(super) async fn get_production_mutation_admission_state(
                 ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
             ) =>
         {
+            state.readiness.poison();
+            temporarily_unavailable()
+        }
+        AwaitOutcome::Completed(Err(_)) | AwaitOutcome::Deadline | AwaitOutcome::Shutdown => {
+            temporarily_unavailable()
+        }
+    }
+}
+
+pub(super) async fn discover_production_qualification_product_inventory(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let service = Arc::clone(&state.runtime_node_authority);
+    let mut shutdown = service.subscribe();
+    if !*shutdown.borrow()
+        || request.uri().path() != PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH
+        || request.method() != axum::http::Method::POST
+        || request.uri().query().is_some()
+    {
+        return temporarily_unavailable();
+    }
+    let headers = request.headers().clone();
+    if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
+        !value
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case(JSON_CONTENT_TYPE)
+    }) || headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            UNSUPPORTED_MEDIA_TYPE,
+            &[],
+        );
+    }
+    let (credential_id, signature) = match classify_production_cutover_signature(&headers) {
+        Some(proof) => proof,
+        None => return authentication_failed(),
+    };
+    if declared_body_exceeds(
+        &headers,
+        PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    ) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, REQUEST_TOO_LARGE, &[]);
+    }
+    let body = match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        to_bytes(
+            request.into_body(),
+            PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+        ),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(body)) => body,
+        AwaitOutcome::Completed(Err(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+        }
+        AwaitOutcome::Deadline | AwaitOutcome::Shutdown => return temporarily_unavailable(),
+    };
+    let principal = match verify_production_mutation_admission_command_discovery(
+        &service.production_cutover_trust,
+        &credential_id,
+        &signature,
+        &body,
+    ) {
+        Ok(principal) => principal,
+        Err(_) => return authentication_failed(),
+    };
+    let command = match decode_production_mutation_admission_command(&body) {
+        Ok(command) => command,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]),
+    };
+    let _global = match service.admission.try_global() {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    let _principal = match service.admission.try_production_cutover(&principal) {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    let request_context = AuthorityRequestContext::new(deadline);
+    let _cancel_on_drop = CancelRequestOnDrop(request_context.clone());
+    let store = Arc::clone(&service.store);
+    let outcome = await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        store.execute(move |store| {
+            store.production_qualification_product_inventory(&principal, &command, &request_context)
+        }),
+    )
+    .await;
+    match outcome {
+        AwaitOutcome::Completed(Ok(
+            ProductionQualificationProductInventoryStoreOutcome::Found(receipt),
+        )) => match encode_production_qualification_product_inventory_receipt(&receipt) {
+            Ok(body) if body.len() <= PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES => {
+                json_response(StatusCode::OK, body)
+            }
+            _ => {
+                state.readiness.poison();
+                temporarily_unavailable()
+            }
+        },
+        AwaitOutcome::Completed(Ok(
+            ProductionQualificationProductInventoryStoreOutcome::CommandIdConflict,
+        )) => error_response(StatusCode::CONFLICT, PRODUCTION_COMMAND_ID_CONFLICT, &[]),
+        AwaitOutcome::Completed(Ok(
+            ProductionQualificationProductInventoryStoreOutcome::AuthenticationFailed,
+        )) => authentication_failed(),
+        AwaitOutcome::Completed(Ok(
+            ProductionQualificationProductInventoryStoreOutcome::NotFound,
+        )) => error_response(StatusCode::NOT_FOUND, PRODUCTION_COMMAND_NOT_FOUND, &[]),
+        AwaitOutcome::Completed(Err(error))
+            if !matches!(
+                error.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            tracing::error!(error = %error, "qualification product inventory Store failed closed");
             state.readiness.poison();
             temporarily_unavailable()
         }

@@ -57,11 +57,19 @@ terminalization、read/health/reset。结束 qualification 后必须先线性化
      `cats.production-mutation-qualification-begin-receipt.v1`；
    - `production-mutation-qualification-terminal.receipt.json`，kind
      `cats.production-mutation-qualification-terminal-receipt.v1`。
-   begin receipt 绑定 binding digest、Begin command/request/official receipt 与 resulting revision。terminal
-   receipt 绑定同一 begin、End command/request/official receipt、canonical final Closed state digest、紧邻
-   final revision、fleet Closed receipt、cleanup inventory receipt，并要求 active guards、product resources、
-   residue 都为零。receipt 不反向哈希最终 qualification manifest，避免递归；最终 manifest 对这两份
-   exact bytes 做 closed-set hash。
+   begin receipt 绑定 binding digest、Begin command/request/official receipt 与 resulting revision。End 后，
+   operator 用原 exact signed close command 调用
+   `/v1/admin/production/qualification-product-inventory-discoveries`。Control 在一个 repeatable-read transaction
+   内对 singleton 取 `FOR SHARE`，核对 current Closed revision/immutable close receipt，完整解码 Workspace
+   clean-slate product graph，并发布
+   `production-mutation-qualification-product-inventory.receipt.json`。当前 Cat、Root/PersistentDisk、Snapshot、
+   Endpoint、hostname lookup、pending Operation 计入 `product_resource_count`；Deleted Cat tombstone、terminal
+   Operation 与 API idempotency receipt 只作为 excluded history 报告。未知 JSON/scalar projection、orphan 或
+   stale pending Operation 一律拒绝，不返回可用的 zero receipt。terminal receipt 绑定同一 begin、End
+   command/request/official receipt、canonical final Closed state digest、紧邻 final revision、product inventory、
+   fleet Closed 与 cleanup inventory receipt，并要求 active guards、product resources、residue 都为零。
+   receipt 不反向哈希最终 qualification manifest，避免递归；最终 manifest 对两份 framework receipt 及其
+   digest-closed support files 做 closed-set hash。
 8. identity/WorkOS、Stripe ledger 与 internal authority 不成为 E13 product gate：
    - Qualification 的 exact Workspace 必须在 Begin 前由 Account/WorkOS identity authority 创建；workspace
      profile、membership、invitation、token 与 session 不写 runtime product rows；

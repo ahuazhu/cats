@@ -1,9 +1,12 @@
 //! Closed row codecs for covered product mutations.
 
+use std::collections::BTreeMap;
+
+use cats_api::production_mutation_admission::ProductionQualificationProductInventoryCounts;
 use cats_api::runtime_reconciliation::{
     decode_desired_runtime_spec, decode_operation, encode_desired_runtime_spec, encode_operation,
     DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Operation, OperationPhase,
-    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis,
+    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis, WireU64,
 };
 use cats_storage::authority::{remote_head_is_valid, AuthorityError, VolumeDurability};
 use postgres::{Row, Transaction};
@@ -1482,6 +1485,219 @@ fn decode_operation_row(row: &Row) -> AuthorityTxResult<Operation> {
         return Err(corrupt(()));
     }
     Ok(record)
+}
+
+/// Decode the complete clean-slate product graph and return the exact current
+/// projection for one qualification Workspace.  This deliberately has no
+/// pagination or client-side list composition: one repeatable-read caller
+/// observes every product row through the same PostgreSQL snapshot.
+pub(super) fn qualification_product_inventory_counts(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &Id,
+) -> AuthorityTxResult<ProductionQualificationProductInventoryCounts> {
+    let cat_sql = format!("SELECT {CAT_COLUMNS} FROM cat_records ORDER BY cat_id COLLATE \"C\"");
+    let cats = transaction
+        .query(&cat_sql, &[])?
+        .iter()
+        .map(decode_cat)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let cats = cats
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.cat_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+
+    let desired_sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs ORDER BY cat_id COLLATE \"C\""
+    );
+    let desired = transaction
+        .query(&desired_sql, &[])?
+        .iter()
+        .map(decode_desired)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let desired = desired
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.cat_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    if cats.keys().ne(desired.keys()) {
+        return Err(corrupt(
+            "qualification product inventory found a Cat/Desired projection gap",
+        ));
+    }
+    let current_cat_count = desired
+        .values()
+        .filter(|record| record.target != RuntimeTarget::Deleted)
+        .count();
+    let deleted_cat_tombstone_count = desired.len().saturating_sub(current_cat_count);
+
+    let disk_sql =
+        format!("SELECT {DISK_COLUMNS} FROM disk_records ORDER BY disk_id COLLATE \"C\"");
+    let disks = transaction
+        .query(&disk_sql, &[])?
+        .iter()
+        .map(decode_disk)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let disks = disks
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.disk_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut root_disk_count = 0_usize;
+    let mut persistent_disk_count = 0_usize;
+    for disk in disks.values() {
+        match &disk.role {
+            DiskRole::Root { cat_id } => {
+                if !cats.contains_key(cat_id.as_str()) {
+                    return Err(corrupt(
+                        "qualification product inventory found an orphan RootDisk",
+                    ));
+                }
+                root_disk_count += 1;
+            }
+            DiskRole::Persistent { .. } => persistent_disk_count += 1,
+        }
+    }
+
+    let snapshot_sql = format!(
+        "SELECT {DISK_SNAPSHOT_COLUMNS} FROM disk_snapshot_records
+          ORDER BY snapshot_id COLLATE \"C\""
+    );
+    let snapshots = transaction
+        .query(&snapshot_sql, &[])?
+        .iter()
+        .map(decode_disk_snapshot)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let mut disk_snapshot_count = 0_usize;
+    for snapshot in snapshots {
+        let Some(disk) = disks.get(snapshot.disk_id.as_str()) else {
+            continue;
+        };
+        if snapshot.volume_id != disk.volume_id || snapshot.size_bytes != disk.size_bytes {
+            return Err(corrupt(
+                "qualification product inventory found a rebound DiskSnapshot",
+            ));
+        }
+        disk_snapshot_count += 1;
+    }
+
+    let endpoint_sql = format!(
+        "SELECT {ENDPOINT_COLUMNS} FROM endpoint_records ORDER BY endpoint_id COLLATE \"C\""
+    );
+    let endpoints = transaction
+        .query(&endpoint_sql, &[])?
+        .iter()
+        .map(decode_endpoint)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let endpoints = endpoints
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.endpoint_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    if endpoints
+        .values()
+        .any(|endpoint| !cats.contains_key(endpoint.cat_id.as_str()))
+    {
+        return Err(corrupt(
+            "qualification product inventory found an orphan Endpoint",
+        ));
+    }
+
+    let hostname_sql = format!(
+        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
+          ORDER BY hostname COLLATE \"C\""
+    );
+    let hostname_lookups = transaction
+        .query(&hostname_sql, &[])?
+        .iter()
+        .map(decode_hostname_lookup)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let hostname_lookups = hostname_lookups
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .collect::<Vec<_>>();
+    for lookup in &hostname_lookups {
+        let Some(endpoint) = endpoints.get(lookup.endpoint_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found an orphan hostname lookup",
+            ));
+        };
+        let Some(current) = desired.get(lookup.cat_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found a hostname without Desired",
+            ));
+        };
+        if endpoint.cat_id != lookup.cat_id || current.desired_revision != lookup.desired_revision {
+            return Err(corrupt(
+                "qualification product inventory found a rebound hostname lookup",
+            ));
+        }
+    }
+
+    let operation_sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          ORDER BY operation_id COLLATE \"C\""
+    );
+    let operations = transaction
+        .query(&operation_sql, &[])?
+        .iter()
+        .map(decode_operation_row)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let operations = operations
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .collect::<Vec<_>>();
+    let mut pending_runtime_operation_count = 0_usize;
+    let mut terminal_runtime_operation_history_count = 0_usize;
+    for operation in &operations {
+        let Some(current) = desired.get(operation.cat_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found an orphan Runtime Operation",
+            ));
+        };
+        if operation.phase == OperationPhase::Pending {
+            if operation.desired_revision != current.desired_revision
+                || operation.desired_spec_digest != current.spec_digest
+            {
+                return Err(corrupt(
+                    "qualification product inventory found a stale pending Runtime Operation",
+                ));
+            }
+            pending_runtime_operation_count += 1;
+        } else {
+            terminal_runtime_operation_history_count += 1;
+        }
+    }
+
+    let api_idempotency_receipt_count = transaction
+        .query_one(
+            "SELECT count(*) FROM api_idempotency_results
+              WHERE authenticated_workspace_id=$1",
+            &[&workspace_id.as_str()],
+        )?
+        .try_get::<_, i64>(0)?;
+    let api_idempotency_receipt_count =
+        usize::try_from(api_idempotency_receipt_count).map_err(corrupt)?;
+
+    Ok(ProductionQualificationProductInventoryCounts {
+        current_cat_count: wire_count(current_cat_count)?,
+        root_disk_count: wire_count(root_disk_count)?,
+        persistent_disk_count: wire_count(persistent_disk_count)?,
+        disk_snapshot_count: wire_count(disk_snapshot_count)?,
+        endpoint_count: wire_count(endpoints.len())?,
+        hostname_desired_lookup_count: wire_count(hostname_lookups.len())?,
+        pending_runtime_operation_count: wire_count(pending_runtime_operation_count)?,
+        deleted_cat_tombstone_count: wire_count(deleted_cat_tombstone_count)?,
+        terminal_runtime_operation_history_count: wire_count(
+            terminal_runtime_operation_history_count,
+        )?,
+        api_idempotency_receipt_count: wire_count(api_idempotency_receipt_count)?,
+    })
+}
+
+fn wire_count(value: usize) -> AuthorityTxResult<WireU64> {
+    let value = u64::try_from(value).map_err(corrupt)?;
+    WireU64::new(value).ok_or_else(|| corrupt("product inventory count exceeds the wire range"))
 }
 
 pub(super) fn insert_api_result(

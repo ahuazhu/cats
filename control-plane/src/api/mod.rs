@@ -922,6 +922,10 @@ pub fn router(state: AppState) -> Router {
             post(runtime_node_authority::get_production_mutation_admission_state),
         )
         .route(
+            "/v1/admin/production/qualification-product-inventory-discoveries",
+            post(runtime_node_authority::discover_production_qualification_product_inventory),
+        )
+        .route(
             "/v1/admin/runtime/fleet-verification",
             get(fleet_verification::fleet_verification),
         )
@@ -1023,6 +1027,10 @@ mod tests {
         ),
         (
             "POST /v1/admin/production/mutation-admission-state-discoveries",
+            "e13_read_only_discovery",
+        ),
+        (
+            "POST /v1/admin/production/qualification-product-inventory-discoveries",
             "e13_read_only_discovery",
         ),
         (
@@ -1339,6 +1347,7 @@ POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/admin/production/mutation-admission-command-discoveries
 POST /v1/admin/production/mutation-admission-commands
 POST /v1/admin/production/mutation-admission-state-discoveries
+POST /v1/admin/production/qualification-product-inventory-discoveries
 POST /v1/admin/runtime/node-authority-applies
 POST /v1/admin/usage/source-terminal/discover
 POST /v1/admin/usage/target-terminal/begin
@@ -1448,6 +1457,7 @@ POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/admin/production/mutation-admission-command-discoveries
 POST /v1/admin/production/mutation-admission-commands
 POST /v1/admin/production/mutation-admission-state-discoveries
+POST /v1/admin/production/qualification-product-inventory-discoveries
 POST /v1/admin/runtime/node-authority-applies
 POST /v1/admin/usage/source-terminal/discover
 POST /v1/admin/usage/target-terminal/begin

@@ -8,18 +8,23 @@
 use cats_api::production_mutation_admission::{
     encode_production_mutation_admission_command,
     encode_production_mutation_admission_command_receipt,
-    encode_production_mutation_admission_state, production_mutation_admission_binding_sha256,
+    encode_production_mutation_admission_state,
+    encode_production_qualification_product_inventory_receipt,
+    production_mutation_admission_binding_sha256,
+    production_mutation_admission_command_receipt_sha256,
     production_mutation_admission_command_sha256, ProductionCutoverOperatorPrincipal,
     ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
     ProductionMutationAdmissionCommandReceipt, ProductionMutationAdmissionMode,
     ProductionMutationAdmissionMutation, ProductionMutationAdmissionState,
     ProductionMutationAdmissionStoredOutcome, ProductionMutationOpenBinding,
-    ProductionQualificationAdmissionBinding, ProductionQualificationMutationClass,
+    ProductionQualificationAdmissionBinding, ProductionQualificationCloseKind,
+    ProductionQualificationMutationClass, ProductionQualificationProductInventoryReceipt,
     PRODUCTION_CUTOVER_CLOCK_SKEW_MS, PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION,
     PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
+    PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND,
 };
 use cats_api::runtime_reconciliation::{
-    ContractVersion, Epoch, RandomId128, Sha256Digest, UnixMillis,
+    ContractVersion, Epoch, RandomId128, Sha256Digest, UnixMillis, WireU64,
 };
 use cats_storage::authority::AuthorityError;
 use postgres::{Row, Transaction};
@@ -88,6 +93,14 @@ pub(crate) enum ProductionMutationAdmissionCommandStoreOutcome {
     AuthenticationFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProductionQualificationProductInventoryStoreOutcome {
+    Found(ProductionQualificationProductInventoryReceipt),
+    CommandIdConflict,
+    NotFound,
+    AuthenticationFailed,
+}
+
 impl Store {
     pub(crate) fn production_mutation_admission_state(
         &self,
@@ -141,6 +154,126 @@ impl Store {
             )
         })
     }
+
+    pub(crate) fn production_qualification_product_inventory(
+        &self,
+        principal: &ProductionCutoverOperatorPrincipal,
+        command: &ProductionMutationAdmissionCommand,
+        request: &AuthorityRequestContext,
+    ) -> Result<ProductionQualificationProductInventoryStoreOutcome> {
+        encode_production_mutation_admission_command(command)
+            .map_err(|_| ApiError::invalid("production qualification close command is invalid"))?;
+        if principal.sts != command.operator {
+            return Ok(ProductionQualificationProductInventoryStoreOutcome::AuthenticationFailed);
+        }
+        let principal = principal.clone();
+        let command = command.clone();
+        self.authority_request_locking_read_snapshot(request, move |transaction| {
+            qualification_product_inventory_in(transaction, &principal, &command)
+        })
+    }
+}
+
+fn qualification_product_inventory_in(
+    transaction: &mut Transaction<'_>,
+    principal: &ProductionCutoverOperatorPrincipal,
+    command: &ProductionMutationAdmissionCommand,
+) -> AuthorityTxResult<ProductionQualificationProductInventoryStoreOutcome> {
+    let (binding, close_kind) = match &command.mutation {
+        ProductionMutationAdmissionMutation::EndQualification { binding } => {
+            (binding, ProductionQualificationCloseKind::EndQualification)
+        }
+        ProductionMutationAdmissionMutation::EmergencyClose {
+            binding: ProductionMutationAdmissionBinding::Qualification(binding),
+        } => (binding, ProductionQualificationCloseKind::EmergencyClose),
+        _ => {
+            return Ok(ProductionQualificationProductInventoryStoreOutcome::NotFound);
+        }
+    };
+    let state = load_state_locked(transaction, "FOR SHARE")?;
+    let Some(expected_closed_revision) = command.expected_revision.get().checked_add(1) else {
+        return Err(corrupt("qualification close revision overflowed"));
+    };
+    if state.mode != ProductionMutationAdmissionMode::Closed
+        || state.revision.get() != expected_closed_revision
+        || state.last_command_id.as_ref() != Some(&command.command_id)
+        || state.binding.as_ref()
+            != Some(&ProductionMutationAdmissionBinding::Qualification(
+                binding.clone(),
+            ))
+    {
+        return Ok(ProductionQualificationProductInventoryStoreOutcome::NotFound);
+    }
+    let Some(stored) = load_command_receipt(transaction, command.command_id.as_str())? else {
+        return Err(corrupt(
+            "Closed qualification state lost its immutable close command",
+        ));
+    };
+    if stored.command != *command {
+        return Ok(ProductionQualificationProductInventoryStoreOutcome::CommandIdConflict);
+    }
+    if stored.principal != *principal {
+        return Ok(ProductionQualificationProductInventoryStoreOutcome::AuthenticationFailed);
+    }
+    if !matches!(
+        &stored.outcome,
+        ProductionMutationAdmissionStoredOutcome::Applied { state: applied } if applied == &state
+    ) {
+        return Err(corrupt(
+            "qualification close command is not the current applied Closed state",
+        ));
+    }
+    if qualified_release_commit() != Some(binding.source_commit_sha.as_str()) {
+        return Err(corrupt(
+            "qualification inventory binding does not match this Control release",
+        ));
+    }
+
+    let counts = super::product_rows::qualification_product_inventory_counts(
+        transaction,
+        &binding.workspace_id,
+    )?;
+    let product_resource_count = [
+        counts.current_cat_count,
+        counts.root_disk_count,
+        counts.persistent_disk_count,
+        counts.disk_snapshot_count,
+        counts.endpoint_count,
+        counts.hostname_desired_lookup_count,
+        counts.pending_runtime_operation_count,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, count| total.checked_add(count.get()))
+    .and_then(WireU64::new)
+    .ok_or_else(|| corrupt("qualification product inventory count overflowed"))?;
+    let receipt = ProductionQualificationProductInventoryReceipt {
+        kind: PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND.to_owned(),
+        version: ContractVersion::V1,
+        qualification_id: binding.qualification_id.clone(),
+        workspace_id: binding.workspace_id.clone(),
+        release_id: binding.release_id.clone(),
+        source_commit_sha: binding.source_commit_sha.clone(),
+        qualification_catalog_sha256: binding.qualification_catalog_sha256.clone(),
+        binding_sha256: production_mutation_admission_binding_sha256(
+            &ProductionMutationAdmissionBinding::Qualification(binding.clone()),
+        )
+        .map_err(corrupt)?,
+        close_kind,
+        close_command_id: command.command_id.clone(),
+        close_request_sha256: production_mutation_admission_command_sha256(command)
+            .map_err(corrupt)?,
+        close_command_receipt_sha256: production_mutation_admission_command_receipt_sha256(&stored)
+            .map_err(corrupt)?,
+        closed_revision: state.revision,
+        evaluated_at_unix_ms: database_now(transaction)?,
+        complete: true,
+        counts,
+        product_resource_count,
+    };
+    encode_production_qualification_product_inventory_receipt(&receipt).map_err(corrupt)?;
+    Ok(ProductionQualificationProductInventoryStoreOutcome::Found(
+        receipt,
+    ))
 }
 
 /// Gate a new product mutation in the same transaction as its business write.

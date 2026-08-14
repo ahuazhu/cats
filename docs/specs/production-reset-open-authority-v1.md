@@ -315,6 +315,7 @@ claim. Submit and typed discovery are exact POSTs to:
 /v1/admin/production/mutation-admission-commands
 /v1/admin/production/mutation-admission-command-discoveries
 /v1/admin/production/mutation-admission-state-discoveries
+/v1/admin/production/qualification-product-inventory-discoveries
 ```
 
 An exact `(command_id,canonical command bytes)` replay returns the original immutable receipt;
@@ -357,7 +358,8 @@ production-mutation-qualification-terminal.receipt.json {
   terminal_outcome: "qualified_closed" | "emergency_closed",
   close_command_id, close_request_sha256, close_command_receipt_sha256,
   final_admission_state_sha256, final_closed_revision,
-  fleet_closed_receipt_sha256, cleanup_inventory_receipt_sha256,
+  fleet_closed_receipt_sha256, product_inventory_receipt_sha256,
+  cleanup_inventory_receipt_sha256,
   active_guard_count: 0, product_resource_count: 0, residue_count: 0,
   completed_at_unix_ms
 }
@@ -370,6 +372,41 @@ cannot authorize reset or Open. `qualification_id` is the exact runner run ID, n
 label. The final state/fleet/cleanup receipts are read afterward; E9 terminalization is later still.
 The final qualification manifest hashes these receipts; neither receipt hashes that manifest,
 avoiding a recursive digest.
+
+After the exact close is applied, the product-inventory discovery POST reuses the original signed
+close command and dedicated cutover headers.  It accepts only `EndQualification` or a
+Qualification-scoped `EmergencyClose` that is the current immutable Closed successor.  One
+deadline-bound repeatable-read transaction locks the singleton `FOR SHARE`, checks the applied
+command receipt, decodes the complete clean-slate product graph without pagination, and emits:
+
+```text
+production-mutation-qualification-product-inventory.receipt.json {
+  kind: "cats.production-mutation-qualification-product-inventory.v1", version: 1,
+  qualification_id, workspace_id, release_id, source_commit_sha,
+  qualification_catalog_sha256, binding_sha256,
+  close_kind, close_command_id, close_request_sha256,
+  close_command_receipt_sha256, closed_revision, evaluated_at_unix_ms,
+  complete: true,
+  counts: {
+    current_cat_count, root_disk_count, persistent_disk_count,
+    disk_snapshot_count, endpoint_count, hostname_desired_lookup_count,
+    pending_runtime_operation_count,
+    deleted_cat_tombstone_count, terminal_runtime_operation_history_count,
+    api_idempotency_receipt_count
+  },
+  product_resource_count
+}
+```
+
+`product_resource_count` is the checked sum of the first seven counters.  A `Deleted` Desired/Cat
+tombstone, terminal `runtime_operations` row, or `api_idempotency_results` row is retained history,
+reported by the final three counters, and never mistaken for a live product resource.  All
+`cat_records`, `endpoint_records`, `disk_records`, `disk_snapshot_records`,
+`desired_runtime_specs`, `hostname_desired_lookups`, and `runtime_operations` JSON/scalar
+projections are decoded and cross-checked.  A missing Cat/Desired pair, orphan RootDisk/Endpoint/
+hostname/Operation, rebound Snapshot, or pending Operation not equal to current Desired is corrupt
+and fails closed.  Volume/residue and physical-runtime zero remain the independent E12/fleet
+oracles; clients must not infer them by counting product APIs.
 
 ### 4.2 Runner Qualification hook
 

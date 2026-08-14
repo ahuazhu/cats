@@ -25,6 +25,8 @@ pub const PRODUCTION_MUTATION_ADMISSION_DISCOVERY_PATH: &str =
     "/v1/admin/production/mutation-admission-command-discoveries";
 pub const PRODUCTION_MUTATION_ADMISSION_STATE_PATH: &str =
     "/v1/admin/production/mutation-admission-state-discoveries";
+pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH: &str =
+    "/v1/admin/production/qualification-product-inventory-discoveries";
 pub const PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES: usize = 65_536;
 pub const PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES: usize = 131_072;
 pub const PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION: u64 = 16;
@@ -42,6 +44,10 @@ pub const PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_FILE: &str =
     "production-mutation-qualification-terminal.receipt.json";
 pub const PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND: &str =
     "cats.production-mutation-qualification-terminal-receipt.v1";
+pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_FILE: &str =
+    "production-mutation-qualification-product-inventory.receipt.json";
+pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND: &str =
+    "cats.production-mutation-qualification-product-inventory.v1";
 
 pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 4] = [
     ProductionQualificationMutationClass::CatCreate,
@@ -406,11 +412,58 @@ pub struct ProductionQualificationTerminalReceipt {
     pub final_admission_state_sha256: Sha256Digest,
     pub final_closed_revision: Epoch,
     pub fleet_closed_receipt_sha256: Sha256Digest,
+    pub product_inventory_receipt_sha256: Sha256Digest,
     pub cleanup_inventory_receipt_sha256: Sha256Digest,
     pub active_guard_count: WireU64,
     pub product_resource_count: WireU64,
     pub residue_count: WireU64,
     pub completed_at_unix_ms: UnixMillis,
+}
+
+/// Complete current-product projection for one qualification Workspace.
+///
+/// The first seven fields contribute to `product_resource_count`.  Deleted
+/// Cat tombstones, terminal Operation rows and exact API idempotency results
+/// are retained history and are reported separately rather than becoming a
+/// false nonzero product inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionQualificationProductInventoryCounts {
+    pub current_cat_count: WireU64,
+    pub root_disk_count: WireU64,
+    pub persistent_disk_count: WireU64,
+    pub disk_snapshot_count: WireU64,
+    pub endpoint_count: WireU64,
+    pub hostname_desired_lookup_count: WireU64,
+    pub pending_runtime_operation_count: WireU64,
+    pub deleted_cat_tombstone_count: WireU64,
+    pub terminal_runtime_operation_history_count: WireU64,
+    pub api_idempotency_receipt_count: WireU64,
+}
+
+/// Canonical read-only evidence obtained after the exact qualification close.
+/// The close command and its immutable Store receipt are carried by digest so
+/// this cannot be rebound to a different Closed revision or operator action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionQualificationProductInventoryReceipt {
+    pub kind: String,
+    pub version: ContractVersion,
+    pub qualification_id: Id,
+    pub workspace_id: Id,
+    pub release_id: Id,
+    pub source_commit_sha: String,
+    pub qualification_catalog_sha256: Sha256Digest,
+    pub binding_sha256: Sha256Digest,
+    pub close_kind: ProductionQualificationCloseKind,
+    pub close_command_id: RandomId128,
+    pub close_request_sha256: Sha256Digest,
+    pub close_command_receipt_sha256: Sha256Digest,
+    pub closed_revision: Epoch,
+    pub evaluated_at_unix_ms: UnixMillis,
+    pub complete: bool,
+    pub counts: ProductionQualificationProductInventoryCounts,
+    pub product_resource_count: WireU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,11 +717,39 @@ pub fn encode_production_qualification_terminal_receipt(
     )
 }
 
+pub fn decode_production_qualification_product_inventory_receipt(
+    body: &[u8],
+) -> Result<ProductionQualificationProductInventoryReceipt, ProductionMutationAdmissionContractError>
+{
+    decode_canonical(body, validate_qualification_product_inventory_receipt)
+}
+
+pub fn encode_production_qualification_product_inventory_receipt(
+    receipt: &ProductionQualificationProductInventoryReceipt,
+) -> Result<Vec<u8>, ProductionMutationAdmissionContractError> {
+    validate_qualification_product_inventory_receipt(receipt)?;
+    encode_canonical(
+        receipt,
+        PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
+    )
+}
+
 pub fn production_mutation_admission_command_sha256(
     command: &ProductionMutationAdmissionCommand,
 ) -> Result<Sha256Digest, ProductionMutationAdmissionContractError> {
     Ok(Sha256Digest::from_bytes(
         sha2::Sha256::digest(encode_production_mutation_admission_command(command)?).into(),
+    ))
+}
+
+pub fn production_mutation_admission_command_receipt_sha256(
+    receipt: &ProductionMutationAdmissionCommandReceipt,
+) -> Result<Sha256Digest, ProductionMutationAdmissionContractError> {
+    Ok(Sha256Digest::from_bytes(
+        sha2::Sha256::digest(encode_production_mutation_admission_command_receipt(
+            receipt,
+        )?)
+        .into(),
     ))
 }
 
@@ -927,6 +1008,33 @@ fn validate_qualification_terminal_receipt(
         || receipt.product_resource_count.get() != 0
         || receipt.residue_count.get() != 0
         || receipt.completed_at_unix_ms.get() == 0
+    {
+        return Err(ProductionMutationAdmissionContractError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_qualification_product_inventory_receipt(
+    receipt: &ProductionQualificationProductInventoryReceipt,
+) -> Result<(), ProductionMutationAdmissionContractError> {
+    let current_counts = [
+        receipt.counts.current_cat_count,
+        receipt.counts.root_disk_count,
+        receipt.counts.persistent_disk_count,
+        receipt.counts.disk_snapshot_count,
+        receipt.counts.endpoint_count,
+        receipt.counts.hostname_desired_lookup_count,
+        receipt.counts.pending_runtime_operation_count,
+    ];
+    let expected_total = current_counts
+        .into_iter()
+        .try_fold(0_u64, |total, count| total.checked_add(count.get()));
+    if receipt.kind != PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND
+        || receipt.version != ContractVersion::V1
+        || !valid_source_commit(&receipt.source_commit_sha)
+        || !receipt.complete
+        || receipt.evaluated_at_unix_ms.get() == 0
+        || expected_total != Some(receipt.product_resource_count.get())
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
@@ -1247,7 +1355,8 @@ mod tests {
             final_admission_state_sha256: digest('5'),
             final_closed_revision: Epoch::new(3).unwrap(),
             fleet_closed_receipt_sha256: digest('6'),
-            cleanup_inventory_receipt_sha256: digest('7'),
+            product_inventory_receipt_sha256: digest('7'),
+            cleanup_inventory_receipt_sha256: digest('8'),
             active_guard_count: WireU64::new(0).unwrap(),
             product_resource_count: WireU64::new(0).unwrap(),
             residue_count: WireU64::new(0).unwrap(),
@@ -1263,6 +1372,53 @@ mod tests {
         nonzero.product_resource_count = WireU64::new(1).unwrap();
         assert_eq!(
             encode_production_qualification_terminal_receipt(&nonzero),
+            Err(ProductionMutationAdmissionContractError::Invalid)
+        );
+    }
+
+    #[test]
+    fn qualification_product_inventory_separates_current_rows_from_history() {
+        let counts = ProductionQualificationProductInventoryCounts {
+            current_cat_count: WireU64::new(1).unwrap(),
+            root_disk_count: WireU64::new(1).unwrap(),
+            persistent_disk_count: WireU64::new(2).unwrap(),
+            disk_snapshot_count: WireU64::new(1).unwrap(),
+            endpoint_count: WireU64::new(1).unwrap(),
+            hostname_desired_lookup_count: WireU64::new(1).unwrap(),
+            pending_runtime_operation_count: WireU64::new(1).unwrap(),
+            deleted_cat_tombstone_count: WireU64::new(3).unwrap(),
+            terminal_runtime_operation_history_count: WireU64::new(4).unwrap(),
+            api_idempotency_receipt_count: WireU64::new(5).unwrap(),
+        };
+        let receipt = ProductionQualificationProductInventoryReceipt {
+            kind: PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND.to_owned(),
+            version: ContractVersion::V1,
+            qualification_id: Id::new("qualification_a").unwrap(),
+            workspace_id: Id::new("workspace_a").unwrap(),
+            release_id: Id::new("release_a").unwrap(),
+            source_commit_sha: "a".repeat(40),
+            qualification_catalog_sha256: digest('1'),
+            binding_sha256: digest('2'),
+            close_kind: ProductionQualificationCloseKind::EndQualification,
+            close_command_id: RandomId128::new("3".repeat(32)).unwrap(),
+            close_request_sha256: digest('3'),
+            close_command_receipt_sha256: digest('4'),
+            closed_revision: Epoch::new(3).unwrap(),
+            evaluated_at_unix_ms: UnixMillis::new(4_000).unwrap(),
+            complete: true,
+            counts,
+            product_resource_count: WireU64::new(8).unwrap(),
+        };
+        let encoded = encode_production_qualification_product_inventory_receipt(&receipt).unwrap();
+        assert_eq!(
+            decode_production_qualification_product_inventory_receipt(&encoded).unwrap(),
+            receipt
+        );
+
+        let mut rebound = receipt;
+        rebound.product_resource_count = WireU64::new(20).unwrap();
+        assert_eq!(
+            encode_production_qualification_product_inventory_receipt(&rebound),
             Err(ProductionMutationAdmissionContractError::Invalid)
         );
     }
