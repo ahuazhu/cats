@@ -391,6 +391,9 @@ pub struct ProviderScope {
 pub struct NodeIdentity {
     pub version: ContractVersion,
     pub node_id: Id,
+    /// Provider scope plus `immutable_host_id` is the complete immutable Host
+    /// identity. Provider instance IDs are never interpreted globally.
+    pub provider_scope: ProviderScope,
     pub immutable_host_id: Id,
     pub credential_id: Id,
     pub credential_binding: CredentialBinding,

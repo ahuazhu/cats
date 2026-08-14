@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 #[cfg(feature = "proposed-node-residue-reclamation")]
 pub use cats_api::runtime_reconciliation::{
     residue_acquisition_digest, AuthorizedServingAcquire, DiskKind,
@@ -49,6 +50,9 @@ pub struct AttachmentLineageIdentity {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedServingAttachment {
     pub identity: AttachmentLineageIdentity,
+    /// Public binding only. The matching attachment-scoped private key lives
+    /// in a separate root-only artifact and never enters this receipt.
+    pub object_write_credential: ObjectWriteCredentialReference,
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub head: RemoteHead,

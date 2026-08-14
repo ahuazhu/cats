@@ -1983,7 +1983,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             request_fingerprint, http_status, content_type, response_body,
             created_at
        FROM api_idempotency_results WHERE FALSE",
-    "SELECT node_id, record, immutable_host_id, credential_id,
+    "SELECT node_id, record, host_provider, host_partition, host_account_id,
+            host_region, immutable_host_id, credential_id,
             credential_kind, credential_public_key_spki_sha256,
             credential_provider, credential_principal,
             credential_lineage_state, state_path_id, state
@@ -2716,6 +2717,22 @@ CREATE TABLE IF NOT EXISTS api_idempotency_results (
 CREATE TABLE IF NOT EXISTS node_identities (
     node_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    host_provider TEXT NOT NULL CHECK (
+        octet_length(host_provider) BETWEEN 1 AND 128
+        AND host_provider ~ '^[A-Za-z0-9._:-]+$'
+    ),
+    host_partition TEXT NOT NULL CHECK (
+        octet_length(host_partition) BETWEEN 1 AND 128
+        AND host_partition ~ '^[A-Za-z0-9._:-]+$'
+    ),
+    host_account_id TEXT NOT NULL CHECK (
+        octet_length(host_account_id) BETWEEN 1 AND 128
+        AND host_account_id ~ '^[A-Za-z0-9._:-]+$'
+    ),
+    host_region TEXT NOT NULL CHECK (
+        octet_length(host_region) BETWEEN 1 AND 128
+        AND host_region ~ '^[A-Za-z0-9._:-]+$'
+    ),
     immutable_host_id TEXT NOT NULL,
     credential_id TEXT NOT NULL UNIQUE,
     credential_kind TEXT NOT NULL
@@ -2727,7 +2744,14 @@ CREATE TABLE IF NOT EXISTS node_identities (
         CHECK (credential_lineage_state IN ('active', 'retired')),
     state_path_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('provisioned', 'retired')),
-    UNIQUE (immutable_host_id, state_path_id),
+    UNIQUE (
+        host_provider, host_partition, host_account_id, host_region,
+        immutable_host_id, state_path_id
+    ),
+    UNIQUE (
+        node_id, host_provider, host_partition, host_account_id, host_region,
+        immutable_host_id
+    ),
     CHECK ((
         (credential_kind = 'public_key'
             AND credential_public_key_spki_sha256 IS NOT NULL
@@ -2770,6 +2794,235 @@ ALTER TABLE node_identities
     REFERENCES runtime_node_credential_lineage(
         node_id, credential_id, public_key_spki_sha256, state)
     ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+CREATE TABLE IF NOT EXISTS object_write_authorities (
+    writer_authority_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    host_provider TEXT NOT NULL,
+    host_partition TEXT NOT NULL,
+    host_account_id TEXT NOT NULL,
+    host_region TEXT NOT NULL,
+    immutable_host_id TEXT NOT NULL,
+    node_id TEXT NOT NULL REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    object_provider TEXT NOT NULL,
+    object_partition TEXT NOT NULL,
+    object_account_id TEXT NOT NULL,
+    object_region TEXT NOT NULL,
+    workload_principal_id TEXT NOT NULL,
+    object_store_scope_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('open', 'cutoff_pending', 'cutoff_complete')
+    ),
+    max_accepted_sequence BIGINT NOT NULL CHECK (max_accepted_sequence >= 0),
+    terminal_prefix_sequence BIGINT NOT NULL CHECK (
+        terminal_prefix_sequence >= 0
+        AND terminal_prefix_sequence <= max_accepted_sequence
+    ),
+    terminal_prefix_sha256 TEXT NOT NULL
+        CHECK (terminal_prefix_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    fence_attempt_id TEXT,
+    cutoff_effective_at_unix_ms BIGINT CHECK (cutoff_effective_at_unix_ms >= 0),
+    cutoff_sequence BIGINT CHECK (cutoff_sequence >= 0),
+    cutoff_receipt JSONB CHECK (
+        cutoff_receipt IS NULL OR jsonb_typeof(cutoff_receipt) = 'object'
+    ),
+    UNIQUE (
+        host_provider, host_partition, host_account_id, host_region,
+        immutable_host_id, writer_authority_id
+    ),
+    CHECK (
+        (state = 'open' AND fence_attempt_id IS NULL
+            AND cutoff_effective_at_unix_ms IS NULL
+            AND cutoff_sequence IS NULL AND cutoff_receipt IS NULL) OR
+        (state = 'cutoff_pending' AND fence_attempt_id IS NOT NULL
+            AND cutoff_effective_at_unix_ms IS NOT NULL
+            AND cutoff_sequence = max_accepted_sequence
+            AND cutoff_receipt IS NULL) OR
+        (state = 'cutoff_complete' AND fence_attempt_id IS NOT NULL
+            AND cutoff_effective_at_unix_ms IS NOT NULL
+            AND cutoff_sequence = max_accepted_sequence
+            AND terminal_prefix_sequence = cutoff_sequence
+            AND cutoff_receipt IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_open_authority_per_host
+    ON object_write_authorities(
+        host_provider, host_partition, host_account_id, host_region,
+        immutable_host_id, object_provider, object_partition,
+        object_account_id, object_region, object_store_scope_id
+    ) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS object_write_authorities_node_state
+    ON object_write_authorities(node_id, state);
+CREATE TABLE IF NOT EXISTS object_write_credentials (
+    credential_id TEXT PRIMARY KEY,
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    public_key_spki TEXT NOT NULL CHECK (
+        octet_length(public_key_spki) BETWEEN 1 AND 512
+        AND public_key_spki ~ '^[A-Za-z0-9_-]+$'
+    ),
+    public_key_spki_sha256 TEXT NOT NULL UNIQUE
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    writer_authority_id TEXT NOT NULL REFERENCES object_write_authorities(writer_authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    host_provider TEXT NOT NULL,
+    host_partition TEXT NOT NULL,
+    host_account_id TEXT NOT NULL,
+    host_region TEXT NOT NULL,
+    immutable_host_id TEXT NOT NULL,
+    node_id TEXT NOT NULL REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    node_boot_id TEXT NOT NULL CHECK (node_boot_id ~ '^[0-9a-f]{32}$'),
+    agent_instance_id TEXT NOT NULL CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
+    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    volume_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL,
+    attachment_epoch BIGINT NOT NULL CHECK (attachment_epoch > 0),
+    private_artifact_id TEXT NOT NULL UNIQUE,
+    private_file_fsync_receipt_id TEXT NOT NULL,
+    private_directory_fsync_receipt_id TEXT NOT NULL,
+    registered_at_unix_ms BIGINT NOT NULL CHECK (registered_at_unix_ms >= 0),
+    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+    retirement_kind TEXT CHECK (retirement_kind IN ('parent_cutoff', 'exact_release')),
+    retirement_transition_id TEXT,
+    retirement_receipt_id TEXT,
+    retired_at_unix_ms BIGINT CHECK (retired_at_unix_ms >= registered_at_unix_ms),
+    UNIQUE (
+        writer_authority_id, volume_id, attachment_id, attachment_epoch,
+        credential_id
+    ),
+    CHECK (
+        (state = 'active' AND retirement_kind IS NULL
+            AND retirement_transition_id IS NULL
+            AND retirement_receipt_id IS NULL AND retired_at_unix_ms IS NULL) OR
+        (state = 'retired' AND retirement_kind IS NOT NULL
+            AND retirement_transition_id IS NOT NULL
+            AND retirement_receipt_id IS NOT NULL AND retired_at_unix_ms IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_active_credential_per_attachment
+    ON object_write_credentials(
+        writer_authority_id, volume_id, attachment_id, attachment_epoch
+    ) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS object_write_credentials_parent_state
+    ON object_write_credentials(writer_authority_id, state, credential_id COLLATE \"C\");
+CREATE TABLE IF NOT EXISTS object_write_attempts (
+    request_id TEXT PRIMARY KEY CHECK (request_id ~ '^sha256:[0-9a-f]{64}$'),
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    writer_authority_id TEXT NOT NULL REFERENCES object_write_authorities(writer_authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    credential_id TEXT NOT NULL REFERENCES object_write_credentials(credential_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    volume_id TEXT NOT NULL,
+    key_kind TEXT NOT NULL CHECK (key_kind IN ('volume_data', 'volume_map', 'volume_commit')),
+    object_provider TEXT NOT NULL,
+    object_partition TEXT NOT NULL,
+    object_account_id TEXT NOT NULL,
+    object_region TEXT NOT NULL,
+    object_store_scope_id TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (content_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    content_length BIGINT NOT NULL CHECK (content_length BETWEEN 0 AND 33554432),
+    receiving_started_at_unix_ms BIGINT NOT NULL CHECK (receiving_started_at_unix_ms >= 0),
+    state TEXT NOT NULL CHECK (state IN (
+        'receiving', 'durable_spooled', 'rejected_before_accept',
+        'accepted_spooled', 'provider_issued', 'terminal_visible',
+        'permanent', 'spool_removed'
+    )),
+    spool_id TEXT CHECK (spool_id ~ '^owsp1_[0-9a-f]{64}$'),
+    spool_file_fsync_receipt_id TEXT,
+    spool_directory_fsync_receipt_id TEXT,
+    spool_durable_at_unix_ms BIGINT CHECK (
+        spool_durable_at_unix_ms >= receiving_started_at_unix_ms
+    ),
+    rejection_receipt_id TEXT,
+    rejected_at_unix_ms BIGINT CHECK (rejected_at_unix_ms >= spool_durable_at_unix_ms),
+    accepted_sequence BIGINT CHECK (accepted_sequence > 0),
+    accepted_at_unix_ms BIGINT CHECK (accepted_at_unix_ms >= spool_durable_at_unix_ms),
+    provider_attempt_id TEXT CHECK (provider_attempt_id ~ '^owpa1_[0-9a-f]{64}$'),
+    provider_issued_at_unix_ms BIGINT CHECK (provider_issued_at_unix_ms >= accepted_at_unix_ms),
+    terminal_kind TEXT CHECK (terminal_kind IN ('succeeded_visible', 'permanently_failed')),
+    put_receipt_id TEXT,
+    put_completed_at_unix_ms BIGINT CHECK (put_completed_at_unix_ms >= provider_issued_at_unix_ms),
+    visibility_receipt_id TEXT,
+    visible_at_unix_ms BIGINT CHECK (visible_at_unix_ms >= put_completed_at_unix_ms),
+    failure_receipt_id TEXT,
+    failed_at_unix_ms BIGINT CHECK (failed_at_unix_ms >= provider_issued_at_unix_ms),
+    spool_removal_receipt_id TEXT,
+    spool_removed_at_unix_ms BIGINT CHECK (
+        spool_removed_at_unix_ms >= COALESCE(visible_at_unix_ms, failed_at_unix_ms)
+    ),
+    CHECK (
+        (state = 'receiving' AND spool_id IS NULL AND accepted_sequence IS NULL) OR
+        (state = 'durable_spooled' AND spool_id IS NOT NULL
+            AND spool_file_fsync_receipt_id IS NOT NULL
+            AND spool_directory_fsync_receipt_id IS NOT NULL
+            AND spool_durable_at_unix_ms IS NOT NULL AND accepted_sequence IS NULL) OR
+        (state = 'rejected_before_accept' AND spool_id IS NOT NULL
+            AND rejection_receipt_id IS NOT NULL AND rejected_at_unix_ms IS NOT NULL
+            AND accepted_sequence IS NULL AND provider_attempt_id IS NULL) OR
+        (state IN ('accepted_spooled', 'provider_issued', 'terminal_visible', 'permanent', 'spool_removed')
+            AND spool_id IS NOT NULL AND accepted_sequence IS NOT NULL
+            AND accepted_at_unix_ms IS NOT NULL AND provider_attempt_id IS NOT NULL)
+    ),
+    CHECK ((state IN ('provider_issued', 'terminal_visible', 'permanent', 'spool_removed'))
+        = (provider_issued_at_unix_ms IS NOT NULL)),
+    CHECK ((terminal_kind = 'succeeded_visible') =
+        (put_receipt_id IS NOT NULL AND put_completed_at_unix_ms IS NOT NULL
+         AND visibility_receipt_id IS NOT NULL AND visible_at_unix_ms IS NOT NULL)),
+    CHECK ((terminal_kind = 'permanently_failed') =
+        (failure_receipt_id IS NOT NULL AND failed_at_unix_ms IS NOT NULL)),
+    CHECK ((state = 'spool_removed') =
+        (spool_removal_receipt_id IS NOT NULL AND spool_removed_at_unix_ms IS NOT NULL)),
+    CHECK (
+        (state = 'terminal_visible' AND terminal_kind = 'succeeded_visible') OR
+        (state = 'permanent' AND terminal_kind = 'permanently_failed') OR
+        (state = 'spool_removed' AND terminal_kind IS NOT NULL) OR
+        (state NOT IN ('terminal_visible', 'permanent', 'spool_removed')
+            AND terminal_kind IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS object_write_attempts_writer_sequence
+    ON object_write_attempts(writer_authority_id, accepted_sequence)
+    WHERE accepted_sequence IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS object_write_attempts_writer_object_accepted
+    ON object_write_attempts(writer_authority_id, object_key)
+    WHERE accepted_sequence IS NOT NULL;
+CREATE INDEX IF NOT EXISTS object_write_attempts_terminal_prefix
+    ON object_write_attempts(writer_authority_id, accepted_sequence)
+    WHERE accepted_sequence IS NOT NULL
+      AND state IN ('terminal_visible', 'permanent', 'spool_removed');
+CREATE OR REPLACE FUNCTION object_write_credential_parent_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM object_write_credentials credential
+          JOIN object_write_authorities authority
+            ON authority.writer_authority_id = credential.writer_authority_id
+         WHERE credential.writer_authority_id = NEW.writer_authority_id
+           AND (credential.host_provider, credential.host_partition,
+                credential.host_account_id, credential.host_region,
+                credential.immutable_host_id, credential.node_id)
+               IS DISTINCT FROM
+               (authority.host_provider, authority.host_partition,
+                authority.host_account_id, authority.host_region,
+                authority.immutable_host_id, authority.node_id)
+            OR credential.writer_authority_id = NEW.writer_authority_id
+           AND credential.state = 'active' AND authority.state <> 'open'
+    ) THEN
+        RAISE EXCEPTION 'active object-write credential under closed parent authority';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER object_write_authority_children_closed
+AFTER INSERT OR UPDATE ON object_write_authorities
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION object_write_credential_parent_guard();
+CREATE CONSTRAINT TRIGGER object_write_credential_parent_open
+AFTER INSERT OR UPDATE ON object_write_credentials
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION object_write_credential_parent_guard();
 CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -3632,6 +3885,10 @@ CREATE OR REPLACE FUNCTION control_node_identity_lineage_is_immutable()
 RETURNS trigger AS $$
 BEGIN
     IF NEW.node_id IS DISTINCT FROM OLD.node_id
+       OR NEW.host_provider IS DISTINCT FROM OLD.host_provider
+       OR NEW.host_partition IS DISTINCT FROM OLD.host_partition
+       OR NEW.host_account_id IS DISTINCT FROM OLD.host_account_id
+       OR NEW.host_region IS DISTINCT FROM OLD.host_region
        OR NEW.immutable_host_id IS DISTINCT FROM OLD.immutable_host_id
        OR NEW.state_path_id IS DISTINCT FROM OLD.state_path_id THEN
         RAISE EXCEPTION 'NodeIdentity lineage is immutable';

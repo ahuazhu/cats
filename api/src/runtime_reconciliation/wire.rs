@@ -4526,6 +4526,15 @@ fn node_identity_schema() -> Schema {
     object(vec![
         field("version", version()),
         field("node_id", id()),
+        field(
+            "provider_scope",
+            object(vec![
+                field("provider", id()),
+                field("partition", id()),
+                field("account_id", id()),
+                field("region", id()),
+            ]),
+        ),
         field("immutable_host_id", id()),
         field("credential_id", id()),
         field("credential_binding", credential_binding_schema()),
