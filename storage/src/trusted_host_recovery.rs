@@ -525,6 +525,7 @@ pub fn trusted_host_fence_recovery_blockers(
             }
         }
     }
+    canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(&mut reasons)?;
     Ok(reasons)
 }
 
@@ -748,6 +749,26 @@ fn validate_assigned_cat(
             _ => return Err(TrustedHostFenceRecoveryError::AssignedProof),
         }
         prior_volume = Some(&intent.volume_intent_id);
+    }
+    if let TrustedHostFenceAssignedCatInventoryV1::AcceptedFull { observed_runtime } =
+        &cat.inventory
+    {
+        if observed_runtime.volumes.len() != cat.volumes.len()
+            || observed_runtime
+                .volumes
+                .iter()
+                .zip(&cat.volumes)
+                .any(|(observed, volume)| {
+                    !matches!(
+                        &volume.inventory,
+                        TrustedHostFenceAssignedVolumeInventoryV1::AcceptedFull {
+                            observed_volume
+                        } if observed == observed_volume.as_ref()
+                    )
+                })
+        {
+            return Err(TrustedHostFenceRecoveryError::AssignedProof);
+        }
     }
     Ok(())
 }
@@ -1431,6 +1452,12 @@ mod tests {
             panic!("test fixture has accepted inventory")
         };
         observed_volume.durability = Some(Durability::Relaxed);
+        let TrustedHostFenceAssignedCatInventoryV1::AcceptedFull { observed_runtime } =
+            &mut attempt.assigned_cats[0].inventory
+        else {
+            panic!("test fixture has accepted Cat inventory")
+        };
+        observed_runtime.volumes[0].durability = Some(Durability::Relaxed);
         attempt.assigned_set_sha256 =
             trusted_host_fence_assigned_set_sha256(&attempt.assigned_cats)
                 .expect("mutated assigned set is canonical");
