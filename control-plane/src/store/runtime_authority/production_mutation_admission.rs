@@ -37,8 +37,10 @@ const STATE_COLUMNS: &str = "
     release_manifest_sha256, qualification_manifest_sha256,
     qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
     reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
-    route_signing_command_receipt_sha256,
-    route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
+    route_v2_rotation_qualification_receipt_sha256,
+    route_v2_rotation_qualification_node_ack_sets_sha256,
+    route_v2_rotation_qualification_transcript_sha256,
+    usage_terminal_receipt_sha256,
     old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
     vhost_user_qualification_bundle_sha256, last_command_id,
     updated_at_unix_ms";
@@ -54,8 +56,10 @@ const COMMAND_COLUMNS: &str = "
     source_bundle_sha256, release_manifest_sha256,
     qualification_manifest_sha256, qualification_catalog_sha256, proof_set_sha256,
     fresh_targets_sha256, reset_complete_receipt_sha256,
-    fleet_closed_receipt_sha256, route_signing_command_receipt_sha256,
-    route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
+    fleet_closed_receipt_sha256, route_v2_rotation_qualification_receipt_sha256,
+    route_v2_rotation_qualification_node_ack_sets_sha256,
+    route_v2_rotation_qualification_transcript_sha256,
+    usage_terminal_receipt_sha256,
     old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
     vhost_user_qualification_bundle_sha256, outcome::text AS outcome_json,
     outcome_kind, resulting_revision, resulting_mode, committed_at_unix_ms";
@@ -416,8 +420,9 @@ fn insert_command_receipt(
         .map(PgBigInt::to_pg)
         .transpose()
         .map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO production_mutation_admission_commands (
+    exactly_one(
+        transaction.execute(
+            "INSERT INTO production_mutation_admission_commands (
             command_id, command, request_sha256, principal, principal_kind,
             operator_credential_id, operator_public_key_spki_sha256,
             operator_trust_bundle_sha256, operator_aws_partition,
@@ -429,8 +434,10 @@ fn insert_command_receipt(
             release_manifest_sha256, qualification_manifest_sha256,
             qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
             reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
-            route_signing_command_receipt_sha256,
-            route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
+            route_v2_rotation_qualification_receipt_sha256,
+            route_v2_rotation_qualification_node_ack_sets_sha256,
+            route_v2_rotation_qualification_transcript_sha256,
+            usage_terminal_receipt_sha256,
             old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
             vhost_user_qualification_bundle_sha256, outcome, outcome_kind,
             resulting_revision, resulting_mode, committed_at_unix_ms
@@ -438,51 +445,59 @@ fn insert_command_receipt(
             $1,$2::TEXT::jsonb,$3,$4::TEXT::jsonb,'production_cutover_operator',
             $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-            $35,$36,$37::TEXT::jsonb,$38,$39,$40,$41)",
-        &[
-            &receipt.command.command_id.as_str(),
-            &command_json,
-            &receipt.request_sha256.as_str(),
-            &principal_json,
-            &receipt.principal.credential_id.as_str(),
-            &receipt.principal.public_key_spki_sha256.as_str(),
-            &receipt.principal.trust_bundle_sha256.as_str(),
-            &receipt.principal.sts.aws_partition.as_str(),
-            &receipt.principal.sts.account_id,
-            &receipt.principal.sts.role_arn,
-            &receipt.principal.sts.principal_arn,
-            &issued_at,
-            &expires_at,
-            &expected_revision,
-            &target_mode,
-            &binding_sha256.as_str(),
-            &binding.reset_id.as_str(),
-            &binding.deployment_id.as_str(),
-            &binding.release_id.as_str(),
-            &binding.source_commit_sha,
-            &schema_version,
-            &binding.source_manifest_sha256.as_str(),
-            &binding.source_bundle_sha256.as_str(),
-            &binding.release_manifest_sha256.as_str(),
-            &binding.qualification_manifest_sha256.as_str(),
-            &binding.qualification_catalog_sha256.as_str(),
-            &binding.proof_set_sha256.as_str(),
-            &binding.fresh_targets_sha256.as_str(),
-            &binding.reset_complete_receipt_sha256.as_str(),
-            &binding.fleet_closed_receipt_sha256.as_str(),
-            &binding.route_signing_command_receipt_sha256.as_str(),
-            &binding.route_ring_delivery_receipt_sha256.as_str(),
-            &binding.usage_terminal_receipt_sha256.as_str(),
-            &binding.old_host_coverage_sha256.as_str(),
-            &binding.kernel_nbd_qualification_bundle_sha256.as_str(),
-            &binding.vhost_user_qualification_bundle_sha256.as_str(),
-            &outcome_json,
-            &outcome_kind,
-            &resulting_revision,
-            &resulting_mode,
-            &committed_at,
-        ],
-    )?)
+            $35,$36,$37,$38::TEXT::jsonb,$39,$40,$41,$42)",
+            &[
+                &receipt.command.command_id.as_str(),
+                &command_json,
+                &receipt.request_sha256.as_str(),
+                &principal_json,
+                &receipt.principal.credential_id.as_str(),
+                &receipt.principal.public_key_spki_sha256.as_str(),
+                &receipt.principal.trust_bundle_sha256.as_str(),
+                &receipt.principal.sts.aws_partition.as_str(),
+                &receipt.principal.sts.account_id,
+                &receipt.principal.sts.role_arn,
+                &receipt.principal.sts.principal_arn,
+                &issued_at,
+                &expires_at,
+                &expected_revision,
+                &target_mode,
+                &binding_sha256.as_str(),
+                &binding.reset_id.as_str(),
+                &binding.deployment_id.as_str(),
+                &binding.release_id.as_str(),
+                &binding.source_commit_sha,
+                &schema_version,
+                &binding.source_manifest_sha256.as_str(),
+                &binding.source_bundle_sha256.as_str(),
+                &binding.release_manifest_sha256.as_str(),
+                &binding.qualification_manifest_sha256.as_str(),
+                &binding.qualification_catalog_sha256.as_str(),
+                &binding.proof_set_sha256.as_str(),
+                &binding.fresh_targets_sha256.as_str(),
+                &binding.reset_complete_receipt_sha256.as_str(),
+                &binding.fleet_closed_receipt_sha256.as_str(),
+                &binding
+                    .route_v2_rotation_qualification_receipt_sha256
+                    .as_str(),
+                &binding
+                    .route_v2_rotation_qualification_node_ack_sets_sha256
+                    .as_str(),
+                &binding
+                    .route_v2_rotation_qualification_transcript_sha256
+                    .as_str(),
+                &binding.usage_terminal_receipt_sha256.as_str(),
+                &binding.old_host_coverage_sha256.as_str(),
+                &binding.kernel_nbd_qualification_bundle_sha256.as_str(),
+                &binding.vhost_user_qualification_bundle_sha256.as_str(),
+                &outcome_json,
+                &outcome_kind,
+                &resulting_revision,
+                &resulting_mode,
+                &committed_at,
+            ],
+        )?,
+    )
 }
 
 fn update_state(
@@ -504,8 +519,9 @@ fn update_state(
         .last_command_id
         .as_ref()
         .ok_or_else(|| corrupt("applied production admission state has no command"))?;
-    exactly_one(transaction.execute(
-        "UPDATE production_mutation_admission SET
+    exactly_one(
+        transaction.execute(
+            "UPDATE production_mutation_admission SET
             revision=$2, mode=$3, binding=$4::TEXT::jsonb,
             binding_sha256=$5, reset_id=$6, deployment_id=$7, release_id=$8,
             source_commit_sha=$9, control_schema_version=$10,
@@ -514,43 +530,52 @@ fn update_state(
             qualification_catalog_sha256=$15, proof_set_sha256=$16,
             fresh_targets_sha256=$17, reset_complete_receipt_sha256=$18,
             fleet_closed_receipt_sha256=$19,
-            route_signing_command_receipt_sha256=$20,
-            route_ring_delivery_receipt_sha256=$21,
-            usage_terminal_receipt_sha256=$22, old_host_coverage_sha256=$23,
-            kernel_nbd_qualification_bundle_sha256=$24,
-            vhost_user_qualification_bundle_sha256=$25,
-            last_command_id=$26, updated_at_unix_ms=$27
+            route_v2_rotation_qualification_receipt_sha256=$20,
+            route_v2_rotation_qualification_node_ack_sets_sha256=$21,
+            route_v2_rotation_qualification_transcript_sha256=$22,
+            usage_terminal_receipt_sha256=$23, old_host_coverage_sha256=$24,
+            kernel_nbd_qualification_bundle_sha256=$25,
+            vhost_user_qualification_bundle_sha256=$26,
+            last_command_id=$27, updated_at_unix_ms=$28
           WHERE singleton AND revision=$1",
-        &[
-            &current_revision,
-            &revision,
-            &mode_text(successor.mode),
-            &binding_json,
-            &binding_sha256.as_str(),
-            &binding.reset_id.as_str(),
-            &binding.deployment_id.as_str(),
-            &binding.release_id.as_str(),
-            &binding.source_commit_sha,
-            &schema_version,
-            &binding.source_manifest_sha256.as_str(),
-            &binding.source_bundle_sha256.as_str(),
-            &binding.release_manifest_sha256.as_str(),
-            &binding.qualification_manifest_sha256.as_str(),
-            &binding.qualification_catalog_sha256.as_str(),
-            &binding.proof_set_sha256.as_str(),
-            &binding.fresh_targets_sha256.as_str(),
-            &binding.reset_complete_receipt_sha256.as_str(),
-            &binding.fleet_closed_receipt_sha256.as_str(),
-            &binding.route_signing_command_receipt_sha256.as_str(),
-            &binding.route_ring_delivery_receipt_sha256.as_str(),
-            &binding.usage_terminal_receipt_sha256.as_str(),
-            &binding.old_host_coverage_sha256.as_str(),
-            &binding.kernel_nbd_qualification_bundle_sha256.as_str(),
-            &binding.vhost_user_qualification_bundle_sha256.as_str(),
-            &command_id.as_str(),
-            &updated_at,
-        ],
-    )?)
+            &[
+                &current_revision,
+                &revision,
+                &mode_text(successor.mode),
+                &binding_json,
+                &binding_sha256.as_str(),
+                &binding.reset_id.as_str(),
+                &binding.deployment_id.as_str(),
+                &binding.release_id.as_str(),
+                &binding.source_commit_sha,
+                &schema_version,
+                &binding.source_manifest_sha256.as_str(),
+                &binding.source_bundle_sha256.as_str(),
+                &binding.release_manifest_sha256.as_str(),
+                &binding.qualification_manifest_sha256.as_str(),
+                &binding.qualification_catalog_sha256.as_str(),
+                &binding.proof_set_sha256.as_str(),
+                &binding.fresh_targets_sha256.as_str(),
+                &binding.reset_complete_receipt_sha256.as_str(),
+                &binding.fleet_closed_receipt_sha256.as_str(),
+                &binding
+                    .route_v2_rotation_qualification_receipt_sha256
+                    .as_str(),
+                &binding
+                    .route_v2_rotation_qualification_node_ack_sets_sha256
+                    .as_str(),
+                &binding
+                    .route_v2_rotation_qualification_transcript_sha256
+                    .as_str(),
+                &binding.usage_terminal_receipt_sha256.as_str(),
+                &binding.old_host_coverage_sha256.as_str(),
+                &binding.kernel_nbd_qualification_bundle_sha256.as_str(),
+                &binding.vhost_user_qualification_bundle_sha256.as_str(),
+                &command_id.as_str(),
+                &updated_at,
+            ],
+        )?,
+    )
 }
 
 fn validate_binding_projection(
@@ -588,10 +613,18 @@ fn validate_binding_projection(
             == binding.reset_complete_receipt_sha256.as_str()
         && text(row, "fleet_closed_receipt_sha256")?
             == binding.fleet_closed_receipt_sha256.as_str()
-        && text(row, "route_signing_command_receipt_sha256")?
-            == binding.route_signing_command_receipt_sha256.as_str()
-        && text(row, "route_ring_delivery_receipt_sha256")?
-            == binding.route_ring_delivery_receipt_sha256.as_str()
+        && text(row, "route_v2_rotation_qualification_receipt_sha256")?
+            == binding
+                .route_v2_rotation_qualification_receipt_sha256
+                .as_str()
+        && text(row, "route_v2_rotation_qualification_node_ack_sets_sha256")?
+            == binding
+                .route_v2_rotation_qualification_node_ack_sets_sha256
+                .as_str()
+        && text(row, "route_v2_rotation_qualification_transcript_sha256")?
+            == binding
+                .route_v2_rotation_qualification_transcript_sha256
+                .as_str()
         && text(row, "usage_terminal_receipt_sha256")?
             == binding.usage_terminal_receipt_sha256.as_str()
         && text(row, "old_host_coverage_sha256")? == binding.old_host_coverage_sha256.as_str()
@@ -708,12 +741,13 @@ mod tests {
             fresh_targets_sha256: digest('6'),
             reset_complete_receipt_sha256: digest('7'),
             fleet_closed_receipt_sha256: digest('8'),
-            route_signing_command_receipt_sha256: digest('9'),
-            route_ring_delivery_receipt_sha256: digest('a'),
-            usage_terminal_receipt_sha256: digest('b'),
-            old_host_coverage_sha256: digest('c'),
-            kernel_nbd_qualification_bundle_sha256: digest('d'),
-            vhost_user_qualification_bundle_sha256: digest('e'),
+            route_v2_rotation_qualification_receipt_sha256: digest('9'),
+            route_v2_rotation_qualification_node_ack_sets_sha256: digest('a'),
+            route_v2_rotation_qualification_transcript_sha256: digest('b'),
+            usage_terminal_receipt_sha256: digest('c'),
+            old_host_coverage_sha256: digest('d'),
+            kernel_nbd_qualification_bundle_sha256: digest('e'),
+            vhost_user_qualification_bundle_sha256: digest('f'),
         }
     }
 

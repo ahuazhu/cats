@@ -3208,12 +3208,15 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
     fleet_closed_receipt_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_fleet_closed_ck
         CHECK (fleet_closed_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_signing_command_receipt_sha256 TEXT NOT NULL
-        CONSTRAINT production_mutation_admission_commands_route_command_ck
-        CHECK (route_signing_command_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_ring_delivery_receipt_sha256 TEXT NOT NULL
-        CONSTRAINT production_mutation_admission_commands_route_delivery_ck
-        CHECK (route_ring_delivery_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_receipt_sha256 TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_route_v2_qualification_ck
+        CHECK (route_v2_rotation_qualification_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_node_ack_sets_sha256 TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_route_v2_node_acks_ck
+        CHECK (route_v2_rotation_qualification_node_ack_sets_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_transcript_sha256 TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_route_v2_transcript_ck
+        CHECK (route_v2_rotation_qualification_transcript_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     usage_terminal_receipt_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_usage_terminal_ck
         CHECK (usage_terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -3299,12 +3302,15 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
     fleet_closed_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_fleet_closed_ck
         CHECK (fleet_closed_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_signing_command_receipt_sha256 TEXT NULL
-        CONSTRAINT production_mutation_admission_route_command_ck
-        CHECK (route_signing_command_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_ring_delivery_receipt_sha256 TEXT NULL
-        CONSTRAINT production_mutation_admission_route_delivery_ck
-        CHECK (route_ring_delivery_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_receipt_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_route_v2_qualification_ck
+        CHECK (route_v2_rotation_qualification_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_node_ack_sets_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_route_v2_node_acks_ck
+        CHECK (route_v2_rotation_qualification_node_ack_sets_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    route_v2_rotation_qualification_transcript_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_route_v2_transcript_ck
+        CHECK (route_v2_rotation_qualification_transcript_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     usage_terminal_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_usage_terminal_ck
         CHECK (usage_terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -3334,8 +3340,9 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND fresh_targets_sha256 IS NULL
             AND reset_complete_receipt_sha256 IS NULL
             AND fleet_closed_receipt_sha256 IS NULL
-            AND route_signing_command_receipt_sha256 IS NULL
-            AND route_ring_delivery_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_node_ack_sets_sha256 IS NULL
+            AND route_v2_rotation_qualification_transcript_sha256 IS NULL
             AND usage_terminal_receipt_sha256 IS NULL
             AND old_host_coverage_sha256 IS NULL
             AND kernel_nbd_qualification_bundle_sha256 IS NULL
@@ -3354,8 +3361,9 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND proof_set_sha256 IS NOT NULL AND fresh_targets_sha256 IS NOT NULL
             AND reset_complete_receipt_sha256 IS NOT NULL
             AND fleet_closed_receipt_sha256 IS NOT NULL
-            AND route_signing_command_receipt_sha256 IS NOT NULL
-            AND route_ring_delivery_receipt_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_receipt_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_node_ack_sets_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_transcript_sha256 IS NOT NULL
             AND usage_terminal_receipt_sha256 IS NOT NULL
             AND old_host_coverage_sha256 IS NOT NULL
             AND kernel_nbd_qualification_bundle_sha256 IS NOT NULL
@@ -3373,15 +3381,17 @@ INSERT INTO production_mutation_admission (
     source_manifest_sha256, source_bundle_sha256, release_manifest_sha256,
     qualification_manifest_sha256, qualification_catalog_sha256,
     proof_set_sha256, fresh_targets_sha256, reset_complete_receipt_sha256,
-    fleet_closed_receipt_sha256, route_signing_command_receipt_sha256,
-    route_ring_delivery_receipt_sha256, usage_terminal_receipt_sha256,
+    fleet_closed_receipt_sha256, route_v2_rotation_qualification_receipt_sha256,
+    route_v2_rotation_qualification_node_ack_sets_sha256,
+    route_v2_rotation_qualification_transcript_sha256,
+    usage_terminal_receipt_sha256,
     old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
     vhost_user_qualification_bundle_sha256, last_command_id,
     updated_at_unix_ms
 ) VALUES (
     TRUE, 1, 'closed', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, 0
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0
 );
 CREATE TABLE IF NOT EXISTS node_identities (
     node_id TEXT PRIMARY KEY,
@@ -4547,10 +4557,12 @@ BEGIN
                 AND NEW.fresh_targets_sha256 = OLD.fresh_targets_sha256
                 AND NEW.reset_complete_receipt_sha256 = OLD.reset_complete_receipt_sha256
                 AND NEW.fleet_closed_receipt_sha256 = OLD.fleet_closed_receipt_sha256
-                AND NEW.route_signing_command_receipt_sha256 =
-                    OLD.route_signing_command_receipt_sha256
-                AND NEW.route_ring_delivery_receipt_sha256 =
-                    OLD.route_ring_delivery_receipt_sha256
+                AND NEW.route_v2_rotation_qualification_receipt_sha256 =
+                    OLD.route_v2_rotation_qualification_receipt_sha256
+                AND NEW.route_v2_rotation_qualification_node_ack_sets_sha256 =
+                    OLD.route_v2_rotation_qualification_node_ack_sets_sha256
+                AND NEW.route_v2_rotation_qualification_transcript_sha256 =
+                    OLD.route_v2_rotation_qualification_transcript_sha256
                 AND NEW.usage_terminal_receipt_sha256 =
                     OLD.usage_terminal_receipt_sha256
                 AND NEW.old_host_coverage_sha256 = OLD.old_host_coverage_sha256
