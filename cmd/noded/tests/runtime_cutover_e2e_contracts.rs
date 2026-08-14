@@ -1082,6 +1082,9 @@ fn production_v2_driver_places_usage_terminal_after_delete_and_preserves_typed_b
     assert!(
         driver.contains("target terminal begin remained ambiguous after one exact journal replay")
     );
+    assert!(driver.contains("target terminal request journal does not match this exact run"));
+    assert!(driver.contains("ln \"$request_source\" \"$request_journal\""));
+    assert!(!driver.contains("atomic_json usage-target-terminal-request.json"));
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
     assert!(!driver.contains("before_agent_session:"));

@@ -1266,23 +1266,51 @@ run_usage_final() {
     sha256sum | awk '{print substr($1,1,32)}')
   [[ $terminal_epoch_id =~ ^[0-9a-f]{32}$ && $terminal_epoch_id != 00000000000000000000000000000000 ]] || \
     fail "derived terminal epoch ID is not canonical"
-  created_at_ms=$(( $(date +%s) * 1000 ))
   request_source=$CASE_DIR/usage-target-terminal-request.source.json
   request_journal=$CASE_DIR/usage-target-terminal-request.json
-  jq -c -n --slurpfile config "$config_path" --argjson sources "$sources_json" \
-    --arg terminal_epoch_id "$terminal_epoch_id" \
-    --arg release_commit "$CATS_E3_EXACT_COMMIT" \
-    --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
-    --argjson created_at_unix_ms "$created_at_ms" \
-    --arg source_set_sha256 "$source_set_sha256" '
-    {contract_version:1,terminal_epoch_id:$terminal_epoch_id,
-     release_commit:$release_commit,artifact_sha256:$artifact_sha256,
-     created_at_unix_ms:$created_at_unix_ms,
-     old_target:$config[0].old_target,fresh_target:$config[0].fresh_target,
-     sources:$sources,source_set_sha256:$source_set_sha256,shards:$config[0].shards}' \
-    >"$request_source"
-  atomic_json usage-target-terminal-request.json "$request_source"
-  chmod 0400 "$request_journal"
+  if [[ -e $request_journal ]]; then
+    [[ -f $request_journal && ! -L $request_journal ]] || \
+      fail "target terminal request journal is not a regular no-symlink file"
+    [[ $(stat -c '%a:%u:%h' "$request_journal") == "400:$EUID:1" ]] || \
+      fail "target terminal request journal lost its private immutable file contract"
+    jq -S -c . "$request_journal" >"$request_source"
+    cmp -s "$request_source" "$request_journal" || \
+      fail "target terminal request journal is not canonical JSON"
+    jq -e --slurpfile config "$config_path" --argjson sources "$sources_json" \
+      --arg terminal_epoch_id "$terminal_epoch_id" \
+      --arg release_commit "$CATS_E3_EXACT_COMMIT" \
+      --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
+      --arg source_set_sha256 "$source_set_sha256" '
+      keys == ["artifact_sha256","contract_version","created_at_unix_ms","fresh_target",
+        "old_target","release_commit","shards","source_set_sha256","sources","terminal_epoch_id"]
+      and .contract_version == 1 and .terminal_epoch_id == $terminal_epoch_id
+      and .release_commit == $release_commit and .artifact_sha256 == $artifact_sha256
+      and (.created_at_unix_ms | type == "number" and . >= 0 and floor == .)
+      and .old_target == $config[0].old_target and .fresh_target == $config[0].fresh_target
+      and .sources == $sources and .source_set_sha256 == $source_set_sha256
+      and .shards == $config[0].shards' "$request_journal" >/dev/null || \
+      fail "target terminal request journal does not match this exact run and source set"
+    created_at_ms=$(jq -er '.created_at_unix_ms' "$request_journal")
+  else
+    created_at_ms=$(( $(date +%s) * 1000 ))
+    jq -S -c -n --slurpfile config "$config_path" --argjson sources "$sources_json" \
+      --arg terminal_epoch_id "$terminal_epoch_id" \
+      --arg release_commit "$CATS_E3_EXACT_COMMIT" \
+      --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
+      --argjson created_at_unix_ms "$created_at_ms" \
+      --arg source_set_sha256 "$source_set_sha256" '
+      {contract_version:1,terminal_epoch_id:$terminal_epoch_id,
+       release_commit:$release_commit,artifact_sha256:$artifact_sha256,
+       created_at_unix_ms:$created_at_unix_ms,
+       old_target:$config[0].old_target,fresh_target:$config[0].fresh_target,
+       sources:$sources,source_set_sha256:$source_set_sha256,shards:$config[0].shards}' \
+      >"$request_source"
+    chmod 0400 "$request_source"
+    if ! ln "$request_source" "$request_journal"; then
+      fail "target terminal request journal lost no-replace publication"
+    fi
+    rm -f "$request_source"
+  fi
 
   begin_response=$CASE_DIR/usage-target-terminal-begin.json
   begin_status=75
