@@ -18,6 +18,7 @@ use cats_api::agent_registration::{
 use cats_api::cat_create::decode_cat_create_v2_accepted_response;
 use cats_api::requests::ListResponse;
 use cats_api::resources::Disk;
+use cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact;
 use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, PROVISIONER_CREDENTIAL_ID_HEADER,
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
@@ -39,7 +40,7 @@ use cats_api::runtime_reconciliation::{
     UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{spawn, spawn_with_gateway_machine, Config, Handle};
 use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::{
     RuntimeCutoverAcceptanceFacts, RuntimeOperationsTableLockForTest,
@@ -229,6 +230,7 @@ struct Context {
     node_signer: Ed25519RequestSigner,
     provisioner_signer: Ed25519KeyPair,
     release: cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt,
+    route_v2_ring: RouteGrantV2PublicKeyRingArtifact,
     image_blob: Arc<FixedImageBlob>,
     config: Config,
     credits: Arc<ToggleCreditStore>,
@@ -277,7 +279,12 @@ impl Context {
             auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
         };
-        let first = spawn(config.clone()).await.unwrap();
+        let (gateway_machine, route_v2_ring) =
+            cats_control_plane::testsupport::route_v2_gateway_machine_fixture("127.0.0.1:0")
+                .unwrap();
+        let first = spawn_with_gateway_machine(config.clone(), gateway_machine)
+            .await
+            .unwrap();
         let second = spawn(config.clone()).await.unwrap();
         let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
             id("credential_cutover_a"),
@@ -296,6 +303,7 @@ impl Context {
             node_signer,
             provisioner_signer,
             release,
+            route_v2_ring,
             image_blob,
             config,
             credits,
@@ -486,6 +494,7 @@ fn session_binding(session: &cats_api::runtime_reconciliation::AgentSession) -> 
 fn full_observation(
     session: &cats_api::runtime_reconciliation::AgentSession,
     read_position: Sequence,
+    route_v2_ring: &RouteGrantV2PublicKeyRingArtifact,
 ) -> NodeObservation {
     let mut observation = NodeObservation {
         version: ContractVersion::V1,
@@ -500,9 +509,13 @@ fn full_observation(
         inventory_epoch: Epoch::new(1).unwrap(),
         inventory_digest: None,
         inventory_read_position: Some(read_position),
-        key_ring_version: None,
-        key_ring_digest: None,
-        loaded_kids: Vec::new(),
+        key_ring_version: Some(route_v2_ring.ring_version),
+        key_ring_digest: Some(route_v2_ring.digest().unwrap()),
+        loaded_kids: route_v2_ring
+            .keys
+            .iter()
+            .map(|entry| entry.kid.clone())
+            .collect(),
         runtimes: Vec::new(),
         residue: Vec::new(),
     };
@@ -622,7 +635,11 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     // Make a strict current-vs-immutable lease assertion deterministic even
     // on a PostgreSQL clock whose visible precision is one millisecond.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let observation = full_observation(&session, empty_snapshot.read_position);
+    let observation = full_observation(
+        &session,
+        empty_snapshot.read_position,
+        &context.route_v2_ring,
+    );
     let observation_body = encode_node_observation(&observation).unwrap();
     let (first_observation, second_observation) = send_through_replica_barrier(
         context.node_request(&context.first, OBSERVATION_PATH, observation_body.clone()),
@@ -1572,7 +1589,12 @@ async fn cat_exact_replay_precedes_mutable_funding_admission() {
         .node_request(
             &context.first,
             OBSERVATION_PATH,
-            encode_node_observation(&full_observation(&session, snapshot.read_position)).unwrap(),
+            encode_node_observation(&full_observation(
+                &session,
+                snapshot.read_position,
+                &context.route_v2_ring,
+            ))
+            .unwrap(),
         )
         .send()
         .await

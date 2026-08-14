@@ -618,7 +618,7 @@ impl GatewayMachineConfig {
         })
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     pub(crate) fn from_test_composition(
         listen: impl Into<String>,
         gateway_authority: GatewayWorkloadIdentityAuthority,

@@ -52,7 +52,7 @@ impl GatewayMachineTlsConfig {
         build_tls_config(artifacts).map(Self)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     pub(crate) fn from_pem_for_test(
         client_ca_bundle_pem: &[u8],
         server_certificate_pem: &[u8],
