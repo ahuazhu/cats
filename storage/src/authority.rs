@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 #[cfg(feature = "proposed-node-residue-reclamation")]
 pub use cats_api::runtime_reconciliation::{
     residue_acquisition_digest, AuthorizedServingAcquire, DiskKind,
@@ -23,6 +24,8 @@ pub use cats_api::runtime_reconciliation::{
     VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::trusted_host_fence::{validate_trusted_host_fence_event_v1, TrustedHostFenceEventV1};
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
 
@@ -49,6 +52,9 @@ pub struct AttachmentLineageIdentity {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedServingAttachment {
     pub identity: AttachmentLineageIdentity,
+    /// Public binding only. The matching attachment-scoped private key lives
+    /// in a separate root-only artifact and never enters this receipt.
+    pub object_write_credential: ObjectWriteCredentialReference,
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub head: RemoteHead,
@@ -1053,14 +1059,67 @@ pub fn consume_takeover(
     authorization_id: &Id,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
-    validate_volume_record(record)?;
     validate_host_fence_event(event)?;
+    consume_takeover_bound_to_event(
+        record,
+        &event.event_id,
+        if event.state == HostFenceEventState::Active {
+            TakeoverFenceAdmission::LegacyActive
+        } else {
+            TakeoverFenceAdmission::LegacyClosed
+        },
+        authorization_record,
+        authorization_id,
+        db_now,
+    )
+}
+
+/// Consumes an authorization derived by the terminal V1 Host recovery writer.
+///
+/// Unlike the retired `Active/Rejoined` authority, this event is an immutable
+/// D2 fact and therefore has no reopen state. The authorization deadline and
+/// exact Volume owner/epoch/head tuple remain mandatory for first consume.
+pub fn consume_trusted_takeover_v1(
+    record: &VolumeRecord,
+    event: &TrustedHostFenceEventV1,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    validate_trusted_host_fence_event_v1(event)
+        .map_err(|_| AuthorityError::InvalidAuthorization)?;
+    consume_takeover_bound_to_event(
+        record,
+        &event.event_id,
+        TakeoverFenceAdmission::TrustedTerminalV1,
+        authorization_record,
+        authorization_id,
+        db_now,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeoverFenceAdmission {
+    LegacyActive,
+    LegacyClosed,
+    TrustedTerminalV1,
+}
+
+fn consume_takeover_bound_to_event(
+    record: &VolumeRecord,
+    event_id: &Id,
+    event_admission: TakeoverFenceAdmission,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    validate_volume_record(record)?;
     validate_authorization_record(authorization_record)?;
     let VolumeAuthorization::Takeover(authorization) = &authorization_record.authorization else {
         return Err(AuthorityError::InvalidAuthorization);
     };
     if &authorization.authorization_id != authorization_id
-        || authorization.host_fence_event_id != event.event_id
+        || &authorization.host_fence_event_id != event_id
         || authorization.volume_id != record.volume_id
     {
         return Err(AuthorityError::InvalidAuthorization);
@@ -1077,13 +1136,16 @@ pub fn consume_takeover(
         ));
     }
 
-    if event.state != HostFenceEventState::Active || db_now > authorization.not_after {
+    if matches!(event_admission, TakeoverFenceAdmission::LegacyClosed)
+        || db_now > authorization.not_after
+    {
         return Err(AuthorityError::InvalidAuthorization);
     }
     let lease_expires_at = checked_expiry(db_now, authorization.lease_duration_ms)?;
     if !matches!(record.admin_state, VolumeAdminState::Active)
         || record.lease_owner.as_ref() != Some(&authorization.expected_attachment_id)
         || record.lease_epoch != authorization.expected_epoch
+        || record.head != authorization.expected_head
     {
         return Err(AuthorityError::InvalidAuthorization);
     }
@@ -1441,6 +1503,7 @@ fn validate_begin_delete_pair(
 }
 
 fn validate_takeover_authorization(authorization: &VolumeTakeoverAuthorization) -> Result<()> {
+    validate_stored_head(&authorization.expected_head)?;
     if authorization.new_attachment_id == authorization.expected_attachment_id {
         return Err(AuthorityError::InvalidAuthorization);
     }
@@ -1461,7 +1524,7 @@ fn validate_takeover_receipt(
         || receipt.volume_id != authorization.volume_id
         || receipt.new_attachment_id != authorization.new_attachment_id
         || receipt.resulting_epoch != stored_next_epoch(authorization.expected_epoch)?
-        || !remote_head_is_valid(&receipt.resulting_head)
+        || receipt.resulting_head != authorization.expected_head
         || receipt.consumed_at > authorization.not_after
         || checked_expiry(receipt.consumed_at, authorization.lease_duration_ms).is_err()
     {

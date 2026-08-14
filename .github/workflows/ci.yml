@@ -133,6 +133,7 @@ jobs:
           terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
           terraform -chdir=deploy/aws/terraform/modules/metal-worker-deployment init -backend=false
           terraform -chdir=deploy/aws/terraform/modules/metal-worker-deployment test
+          terraform -chdir=deploy/aws/terraform/stacks/platform test
           terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
           terraform -chdir=deploy/aws/terraform/stacks/production-application test
           python3 deploy/aws/terraform/test-alert-recipient-privacy.py

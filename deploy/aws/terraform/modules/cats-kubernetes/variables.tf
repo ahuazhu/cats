@@ -29,6 +29,93 @@ variable "gateway_image" {
   }
 }
 
+variable "object_write_gateway_image" {
+  description = "Immutable image containing /usr/local/bin/cats-object-write-gatewayd, pinned by sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.object_write_gateway_image))
+    error_message = "object_write_gateway_image must be pinned by sha256 digest."
+  }
+}
+
+variable "object_write_gateway_replicas" {
+  description = "Active-active ObjectWrite Gateway replica count sharing PostgreSQL and one EFS access point."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.object_write_gateway_replicas >= 2 && floor(var.object_write_gateway_replicas) == var.object_write_gateway_replicas
+    error_message = "object_write_gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "object_write_gateway_tls_secret_name" {
+  description = "Pre-created immutable two-file Secret containing the release-bound internal server certificate and private key."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.object_write_gateway_tls_secret_name)) &&
+      endswith(var.object_write_gateway_tls_secret_name, "-r1")
+    )
+    error_message = "object_write_gateway_tls_secret_name must be a Kubernetes DNS-subdomain ending in -r1."
+  }
+}
+
+variable "object_write_gateway_nlb_security_group_id" {
+  description = "Platform-owned internal NLB SG with ingress from only the exact metal worker SG."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]{8,17}$", var.object_write_gateway_nlb_security_group_id))
+    error_message = "object_write_gateway_nlb_security_group_id must be one explicit AWS security group ID."
+  }
+}
+
+variable "object_write_gateway_private_subnet_ids" {
+  description = "Exact private subnets in which EKS Auto Mode creates the internal ObjectWrite NLB."
+  type        = list(string)
+
+  validation {
+    condition = (
+      length(var.object_write_gateway_private_subnet_ids) >= 2 &&
+      alltrue([for subnet_id in var.object_write_gateway_private_subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", subnet_id))])
+    )
+    error_message = "object_write_gateway_private_subnet_ids must contain at least two explicit AWS subnet IDs."
+  }
+}
+
+variable "object_write_spool_file_system_id" {
+  description = "Platform-owned encrypted EFS file system for durable pre-accept and accepted spools."
+  type        = string
+
+  validation {
+    condition     = can(regex("^fs-[0-9a-f]{8,17}$", var.object_write_spool_file_system_id))
+    error_message = "object_write_spool_file_system_id must be one explicit EFS file system ID."
+  }
+}
+
+variable "object_write_spool_access_point_id" {
+  description = "Platform-owned EFS access point rooted at /object-write-spools as uid/gid 10001."
+  type        = string
+
+  validation {
+    condition     = can(regex("^fsap-[0-9a-f]{8,17}$", var.object_write_spool_access_point_id))
+    error_message = "object_write_spool_access_point_id must be one explicit EFS access point ID."
+  }
+}
+
+variable "object_write_provider_partition" {
+  description = "Provisioned AWS partition bound into every ObjectWrite authority."
+  type        = string
+}
+
+variable "object_write_provider_account_id" {
+  description = "Provisioned AWS account bound into every ObjectWrite authority."
+  type        = string
+}
+
 variable "control_plane_replicas" {
   description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
   type        = number

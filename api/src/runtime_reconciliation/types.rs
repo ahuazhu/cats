@@ -379,9 +379,21 @@ impl<'de> Deserialize<'de> for Sha256Digest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderScope {
+    pub provider: Id,
+    pub partition: Id,
+    pub account_id: Id,
+    pub region: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
     pub version: ContractVersion,
     pub node_id: Id,
+    /// Provider scope plus `immutable_host_id` is the complete immutable Host
+    /// identity. Provider instance IDs are never interpreted globally.
+    pub provider_scope: ProviderScope,
     pub immutable_host_id: Id,
     pub credential_id: Id,
     pub credential_binding: CredentialBinding,
@@ -1603,6 +1615,7 @@ pub struct VolumeTakeoverAuthorization {
     pub volume_id: Id,
     pub expected_attachment_id: Id,
     pub expected_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
     pub new_attachment_id: Id,
     pub desired_revision: Revision,
     pub new_placement_epoch: Epoch,

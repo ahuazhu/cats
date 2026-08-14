@@ -161,3 +161,17 @@ resource "aws_eks_addon" "pod_identity" {
 
   tags = var.tags
 }
+
+# EFS is the crash-safe, cross-replica receiving spool for the ObjectWrite
+# Gateway. The application uses one Terraform-created static access point; the
+# driver never dynamically creates or deletes access points.
+resource "aws_eks_addon" "efs_csi" {
+  cluster_name  = aws_eks_cluster.this.name
+  addon_name    = "aws-efs-csi-driver"
+  addon_version = var.efs_csi_addon_version
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  tags = var.tags
+}

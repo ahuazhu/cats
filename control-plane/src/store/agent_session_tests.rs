@@ -61,6 +61,12 @@ fn identity(number: u64) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(&format!("node_{number}")),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(&format!("host_{number}")),
         credential_id: id(&format!("credential_{number}")),
         credential_binding: CredentialBinding::PublicKey {

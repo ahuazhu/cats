@@ -1167,6 +1167,25 @@ pub(super) fn load_assigned_desired_for_update(
         .collect()
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch authority")]
+pub(super) fn load_assigned_desired_for_update_bounded(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    limit: usize,
+) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
+    let limit = i64::try_from(limit).map_err(corrupt)?;
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
+          ORDER BY cat_id COLLATE \"C\" LIMIT $2 FOR UPDATE"
+    );
+    transaction
+        .query(&sql, &[&node_id.as_str(), &limit])?
+        .iter()
+        .map(decode_desired)
+        .collect()
+}
+
 pub(super) fn load_assigned_desired_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,

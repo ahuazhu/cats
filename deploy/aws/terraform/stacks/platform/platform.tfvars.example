@@ -13,6 +13,9 @@ one_nat_gateway_per_az  = true
 # Cluster. Dedicated to Cats — do not point this at another product's cluster.
 cluster_name       = "cats-production"
 kubernetes_version = "1.34"
+# Pin after `aws eks describe-addon-versions --addon-name aws-efs-csi-driver`;
+# null asks EKS for the compatible default and is intended only for bootstrap.
+efs_csi_addon_version = null
 
 # Narrow this to the operator egress ranges once they are known.
 cluster_public_access_cidrs  = ["0.0.0.0/0"]
@@ -39,6 +42,8 @@ alert_email_recipients = {
 # current unencrypted root so an ordinary plan does not replace it. In the
 # approved maintenance window, change only that value to true and retain the
 # exact reviewed replacement plan; never set metal-1 back to false.
+chunkstore_prefix = "cats-fresh"
+
 metal_workers = {
   "metal-2" = {
     subnet_index          = 0

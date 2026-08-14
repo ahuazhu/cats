@@ -133,6 +133,12 @@ fn transition_node(store: &Store, node_id: &str) -> TransitionNode {
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(node_id),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(&format!("host-{suffix}")),
         credential_id: id(&format!("credential-{suffix}")),
         credential_binding: CredentialBinding::PublicKey {
@@ -1982,6 +1988,7 @@ fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: volume.lease_owner.clone().unwrap(),
             expected_epoch: volume.lease_epoch,
+            expected_head: volume.head.clone(),
             new_attachment_id: id("attachment-new"),
             desired_revision: revision(12),
             new_placement_epoch: epoch(4),
@@ -3336,6 +3343,7 @@ fn a22_root_release_ignores_a_historical_consumed_takeover() {
             volume_id: owned.volume_id.clone(),
             expected_attachment_id: id("historical-attachment-old"),
             expected_epoch: fence_epoch(5),
+            expected_head: owned.head.clone(),
             new_attachment_id: id("historical-attachment-new"),
             desired_revision: revision(9),
             new_placement_epoch: epoch(2),
@@ -3568,7 +3576,9 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
                 "INSERT INTO volume_authorizations (
                     authorization_id, record, kind, authorized_node_id,
                     host_fence_event_id, volume_id, state, desired_revision,
-                    placement_epoch, lease_duration_ms, not_after, consumed_at
+                    placement_epoch, lease_duration_ms, expected_head_generation,
+                    expected_head_root_hash, expected_head_root_object_id,
+                    not_after, consumed_at
                  )
                  SELECT 'history-auth-' || lpad(entry::text, 8, '0'),
                         jsonb_build_object('unrelated_history', entry),
@@ -3581,7 +3591,7 @@ fn a22_disposable_authorization_scope_stays_indexed_with_large_history() {
                         $1, 'unconsumed',
                         100 + entry % 97, 100 + entry % 89,
                         CASE WHEN entry % 2 = 0 THEN 30000 ELSE NULL END,
-                        9223372036854775807, NULL
+                        0, NULL, NULL, 9223372036854775807, NULL
                    FROM generate_series(1, 100000) AS entry",
                 &[&owned.volume_id.as_str(), &history_event.event_id.as_str()],
             )?;

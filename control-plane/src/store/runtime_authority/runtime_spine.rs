@@ -128,6 +128,7 @@ pub(crate) struct PlacementAdmissionSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementAdmissionRejection {
     IdentityNotProvisioned,
+    HostRecoveryActive,
     SessionMissing,
     SessionExpired,
     GuestConfigMismatch,
@@ -821,6 +822,12 @@ where
     if identity.state != NodeIdentityState::Provisioned {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::IdentityNotProvisioned,
+        ));
+    }
+    checkpoint(transaction)?;
+    if super::host_fence_recovery_batch::product_admission_is_blocked_in(transaction, node_id)? {
+        return Ok(PlacementAdmissionLoad::Rejected(
+            PlacementAdmissionRejection::HostRecoveryActive,
         ));
     }
     // Stored assigned-set overflow/corruption is fatal even when the session
@@ -3066,7 +3073,7 @@ fn upsert_observation_receive_state(
     Ok(())
 }
 
-fn load_admission_inventory_state_for_update(
+pub(super) fn load_admission_inventory_state_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AdmissionInventoryState>> {

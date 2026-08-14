@@ -197,6 +197,12 @@ fn node_identity(node_id: &Id, discriminator: u8) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: node_id.clone(),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(format!("host_{discriminator}")),
         credential_id: id(format!("credential_{discriminator}")),
         credential_binding: CredentialBinding::PublicKey {
@@ -7064,12 +7070,15 @@ fn runtime_cat_read_rejects_incomplete_duplicate_or_drifted_delete_graphs() {
             "INSERT INTO volume_authorizations (
                 authorization_id, record, kind, authorized_node_id,
                 host_fence_event_id, volume_id, state, desired_revision,
-                placement_epoch, lease_duration_ms, not_after, consumed_at
+                placement_epoch, lease_duration_ms, expected_head_generation,
+                expected_head_root_hash, expected_head_root_object_id,
+                not_after, consumed_at
              ) SELECT
                 'authorization_product_read_duplicate', record, kind,
                 authorized_node_id, host_fence_event_id, volume_id, state,
                 desired_revision, placement_epoch, lease_duration_ms,
-                not_after, consumed_at
+                expected_head_generation, expected_head_root_hash,
+                expected_head_root_object_id, not_after, consumed_at
                FROM volume_authorizations",
         ),
     ]

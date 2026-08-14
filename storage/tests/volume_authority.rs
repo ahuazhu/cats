@@ -1,3 +1,4 @@
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 use cats_storage::authority::*;
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
@@ -47,6 +48,13 @@ fn head(value: u64) -> RemoteHead {
         generation: generation(value),
         root_hash: Some(Sha256Digest::new(format!("sha256:{:064x}", value.max(1))).unwrap()),
         root_object_id: Some(AsciiText::new(format!("roots/{value}")).unwrap()),
+    }
+}
+
+fn object_write_credential(value: u8) -> ObjectWriteCredentialReference {
+    ObjectWriteCredentialReference {
+        credential_id: id(&format!("object-write-credential-{value}")),
+        public_key_spki_sha256: Sha256Digest::from_bytes([value; 32]),
     }
 }
 
@@ -101,6 +109,7 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
                 node_id: id("node-1"),
                 placement_epoch: request.placement_epoch,
             },
+            object_write_credential: object_write_credential(1),
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head.clone(),
@@ -208,6 +217,7 @@ fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: volume.lease_owner.clone().unwrap(),
             expected_epoch: volume.lease_epoch,
+            expected_head: volume.head.clone(),
             new_attachment_id: id("attachment-new"),
             desired_revision: revision(12),
             new_placement_epoch: epoch(4),
@@ -251,6 +261,7 @@ fn authorized_takeover_attachment() -> (AuthorizedServingAttachment, VolumeRecor
                 node_id: authorization.authorized_node_id.clone(),
                 placement_epoch: authorization.new_placement_epoch,
             },
+            object_write_credential: object_write_credential(2),
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head.clone(),

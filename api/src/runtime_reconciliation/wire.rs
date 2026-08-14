@@ -2213,6 +2213,7 @@ fn takeover_authorization_fields() -> Vec<Field> {
         field("volume_id", id()),
         field("expected_attachment_id", id()),
         field("expected_epoch", wire_u64()),
+        field("expected_head", remote_head_schema()),
         field("new_attachment_id", id()),
         field("desired_revision", revision()),
         field("new_placement_epoch", epoch()),
@@ -4526,6 +4527,15 @@ fn node_identity_schema() -> Schema {
     object(vec![
         field("version", version()),
         field("node_id", id()),
+        field(
+            "provider_scope",
+            object(vec![
+                field("provider", id()),
+                field("partition", id()),
+                field("account_id", id()),
+                field("region", id()),
+            ]),
+        ),
         field("immutable_host_id", id()),
         field("credential_id", id()),
         field("credential_binding", credential_binding_schema()),
@@ -5897,17 +5907,19 @@ fn authorization_record_valid(record: &AuthorizationRecord) -> bool {
     match (&record.authorization, &record.state) {
         (VolumeAuthorization::Takeover(authorization), AuthorizationState::Unconsumed) => {
             authorization.new_attachment_id != authorization.expected_attachment_id
+                && remote_head_valid(&authorization.expected_head)
         }
         (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
             match receipt.as_ref() {
                 AuthorizationConsumedReceipt::Takeover(receipt) => {
                     authorization.new_attachment_id != authorization.expected_attachment_id
+                        && remote_head_valid(&authorization.expected_head)
                         && receipt.authorization_id == authorization.authorization_id
                         && receipt.host_fence_event_id == authorization.host_fence_event_id
                         && receipt.volume_id == authorization.volume_id
                         && receipt.new_attachment_id == authorization.new_attachment_id
                         && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
-                        && remote_head_valid(&receipt.resulting_head)
+                        && receipt.resulting_head == authorization.expected_head
                         && receipt.consumed_at <= authorization.not_after
                         && receipt
                             .consumed_at
@@ -6424,6 +6436,7 @@ fn residue_acquisition_is_exact(lineage: &ResidueDataDirectoryLineage) -> bool {
                 && authorization.authorized_node_id == lineage.node_id
                 && authorization.volume_id == lineage.volume_id
                 && authorization.new_attachment_id != authorization.expected_attachment_id
+                && remote_head_valid(&authorization.expected_head)
                 && authorization.new_attachment_id == lineage.attachment_id
                 && authorization.new_placement_epoch == lineage.placement_epoch
                 && receipt.authorization_id == authorization.authorization_id
@@ -6432,6 +6445,7 @@ fn residue_acquisition_is_exact(lineage: &ResidueDataDirectoryLineage) -> bool {
                 && receipt.new_attachment_id == authorization.new_attachment_id
                 && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
                 && receipt.resulting_epoch == lineage.attachment_epoch
+                && receipt.resulting_head == authorization.expected_head
                 && receipt.consumed_at <= authorization.not_after
                 && receipt
                     .consumed_at

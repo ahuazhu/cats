@@ -303,6 +303,34 @@ pub fn verify_request_proof(
     ))
 }
 
+/// Verify a frame owned by another closed internal protocol while reusing the
+/// one provisioned A19 credential lineage. The caller's domain-separated
+/// frame must bind its method, path, content type and complete request
+/// metadata; this helper only decodes the canonical proof headers.
+pub(crate) fn verify_framed_request_proof(
+    framed: &[u8],
+    credential_id: &str,
+    public_key_spki: &str,
+    signature: &str,
+) -> Result<AuthenticatedNodeCredential, RequestProofError> {
+    let credential_id = Id::new(credential_id.to_owned()).ok_or(RequestProofError)?;
+    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(public_key_spki)?;
+    if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        return Err(RequestProofError);
+    }
+    let signature = decode_base64url_exact::<64>(signature)?;
+    UnparsedPublicKey::new(&ED25519, &spki[ED25519_SPKI_PREFIX.len()..])
+        .verify(framed, &signature)
+        .map_err(|_| RequestProofError)?;
+    let digest = Sha256Digest::from_bytes(Sha256::digest(spki).into());
+    Ok(AuthenticatedNodeCredential::new(
+        credential_id,
+        CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest,
+        },
+    ))
+}
+
 fn signed_request(
     method: &str,
     path: &str,
@@ -580,6 +608,12 @@ mod tests {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new("node_a").unwrap(),
+            provider_scope: crate::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
             immutable_host_id: Id::new("host_a").unwrap(),
             credential_id: Id::new("credential_a").unwrap(),
             credential_binding: CredentialBinding::PublicKey {

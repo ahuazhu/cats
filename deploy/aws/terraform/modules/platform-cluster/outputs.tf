@@ -28,6 +28,11 @@ output "node_role_arn" {
   value = aws_iam_role.node.arn
 }
 
+output "node_role_name" {
+  description = "Exact EKS Auto Mode node role name for resource-scoped client policies."
+  value       = aws_iam_role.node.name
+}
+
 output "oidc_issuer_url" {
   value = aws_eks_cluster.this.identity[0].oidc[0].issuer
 }

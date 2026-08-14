@@ -812,6 +812,12 @@ impl Ctx {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new(node_id).unwrap(),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
             immutable_host_id: Id::new(format!("host_{node_id}")).unwrap(),
             credential_id: signer.credential_id().clone(),
             credential_binding: CredentialBinding::PublicKey {
@@ -3308,6 +3314,12 @@ async fn every_composition_closes_old_node_ingress_and_accepts_the_signed_spine(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: Id::new("fixture-node").unwrap(),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: Id::new("test_provider").unwrap(),
+            partition: Id::new("test_partition").unwrap(),
+            account_id: Id::new("test_account").unwrap(),
+            region: Id::new("test_region").unwrap(),
+        },
         immutable_host_id: Id::new("fixture-host").unwrap(),
         credential_id: signer.credential_id().clone(),
         credential_binding: CredentialBinding::PublicKey {

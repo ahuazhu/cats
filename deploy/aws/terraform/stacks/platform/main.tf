@@ -28,11 +28,12 @@ module "network" {
 module "cluster" {
   source = "../../modules/platform-cluster"
 
-  cluster_name        = var.cluster_name
-  kubernetes_version  = var.kubernetes_version
-  public_subnet_ids   = module.network.public_subnet_ids
-  private_subnet_ids  = module.network.private_subnet_ids
-  public_access_cidrs = var.cluster_public_access_cidrs
+  cluster_name          = var.cluster_name
+  kubernetes_version    = var.kubernetes_version
+  public_subnet_ids     = module.network.public_subnet_ids
+  private_subnet_ids    = module.network.private_subnet_ids
+  public_access_cidrs   = var.cluster_public_access_cidrs
+  efs_csi_addon_version = var.efs_csi_addon_version
   cluster_admin_principal_arns = distinct(concat(
     var.cluster_admin_principal_arns,
     [module.github_release.release_role_arn],
@@ -228,6 +229,7 @@ data "aws_iam_policy_document" "github_application_deploy" {
     ]
     resources = [
       "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${module.dns.zone_id}",
+      "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${aws_route53_zone.object_write_internal.zone_id}",
     ]
   }
 
@@ -310,6 +312,83 @@ resource "aws_vpc_security_group_egress_rule" "metal_worker_all" {
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
   description       = "All outbound"
+}
+
+# Host fencing may replace a worker's primary ENI groups with this exact empty
+# boundary, but the group is never the HostFence authority: the authoritative
+# proof is the ObjectWrite Gateway's closed accepted-PUT prefix. Keeping this
+# as a dedicated, rule-free group makes the secondary observation exact and
+# prevents a broad account-wide network mutation.
+resource "aws_security_group" "metal_worker_fence" {
+  name                   = "${var.name_prefix}-${var.environment}-metal-worker-fence"
+  description            = "Deny-all secondary quarantine boundary for fenced Cats workers"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-metal-worker-fence"
+    Authority = "secondary-only"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# VPC-internal TLS pass-through for the ObjectWrite Gateway. The frontend has
+# one ingress source: the exact metal-worker security group. It is not a
+# public endpoint and no CIDR-wide rule can silently admit a non-worker.
+resource "aws_security_group" "object_write_gateway_nlb" {
+  name                   = "${var.name_prefix}-${var.environment}-object-write-gateway-nlb"
+  description            = "Internal ObjectWrite Gateway NLB; metal workers only"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-object-write-gateway-nlb"
+    Authority = "transport-only"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "object_write_gateway_nlb_from_workers" {
+  security_group_id            = aws_security_group.object_write_gateway_nlb.id
+  referenced_security_group_id = aws_security_group.metal_worker.id
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  description                  = "TLS from exact Cats metal worker boundary"
+}
+
+resource "aws_vpc_security_group_egress_rule" "object_write_gateway_nlb_to_cluster" {
+  security_group_id            = aws_security_group.object_write_gateway_nlb.id
+  referenced_security_group_id = module.cluster.cluster_security_group_id
+  from_port                    = 7443
+  to_port                      = 7443
+  ip_protocol                  = "tcp"
+  description                  = "TLS pass-through to ObjectWrite Gateway Pods"
+}
+
+# A stable private name is required for release-bound server certificates. The
+# application state aliases this zone to the NLB that EKS creates for the
+# Service; the generated elb.amazonaws.com name is never a certificate SAN.
+resource "aws_route53_zone" "object_write_internal" {
+  name = "object-write.${var.environment}.cats.internal"
+
+  vpc {
+    vpc_id = module.network.vpc_id
+  }
+
+  tags = merge(var.tags, {
+    Name = "object-write.${var.environment}.cats.internal"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_ecr_repository" "control_plane" {
@@ -445,12 +524,10 @@ resource "aws_s3_bucket_policy" "chunkstore" {
   policy = data.aws_iam_policy_document.chunkstore_tls_only.json
 }
 
-# Bare-metal worker instance identity.
-#
-# The S3 adapter uses these instance credentials and refreshes them, so no
-# long-lived AWS key ever reaches worker.env. The infrastructure stack attaches
-# SSM and artifact-bucket access to this same role; what it cannot know about
-# is the ChunkStore, so that grant lives here with the bucket.
+# Bare-metal worker instance identity. Workers retain direct immutable-object
+# reads, but no direct ChunkStore write or delete authority. Every accepted PUT
+# passes through the repository-owned ObjectWrite Gateway so a Host-scoped
+# principal can be atomically closed and its accepted sequence prefix drained.
 data "aws_iam_policy_document" "metal_worker_assume" {
   statement {
     effect  = "Allow"
@@ -483,21 +560,40 @@ data "aws_iam_policy_document" "metal_worker_chunkstore" {
     effect    = "Allow"
     actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
     resources = [aws_s3_bucket.chunkstore.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values = [
+        var.chunkstore_prefix,
+        "${var.chunkstore_prefix}/*",
+      ]
+    }
   }
 
   statement {
-    sid    = "ReadWriteChunkStore"
-    effect = "Allow"
+    sid     = "ReadChunkStore"
+    effect  = "Allow"
+    actions = ["s3:GetObject"]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
 
+  # An explicit identity-policy deny prevents a later broad attachment from
+  # silently restoring direct writes to blockd. The Gateway role below is a
+  # different principal and is unaffected.
+  statement {
+    sid    = "DenyDirectChunkStoreMutation"
+    effect = "Deny"
     actions = [
       "s3:AbortMultipartUpload",
       "s3:DeleteObject",
-      "s3:GetObject",
-      "s3:ListMultipartUploadParts",
       "s3:PutObject",
     ]
-
-    resources = ["${aws_s3_bucket.chunkstore.arn}/*"]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
   }
 }
 
@@ -505,6 +601,450 @@ resource "aws_iam_role_policy" "metal_worker_chunkstore" {
   name   = "chunkstore"
   role   = aws_iam_role.metal_worker.id
   policy = data.aws_iam_policy_document.metal_worker_chunkstore.json
+}
+
+# The ObjectWrite Gateway is the sole principal permitted to publish new
+# ChunkStore objects. Its PostgreSQL authority issues and closes Host-scoped
+# accepted request sequences; this AWS role only performs the resulting exact
+# immutable PUT and visibility discovery. It cannot delete objects or mutate
+# compute/network state.
+data "aws_iam_policy_document" "object_write_gateway_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "object_write_gateway" {
+  name               = "${var.name_prefix}-${var.environment}-object-write-gateway"
+  description        = "Publishes only DB-accepted immutable Cats objects and proves their visibility"
+  assume_role_policy = data.aws_iam_policy_document.object_write_gateway_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "object_write_gateway_chunkstore" {
+  statement {
+    sid    = "PublishAndVerifyAcceptedObjects"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "object_write_gateway_chunkstore" {
+  name   = "accepted-object-publish"
+  role   = aws_iam_role.object_write_gateway.id
+  policy = data.aws_iam_policy_document.object_write_gateway_chunkstore.json
+}
+
+resource "aws_eks_pod_identity_association" "object_write_gateway" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = "cats"
+  service_account = "cats-object-write-gateway"
+  role_arn        = aws_iam_role.object_write_gateway.arn
+
+  tags = var.tags
+}
+
+# Durable spool ----------------------------------------------------------------
+
+# The receiving row does not enter the accepted prefix until its exact body is
+# on this regional EFS file system and both file and directory fsync receipts
+# exist. Elastic throughput avoids a small provisioned ceiling; application
+# admission still bounds every object to the ChunkStore 32 MiB maximum and a
+# fixed number of concurrent receiving streams.
+resource "aws_efs_file_system" "object_write_spool" {
+  encrypted        = true
+  performance_mode = "generalPurpose"
+  throughput_mode  = "elastic"
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-object-write-spool"
+    Authority = "accepted-put-recovery"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_efs_backup_policy" "object_write_spool" {
+  file_system_id = aws_efs_file_system.object_write_spool.id
+
+  backup_policy {
+    status = "ENABLED"
+  }
+}
+
+resource "aws_security_group" "object_write_spool" {
+  name                   = "${var.name_prefix}-${var.environment}-object-write-spool"
+  description            = "NFS only from the exact EKS cluster security group"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-${var.environment}-object-write-spool"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "object_write_spool_nfs" {
+  security_group_id            = aws_security_group.object_write_spool.id
+  referenced_security_group_id = module.cluster.cluster_security_group_id
+  from_port                    = 2049
+  to_port                      = 2049
+  ip_protocol                  = "tcp"
+  description                  = "NFS from EKS ObjectWrite Gateway Pods"
+}
+
+resource "aws_efs_mount_target" "object_write_spool" {
+  for_each = toset(module.network.private_subnet_ids)
+
+  file_system_id  = aws_efs_file_system.object_write_spool.id
+  subnet_id       = each.value
+  security_groups = [aws_security_group.object_write_spool.id]
+
+  # EFS permits anonymous NFS clients while no file-system policy exists.
+  # Do not create a reachable mount target until the exact IAM/TLS/access-point
+  # policy is durable.
+  depends_on = [aws_efs_file_system_policy.object_write_spool]
+}
+
+resource "aws_efs_access_point" "object_write_spool" {
+  file_system_id = aws_efs_file_system.object_write_spool.id
+
+  posix_user {
+    uid = 10001
+    gid = 10001
+  }
+
+  root_directory {
+    path = "/object-write-spools"
+
+    creation_info {
+      owner_uid   = 10001
+      owner_gid   = 10001
+      permissions = "0700"
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-${var.environment}-object-write-spool"
+  })
+}
+
+# EFS has anonymous full NFS access by default when no file-system policy is
+# present. The cluster security group is therefore only a transport boundary,
+# not sufficient protection for the accepted-write recovery authority. Force
+# every mount through IAM, TLS, the one immutable access point and the exact
+# EKS Auto Mode node role. The access point maps every request to UID/GID 10001;
+# no client receives ClientRootAccess.
+data "aws_iam_policy_document" "object_write_spool_client" {
+  statement {
+    sid    = "DenyUnencryptedClientAccess"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientAccessOutsideExactAccessPoint"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnNotEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientAccessOutsideExactNodeRole"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientRootAccess",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnNotEquals"
+      variable = "aws:PrincipalArn"
+      values   = [module.cluster.node_role_arn]
+    }
+  }
+
+  statement {
+    sid    = "DenyClientRootAccess"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions   = ["elasticfilesystem:ClientRootAccess"]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+  }
+
+  statement {
+    sid    = "AllowExactNodeRoleThroughAccessPoint"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [module.cluster.node_role_arn]
+    }
+
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "elasticfilesystem:AccessedViaMountTarget"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_efs_file_system_policy" "object_write_spool" {
+  file_system_id                     = aws_efs_file_system.object_write_spool.id
+  policy                             = data.aws_iam_policy_document.object_write_spool_client.json
+  bypass_policy_lockout_safety_check = false
+}
+
+data "aws_iam_policy_document" "object_write_spool_node_client" {
+  statement {
+    sid    = "MountAndWriteExactObjectWriteSpool"
+    effect = "Allow"
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = [aws_efs_file_system.object_write_spool.arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "elasticfilesystem:AccessPointArn"
+      values   = [aws_efs_access_point.object_write_spool.arn]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "elasticfilesystem:AccessedViaMountTarget"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "object_write_spool_node_client" {
+  name   = "exact-object-write-spool-client"
+  role   = module.cluster.node_role_name
+  policy = data.aws_iam_policy_document.object_write_spool_node_client.json
+}
+
+# Static provisioning needs discovery only. In particular this role cannot
+# create/delete access points or touch an EFS file; Terraform owns the sole
+# access point above and the mount itself is constrained by its POSIX root.
+data "aws_iam_policy_document" "efs_csi_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "efs_csi" {
+  name               = "${var.name_prefix}-${var.environment}-efs-csi-static"
+  description        = "Read-only EFS discovery for the static ObjectWrite spool PV"
+  assume_role_policy = data.aws_iam_policy_document.efs_csi_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "efs_csi_static" {
+  statement {
+    sid    = "DiscoverStaticObjectWriteSpool"
+    effect = "Allow"
+    actions = [
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:DescribeFileSystems",
+      "elasticfilesystem:DescribeMountTargets",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "efs_csi_static" {
+  name   = "object-write-spool-discovery"
+  role   = aws_iam_role.efs_csi.id
+  policy = data.aws_iam_policy_document.efs_csi_static.json
+}
+
+resource "aws_eks_pod_identity_association" "efs_csi" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = "kube-system"
+  service_account = "efs-csi-controller-sa"
+  role_arn        = aws_iam_role.efs_csi.arn
+
+  tags = var.tags
+}
+
+# HostFence provider permissions are deliberately separate from the object
+# writer. Read-only Describe calls must be global because EC2 does not support
+# resource scoping for them; every mutation is limited to the immutable worker
+# instance IDs and primary ENIs declared in this same state. There is no Start,
+# IAM, credential, tag, or account-wide mutation permission.
+data "aws_iam_policy_document" "host_fence_provider_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "host_fence_provider" {
+  name               = "${var.name_prefix}-${var.environment}-host-fence-provider"
+  description        = "Observes and secondarily isolates only declared Cats bare-metal workers"
+  assume_role_policy = data.aws_iam_policy_document.host_fence_provider_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "host_fence_provider" {
+  statement {
+    sid    = "RediscoverFencePostconditions"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeSecurityGroups",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid     = "StopOnlyDeclaredWorkers"
+    effect  = "Allow"
+    actions = ["ec2:StopInstances"]
+    resources = [
+      for worker in aws_instance.metal_worker :
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${var.expected_account_id}:instance/${worker.id}"
+    ]
+  }
+
+  statement {
+    sid     = "QuarantineOnlyDeclaredWorkerPrimaryEnis"
+    effect  = "Allow"
+    actions = ["ec2:ModifyNetworkInterfaceAttribute"]
+    resources = [
+      for worker in aws_instance.metal_worker :
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${var.expected_account_id}:network-interface/${worker.primary_network_interface_id}"
+    ]
+  }
+
+  # The Control Plane invokes HostFence but is not the ObjectWrite Gateway.
+  # Keep this deny explicit so a future broad S3 attachment cannot collapse
+  # the independently fenced writer boundary back into cats-controld.
+  statement {
+    sid    = "DenyControlPlaneChunkStoreMutation"
+    effect = "Deny"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObject",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "host_fence_provider" {
+  name   = "exact-worker-secondary-isolation"
+  role   = aws_iam_role.host_fence_provider.id
+  policy = data.aws_iam_policy_document.host_fence_provider.json
+}
+
+resource "aws_eks_pod_identity_association" "host_fence_provider" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = var.host_fence_provider_namespace
+  service_account = var.host_fence_provider_service_account
+  role_arn        = aws_iam_role.host_fence_provider.arn
+
+  tags = var.tags
 }
 
 # The bare-metal worker itself.

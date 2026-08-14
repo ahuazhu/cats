@@ -23,6 +23,11 @@ output "gateway_service" {
   value       = "${kubernetes_service_v1.gateway.metadata[0].name}.${var.namespace}.svc"
 }
 
+output "object_write_gateway_load_balancer_hostname" {
+  description = "Generated private NLB hostname used only as the target of the stable private DNS CNAME."
+  value       = kubernetes_service_v1.object_write_gateway.status[0].load_balancer[0].ingress[0].hostname
+}
+
 output "ingress_name" {
   description = "Public ingress name, or null when public ingress is disabled."
   value       = local.effective_public_ingress ? kubernetes_ingress_v1.public[0].metadata[0].name : null

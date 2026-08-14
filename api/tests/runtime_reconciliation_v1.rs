@@ -75,7 +75,7 @@ const VOLUME_TRANSITION_NORMAL_REQUEST_WIRE: &str = r#"{"cat_id":"cat_01","desir
 const VOLUME_TRANSITION_LEASE_GRANTED_WIRE: &str = r#"{"cat_id":"cat_01","desired_revision":7,"outcome":{"grant":{"acquire_origin":{"kind":"normal","transition_id":"22222222222222222222222222222222"},"attachment_epoch":1,"attachment_id":"att_01","durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"lease_expires_at":1720000060000,"size_bytes":4294967296,"volume_id":"vol_root"},"kind":"lease_granted"},"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","version":1}"#;
 const VOLUME_TRANSITION_INVENTORY_STALE_WIRE: &str = r#"{"error":{"cat_id":"cat_01","code":"transition_precondition_failed","problem":"inventory_stale"},"message":"complete inventory is stale","version":1}"#;
 const VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE: &str = r#"{"authorization_id":"auth_01","session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
-const CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE: &str = r#"{"authorization":{"authorization":{"authorization_id":"auth_01","authorized_node_id":"node_a","desired_revision":8,"expected_attachment_id":"att_old","expected_epoch":3,"host_fence_event_id":"fence_01","kind":"takeover","lease_duration_ms":60000,"new_attachment_id":"att_new","new_placement_epoch":4,"not_after":1720000030000,"volume_id":"vol_root"},"state":{"kind":"consumed","receipt":{"authorization_id":"auth_01","consumed_at":1720000000000,"host_fence_event_id":"fence_01","kind":"takeover","new_attachment_id":"att_new","resulting_epoch":4,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"volume_id":"vol_root"}}},"authorization_id":"auth_01","current_volume":{"admin_state":{"kind":"active"},"durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"last_transition":{"authorization_id":"auth_01","kind":"takeover"},"lease_epoch":4,"lease_expires_at":1720000060000,"lease_owner":"att_new","size_bytes":4294967296,"volume_id":"vol_root"},"delete_completion":null,"direct_successor_authorization":null,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
+const CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE: &str = r#"{"authorization":{"authorization":{"authorization_id":"auth_01","authorized_node_id":"node_a","desired_revision":8,"expected_attachment_id":"att_old","expected_epoch":3,"expected_head":{"generation":0,"root_hash":null,"root_object_id":null},"host_fence_event_id":"fence_01","kind":"takeover","lease_duration_ms":60000,"new_attachment_id":"att_new","new_placement_epoch":4,"not_after":1720000030000,"volume_id":"vol_root"},"state":{"kind":"consumed","receipt":{"authorization_id":"auth_01","consumed_at":1720000000000,"host_fence_event_id":"fence_01","kind":"takeover","new_attachment_id":"att_new","resulting_epoch":4,"resulting_head":{"generation":0,"root_hash":null,"root_object_id":null},"volume_id":"vol_root"}}},"authorization_id":"auth_01","current_volume":{"admin_state":{"kind":"active"},"durability":"strict","head":{"generation":0,"root_hash":null,"root_object_id":null},"last_transition":{"authorization_id":"auth_01","kind":"takeover"},"lease_epoch":4,"lease_expires_at":1720000060000,"lease_owner":"att_new","size_bytes":4294967296,"volume_id":"vol_root"},"delete_completion":null,"direct_successor_authorization":null,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
 const AUTHORIZATION_EVIDENCE_UNAVAILABLE_WIRE: &str = r#"{"error":{"authorization_id":"auth_01","code":"authorization_evidence_unavailable"},"message":"authorization evidence is unavailable","version":1}"#;
 const MULTI_TERMINAL_CONDITIONS_WIRE: &str = r#"[{"kind":"ready","reason":{"kind":"postcondition_satisfied","target":"running"}},{"kind":"precondition_failed","reason":{"kind":"must_be_cold","observed_state":"running"}},{"kind":"precondition_failed","reason":{"kind":"placement_rejected","node_id":"node_a","placement_epoch":3,"reason":"insufficient_memory"}},{"kind":"quarantined","reason":{"kind":"checkpoint_corrupt","raw_content_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]"#;
 const SELECTED_TERMINAL_FAILURE_WIRE: &str =
@@ -146,6 +146,7 @@ fn takeover_evidence_with_direct_successor() -> serde_json::Value {
             "volume_id": "vol_root",
             "expected_attachment_id": "att_new",
             "expected_epoch": 4,
+            "expected_head": zero_remote_head(),
             "new_attachment_id": "att_next",
             "desired_revision": 9,
             "new_placement_epoch": 5,
@@ -1591,12 +1592,12 @@ fn a22_authorization_evidence_fixed_vectors_round_trip_exactly() {
         VOLUME_TRANSITION_EVIDENCE_REQUEST_WIRE.as_bytes()
     );
 
-    assert_eq!(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.len(), 1232);
+    assert_eq!(CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.len(), 1304);
     assert_eq!(
         hex::encode(Sha256::digest(
             CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes()
         )),
-        "2ba047bca62bc579dac06494a3eee7ff16798faeb3aae3f1764121a591bca344"
+        "ae6887d29ba51168045d16eb8c525e9fbd8a69ff0d6316b413ccba5edcd857d1"
     );
     let success = decode_runtime_volume_transition_evidence_success(
         CONSUMED_TAKEOVER_EVIDENCE_SUCCESS_WIRE.as_bytes(),
@@ -2086,11 +2087,15 @@ fn a22_evidence_success_codec_requires_the_complete_authority_closure() {
     assert_direct_successor_invalid(non_monotonic);
 
     let mut conflicting_head = takeover_evidence_with_higher_direct_successor();
-    conflicting_head["authorization"]["state"]["receipt"]["resulting_head"] = nonzero_remote_head();
+    let primary_head = nonzero_remote_head();
+    conflicting_head["authorization"]["authorization"]["expected_head"] = primary_head.clone();
+    conflicting_head["authorization"]["state"]["receipt"]["resulting_head"] = primary_head;
     let mut other_head = nonzero_remote_head();
     other_head["root_hash"] =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111".into();
     other_head["root_object_id"] = "volumes/vol_root/roots/conflict".into();
+    conflicting_head["direct_successor_authorization"]["authorization"]["expected_head"] =
+        other_head.clone();
     conflicting_head["direct_successor_authorization"]["state"]["receipt"]["resulting_head"] =
         other_head.clone();
     conflicting_head["current_volume"]["head"] = other_head;

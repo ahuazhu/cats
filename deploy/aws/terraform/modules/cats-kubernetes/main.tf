@@ -11,9 +11,15 @@ locals {
     "app.kubernetes.io/managed-by" = "terraform"
   }
 
-  effective_control_plane_replicas = var.maintenance_mode ? 0 : var.control_plane_replicas
-  effective_gateway_replicas       = var.maintenance_mode ? 0 : var.gateway_replicas
-  effective_public_ingress         = var.enable_public_ingress && !var.maintenance_mode
+  effective_control_plane_replicas        = var.maintenance_mode ? 0 : var.control_plane_replicas
+  effective_gateway_replicas              = var.maintenance_mode ? 0 : var.gateway_replicas
+  effective_object_write_gateway_replicas = var.maintenance_mode ? 0 : var.object_write_gateway_replicas
+  effective_public_ingress                = var.enable_public_ingress && !var.maintenance_mode
+
+  # These immutable pre-created Secrets carry two different SECURITY DEFINER
+  # caller roles. Terraform receives only their fixed names, never either DSN.
+  object_write_gateway_postgres_secret_name = "cats-object-write-gateway-postgres"
+  host_fence_provider_postgres_secret_name  = "cats-host-fence-provider-postgres"
 
   runtime_secret_data = merge(
     var.runtime_secret_data,
@@ -111,6 +117,13 @@ check "control_postgres_search_path" {
   }
 }
 
+check "provider_database_credentials_are_separate" {
+  assert {
+    condition     = local.object_write_gateway_postgres_secret_name != local.host_fence_provider_postgres_secret_name
+    error_message = "ObjectWrite Gateway and HostFence provider must use distinct dedicated PostgreSQL role Secrets."
+  }
+}
+
 check "stripe_configuration" {
   assert {
     condition = !var.stripe_enabled || (
@@ -163,6 +176,75 @@ resource "kubernetes_service_account_v1" "gateway" {
   }
 
   automount_service_account_token = false
+}
+
+resource "kubernetes_service_account_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  # EKS Pod Identity injects its own short-lived projected token. The default
+  # Kubernetes API token is neither needed nor mounted.
+  automount_service_account_token = false
+}
+
+# Terraform receives only the immutable Secret name. Certificate/private-key
+# bytes are release artifacts and never enter state.
+resource "kubernetes_persistent_volume_v1" "object_write_spool" {
+  metadata {
+    name = "cats-object-write-spool"
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    capacity = {
+      storage = "1Ti"
+    }
+    access_modes                     = ["ReadWriteMany"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = ""
+    mount_options                    = ["tls", "iam"]
+
+    persistent_volume_source {
+      csi {
+        driver        = "efs.csi.aws.com"
+        volume_handle = "${var.object_write_spool_file_system_id}::${var.object_write_spool_access_point_id}"
+        volume_attributes = {
+          encryptInTransit = "true"
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_persistent_volume_claim_v1" "object_write_spool" {
+  metadata {
+    name      = "cats-object-write-spool"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = ""
+    volume_name        = kubernetes_persistent_volume_v1.object_write_spool.metadata[0].name
+
+    resources {
+      requests = {
+        storage = "1Ti"
+      }
+    }
+  }
+
+  wait_until_bound = true
 }
 
 resource "kubernetes_secret_v1" "runtime" {
@@ -671,6 +753,358 @@ resource "kubernetes_service_v1" "control_plane_route_v2_rotation" {
       target_port = "route-rotation"
     }
   }
+}
+
+
+resource "kubernetes_deployment_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    replicas = local.effective_object_write_gateway_replicas
+
+    strategy {
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-object-write-gateway"
+      }
+    }
+
+    template {
+      metadata {
+        labels = merge(local.labels, {
+          "app.kubernetes.io/name" = "cats-object-write-gateway"
+        })
+        annotations = {
+          "cats.run/object-write-tls-artifact-secret" = var.object_write_gateway_tls_secret_name
+          "cats.run/object-write-spool-access-point"  = var.object_write_spool_access_point_id
+          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
+        }
+      }
+
+      spec {
+        automount_service_account_token  = false
+        enable_service_links             = false
+        service_account_name             = kubernetes_service_account_v1.object_write_gateway.metadata[0].name
+        termination_grace_period_seconds = 120
+
+        node_selector = {
+          "kubernetes.io/arch" = "amd64"
+        }
+
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-object-write-gateway"
+                }
+              }
+            }
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "topology.kubernetes.io/zone"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-object-write-gateway"
+            }
+          }
+        }
+
+        # Projected Secrets are symlink trees. Render the closed two-file TLS
+        # artifact into a private in-memory directory before gateway startup so
+        # the process opens stable regular files and never sees a hot rotation.
+        init_container {
+          name              = "object-write-tls-renderer"
+          image             = var.object_write_gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='object-write-server-certificate.pem object-write-server-private-key.pem'
+            actual_count=$(find -L /var/run/cats/object-write-tls-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 2
+            install -d -o 0 -g 0 -m 0700 /etc/cats/object-write-tls
+            for name in $expected; do
+              test -f "/var/run/cats/object-write-tls-source/$name"
+              mode=0644
+              test "$name" != object-write-server-private-key.pem || mode=0600
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/object-write-tls-source/$name" "/etc/cats/object-write-tls/$name"
+            done
+            sync /etc/cats/object-write-tls
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "object-write-tls-source"
+            mount_path = "/var/run/cats/object-write-tls-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-tls"
+            mount_path = "/etc/cats/object-write-tls"
+          }
+        }
+
+        container {
+          name              = "object-write-gateway"
+          image             = var.object_write_gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/usr/local/bin/cats-object-write-gatewayd"]
+          args = [
+            "--listen",
+            "0.0.0.0:7443",
+            "--control-store-url-file",
+            "/run/cats/object-write-gateway/postgres/url",
+            "--control-store-ca-file",
+            "/etc/cats/rds-ca.pem",
+            "--control-store-schema",
+            var.control_postgres_schema,
+            "--server-certificate-file",
+            "/etc/cats/object-write-tls/object-write-server-certificate.pem",
+            "--server-private-key-file",
+            "/etc/cats/object-write-tls/object-write-server-private-key.pem",
+            "--durable-spool-root",
+            "/var/lib/cats/object-write-spool",
+            "--provider",
+            "aws",
+            "--partition",
+            var.object_write_provider_partition,
+            "--account-id",
+            var.object_write_provider_account_id,
+            "--region",
+            var.chunkstore_region,
+            "--bucket",
+            var.chunkstore_bucket_name,
+            "--prefix",
+            var.chunkstore_prefix,
+            "--object-store-scope-id",
+            "arn:${var.object_write_provider_partition}:s3:::${var.chunkstore_bucket_name}/${var.chunkstore_prefix}",
+          ]
+
+          port {
+            name           = "https"
+            container_port = 7443
+            protocol       = "TCP"
+          }
+
+          resources {
+            requests = {
+              cpu    = "250m"
+              memory = "256Mi"
+            }
+            limits = {
+              cpu    = "2"
+              memory = "1Gi"
+            }
+          }
+
+          startup_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            failure_threshold = 30
+            period_seconds    = 5
+          }
+
+          readiness_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            period_seconds = 5
+          }
+
+          liveness_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            period_seconds = 15
+          }
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "object-write-database"
+            mount_path = "/run/cats/object-write-gateway/postgres"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "rds-ca"
+            mount_path = "/etc/cats/rds-ca.pem"
+            sub_path   = "rds-ca.pem"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-tls"
+            mount_path = "/etc/cats/object-write-tls"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-spool"
+            mount_path = "/var/lib/cats/object-write-spool"
+          }
+        }
+
+        volume {
+          name = "object-write-database"
+
+          secret {
+            secret_name  = local.object_write_gateway_postgres_secret_name
+            default_mode = "0400"
+            optional     = false
+
+            items {
+              key  = "url"
+              path = "url"
+              mode = "0400"
+            }
+          }
+        }
+
+        volume {
+          name = "rds-ca"
+
+          config_map {
+            name = kubernetes_config_map_v1.rds_ca.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "object-write-tls-source"
+
+          secret {
+            secret_name  = var.object_write_gateway_tls_secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "object-write-tls"
+
+          empty_dir {
+            medium = "Memory"
+          }
+        }
+
+        volume {
+          name = "object-write-spool"
+
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim_v1.object_write_spool.metadata[0].name
+            read_only  = false
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = var.maintenance_mode ? "0" : "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-object-write-gateway"
+      }
+    }
+  }
+}
+
+# The NLB is VPC-internal and carries TCP unchanged: TLS terminates only in the
+# Pod against the release-bound node-server-CA leaf. Its custom frontend SG is
+# provisioned in the platform state with exactly one worker-SG ingress rule.
+resource "kubernetes_service_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+    annotations = {
+      "service.beta.kubernetes.io/aws-load-balancer-scheme"                              = "internal"
+      "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"                     = "ip"
+      "service.beta.kubernetes.io/aws-load-balancer-security-groups"                     = var.object_write_gateway_nlb_security_group_id
+      "service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules" = "true"
+      "service.beta.kubernetes.io/aws-load-balancer-subnets"                             = join(",", var.object_write_gateway_private_subnet_ids)
+      "service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol"                = "TCP"
+    }
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    }
+    type                = "LoadBalancer"
+    load_balancer_class = "eks.amazonaws.com/nlb"
+
+    port {
+      name        = "tls"
+      port        = 443
+      target_port = "https"
+      protocol    = "TCP"
+    }
+  }
+
+  wait_for_load_balancer = true
 }
 
 resource "kubernetes_deployment_v1" "gateway" {

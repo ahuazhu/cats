@@ -19,6 +19,7 @@ mod executor;
 mod leadership;
 mod metrics;
 mod nodes;
+mod object_write_gateway_client;
 mod oci;
 mod operations;
 mod rows;
@@ -43,8 +44,19 @@ mod agent_session_tests;
 
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
+pub use object_write_gateway_client::{
+    ObjectWriteGatewayClient, OBJECT_WRITE_GATEWAY_POSTGRES_ROLE,
+    OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1,
+};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
+pub use runtime_authority::host_fence_provider_queue::{
+    HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
+    HostFenceProviderQueueRecordV1, HostFenceProviderQueueStateV1, PgObjectWriteCutoffPort,
+    HOST_FENCE_PROVIDER_EVIDENCE_MAX_BYTES, HOST_FENCE_PROVIDER_LEASE_MAX_MS,
+    HOST_FENCE_PROVIDER_POSTGRES_ROLE, HOST_FENCE_PROVIDER_QUEUE_VERSION_V1,
+    HOST_FENCE_PROVIDER_REQUEST_MAX_BYTES,
+};
 pub use work::WorkLeaseGuard;
 
 use rows::{
@@ -421,7 +433,7 @@ fn drop_on_executor<T: Send + 'static>(
     }
 }
 
-fn drop_on_normal_executor(value: Client) {
+fn drop_on_normal_executor<T: Send + 'static>(value: T) {
     drop_on_executor(value, control_store_executor, metrics::ExecutorKind::Normal);
 }
 

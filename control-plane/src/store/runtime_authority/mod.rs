@@ -5,8 +5,16 @@ mod covered_commit;
 pub(crate) mod delete_sweeper;
 pub(crate) mod fleet_verification;
 pub(crate) mod gateway_identity;
+pub(crate) mod host_fence_commit;
+pub(crate) mod host_fence_provider_queue;
+#[allow(
+    dead_code,
+    reason = "C3 raw batch authority is intentionally unreachable until the authenticated server-side planner service is composed"
+)]
+pub(crate) mod host_fence_recovery_batch;
 pub(crate) mod image_manifest_resolver;
 pub(crate) mod normal_delete;
+pub(crate) mod object_write;
 pub(crate) mod persistent_disk_create_service;
 pub(super) mod pg_codec;
 pub(crate) mod placement_planner;
@@ -53,6 +61,15 @@ pub(crate) mod product_tests;
 
 #[cfg(test)]
 mod placement_policy_tests;
+
+#[cfg(test)]
+mod host_fence_commit_tests;
+
+#[cfg(test)]
+mod host_fence_provider_queue_tests;
+
+#[cfg(test)]
+mod host_fence_recovery_batch_tests;
 
 #[cfg(test)]
 mod gateway_identity_tests;

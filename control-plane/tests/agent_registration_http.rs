@@ -107,6 +107,12 @@ impl Context {
             NodeIdentity {
                 version: ContractVersion::V1,
                 node_id: Id::new("node_http_a").unwrap(),
+                provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                    provider: Id::new("test_provider").unwrap(),
+                    partition: Id::new("test_partition").unwrap(),
+                    account_id: Id::new("test_account").unwrap(),
+                    region: Id::new("test_region").unwrap(),
+                },
                 immutable_host_id: Id::new("host_http_a").unwrap(),
                 credential_id: signer.credential_id().clone(),
                 credential_binding: CredentialBinding::PublicKey {

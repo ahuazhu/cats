@@ -22,6 +22,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::gateway_identity::lock_route_v2_machine_authority_shared;
+use super::host_fence_recovery_batch::{
+    require_host_recovery_unblocked_in, require_product_mutation_unblocked_in,
+};
 use super::pg_codec::PgBigInt;
 use super::product_rows::load_assigned_desired_for_update;
 use super::route_signing_authority::node_acks_current_published_ring_in;
@@ -650,7 +653,11 @@ fn apply_runtime_node_authority_in(
             let identity = load_identity_by_node_for_update(transaction, &apply.node_id)?;
             let policy = load_policy_for_update(transaction, &apply.node_id)?;
             let absent = identity.is_none() && policy.is_none();
-            let host_state_fresh = lock_and_check_fresh_host_state(transaction, node_identity)?;
+            let host_state_fresh = if absent {
+                lock_and_check_fresh_host_state(transaction, node_identity)?
+            } else {
+                false
+            };
             (identity, policy, absent, host_state_fresh)
         }
         _ => {
@@ -663,6 +670,13 @@ fn apply_runtime_node_authority_in(
         return Err(corrupt(
             "NodeIdentity and placement policy presence diverged",
         ));
+    }
+    if identity.is_some() {
+        // The clean-slate catalog permits only one Provisioned NodeIdentity
+        // per physical Host. Existing identities therefore use the exact
+        // Node barrier; only the missing-row Provision path needs the
+        // Host-global guard below.
+        require_product_mutation_unblocked_in(transaction, &apply.node_id)?;
     }
     let committed_at = database_now(transaction)?;
     let stored_outcome = match &apply.mutation {
@@ -791,6 +805,37 @@ fn lock_and_check_fresh_host_state(
     transaction: &mut Transaction<'_>,
     identity: &NodeIdentity,
 ) -> AuthorityTxResult<bool> {
+    // The Host advisory is also the missing-row lock for the clean-slate
+    // one-Provisioned-identity invariant. Existing Node mutations never take
+    // it after their identity row, so querying the current Host row below
+    // cannot form a row/advisory lock inversion with Retire.
+    require_host_recovery_unblocked_in(
+        transaction,
+        &identity.provider_scope,
+        &identity.immutable_host_id,
+    )?;
+    let provisioned = transaction.query(
+        "SELECT node_id FROM node_identities
+          WHERE host_provider=$1 AND host_partition=$2
+            AND host_account_id=$3 AND host_region=$4
+            AND immutable_host_id=$5 AND state='provisioned'
+          ORDER BY node_id COLLATE \"C\" LIMIT 2 FOR UPDATE",
+        &[
+            &identity.provider_scope.provider.as_str(),
+            &identity.provider_scope.partition.as_str(),
+            &identity.provider_scope.account_id.as_str(),
+            &identity.provider_scope.region.as_str(),
+            &identity.immutable_host_id.as_str(),
+        ],
+    )?;
+    if provisioned.len() > 1 {
+        return Err(corrupt(
+            "more than one Provisioned NodeIdentity exists for one immutable Host",
+        ));
+    }
+    if !provisioned.is_empty() {
+        return Ok(false);
+    }
     transaction.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended(
             current_schema() || ':runtime-node-host-state:' || $1 || ':' || $2,
@@ -1055,7 +1100,7 @@ fn update_policy(
     )?)
 }
 
-fn load_policy_for_update(
+pub(super) fn load_policy_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<NodePlacementPolicy>> {
