@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aws_sdk_ec2::config::retry::RetryConfig;
 use aws_sdk_ec2::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_ec2::operation::RequestId as _;
 use cats_api::runtime_reconciliation::{AsciiText, Id, ProviderScope, UnixMillis};
@@ -19,6 +20,14 @@ use sha2::{Digest, Sha256};
 use crate::VerifiedAwsProviderBinding;
 
 const OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+fn mutation_retry_config() -> RetryConfig {
+    // HostFence owns ambiguity recovery: every uncertain StopInstances or
+    // ModifyNetworkInterfaceAttribute response is followed by a fresh exact
+    // Describe before another effect may be considered. An SDK-internal retry
+    // would repeat a mutation without that required postcondition discovery.
+    RetryConfig::disabled()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsHostTarget {
@@ -695,6 +704,10 @@ impl Ec2FenceApi for SdkEc2FenceApi {
                 self.client
                     .stop_instances()
                     .instance_ids(host_id.as_str())
+                    .customize()
+                    .config_override(
+                        aws_sdk_ec2::config::Builder::new().retry_config(mutation_retry_config()),
+                    )
                     .send(),
                 deadline,
             )
@@ -760,6 +773,10 @@ impl Ec2FenceApi for SdkEc2FenceApi {
                     .modify_network_interface_attribute()
                     .network_interface_id(interface_id.as_str())
                     .groups(quarantine_security_group_id.as_str())
+                    .customize()
+                    .config_override(
+                        aws_sdk_ec2::config::Builder::new().retry_config(mutation_retry_config()),
+                    )
                     .send(),
                 deadline,
             )
@@ -991,6 +1008,11 @@ mod tests {
             ),
             Err(HostFenceProviderError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn ec2_mutations_have_exactly_one_sdk_attempt() {
+        assert_eq!(mutation_retry_config().max_attempts(), 1);
     }
 
     fn host(state: Ec2InstanceState, at: u64, observation: &str) -> HostObservation {
