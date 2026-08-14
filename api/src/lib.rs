@@ -34,6 +34,7 @@ pub mod resources;
 pub mod route_grant;
 pub mod route_grant_v2;
 pub mod runtime_artifacts;
+pub mod runtime_host_loss_recovery;
 pub mod runtime_node_authority;
 pub mod runtime_product_reads;
 pub mod runtime_reconciliation;
