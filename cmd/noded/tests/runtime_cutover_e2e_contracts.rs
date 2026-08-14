@@ -1146,6 +1146,45 @@ fn runtime_cutover_runner_rejects_evidence_outside_the_catalog_union() {
 }
 
 #[test]
+fn runtime_cutover_runner_collects_only_the_three_route_rotation_terminal_files() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("route-rotation-wip-evidence");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env(
+            "CATS_E3_FIXTURE_EXTRA_EVIDENCE_CASE",
+            "route-v2-rotation-disable-live-delivery",
+        );
+    });
+    assert_success(&output);
+
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    let route: serde_json::Value = results
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|row: &serde_json::Value| row["case_id"] == "route-v2-rotation-disable-live-delivery")
+        .unwrap();
+    assert_eq!(route["status"], "passed");
+
+    let evidence = fs::read_to_string(output_dir.join("case-evidence.jsonl")).unwrap();
+    let route_files = evidence
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["case_id"] == "route-v2-rotation-disable-live-delivery")
+        .map(|row| row["filename"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        route_files,
+        [
+            "route-v2-rotation-disable-live-delivery.receipt.json",
+            "route-v2-rotation-disable-live-delivery.node-acks.json",
+            "route-v2-rotation-disable-live-delivery.transcript.log",
+            "cleanup-receipt.json",
+        ]
+    );
+    assert!(!evidence.contains("extra-receipt.json"));
+}
+
+#[test]
 fn runtime_cutover_runner_gives_only_route_rotation_a_long_cleanup_window() {
     let fixture = Fixture::new();
     let output_dir = fixture.output_dir("route-rotation-cleanup-deadline");

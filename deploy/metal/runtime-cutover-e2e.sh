@@ -57,6 +57,13 @@ cats_e3_run_cases_post_preflight() {
     for candidate in "${candidates[@]}"; do
       [[ -f $candidate && ! -L $candidate ]] || continue
       filename=${candidate##*/}
+      if [[ $case_id == route-v2-rotation-disable-live-delivery ]]; then
+        if jq -e --arg filename "$filename" \
+          'any(.[]; .filename == $filename)' <<<"$required_evidence" >/dev/null; then
+          actual_names+=("$filename")
+        fi
+        continue
+      fi
       case "$filename" in
         *receipt*.json|*.node-acks.json|*.transcript.log) actual_names+=("$filename") ;;
         *)
