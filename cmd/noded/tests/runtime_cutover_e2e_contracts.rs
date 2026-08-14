@@ -890,6 +890,10 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
     assert!(runner.contains("value[\"release_commit_sha\"] != exact_commit"));
     assert!(runner.contains("route_v2_rotation_operator:{config_label:"));
     assert!(runner.contains("CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID"));
+    assert!(runner.contains(
+        "CATS_E3_QUALIFICATION_CATALOG_SHA256=sha256:$qualification_catalog_authority_sha256"
+    ));
+    assert!(runner.contains("qualification catalog digest changed"));
     assert!(builder.contains("--input-file \"qualification_catalog="));
 }
 

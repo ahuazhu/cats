@@ -288,6 +288,7 @@ cats_e3_export_qualification_environment() {
   export CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID=$route_rotation_operator_authority_id
   export CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID=$route_rotation_operator_route_deployment_id
   export CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256=$route_rotation_operator_trust_sha256
+  export CATS_E3_QUALIFICATION_CATALOG_SHA256=sha256:$qualification_catalog_authority_sha256
 }
 
 cats_e3_environment_labels_are_unique() {
@@ -1313,6 +1314,8 @@ coordinate_recheck=$scratch/qualification-coordinate-diagnostic.txt
   printf '%s\n' 'Endpoint hostname changed' >>"$coordinate_recheck"
 [[ ${CATS_E3_PUBLIC_ORIGIN:-} == "https://$endpoint_hostname" ]] || \
   printf '%s\n' 'public origin changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_QUALIFICATION_CATALOG_SHA256:-} == "sha256:$qualification_catalog_authority_sha256" ]] || \
+  printf '%s\n' 'qualification catalog digest changed' >>"$coordinate_recheck"
 [[ -f $token_file_original && ! -L $token_file_original ]] && \
   protected_token_file "$token_file_original" >/dev/null 2>&1 && \
   [[ $(sha256sum "$token_file_original" | awk '{print $1}') == "$token_file_authority_sha256" ]] || \
