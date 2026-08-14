@@ -347,6 +347,49 @@ fn disabled_initial_authority_persists_without_a_key_lineage() {
 }
 
 #[test]
+fn disabled_empty_ring_can_publish_fresh_ring_with_zero_provisioned_nodes() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let empty_ring = RouteGrantV2PublicKeyRingArtifact {
+        version: ContractVersion::V1,
+        ring_version: Epoch::new(1).unwrap(),
+        expected_previous: None,
+        keys: Vec::new(),
+    };
+    let mut reference = decode_route_grant_v2_signer_reference(SIGNER).unwrap();
+    reference.signer = RouteGrantV2SignerSelection::Disabled;
+    reference.public_key_ring_digest = empty_ring.digest().unwrap();
+    let exact_reference_bytes = encode_route_grant_v2_signer_reference(&reference).unwrap();
+    let disabled = InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+        &reference,
+        &exact_reference_bytes,
+        &empty_ring,
+        None,
+        120,
+    )
+    .unwrap();
+    store
+        .install_route_grant_v2_signer_authority(&disabled)
+        .unwrap();
+
+    let fresh_ring = successor_ring(&empty_ring, vec![third_entry()]);
+    let fresh_reference = successor_reference(
+        &reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &fresh_ring,
+    );
+    assert_applied(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: fresh_reference,
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: fresh_ring,
+                new_secret_reference_id: id("route_secret_bootstrap"),
+            },
+        },
+    ));
+}
+
+#[test]
 fn immutable_rows_and_projection_drift_fail_closed() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let installed = installation(SIGNER);

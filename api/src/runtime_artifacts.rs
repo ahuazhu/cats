@@ -3226,12 +3226,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn node_route_v2_machine_reader_pins_closed_set_and_private_mode() {
+    fn node_route_v2_machine_reader_allows_sibling_temp_but_pins_exact_catalog() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().unwrap();
         let directory_path = temp.path().join("route-v2");
         write_test_node_route_v2_machine_artifacts(&directory_path);
+        let sibling_temp = temp.path().join(concat!(
+            ".route-v2.public-key-ring.v1.2.",
+            "0000000000000000000000000000000000000000000000000000000000000000.tmp"
+        ));
+        std::fs::write(&sibling_temp, b"partial ring publication").unwrap();
+        std::fs::set_permissions(&sibling_temp, std::fs::Permissions::from_mode(0o644)).unwrap();
         let (public_contract, private_contract) = test_node_route_contracts(&directory_path);
         let retained = open_test_route_directory(temp.path());
         let installed =

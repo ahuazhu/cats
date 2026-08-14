@@ -531,11 +531,8 @@ fn publish_overlap_in(
             entry
         }
         RouteGrantV2SignerSelection::Disabled => {
-            if successor_ring.keys.len() != 1 {
-                return Ok(None);
-            }
-            if !current_ring.keys.is_empty()
-                && !all_provisioned_nodes_closed_or_fenced(transaction, committed_at)?
+            if successor_ring.keys.len() != 1
+                || !all_provisioned_nodes_closed_or_fenced(transaction, committed_at)?
             {
                 return Ok(None);
             }
