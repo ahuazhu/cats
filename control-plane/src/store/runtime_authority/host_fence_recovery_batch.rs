@@ -728,9 +728,6 @@ fn load_current_open_writer_for_update(
           WHERE host_provider=$1 AND host_partition=$2
             AND host_account_id=$3 AND host_region=$4
             AND immutable_host_id=$5 AND node_id=$6
-            AND object_provider=$7 AND object_partition=$8
-            AND object_account_id=$9 AND object_region=$10
-            AND workload_principal_id=$11 AND object_store_scope_id=$12
             AND state='open'
           ORDER BY writer_authority_id COLLATE \"C\"
           LIMIT 2 FOR UPDATE",
@@ -741,12 +738,6 @@ fn load_current_open_writer_for_update(
             &scope.region.as_str(),
             &identity.immutable_host_id.as_str(),
             &identity.node_id.as_str(),
-            &scope.provider.as_str(),
-            &scope.partition.as_str(),
-            &scope.account_id.as_str(),
-            &scope.region.as_str(),
-            &bindings.workload_principal_id.as_str(),
-            &bindings.object_store_scope_id.as_str(),
         ],
     )?;
     let [row] = rows.as_slice() else {
@@ -2105,6 +2096,11 @@ fn batch_recovery_in(
             )));
         }
         TrustedHostFenceRecoveryAttemptStateV1::Blocked { receipt } => {
+            if receipt.terminal_event != commit.terminal_event {
+                return Err(conflict(
+                    "Blocked Host recovery replay changed its terminal provider evidence",
+                ));
+            }
             return Ok(TrustedHostFenceBatchRecoveryStoreOutcomeV1::Blocked(
                 Box::new(receipt.clone()),
             ));

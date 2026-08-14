@@ -59,24 +59,33 @@ fn authority_bindings(identity: &NodeIdentity) -> HostFenceAuthorityBindingsV1 {
     }
 }
 
-fn insert_open_writer(fixture: &RecoveryFixture, bindings: &HostFenceAuthorityBindingsV1) {
-    let writer = ObjectWriterIdentity {
-        authority_id: id("owa1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        host_provider_scope: fixture.old_identity.provider_scope.clone(),
-        immutable_host_id: fixture.old_identity.immutable_host_id.clone(),
-        node_id: fixture.old_identity.node_id.clone(),
-        object_provider_scope: bindings.provider_scope.clone(),
-        workload_principal_id: bindings.workload_principal_id.clone(),
-        object_store_scope_id: bindings.object_store_scope_id.clone(),
-    };
-    let authority = ObjectWriteAuthority {
-        writer: writer.clone(),
+fn open_writer(
+    fixture: &RecoveryFixture,
+    authority_id: &str,
+    object_provider_scope: cats_api::runtime_reconciliation::ProviderScope,
+    workload_principal_id: AsciiText,
+    object_store_scope_id: AsciiText,
+) -> ObjectWriteAuthority {
+    ObjectWriteAuthority {
+        writer: ObjectWriterIdentity {
+            authority_id: id(authority_id),
+            host_provider_scope: fixture.old_identity.provider_scope.clone(),
+            immutable_host_id: fixture.old_identity.immutable_host_id.clone(),
+            node_id: fixture.old_identity.node_id.clone(),
+            object_provider_scope,
+            workload_principal_id,
+            object_store_scope_id,
+        },
         state: ObjectWriteAuthorityState::Open,
         max_accepted_sequence: WireU64::new(0).unwrap(),
         terminal_prefix_sequence: WireU64::new(0).unwrap(),
         terminal_prefix_sha256: empty_terminal_prefix_sha256(),
-    };
-    let record = serde_json::to_string(&authority).unwrap();
+    }
+}
+
+fn insert_writer_authority(fixture: &RecoveryFixture, authority: &ObjectWriteAuthority) {
+    let writer = &authority.writer;
+    let record = serde_json::to_string(authority).unwrap();
     fixture
         .store
         .with(|client| {
@@ -112,6 +121,17 @@ fn insert_open_writer(fixture: &RecoveryFixture, bindings: &HostFenceAuthorityBi
             )
         })
         .unwrap();
+}
+
+fn insert_open_writer(fixture: &RecoveryFixture, bindings: &HostFenceAuthorityBindingsV1) {
+    let authority = open_writer(
+        fixture,
+        "owa1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        bindings.provider_scope.clone(),
+        bindings.workload_principal_id.clone(),
+        bindings.object_store_scope_id.clone(),
+    );
+    insert_writer_authority(fixture, &authority);
 }
 
 fn expected_cat(desired: &DesiredRuntimeSpec) -> HostLossRecoveryExpectedAssignedCatV1 {
@@ -333,6 +353,56 @@ fn two_cat_begin_is_one_sealed_attempt_and_exact_response_loss_replay() {
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+#[test]
+fn two_open_writer_parents_reject_before_queue_or_cutoff() {
+    let fixture = batch_fixture("host-recovery-two-open-writers");
+    // The clean v16 catalog prevents this state. Dropping only the isolated
+    // fixture index characterizes the Store's fail-closed behavior for a
+    // preexisting/corrupt catalog instead of relying on DDL alone.
+    fixture
+        .fixture
+        .store
+        .with(|client| client.batch_execute("DROP INDEX object_write_one_open_authority_per_host"))
+        .unwrap();
+    let mut foreign_scope = fixture.bindings.provider_scope.clone();
+    foreign_scope.region = id("foreign-region");
+    let foreign = open_writer(
+        &fixture.fixture,
+        "owa1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        foreign_scope,
+        text("foreign-object-writer-principal"),
+        text("foreign-object-store/chunks"),
+    );
+    insert_writer_authority(&fixture.fixture, &foreign);
+
+    let error = fixture
+        .fixture
+        .store
+        .begin_trusted_host_fence_recovery_attempt_v1(
+            &principal(),
+            &fixture.apply,
+            &fixture.bindings,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    let counts: (i64, i64, i64) = fixture
+        .fixture
+        .store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT
+                        (SELECT count(*) FROM trusted_host_fence_recovery_attempts_v1),
+                        (SELECT count(*) FROM host_fence_provider_queue_v1),
+                        (SELECT count(*) FROM object_write_authorities WHERE state='open')",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0, 2));
 }
 
 #[test]

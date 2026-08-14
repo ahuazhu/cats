@@ -1573,6 +1573,12 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
+        "object_write_authorities",
+        "object_write_one_open_authority_per_host",
+        "host_provider,host_partition,host_account_id,host_region,immutable_host_id,node_id",
+        Some("(state = 'open'::text)"),
+    ),
+    (
         "trusted_host_fence_recovery_attempts_v1",
         "host_recovery_attempt_apply_id_key",
         "apply_id",
@@ -4061,8 +4067,7 @@ CREATE TABLE IF NOT EXISTS object_write_authorities (
 CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_open_authority_per_host
     ON object_write_authorities(
         host_provider, host_partition, host_account_id, host_region,
-        immutable_host_id, object_provider, object_partition,
-        object_account_id, object_region, object_store_scope_id
+        immutable_host_id, node_id
     ) WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS object_write_authorities_node_state
     ON object_write_authorities(node_id, state);
