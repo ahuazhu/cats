@@ -486,7 +486,7 @@ deploy/aws/run-postgres-probe.sh \
   > /approved/evidence/<CUTOVER_ID>/50-control-schema-version.txt
 ```
 
-The schema query must return exactly `14`. Starting Gateway here does not open public ingress;
+The schema query must return exactly `15`. Starting Gateway here does not open public ingress;
 E12 and E3 still require every Node-local lifecycle/route gate Closed.
 
 For each Host, prepare/export its Host-local identity while the Node service is stopped:
