@@ -1713,6 +1713,17 @@ mod tests {
     use super::*;
     use cats_metering::{deterministic_event_id, UsageAggregate};
 
+    async fn drop_test_schema(url: String, schema: String) {
+        tokio::task::spawn_blocking(move || {
+            let mut cleanup = connect_client(&url, None, &schema).unwrap();
+            cleanup
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .unwrap();
+        })
+        .await
+        .expect("join PostgreSQL test schema cleanup");
+    }
+
     /// The worker resolves this on every connect, so a rotated credential
     /// reaches the next reconnect instead of waiting for a restart that a
     /// stale credential would prevent anyway.
@@ -1909,7 +1920,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut cleanup = connect_client(&url, None, &schema).unwrap();
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std_mpsc::channel();
         let slow_store = Arc::clone(&store);
@@ -1972,9 +1982,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("worker did not discard the queued effect after poison");
         assert_eq!(effects.load(Ordering::SeqCst), 0);
-        cleanup
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .unwrap();
+        drop(store);
+        drop_test_schema(url, schema).await;
     }
 
     #[tokio::test]
@@ -1997,7 +2006,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut cleanup = connect_client(&url, None, &schema).unwrap();
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std_mpsc::channel();
         let (finished, finished_rx) = std_mpsc::channel();
@@ -2028,9 +2036,8 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("cancelled worker effect did not exit after release");
-        cleanup
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .unwrap();
+        drop(store);
+        drop_test_schema(url, schema).await;
     }
 
     #[tokio::test]
@@ -2089,11 +2096,18 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut blocker = connect_client(&url, None, &schema).unwrap();
-        assert!(blocker
-            .query_one("SELECT pg_terminate_backend($1)", &[&worker_pid])
-            .unwrap()
-            .get::<_, bool>(0));
+        let blocker_url = url.clone();
+        let blocker_schema = schema.clone();
+        let mut blocker = tokio::task::spawn_blocking(move || {
+            let mut blocker = connect_client(&blocker_url, None, &blocker_schema).unwrap();
+            assert!(blocker
+                .query_one("SELECT pg_terminate_backend($1)", &[&worker_pid])
+                .unwrap()
+                .get::<_, bool>(0));
+            blocker
+        })
+        .await
+        .expect("join PostgreSQL worker termination setup");
         let first_reconnect = tokio::time::timeout(
             Duration::from_secs(10),
             store.dispatch(|client| {
@@ -2152,9 +2166,14 @@ mod tests {
         );
 
         let lock_key = i64::try_from(suffix % u128::try_from(i64::MAX).unwrap()).unwrap();
-        blocker
-            .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
-            .unwrap();
+        blocker = tokio::task::spawn_blocking(move || {
+            blocker
+                .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
+                .unwrap();
+            blocker
+        })
+        .await
+        .expect("join PostgreSQL advisory-lock setup");
         let lock_result = tokio::time::timeout(
             Duration::from_secs(7),
             store.dispatch(move |client| {
@@ -2165,7 +2184,9 @@ mod tests {
             }),
         )
         .await;
-        drop(blocker);
+        tokio::task::spawn_blocking(move || drop(blocker))
+            .await
+            .expect("join PostgreSQL advisory-lock release");
         let lock_error = lock_result
             .expect("server-side lock_timeout did not bound the worker")
             .unwrap_err();
