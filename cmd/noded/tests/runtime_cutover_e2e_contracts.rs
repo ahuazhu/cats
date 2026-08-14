@@ -163,6 +163,121 @@ exec "$@"
         configure(&mut command);
         command.output().expect("run runtime cutover fixture")
     }
+
+    fn run_v2_driver(&self, output_dir: &Path) -> Output {
+        let fake = r#"#!/usr/bin/env bash
+set -euo pipefail
+role=$(basename "$0")
+case "$role" in
+  cats)
+    case " $* " in
+      *" admin fleet-verify "*)
+        printf '{"version":1,"release_commit_sha":"%s","snapshot":{"desired_runtime_count":0,"current_runtime_observation_count":0,"nodes":[{"node_id":"node_fixture","inventory":{"complete_inventory":true,"assigned_desired_count":0,"runtime_count":0,"residue_count":0,"lifecycle_open_count":0,"route_active_count":0,"route_closed_count":0,"active_guard_count":0,"cancellation_pending_count":0,"quarantined_condition_count":0}}]}}\n' "$CATS_E3_EXACT_COMMIT"
+        ;;
+      *" create "*) printf '%s\n' '{"cat_id":"cat_fixture","operation_id":"op_create"}' ;;
+      *" get "*) printf '%s\n' '{"id":"cat_fixture","desired":{"target":"running"},"observed":{"stable_state":"running","conditions":["ready"]}}' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  curl)
+    output=/dev/null headers= method=GET url= write_out=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --output|--dump-header|--request|--header|--proto|--max-time|--write-out|--data-binary)
+          [[ $1 == --output ]] && output=$2
+          [[ $1 == --dump-header ]] && headers=$2
+          [[ $1 == --request ]] && method=$2
+          [[ $1 == --write-out ]] && write_out=true
+          shift 2
+          ;;
+        --fail|--fail-with-body|--silent|--show-error|--tlsv1.2) shift ;;
+        https://*) url=$1; shift ;;
+        *) exit 64 ;;
+      esac
+    done
+    status=200 body='{}'
+    case "$url|$method" in
+      */healthz*) ;;
+      */operations/op_create*|*/operations/op_endpoint*) body='{"phase":"succeeded","terminal":{"result":{"observed_target":"running"}}}' ;;
+      */operations/op_delete*) body='{"phase":"succeeded","terminal":{"result":{"observed_target":"deleted"}}}' ;;
+      */endpoints*'|POST') status=202; body='{"desired_revision":2,"operation_id":"op_endpoint"}' ;;
+      */cats/cat_fixture*'|DELETE') status=202; body='{"desired_revision":3,"operation_id":"op_delete"}' ;;
+      *) exit 64 ;;
+    esac
+    [[ -z $headers ]] || printf 'HTTP/1.1 %s Fixture\r\nContent-Type: application/json\r\n\r\n' "$status" >"$headers"
+    [[ $output == /dev/null ]] || printf '%s\n' "$body" >"$output"
+    [[ $write_out == false ]] || printf '%s' "$status"
+    ;;
+  journalctl) printf '%s\n' 'fixture journal is bounded and nonsecret' ;;
+  route-g5-http|route-g5-ws|node-agent-tests) exit 0 ;;
+  *) exit 64 ;;
+esac
+"#;
+        let labels = [
+            "cats",
+            "curl",
+            "journalctl",
+            "route-g5-http",
+            "route-g5-ws",
+            "node-agent-tests",
+        ];
+        let mut binaries = Vec::new();
+        for label in labels {
+            let path = self._temp.path().join(label);
+            fs::write(&path, fake).expect("write v2 fake executable");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make v2 fake executable");
+            binaries.push((label, path));
+        }
+
+        let mut command = Command::new("bash");
+        command
+            .arg(self.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+            .args(["--exact-commit", &self.exact_commit])
+            .args(["--block-path", "kernel-nbd"])
+            .args(["--run-id", "v2-fixture-run"])
+            .arg("--output-dir")
+            .arg(output_dir)
+            .arg("--build-receipt")
+            .arg(&self.build_receipt)
+            .arg("--release-manifest")
+            .arg(&self.release_manifest)
+            .args(["--guest-kernel", "fixture-guest-kernel"]);
+        for (label, path) in &binaries {
+            command.arg("--binary").arg(format!(
+                "{label}={}@sha256:{}",
+                path.display(),
+                sha256(path)
+            ));
+        }
+        command
+            .arg("--config")
+            .arg(format!("route-key-ring={}", self.config.display()))
+            .args([
+                "--key-fingerprint",
+                "route=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])
+            .arg("--scenario-driver")
+            .arg(
+                self.root
+                    .join("deploy/metal/runtime-cutover-v2-scenarios.sh"),
+            )
+            .env("CATS_E3_TIMEOUT_BIN", &self.timeout)
+            .env("CATS_TOKEN", "fixture-token")
+            .env("CATS_E3_CONTROL_ORIGIN", "https://control.fixture")
+            .env("CATS_E3_WORKSPACE_ID", "ws_fixture")
+            .env("CATS_E3_EXPECTED_NODES", "node_fixture")
+            .env("CATS_E3_CAT_NAME", "fixture-cat")
+            .env(
+                "CATS_E3_BOOT_IMAGE_DIGEST",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .env("CATS_E3_ENDPOINT_NAME", "e3-web")
+            .env("CATS_E3_ENDPOINT_HOSTNAME", "e3.fixture.test")
+            .env("CATS_E3_NODE_SERVICE", "cats-noded.service")
+            .current_dir(&self.root);
+        command.output().expect("run production v2 driver fixture")
+    }
 }
 
 fn sha256(path: &Path) -> String {
@@ -313,4 +428,48 @@ fn runtime_cutover_runner_rejects_sensitive_final_inventory() {
     let inventory = fs::read_to_string(output_dir.join("final-inventory.json")).unwrap();
     assert!(!inventory.contains("fixture-token-must-not-survive"));
     assert!(inventory.contains("unavailable"));
+}
+
+#[test]
+fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("production-v2-driver");
+    let output = fixture.run_v2_driver(&output_dir);
+    assert!(
+        !output.status.success(),
+        "E9 and live Guest/route must stay blocked"
+    );
+
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    for case_id in CASES {
+        assert!(results.contains(&format!("\"case_id\":\"{case_id}\"")));
+    }
+    for passed in [
+        "control-startup-schema",
+        "node-registration-full-inventory",
+        "cat-create-running",
+        "agent-restart-adoption",
+        "delete-cleanup",
+    ] {
+        assert!(results.lines().any(|line| {
+            line.contains(&format!("\"case_id\":\"{passed}\""))
+                && line.contains("\"status\":\"passed\"")
+        }));
+    }
+    for blocked in [
+        "durable-write-flush",
+        "route-http-ws",
+        "usage-final-terminal-receipt",
+    ] {
+        assert!(results.lines().any(|line| {
+            line.contains(&format!("\"case_id\":\"{blocked}\""))
+                && line.contains("\"status\":\"blocked\"")
+        }));
+    }
+    let state = fs::read_to_string(output_dir.join("runtime-state.json")).unwrap();
+    assert!(state.contains("\"cat_id\":\"cat_fixture\""));
+    let journal = fs::read_to_string(output_dir.join("component-journal-summary.txt")).unwrap();
+    assert!(journal.contains("BLOCKED_RECEIPT"));
+    assert!(journal.contains("FOCUSED_RECEIPT"));
+    assert!(!journal.contains("fixture-token"));
 }

@@ -185,7 +185,7 @@ atomic_text() {
 }
 
 record_hashed_entries() {
-  local kind=$1 output=$2 entry label path canonical digest expected size
+  local kind=$1 output=$2 entry label path canonical digest expected size environment_label
   shift 2
   for entry in "$@"; do
     label=${entry%%=*}
@@ -209,6 +209,14 @@ record_hashed_entries() {
     size=$(wc -c <"$canonical" | tr -d ' ')
     jq -S -c -n --arg label "$label" --arg path "$canonical" --arg sha256 "$digest" --arg expected_sha256 "$expected" --argjson size_bytes "$size" \
       '{label:$label,path:$path,sha256:$sha256,size_bytes:$size_bytes} + (if $expected_sha256 == "" then {} else {expected_sha256:$expected_sha256} end)' >>"$output"
+    environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+    if [[ $kind == binary ]]; then
+      printf -v "CATS_E3_BINARY_${environment_label}" '%s' "$canonical"
+      export "CATS_E3_BINARY_${environment_label}"
+    else
+      printf -v "CATS_E3_CONFIG_${environment_label}" '%s' "$canonical"
+      export "CATS_E3_CONFIG_${environment_label}"
+    fi
   done
 }
 
@@ -301,6 +309,13 @@ export CATS_E3_EXACT_COMMIT=$exact_commit
 export CATS_E3_BLOCK_PATH=$block_path
 export CATS_E3_RUN_ID=$run_id
 export CATS_E3_OUTPUT_DIR=$output_dir
+export CATS_E3_RUNTIME_STATE=$output_dir/runtime-state.json
+
+jq -S -c -n \
+  --arg exact_commit "$exact_commit" --arg block_path "$block_path" --arg run_id "$run_id" \
+  '{version:1,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,cat_id:null}' \
+  >"$scratch/runtime-state.initial.json"
+atomic_copy "$scratch/runtime-state.initial.json" runtime-state.json
 
 run_filtered() {
   local action=$1 case_id=$2 deadline=$3 destination=$4 case_dir=$5
@@ -375,6 +390,8 @@ for index in "${!case_ids[@]}"; do
   fi
   if [[ $run_code -eq 124 ]]; then
     status=timed_out
+  elif [[ $run_code -eq 78 ]]; then
+    status=blocked
   fi
   jq -S -c -n \
     --arg case_id "$case_id" \
@@ -427,6 +444,7 @@ checksums_tmp=$(mktemp "$output_dir/.SHA256SUMS.XXXXXX")
     exit-code \
     final-inventory.json \
     manifest.json \
+    runtime-state.json \
     scenario-results.jsonl
 ) >"$checksums_tmp"
 chmod 0600 "$checksums_tmp"
