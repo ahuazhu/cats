@@ -8,9 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 #[cfg(debug_assertions)]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-#[cfg(debug_assertions)]
-use axum::extract::Query;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
