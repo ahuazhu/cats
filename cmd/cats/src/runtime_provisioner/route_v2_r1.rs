@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -20,15 +21,21 @@ use cats_api::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
     encode_route_grant_v2_public_key_ring, encode_route_grant_v2_signer_reference,
     RouteGrantV2PublicKey, RouteGrantV2PublicKeyEntry, RouteGrantV2PublicKeyRingArtifact,
+    RouteGrantV2PublicKeyRingExpectedPrevious, RouteGrantV2SignerExpectedPrevious,
     RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
 };
 use cats_api::route_signing_operator::{
-    decode_route_v2_rotation_operator_trust, encode_route_v2_rotation_operator_trust,
-    RouteV2RotationOperatorCredential, RouteV2RotationOperatorTrust,
+    decode_route_v2_rotation_operator_trust, decode_route_v2_signing_command_payload,
+    decode_signed_route_v2_signing_command, encode_route_v2_rotation_operator_trust,
+    encode_route_v2_signing_command_payload, encode_signed_route_v2_signing_command,
+    sign_route_v2_signing_command, verify_signed_route_v2_signing_command,
+    RouteGrantV2SigningAuthorityCommand, RouteGrantV2SigningAuthorityCommandKind,
+    RouteV2RotationOperatorCredential, RouteV2RotationOperatorTrust, RouteV2SigningCommandPayload,
+    SignedRouteV2SigningCommand, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
 };
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Hostname, Id,
-    Sha256Digest,
+    RandomId128, Sha256Digest, UnixMillis,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 use rustls::pki_types::pem::PemObject as _;
@@ -40,8 +47,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     generate_pkcs8_v2_pem, list_directory_names, open_directory_nofollow, open_file_at,
-    read_regular_at, read_stable_file, report, set_file_mode, sync_directory, validate_directory,
-    validate_regular_metadata, write_new_file_at, Cli, RuntimeProvisionerRouteV2R1Command,
+    publish_user_file_idempotent, read_regular_at, read_stable_file, read_user_file, report,
+    set_file_mode, sync_directory, validate_directory, validate_regular_metadata,
+    write_new_file_at, Cli, RuntimeProvisionerRouteV2R1Command,
 };
 use crate::stable_unix_fs::{c_os_name, mkdir_at};
 
@@ -50,6 +58,8 @@ const HTTP_11_ALPN: &[u8] = b"http/1.1";
 const MAX_PEM_BYTES: usize = 65_536;
 const MAX_PRIVATE_KEY_BYTES: usize = 16_384;
 const MAX_JSON_BYTES: usize = 262_144;
+const MAX_ROTATION_RECOVERY_BUNDLE_BYTES: usize = 1_048_576;
+const ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS: u64 = 5 * 60 * 1_000;
 const ROOT_DIRECTORIES: [&str; 5] = ["authority", "control", "gateway", "node", "provider"];
 const AUTHORITY_FILES: [(&str, u32); 3] = [
     ("route-v2-ca-certificate.pem", 0o644),
@@ -125,10 +135,1495 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
             node_secret_name,
             release_commit_sha,
         )?,
+        RuntimeProvisionerRouteV2R1Command::SignCommand {
+            input,
+            payload,
+            output,
+        } => return sign_command(cli, input, payload, output),
+        RuntimeProvisionerRouteV2R1Command::PrepareRotationRecovery {
+            input,
+            output,
+            run_id,
+        } => return prepare_rotation_recovery(cli, input, output, run_id),
+        RuntimeProvisionerRouteV2R1Command::VerifyRotationRecovery {
+            input,
+            output,
+            run_id,
+        } => return verify_rotation_recovery_command(cli, input, output, run_id),
+        RuntimeProvisionerRouteV2R1Command::SignRotationRecoveryPhase {
+            input,
+            recovery,
+            phase,
+            output,
+        } => return sign_rotation_recovery_phase(cli, input, recovery, phase, output),
     };
     let candidate = Candidate::open_existing(&inputs.root, 0)?;
     let receipt = verify(&candidate, &inputs)?;
     report(cli, &receipt)
+}
+
+#[derive(Serialize)]
+struct CommandSigningReceipt {
+    version: u32,
+    authority_id: String,
+    route_deployment_id: String,
+    release_commit_sha: String,
+    command_id: String,
+    exact_payload_sha256: String,
+    exact_command_sha256: String,
+    output: String,
+}
+
+fn sign_command(cli: &Cli, input: &Path, payload: &Path, output: &Path) -> Result<()> {
+    let candidate = Candidate::open_existing(input, 0)?;
+    let trust_bytes = read_file(
+        &candidate.control,
+        "rotation-operator-trust.v1.json",
+        0o644,
+        candidate.expected_uid,
+        MAX_JSON_BYTES,
+    )?;
+    let node_trust_bytes = read_file(
+        &candidate.node,
+        "rotation-operator-trust.v1.json",
+        0o644,
+        candidate.expected_uid,
+        MAX_JSON_BYTES,
+    )?;
+    anyhow::ensure!(
+        trust_bytes == node_trust_bytes,
+        "Control and Node Route rotation operator trusts differ"
+    );
+    let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
+        .map_err(|error| anyhow!("decode Route rotation operator trust: {error}"))?;
+    anyhow::ensure!(
+        trust.threshold == 1 && trust.credentials.len() == 1,
+        "revision-1 offline signer requires the generated one-of-one operator trust"
+    );
+
+    let payload_bytes = read_user_file(
+        payload,
+        ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
+        0o644,
+        false,
+    )?;
+    let payload_value = decode_route_v2_signing_command_payload(&payload_bytes)
+        .map_err(|error| anyhow!("decode canonical Route v2 signing payload: {error}"))?;
+    anyhow::ensure!(
+        payload_value.authority_id == trust.authority_id
+            && payload_value.release_commit_sha == trust.release_commit_sha
+            && payload_value.command.successor.deployment_id == trust.route_deployment_id,
+        "Route v2 signing payload does not bind the fixed operator trust"
+    );
+
+    let mut private_key = read_file(
+        &candidate.authority,
+        "rotation-operator-private-key.pem",
+        0o600,
+        candidate.expected_uid,
+        MAX_PRIVATE_KEY_BYTES,
+    )?;
+    let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        trust.credentials[0].credential_id.clone(),
+        &private_key,
+    )
+    .map_err(|_| anyhow!("Route rotation operator private key is not strict PKCS#8 v2"))?;
+    private_key.fill(0);
+    anyhow::ensure!(
+        Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(signer.public_key_spki_der())).as_ref()
+            == Some(&trust.credentials[0].public_key_spki),
+        "Route rotation operator private key does not match fixed trust"
+    );
+    let proof = sign_route_v2_signing_command(&payload_value, &signer)
+        .map_err(|error| anyhow!("sign Route v2 command: {error}"))?;
+    let signed = SignedRouteV2SigningCommand {
+        payload: payload_value,
+        proofs: vec![proof],
+    };
+    let command_bytes = encode_signed_route_v2_signing_command(&signed)
+        .map_err(|error| anyhow!("encode signed Route v2 command: {error}"))?;
+    publish_user_file_idempotent(output, &command_bytes, 0o644)?;
+    report(
+        cli,
+        &CommandSigningReceipt {
+            version: 1,
+            authority_id: trust.authority_id.to_string(),
+            route_deployment_id: trust.route_deployment_id.to_string(),
+            release_commit_sha: trust.release_commit_sha,
+            command_id: signed.payload.command_id.to_string(),
+            exact_payload_sha256: sha256(&payload_bytes),
+            exact_command_sha256: sha256(&command_bytes),
+            output: output.display().to_string(),
+        },
+    )
+}
+
+const ROTATION_RECOVERY_REVISIONS: [u64; 7] = [2, 3, 4, 5, 6, 7, 8];
+const ROTATION_RECOVERY_ROOT_DIRECTORIES: [&str; 5] = [
+    "authority",
+    "commands",
+    "control",
+    "provider",
+    "secret-channel",
+];
+const ROTATION_RECOVERY_AUTHORITY_FILES: [(&str, u32); 2] = [
+    ("normal-successor-private-key.pem", 0o600),
+    ("recovery-successor-private-key.pem", 0o600),
+];
+const ROTATION_RECOVERY_COMMAND_FILES: [(&str, u32); 1] =
+    [("route-v2-rotation-command-bundle.v1.json", 0o600)];
+const ROTATION_RECOVERY_PROVIDER_FILES: [(&str, u32); 1] =
+    [("control-rollout-reference.v1.json", 0o600)];
+const ROTATION_RECOVERY_SECRET_FILES: [(&str, u32); 1] = [("control-secret.v1.json", 0o600)];
+const ROTATION_RECOVERY_CASE_ID: &str = "route-v2-rotation-disable-live-delivery";
+const ROTATION_RECOVERY_PHASES: [&str; 7] = [
+    "publish_overlap",
+    "switch_active",
+    "publish_new_only",
+    "retire",
+    "disable",
+    "publish_recovery",
+    "activate",
+];
+
+struct RotationRecoveryOutput {
+    root_path: PathBuf,
+    root: File,
+    authority: File,
+    commands: File,
+    control: BTreeMap<u64, File>,
+    provider: BTreeMap<u64, File>,
+    secret_channel: BTreeMap<u64, File>,
+    expected_uid: u32,
+}
+
+impl RotationRecoveryOutput {
+    fn open_or_create(path: &Path, expected_uid: u32) -> Result<(Self, bool)> {
+        anyhow::ensure!(
+            path.is_absolute() && path != Path::new("/"),
+            "Route v2 recovery output must be an absolute non-root directory"
+        );
+        let parent_path = path.parent().context("recovery output has no parent")?;
+        let basename = path
+            .file_name()
+            .context("recovery output has no basename")?;
+        let parent = open_directory_nofollow(parent_path)?;
+        validate_directory(&parent, expected_uid, None, "recovery output parent")?;
+        let name = c_os_name(basename)?;
+        let (root, created) =
+            match open_file_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(root) => (root, false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    mkdir_at(&parent, &name, 0o700).context("create recovery output")?;
+                    sync_directory(&parent, "sync recovery output parent")?;
+                    let root = open_file_at(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                    set_file_mode(&root, 0o700)?;
+                    root.sync_all().context("sync recovery output")?;
+                    (root, true)
+                }
+                Err(error) => return Err(error).context("open recovery output"),
+            };
+        validate_directory(&root, expected_uid, Some(0o700), "recovery output")?;
+        if created {
+            for directory in ROTATION_RECOVERY_ROOT_DIRECTORIES {
+                create_private_directory(&root, directory)?;
+            }
+            for parent_name in ["control", "provider", "secret-channel"] {
+                let parent_dir = open_child_directory(&root, parent_name, expected_uid)?;
+                for revision in ROTATION_RECOVERY_REVISIONS {
+                    create_private_directory(&parent_dir, &format!("r{revision}"))?;
+                }
+            }
+            sync_directory(&root, "sync recovery output children")?;
+        }
+        Ok((Self::from_root(path, root, expected_uid)?, created))
+    }
+
+    fn open_existing(path: &Path, expected_uid: u32) -> Result<Self> {
+        let root = open_directory_nofollow(path)?;
+        validate_directory(&root, expected_uid, Some(0o700), "recovery output")?;
+        Self::from_root(path, root, expected_uid)
+    }
+
+    fn from_root(path: &Path, root: File, expected_uid: u32) -> Result<Self> {
+        let authority = open_child_directory(&root, "authority", expected_uid)?;
+        let commands = open_child_directory(&root, "commands", expected_uid)?;
+        let control_root = open_child_directory(&root, "control", expected_uid)?;
+        let provider_root = open_child_directory(&root, "provider", expected_uid)?;
+        let secret_root = open_child_directory(&root, "secret-channel", expected_uid)?;
+        let open_revisions = |parent: &File| -> Result<BTreeMap<u64, File>> {
+            ROTATION_RECOVERY_REVISIONS
+                .into_iter()
+                .map(|revision| {
+                    Ok((
+                        revision,
+                        open_child_directory(parent, &format!("r{revision}"), expected_uid)?,
+                    ))
+                })
+                .collect()
+        };
+        Ok(Self {
+            root_path: path.to_path_buf(),
+            root,
+            authority,
+            commands,
+            control: open_revisions(&control_root)?,
+            provider: open_revisions(&provider_root)?,
+            secret_channel: open_revisions(&secret_root)?,
+            expected_uid,
+        })
+    }
+}
+
+fn create_private_directory(parent: &File, name: &str) -> Result<()> {
+    let name = super::c_name(name)?;
+    mkdir_at(parent, &name, 0o700)
+        .with_context(|| format!("create recovery directory {name:?}"))?;
+    let child = open_file_at(parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    set_file_mode(&child, 0o700)?;
+    child.sync_all().context("sync recovery directory")?;
+    sync_directory(parent, "sync recovery directory parent")
+}
+
+fn open_child_directory(parent: &File, name: &str, expected_uid: u32) -> Result<File> {
+    let name = super::c_name(name)?;
+    let child = open_file_at(parent, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    validate_directory(
+        &child,
+        expected_uid,
+        Some(0o700),
+        "recovery child directory",
+    )?;
+    Ok(child)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationRecoveryCommandEntry {
+    phase: String,
+    signer_revision: u64,
+    ring_version: u64,
+    exact_authority_command_sha256: String,
+    exact_authority_command_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationRecoveryRolloutEntry {
+    signer_revision: u64,
+    secret_name: String,
+    signer_reference_sha256: String,
+    public_key_ring_digest: String,
+    secret_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationRecoveryCommandBundle {
+    version: u32,
+    case_id: String,
+    source_commit_sha: String,
+    qualification_run_id: String,
+    route_deployment_id: String,
+    rotation_operator_authority_id: String,
+    rotation_operator_trust_sha256: String,
+    commands: Vec<RotationRecoveryCommandEntry>,
+    control_rollouts: Vec<RotationRecoveryRolloutEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationRecoveryRolloutReference {
+    version: u32,
+    signer_revision: u64,
+    secret_name: String,
+    secret_manifest_sha256: String,
+    signer_reference_sha256: String,
+    public_key_ring_digest: String,
+}
+
+#[derive(Serialize)]
+struct RotationRecoveryVerificationReceipt {
+    version: u32,
+    output_directory: String,
+    case_id: String,
+    qualification_run_id: String,
+    source_commit_sha: String,
+    route_deployment_id: String,
+    rotation_operator_authority_id: String,
+    rotation_operator_trust_sha256: String,
+    command_bundle_sha256: String,
+    first_signer_revision: u64,
+    terminal_signer_revision: u64,
+    terminal_ring_version: u64,
+    terminal_secret_name: String,
+}
+
+#[derive(Serialize)]
+struct RotationRecoveryPhaseSigningReceipt {
+    version: u32,
+    case_id: String,
+    qualification_run_id: String,
+    phase: String,
+    signer_revision: u64,
+    ring_version: u64,
+    authority_id: String,
+    route_deployment_id: String,
+    release_commit_sha: String,
+    command_id: String,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    exact_authority_command_sha256: String,
+    exact_payload_sha256: String,
+    exact_signed_command_sha256: String,
+    pending_command_path: String,
+}
+
+struct RotationRecoverySource {
+    control_files: BTreeMap<String, Vec<u8>>,
+    control_secret_r1: String,
+    signer_reference: RouteGrantV2SignerReference,
+    public_ring: RouteGrantV2PublicKeyRingArtifact,
+    signer_private_key: Vec<u8>,
+    operator_trust: RouteV2RotationOperatorTrust,
+    operator_trust_bytes: Vec<u8>,
+    operator_private_key: Vec<u8>,
+}
+
+struct RotationRecoveryRevision {
+    reference: RouteGrantV2SignerReference,
+    ring: RouteGrantV2PublicKeyRingArtifact,
+    signer_private_key: Vec<u8>,
+    command: RouteGrantV2SigningAuthorityCommand,
+}
+
+fn prepare_rotation_recovery(cli: &Cli, input: &Path, output: &Path, run_id: &str) -> Result<()> {
+    validate_rotation_recovery_run_id(run_id)?;
+    let candidate = Candidate::open_existing(input, 0)?;
+    let source = load_rotation_recovery_source(&candidate)?;
+    let (recovery, created) = RotationRecoveryOutput::open_or_create(output, 0)?;
+    if created {
+        generate_rotation_recovery(&recovery, &source, run_id)?;
+    }
+    let receipt = verify_rotation_recovery(&recovery, &source, run_id)?;
+    report(cli, &receipt)
+}
+
+fn verify_rotation_recovery_command(
+    cli: &Cli,
+    input: &Path,
+    output: &Path,
+    run_id: &str,
+) -> Result<()> {
+    validate_rotation_recovery_run_id(run_id)?;
+    let candidate = Candidate::open_existing(input, 0)?;
+    let source = load_rotation_recovery_source(&candidate)?;
+    let recovery = RotationRecoveryOutput::open_existing(output, 0)?;
+    let receipt = verify_rotation_recovery(&recovery, &source, run_id)?;
+    report(cli, &receipt)
+}
+
+fn validate_rotation_recovery_run_id(run_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        Id::new(run_id.to_owned()).is_some(),
+        "qualification run ID is not a canonical Cats ID"
+    );
+    Ok(())
+}
+
+fn load_rotation_recovery_source(candidate: &Candidate) -> Result<RotationRecoverySource> {
+    ensure_file_contract(
+        &candidate.authority,
+        &AUTHORITY_FILES,
+        candidate.expected_uid,
+    )?;
+    ensure_file_contract(&candidate.control, &CONTROL_FILES, candidate.expected_uid)?;
+    ensure_file_contract(&candidate.provider, &PROVIDER_FILES, candidate.expected_uid)?;
+    let authority = read_role_data(
+        &candidate.authority,
+        &AUTHORITY_FILES,
+        candidate.expected_uid,
+    )?;
+    let control_files = read_role_data(&candidate.control, &CONTROL_FILES, candidate.expected_uid)?;
+    let signer_bytes = required(&control_files, "signer.v1.json")?;
+    let signer_reference = decode_route_grant_v2_signer_reference(signer_bytes)
+        .map_err(|error| anyhow!("decode recovery source signer reference: {error:?}"))?;
+    let ring_bytes = required(&control_files, "public-key-ring.v1.json")?;
+    let public_ring = decode_route_grant_v2_public_key_ring(ring_bytes)
+        .map_err(|error| anyhow!("decode recovery source public ring: {error:?}"))?;
+    signer_reference
+        .validate_ring(&public_ring)
+        .map_err(|error| anyhow!("bind recovery source signer/ring: {error:?}"))?;
+    anyhow::ensure!(
+        signer_reference.signer_revision.get() == 1
+            && public_ring.ring_version.get() == 1
+            && signer_reference.expected_previous.is_none()
+            && public_ring.expected_previous.is_none()
+            && public_ring.keys.len() == 1,
+        "recovery source is not the exact revision-1 lineage root"
+    );
+    let RouteGrantV2SignerSelection::Active { active_kid, .. } = &signer_reference.signer else {
+        bail!("recovery source revision-1 signer is disabled")
+    };
+    anyhow::ensure!(
+        public_ring.key(active_kid).is_some(),
+        "recovery source active signer is absent from its ring"
+    );
+
+    let signer_private_key = required(&control_files, "signer-private-key.pem")?.to_vec();
+    ensure_private_key_matches_kid(&signer_private_key, active_kid.as_str())?;
+    let operator_trust_bytes =
+        required(&control_files, "rotation-operator-trust.v1.json")?.to_vec();
+    let operator_trust = decode_route_v2_rotation_operator_trust(&operator_trust_bytes)
+        .map_err(|error| anyhow!("decode recovery source operator trust: {error}"))?;
+    anyhow::ensure!(
+        operator_trust.route_deployment_id == signer_reference.deployment_id
+            && operator_trust.threshold == 1
+            && operator_trust.credentials.len() == 1,
+        "recovery source operator trust does not bind the revision-1 deployment"
+    );
+    let operator_private_key = required(&authority, "rotation-operator-private-key.pem")?.to_vec();
+    let operator = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        operator_trust.credentials[0].credential_id.clone(),
+        &operator_private_key,
+    )
+    .map_err(|_| anyhow!("recovery source operator key is not strict PKCS#8 v2"))?;
+    anyhow::ensure!(
+        Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(operator.public_key_spki_der())).as_ref()
+            == Some(&operator_trust.credentials[0].public_key_spki),
+        "recovery source operator key does not match its trust"
+    );
+
+    let provider_bytes = read_file(
+        &candidate.provider,
+        "control-secret.v1.json",
+        0o600,
+        candidate.expected_uid,
+        MAX_JSON_BYTES,
+    )?;
+    let provider: KubernetesSecretManifest = serde_json::from_slice(&provider_bytes)
+        .context("decode revision-1 immutable Control Secret")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&provider)? == provider_bytes,
+        "revision-1 Control Secret input is not canonical JSON"
+    );
+    verify_kubernetes_secret(provider_bytes, &provider.metadata.name, &control_files)?;
+    validate_kubernetes_secret_name_at_revision(&provider.metadata.name, 1)?;
+
+    Ok(RotationRecoverySource {
+        control_files,
+        control_secret_r1: provider.metadata.name,
+        signer_reference,
+        public_ring,
+        signer_private_key,
+        operator_trust,
+        operator_trust_bytes,
+        operator_private_key,
+    })
+}
+
+fn generate_rotation_recovery(
+    output: &RotationRecoveryOutput,
+    source: &RotationRecoverySource,
+    run_id: &str,
+) -> Result<()> {
+    let mut normal_private_key = generate_pkcs8_v2_pem()?;
+    let mut recovery_private_key = generate_pkcs8_v2_pem()?;
+    let normal_entry = public_entry_for_private_key("route_normal_successor", &normal_private_key)?;
+    let recovery_entry =
+        public_entry_for_private_key("route_recovery_successor", &recovery_private_key)?;
+    anyhow::ensure!(
+        normal_entry.kid != recovery_entry.kid
+            && source.public_ring.key(&normal_entry.kid).is_none()
+            && source.public_ring.key(&recovery_entry.kid).is_none(),
+        "generated Route v2 successor keys are not fresh"
+    );
+    let normal_secret_reference_id =
+        Id::new(random_id("route_secret")?).expect("generated normal secret reference ID is valid");
+    let recovery_secret_reference_id = Id::new(random_id("route_secret")?)
+        .expect("generated recovery secret reference ID is valid");
+    anyhow::ensure!(
+        normal_secret_reference_id != recovery_secret_reference_id
+            && source_secret_reference_id(&source.signer_reference)
+                != Some(&normal_secret_reference_id)
+            && source_secret_reference_id(&source.signer_reference)
+                != Some(&recovery_secret_reference_id),
+        "generated Route v2 secret reference IDs are not fresh"
+    );
+
+    let revisions = build_rotation_recovery_revisions(
+        source,
+        &normal_entry,
+        &normal_secret_reference_id,
+        &normal_private_key,
+        &recovery_entry,
+        &recovery_secret_reference_id,
+        &recovery_private_key,
+    )?;
+
+    publish(
+        &output.authority,
+        "normal-successor-private-key.pem",
+        &normal_private_key,
+        0o600,
+    )?;
+    publish(
+        &output.authority,
+        "recovery-successor-private-key.pem",
+        &recovery_private_key,
+        0o600,
+    )?;
+
+    let mut command_entries = Vec::with_capacity(ROTATION_RECOVERY_REVISIONS.len());
+    let mut rollout_entries = Vec::with_capacity(ROTATION_RECOVERY_REVISIONS.len());
+    for (phase, revision) in ROTATION_RECOVERY_PHASES
+        .into_iter()
+        .zip(ROTATION_RECOVERY_REVISIONS)
+    {
+        let material = revisions
+            .get(&revision)
+            .context("missing generated Route v2 recovery revision")?;
+        let reference_bytes = encode_route_grant_v2_signer_reference(&material.reference)
+            .map_err(|error| anyhow!("encode recovery signer reference r{revision}: {error:?}"))?;
+        let ring_bytes = encode_route_grant_v2_public_key_ring(&material.ring)
+            .map_err(|error| anyhow!("encode recovery public ring r{revision}: {error:?}"))?;
+        let control_directory = output
+            .control
+            .get(&revision)
+            .context("missing recovery Control revision directory")?;
+        for (name, mode) in CONTROL_FILES {
+            let bytes = match name {
+                "signer.v1.json" => reference_bytes.as_slice(),
+                "public-key-ring.v1.json" => ring_bytes.as_slice(),
+                "signer-private-key.pem" => material.signer_private_key.as_slice(),
+                fixed => required(&source.control_files, fixed)?,
+            };
+            publish(control_directory, name, bytes, mode)?;
+        }
+        sync_directory(control_directory, "sync recovery Control revision")?;
+        let control_data = read_role_data(control_directory, &CONTROL_FILES, output.expected_uid)?;
+        let secret_name = revisioned_control_secret_name(&source.control_secret_r1, revision)?;
+        let secret_manifest = encode_kubernetes_secret(&secret_name, &control_data)?;
+        let secret_directory = output
+            .secret_channel
+            .get(&revision)
+            .context("missing recovery secret-channel revision directory")?;
+        publish(
+            secret_directory,
+            "control-secret.v1.json",
+            &secret_manifest,
+            0o600,
+        )?;
+        sync_directory(secret_directory, "sync recovery secret-channel revision")?;
+
+        let rollout = RotationRecoveryRolloutReference {
+            version: 1,
+            signer_revision: revision,
+            secret_name: secret_name.clone(),
+            secret_manifest_sha256: sha256(&secret_manifest),
+            signer_reference_sha256: sha256(&reference_bytes),
+            public_key_ring_digest: material
+                .ring
+                .digest()
+                .map_err(|error| anyhow!("digest recovery ring r{revision}: {error:?}"))?
+                .to_string(),
+        };
+        let rollout_bytes = serde_json::to_vec(&rollout).context("encode Control rollout ref")?;
+        let provider_directory = output
+            .provider
+            .get(&revision)
+            .context("missing recovery provider revision directory")?;
+        publish(
+            provider_directory,
+            "control-rollout-reference.v1.json",
+            &rollout_bytes,
+            0o600,
+        )?;
+        sync_directory(provider_directory, "sync recovery provider revision")?;
+
+        let command_bytes = encode_authority_command(&material.command)?;
+        command_entries.push(RotationRecoveryCommandEntry {
+            phase: phase.to_owned(),
+            signer_revision: revision,
+            ring_version: material.reference.public_key_ring_version.get(),
+            exact_authority_command_sha256: sha256(&command_bytes),
+            exact_authority_command_json: String::from_utf8(command_bytes)
+                .expect("canonical Route v2 command JSON is UTF-8"),
+        });
+        rollout_entries.push(RotationRecoveryRolloutEntry {
+            signer_revision: revision,
+            secret_name,
+            signer_reference_sha256: rollout.signer_reference_sha256,
+            public_key_ring_digest: rollout.public_key_ring_digest,
+            secret_manifest_sha256: rollout.secret_manifest_sha256,
+        });
+    }
+
+    let bundle = RotationRecoveryCommandBundle {
+        version: 1,
+        case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+        source_commit_sha: source.operator_trust.release_commit_sha.clone(),
+        qualification_run_id: run_id.to_owned(),
+        route_deployment_id: source.signer_reference.deployment_id.to_string(),
+        rotation_operator_authority_id: source.operator_trust.authority_id.to_string(),
+        rotation_operator_trust_sha256: sha256(&source.operator_trust_bytes),
+        commands: command_entries,
+        control_rollouts: rollout_entries,
+    };
+    let bundle_bytes = serde_json::to_vec(&bundle).context("encode recovery command bundle")?;
+    anyhow::ensure!(
+        bundle_bytes.len() <= MAX_ROTATION_RECOVERY_BUNDLE_BYTES,
+        "recovery command bundle exceeds its closed byte limit"
+    );
+    publish(
+        &output.commands,
+        "route-v2-rotation-command-bundle.v1.json",
+        &bundle_bytes,
+        0o600,
+    )?;
+    sync_directory(&output.commands, "sync recovery command bundle")?;
+    sync_directory(&output.root, "sync completed Route v2 recovery output")?;
+    normal_private_key.fill(0);
+    recovery_private_key.fill(0);
+    Ok(())
+}
+
+fn build_rotation_recovery_revisions(
+    source: &RotationRecoverySource,
+    normal_entry: &RouteGrantV2PublicKeyEntry,
+    normal_secret_reference_id: &Id,
+    normal_private_key: &[u8],
+    recovery_entry: &RouteGrantV2PublicKeyEntry,
+    recovery_secret_reference_id: &Id,
+    recovery_private_key: &[u8],
+) -> Result<BTreeMap<u64, RotationRecoveryRevision>> {
+    let mut revisions = BTreeMap::new();
+
+    let ring2 = successor_ring(
+        &source.public_ring,
+        vec![source.public_ring.keys[0].clone(), normal_entry.clone()],
+    )?;
+    let reference2 = successor_reference(
+        &source.signer_reference,
+        source.signer_reference.signer.clone(),
+        &ring2,
+    )?;
+    insert_recovery_revision(
+        &mut revisions,
+        2,
+        reference2,
+        ring2.clone(),
+        source.signer_private_key.clone(),
+        RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: ring2,
+            new_secret_reference_id: normal_secret_reference_id.clone(),
+        },
+    )?;
+
+    let reference3 = successor_reference(
+        &revisions[&2].reference,
+        RouteGrantV2SignerSelection::Active {
+            active_kid: normal_entry.kid.clone(),
+            secret_reference_id: normal_secret_reference_id.clone(),
+        },
+        &revisions[&2].ring,
+    )?;
+    let ring2_for_revision3 = revisions[&2].ring.clone();
+    insert_recovery_revision(
+        &mut revisions,
+        3,
+        reference3,
+        ring2_for_revision3,
+        normal_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::SwitchActive,
+    )?;
+
+    let ring3 = successor_ring(&revisions[&3].ring, vec![normal_entry.clone()])?;
+    let reference4 = successor_reference(
+        &revisions[&3].reference,
+        revisions[&3].reference.signer.clone(),
+        &ring3,
+    )?;
+    insert_recovery_revision(
+        &mut revisions,
+        4,
+        reference4,
+        ring3.clone(),
+        normal_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly {
+            successor_ring: ring3,
+        },
+    )?;
+
+    let reference5 = successor_reference(
+        &revisions[&4].reference,
+        revisions[&4].reference.signer.clone(),
+        &revisions[&4].ring,
+    )?;
+    let ring3_for_revision5 = revisions[&4].ring.clone();
+    insert_recovery_revision(
+        &mut revisions,
+        5,
+        reference5,
+        ring3_for_revision5,
+        normal_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::Retire,
+    )?;
+
+    let ring4 = successor_ring(&revisions[&5].ring, Vec::new())?;
+    let reference6 = successor_reference(
+        &revisions[&5].reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &ring4,
+    )?;
+    insert_recovery_revision(
+        &mut revisions,
+        6,
+        reference6,
+        ring4.clone(),
+        normal_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::Disable {
+            successor_ring: ring4,
+        },
+    )?;
+
+    let ring5 = successor_ring(&revisions[&6].ring, vec![recovery_entry.clone()])?;
+    let reference7 = successor_reference(
+        &revisions[&6].reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &ring5,
+    )?;
+    insert_recovery_revision(
+        &mut revisions,
+        7,
+        reference7,
+        ring5.clone(),
+        recovery_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: ring5,
+            new_secret_reference_id: recovery_secret_reference_id.clone(),
+        },
+    )?;
+
+    let reference8 = successor_reference(
+        &revisions[&7].reference,
+        RouteGrantV2SignerSelection::Active {
+            active_kid: recovery_entry.kid.clone(),
+            secret_reference_id: recovery_secret_reference_id.clone(),
+        },
+        &revisions[&7].ring,
+    )?;
+    let ring5_for_revision8 = revisions[&7].ring.clone();
+    insert_recovery_revision(
+        &mut revisions,
+        8,
+        reference8,
+        ring5_for_revision8,
+        recovery_private_key.to_vec(),
+        RouteGrantV2SigningAuthorityCommandKind::Activate,
+    )?;
+
+    Ok(revisions)
+}
+
+fn insert_recovery_revision(
+    revisions: &mut BTreeMap<u64, RotationRecoveryRevision>,
+    revision: u64,
+    reference: RouteGrantV2SignerReference,
+    ring: RouteGrantV2PublicKeyRingArtifact,
+    signer_private_key: Vec<u8>,
+    kind: RouteGrantV2SigningAuthorityCommandKind,
+) -> Result<()> {
+    anyhow::ensure!(
+        reference.signer_revision.get() == revision,
+        "generated recovery signer revision is not adjacent"
+    );
+    reference
+        .validate_ring(&ring)
+        .map_err(|error| anyhow!("generated recovery signer/ring mismatch: {error:?}"))?;
+    let command = RouteGrantV2SigningAuthorityCommand {
+        successor: reference.clone(),
+        kind,
+    };
+    command
+        .validate()
+        .map_err(|error| anyhow!("generated recovery command is invalid: {error}"))?;
+    anyhow::ensure!(
+        revisions
+            .insert(
+                revision,
+                RotationRecoveryRevision {
+                    reference,
+                    ring,
+                    signer_private_key,
+                    command,
+                },
+            )
+            .is_none(),
+        "duplicate recovery revision"
+    );
+    Ok(())
+}
+
+fn successor_ring(
+    current: &RouteGrantV2PublicKeyRingArtifact,
+    mut keys: Vec<RouteGrantV2PublicKeyEntry>,
+) -> Result<RouteGrantV2PublicKeyRingArtifact> {
+    keys.sort_by(|left, right| left.kid.cmp(&right.kid));
+    let ring = RouteGrantV2PublicKeyRingArtifact {
+        version: ContractVersion::V1,
+        ring_version: Epoch::new(
+            current
+                .ring_version
+                .get()
+                .checked_add(1)
+                .context("recovery ring version overflow")?,
+        )
+        .context("invalid recovery ring version")?,
+        expected_previous: Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+            ring_version: current.ring_version,
+            key_ring_digest: current
+                .digest()
+                .map_err(|error| anyhow!("digest previous recovery ring: {error:?}"))?,
+        }),
+        keys,
+    };
+    ring.validate()
+        .map_err(|error| anyhow!("generated recovery ring is invalid: {error:?}"))?;
+    Ok(ring)
+}
+
+fn successor_reference(
+    current: &RouteGrantV2SignerReference,
+    signer: RouteGrantV2SignerSelection,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+) -> Result<RouteGrantV2SignerReference> {
+    let reference = RouteGrantV2SignerReference {
+        version: ContractVersion::V1,
+        deployment_id: current.deployment_id.clone(),
+        signer_revision: Epoch::new(
+            current
+                .signer_revision
+                .get()
+                .checked_add(1)
+                .context("recovery signer revision overflow")?,
+        )
+        .context("invalid recovery signer revision")?,
+        expected_previous: Some(RouteGrantV2SignerExpectedPrevious {
+            signer_revision: current.signer_revision,
+            signer_reference_sha256: current
+                .digest()
+                .map_err(|error| anyhow!("digest previous signer reference: {error:?}"))?,
+        }),
+        signer,
+        public_key_ring_version: ring.ring_version,
+        public_key_ring_digest: ring
+            .digest()
+            .map_err(|error| anyhow!("digest recovery public ring: {error:?}"))?,
+    };
+    reference
+        .validate_ring(ring)
+        .map_err(|error| anyhow!("generated recovery signer reference is invalid: {error:?}"))?;
+    Ok(reference)
+}
+
+fn public_entry_for_private_key(
+    validation_label: &str,
+    private_key: &[u8],
+) -> Result<RouteGrantV2PublicKeyEntry> {
+    let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        Id::new(random_id(validation_label)?)
+            .expect("generated key validation ID is a canonical Cats ID"),
+        private_key,
+    )
+    .map_err(|_| anyhow!("generated recovery signer is not strict PKCS#8 v2"))?;
+    let public = RouteGrantV2PublicKey::from_spki_der(signer.public_key_spki_der())
+        .context("derive recovery signer public key")?;
+    Ok(RouteGrantV2PublicKeyEntry {
+        kid: public.kid().clone(),
+        public_key_spki: Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(signer.public_key_spki_der()))
+            .expect("generated recovery signer SPKI is canonical base64url"),
+    })
+}
+
+fn source_secret_reference_id(reference: &RouteGrantV2SignerReference) -> Option<&Id> {
+    match &reference.signer {
+        RouteGrantV2SignerSelection::Active {
+            secret_reference_id,
+            ..
+        } => Some(secret_reference_id),
+        RouteGrantV2SignerSelection::Disabled => None,
+    }
+}
+
+fn encode_authority_command(command: &RouteGrantV2SigningAuthorityCommand) -> Result<Vec<u8>> {
+    command
+        .validate()
+        .map_err(|error| anyhow!("validate Route v2 authority command: {error}"))?;
+    serde_json::to_vec(command).context("encode canonical Route v2 authority command")
+}
+
+fn decode_authority_command(bytes: &[u8]) -> Result<RouteGrantV2SigningAuthorityCommand> {
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
+        "Route v2 authority command exceeds its closed byte limit"
+    );
+    let command: RouteGrantV2SigningAuthorityCommand =
+        serde_json::from_slice(bytes).context("decode Route v2 authority command")?;
+    anyhow::ensure!(
+        encode_authority_command(&command)? == bytes,
+        "Route v2 authority command is not canonical JSON"
+    );
+    Ok(command)
+}
+
+fn revisioned_control_secret_name(revision_one: &str, revision: u64) -> Result<String> {
+    validate_kubernetes_secret_name_at_revision(revision_one, 1)?;
+    anyhow::ensure!(
+        revision > 0,
+        "Control Secret signer revision must be positive"
+    );
+    let prefix = revision_one
+        .strip_suffix("-r1")
+        .context("revision-1 Control Secret name has no canonical suffix")?;
+    let name = format!("{prefix}-r{revision}");
+    validate_kubernetes_secret_name_at_revision(&name, revision)?;
+    Ok(name)
+}
+
+fn ensure_private_key_matches_kid(private_key: &[u8], expected_kid: &str) -> Result<()> {
+    let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        Id::new("route_recovery_key_verifier").expect("fixed verifier ID is valid"),
+        private_key,
+    )
+    .map_err(|_| anyhow!("Route v2 recovery signer key is not strict PKCS#8 v2"))?;
+    let public = RouteGrantV2PublicKey::from_spki_der(signer.public_key_spki_der())
+        .context("derive Route v2 recovery signer kid")?;
+    anyhow::ensure!(
+        public.kid().as_str() == expected_kid,
+        "Route v2 recovery private key does not match the selected kid"
+    );
+    Ok(())
+}
+
+fn verify_rotation_recovery(
+    output: &RotationRecoveryOutput,
+    source: &RotationRecoverySource,
+    run_id: &str,
+) -> Result<RotationRecoveryVerificationReceipt> {
+    ensure_names(&output.root, &ROTATION_RECOVERY_ROOT_DIRECTORIES)?;
+    ensure_file_contract(
+        &output.authority,
+        &ROTATION_RECOVERY_AUTHORITY_FILES,
+        output.expected_uid,
+    )?;
+    ensure_file_contract(
+        &output.commands,
+        &ROTATION_RECOVERY_COMMAND_FILES,
+        output.expected_uid,
+    )?;
+    let expected_revisions = ROTATION_RECOVERY_REVISIONS
+        .into_iter()
+        .map(|revision| format!("r{revision}"))
+        .collect::<Vec<_>>();
+    for parent_name in ["control", "provider", "secret-channel"] {
+        let parent = open_child_directory(&output.root, parent_name, output.expected_uid)?;
+        ensure_names(&parent, &expected_revisions)?;
+    }
+
+    let bundle_bytes = read_file(
+        &output.commands,
+        "route-v2-rotation-command-bundle.v1.json",
+        0o600,
+        output.expected_uid,
+        MAX_ROTATION_RECOVERY_BUNDLE_BYTES,
+    )?;
+    let bundle: RotationRecoveryCommandBundle =
+        serde_json::from_slice(&bundle_bytes).context("decode Route v2 recovery command bundle")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&bundle)? == bundle_bytes
+            && bundle.version == 1
+            && bundle.case_id == ROTATION_RECOVERY_CASE_ID
+            && bundle.source_commit_sha == source.operator_trust.release_commit_sha
+            && bundle.qualification_run_id == run_id
+            && bundle.route_deployment_id == source.signer_reference.deployment_id.as_str()
+            && bundle.rotation_operator_authority_id == source.operator_trust.authority_id.as_str()
+            && bundle.rotation_operator_trust_sha256 == sha256(&source.operator_trust_bytes)
+            && bundle.commands.len() == ROTATION_RECOVERY_REVISIONS.len()
+            && bundle.control_rollouts.len() == ROTATION_RECOVERY_REVISIONS.len(),
+        "Route v2 recovery command bundle is not the exact source-bound target"
+    );
+
+    let normal_private_key = read_file(
+        &output.authority,
+        "normal-successor-private-key.pem",
+        0o600,
+        output.expected_uid,
+        MAX_PRIVATE_KEY_BYTES,
+    )?;
+    let recovery_private_key = read_file(
+        &output.authority,
+        "recovery-successor-private-key.pem",
+        0o600,
+        output.expected_uid,
+        MAX_PRIVATE_KEY_BYTES,
+    )?;
+    let normal_entry =
+        public_entry_for_private_key("normal_recovery_verifier", &normal_private_key)?;
+    let recovery_entry =
+        public_entry_for_private_key("disabled_recovery_verifier", &recovery_private_key)?;
+    anyhow::ensure!(
+        normal_entry.kid != recovery_entry.kid
+            && source.public_ring.key(&normal_entry.kid).is_none()
+            && source.public_ring.key(&recovery_entry.kid).is_none(),
+        "Route v2 recovery output reuses a signer lineage"
+    );
+
+    let mut previous_reference = source.signer_reference.clone();
+    let mut previous_ring = source.public_ring.clone();
+    let mut normal_secret_reference_id: Option<Id> = None;
+    let mut recovery_secret_reference_id: Option<Id> = None;
+    let mut terminal_secret_name = None;
+    for (index, ((phase, revision), command_entry)) in ROTATION_RECOVERY_PHASES
+        .into_iter()
+        .zip(ROTATION_RECOVERY_REVISIONS)
+        .zip(&bundle.commands)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            command_entry.phase == phase
+                && command_entry.signer_revision == revision
+                && command_entry.exact_authority_command_sha256
+                    == sha256(command_entry.exact_authority_command_json.as_bytes()),
+            "Route v2 recovery command entry {phase} is not canonical"
+        );
+        let command =
+            decode_authority_command(command_entry.exact_authority_command_json.as_bytes())?;
+        let control_directory = output
+            .control
+            .get(&revision)
+            .context("missing verified recovery Control directory")?;
+        ensure_file_contract(control_directory, &CONTROL_FILES, output.expected_uid)?;
+        let control_data = read_role_data(control_directory, &CONTROL_FILES, output.expected_uid)?;
+        for (name, _) in CONTROL_FILES {
+            if !matches!(
+                name,
+                "signer.v1.json" | "public-key-ring.v1.json" | "signer-private-key.pem"
+            ) {
+                anyhow::ensure!(
+                    required(&control_data, name)? == required(&source.control_files, name)?,
+                    "fixed Control artifact {name} changes at recovery r{revision}"
+                );
+            }
+        }
+        let reference_bytes = required(&control_data, "signer.v1.json")?;
+        let reference = decode_route_grant_v2_signer_reference(reference_bytes)
+            .map_err(|error| anyhow!("decode recovery signer r{revision}: {error:?}"))?;
+        let ring_bytes = required(&control_data, "public-key-ring.v1.json")?;
+        let ring = decode_route_grant_v2_public_key_ring(ring_bytes)
+            .map_err(|error| anyhow!("decode recovery ring r{revision}: {error:?}"))?;
+        reference
+            .validate_ring(&ring)
+            .map_err(|error| anyhow!("bind recovery signer/ring r{revision}: {error:?}"))?;
+        anyhow::ensure!(
+            reference.signer_revision.get() == revision
+                && reference.deployment_id == source.signer_reference.deployment_id
+                && reference.expected_previous
+                    == Some(RouteGrantV2SignerExpectedPrevious {
+                        signer_revision: previous_reference.signer_revision,
+                        signer_reference_sha256: previous_reference.digest().map_err(|error| {
+                            anyhow!("digest previous recovery signer: {error:?}")
+                        })?,
+                    })
+                && command.successor == reference
+                && command_entry.ring_version == ring.ring_version.get(),
+            "Route v2 recovery signer r{revision} is not the exact adjacent command target"
+        );
+
+        let expected_private_key: &[u8] = match revision {
+            2 => &source.signer_private_key,
+            3..=6 => &normal_private_key,
+            7..=8 => &recovery_private_key,
+            _ => unreachable!("closed recovery revision set"),
+        };
+        anyhow::ensure!(
+            required(&control_data, "signer-private-key.pem")? == expected_private_key,
+            "Route v2 recovery Control private key does not match r{revision}"
+        );
+
+        verify_rotation_recovery_phase(
+            phase,
+            &command,
+            &previous_reference,
+            &previous_ring,
+            &ring,
+            &normal_entry,
+            &recovery_entry,
+            &mut normal_secret_reference_id,
+            &mut recovery_secret_reference_id,
+        )?;
+
+        let secret_name = revisioned_control_secret_name(&source.control_secret_r1, revision)?;
+        let secret_directory = output
+            .secret_channel
+            .get(&revision)
+            .context("missing verified recovery secret-channel directory")?;
+        ensure_file_contract(
+            secret_directory,
+            &ROTATION_RECOVERY_SECRET_FILES,
+            output.expected_uid,
+        )?;
+        let secret_manifest = read_file(
+            secret_directory,
+            "control-secret.v1.json",
+            0o600,
+            output.expected_uid,
+            MAX_JSON_BYTES,
+        )?;
+        verify_kubernetes_secret(secret_manifest.clone(), &secret_name, &control_data)?;
+        let provider_directory = output
+            .provider
+            .get(&revision)
+            .context("missing verified recovery provider directory")?;
+        ensure_file_contract(
+            provider_directory,
+            &ROTATION_RECOVERY_PROVIDER_FILES,
+            output.expected_uid,
+        )?;
+        let rollout_bytes = read_file(
+            provider_directory,
+            "control-rollout-reference.v1.json",
+            0o600,
+            output.expected_uid,
+            MAX_JSON_BYTES,
+        )?;
+        let rollout: RotationRecoveryRolloutReference = serde_json::from_slice(&rollout_bytes)
+            .context("decode recovery Control rollout reference")?;
+        let expected_rollout = RotationRecoveryRolloutReference {
+            version: 1,
+            signer_revision: revision,
+            secret_name: secret_name.clone(),
+            secret_manifest_sha256: sha256(&secret_manifest),
+            signer_reference_sha256: sha256(reference_bytes),
+            public_key_ring_digest: ring
+                .digest()
+                .map_err(|error| anyhow!("digest verified recovery ring: {error:?}"))?
+                .to_string(),
+        };
+        anyhow::ensure!(
+            rollout == expected_rollout
+                && serde_json::to_vec(&rollout)? == rollout_bytes
+                && bundle.control_rollouts[index]
+                    == RotationRecoveryRolloutEntry {
+                        signer_revision: revision,
+                        secret_name: secret_name.clone(),
+                        signer_reference_sha256: expected_rollout.signer_reference_sha256.clone(),
+                        public_key_ring_digest: expected_rollout.public_key_ring_digest.clone(),
+                        secret_manifest_sha256: expected_rollout.secret_manifest_sha256.clone(),
+                    },
+            "Route v2 recovery rollout reference differs at r{revision}"
+        );
+        terminal_secret_name = Some(secret_name);
+        previous_reference = reference;
+        previous_ring = ring;
+    }
+
+    let normal_secret_reference_id = normal_secret_reference_id
+        .context("recovery bundle has no normal successor secret reference")?;
+    let recovery_secret_reference_id = recovery_secret_reference_id
+        .context("recovery bundle has no recovery successor secret reference")?;
+    anyhow::ensure!(
+        normal_secret_reference_id != recovery_secret_reference_id
+            && source_secret_reference_id(&source.signer_reference)
+                != Some(&normal_secret_reference_id)
+            && source_secret_reference_id(&source.signer_reference)
+                != Some(&recovery_secret_reference_id),
+        "Route v2 recovery bundle reuses a secret reference lineage"
+    );
+    let RouteGrantV2SignerSelection::Active { active_kid, .. } = &previous_reference.signer else {
+        bail!("terminal Route v2 recovery signer is not active")
+    };
+    anyhow::ensure!(
+        active_kid == &recovery_entry.kid
+            && previous_reference.signer_revision.get() == 8
+            && previous_ring.ring_version.get() == 5
+            && previous_ring.keys == vec![recovery_entry],
+        "terminal Route v2 recovery target is not the fresh active lineage"
+    );
+
+    Ok(RotationRecoveryVerificationReceipt {
+        version: 1,
+        output_directory: output.root_path.display().to_string(),
+        case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+        qualification_run_id: run_id.to_owned(),
+        source_commit_sha: source.operator_trust.release_commit_sha.clone(),
+        route_deployment_id: source.signer_reference.deployment_id.to_string(),
+        rotation_operator_authority_id: source.operator_trust.authority_id.to_string(),
+        rotation_operator_trust_sha256: sha256(&source.operator_trust_bytes),
+        command_bundle_sha256: sha256(&bundle_bytes),
+        first_signer_revision: 2,
+        terminal_signer_revision: previous_reference.signer_revision.get(),
+        terminal_ring_version: previous_ring.ring_version.get(),
+        terminal_secret_name: terminal_secret_name.context("missing terminal Control Secret")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_rotation_recovery_phase(
+    phase: &str,
+    command: &RouteGrantV2SigningAuthorityCommand,
+    previous_reference: &RouteGrantV2SignerReference,
+    previous_ring: &RouteGrantV2PublicKeyRingArtifact,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+    normal_entry: &RouteGrantV2PublicKeyEntry,
+    recovery_entry: &RouteGrantV2PublicKeyEntry,
+    normal_secret_reference_id: &mut Option<Id>,
+    recovery_secret_reference_id: &mut Option<Id>,
+) -> Result<()> {
+    match (phase, &command.kind) {
+        (
+            "publish_overlap",
+            RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring,
+                new_secret_reference_id,
+            },
+        ) => {
+            anyhow::ensure!(
+                command.successor.signer == previous_reference.signer
+                    && successor_ring == ring
+                    && ring_is_successor_of(previous_ring, ring)?
+                    && ring.keys.len() == 2
+                    && previous_ring
+                        .keys
+                        .iter()
+                        .all(|entry| ring.key(&entry.kid) == Some(entry))
+                    && ring.key(&normal_entry.kid) == Some(normal_entry),
+                "normal Route v2 overlap phase is not the exact two-key successor"
+            );
+            anyhow::ensure!(
+                normal_secret_reference_id
+                    .replace(new_secret_reference_id.clone())
+                    .is_none(),
+                "normal Route v2 successor secret reference appears twice"
+            );
+        }
+        ("switch_active", RouteGrantV2SigningAuthorityCommandKind::SwitchActive) => {
+            let RouteGrantV2SignerSelection::Active {
+                active_kid,
+                secret_reference_id,
+            } = &command.successor.signer
+            else {
+                bail!("normal Route v2 switch target is not active")
+            };
+            anyhow::ensure!(
+                ring == previous_ring
+                    && active_kid == &normal_entry.kid
+                    && Some(secret_reference_id) == normal_secret_reference_id.as_ref(),
+                "normal Route v2 switch target does not select the fresh successor"
+            );
+        }
+        (
+            "publish_new_only",
+            RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { successor_ring },
+        ) => {
+            anyhow::ensure!(
+                command.successor.signer == previous_reference.signer
+                    && successor_ring == ring
+                    && ring_is_successor_of(previous_ring, ring)?
+                    && ring.keys == vec![normal_entry.clone()],
+                "normal Route v2 new-only phase is not the exact one-key successor"
+            );
+        }
+        ("retire", RouteGrantV2SigningAuthorityCommandKind::Retire) => {
+            anyhow::ensure!(
+                command.successor.signer == previous_reference.signer && ring == previous_ring,
+                "normal Route v2 retire phase changes the signer or public ring"
+            );
+        }
+        ("disable", RouteGrantV2SigningAuthorityCommandKind::Disable { successor_ring }) => {
+            anyhow::ensure!(
+                command.successor.signer == RouteGrantV2SignerSelection::Disabled
+                    && successor_ring == ring
+                    && ring_is_successor_of(previous_ring, ring)?
+                    && ring.keys.is_empty(),
+                "Route v2 disable phase is not the exact empty-ring successor"
+            );
+        }
+        (
+            "publish_recovery",
+            RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring,
+                new_secret_reference_id,
+            },
+        ) => {
+            anyhow::ensure!(
+                previous_reference.signer == RouteGrantV2SignerSelection::Disabled
+                    && command.successor.signer == RouteGrantV2SignerSelection::Disabled
+                    && successor_ring == ring
+                    && ring_is_successor_of(previous_ring, ring)?
+                    && ring.keys == vec![recovery_entry.clone()],
+                "Route v2 recovery publication is not a fresh disabled one-key successor"
+            );
+            anyhow::ensure!(
+                recovery_secret_reference_id
+                    .replace(new_secret_reference_id.clone())
+                    .is_none(),
+                "Route v2 recovery secret reference appears twice"
+            );
+        }
+        ("activate", RouteGrantV2SigningAuthorityCommandKind::Activate) => {
+            let RouteGrantV2SignerSelection::Active {
+                active_kid,
+                secret_reference_id,
+            } = &command.successor.signer
+            else {
+                bail!("Route v2 activation target is not active")
+            };
+            anyhow::ensure!(
+                previous_reference.signer == RouteGrantV2SignerSelection::Disabled
+                    && ring == previous_ring
+                    && active_kid == &recovery_entry.kid
+                    && Some(secret_reference_id) == recovery_secret_reference_id.as_ref(),
+                "Route v2 activation does not select the fresh recovery signer"
+            );
+        }
+        _ => bail!("Route v2 recovery phase {phase} has the wrong typed command"),
+    }
+    Ok(())
+}
+
+fn ring_is_successor_of(
+    previous: &RouteGrantV2PublicKeyRingArtifact,
+    successor: &RouteGrantV2PublicKeyRingArtifact,
+) -> Result<bool> {
+    Ok(
+        previous.ring_version.get().checked_add(1) == Some(successor.ring_version.get())
+            && successor.expected_previous
+                == Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+                    ring_version: previous.ring_version,
+                    key_ring_digest: previous
+                        .digest()
+                        .map_err(|error| anyhow!("digest previous recovery ring: {error:?}"))?,
+                }),
+    )
+}
+
+fn sign_rotation_recovery_phase(
+    cli: &Cli,
+    input: &Path,
+    recovery_path: &Path,
+    phase: &str,
+    output: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        ROTATION_RECOVERY_PHASES.contains(&phase),
+        "unknown Route v2 recovery phase"
+    );
+    let candidate = Candidate::open_existing(input, 0)?;
+    let source = load_rotation_recovery_source(&candidate)?;
+    let recovery = RotationRecoveryOutput::open_existing(recovery_path, 0)?;
+    let bundle_bytes = read_file(
+        &recovery.commands,
+        "route-v2-rotation-command-bundle.v1.json",
+        0o600,
+        recovery.expected_uid,
+        MAX_ROTATION_RECOVERY_BUNDLE_BYTES,
+    )?;
+    let bundle: RotationRecoveryCommandBundle = serde_json::from_slice(&bundle_bytes)
+        .context("decode Route v2 recovery command bundle before signing")?;
+    validate_rotation_recovery_run_id(&bundle.qualification_run_id)?;
+    verify_rotation_recovery(&recovery, &source, &bundle.qualification_run_id)?;
+    let entry = bundle
+        .commands
+        .iter()
+        .find(|entry| entry.phase == phase)
+        .context("prepared recovery bundle is missing the requested phase")?;
+    let authority_command =
+        decode_authority_command(entry.exact_authority_command_json.as_bytes())?;
+
+    let signed_bytes = if output.exists() {
+        read_user_file(output, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES, 0o600, true)?
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time predates the Unix epoch")?
+            .as_millis();
+        let now = u64::try_from(now).context("system time exceeds Route v2 wire range")?;
+        let issued_at = now.saturating_sub(5_000);
+        let expires_at = issued_at
+            .checked_add(ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS)
+            .context("Route v2 recovery command expiry overflow")?;
+        let payload = RouteV2SigningCommandPayload {
+            version: ContractVersion::V1,
+            authority_id: source.operator_trust.authority_id.clone(),
+            release_commit_sha: source.operator_trust.release_commit_sha.clone(),
+            command_id: RandomId128::new(random_hex(16)?)
+                .expect("generated Route v2 command ID is canonical 128-bit hex"),
+            issued_at_unix_ms: UnixMillis::new(issued_at)
+                .context("invalid Route v2 recovery issue time")?,
+            expires_at_unix_ms: UnixMillis::new(expires_at)
+                .context("invalid Route v2 recovery expiry time")?,
+            command: authority_command,
+        };
+        let operator = Ed25519RequestSigner::from_pkcs8_v2_pem(
+            source.operator_trust.credentials[0].credential_id.clone(),
+            &source.operator_private_key,
+        )
+        .map_err(|_| anyhow!("Route rotation operator key is not strict PKCS#8 v2"))?;
+        let proof = sign_route_v2_signing_command(&payload, &operator)
+            .map_err(|error| anyhow!("sign fresh Route v2 recovery command: {error}"))?;
+        let signed = SignedRouteV2SigningCommand {
+            payload,
+            proofs: vec![proof],
+        };
+        let bytes = encode_signed_route_v2_signing_command(&signed)
+            .map_err(|error| anyhow!("encode fresh Route v2 recovery command: {error}"))?;
+        publish_user_file_idempotent(output, &bytes, 0o600)?;
+        bytes
+    };
+
+    let signed = decode_signed_route_v2_signing_command(&signed_bytes)
+        .map_err(|error| anyhow!("decode durable Route v2 recovery command: {error}"))?;
+    verify_signed_route_v2_signing_command(
+        &source.operator_trust,
+        &source.operator_trust.release_commit_sha,
+        &signed,
+    )
+    .map_err(|error| anyhow!("verify durable Route v2 recovery command: {error}"))?;
+    anyhow::ensure!(
+        signed.payload.command
+            == decode_authority_command(entry.exact_authority_command_json.as_bytes())?
+            && signed
+                .payload
+                .expires_at_unix_ms
+                .get()
+                .checked_sub(signed.payload.issued_at_unix_ms.get())
+                == Some(ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS),
+        "durable Route v2 recovery command does not match the prepared phase"
+    );
+    let payload_bytes = encode_route_v2_signing_command_payload(&signed.payload)
+        .map_err(|error| anyhow!("encode durable Route v2 recovery payload: {error}"))?;
+    report(
+        cli,
+        &RotationRecoveryPhaseSigningReceipt {
+            version: 1,
+            case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+            qualification_run_id: bundle.qualification_run_id,
+            phase: phase.to_owned(),
+            signer_revision: entry.signer_revision,
+            ring_version: entry.ring_version,
+            authority_id: source.operator_trust.authority_id.to_string(),
+            route_deployment_id: source.operator_trust.route_deployment_id.to_string(),
+            release_commit_sha: source.operator_trust.release_commit_sha,
+            command_id: signed.payload.command_id.to_string(),
+            issued_at_unix_ms: signed.payload.issued_at_unix_ms.get(),
+            expires_at_unix_ms: signed.payload.expires_at_unix_ms.get(),
+            exact_authority_command_sha256: entry.exact_authority_command_sha256.clone(),
+            exact_payload_sha256: sha256(&payload_bytes),
+            exact_signed_command_sha256: sha256(&signed_bytes),
+            pending_command_path: output.display().to_string(),
+        },
+    )
 }
 
 struct Inputs {
@@ -194,9 +1689,15 @@ impl Inputs {
 }
 
 fn validate_kubernetes_secret_name(value: &str) -> Result<()> {
+    validate_kubernetes_secret_name_at_revision(value, 1)
+}
+
+fn validate_kubernetes_secret_name_at_revision(value: &str, revision: u64) -> Result<()> {
+    anyhow::ensure!(revision > 0, "Kubernetes Secret revision must be positive");
+    let suffix = format!("-r{revision}");
     anyhow::ensure!(
         value.len() <= 253
-            && value.ends_with("-r1")
+            && value.ends_with(&suffix)
             && value.split('.').all(|label| {
                 !label.is_empty()
                     && label.len() <= 63
@@ -212,7 +1713,7 @@ fn validate_kubernetes_secret_name(value: &str) -> Result<()> {
                         .last()
                         .is_some_and(u8::is_ascii_alphanumeric)
             }),
-        "Kubernetes Secret name must be a DNS subdomain ending in -r1"
+        "Kubernetes Secret name must be a DNS subdomain ending in {suffix}"
     );
     Ok(())
 }
@@ -1632,5 +3133,32 @@ mod tests {
         assert!(!receipt_bytes
             .windows(b"PRIVATE KEY".len())
             .any(|window| window == b"PRIVATE KEY"));
+
+        let source = load_rotation_recovery_source(&candidate).unwrap();
+        let recovery_path = root.path().join("rotation-recovery");
+        let (recovery, created) =
+            RotationRecoveryOutput::open_or_create(&recovery_path, uid).unwrap();
+        assert!(created);
+        generate_rotation_recovery(&recovery, &source, "qualification_run_a").unwrap();
+        let recovery_receipt =
+            verify_rotation_recovery(&recovery, &source, "qualification_run_a").unwrap();
+        assert_eq!(recovery_receipt.first_signer_revision, 2);
+        assert_eq!(recovery_receipt.terminal_signer_revision, 8);
+        assert_eq!(recovery_receipt.terminal_ring_version, 5);
+        assert_eq!(
+            recovery_receipt.terminal_secret_name,
+            "cats-route-v2-control-r8"
+        );
+        let command_bundle = read_file(
+            &recovery.commands,
+            "route-v2-rotation-command-bundle.v1.json",
+            0o600,
+            uid,
+            MAX_ROTATION_RECOVERY_BUNDLE_BYTES,
+        )
+        .unwrap();
+        assert!(!String::from_utf8(command_bundle)
+            .unwrap()
+            .contains("issued_at_unix_ms"));
     }
 }

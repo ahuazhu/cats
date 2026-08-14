@@ -257,6 +257,15 @@ pub struct RouteV2SigningCommandReceipt {
     pub committed_at_unix_ms: UnixMillis,
 }
 
+impl RouteV2SigningCommandReceipt {
+    pub fn validate(&self) -> Result<(), RouteV2RotationOperatorError> {
+        if self.version.get() != 1 || !valid_release_commit_sha(&self.release_commit_sha) {
+            return Err(RouteV2RotationOperatorError::InvalidCommand);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RouteV2RotationOperatorError {
     #[error("Route v2 rotation operator trust is invalid")]
@@ -305,6 +314,32 @@ pub fn encode_signed_route_v2_signing_command(
     Ok(bytes)
 }
 
+pub fn encode_route_v2_signing_command_payload(
+    payload: &RouteV2SigningCommandPayload,
+) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
+    payload.validate()?;
+    let bytes =
+        serde_json::to_vec(payload).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_route_v2_signing_command_payload(
+    bytes: &[u8],
+) -> Result<RouteV2SigningCommandPayload, RouteV2RotationOperatorError> {
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let payload: RouteV2SigningCommandPayload =
+        serde_json::from_slice(bytes).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if encode_route_v2_signing_command_payload(&payload)? != bytes {
+        return Err(RouteV2RotationOperatorError::NonCanonical);
+    }
+    Ok(payload)
+}
+
 pub fn decode_signed_route_v2_signing_command(
     bytes: &[u8],
 ) -> Result<SignedRouteV2SigningCommand, RouteV2RotationOperatorError> {
@@ -323,6 +358,7 @@ pub fn decode_signed_route_v2_signing_command(
 pub fn encode_route_v2_signing_command_receipt(
     receipt: &RouteV2SigningCommandReceipt,
 ) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
+    receipt.validate()?;
     let bytes =
         serde_json::to_vec(receipt).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
     if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES {
@@ -422,7 +458,7 @@ pub fn verify_signed_route_v2_signing_command(
 fn canonical_payload(
     payload: &RouteV2SigningCommandPayload,
 ) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
-    serde_json::to_vec(payload).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)
+    encode_route_v2_signing_command_payload(payload)
 }
 
 fn signed_frame(payload: &[u8]) -> Vec<u8> {
@@ -549,6 +585,11 @@ mod tests {
             credentials: vec![credential(&first), credential(&second)],
         };
         let payload = payload();
+        let payload_bytes = encode_route_v2_signing_command_payload(&payload).unwrap();
+        assert_eq!(
+            decode_route_v2_signing_command_payload(&payload_bytes).unwrap(),
+            payload
+        );
         let signed = SignedRouteV2SigningCommand {
             proofs: vec![
                 sign_route_v2_signing_command(&payload, &first).unwrap(),

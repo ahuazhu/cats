@@ -540,6 +540,57 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         #[arg(long)]
         release_commit_sha: String,
     },
+    /// Sign one canonical typed rotation command with the offline operator key.
+    SignCommand {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute canonical unsigned command-payload JSON file (mode 0644).
+        #[arg(long)]
+        payload: std::path::PathBuf,
+        /// Absolute absent or exact-replay signed command JSON file (mode 0644).
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Generate a complete r1-to-r8 rotation, disable and recovery artifact set.
+    PrepareRotationRecovery {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only recovery output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Qualification run ID embedded in the one composed command bundle.
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Revalidate a complete r1-to-r8 recovery artifact set offline.
+    VerifyRotationRecovery {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only recovery output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Qualification run ID embedded in the command bundle.
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Fresh-sign one prepared recovery phase into a durable replay file.
+    SignRotationRecoveryPhase {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only prepared recovery artifact directory.
+        #[arg(long)]
+        recovery: std::path::PathBuf,
+        /// Exact prepared phase name.
+        #[arg(long)]
+        phase: String,
+        /// Absolute absent or exact-replay root-only pending command file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -2907,6 +2958,50 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--openssl",
             "/usr/bin/openssl",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-command",
+            "--input",
+            "/approved/route-v2-r1",
+            "--payload",
+            "/approved/command-payload.json",
+            "--output",
+            "/approved/signed-command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "prepare-rotation-recovery",
+            "--input",
+            "/approved/route-v2-r1",
+            "--output",
+            "/approved/route-v2-recovery",
+            "--run-id",
+            "qualification_run_a",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-rotation-recovery-phase",
+            "--input",
+            "/approved/route-v2-r1",
+            "--recovery",
+            "/approved/route-v2-recovery",
+            "--phase",
+            "disable",
+            "--output",
+            "/approved/pending/disable.command.json",
         ])
         .is_ok());
     }
