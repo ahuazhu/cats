@@ -1,6 +1,6 @@
-//! Durable, descriptor-relative recovery state for covered public create
-//! requests. One unresolved request is bound to one API origin, immutable
-//! Workspace ID, resource name, exact path, exact body, and Idempotency-Key.
+//! Durable, descriptor-relative recovery state for covered public mutations.
+//! One unresolved request is bound to one API origin, immutable Workspace and
+//! resource identity, exact path, exact body, and Idempotency-Key.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cats_api::cat_create::CatCreateV2Request;
-use cats_api::persistent_disk::PersistentDiskCreateV1Request;
+use cats_api::persistent_disk::{PersistentDiskBindingV2Request, PersistentDiskCreateV1Request};
 use cats_api::runtime_reconciliation::Id;
 use fs2::FileExt as _;
 use serde::de::DeserializeOwned;
@@ -33,6 +33,7 @@ const PENDING_MAX_BYTES: usize = 16 * 1024;
 const BODY_MAX_BYTES: usize = 4 * 1024;
 const CAT_STATE_DIRECTORY: &str = "cat-create-v2-authority-v1";
 const PERSISTENT_DISK_STATE_DIRECTORY: &str = "persistent-disk-create-v1-authority-v1";
+const PERSISTENT_DISK_BINDING_STATE_DIRECTORY: &str = "persistent-disk-binding-v2-authority-v1";
 
 #[derive(Clone, Copy)]
 struct PendingNamespace {
@@ -52,6 +53,28 @@ const PERSISTENT_DISK_NAMESPACE: PendingNamespace = PendingNamespace {
     lock_scope: "persistent-disk-create-v1",
     file_prefix: "disk",
 };
+
+const PERSISTENT_DISK_BINDING_NAMESPACE: PendingNamespace = PendingNamespace {
+    description: "PersistentDisk-binding",
+    lock_scope: "persistent-disk-binding-v2",
+    file_prefix: "binding",
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PersistentDiskBindingAction {
+    Attach,
+    Detach,
+}
+
+impl PersistentDiskBindingAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Detach => "detach",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +445,231 @@ impl PreparedPersistentDiskCreate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentDiskBindingPendingRecord {
+    version: u32,
+    origin: String,
+    authenticated_workspace_id: String,
+    disk_id: Id,
+    action: PersistentDiskBindingAction,
+    method: String,
+    target: String,
+    content_type: String,
+    idempotency_key: String,
+    request_sha256: String,
+    body_base64: String,
+}
+
+impl PersistentDiskBindingPendingRecord {
+    fn new(
+        origin: &str,
+        workspace_id: &str,
+        disk_id: &str,
+        action: PersistentDiskBindingAction,
+        body: &[u8],
+    ) -> Result<Self> {
+        let origin = canonical_api_origin(origin)?;
+        let workspace_id = canonical_workspace_id(workspace_id)?;
+        let disk_id = canonical_product_id(disk_id, "disk_", "Disk")?;
+        let request = canonical_persistent_disk_binding_request(body)?;
+        let record = Self {
+            version: STATE_VERSION,
+            origin,
+            target: persistent_disk_binding_target(&workspace_id, &disk_id, action),
+            authenticated_workspace_id: workspace_id,
+            disk_id,
+            action,
+            method: METHOD.to_owned(),
+            content_type: CONTENT_TYPE.to_owned(),
+            idempotency_key: format!("cli-{}", uuid::Uuid::new_v4().simple()),
+            request_sha256: sha256_digest(body),
+            body_base64: URL_SAFE_NO_PAD.encode(body),
+        };
+        anyhow::ensure!(
+            record.validate()? == request,
+            "new pending PersistentDisk-binding state changed the exact request body"
+        );
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<PersistentDiskBindingV2Request> {
+        anyhow::ensure!(
+            self.version == STATE_VERSION,
+            "pending PersistentDisk-binding state has an unsupported version"
+        );
+        anyhow::ensure!(
+            canonical_api_origin(&self.origin)? == self.origin,
+            "pending PersistentDisk-binding state contains a non-canonical API origin"
+        );
+        let workspace_id = canonical_workspace_id(&self.authenticated_workspace_id)?;
+        let disk_id = canonical_product_id(self.disk_id.as_str(), "disk_", "Disk")?;
+        anyhow::ensure!(
+            disk_id == self.disk_id
+                && self.method == METHOD
+                && self.content_type == CONTENT_TYPE
+                && self.target
+                    == persistent_disk_binding_target(&workspace_id, &disk_id, self.action),
+            "pending PersistentDisk-binding state changed its exact HTTP request binding"
+        );
+        validate_idempotency_key(&self.idempotency_key, "PersistentDisk-binding")?;
+        let body = canonical_pending_body(
+            &self.body_base64,
+            &self.request_sha256,
+            "PersistentDisk-binding",
+        )?;
+        canonical_persistent_disk_binding_request(&body)
+    }
+
+    fn validate_for_slot(&self, slot: &str) -> Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            persistent_disk_binding_request_slot(&self.authenticated_workspace_id, &self.disk_id,)
+                == slot,
+            "pending PersistentDisk-binding state does not bind its storage slot"
+        );
+        Ok(())
+    }
+
+    fn body(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        URL_SAFE_NO_PAD
+            .decode(&self.body_base64)
+            .context("pending PersistentDisk-binding state contains invalid body base64")
+    }
+
+    fn binds(&self, desired: &Self) -> Result<bool> {
+        self.validate()?;
+        desired.validate()?;
+        Ok(self.origin == desired.origin
+            && self.authenticated_workspace_id == desired.authenticated_workspace_id
+            && self.disk_id == desired.disk_id
+            && self.action == desired.action
+            && self.method == desired.method
+            && self.target == desired.target
+            && self.content_type == desired.content_type
+            && self.request_sha256 == desired.request_sha256
+            && self.body_base64 == desired.body_base64)
+    }
+}
+
+/// A held cross-process authority lock plus one exact persisted attach or
+/// detach request. Both actions share the per-Disk slot so an unresolved
+/// result must be recovered before a contrary mutation can be issued.
+pub(crate) struct PreparedPersistentDiskBinding {
+    state: PendingState,
+    record: PersistentDiskBindingPendingRecord,
+}
+
+impl PreparedPersistentDiskBinding {
+    pub(crate) fn prepare(
+        origin: &str,
+        workspace_id: &str,
+        disk_id: &str,
+        action: PersistentDiskBindingAction,
+        body: &[u8],
+    ) -> Result<Self> {
+        Self::prepare_in(
+            &persistent_disk_binding_state_root()?,
+            origin,
+            workspace_id,
+            disk_id,
+            action,
+            body,
+        )
+    }
+
+    fn prepare_in(
+        root: &Path,
+        origin: &str,
+        workspace_id: &str,
+        disk_id: &str,
+        action: PersistentDiskBindingAction,
+        body: &[u8],
+    ) -> Result<Self> {
+        let desired =
+            PersistentDiskBindingPendingRecord::new(origin, workspace_id, disk_id, action, body)?;
+        let slot = persistent_disk_binding_request_slot(
+            &desired.authenticated_workspace_id,
+            &desired.disk_id,
+        );
+        let state = PendingState::acquire(
+            root,
+            &desired.authenticated_workspace_id,
+            &desired.disk_id,
+            PERSISTENT_DISK_BINDING_NAMESPACE,
+            slot,
+        )?;
+        let record: PersistentDiskBindingPendingRecord = match state
+            .load_pending::<PersistentDiskBindingPendingRecord>(
+        )? {
+            Some(existing) => {
+                anyhow::ensure!(
+                        existing.binds(&desired)?,
+                        "an unresolved PersistentDisk-binding request for this Workspace and Disk is bound to a different origin, action, path, or body; no HTTP request was sent (pending {})",
+                        state.pending_path().display()
+                    );
+                existing
+            }
+            None => {
+                desired.validate_for_slot(&state.slot)?;
+                state.publish_pending(&desired)?;
+                desired
+            }
+        };
+        record.validate_for_slot(&state.slot)?;
+        Ok(Self { state, record })
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        &self.record.origin
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.record.target
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        &self.record.content_type
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        &self.record.idempotency_key
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.record.authenticated_workspace_id
+    }
+
+    pub(crate) fn disk_id(&self) -> &Id {
+        &self.record.disk_id
+    }
+
+    pub(crate) fn action(&self) -> PersistentDiskBindingAction {
+        self.record.action
+    }
+
+    pub(crate) fn request(&self) -> Result<PersistentDiskBindingV2Request> {
+        self.record.validate()
+    }
+
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        self.record.body()
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        self.state.assert_current_authority()
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        self.state.pending_path()
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        self.state.delete_pending()
+    }
+}
+
 pub(crate) fn canonical_api_origin(value: &str) -> Result<String> {
     let parsed = reqwest::Url::parse(value).context("invalid Cats API origin")?;
     let has_userinfo = value.split_once("://").is_some_and(|(_, remainder)| {
@@ -449,12 +697,33 @@ fn canonical_workspace_id(value: &str) -> Result<String> {
         .context("invalid immutable Workspace ID")
 }
 
+fn canonical_product_id(value: &str, prefix: &str, description: &str) -> Result<Id> {
+    let id =
+        Id::new(value.to_owned()).with_context(|| format!("invalid immutable {description} ID"))?;
+    anyhow::ensure!(
+        id.as_str().starts_with(prefix),
+        "immutable {description} ID must start with {prefix}"
+    );
+    Ok(id)
+}
+
 fn cat_create_target(workspace_id: &str) -> String {
     format!("/v1/workspaces/{workspace_id}/cats")
 }
 
 fn persistent_disk_create_target(workspace_id: &str) -> String {
     format!("/v1/workspaces/{workspace_id}/disks")
+}
+
+fn persistent_disk_binding_target(
+    workspace_id: &str,
+    disk_id: &Id,
+    action: PersistentDiskBindingAction,
+) -> String {
+    format!(
+        "/v1/workspaces/{workspace_id}/disks/{disk_id}/actions/{}",
+        action.as_str()
+    )
 }
 
 fn canonical_request(bytes: &[u8]) -> Result<CatCreateV2Request> {
@@ -493,6 +762,30 @@ fn canonical_persistent_disk_request(bytes: &[u8]) -> Result<PersistentDiskCreat
     anyhow::ensure!(
         serde_json::to_vec(&request)? == bytes,
         "PersistentDisk-create request is not the canonical frozen DTO encoding"
+    );
+    Ok(request)
+}
+
+fn canonical_persistent_disk_binding_request(
+    bytes: &[u8],
+) -> Result<PersistentDiskBindingV2Request> {
+    anyhow::ensure!(
+        bytes.len() <= BODY_MAX_BYTES,
+        "PersistentDisk-binding request exceeds its closed byte limit"
+    );
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let request = PersistentDiskBindingV2Request::deserialize(&mut decoder)
+        .context("parse exact PersistentDisk-binding request")?;
+    decoder
+        .end()
+        .context("PersistentDisk-binding request has a trailing JSON value")?;
+    request
+        .validate()
+        .context("invalid PersistentDisk-binding request")?;
+    canonical_product_id(request.cat_id.as_str(), "cat_", "Cat")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&request)? == bytes,
+        "PersistentDisk-binding request is not the canonical frozen DTO encoding"
     );
     Ok(request)
 }
@@ -556,12 +849,29 @@ fn persistent_disk_state_root() -> Result<PathBuf> {
     Ok(parent.join(PERSISTENT_DISK_STATE_DIRECTORY))
 }
 
+fn persistent_disk_binding_state_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_PERSISTENT_DISK_BINDING_STATE_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
+    }
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("CATS_TEST_PERSISTENT_DISK_BINDING_STATE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let config = crate::config::config_path();
+    let parent = config.parent().context("Cats config path has no parent")?;
+    Ok(parent.join(PERSISTENT_DISK_BINDING_STATE_DIRECTORY))
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
     static TEST_PERSISTENT_DISK_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static TEST_PERSISTENT_DISK_BINDING_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -611,6 +921,30 @@ impl TestPersistentDiskStateRootGuard {
 impl Drop for TestPersistentDiskStateRootGuard {
     fn drop(&mut self) {
         TEST_PERSISTENT_DISK_STATE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestPersistentDiskBindingStateRootGuard;
+
+#[cfg(test)]
+impl TestPersistentDiskBindingStateRootGuard {
+    pub(crate) fn set(root: PathBuf) -> Self {
+        TEST_PERSISTENT_DISK_BINDING_STATE_ROOT.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "PersistentDisk-binding test state root is already set"
+            );
+            *slot.borrow_mut() = Some(root);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestPersistentDiskBindingStateRootGuard {
+    fn drop(&mut self) {
+        TEST_PERSISTENT_DISK_BINDING_STATE_ROOT.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -743,7 +1077,7 @@ impl PendingState {
         }
         sync_directory(
             &self.state_root.directory,
-            "sync pending covered-create deletion",
+            "sync pending covered-mutation deletion",
         )?;
         self.assert_current_authority()
     }
@@ -1059,6 +1393,15 @@ fn persistent_disk_request_slot(workspace_id: &str, name: &str) -> String {
     lowercase_hex(&hasher.finalize())
 }
 
+fn persistent_disk_binding_request_slot(workspace_id: &str, disk_id: &Id) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cats.persistent-disk-binding-v2.pending-slot.v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(disk_id.as_str().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
 fn sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1103,6 +1446,14 @@ mod tests {
             durability: cats_api::resources::DiskDurability::Strict,
             name: Id::new("data").unwrap(),
             size_bytes,
+        })
+        .unwrap()
+    }
+
+    fn persistent_disk_binding_body(mount_path: &str) -> Vec<u8> {
+        serde_json::to_vec(&PersistentDiskBindingV2Request {
+            cat_id: Id::new("cat_01").unwrap(),
+            mount_path: cats_api::runtime_reconciliation::HostPath::new(mount_path).unwrap(),
         })
         .unwrap()
     }
@@ -1221,6 +1572,109 @@ mod tests {
             "https://control.example",
             "ws_01",
             &persistent_disk_body(1 << 30),
+        )
+        .unwrap();
+        assert_eq!(recovered.idempotency_key(), key);
+    }
+
+    #[test]
+    fn persistent_disk_binding_restart_recovers_exact_action_path_body_and_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("binding-state");
+        let first = PreparedPersistentDiskBinding::prepare_in(
+            &root,
+            "https://CONTROL.example:443",
+            "ws_01",
+            "disk_01",
+            PersistentDiskBindingAction::Attach,
+            &persistent_disk_binding_body("/srv/data"),
+        )
+        .unwrap();
+        let key = first.idempotency_key().to_owned();
+        let exact_body = first.body().unwrap();
+        let pending_path = first.pending_path();
+        assert!(pending_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("binding-"));
+        drop(first);
+
+        let recovered = PreparedPersistentDiskBinding::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            "disk_01",
+            PersistentDiskBindingAction::Attach,
+            &persistent_disk_binding_body("/srv/data"),
+        )
+        .unwrap();
+        assert_eq!(recovered.idempotency_key(), key);
+        assert_eq!(recovered.body().unwrap(), exact_body);
+        assert_eq!(
+            recovered.target(),
+            "/v1/workspaces/ws_01/disks/disk_01/actions/attach"
+        );
+        assert_eq!(recovered.disk_id(), &Id::new("disk_01").unwrap());
+        assert_eq!(recovered.action(), PersistentDiskBindingAction::Attach);
+        recovered.clear().unwrap();
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn persistent_disk_binding_contrary_action_or_body_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("binding-state");
+        let first = PreparedPersistentDiskBinding::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            "disk_01",
+            PersistentDiskBindingAction::Attach,
+            &persistent_disk_binding_body("/srv/data"),
+        )
+        .unwrap();
+        let key = first.idempotency_key().to_owned();
+        drop(first);
+        for (action, body) in [
+            (
+                PersistentDiskBindingAction::Detach,
+                persistent_disk_binding_body("/srv/data"),
+            ),
+            (
+                PersistentDiskBindingAction::Attach,
+                persistent_disk_binding_body("/srv/other"),
+            ),
+        ] {
+            let error = PreparedPersistentDiskBinding::prepare_in(
+                &root,
+                "https://control.example",
+                "ws_01",
+                "disk_01",
+                action,
+                &body,
+            )
+            .err()
+            .unwrap();
+            assert!(error
+                .to_string()
+                .contains("different origin, action, path, or body"));
+        }
+        let recovered = PreparedPersistentDiskBinding::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            "disk_01",
+            PersistentDiskBindingAction::Attach,
+            &persistent_disk_binding_body("/srv/data"),
         )
         .unwrap();
         assert_eq!(recovered.idempotency_key(), key);
