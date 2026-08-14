@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import datetime as dt
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Mapping, Sequence
 
 
@@ -1385,6 +1387,281 @@ def assert_binding_failures(parent: Path) -> None:
         raise AssertionError("aged-out pre-start evidence executed a physical effect")
 
 
+def assert_cutover_verifier_wiring(parent: Path) -> None:
+    config, _runner, _executor, _plan_path, _plan_digest = build_scenario(
+        parent, "cutover-wiring-0001"
+    )
+    root = parent / "cutover-wiring-0001"
+    admission_real = reset.production_mutation_admission()
+    proof_module = reset.cutover_proof
+    digest = "sha256:" + "e" * 64
+    spki = admission_real.ED25519_SPKI_PREFIX + b"\x00" * 32
+    trust = {
+        "version": 1,
+        "deployment_id": "dep-fixture",
+        "release_id": "release-fixture",
+        "source_commit_sha": config.release_commit,
+        "signature_threshold": 1,
+        "credentials": [
+            {
+                "credential_id": "cred-fixture",
+                "public_key_spki": admission_real.encode_base64url(spki),
+                "scope": {
+                    "aws_partition": "aws",
+                    "account_id": config.aws_account_id,
+                    "role_arn": (
+                        f"arn:aws:iam::{config.aws_account_id}:role/cutover"
+                    ),
+                },
+            }
+        ],
+    }
+    trust_path = config.production_cutover_operator_trust_file
+    trust_path.write_bytes(admission_real.canonical_json(trust))
+    trust_path.chmod(0o600)
+
+    class AdmissionProxy:
+        """Real admission module with only online STS discovery faked."""
+
+        def __init__(self, real: object) -> None:
+            self._real = real
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+        def discover_sts(self, _aws: Path, scope: Mapping[str, str]) -> dict[str, str]:
+            return {
+                "aws_partition": scope["aws_partition"],
+                "account_id": scope["account_id"],
+                "role_arn": scope["role_arn"],
+                "principal_arn": (
+                    f"arn:{scope['aws_partition']}:sts::{scope['account_id']}"
+                    ":assumed-role/cutover/session"
+                ),
+            }
+
+    captured: list[dict[str, object]] = []
+
+    def fake_verify(_directory: Path, **kwargs: object) -> SimpleNamespace:
+        captured.append(dict(kwargs))
+        return SimpleNamespace(
+            value={
+                "cutover_id": "wiring-cutover",
+                "release": {"release_id": trust["release_id"]},
+                "fresh": {"deployment_id": trust["deployment_id"]},
+            },
+            sha256=digest,
+            release_manifest_sha256="sha256:" + config.artifact_sha256,
+            worker_bundle_sha256=digest,
+            qualification_manifest_sha256=digest,
+            qualification_catalog_sha256=digest,
+            fresh_targets_sha256=digest,
+            fleet_closed_sha256=digest,
+            route_v2_rotation_qualification_receipt_sha256=digest,
+            route_v2_rotation_qualification_node_ack_sets_sha256=digest,
+            route_v2_rotation_qualification_transcript_sha256=digest,
+            usage_terminal_sha256=digest,
+            old_host_coverage_sha256=digest,
+            kernel_nbd_qualification_bundle_sha256=digest,
+            vhost_user_qualification_bundle_sha256=digest,
+            producer_context=lambda: None,
+        )
+
+    class FakeSchemaVerifier:
+        def __init__(self, _state_directory: Path, **_kwargs: object) -> None:
+            pass
+
+        def verify(
+            self,
+            *,
+            dsn_file: Path,
+            ca_file: Path,
+            schema: str,
+            context: object,
+        ) -> object:
+            value = {
+                "binary_sha256": digest,
+                "catalog_sha256": digest,
+                "kind": proof_module.USAGE_SCHEMA_VERIFICATION_KIND,
+                "release_commit": config.release_commit,
+                "schema": schema,
+                "schema_version": 16,
+                "verified": True,
+                "version": 1,
+                "worker_bundle_sha256": digest,
+            }
+            data = proof_module.canonical_json(value, newline=True)
+            return proof_module.VerifiedFile(
+                proof_module.USAGE_SCHEMA_VERIFICATION_FILE,
+                data,
+                "sha256:" + hashlib.sha256(data).hexdigest(),
+                len(data),
+            )
+
+    forensic = b"manual fence forensic artifact\n"
+    forensic_file = proof_module.VerifiedFile(
+        "old-host-a.fence-receipt.json",
+        forensic,
+        "sha256:" + hashlib.sha256(forensic).hexdigest(),
+        len(forensic),
+    )
+    fence_expected = {
+        "event_id": "manual-fence-old-host-a",
+        "host_id": "old-host-a",
+        "components": ["blockd", "node_agent", "vmm"],
+    }
+    manual_value = {
+        "kind": proof_module.MANUAL_FENCE_EVIDENCE_KIND,
+        "version": 1,
+        "decision": proof_module.MANUAL_FENCE_EVIDENCE_DECISION,
+        "operator_principal_arn": (
+            f"arn:aws:sts::{config.aws_account_id}:assumed-role/cutover/session"
+        ),
+        "recorded_at": "2026-08-12T00:00:00Z",
+        "hosts": [
+            {
+                "host_id": "old-host-a",
+                "components": ["blockd", "node_agent", "vmm"],
+                "terminal_kind": "host_fence_event",
+                "event_id": "manual-fence-old-host-a",
+                "ec2_stop": {
+                    "instance_id": "i-0123456789abcdef0",
+                    "stopped_at": "2026-08-11T23:50:00Z",
+                },
+                "checklist": {
+                    "instance_stopped": True,
+                    "no_running_writers": True,
+                    "object_write_cutoff_verified": True,
+                    "forensic_artifact_retained": True,
+                },
+                "receipt_sha256": forensic_file.sha256,
+            }
+        ],
+    }
+    manual_path = root / "manual-fence.json"
+    manual_path.write_bytes(proof_module.canonical_json(manual_value, newline=True))
+    manual_path.chmod(0o600)
+    unattested_value = json.loads(manual_path.read_text())
+    unattested_value["hosts"][0]["checklist"]["object_write_cutoff_verified"] = False
+    unattested_path = root / "manual-fence-unattested.json"
+    unattested_path.write_bytes(
+        proof_module.canonical_json(unattested_value, newline=True)
+    )
+    unattested_path.chmod(0o600)
+
+    original_admission = reset._ADMISSION_MODULE
+    original_verify = proof_module.verify
+    original_schema_verifier = proof_module.SubprocessUsageSchemaV16Verifier
+    try:
+        reset._ADMISSION_MODULE = AdmissionProxy(admission_real)
+        proof_module.verify = fake_verify
+        proof_module.SubprocessUsageSchemaV16Verifier = FakeSchemaVerifier
+        runner = FakeRunner(
+            config.aws_account_id, config.aws_region, config.eks_cluster_name
+        )
+        authority = reset.ResetExecutor(
+            config, runner, now=FIXTURE_NOW
+        )._production_cutover_authority(FIXTURE_NOW)
+        if len(captured) != 1:
+            raise AssertionError("proof verification was not invoked exactly once")
+        wired = captured[0]
+        if not isinstance(
+            wired.get("route_v2_verifier"),
+            proof_module.RouteV2RotationQualificationEvidenceVerifier,
+        ):
+            raise AssertionError("G3 route verifier is not wired to proof verification")
+        if not isinstance(
+            wired.get("qualification_admission_verifier"),
+            proof_module.QualificationAdmissionEvidenceVerifier,
+        ):
+            raise AssertionError(
+                "Qualification admission verifier is not wired to proof verification"
+            )
+        if not isinstance(
+            wired.get("usage_verifier"),
+            proof_module.SubprocessUsageTargetTerminalVerifier,
+        ):
+            raise AssertionError("E9 usage verifier wiring drifted")
+        if "host_fence_verifier" in wired or "local_positive_stop_verifier" in wired:
+            raise AssertionError(
+                "fence verifiers were supplied without operator manual evidence"
+            )
+        if authority.projection["release_id"] != trust["release_id"]:
+            raise AssertionError("cutover authority projection lost its release binding")
+        for unavailable in (
+            proof_module.UNAVAILABLE_HOST_FENCE_VERIFIER,
+            proof_module.UNAVAILABLE_LOCAL_POSITIVE_STOP_VERIFIER,
+        ):
+            try:
+                unavailable.verify(forensic_file, dict(fence_expected))
+            except proof_module.ProofSetError as error:
+                if "--accept-manual-fence-evidence" not in str(error):
+                    raise AssertionError(
+                        "unavailable fence verifier does not point at the D7 manual input"
+                    )
+            else:
+                raise AssertionError("unavailable fence verifier did not fail closed")
+
+        manual_config = dataclasses.replace(
+            config, manual_fence_evidence_file=manual_path
+        )
+        reset.ResetExecutor(
+            manual_config, runner, now=FIXTURE_NOW
+        )._production_cutover_authority(FIXTURE_NOW)
+        if len(captured) != 2:
+            raise AssertionError("manual-evidence run did not reach proof verification")
+        manual_wired = captured[1]
+        fence_verifier = manual_wired.get("host_fence_verifier")
+        stop_verifier = manual_wired.get("local_positive_stop_verifier")
+        if fence_verifier is None or stop_verifier is None:
+            raise AssertionError(
+                "validated manual evidence did not wire the fence verifiers"
+            )
+        fence_verifier.verify(forensic_file, dict(fence_expected))
+        try:
+            fence_verifier.verify(
+                proof_module.VerifiedFile("foreign", b"x", "sha256:" + "f" * 64, 1),
+                dict(fence_expected),
+            )
+        except proof_module.ProofSetError:
+            pass
+        else:
+            raise AssertionError("manual fence verifier accepted a foreign receipt")
+        try:
+            stop_verifier.verify(forensic_file, {"host_id": "old-host-a", "components": []})
+        except proof_module.ProofSetError:
+            pass
+        else:
+            raise AssertionError(
+                "manual stop verifier accepted a fence-attested Host"
+            )
+
+        unattested_config = dataclasses.replace(
+            config, manual_fence_evidence_file=unattested_path
+        )
+        try:
+            reset.ResetExecutor(
+                unattested_config, runner, now=FIXTURE_NOW
+            )._production_cutover_authority(FIXTURE_NOW)
+        except reset.ResetError as error:
+            if "production cutover proof or Usage verifier failed closed" not in str(
+                error
+            ):
+                raise
+        else:
+            raise AssertionError(
+                "an incompletely attested manual evidence file was accepted"
+            )
+        if len(captured) != 2:
+            raise AssertionError(
+                "malformed manual evidence still reached proof verification"
+            )
+    finally:
+        reset._ADMISSION_MODULE = original_admission
+        proof_module.verify = original_verify
+        proof_module.SubprocessUsageSchemaV16Verifier = original_schema_verifier
+
+
 def assert_post_open_verifiers_accept_only_target_drift(parent: Path) -> None:
     config, runner, executor, plan_path, plan_digest = build_scenario(
         parent,
@@ -1758,13 +2035,15 @@ def main() -> int:
             assert_binding_failures(root)
             assert_unaccepted_proofs_block_execute(root)
             assert_cutover_authority_ordering_and_replay(root)
+            assert_cutover_verifier_wiring(root)
             assert_post_open_verifiers_accept_only_target_drift(root)
 
             print(
                 "clean-slate fixture: paginated versions+markers, multipart abort, "
                 "fresh namespace preserved, exact old retire, dry-run, receipts, "
                 "post-green blocker passed, closed forward-resume, crash replay, binding failures, "
-                "mechanical prerequisite blocks, recoverable receipt publication, and S3 "
+                "mechanical prerequisite blocks, recoverable receipt publication, cutover verifier "
+                "wiring with D7 manual fence evidence, and S3 "
                 "expected-owner gates passed; fresh DB read-only, ingress Closed, and post-open "
                 "forward/credential-independent cleanup verification passed"
             )
