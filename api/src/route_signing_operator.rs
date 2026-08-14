@@ -855,12 +855,18 @@ mod tests {
     }
 
     fn payload() -> RouteV2SigningCommandPayload {
+        let public_key_spki = Base64UrlNoPad::new(
+            "MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To".to_owned(),
+        )
+        .unwrap();
         let key = RouteGrantV2PublicKeyEntry {
-            kid: KeyId::new("11".repeat(32)).unwrap(),
-            public_key_spki: Base64UrlNoPad::new(
-                "MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To".to_owned(),
+            kid: crate::route_grant_v2::RouteGrantV2PublicKey::from_base64url_spki(
+                &public_key_spki,
             )
-            .unwrap(),
+            .unwrap()
+            .kid()
+            .clone(),
+            public_key_spki,
         };
         let ring = RouteGrantV2PublicKeyRingArtifact {
             version: ContractVersion::V1,

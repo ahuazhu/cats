@@ -1256,7 +1256,7 @@ mod tests {
     fn command_round_trips_only_as_exact_canonical_bytes() {
         let command = ProductionMutationAdmissionCommand {
             version: ContractVersion::V1,
-            command_id: RandomId128::new("0".repeat(32)).unwrap(),
+            command_id: RandomId128::new(format!("{}1", "0".repeat(31))).unwrap(),
             issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
             expires_at_unix_ms: UnixMillis::new(301_000).unwrap(),
             operator: operator(),
