@@ -1046,11 +1046,14 @@ def validate_state(value: Any) -> dict[str, Any]:
 
 
 class Cancellation:
-    def __init__(self) -> None:
+    def __init__(self, parent: Any | None = None) -> None:
         self.requested = False
+        self.parent = parent
 
     def handler(self, _signum: int, _frame: Any) -> None:
         self.requested = True
+        if self.parent is not None:
+            self.parent.requested = True
 
 
 def settle(args: argparse.Namespace) -> tuple[Path, str]:
@@ -1068,23 +1071,31 @@ def settle(args: argparse.Namespace) -> tuple[Path, str]:
         validate_receipt(synthetic, command, body, pending)
         return receipt_path, sha256(receipt_bytes)
 
-    cancellation = Cancellation()
+    # A composing transaction may already own the process signal boundary.  It
+    # must learn about a signal caught while this nested resolver temporarily
+    # owns SIGINT/SIGTERM.  Once a command may have been sent, both layers keep
+    # resolving the same immutable request; cancellation cannot turn an
+    # ambiguous success into a different command.
+    cancellation = Cancellation(getattr(args, "parent_cancellation", None))
     prior_handlers: dict[int, Any] = {}
     for signal_number in (signal.SIGINT, signal.SIGTERM):
         prior_handlers[signal_number] = signal.signal(signal_number, cancellation.handler)
     sent = False
+    may_have_been_sent = False
     deadline = time.monotonic() + args.resolution_timeout_seconds
     last_error: AdmissionError | None = None
     try:
         while time.monotonic() < deadline:
-            if cancellation.requested and not sent:
+            if cancellation.requested and not may_have_been_sent:
                 raise AdmissionError("cancelled before any admission command was sent")
             target = pending["discovery_target"] if sent else pending["target"]
             try:
                 result = post_exact(pending["origin"], target, pending, body)
                 sent = True
+                may_have_been_sent = True
             except AdmissionError as error:
                 sent = True
+                may_have_been_sent = True
                 last_error = error
                 time.sleep(0.25)
                 continue

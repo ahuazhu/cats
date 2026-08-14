@@ -279,6 +279,9 @@ usage_terminal_sha256
 
 The ordered chain remains `reset-started -> s3-empty -> usage-transport-empty ->
 control-schema-empty -> usage-schema-empty -> reset-complete`. Each stage binds its predecessor.
+The terminal `fresh_namespace_proof` binds both `control_schema_version: "16"` and
+`usage_schema_version: "16"`; either fresh schema at another version fails before
+`reset-started` and on every forward replay.
 After `reset-started`, only the same exact invocation may resume. A missing receipt triggers live
 postcondition discovery; a completed postcondition settles the receipt without repeating the
 effect. A contradictory or ahead-of-chain effect stops for investigation. `SIGINT`/`SIGTERM` before
@@ -481,32 +484,53 @@ Final-open has separate canonical plan/receipt kinds and a new `open_id`. The re
 the exact `reset-complete` bytes, proof set, operator principal, mutation-open request, sorted A23
 schedulable requests, reviewed Terraform plan file and final probe target. It refuses a plan whose
 Terraform projection changes anything outside the closed ingress/DNS/application-open set.
+The plan records an execution deadline at least 30 seconds before the signed mutation-open command
+expires. A plan at or beyond that deadline is unusable and requires a new `open_id`; it is never
+silently re-signed or refreshed under the reviewed plan.
 
-Execution revalidates all terminal proof bindings and live Closed fleet before publishing
-`open-started`. Its ordered receipts are:
+Execution revalidates all terminal proof bindings, live Closed fleet and the exact signed Open
+pending request before publishing `open-started`. The effects plan has exact
+`public_probe_method: "GET"`, `public_probe_path: "/healthz"` and
+`public_probe_admission_mode: "closed"`; it is not a Cat, Disk, Desired or WebSocket operation. The Control health handler
+reads only the process readiness latch and remains valid while the PostgreSQL singleton is Closed.
+A23 Node policy and reviewed Terraform Ingress also use their independent authorities, so they are
+prepared and proved before product admission changes. The production Effects adapter remains
+unavailable until it can bind this exact descriptor and invocation. Its ordered receipts are:
 
 ```text
 open-started
-mutation-admission-open
 node-<node_id>-schedulable       // sorted exact Node set
 nodes-schedulable
 public-ingress-open
 public-probe-terminal
+mutation-admission-open-finalizing
+mutation-admission-open
 open-complete
 ```
 
-Mutation-open and A23 effects use their canonical request IDs and exact bodies. Ambiguous HTTP or
-process results retain/replay the same official pending request and discover the typed stored
-outcome; never issue a new ID. Terraform applies only the exact reviewed saved plan and settles an
-ambiguous response through refresh/show plus exact Kubernetes/AWS postcondition discovery. Public
-Ingress is the last mutation. New product creation is forbidden until `open-complete` exists.
+A23 effects and mutation-open use their canonical request IDs and exact bodies. Ambiguous HTTP or
+process results retain/replay the same official request and discover the typed stored outcome;
+never issue a new ID. Terraform applies only the exact reviewed saved plan and settles an ambiguous
+response through refresh/show plus exact Kubernetes/AWS postcondition discovery.
 
-Cancellation before `open-started` is mutation-free. Cancellation/failure afterward invokes the
-closed cleanup sequence: apply the exact reviewed ingress-close plan if ingress may be open,
-re-cordon each possibly schedulable Node with new exact A23 revisions/IDs, close mutation admission,
-then obtain a fresh empty-fleet/zero-guard receipt. Cleanup is idempotent and journals every
-terminal result; inability to prove cleanup exits nonzero and keeps incident ownership—it never
-marks the open complete or touches the old namespace.
+Immediately before `mutation-admission-open-finalizing`, execution repeats typed admission-state
+discovery and requires the exact planned Closed bytes/revision plus at least 30 seconds of command
+lifetime. Expiry, foreign state or cancellation before that marker enters cleanup. The marker binds
+the exact Open command ID, request SHA-256 and expected revision and is the forward-only boundary:
+after it may have linked, signal handling propagates through the nested command resolver, but signal,
+response loss, process crash and receipt-publication crash all continue settling only that exact
+Open. Open is the final external effect; `mutation-admission-open` and `open-complete` are published
+adjacently afterward. Product creation can begin only at the authoritative Control Open commit;
+`open-complete` records that terminal transaction and is not a second admission gate.
+
+Cancellation before `open-started` is mutation-free. Cancellation/failure after `open-started` but
+before the finalizing marker invokes the closed cleanup sequence: apply the exact reviewed
+ingress-close plan if Ingress may be open, re-cordon each possibly schedulable Node with new exact
+A23 revisions/IDs, prove admission is still the exact planned Closed state, then obtain a fresh
+empty-fleet/zero-guard receipt. Cleanup cannot close or claim a foreign command merely because it
+installed the same Open binding. Cleanup is idempotent and journals every terminal result; inability
+to prove cleanup exits nonzero and keeps incident ownership. After the finalizing marker cleanup and
+EmergencyClose are forbidden; the same plan must forward-settle Open and publish `open-complete`.
 
 ## 6. Qualification contract
 

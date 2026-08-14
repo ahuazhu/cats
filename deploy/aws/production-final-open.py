@@ -6,7 +6,10 @@ reviewed Terraform ingress, public-probe and cleanup adapter is installed.
 Planning validates the exact terminal reset/proof set before it asks that
 adapter for a closed effects plan.  Execution journals every terminal result,
 uses only the dedicated ProductionCutoverOperator command path for the
-mutation-admission CAS, and closes partial state before returning failure.
+mutation-admission CAS, keeps product admission Closed while Nodes, Ingress and
+the read-only public probe are prepared, and makes Open the final external
+effect.  Before the finalization marker failures close partial infrastructure;
+after it, only exact-forward settlement of that one Open command is allowed.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 RAW_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 MAX_OPEN_PLAN_BYTES = 2 * 1024 * 1024
+OPEN_EXECUTION_MIN_REMAINING_MS = 30_000
 
 
 class FinalOpenError(RuntimeError):
@@ -129,10 +133,18 @@ class AdmissionClient(Protocol):
         authority: OpenAuthority,
     ) -> None: ...
 
+    def validate_live_closed(
+        self,
+        prepared: PreparedAdmission,
+        authority: OpenAuthority,
+        at_unix_ms: int,
+    ) -> None: ...
+
     def settle_open(
         self,
         prepared: PreparedAdmission,
         authority: OpenAuthority,
+        cancellation: Cancellation,
     ) -> dict[str, Any]: ...
 
     def validate_open_evidence(
@@ -159,7 +171,19 @@ class AdmissionClient(Protocol):
 class EffectsAdapter(Protocol):
     def prepare(self, authority: OpenAuthority) -> dict[str, Any]: ...
 
-    def validate(self, value: dict[str, Any], authority: OpenAuthority) -> None: ...
+    def validate_plan(self, value: dict[str, Any], authority: OpenAuthority) -> None: ...
+
+    def validate_live_closed_before_start(
+        self, value: dict[str, Any], authority: OpenAuthority
+    ) -> None: ...
+
+    def validate_post_boundary_forward(
+        self, value: dict[str, Any], authority: OpenAuthority
+    ) -> None: ...
+
+    def validate_cleanup(
+        self, value: dict[str, Any], authority: OpenAuthority
+    ) -> None: ...
 
     def settle_node_schedulable(
         self,
@@ -252,7 +276,24 @@ class UnavailableEffectsAdapter:
         self._unavailable()
         raise AssertionError("unreachable")
 
-    def validate(self, _value: dict[str, Any], _authority: OpenAuthority) -> None:
+    def validate_plan(
+        self, _value: dict[str, Any], _authority: OpenAuthority
+    ) -> None:
+        self._unavailable()
+
+    def validate_live_closed_before_start(
+        self, _value: dict[str, Any], _authority: OpenAuthority
+    ) -> None:
+        self._unavailable()
+
+    def validate_post_boundary_forward(
+        self, _value: dict[str, Any], _authority: OpenAuthority
+    ) -> None:
+        self._unavailable()
+
+    def validate_cleanup(
+        self, _value: dict[str, Any], _authority: OpenAuthority
+    ) -> None:
         self._unavailable()
 
     def settle_node_schedulable(
@@ -410,10 +451,6 @@ class ProductionAdmissionClient:
     ) -> Path:
         path = self._pending_path(authority.binding, phase)
         command_id = open_command_id(self.open_id, authority.binding, phase)
-        binding_kind = "open" if mutation == "emergency_close" else None
-        expected_wire_binding: Any = authority.binding
-        if mutation == "emergency_close":
-            expected_wire_binding = {"kind": "open", "binding": authority.binding}
         if path.exists() or path.is_symlink():
             try:
                 _pending, _body, command = ADMISSION.load_pending(path, self.trust_file)
@@ -424,7 +461,7 @@ class ProductionAdmissionClient:
                 or command["expected_revision"] != expected_revision
                 or command["operator"] != authority.operator
                 or command["mutation"]
-                != {"kind": mutation, "binding": expected_wire_binding}
+                != {"kind": mutation, "binding": authority.binding}
             ):
                 raise FinalOpenError("durable final-open pending command conflicts")
             return path
@@ -436,7 +473,7 @@ class ProductionAdmissionClient:
             state_directory=self.state_directory,
             expected_revision=expected_revision,
             mutation=mutation,
-            binding_kind=binding_kind,
+            binding_kind=None,
             command_id=command_id,
             command_lifetime_seconds=self.command_lifetime_seconds,
             aws=Path("/usr/local/bin/aws"),
@@ -593,10 +630,50 @@ class ProductionAdmissionClient:
         ):
             raise FinalOpenError("prepared final-open admission binding drifted")
 
+    def validate_live_closed(
+        self,
+        prepared: PreparedAdmission,
+        authority: OpenAuthority,
+        at_unix_ms: int,
+    ) -> None:
+        self.validate(prepared, authority)
+        if type(at_unix_ms) is not int or at_unix_ms <= 0:
+            raise FinalOpenError("final-open live-Closed evaluation time is invalid")
+        pending_path = self._read_ref(
+            prepared.value["open_pending"],
+            "final-open pending command",
+        )
+        try:
+            _pending, _body, command = ADMISSION.load_pending(
+                pending_path,
+                self.trust_file,
+            )
+            live = ADMISSION.discover_state(
+                argparse.Namespace(pending=pending_path, trust_file=self.trust_file)
+            )
+        except ADMISSION.AdmissionError as error:
+            raise FinalOpenError(
+                "cannot revalidate live Closed admission before open-started"
+            ) from error
+        planned = ADMISSION.validate_state(prepared.value["observed_closed_state"])
+        if (
+            command["issued_at_unix_ms"] > at_unix_ms
+            or command["expires_at_unix_ms"] - at_unix_ms
+            < OPEN_EXECUTION_MIN_REMAINING_MS
+        ):
+            raise FinalOpenError(
+                "signed final-open request has insufficient safe lifetime"
+            )
+        if live != planned or live["mode"] != "closed":
+            raise FinalOpenError(
+                "mutation admission revision/mode changed before open-started"
+            )
+
     def settle_open(
         self,
         prepared: PreparedAdmission,
         authority: OpenAuthority,
+        cancellation: Cancellation,
     ) -> dict[str, Any]:
         self.validate(prepared, authority)
         pending_path = self._read_ref(
@@ -609,6 +686,7 @@ class ProductionAdmissionClient:
                     pending=pending_path,
                     trust_file=self.trust_file,
                     resolution_timeout_seconds=self.resolution_timeout_seconds,
+                    parent_cancellation=cancellation,
                 )
             )
             receipt_raw = ADMISSION.read_stable_file(
@@ -737,99 +815,40 @@ class ProductionAdmissionClient:
         planned_closed = ADMISSION.validate_state(
             prepared.value["observed_closed_state"]
         )
-        exact_open_binding = {"kind": "open", "binding": authority.binding}
         if discovered["mode"] == "closed":
-            if discovered != planned_closed and discovered["binding"] != exact_open_binding:
+            if discovered == planned_closed:
+                return {
+                    "kind": "cats.production-final-open-admission-closed.v1",
+                    "version": 1,
+                    "close_kind": "already_closed",
+                    "command_id": None,
+                    "request_sha256": None,
+                    "command_receipt_sha256": None,
+                    "resulting_state": discovered,
+                    "resulting_state_sha256": ADMISSION.sha256(
+                        ADMISSION.canonical_json(discovered)
+                    ),
+                    "resulting_revision": discovered["revision"],
+                    "committed_at_unix_ms": discovered["updated_at_unix_ms"],
+                }
+            if discovered["binding"] != {
+                "kind": "open",
+                "binding": authority.binding,
+            }:
                 raise FinalOpenError(
                     "closed cleanup discovered a foreign admission binding"
                 )
-            close_pending = self._pending_path(authority.binding, "emergency-close")
-            if discovered["binding"] == exact_open_binding and (
-                close_pending.exists() or close_pending.is_symlink()
-            ):
-                try:
-                    _pending, _body, close_command = ADMISSION.load_pending(
-                        close_pending,
-                        self.trust_file,
-                    )
-                except ADMISSION.AdmissionError as error:
-                    raise FinalOpenError(
-                        "durable emergency-close pending command is invalid"
-                    ) from error
-                if discovered["last_command_id"] == close_command["command_id"]:
-                    return self._settle_emergency_close(
-                        close_pending,
-                        authority,
-                    )
-            return {
-                "kind": "cats.production-final-open-admission-closed.v1",
-                "version": 1,
-                "close_kind": "already_closed",
-                "command_id": None,
-                "request_sha256": None,
-                "command_receipt_sha256": None,
-                "resulting_state_sha256": ADMISSION.sha256(
-                    ADMISSION.canonical_json(discovered)
-                ),
-                "resulting_revision": discovered["revision"],
-                "committed_at_unix_ms": discovered["updated_at_unix_ms"],
-            }
-        if discovered["mode"] != "open" or discovered["binding"] != exact_open_binding:
+            raise FinalOpenError(
+                "closed cleanup discovered a foreign command for the same Open binding"
+            )
+        if discovered["mode"] != "open" or discovered["binding"] != {
+            "kind": "open",
+            "binding": authority.binding,
+        }:
             raise FinalOpenError("closed cleanup discovered foreign admission authority")
-        revision = discovered["revision"]
-        close_pending = self._ensure_pending(
-            authority,
-            phase="emergency-close",
-            expected_revision=revision,
-            mutation="emergency_close",
+        raise FinalOpenError(
+            "closed cleanup discovered a foreign Open command for the same binding"
         )
-        return self._settle_emergency_close(close_pending, authority)
-
-    def _settle_emergency_close(
-        self,
-        close_pending: Path,
-        authority: OpenAuthority,
-    ) -> dict[str, Any]:
-        try:
-            receipt_path, receipt_digest = ADMISSION.settle(
-                argparse.Namespace(
-                    pending=close_pending,
-                    trust_file=self.trust_file,
-                    resolution_timeout_seconds=self.resolution_timeout_seconds,
-                )
-            )
-            raw = ADMISSION.read_stable_file(
-                receipt_path,
-                "final-open emergency-close receipt",
-                ADMISSION.MAX_RESPONSE_BYTES,
-                private=True,
-            )
-            receipt = ADMISSION.decode_json(raw, "final-open emergency-close receipt")
-            state = ADMISSION.validate_state(receipt["outcome"]["state"])
-            discovered = ADMISSION.discover_state(
-                argparse.Namespace(pending=close_pending, trust_file=self.trust_file)
-            )
-        except (ADMISSION.AdmissionError, KeyError, TypeError) as error:
-            raise FinalOpenError("final-open emergency close did not settle") from error
-        if (
-            receipt_digest != ADMISSION.sha256(raw)
-            or receipt["outcome"].get("kind") != "applied"
-            or state != discovered
-            or state["mode"] != "closed"
-            or state["binding"] != {"kind": "open", "binding": authority.binding}
-        ):
-            raise FinalOpenError("final-open emergency close reached a foreign state")
-        return {
-            "kind": "cats.production-final-open-admission-closed.v1",
-            "version": 1,
-            "close_kind": "emergency_close",
-            "command_id": receipt["command"]["command_id"],
-            "request_sha256": receipt["request_sha256"],
-            "command_receipt_sha256": receipt_digest,
-            "resulting_state_sha256": ADMISSION.sha256(ADMISSION.canonical_json(state)),
-            "resulting_revision": state["revision"],
-            "committed_at_unix_ms": receipt["committed_at_unix_ms"],
-        }
 
     def validate_closed_evidence(
         self,
@@ -837,53 +856,54 @@ class ProductionAdmissionClient:
         prepared: PreparedAdmission,
         authority: OpenAuthority,
     ) -> None:
-        close_kind = evidence.get("close_kind")
-        if close_kind == "emergency_close":
-            close_pending = self._pending_path(authority.binding, "emergency-close")
-            if not close_pending.exists() and not close_pending.is_symlink():
-                raise FinalOpenError(
-                    "closed cleanup journal lost its emergency-close pending command"
-                )
-            try:
-                _pending, _body, command = ADMISSION.load_pending(
-                    close_pending,
-                    self.trust_file,
-                )
-            except ADMISSION.AdmissionError as error:
-                raise FinalOpenError(
-                    "closed cleanup pending command cannot be validated"
-                ) from error
-            receipt_path = close_pending.parent / (
-                f"{command['command_id']}.receipt.v1.json"
-            )
-            if not receipt_path.exists() and not receipt_path.is_symlink():
-                raise FinalOpenError(
-                    "closed cleanup journal lost its Store command receipt"
-                )
-            settled = self._settle_emergency_close(close_pending, authority)
-        elif close_kind == "already_closed":
-            open_pending = self._read_ref(
-                prepared.value["open_pending"],
-                "final-open pending command",
-            )
-            try:
-                state = ADMISSION.discover_state(
-                    argparse.Namespace(
-                        pending=open_pending,
-                        trust_file=self.trust_file,
-                    )
-                )
-            except ADMISSION.AdmissionError as error:
-                raise FinalOpenError(
-                    "cannot validate already-Closed cleanup state"
-                ) from error
-            if state["mode"] != "closed":
-                raise FinalOpenError("already-Closed cleanup state is no longer Closed")
-            settled = self.settle_closed(prepared, authority)
-        else:
-            raise FinalOpenError("closed cleanup admission evidence kind drifted")
-        if settled != evidence:
+        evidence = require_fields(
+            evidence,
+            {
+                "kind",
+                "version",
+                "close_kind",
+                "command_id",
+                "request_sha256",
+                "command_receipt_sha256",
+                "resulting_state",
+                "resulting_state_sha256",
+                "resulting_revision",
+                "committed_at_unix_ms",
+            },
+            "closed cleanup admission evidence",
+        )
+        try:
+            state = ADMISSION.validate_state(evidence["resulting_state"])
+        except ADMISSION.AdmissionError as error:
+            raise FinalOpenError("closed cleanup state evidence is malformed") from error
+        planned_closed = ADMISSION.validate_state(
+            prepared.value["observed_closed_state"]
+        )
+        if (
+            evidence["kind"] != "cats.production-final-open-admission-closed.v1"
+            or not version_one(evidence["version"])
+            or evidence["close_kind"] != "already_closed"
+            or state != planned_closed
+            or evidence["resulting_state_sha256"]
+            != ADMISSION.sha256(ADMISSION.canonical_json(state))
+            or evidence["resulting_revision"] != state["revision"]
+            or evidence["committed_at_unix_ms"] != state["updated_at_unix_ms"]
+        ):
             raise FinalOpenError("closed cleanup admission evidence drifted")
+        if any(
+            evidence[field] is not None
+            for field in (
+                "command_id",
+                "request_sha256",
+                "command_receipt_sha256",
+            )
+        ):
+            raise FinalOpenError("already-Closed evidence names a command")
+        # A prior local cleanup receipt is not current admission authority.
+        # Re-discover through the immutable Open request and require the same
+        # exact planned Closed bytes before publishing later cleanup stages.
+        if self.settle_closed(prepared, authority) != evidence:
+            raise FinalOpenError("closed cleanup admission state changed after receipt")
 
 
 def validate_authority(value: OpenAuthority, open_id: str) -> OpenAuthority:
@@ -931,6 +951,9 @@ def validate_effects(value: Any, authority: OpenAuthority, open_id: str) -> dict
             "ingress_open_plan_sha256",
             "ingress_close_plan_sha256",
             "public_probe_target_sha256",
+            "public_probe_method",
+            "public_probe_path",
+            "public_probe_admission_mode",
         },
         "final-open effects plan",
     )
@@ -943,6 +966,9 @@ def validate_effects(value: Any, authority: OpenAuthority, open_id: str) -> dict
         or value["release_id"] != binding["release_id"]
         or value["source_commit_sha"] != binding["source_commit_sha"]
         or value["proof_set_sha256"] != binding["proof_set_sha256"]
+        or value["public_probe_method"] != "GET"
+        or value["public_probe_path"] != "/healthz"
+        or value["public_probe_admission_mode"] != "closed"
     ):
         raise FinalOpenError("final-open effects plan lineage drifted")
     for field in (
@@ -990,6 +1016,8 @@ class FinalOpenExecutor:
         effects: EffectsAdapter = UNAVAILABLE_EFFECTS_ADAPTER,
         receipt_directory: Path,
         authority_verifier: Callable[[], OpenAuthority] | None = None,
+        forward_authority_verifier: Callable[[], OpenAuthority] | None = None,
+        cleanup_authority_verifier: Callable[[], OpenAuthority] | None = None,
         receipt_publication_hook: Callable[[str, Path], None] | None = None,
     ) -> None:
         if OPEN_ID.fullmatch(open_id) is None:
@@ -1006,6 +1034,8 @@ class FinalOpenExecutor:
         self.effects = effects
         self.receipt_directory = receipt_directory
         self.authority_verifier = authority_verifier
+        self.forward_authority_verifier = forward_authority_verifier
+        self.cleanup_authority_verifier = cleanup_authority_verifier
         self.receipt_publication_hook = receipt_publication_hook
 
     def _authority(self) -> OpenAuthority:
@@ -1031,6 +1061,124 @@ class FinalOpenExecutor:
             self.open_id,
         )
 
+    def _validate_post_boundary_completion(
+        self,
+        completion: Any,
+        planned: OpenAuthority,
+    ) -> OpenAuthority:
+        frozen = completion.cutover_authority
+        if not isinstance(frozen, dict) or set(frozen) != RESET.CUTOVER_AUTHORITY_FIELDS:
+            raise FinalOpenError("post-boundary reset authority is malformed")
+        trust = require_fields(
+            completion.operator_trust,
+            {
+                "version",
+                "deployment_id",
+                "release_id",
+                "source_commit_sha",
+                "signature_threshold",
+                "credentials",
+            },
+            "post-boundary cutover trust",
+        )
+        if not isinstance(trust["credentials"], list) or len(trust["credentials"]) != 1:
+            raise FinalOpenError("post-boundary cutover trust credential drifted")
+        credential = require_fields(
+            trust["credentials"][0],
+            {"credential_id", "public_key_spki", "scope"},
+            "post-boundary cutover credential",
+        )
+        scope = require_fields(
+            credential["scope"],
+            {"aws_partition", "account_id", "role_arn"},
+            "post-boundary cutover scope",
+        )
+        complete = completion.reset_complete
+        binding = planned.binding
+        projection_bindings = {
+            "release_id": "release_id",
+            "release_manifest_sha256": "release_manifest_sha256",
+            "qualification_manifest_sha256": "qualification_manifest_sha256",
+            "qualification_catalog_sha256": "qualification_catalog_sha256",
+            "proof_set_sha256": "proof_set_sha256",
+            "fresh_targets_sha256": "fresh_targets_sha256",
+            "fleet_closed_receipt_sha256": "fleet_closed_receipt_sha256",
+            "route_v2_rotation_qualification_receipt_sha256": (
+                "route_v2_rotation_qualification_receipt_sha256"
+            ),
+            "route_v2_rotation_qualification_node_ack_sets_sha256": (
+                "route_v2_rotation_qualification_node_ack_sets_sha256"
+            ),
+            "route_v2_rotation_qualification_transcript_sha256": (
+                "route_v2_rotation_qualification_transcript_sha256"
+            ),
+            "usage_terminal_receipt_sha256": "usage_terminal_receipt_sha256",
+            "old_host_coverage_sha256": "old_host_coverage_sha256",
+            "kernel_nbd_qualification_bundle_sha256": (
+                "kernel_nbd_qualification_bundle_sha256"
+            ),
+            "vhost_user_qualification_bundle_sha256": (
+                "vhost_user_qualification_bundle_sha256"
+            ),
+        }
+        if (
+            completion.plan_sha256 != planned.reset_plan_sha256.removeprefix("sha256:")
+            or completion.reset_complete_sha256
+            != planned.reset_complete_receipt_sha256
+            or complete.get("reset_id") != binding["reset_id"]
+            or complete.get("release_commit") != binding["source_commit_sha"]
+            or complete.get("artifact_sha256")
+            != binding["release_manifest_sha256"].removeprefix("sha256:")
+            or frozen["operator"] != planned.operator
+            or trust["deployment_id"] != binding["deployment_id"]
+            or trust["release_id"] != binding["release_id"]
+            or trust["source_commit_sha"] != binding["source_commit_sha"]
+            or scope["aws_partition"] != planned.operator["aws_partition"]
+            or scope["account_id"] != planned.operator["account_id"]
+            or scope["role_arn"] != planned.operator["role_arn"]
+            or any(
+                frozen[projection_field] != binding[binding_field]
+                for projection_field, binding_field in projection_bindings.items()
+            )
+        ):
+            raise FinalOpenError("post-boundary reset authority drifted")
+        return planned
+
+    def _post_boundary_authority(
+        self,
+        planned: OpenAuthority,
+        *,
+        cleanup: bool,
+    ) -> OpenAuthority:
+        injected = (
+            self.cleanup_authority_verifier
+            if cleanup
+            else self.forward_authority_verifier
+        )
+        if injected is None:
+            injected = self.authority_verifier
+        if injected is not None:
+            live = validate_authority(injected(), self.open_id)
+            if live != planned:
+                raise FinalOpenError("post-boundary reset/proof authority drifted")
+            return live
+        try:
+            verifier = (
+                self.reset_executor.verify_complete_for_cleanup
+                if cleanup
+                else self.reset_executor.verify_complete_after_open_started
+            )
+            completion = verifier(
+                self.reset_plan_path,
+                self.reset_plan_sha256,
+            )
+            return self._validate_post_boundary_completion(completion, planned)
+        except (RESET.ResetError, RESET.cutover_proof.ProofSetError) as error:
+            mode = "cleanup" if cleanup else "forward recovery"
+            raise FinalOpenError(
+                f"post-boundary reset authority failed closed for {mode}"
+            ) from error
+
     def _write(self, stage: str, value: dict[str, Any]) -> tuple[Path, str]:
         return RESET.write_receipt(
             self.receipt_directory,
@@ -1043,7 +1191,6 @@ class FinalOpenExecutor:
     def _stage_names(self, effects: dict[str, Any]) -> list[str]:
         return [
             "open-started",
-            "mutation-admission-open",
             *[
                 f"node-{node['node_id']}-schedulable"
                 for node in effects["nodes"]
@@ -1051,8 +1198,19 @@ class FinalOpenExecutor:
             "nodes-schedulable",
             "public-ingress-open",
             "public-probe-terminal",
+            "mutation-admission-open-finalizing",
+            "mutation-admission-open",
             "open-complete",
         ]
+
+    @staticmethod
+    def _open_finalizing_evidence(prepared: PreparedAdmission) -> dict[str, Any]:
+        return {
+            "status": "exact_open_forward_settlement_required",
+            "command_id": prepared.value["command_id"],
+            "request_sha256": prepared.value["request_sha256"],
+            "expected_revision": prepared.value["expected_revision"],
+        }
 
     def _receipt(
         self,
@@ -1083,13 +1241,17 @@ class FinalOpenExecutor:
         )
         if existing is not None:
             path, _value, digest = existing
-            _plan, _plan_digest, authority, _prepared, _effects = self._validate_plan(
+            plan, _plan_digest, authority, _prepared, _effects = self._validate_plan(
                 path,
                 digest,
             )
             if self._authority() != authority:
                 raise FinalOpenError(
                     "terminal reset/proof authority changed since the existing plan"
+                )
+            if now_unix_ms() >= plan["execution_deadline_unix_ms"]:
+                raise FinalOpenError(
+                    "the existing final-open plan expired; use a new open_id"
                 )
             return path, digest
         authority = self._authority()
@@ -1098,23 +1260,40 @@ class FinalOpenExecutor:
             authority,
             self.open_id,
         )
-        self.effects.validate(effects, authority)
+        self.effects.validate_plan(effects, authority)
         prepared = self.admission.prepare(authority)
         self.admission.validate(prepared, authority)
         authority_projection = authority.projection()
+        created_at_unix_ms = now_unix_ms()
+        expires_at_unix_ms = prepared.value.get("expires_at_unix_ms")
+        if (
+            type(expires_at_unix_ms) is not int
+            or expires_at_unix_ms - created_at_unix_ms
+            <= OPEN_EXECUTION_MIN_REMAINING_MS
+        ):
+            raise FinalOpenError(
+                "signed final-open request has no safe reviewed execution window"
+            )
         plan = {
             "kind": PLAN_KIND,
             "version": 1,
             "mode": "read_only_plan",
             "open_id": self.open_id,
-            "created_at_unix_ms": now_unix_ms(),
+            "created_at_unix_ms": created_at_unix_ms,
+            "execution_deadline_unix_ms": (
+                expires_at_unix_ms - OPEN_EXECUTION_MIN_REMAINING_MS
+            ),
             "authority": authority_projection,
             "authority_sha256": sha256(canonical_json(authority_projection)),
             "admission": prepared.value,
             "admission_sha256": sha256(canonical_json(prepared.value)),
             "effects": effects,
             "effects_sha256": sha256(canonical_json(effects)),
-            "rollback_boundary": "before open-started: mutation-free; afterward: close ingress, re-cordon, emergency-close admission, prove Fleet Closed",
+            "rollback_boundary": (
+                "before open-started: mutation-free; after open-started and before "
+                "mutation-admission-open-finalizing: close ingress, re-cordon, prove "
+                "admission/Fleet Closed; after finalizing: exact-forward Open only"
+            ),
         }
         return self._write("open-plan", plan)
 
@@ -1137,6 +1316,7 @@ class FinalOpenExecutor:
                 "mode",
                 "open_id",
                 "created_at_unix_ms",
+                "execution_deadline_unix_ms",
                 "authority",
                 "authority_sha256",
                 "admission",
@@ -1154,6 +1334,12 @@ class FinalOpenExecutor:
             or plan["open_id"] != self.open_id
             or type(plan["created_at_unix_ms"]) is not int
             or plan["created_at_unix_ms"] <= 0
+            or type(plan["execution_deadline_unix_ms"]) is not int
+            or plan["execution_deadline_unix_ms"] <= plan["created_at_unix_ms"]
+            or type(plan["admission"].get("expires_at_unix_ms")) is not int
+            or plan["execution_deadline_unix_ms"]
+            != plan["admission"]["expires_at_unix_ms"]
+            - OPEN_EXECUTION_MIN_REMAINING_MS
             or plan["authority_sha256"] != sha256(canonical_json(plan["authority"]))
             or plan["admission_sha256"] != sha256(canonical_json(plan["admission"]))
             or plan["effects_sha256"] != sha256(canonical_json(plan["effects"]))
@@ -1176,7 +1362,7 @@ class FinalOpenExecutor:
         prepared = PreparedAdmission(plan["admission"])
         effects = validate_effects(plan["effects"], authority, self.open_id)
         self.admission.validate(prepared, authority)
-        self.effects.validate(effects, authority)
+        self.effects.validate_plan(effects, authority)
         return plan, "sha256:" + actual, authority, prepared, effects
 
     def _load_chain(
@@ -1238,7 +1424,7 @@ class FinalOpenExecutor:
     ) -> None:
         if "open-started" in loaded:
             expected = {
-                "status": "forward_only_open_started",
+                "status": "closed_preparation_started",
                 "reset_complete_receipt_sha256": (
                     authority.reset_complete_receipt_sha256
                 ),
@@ -1246,12 +1432,6 @@ class FinalOpenExecutor:
             }
             if loaded["open-started"][1]["evidence"] != expected:
                 raise FinalOpenError("open-started evidence drifted")
-        if "mutation-admission-open" in loaded:
-            self.admission.validate_open_evidence(
-                loaded["mutation-admission-open"][1]["evidence"],
-                prepared,
-                authority,
-            )
         for node in effects["nodes"]:
             stage = f"node-{node['node_id']}-schedulable"
             if stage in loaded:
@@ -1279,6 +1459,18 @@ class FinalOpenExecutor:
                 effects,
                 authority,
             )
+        if "mutation-admission-open-finalizing" in loaded:
+            if (
+                loaded["mutation-admission-open-finalizing"][1]["evidence"]
+                != self._open_finalizing_evidence(prepared)
+            ):
+                raise FinalOpenError("Open finalization marker evidence drifted")
+        if "mutation-admission-open" in loaded:
+            self.admission.validate_open_evidence(
+                loaded["mutation-admission-open"][1]["evidence"],
+                prepared,
+                authority,
+            )
         if "open-complete" in loaded:
             expected = {
                 "outcome": "open_complete",
@@ -1299,6 +1491,23 @@ class FinalOpenExecutor:
             "cleanup-fleet-closed",
             "open-aborted",
         ]
+
+    def _conservative_cleanup_projection(
+        self,
+        main: dict[str, tuple[Path, dict[str, Any], str]],
+        effects: dict[str, Any],
+    ) -> tuple[bool, bool, list[dict[str, Any]]]:
+        """Include the one receipt-less effect that may already have applied."""
+
+        admission_may_be_open = "mutation-admission-open-finalizing" in main
+        possibly_schedulable: list[dict[str, Any]] = []
+        if "open-started" in main:
+            for node in effects["nodes"]:
+                possibly_schedulable.append(node)
+                if f"node-{node['node_id']}-schedulable" not in main:
+                    break
+        ingress_may_be_open = "nodes-schedulable" in main
+        return admission_may_be_open, ingress_may_be_open, possibly_schedulable
 
     def _stage_artifact_exists(self, stage: str) -> bool:
         return any(
@@ -1333,6 +1542,10 @@ class FinalOpenExecutor:
                     "cleanup journal has an effect receipt without cleanup-started"
                 )
             return None
+        if "mutation-admission-open-finalizing" in main:
+            raise FinalOpenError(
+                "cleanup journal crossed the forward-only Open finalization marker"
+            )
         _path, start_value, _digest = start
         if not isinstance(start_value, dict):
             raise FinalOpenError("cleanup-started receipt is not an object")
@@ -1357,12 +1570,8 @@ class FinalOpenExecutor:
             or not isinstance(node_ids, list)
             or any(not isinstance(node_id, str) for node_id in node_ids)
             or node_ids != all_node_ids[: len(node_ids)]
-            or (node_ids and not evidence["admission_may_be_open"])
             or (evidence["ingress_may_be_open"] and node_ids != all_node_ids)
-            or (
-                "mutation-admission-open" in main
-                and not evidence["admission_may_be_open"]
-            )
+            or evidence["admission_may_be_open"]
             or (
                 "public-ingress-open" in main
                 and not evidence["ingress_may_be_open"]
@@ -1494,11 +1703,6 @@ class FinalOpenExecutor:
             raise FinalOpenError(
                 "apply requires the exact immutable plan published for this open_id"
             )
-        live_authority = self._authority()
-        if live_authority != planned_authority:
-            raise FinalOpenError("terminal reset/proof authority changed since planning")
-        self.admission.validate(prepared, live_authority)
-        self.effects.validate(effects, live_authority)
         authority_digest = plan["authority_sha256"]
         stages = self._stage_names(effects)
         existing = self._load_chain(stages, plan_digest, authority_digest)
@@ -1511,7 +1715,7 @@ class FinalOpenExecutor:
         )
         self._validate_main_chain(
             existing,
-            authority=live_authority,
+            authority=planned_authority,
             prepared=prepared,
             effects=effects,
         )
@@ -1520,7 +1724,7 @@ class FinalOpenExecutor:
             self._validate_cleanup_chain(
                 cleanup_context,
                 cleanup_existing,
-                authority=live_authority,
+                authority=planned_authority,
                 prepared=prepared,
                 effects=effects,
             )
@@ -1532,6 +1736,12 @@ class FinalOpenExecutor:
                 raise FinalOpenError(
                     "closed cleanup is incomplete; use --execute to resume it"
                 )
+            live_authority = self._post_boundary_authority(
+                planned_authority,
+                cleanup=True,
+            )
+            self.admission.validate(prepared, live_authority)
+            self.effects.validate_cleanup(effects, live_authority)
             self._resume_cleanup(
                 context=cleanup_context,
                 existing=cleanup_existing,
@@ -1547,11 +1757,79 @@ class FinalOpenExecutor:
         if "open-complete" in existing:
             path, _value, digest = existing["open-complete"]
             return path, digest.removeprefix("sha256:")
+
+        started_on_entry = "open-started" in existing
+        finalizing_on_entry = "mutation-admission-open-finalizing" in existing
+        if started_on_entry:
+            try:
+                live_authority = self._post_boundary_authority(
+                    planned_authority,
+                    cleanup=False,
+                )
+                self.admission.validate(prepared, live_authority)
+                self.effects.validate_post_boundary_forward(
+                    effects,
+                    live_authority,
+                )
+            except BaseException as forward_error:
+                if finalizing_on_entry:
+                    raise FinalOpenError(
+                        "Open finalization authority is unavailable; exact-forward resume is required"
+                    ) from forward_error
+                if not execute:
+                    raise FinalOpenError(
+                        "post-boundary forward authority failed; use --execute for cleanup"
+                    ) from forward_error
+                cleanup_authority = self._post_boundary_authority(
+                    planned_authority,
+                    cleanup=True,
+                )
+                self.admission.validate(prepared, cleanup_authority)
+                self.effects.validate_cleanup(effects, cleanup_authority)
+                (
+                    admission_may_be_open,
+                    ingress_may_be_open,
+                    possibly_schedulable,
+                ) = self._conservative_cleanup_projection(existing, effects)
+                self._start_or_resume_cleanup(
+                    plan_digest=plan_digest,
+                    authority_digest=authority_digest,
+                    authority=cleanup_authority,
+                    prepared=prepared,
+                    effects=effects,
+                    admission_may_be_open=admission_may_be_open,
+                    ingress_may_be_open=ingress_may_be_open,
+                    possibly_schedulable=possibly_schedulable,
+                )
+                raise FinalOpenError(
+                    "post-boundary forward authority failed; closed cleanup is terminal"
+                ) from forward_error
+        else:
+            live_authority = self._authority()
+            if live_authority != planned_authority:
+                raise FinalOpenError(
+                    "terminal reset/proof authority changed since planning"
+                )
+            self.admission.validate(prepared, live_authority)
         if not execute:
             if existing:
                 raise FinalOpenError(
                     "final Open already crossed open-started; use --execute to resume"
                 )
+            evaluated_at_unix_ms = now_unix_ms()
+            if evaluated_at_unix_ms >= plan["execution_deadline_unix_ms"]:
+                raise FinalOpenError(
+                    "final-open plan expired before its mutation-free dry-run"
+                )
+            self.admission.validate_live_closed(
+                prepared,
+                live_authority,
+                evaluated_at_unix_ms,
+            )
+            self.effects.validate_live_closed_before_start(
+                effects,
+                live_authority,
+            )
             dry_run = RESET.read_stage_receipt(
                 self.receipt_directory,
                 self.open_id,
@@ -1600,21 +1878,36 @@ class FinalOpenExecutor:
         prior_handlers: dict[int, Any] = {}
         for signal_number in (signal.SIGINT, signal.SIGTERM):
             prior_handlers[signal_number] = signal.signal(signal_number, cancellation.handler)
-        admission_may_be_open = "mutation-admission-open" in existing
-        ingress_may_be_open = "public-ingress-open" in existing
-        possibly_schedulable = [
-            node
-            for node in effects["nodes"]
-            if f"node-{node['node_id']}-schedulable" in existing
-        ]
+        (
+            admission_may_be_open,
+            ingress_may_be_open,
+            possibly_schedulable,
+        ) = self._conservative_cleanup_projection(existing, effects)
+        admission_finalization_started = finalizing_on_entry
         try:
-            if "open-started" not in existing:
+            if not started_on_entry:
+                if cancellation.requested:
+                    raise FinalOpenError("final Open cancelled before open-started")
+                evaluated_at_unix_ms = now_unix_ms()
+                if evaluated_at_unix_ms >= plan["execution_deadline_unix_ms"]:
+                    raise FinalOpenError(
+                        "final-open plan expired before open-started"
+                    )
+                self.admission.validate_live_closed(
+                    prepared,
+                    live_authority,
+                    evaluated_at_unix_ms,
+                )
+                self.effects.validate_live_closed_before_start(
+                    effects,
+                    live_authority,
+                )
                 if cancellation.requested:
                     raise FinalOpenError("final Open cancelled before open-started")
                 _path, _value, previous = self._publish_stage(
                     "open-started",
                     {
-                        "status": "forward_only_open_started",
+                        "status": "closed_preparation_started",
                         "reset_complete_receipt_sha256": (
                             live_authority.reset_complete_receipt_sha256
                         ),
@@ -1624,23 +1917,17 @@ class FinalOpenExecutor:
                     authority_sha256=authority_digest,
                     previous_sha256=None,
                 )
-            if "mutation-admission-open" not in existing:
-                if cancellation.requested:
-                    raise FinalOpenError("final Open cancelled at a stage boundary")
-                admission_may_be_open = True
-                evidence = self.admission.settle_open(prepared, live_authority)
-                _path, _value, previous = self._publish_stage(
-                    "mutation-admission-open",
-                    evidence,
-                    plan_sha256=plan_digest,
-                    authority_sha256=authority_digest,
-                    previous_sha256=previous,
+            if started_on_entry and not finalizing_on_entry:
+                evaluated_at_unix_ms = now_unix_ms()
+                if evaluated_at_unix_ms >= plan["execution_deadline_unix_ms"]:
+                    raise FinalOpenError(
+                        "signed Open expired before finalization; closing the attempt"
+                    )
+                self.admission.validate_live_closed(
+                    prepared,
+                    live_authority,
+                    evaluated_at_unix_ms,
                 )
-            else:
-                open_evidence = existing["mutation-admission-open"][1]["evidence"]
-                settled = self.admission.settle_open(prepared, live_authority)
-                if settled != open_evidence:
-                    raise FinalOpenError("final-open admission replay drifted")
 
             for node in effects["nodes"]:
                 stage = f"node-{node['node_id']}-schedulable"
@@ -1694,8 +1981,57 @@ class FinalOpenExecutor:
                     authority_sha256=authority_digest,
                     previous_sha256=previous,
                 )
-            if cancellation.requested:
-                raise FinalOpenError("final Open cancelled at a stage boundary")
+            if "mutation-admission-open-finalizing" not in existing:
+                if cancellation.requested:
+                    raise FinalOpenError("final Open cancelled before Open finalization")
+                evaluated_at_unix_ms = now_unix_ms()
+                if evaluated_at_unix_ms >= plan["execution_deadline_unix_ms"]:
+                    raise FinalOpenError(
+                        "signed Open expired before finalization; closing the attempt"
+                    )
+                self.admission.validate_live_closed(
+                    prepared,
+                    live_authority,
+                    evaluated_at_unix_ms,
+                )
+                if cancellation.requested:
+                    raise FinalOpenError(
+                        "final Open cancelled before Open finalization"
+                    )
+                # Once this immutable marker may have linked, cancellation and
+                # every ambiguous result converge only by settling the exact
+                # reviewed Open command.  There is no later external effect.
+                admission_finalization_started = True
+                admission_may_be_open = True
+                _path, _value, previous = self._publish_stage(
+                    "mutation-admission-open-finalizing",
+                    self._open_finalizing_evidence(prepared),
+                    plan_sha256=plan_digest,
+                    authority_sha256=authority_digest,
+                    previous_sha256=previous,
+                )
+            if "mutation-admission-open" not in existing:
+                evidence = self.admission.settle_open(
+                    prepared,
+                    live_authority,
+                    cancellation,
+                )
+                _path, _value, previous = self._publish_stage(
+                    "mutation-admission-open",
+                    evidence,
+                    plan_sha256=plan_digest,
+                    authority_sha256=authority_digest,
+                    previous_sha256=previous,
+                )
+            else:
+                open_evidence = existing["mutation-admission-open"][1]["evidence"]
+                settled = self.admission.settle_open(
+                    prepared,
+                    live_authority,
+                    cancellation,
+                )
+                if settled != open_evidence:
+                    raise FinalOpenError("final-open admission replay drifted")
             complete_path, _complete, complete_digest = self._publish_stage(
                 "open-complete",
                 {
@@ -1711,6 +2047,10 @@ class FinalOpenExecutor:
             )
             return complete_path, complete_digest.removeprefix("sha256:")
         except BaseException as error:
+            if admission_finalization_started:
+                raise FinalOpenError(
+                    "Open finalization is incomplete; resume the exact plan to settle it"
+                ) from error
             if "open-started" in existing or previous is not None:
                 try:
                     self._start_or_resume_cleanup(

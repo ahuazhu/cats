@@ -96,7 +96,9 @@ terminalization、read/health/reset。结束 qualification 后必须先线性化
 - Account/Stripe/internal authority 保持各自的 authentication、idempotency 与 recovery protocol；它们不能
   mint runtime product admission，也不能把 qualification scope 扩到另一个 Workspace。
 - final `Open` 仍必须消费完整 reset/proof set。Closed qualification binding 可被新的 exact qualification
-  或 final Open 替换；Closed final-Open binding 只能用同一 exact binding 重开。
+  或 final Open 替换；Closed final-Open binding 只能用同一 exact binding 重开。final-open 的 effect 顺序由
+  [ADR-0053](0053-final-open-last-product-admission.md) 修正：Node/Ingress/read-only probe 在 Closed 下完成，
+  Open 是最后一个外部 effect。
 
 ## 不采用的方案
 

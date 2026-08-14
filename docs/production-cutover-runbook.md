@@ -1099,8 +1099,9 @@ remaining old-retirement receipt. The accepted cross-component admission authori
 exact mutation-open transition; today that input is
 `DEFERRED(CROSS_COMPONENT_MUTATION_ADMISSION_OPEN)`, so none of the commands below may run.
 
-When that prerequisite exists, apply a reviewed monotonic A23 schedulable policy to each exact Node
-(repeat per Node and use its exact current revision):
+When that prerequisite exists, ADR-0053 keeps product mutation admission at exact `Closed` while
+preparing all other serving effects. Apply a reviewed monotonic A23 schedulable policy to each exact
+Node (repeat per Node and use its exact current revision):
 
 ```sh
 /approved/staged-worker/cats \
@@ -1115,9 +1116,8 @@ When that prerequisite exists, apply a reviewed monotonic A23 schedulable policy
   > /approved/evidence/<CUTOVER_ID>/110-<EXACT_NODE_ID>-schedulable-result.v1.json
 ```
 
-Only after mutation admission is opened by its accepted exact transition, prepare a final
-application tfvars with `maintenance_mode=false` and `enable_public_ingress=true`, then use one
-reviewed saved plan:
+With mutation admission still Closed, prepare a final application tfvars with
+`maintenance_mode=false` and `enable_public_ingress=true`, then use one reviewed saved plan:
 
 ```sh
 terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
@@ -1135,15 +1135,22 @@ terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
 ```
 
 After rollout, rerun E12's fleet verifier with the now-schedulable policy facts and run the
-repository's bounded public HTTP/WebSocket probe before creating any new product resource. Do not
-reuse the E3 qualification Cat, any retired ID, credential, SPKI, schema, prefix, stream or table.
+repository's bounded read-only public `GET /healthz` probe while product admission is still Closed;
+do not use the shell WebSocket or another product operation as this probe. Full public WebSocket
+evidence remains the reset-bound G3 qualification rather than a post-reset product mutation.
+Immediately re-discover the exact planned Closed revision and signed-command lifetime, publish the
+forward-only `mutation-admission-open-finalizing` marker, then settle the one exact Open command as
+the final external effect and publish `open-complete`. Before the marker, failure closes Ingress and
+re-cordons every possibly schedulable Node; after it, cancellation or ambiguity only exact-forward
+settles Open and never EmergencyClose. Do not reuse the E3 qualification Cat, any retired ID,
+credential, SPKI, schema, prefix, stream or table.
 
 **Retain.** Independent final-reset verification, mutation-open receipt, every schedulable policy
 result, public-open plan/apply evidence and bounded public probes.
 
-**Cancel point.** If failure occurs before any opening transition, remain Closed. Once admission is
-partially opened, close it through its accepted exact authority before diagnosis; do not compensate
-with ad hoc ingress or Node commands.
+**Cancel point.** Before `mutation-admission-open-finalizing`, use the journaled Closed cleanup. At or
+after that marker, cancellation cannot change the decision: resume the same plan and exact Open
+command to `open-complete`; do not compensate with ad hoc Ingress, Node or admission commands.
 
 ## Operator sign-off checklist
 

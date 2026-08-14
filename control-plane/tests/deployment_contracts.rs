@@ -393,6 +393,25 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
     assert!(stdout.contains("S3 expected-owner gates passed"));
     assert!(stdout.contains("fresh DB read-only"));
     assert!(stdout.contains("ingress Closed"));
+    assert!(stdout.contains("post-open forward/credential-independent cleanup verification"));
+}
+
+#[test]
+fn production_final_open_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-final-open-fixture.py"))
+        .output()
+        .expect("run production final-open fixture");
+    assert!(
+        output.status.success(),
+        "production final-open fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("fixture output is UTF-8"),
+        "production final-open fixture: PASS\n"
+    );
 }
 
 #[test]

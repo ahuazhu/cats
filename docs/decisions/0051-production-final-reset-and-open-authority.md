@@ -9,6 +9,7 @@
   [ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)、
   [ADR-0044](0044-independent-route-v2-signing-authority.md)
 - 后续闭合：[ADR-0052](0052-bounded-production-qualification-admission.md)
+- final-open 顺序修正：[ADR-0053](0053-final-open-last-product-admission.md)
 - 规格：[Production reset and final-open authority v1](../specs/production-reset-open-authority-v1.md)
 
 ## 背景
@@ -57,14 +58,17 @@ Ingress。外部 effect 的 success response 可能丢失，因此 exit code 或
    postcondition discovery；ambiguous response不blind retry，receipt gap、body drift、effect-ahead或
    fresh-boundary drift停止并保留全部证据。
 7. public open 是独立 transaction。它只接受 exact verified `reset-complete` 和同一 proof set，先写
-   `open-started`，再通过专用E13 signed command/CAS完成mutation-open，然后通过已有authority完成每个A23 Node exact
-   cordoned→schedulable apply、reviewed Terraform public-ingress apply。每个外部 mutation使用固定 request ID/
-   body，response不明时只经官方 typed discovery/replay结算；不得 direct SQL、patch Kubernetes state、写
-   Control内部row或接受任意operator command。
-8. 任一 open stage 失败或取消时，operator transaction先用相同官方 authority关闭 ingress、把已打开Node
-   exact re-cordon并重验 empty/Closed/zero-guard fleet，再退出非零。只有所有terminal stage与最终公开
-   HTTP/WebSocket probe完成后才写`open-complete`；此前不得创建新产品resource。cleanup receipt不授权继续
-   open，必须重新生成并review fresh open plan。
+   `open-started`；[ADR-0053](0053-final-open-last-product-admission.md) 修正本条原 effect 顺序为：在 product
+   admission 保持 Closed 时通过已有 authority 完成每个 A23 Node exact cordoned→schedulable apply、reviewed
+   Terraform public-ingress apply 与 read-only `GET /healthz` probe，最后才通过专用 E13 signed command/CAS
+   完成 mutation-open。每个外部 mutation 使用固定 request ID/body，response 不明时只经官方 typed
+   discovery/replay 结算；不得 direct SQL、patch Kubernetes state、写 Control 内部 row 或接受任意 operator
+   command。
+8. ADR-0053 的 `mutation-admission-open-finalizing` marker 前，任一 stage 失败或取消时 operator transaction
+   先用相同官方 authority 关闭 Ingress、把所有可能已打开 Node exact re-cordon、确认 admission 仍为 exact
+   Closed，并重验 empty/zero-guard fleet，再退出非零。marker 后只允许 exact-forward settle 同一 Open 并紧邻
+   写 `open-complete`，不得 EmergencyClose。cleanup receipt 不授权继续 open，必须重新生成并 review fresh
+   open plan。
 9. 全部 authority JSON使用closed decoder、bounded stable read、duplicate-key rejection和exact digest。
    operator journal使用同目录0600临时文件、file fsync、no-replace publish、directory fsync；JSON是authority，
    SHA sidecar只由其exact bytes派生。exact replay可补丢失sidecar，不能覆盖不同bytes。
@@ -75,8 +79,9 @@ Ingress。外部 effect 的 success response 可能丢失，因此 exit code 或
 - reset与public open由两个journal隔开；完成旧namespace retirement不会隐式 uncordon 或创建Ingress。
 - old Host的本地正向停止与不可达Host的external fence可混合覆盖，但同一个Host/component必须恰好一个
   terminal authority；EC2 deny-all evidence仍只是诊断证据。
-- rollback只存在于`reset-started`之前。public-open的安全恢复是重新关闭，而不是恢复old namespace或复用
-  retired credential/ID/schema/prefix/stream。
+- rollback只存在于`reset-started`之前。public-open 在 ADR-0053 marker 前通过 Ingress close/Node cordon并
+  证明 admission 仍是 original Closed 来恢复；marker 后只 exact-forward Open，绝不恢复 old namespace、
+  EmergencyClose 或复用 retired credential/ID/schema/prefix/stream。
 
 ## 不采用的方案
 
