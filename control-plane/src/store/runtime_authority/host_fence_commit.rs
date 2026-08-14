@@ -157,7 +157,7 @@ fn next_epoch(value: Epoch) -> AuthorityTxResult<Epoch> {
         .ok_or_else(|| rejected("recovery placement epoch is exhausted"))
 }
 
-fn takeover_payload(
+pub(super) fn takeover_payload(
     record: &AuthorizationRecord,
 ) -> AuthorityTxResult<&cats_api::runtime_reconciliation::VolumeTakeoverAuthorization> {
     if !matches!(record.state, AuthorizationState::Unconsumed) {
@@ -704,7 +704,7 @@ fn lock_fresh_preconditions(
     Ok(session)
 }
 
-fn retire_source_node(
+pub(super) fn retire_source_node(
     transaction: &mut Transaction<'_>,
     identity: &NodeIdentity,
     session: &AgentSession,
@@ -742,7 +742,7 @@ fn retire_source_node(
     Ok(())
 }
 
-fn insert_terminal_event(
+pub(super) fn insert_terminal_event(
     transaction: &mut Transaction<'_>,
     event: &TrustedHostFenceEventV1,
 ) -> AuthorityTxResult<()> {
@@ -798,7 +798,7 @@ fn head_projection(head: &RemoteHead) -> AuthorityTxResult<(i64, Option<String>,
     ))
 }
 
-fn insert_takeover_authorization(
+pub(super) fn insert_takeover_authorization(
     transaction: &mut Transaction<'_>,
     record: &AuthorizationRecord,
 ) -> AuthorityTxResult<()> {
@@ -847,7 +847,7 @@ fn insert_takeover_authorization(
     Ok(())
 }
 
-fn replace_desired(
+pub(super) fn replace_desired(
     transaction: &mut Transaction<'_>,
     expected: &DesiredRuntimeSpec,
     replacement: &DesiredRuntimeSpec,
@@ -899,7 +899,7 @@ fn replace_desired(
     Ok(())
 }
 
-fn update_hostname_lookups(
+pub(super) fn update_hostname_lookups(
     transaction: &mut Transaction<'_>,
     expected: &DesiredRuntimeSpec,
     replacement: &DesiredRuntimeSpec,

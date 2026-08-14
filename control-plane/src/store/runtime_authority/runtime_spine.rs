@@ -2974,7 +2974,7 @@ fn upsert_observation_receive_state(
     Ok(())
 }
 
-fn load_admission_inventory_state_for_update(
+pub(super) fn load_admission_inventory_state_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AdmissionInventoryState>> {

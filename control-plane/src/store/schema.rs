@@ -1574,9 +1574,15 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
         "trusted_host_fence_recovery_attempts_v1",
+        "host_recovery_attempt_apply_id_key",
+        "apply_id",
+        None,
+    ),
+    (
+        "trusted_host_fence_recovery_attempts_v1",
         "host_recovery_one_active_source_session",
         "provider,host_partition,host_account_id,host_region,immutable_host_id,node_id,expected_node_boot_id,expected_agent_session_epoch",
-        Some("(state = ANY (ARRAY['provider_pending'::text, 'provider_terminal'::text]))"),
+        Some("(state = ANY (ARRAY['provider_pending'::text, 'provider_terminal'::text, 'blocked'::text]))"),
     ),
     (
         "trusted_host_fence_recovery_attempt_cats_v1",
@@ -2218,7 +2224,7 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "host_recovery_attempt_transition_v1",
         "control_host_recovery_attempt_transition_v1",
         BEFORE_ROW_UPDATE,
-        "966a5712f6f2e6680a6eb0d4d926312fbced1d94da8dfbdf34777f409ab13752",
+        "3dce8a351119f6f0c6dffd4567e7d4787f815507ce1a840ceae46de4e06f16b0",
     ),
     (
         "trusted_host_fence_recovery_attempts_v1",
@@ -2303,12 +2309,15 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             renewed_to_unix_ms, evidence_bytes, evidence_sha256,
             enqueued_at_unix_ms, completed_at_unix_ms
        FROM host_fence_provider_queue_v1 WHERE FALSE",
-    "SELECT fence_attempt_id, attempt_bytes, attempt_sha256,
+    "SELECT fence_attempt_id, apply_id, attempt_bytes, attempt_sha256,
             provider, host_partition, host_account_id, host_region,
             immutable_host_id, node_id, expected_node_boot_id,
             agent_instance_id, expected_agent_session_epoch,
             physical_snapshot_state, inventory_epoch, inventory_digest, inventory_read_position,
-            full_observation_id, assigned_set_sha256, assigned_cat_count,
+            full_observation_id, full_observation_bytes,
+            full_observation_sha256, full_observation_length,
+            assigned_snapshot_bytes, assigned_snapshot_sha256,
+            assigned_snapshot_length, assigned_set_sha256, assigned_cat_count,
             state, provider_evidence_bytes, provider_evidence_sha256,
             provider_completed_at_unix_ms, outcome_bytes, outcome_sha256,
             enqueued_at_unix_ms, outcome_completed_at_unix_ms
@@ -4781,9 +4790,12 @@ EXECUTE FUNCTION control_host_fence_provider_queue_cannot_delete();
 CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
     fence_attempt_id TEXT
         CONSTRAINT trusted_host_fence_recovery_attempts_v1_pkey PRIMARY KEY,
+    apply_id TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_apply_id_check
+        CHECK (apply_id ~ '^[0-9a-f]{32}$'),
     attempt_bytes BYTEA NOT NULL
         CONSTRAINT host_recovery_attempt_bytes_check
-        CHECK (octet_length(attempt_bytes) BETWEEN 2 AND 67108864),
+        CHECK (octet_length(attempt_bytes) BETWEEN 2 AND 33554432),
     attempt_sha256 TEXT NOT NULL
         CONSTRAINT host_recovery_attempt_digest_check
         CHECK (attempt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -4819,6 +4831,26 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
     full_observation_id TEXT
         CONSTRAINT host_recovery_attempt_observation_id_check
         CHECK (full_observation_id ~ '^[0-9a-f]{32}$'),
+    full_observation_bytes BYTEA
+        CONSTRAINT host_recovery_attempt_observation_bytes_check
+        CHECK (full_observation_bytes IS NULL OR
+               octet_length(full_observation_bytes) BETWEEN 2 AND 8388608),
+    full_observation_sha256 TEXT
+        CONSTRAINT host_recovery_attempt_observation_digest_check
+        CHECK (full_observation_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    full_observation_length BIGINT
+        CONSTRAINT host_recovery_attempt_observation_length_check
+        CHECK (full_observation_length BETWEEN 2 AND 8388608),
+    assigned_snapshot_bytes BYTEA
+        CONSTRAINT host_recovery_attempt_snapshot_bytes_check
+        CHECK (assigned_snapshot_bytes IS NULL OR
+               octet_length(assigned_snapshot_bytes) BETWEEN 2 AND 16777216),
+    assigned_snapshot_sha256 TEXT
+        CONSTRAINT host_recovery_attempt_snapshot_digest_check
+        CHECK (assigned_snapshot_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    assigned_snapshot_length BIGINT
+        CONSTRAINT host_recovery_attempt_snapshot_length_check
+        CHECK (assigned_snapshot_length BETWEEN 2 AND 16777216),
     assigned_set_sha256 TEXT NOT NULL
         CONSTRAINT host_recovery_attempt_assigned_digest_check
         CHECK (assigned_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -4861,11 +4893,25 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
         (physical_snapshot_state = 'accepted_full'
             AND inventory_epoch IS NOT NULL AND inventory_digest IS NOT NULL
             AND inventory_read_position IS NOT NULL
-            AND full_observation_id IS NOT NULL) OR
+            AND full_observation_id IS NOT NULL
+            AND full_observation_bytes IS NOT NULL
+            AND full_observation_sha256 IS NOT NULL
+            AND full_observation_length IS NOT NULL
+            AND octet_length(full_observation_bytes) = full_observation_length
+            AND assigned_snapshot_bytes IS NOT NULL
+            AND assigned_snapshot_sha256 IS NOT NULL
+            AND assigned_snapshot_length IS NOT NULL
+            AND octet_length(assigned_snapshot_bytes) = assigned_snapshot_length) OR
         (physical_snapshot_state = 'unavailable'
             AND inventory_epoch IS NULL AND inventory_digest IS NULL
             AND inventory_read_position IS NULL
-            AND full_observation_id IS NULL)
+            AND full_observation_id IS NULL
+            AND full_observation_bytes IS NULL
+            AND full_observation_sha256 IS NULL
+            AND full_observation_length IS NULL
+            AND assigned_snapshot_bytes IS NULL
+            AND assigned_snapshot_sha256 IS NULL
+            AND assigned_snapshot_length IS NULL)
     ),
     CONSTRAINT host_recovery_attempt_state_shape_check CHECK (
         (state = 'provider_pending' AND provider_evidence_bytes IS NULL
@@ -4884,18 +4930,19 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
             AND provider_completed_at_unix_ms IS NOT NULL
             AND outcome_bytes IS NOT NULL AND outcome_sha256 IS NOT NULL
             AND outcome_completed_at_unix_ms IS NOT NULL)
-    )
+    ),
+    CONSTRAINT host_recovery_attempt_apply_id_key UNIQUE (apply_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS host_recovery_one_active_source_session
     ON trusted_host_fence_recovery_attempts_v1(
         provider, host_partition, host_account_id, host_region,
         immutable_host_id, node_id, expected_node_boot_id,
         expected_agent_session_epoch
-    ) WHERE state IN ('provider_pending', 'provider_terminal');
+    ) WHERE state IN ('provider_pending', 'provider_terminal', 'blocked');
 CREATE INDEX IF NOT EXISTS host_recovery_active_node_barrier
     ON trusted_host_fence_recovery_attempts_v1(
         node_id, state, fence_attempt_id COLLATE \"C\"
-    ) WHERE state IN ('provider_pending', 'provider_terminal');
+    ) WHERE state IN ('provider_pending', 'provider_terminal', 'blocked');
 CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
     fence_attempt_id TEXT NOT NULL,
     ordinal BIGINT NOT NULL
@@ -4906,7 +4953,7 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
         REFERENCES cat_records(cat_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     cat_snapshot_bytes BYTEA NOT NULL
         CONSTRAINT host_recovery_cat_snapshot_bytes_check
-        CHECK (octet_length(cat_snapshot_bytes) BETWEEN 2 AND 8388608),
+        CHECK (octet_length(cat_snapshot_bytes) BETWEEN 2 AND 33554432),
     cat_snapshot_sha256 TEXT NOT NULL
         CONSTRAINT host_recovery_cat_snapshot_digest_check
         CHECK (cat_snapshot_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -4923,7 +4970,7 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     volume_count BIGINT NOT NULL
         CONSTRAINT host_recovery_cat_volume_count_check
-        CHECK (volume_count BETWEEN 1 AND 1024),
+        CHECK (volume_count BETWEEN 1 AND 64),
     volume_set_sha256 TEXT NOT NULL
         CONSTRAINT host_recovery_cat_volume_digest_check
         CHECK (volume_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -4939,20 +4986,28 @@ CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
 CREATE OR REPLACE FUNCTION control_host_recovery_attempt_transition_v1()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    IF (OLD.fence_attempt_id, OLD.attempt_bytes, OLD.attempt_sha256,
+    IF (OLD.fence_attempt_id, OLD.apply_id, OLD.attempt_bytes, OLD.attempt_sha256,
         OLD.provider, OLD.host_partition, OLD.host_account_id, OLD.host_region,
         OLD.immutable_host_id, OLD.node_id, OLD.expected_node_boot_id,
         OLD.agent_instance_id, OLD.expected_agent_session_epoch,
         OLD.physical_snapshot_state, OLD.inventory_epoch, OLD.inventory_digest,
-        OLD.inventory_read_position, OLD.full_observation_id, OLD.assigned_set_sha256,
+        OLD.inventory_read_position, OLD.full_observation_id,
+        OLD.full_observation_bytes, OLD.full_observation_sha256,
+        OLD.full_observation_length, OLD.assigned_snapshot_bytes,
+        OLD.assigned_snapshot_sha256, OLD.assigned_snapshot_length,
+        OLD.assigned_set_sha256,
         OLD.assigned_cat_count, OLD.enqueued_at_unix_ms)
        IS DISTINCT FROM
-       (NEW.fence_attempt_id, NEW.attempt_bytes, NEW.attempt_sha256,
+       (NEW.fence_attempt_id, NEW.apply_id, NEW.attempt_bytes, NEW.attempt_sha256,
         NEW.provider, NEW.host_partition, NEW.host_account_id, NEW.host_region,
         NEW.immutable_host_id, NEW.node_id, NEW.expected_node_boot_id,
         NEW.agent_instance_id, NEW.expected_agent_session_epoch,
         NEW.physical_snapshot_state, NEW.inventory_epoch, NEW.inventory_digest,
-        NEW.inventory_read_position, NEW.full_observation_id, NEW.assigned_set_sha256,
+        NEW.inventory_read_position, NEW.full_observation_id,
+        NEW.full_observation_bytes, NEW.full_observation_sha256,
+        NEW.full_observation_length, NEW.assigned_snapshot_bytes,
+        NEW.assigned_snapshot_sha256, NEW.assigned_snapshot_length,
+        NEW.assigned_set_sha256,
         NEW.assigned_cat_count, NEW.enqueued_at_unix_ms)
        OR NOT (
             (OLD.state = 'provider_pending' AND NEW.state = 'provider_terminal'

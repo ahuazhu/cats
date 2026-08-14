@@ -91,6 +91,7 @@ fn corrupt(message: impl Into<String>) -> AuthorityTransactionError {
     application(ApiError::failed_precondition(message.into()))
 }
 
+#[allow(dead_code, reason = "also used by the gated C3 batch producer")]
 fn pg(value: u64) -> AuthorityTxResult<i64> {
     i64::try_from(value).map_err(|_| corrupt("Host-fence queue integer exceeds PostgreSQL BIGINT"))
 }
@@ -156,6 +157,7 @@ fn decode_canonical_evidence(bytes: &[u8]) -> AuthorityTxResult<HostFenceProvide
     Ok(evidence)
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch producer")]
 fn validate_request_binding(request: &HostFenceAttemptRequest) -> AuthorityTxResult<()> {
     if request.binding.provider_scope != request.object_writer.provider_scope {
         return Err(application(ApiError::invalid(
@@ -165,6 +167,7 @@ fn validate_request_binding(request: &HostFenceAttemptRequest) -> AuthorityTxRes
     Ok(())
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch authority")]
 pub(super) fn load_queue_for_update(
     transaction: &mut Transaction<'_>,
     fence_attempt_id: &Id,
@@ -192,6 +195,10 @@ pub(super) fn load_queue_for_update(
 /// recovery authority. Exact queue replay remains available to the legacy
 /// owner-side seam, but a batch producer must reject an existing queue row
 /// when its corresponding recovery-attempt row is absent.
+#[allow(
+    dead_code,
+    reason = "only the gated C3 batch authority may enqueue in production"
+)]
 pub(super) fn enqueue_host_fence_provider_attempt_in(
     transaction: &mut Transaction<'_>,
     request: &HostFenceAttemptRequest,
@@ -258,6 +265,7 @@ pub(super) fn enqueue_host_fence_provider_attempt_in(
         .ok_or_else(|| corrupt("Host-fence provider queue row disappeared after insert"))
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch producer")]
 fn exact_replay_or_conflict(
     existing: HostFenceProviderQueueRecordV1,
     request: &HostFenceAttemptRequest,
@@ -347,6 +355,7 @@ fn decode_queue_row(row: &Row) -> AuthorityTxResult<HostFenceProviderQueueRecord
     })
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch producer")]
 fn lock_current_source(
     transaction: &mut Transaction<'_>,
     request: &HostFenceAttemptRequest,
@@ -397,6 +406,7 @@ fn lock_current_source(
     Ok(())
 }
 
+#[allow(dead_code, reason = "used by the gated C3 batch producer")]
 fn validate_cutoff_authority(
     request: &HostFenceAttemptRequest,
     authority: &cats_storage::object_write_authority::ObjectWriteAuthority,
@@ -431,10 +441,11 @@ fn validate_cutoff_authority(
 }
 
 impl Store {
-    /// Seal one provider attempt and close its object-writer lineage in the
-    /// same transaction.  A committed exact replay returns the original row
-    /// before consulting source identities that recovery may already retire.
-    pub fn enqueue_host_fence_provider_attempt_v1(
+    /// Queue-only harness retained for the least-privilege worker protocol
+    /// tests. Production can enqueue only through the Host-scoped recovery
+    /// attempt transaction, which adds the assigned-set mutation barrier.
+    #[cfg(test)]
+    pub(crate) fn enqueue_host_fence_provider_attempt_for_test(
         &self,
         request: &HostFenceAttemptRequest,
     ) -> crate::store::Result<HostFenceProviderQueueRecordV1> {

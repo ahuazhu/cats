@@ -348,11 +348,11 @@ fn enqueue_closes_the_exact_writer_and_exact_replay_is_zero_write() {
     );
     let first = fixture
         .store
-        .enqueue_host_fence_provider_attempt_v1(&fixture.request)
+        .enqueue_host_fence_provider_attempt_for_test(&fixture.request)
         .unwrap();
     let replay = fixture
         .store
-        .enqueue_host_fence_provider_attempt_v1(&fixture.request)
+        .enqueue_host_fence_provider_attempt_for_test(&fixture.request)
         .unwrap();
     assert_eq!(first, replay);
     assert_eq!(
@@ -380,7 +380,7 @@ fn enqueue_closes_the_exact_writer_and_exact_replay_is_zero_write() {
     drift.network_quarantine_boundary_id = text("sg-0ffffffffffffffff");
     let error = fixture
         .store
-        .enqueue_host_fence_provider_attempt_v1(&drift)
+        .enqueue_host_fence_provider_attempt_for_test(&drift)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(
@@ -397,7 +397,7 @@ fn stale_source_session_is_zero_side_effect() {
         Epoch::new(stale.binding.expected_agent_session_epoch.get() + 1).unwrap();
     let error = fixture
         .store
-        .enqueue_host_fence_provider_attempt_v1(&stale)
+        .enqueue_host_fence_provider_attempt_for_test(&stale)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(
@@ -425,10 +425,10 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
     let first_request = fixture.request.clone();
     let second_request = fixture.request.clone();
     let first = std::thread::spawn(move || {
-        first_store.enqueue_host_fence_provider_attempt_v1(&first_request)
+        first_store.enqueue_host_fence_provider_attempt_for_test(&first_request)
     });
     let second = std::thread::spawn(move || {
-        second_store.enqueue_host_fence_provider_attempt_v1(&second_request)
+        second_store.enqueue_host_fence_provider_attempt_for_test(&second_request)
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -469,7 +469,7 @@ fn least_privilege_functions_claim_recover_cutoff_and_complete_exactly() {
     let fixture = fixture();
     fixture
         .store
-        .enqueue_host_fence_provider_attempt_v1(&fixture.request)
+        .enqueue_host_fence_provider_attempt_for_test(&fixture.request)
         .unwrap();
     let claim_token_1 = "11111111111111111111111111111111";
     let claim_token_2 = "22222222222222222222222222222222";

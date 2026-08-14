@@ -1059,7 +1059,7 @@ fn update_policy(
     )?)
 }
 
-fn load_policy_for_update(
+pub(super) fn load_policy_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<NodePlacementPolicy>> {

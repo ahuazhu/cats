@@ -530,6 +530,70 @@ fn evaluate_create_candidate(
     Ok(CandidateEvaluation::Eligible(network))
 }
 
+/// Re-evaluate a Host-recovery target from current policy, admission and the
+/// complete set of replacement Desired specs destined for that Node.
+///
+/// The caller holds every source/target NodeIdentity and policy row lock. This
+/// helper applies the same capacity/network oracle as ordinary Cat creation,
+/// adding replacements in canonical Cat order so a multi-Cat batch cannot
+/// overbook a target that admitted each Cat independently.
+#[allow(dead_code, reason = "used by the gated C3 batch authority")]
+pub(super) fn host_recovery_replacements_fit(
+    policy: &NodePlacementPolicy,
+    admission: &PlacementAdmissionSnapshot,
+    replacements: &[DesiredRuntimeSpec],
+) -> AuthorityTxResult<bool> {
+    if policy.scheduling_state != RuntimeSchedulingState::Schedulable
+        || policy.node_id != admission.node_identity.node_id
+        || admission.agent_session.guest_config_digest != policy.capabilities.guest_config_digest
+    {
+        return Ok(false);
+    }
+    let mut assigned = admission.assigned_desired_specs.clone();
+    let mut ordered = replacements.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.cat_id.as_str().cmp(right.cat_id.as_str()));
+    for replacement in ordered {
+        if replacement.placement.node_id != policy.node_id
+            || replacement.runtime.guest_config_digest != policy.capabilities.guest_config_digest
+        {
+            return Ok(false);
+        }
+        let validated = validate_current_assigned(policy, &assigned)?;
+        if assigned.len() == MAX_ASSIGNED_SPECS
+            || validated.cat_ids.contains(&replacement.cat_id)
+            || validated
+                .network_ids
+                .contains(&replacement.runtime.network_config.network_id)
+            || !observation_networks_are_clean(admission, &validated.desired_networks)
+        {
+            return Ok(false);
+        }
+        let post_vcpus = validated
+            .total_vcpus
+            .checked_add(u128::from(replacement.runtime.vcpus))
+            .ok_or_else(|| corrupt("Host recovery target vCPU sum overflow"))?;
+        let post_memory = validated
+            .total_memory
+            .checked_add(u128::from(replacement.runtime.memory_bytes))
+            .ok_or_else(|| corrupt("Host recovery target memory sum overflow"))?;
+        if post_vcpus > u128::from(policy.allocatable_vcpus.get())
+            || post_memory > u128::from(policy.allocatable_memory_bytes.get())
+        {
+            return Ok(false);
+        }
+        let allocated = allocate_network(
+            policy,
+            &replacement.runtime.network_config.network_id,
+            &validated.occupied_slots,
+        )?;
+        if allocated.as_ref() != Some(&replacement.runtime.network_config) {
+            return Ok(false);
+        }
+        assigned.push(replacement.clone());
+    }
+    Ok(true)
+}
+
 /// Revalidates a Cat-create target after the caller has reserved the API key
 /// and proved the name is free, but before any Volume/business row lock. The
 /// A20 helper takes the NodeIdentity coordination lock first; policy, fence,
