@@ -383,7 +383,7 @@ variable "rds_ca_pem" {
 variable "auto_warm_after_seconds" {
   description = "Seconds before an eligible Suspended Cat becomes Warm; zero disables the transition."
   type        = number
-  default     = 600
+  default     = 0
 
   validation {
     condition     = var.auto_warm_after_seconds >= 0 && floor(var.auto_warm_after_seconds) == var.auto_warm_after_seconds

@@ -65,6 +65,9 @@ async fn cat_lifecycle_v2(
         check_workspace_auth(&state, request.headers(), &workspace),
     )
     .await??;
+    if action == CatLifecycleAction::Warm {
+        return Err(ApiError::failed_precondition("Warm is unavailable in this release").into());
+    }
     let workspace_id = authenticated_workspace_id(&scope.workspace.id)?;
     let ingress = authorized_after_auth(
         &workspace_id,
@@ -414,6 +417,29 @@ mod tests {
         );
         let client = reqwest::Client::new();
 
+        let warm_url = format!(
+            "{}/v1/workspaces/{workspace}/cats/{cat_id}/actions/warm",
+            handle.base_url()
+        );
+        assert_eq!(
+            client.post(&warm_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let warm = client
+            .post(&warm_url)
+            .bearer_auth("admin-token")
+            .header("Idempotency-Key", "warm-disabled-r1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::PRECONDITION_FAILED);
+        let warm_body: cats_api::error::ErrorBody = warm.json().await.unwrap();
+        assert_eq!(
+            warm_body.code,
+            cats_api::error::ErrorCode::FailedPrecondition
+        );
+        assert!(warm_body.message.contains("Warm"));
+
         // Authentication precedes body/envelope parsing on the legal V2
         // route, including for a deliberately malformed non-empty body.
         let unauthenticated = client
@@ -486,6 +512,23 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(malformed_rows, 0);
+        let warm_rows: i64 = tokio::task::block_in_place(|| {
+            handle
+                .state
+                .store
+                .with(|client| {
+                    client
+                        .query_one(
+                            "SELECT count(*) FROM api_idempotency_results
+                              WHERE authenticated_workspace_id=$1
+                                AND idempotency_key='warm-disabled-r1'",
+                            &[&workspace.as_str()],
+                        )
+                        .map(|row| row.get(0))
+                })
+                .unwrap()
+        });
+        assert_eq!(warm_rows, 0);
         handle.shutdown().await.unwrap();
     }
 }

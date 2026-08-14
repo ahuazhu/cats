@@ -278,8 +278,14 @@ variable "endpoint_wildcard_host" {
 }
 
 variable "auto_warm_after_seconds" {
-  type    = number
-  default = 600
+  description = "Automatic Warm is disabled for the first release."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.auto_warm_after_seconds == 0
+    error_message = "auto_warm_after_seconds must remain zero until Warm ships."
+  }
 }
 
 variable "auto_cold_after_seconds" {

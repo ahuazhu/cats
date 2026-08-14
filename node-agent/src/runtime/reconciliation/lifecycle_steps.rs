@@ -1166,6 +1166,9 @@ impl LifecycleStepEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
         context.check_active()?;
+        if desired.target == RuntimeTarget::Warm {
+            return Ok(Some(stop_local()));
+        }
         let accepted = context.accepted_full()?;
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
@@ -2954,7 +2957,10 @@ fn settle_cleanup_target(
         "cleanup target cannot settle while runtime residue remains"
     );
     let state = match desired.target {
-        RuntimeTarget::Warm | RuntimeTarget::Cold => {
+        RuntimeTarget::Warm => {
+            anyhow::bail!("Warm is unavailable in this release")
+        }
+        RuntimeTarget::Cold => {
             anyhow::ensure!(
                 matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
                     && runtime.volumes.iter().all(|volume| matches!(
@@ -3233,6 +3239,10 @@ fn first_lifecycle_step(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
 ) -> anyhow::Result<Option<ReconcileStep>> {
+    anyhow::ensure!(
+        desired.target != RuntimeTarget::Warm,
+        "Warm is unavailable in this release"
+    );
     if desired.target == RuntimeTarget::Running {
         return Ok(None);
     }
@@ -3887,11 +3897,7 @@ mod tests {
 
     #[test]
     fn r_equals_l_still_requires_drain_before_any_stop() {
-        for target in [
-            RuntimeTarget::Warm,
-            RuntimeTarget::Cold,
-            RuntimeTarget::Deleted,
-        ] {
+        for target in [RuntimeTarget::Cold, RuntimeTarget::Deleted] {
             let (desired, _, runtime) = fixtures(target);
             let lineage = &runtime.volumes[0].local_lineages[0];
             assert_eq!(
@@ -3914,11 +3920,7 @@ mod tests {
 
     #[test]
     fn relaxed_suspend_pauses_locally_while_deeper_targets_drain_publish() {
-        for target in [
-            RuntimeTarget::Suspended,
-            RuntimeTarget::Warm,
-            RuntimeTarget::Cold,
-        ] {
+        for target in [RuntimeTarget::Suspended, RuntimeTarget::Cold] {
             let (desired, _, mut runtime) = fixtures(target);
             let lineage = &mut runtime.volumes[0].local_lineages[0];
             lineage.local_durable_generation =
@@ -3954,47 +3956,20 @@ mod tests {
     }
 
     #[test]
-    fn verified_drain_advances_to_pause_and_warm_uses_the_cold_stop_path() {
-        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Warm);
-        add_second_drain_volume(&mut desired, &mut checkpoint, &mut runtime);
+    fn warm_target_never_enters_or_settles_the_cold_lifecycle_path() {
+        let (desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Warm);
+        assert!(first_lifecycle_step(&desired, &runtime).is_err());
+
         checkpoint.stable_state = None;
-        checkpoint.step = first_lifecycle_step(&desired, &runtime)
-            .unwrap()
-            .expect("Warm departure starts with one exact drain token");
-        runtime.stable_state = None;
-        runtime.step = checkpoint.step.clone();
-        let receipt = exact_drain_receipt(&desired, &runtime);
-        assert_eq!(receipt.volumes.len(), 2);
-        let drained = drain_attempt_successor(
-            &desired,
-            &runtime,
-            &checkpoint,
-            &LifecyclePhysicalAttempt::VerifiedDrain(receipt),
-            checkpoint.updated_at_unix_ms,
-        )
-        .unwrap()
-        .expect("verified final drain must publish PauseRuntime");
-        assert!(matches!(drained.step, ReconcileStep::PauseRuntime { .. }));
-
-        let mut paused = runtime;
-        paused.step = drained.step.clone();
-        paused.processes[0].state = ProcessState::Paused;
-        let stopped = exact_postcondition_successor(
-            Path::new("/unused-after-Warm-cold-fallback"),
-            &desired,
-            &paused,
-            &drained,
-        )
-        .unwrap()
-        .expect("Warm is deliberately converged through the Cold stop path");
-        assert!(matches!(stopped.step, ReconcileStep::StopRuntime { .. }));
-
-        let mut cleaned = paused;
-        cleaned.processes.clear();
-        cleaned.networks.clear();
-        cleaned.guest_transport = GuestTransportEvidence::Unavailable;
-        cleaned.warm_snapshot = WarmSnapshotEvidence::Absent;
-        for volume in &mut cleaned.volumes {
+        checkpoint.step = ReconcileStep::StopRuntime {
+            runtime_incarnation: checkpoint.runtime_incarnation.clone().unwrap(),
+            process_start_time_ticks: runtime.processes[0].process_start_time_ticks,
+            scope_id: runtime.processes[0].scope_id.clone(),
+        };
+        runtime.processes.clear();
+        runtime.networks.clear();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        for volume in &mut runtime.volumes {
             volume.devices.clear();
             let VolumeAuthorityEvidence::Owned {
                 attachment_epoch,
@@ -4009,15 +3984,7 @@ mod tests {
                 head: head.clone(),
             };
         }
-        let mut settled = stopped;
-        settle_cleanup_target(&desired, &cleaned, &mut settled).unwrap();
-        assert_eq!(settled.stable_state, Some(StableState::Cold));
-        assert!(matches!(
-            settled.step,
-            ReconcileStep::Stable {
-                state: StableState::Cold
-            }
-        ));
+        assert!(settle_cleanup_target(&desired, &runtime, &mut checkpoint).is_err());
     }
 
     #[test]

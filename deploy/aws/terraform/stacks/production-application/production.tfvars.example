@@ -15,6 +15,9 @@ maintenance_mode = false
 # establish the Control/Node mutation-admission proof by itself.
 enable_public_ingress = false
 
+# Warm snapshots are outside the first release. Zero disables automatic Warm.
+auto_warm_after_seconds = 0
+
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
 gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_GATEWAY_64_HEX_CHARACTERS"
 

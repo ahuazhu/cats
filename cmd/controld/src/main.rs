@@ -232,7 +232,7 @@ struct Args {
     reconcile_interval_ms: u64,
     /// Seconds a stable Suspended Cat remains before automatic Warm.
     /// Zero disables this automatic boundary.
-    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 600)]
+    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 0)]
     auto_warm_after_seconds: u64,
     /// Seconds a stable Warm Cat remains before automatic Cold.
     /// Zero disables this automatic boundary.

@@ -3234,6 +3234,14 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
             .auto_tier_candidates(Some(1_000), Some(1_000))
             .unwrap();
         assert_eq!(candidates, vec![cat.id.clone()]);
+        assert!(store
+            .auto_tier_candidates(None, Some(1_000))
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .try_auto_tier(&cat.id, None, Some(1_000))
+            .unwrap()
+            .is_none());
         let warm = store
             .try_auto_tier(&cat.id, Some(1_000), Some(1_000))
             .unwrap()
