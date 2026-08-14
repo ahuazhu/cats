@@ -1104,7 +1104,9 @@ fn runbook_installs_the_allowlisted_early_guard_before_public_ingress() {
         );
     }
     let guard = runbook.find("cats_e3_window_install_guard").unwrap();
-    let initiated = runbook.find("\ningress_open_initiated=1\n").unwrap();
+    let initiated = runbook
+        .find("\ncats_e3_window_mark_open_initiated\n")
+        .unwrap();
     let open = runbook
         .find("-qualification-ingress-open.tfplan \\")
         .unwrap();

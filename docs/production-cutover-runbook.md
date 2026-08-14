@@ -649,8 +649,8 @@ passed by path, never argv content or manifest data. Before either invocation, w
 still cordoned, save and review `qualification-ingress-open.tfplan`; it must change only
 `enable_public_ingress=false -> true`. Also save and review the complete
 `qualification-ingress-close.tfvars` with that one value fixed false and every other input
-byte-identical. Install the early cleanup guard below, mark the open effect initiated, and only then
-apply the open plan. Immediately plan against the now-open live state and save and review
+byte-identical. Bind the persistent window journal, install the early cleanup guard below, durably
+mark the open effect initiated, and only then apply the open plan. Immediately plan against the now-open live state and save and review
 `qualification-ingress-close.tfplan`. It must only remove or close qualification ingress. A close
 plan made against the earlier Closed state is invalid.
 Retain `terraform show -json` for both plans; pass those two JSON files as the required runner
@@ -678,6 +678,10 @@ test "$(git hash-object deploy/metal/runtime-cutover-e3-window.sh)" = \
 test "$(git hash-object deploy/metal/runtime-cutover-ingress-close-plan.sh)" = \
   "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-ingress-close-plan.sh)"
 . deploy/metal/runtime-cutover-e3-window.sh
+install -d -m 0700 /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state
+cats_e3_window_bind \
+  /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state \
+  <CUTOVER_ID>-<BLOCK_PATH>-e3-window
 
 cats_e3_window_emergency_close() {
   terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
@@ -720,7 +724,7 @@ cats_e3_window_run_e12() {
 
 <VERIFY_EXACT_FALSE_TFVARS_APPROVAL_RECEIPT>
 cats_e3_window_install_guard
-ingress_open_initiated=1
+cats_e3_window_mark_open_initiated
 terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
   -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-open.tfplan \
   > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-open-apply.txt
@@ -777,7 +781,7 @@ cats_e3_window_exact_re_cordon() {
     /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
 }
 
-qualification_transition=initiated
+cats_e3_window_mark_qualification_initiated
 set +e
 apply_schedulable_policy \
   > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-result.v1.json
@@ -786,7 +790,7 @@ set -e
 if [ "$schedulable_apply_status" -ne 0 ]; then
   exit "$schedulable_apply_status"
 fi
-qualification_transition=terminal_schedulable
+cats_e3_window_mark_qualification_terminal
 
 set +e
 deploy/metal/runtime-cutover-e2e.sh <THE_MATCHING_FULL_INVOCATION_BELOW>
@@ -802,13 +806,39 @@ fi
 case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
 ```
 
-The early guard is live before `ingress_open_initiated=1`, which itself precedes the open effect, so
-an ambiguous open response also takes the emergency close path. The saved-plan switch is one shell
-assignment after approval; every earlier failure remains on the targeted emergency close. Clear the
-guard only after exact re-cordon, ingress-close and post-cleanup E12 results all exist. E12 proves
-empty/session/full-inventory/ring, while the latest A23 result and full policy independently prove
-exact re-cordon.
+The early guard is live before `cats_e3_window_mark_open_initiated`, which itself durably records
+open intent before the open effect, so an ambiguous open response also takes the emergency close
+path. The saved-plan switch is one journaled transition after approval; every earlier failure
+remains on the targeted emergency close. Clear the guard only after exact re-cordon, ingress-close
+and post-cleanup E12 results all exist. E12 proves empty/session/full-inventory/ring, while the
+latest A23 result and full policy independently prove exact re-cordon.
 Do not continue to the other block path if ingress-close, A23 re-cordon or E12 fails.
+
+**Crash recovery for the operator window.** Every window transition and every one-shot cleanup
+effect above is journaled into the mode-0700 state directory as no-overwrite mode-0600 marker
+files (same-directory 0600 temporary, fsync, no-replace link, directory fsync), and the live
+operator shell holds the journal's flock for its lifetime, so a second shell cannot adopt a held
+window. If the operator shell is SIGKILLed or the Host is lost at any point after
+`cats_e3_window_bind`, open a fresh shell, repeat the hash assertions and `source` line above,
+redefine the same five effect functions, then run:
+
+```sh
+cats_e3_window_adopt /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state
+```
+
+Adoption recovers `ingress_open_initiated`, the close mode, the qualification transition and every
+cleanup-effect record, prints the recovered state plus the allowed next actions, and fails closed —
+missing binding, unknown or non-canonical marker, orphan temporary from an interrupted publish,
+mode/ownership violation or a completion record without its attempted record all refuse adoption
+and demand manual inspection; nothing is guessed. After a successful adopt, run
+`cats_e3_window_install_guard` and either resume the mainline exactly where the journal stopped or
+run `cats_e3_window_finish` to drive the remaining cleanup ladder. The attempted marker is written
+before each effect runs, so an attempted record without a completion record means the outcome is
+unknown: cleanup reports that effect as ambiguous and never reruns it. Discover the physical
+postcondition manually (A23 policy revision, live ingress state, E12 evidence), record it with
+`cats_e3_window_resolve_effect <replay|re-cordon|ingress-close|e12> <exit-status>`, then run
+`cats_e3_window_finish` again. Marker existence is the at-most-once authority: no shell, original
+or adopted, repeats an already-attempted effect.
 
 **Command — kernel NBD:**
 
