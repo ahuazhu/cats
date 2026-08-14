@@ -63,6 +63,66 @@ module "usage_infrastructure" {
   depends_on = [terraform_data.platform_alert_topic_identity]
 }
 
+# Clean-slate cutover lane: the reset executor requires the fresh Kinesis
+# stream, checkpoint table and usage archive to exist in parallel with the old
+# set under strictly different names (deploy/aws/production-clean-slate-reset.py
+# rejects any collision). Guard the half-configured case before the module can
+# fail deep inside S3 bucket creation or, worse, alias the old archive.
+resource "terraform_data" "fresh_usage_inputs" {
+  count = var.fresh_usage_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.fresh_usage_archive_bucket_name != ""
+      error_message = "fresh_usage_enabled requires fresh_usage_archive_bucket_name."
+    }
+
+    precondition {
+      condition     = var.fresh_usage_archive_bucket_name != var.usage_archive_bucket_name
+      error_message = "The fresh usage archive bucket must not reuse the old usage archive bucket name; the reset executor rejects the collision."
+    }
+
+    # The old instance binds the module-default cats-controld service account,
+    # and EKS Pod Identity allows one association per cluster, namespace and
+    # service account. The fresh association must not claim the same one while
+    # both instances exist.
+    precondition {
+      condition     = var.fresh_usage_service_account_name != "cats-controld"
+      error_message = "fresh_usage_service_account_name must differ from the old instance's cats-controld service account while both usage sets exist."
+    }
+  }
+}
+
+# Second usage-infrastructure instance for the cutover. Every regional name in
+# the module derives from "<name_prefix>-<environment>-usage", so suffixing the
+# prefix yields the fully disjoint fresh set -- stream, checkpoint table,
+# producer/consumer/replay policies, pipeline role and alarms -- without
+# changing the module. The archive bucket name is global and passed explicitly.
+module "usage_fresh" {
+  source = "../../modules/usage-infrastructure"
+
+  count = var.fresh_usage_enabled ? 1 : 0
+
+  name_prefix                     = "cats-${var.fresh_usage_name_suffix}"
+  environment                     = var.environment
+  eks_cluster_name                = var.eks_cluster_name
+  archive_bucket_name             = var.fresh_usage_archive_bucket_name
+  chunkstore_manifest_bucket_name = var.chunkstore_bucket_name
+  chunkstore_prefix               = var.chunkstore_prefix
+  archive_object_lock_days        = var.usage_archive_object_lock_days
+  kinesis_shard_count             = var.usage_kinesis_shard_count
+  kinesis_retention_hours         = var.usage_kinesis_retention_hours
+  consumer_lag_alarm_threshold_ms = var.usage_consumer_lag_alarm_threshold_ms
+  alarm_action_arns               = [var.platform_alert_sns_topic_arn]
+  usage_service_account_name      = var.fresh_usage_service_account_name
+  tags                            = var.tags
+
+  depends_on = [
+    terraform_data.platform_alert_topic_identity,
+    terraform_data.fresh_usage_inputs,
+  ]
+}
+
 locals {
   metal_worker_enabled = (
     var.metal_worker_enabled != null
