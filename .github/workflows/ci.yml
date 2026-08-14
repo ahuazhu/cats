@@ -141,6 +141,8 @@ jobs:
           python3 deploy/aws/verify-aws-target-fixture.py
           python3 deploy/aws/tools/manual-image-reference-fixture.py \
             --builder deploy/aws/tools/build-manual-release.sh
+          python3 deploy/aws/tools/image-transport-fixture.py \
+            --verifier deploy/aws/tools/verify-image-transport.py
           python3 deploy/aws/tools/manual-release-fixture.py \
             --verifier deploy/aws/tools/verify-manual-release.py
           python3 deploy/aws/route-v2-node-r1-install-fixture.py \

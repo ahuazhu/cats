@@ -250,6 +250,31 @@ digests, Gateway binary digest and the worker tar SHA-256. Without `--push`,
 both images remain only in the local Docker store and the manifest records both
 registry verifications as false; that output is useful for dry-run
 qualification but is not a registry deployment receipt.
+
+To keep AWS credentials off the native build Host, replace `--push` with
+`--export-images`. The output then also contains
+`cats-control-plane-image.tar`, `cats-gateway-image.tar` and `SHA256SUMS`.
+Those files are transport only: the unchanged manifest and its independently
+recorded SHA-256 remain the authority. On an approved x86_64 operator Host with
+Docker Buildx and existing ECR credentials, publish without rebuilding:
+
+```sh
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+deploy/aws/tools/publish-manual-release.sh \
+  --release /approved/private-output/cats-release \
+  --manifest-sha256 sha256:REPLACE_WITH_APPROVED_MANIFEST_SHA256 \
+  --output-manifest /approved/private-output/release-manifest.registry-verified.v1.json
+```
+
+The helper checks the transport sums, verifies each closed OCI archive against
+the existing manifest, loads and inspects linux/amd64 identity, pushes the two
+exact manifest references, verifies the registry digests and asks the existing
+manual-release verifier to produce the registry-verified manifest. It neither
+builds an artifact nor uploads the worker bundle. Pass the same
+`cats-worker.tar.zst` and its manifest `bundle_sha256` to the existing
+`production-infrastructure` Terraform inputs; that module publishes the bundle
+at `worker/<sha256>/cats-worker.tar.zst` in its existing artifact bucket.
 The builder never invokes Terraform, Kubernetes or a production service.
 The worker bundle also carries the exact
 [`old-host-positive-stop.py`](old-host-positive-stop.py) bytes bound as a

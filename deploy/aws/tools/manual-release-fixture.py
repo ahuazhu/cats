@@ -294,6 +294,70 @@ def main() -> int:
         }
         assert b"guest_runtime_release_id=" + expected_release_id.encode() in result.stdout
 
+        manifest_digest = digest(raw)
+        candidate = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(verifier),
+                "registry-candidate",
+                "--manifest",
+                str(output),
+                "--manifest-sha256",
+                manifest_digest,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        candidate_identity = json.loads(candidate.stdout)
+        assert candidate_identity["control_plane"]["image_digest"] == "sha256:" + "1" * 64
+        assert candidate_identity["gateway"]["image_digest"] == "sha256:" + "6" * 64
+
+        promoted = root / "release-manifest.registry-verified.v1.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(verifier),
+                "registry-candidate",
+                "--manifest",
+                str(output),
+                "--manifest-sha256",
+                manifest_digest,
+                "--control-registry-digest",
+                "sha256:" + "1" * 64,
+                "--gateway-registry-digest",
+                "sha256:" + "6" * 64,
+                "--output",
+                str(promoted),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        promoted_value = json.loads(promoted.read_bytes())
+        assert promoted_value["artifacts"]["control_plane"]["registry_verified"] is True
+        assert promoted_value["artifacts"]["gateway"]["registry_verified"] is True
+        promoted_value["artifacts"]["control_plane"]["registry_verified"] = False
+        promoted_value["artifacts"]["gateway"]["registry_verified"] = False
+        assert canonical(promoted_value) == raw
+
+        wrong_manifest_digest = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(verifier),
+                "registry-candidate",
+                "--manifest",
+                str(output),
+                "--manifest-sha256",
+                "sha256:" + "0" * 64,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        assert wrong_manifest_digest.returncode != 0
+        assert b"differs from its approved digest" in wrong_manifest_digest.stderr
+
         # The verifier never overwrites its canonical receipt.
         run_verifier(verifier, root, output, expect_success=False)
         assert output.read_bytes() == raw

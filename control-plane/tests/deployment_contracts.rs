@@ -3790,6 +3790,12 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--gateway-image-registry-verified true",
         "--input-file \"guest_host_kernel=$guest_kernel\"",
         "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
+        "--export-images",
+        "type=oci,dest=$control_archive",
+        "type=oci,dest=$gateway_archive",
+        "cats-control-plane-image.tar",
+        "cats-gateway-image.tar",
+        "> SHA256SUMS",
     ] {
         assert!(
             builder.contains(required),
@@ -3824,6 +3830,27 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("fixture passed"));
+
+    let publisher = read_workspace_file("deploy/aws/tools/publish-manual-release.sh");
+    for required in [
+        "--manifest-sha256",
+        "verify-image-transport.py",
+        "verify-manual-release.py",
+        "registry-candidate",
+        "docker image load --input",
+        "docker buildx imagetools inspect --raw",
+    ] {
+        assert!(
+            publisher.contains(required),
+            "manual release publisher lost {required:?}"
+        );
+    }
+    for forbidden in ["docker build ", "docker buildx build", "terraform", "kubectl"] {
+        assert!(
+            !publisher.contains(forbidden),
+            "manual release publisher gained rebuild/deployment effect {forbidden:?}"
+        );
+    }
 }
 
 #[test]

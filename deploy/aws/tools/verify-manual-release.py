@@ -31,6 +31,7 @@ MAX_BOOT_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_WORKER_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_WORKER_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_GATEWAY_BINARY_BYTES = 256 * 1024 * 1024
+MAX_RELEASE_MANIFEST_BYTES = 1024 * 1024
 WORKER_STATIC_FILES = {
     "cats",
     "cats-noded",
@@ -577,6 +578,188 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_registry_candidate_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Verify or registry-promote an existing manual release manifest."
+    )
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--control-registry-digest")
+    parser.add_argument("--gateway-registry-digest")
+    parser.add_argument("--output", type=Path)
+    arguments = parser.parse_args(argv)
+    promotion = (
+        arguments.control_registry_digest,
+        arguments.gateway_registry_digest,
+        arguments.output,
+    )
+    if any(value is not None for value in promotion) and not all(
+        value is not None for value in promotion
+    ):
+        parser.error("registry promotion requires both registry digests and --output")
+    return arguments
+
+
+def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[str, str]]:
+    if set(value) != {"artifacts", "build_inputs", "guest_runtime", "source", "version"}:
+        raise VerificationError("existing release manifest has the wrong top-level shape")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise VerificationError("existing release manifest version is not 1")
+    artifacts = value["artifacts"]
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "control_plane",
+        "gateway",
+        "worker",
+    }:
+        raise VerificationError("existing release manifest has the wrong artifact set")
+    expected_image_keys = {
+        "control_plane": {
+            "guest_manifest_sha256",
+            "guest_profile_sha256",
+            "image_config_digest",
+            "image_digest",
+            "image_reference",
+            "registry_verified",
+        },
+        "gateway": {
+            "binary_sha256",
+            "binary_size_bytes",
+            "image_config_digest",
+            "image_digest",
+            "image_reference",
+            "registry_verified",
+        },
+    }
+    identity: dict[str, dict[str, str]] = {}
+    for name, expected_keys in expected_image_keys.items():
+        image = artifacts[name]
+        if not isinstance(image, dict) or set(image) != expected_keys:
+            raise VerificationError(f"existing {name} artifact has the wrong shape")
+        if image["registry_verified"] is not False:
+            raise VerificationError(f"existing {name} artifact is already registry-verified")
+        reference = image["image_reference"]
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or len(reference) > 1024
+            or "@" in reference
+            or any(character.isspace() or ord(character) < 0x20 for character in reference)
+        ):
+            raise VerificationError(f"existing {name} image reference is invalid")
+        image_digest = require_sha256(
+            image["image_digest"], name=f"existing {name} OCI digest"
+        )
+        config_digest = require_sha256(
+            image["image_config_digest"], name=f"existing {name} config digest"
+        )
+        identity[name] = {
+            "reference": reference,
+            "image_digest": image_digest,
+            "config_digest": config_digest,
+        }
+    try:
+        require_distinct_image_tags(
+            identity["control_plane"]["reference"], identity["gateway"]["reference"]
+        )
+    except ImageReferenceError as error:
+        raise VerificationError(str(error)) from error
+
+    worker = artifacts["worker"]
+    if not isinstance(worker, dict) or set(worker) != {
+        "bundle_name",
+        "bundle_sha256",
+        "bundle_size_bytes",
+        "guest_initramfs_sha256",
+        "guest_kernel_sha256",
+        "guest_manifest_sha256",
+        "guest_profile_sha256",
+    }:
+        raise VerificationError("existing worker artifact has the wrong shape")
+    if worker["bundle_name"] != "cats-worker.tar.zst":
+        raise VerificationError("existing worker artifact has the wrong bundle name")
+
+    build_inputs = value["build_inputs"]
+    guest_runtime = value["guest_runtime"]
+    source = value["source"]
+    if not isinstance(build_inputs, dict) or set(build_inputs) != {
+        "files",
+        "fingerprint",
+        "guest_target",
+        "platform",
+    }:
+        raise VerificationError("existing release build_inputs has the wrong shape")
+    if (
+        build_inputs["guest_target"] != "x86_64-unknown-linux-musl"
+        or build_inputs["platform"] != "linux/amd64"
+    ):
+        raise VerificationError("existing release targets are not the production targets")
+    if not isinstance(guest_runtime, dict) or set(guest_runtime) != {
+        "initramfs",
+        "kernel",
+        "manifest_sha256",
+        "profile_sha256",
+        "release_id",
+    }:
+        raise VerificationError("existing guest_runtime has the wrong shape")
+    if not isinstance(source, dict) or set(source) != {"commit", "fingerprint", "tree"}:
+        raise VerificationError("existing release source has the wrong shape")
+    if (
+        GIT_OBJECT_PATTERN.fullmatch(source.get("commit", "")) is None
+        or GIT_OBJECT_PATTERN.fullmatch(source.get("tree", "")) is None
+    ):
+        raise VerificationError("existing release source identity is invalid")
+
+    def validate_named_digests(node: Any, path: str = "manifest") -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                child_path = f"{path}.{key}"
+                if (
+                    key.endswith(("_sha256", "_digest", "fingerprint", "release_id"))
+                    and child is not None
+                ):
+                    require_sha256(child, name=child_path)
+                validate_named_digests(child, child_path)
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                validate_named_digests(child, f"{path}[{index}]")
+
+    validate_named_digests(value)
+    return identity
+
+
+def registry_candidate(arguments: argparse.Namespace) -> int:
+    raw = read_regular(arguments.manifest, cap=MAX_RELEASE_MANIFEST_BYTES)
+    expected_manifest = require_sha256(
+        arguments.manifest_sha256, name="approved release manifest digest"
+    )
+    if sha256_bytes(raw) != expected_manifest:
+        raise VerificationError("release manifest differs from its approved digest")
+    value = decode_canonical_json(raw, name="release manifest")
+    identity = validate_existing_release_manifest(value)
+    if arguments.output is None:
+        print(canonical_json(identity).decode())
+        return 0
+
+    observed = {
+        "control_plane": require_sha256(
+            arguments.control_registry_digest, name="observed Control registry digest"
+        ),
+        "gateway": require_sha256(
+            arguments.gateway_registry_digest, name="observed Gateway registry digest"
+        ),
+    }
+    for name, digest in observed.items():
+        if digest != identity[name]["image_digest"]:
+            raise VerificationError(
+                f"observed {name} registry digest differs from release manifest"
+            )
+        value["artifacts"][name]["registry_verified"] = True
+    promoted = canonical_json(value)
+    atomic_write_new(arguments.output, promoted)
+    print(f"release_manifest_sha256={sha256_bytes(promoted)}")
+    return 0
+
+
 def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
     for name, value in (
         ("source commit", arguments.source_commit),
@@ -834,6 +1017,8 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
 
 def main() -> int:
     try:
+        if sys.argv[1:2] == ["registry-candidate"]:
+            return registry_candidate(parse_registry_candidate_arguments(sys.argv[2:]))
         arguments = parse_arguments()
         release_manifest, raw = verify(arguments)
         atomic_write_new(arguments.output, raw)

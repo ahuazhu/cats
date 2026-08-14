@@ -4,12 +4,14 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--gateway-image REPOSITORY:TAG] [--push]
+usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--gateway-image REPOSITORY:TAG] [--push | --export-images]
 
 Builds the shared Guest runtime once, then the linux/amd64 Control image,
 Route v2 Gateway image and worker bundle. Default images stay local; --push
 requires both explicit repository:tag references and verifies both reported
 digests against the registry before writing release-manifest.v1.json.
+--export-images instead writes two transport-only Docker image archives and a
+SHA256SUMS file. It does not contact a registry or change manifest authority.
 EOF
 }
 
@@ -18,6 +20,7 @@ output_root=
 image_reference=
 gateway_image_reference=
 push_image=false
+export_images=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       push_image=true
       shift
       ;;
+    --export-images)
+      export_images=true
+      shift
+      ;;
     *)
       usage
       exit 2
@@ -64,13 +71,17 @@ done
   echo "release output already exists: $output_root" >&2
   exit 1
 }
-if [[ $push_image == true ]]; then
+[[ $push_image != true || $export_images != true ]] || {
+  echo "--push and --export-images are mutually exclusive" >&2
+  exit 2
+}
+if [[ $push_image == true || $export_images == true ]]; then
   [[ -n $image_reference && $image_reference != *@* && $image_reference == */*:* ]] || {
-    echo "--push requires --image with an explicit repository:tag (not a digest)" >&2
+    echo "--push/--export-images requires --image with an explicit repository:tag (not a digest)" >&2
     exit 2
   }
   [[ -n $gateway_image_reference && $gateway_image_reference != *@* && $gateway_image_reference == */*:* ]] || {
-    echo "--push requires --gateway-image with an explicit repository:tag (not a digest)" >&2
+    echo "--push/--export-images requires --gateway-image with an explicit repository:tag (not a digest)" >&2
     exit 2
   }
 elif [[ -z $image_reference ]]; then
@@ -211,6 +222,8 @@ sudo chown -R "$(id -u):$(id -g)" "$guest_output" "$guest_release"
 control_metadata="$output_incomplete/control-image-metadata.json"
 gateway_metadata="$output_incomplete/gateway-image-metadata.json"
 worker_metadata="$output_incomplete/worker-image-metadata.json"
+control_archive="$output_incomplete/cats-control-plane-image.tar"
+gateway_archive="$output_incomplete/cats-gateway-image.tar"
 control_root="$output_incomplete/control-root"
 gateway_root="$output_incomplete/gateway-root"
 worker_root="$output_incomplete/worker-root"
@@ -225,8 +238,12 @@ build_arguments=(
   --provenance=false
   --metadata-file "$control_metadata"
   --tag "$image_reference"
-  --load
 )
+if [[ $export_images == true ]]; then
+  build_arguments+=(--output "type=oci,dest=$control_archive")
+else
+  build_arguments+=(--load)
+fi
 docker buildx build "${build_arguments[@]}" "$source_root"
 
 control_image_digest=$(
@@ -251,9 +268,17 @@ if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) i
 print(digest)
 PY
 )
+if [[ $export_images == true ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-image-transport.py \
+    --archive "$control_archive" \
+    --reference "$image_reference" \
+    --image-digest "$control_image_digest" \
+    --config-digest "$control_config_digest"
+  docker image load --input "$control_archive" >/dev/null
+fi
 control_image_id=$(docker image inspect --format '{{.Id}}' "$image_reference")
-[[ $control_image_id == "$control_config_digest" ]] || {
-  echo "loaded Control image ID differs from the build config digest" >&2
+[[ $control_image_id == "$control_config_digest" || $control_image_id == "$control_image_digest" ]] || {
+  echo "loaded Control image ID differs from both verified image identities" >&2
   exit 1
 }
 [[ $(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$control_image_id") == amd64/linux ]] || {
@@ -274,15 +299,20 @@ docker cp \
 docker rm "$control_container" >/dev/null
 control_container=
 
-docker buildx build \
-  --file deploy/aws/Dockerfile.gateway \
-  --target runtime \
-  --platform linux/amd64 \
-  --provenance=false \
-  --metadata-file "$gateway_metadata" \
-  --tag "$gateway_image_reference" \
-  --load \
-  "$source_root"
+gateway_build_arguments=(
+  --file deploy/aws/Dockerfile.gateway
+  --target runtime
+  --platform linux/amd64
+  --provenance=false
+  --metadata-file "$gateway_metadata"
+  --tag "$gateway_image_reference"
+)
+if [[ $export_images == true ]]; then
+  gateway_build_arguments+=(--output "type=oci,dest=$gateway_archive")
+else
+  gateway_build_arguments+=(--load)
+fi
+docker buildx build "${gateway_build_arguments[@]}" "$source_root"
 
 gateway_image_digest=$(
   python3 - "$gateway_metadata" <<'PY'
@@ -306,9 +336,17 @@ if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) i
 print(digest)
 PY
 )
+if [[ $export_images == true ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-image-transport.py \
+    --archive "$gateway_archive" \
+    --reference "$gateway_image_reference" \
+    --image-digest "$gateway_image_digest" \
+    --config-digest "$gateway_config_digest"
+  docker image load --input "$gateway_archive" >/dev/null
+fi
 gateway_image_id=$(docker image inspect --format '{{.Id}}' "$gateway_image_reference")
-[[ $gateway_image_id == "$gateway_config_digest" ]] || {
-  echo "loaded Gateway image ID differs from the build config digest" >&2
+[[ $gateway_image_id == "$gateway_config_digest" || $gateway_image_id == "$gateway_image_digest" ]] || {
+  echo "loaded Gateway image ID differs from both verified image identities" >&2
   exit 1
 }
 [[ $(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$gateway_image_id") == amd64/linux ]] || {
@@ -371,6 +409,7 @@ verifier_arguments=(
   --input-file "release_verifier=$source_root/deploy/aws/tools/verify-manual-release.py"
   --input-file "release_builder=$source_root/deploy/aws/tools/build-manual-release.sh"
   --input-file "manual_image_reference_validator=$source_root/deploy/aws/tools/manual_image_reference.py"
+  --input-file "image_transport_verifier=$source_root/deploy/aws/tools/verify-image-transport.py"
 )
 preflight_manifest="$output_incomplete/release-manifest.preflight.v1.json"
 PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-manual-release.py \
@@ -402,6 +441,16 @@ else
   mv "$preflight_manifest" "$output_incomplete/release-manifest.v1.json"
 fi
 
+if [[ $export_images == true ]]; then
+  (
+    cd "$output_incomplete"
+    sha256sum \
+      cats-control-plane-image.tar \
+      cats-gateway-image.tar \
+      > SHA256SUMS
+  )
+fi
+
 # The final handoff deliberately contains only immutable deployment inputs and
 # their canonical manifest, not mutable build caches or extraction scratch.
 rm -rf -- "$control_root" "$gateway_root" "$worker_root" "$guest_output"
@@ -409,5 +458,11 @@ rm -f -- "$control_metadata" "$gateway_metadata" "$worker_metadata"
 cp -R "$guest_release" "$output_incomplete/guest-runtime-release.v1"
 chmod -R a-w "$output_incomplete/guest-runtime-release.v1"
 chmod a-w "$output_incomplete/cats-worker.tar.zst" "$output_incomplete/release-manifest.v1.json"
+if [[ $export_images == true ]]; then
+  chmod a-w \
+    "$output_incomplete/cats-control-plane-image.tar" \
+    "$output_incomplete/cats-gateway-image.tar" \
+    "$output_incomplete/SHA256SUMS"
+fi
 mv "$output_incomplete" "$output_root"
 echo "manual release ready: $output_root"
