@@ -1341,7 +1341,7 @@ def assert_binding_failures(parent: Path) -> None:
     try:
         fixture_executor(stale_config, stale_runner).plan()
     except reset.ResetError as error:
-        if "older than" not in str(error):
+        if "stale" not in str(error):
             raise
     else:
         raise AssertionError("stale post-green evidence was accepted")
@@ -1376,7 +1376,7 @@ def assert_binding_failures(parent: Path) -> None:
             execute=True,
         )
     except reset.ResetError as error:
-        if "older than" not in str(error):
+        if "stale" not in str(error):
             raise
     else:
         raise AssertionError("evidence that aged out during preflight crossed reset-started")
