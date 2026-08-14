@@ -38,6 +38,8 @@ WORKER_STATIC_FILES = {
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-runtime-e3-probe",
+    "cats-usage-schema-v16-verifier",
+    "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
     "cats-guest-agent",
     "cats-e3-guest-workload",
@@ -72,6 +74,8 @@ WORKER_EXECUTABLE_FILES = {
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-runtime-e3-probe",
+    "cats-usage-schema-v16-verifier",
+    "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
     "cats-guest-agent",
     "cats-e3-guest-workload",
@@ -336,8 +340,8 @@ def preflight_worker_archive(archive: tarfile.TarFile) -> list[tuple[tarfile.Tar
     seen: set[str] = set()
     total_size = 0
     for member in archive:
-        if len(entries) >= 32:
-            raise VerificationError("worker bundle has more than 32 archive entries")
+        if len(entries) >= 34:
+            raise VerificationError("worker bundle has more than 34 archive entries")
         relative = normalized_tar_path(member.name)
         if relative in seen:
             raise VerificationError(f"worker bundle repeats path {relative!r}")

@@ -546,7 +546,12 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         2,
         "manual verifier fixture must mirror cats in its file and executable sets"
     );
-    for binary in ["cats-runtime-e3-probe", "cats-e3-guest-workload"] {
+    for binary in [
+        "cats-runtime-e3-probe",
+        "cats-e3-guest-workload",
+        "cats-usage-schema-v16-verifier",
+        "cats-usage-terminal-receipt-verifier",
+    ] {
         assert!(
             dockerfile.contains(&format!("COPY --from=builder /out/{binary} /{binary}")),
             "worker artifact must publish qualification binary {binary}"
@@ -562,6 +567,11 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
                 "\"$stage_path/{binary}\" \"${{var.install_root}}/bin/{binary}"
             )),
             "Terraform worker transaction must install qualification binary {binary}"
+        );
+        assert_eq!(
+            deployment.matches(&format!("    \"{binary}\",")).count(),
+            1,
+            "worker installation receipt must fingerprint {binary} exactly once"
         );
         assert_eq!(
             manual_verifier

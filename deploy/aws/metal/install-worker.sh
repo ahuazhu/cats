@@ -236,6 +236,10 @@ install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/
 cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
 install -m 0755 "$CATS_REPO/target/release/cats-runtime-e3-probe" "$CATS_PREFIX/bin/cats-runtime-e3-probe"
 cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
+install -m 0755 "$CATS_REPO/target/release/cats-usage-schema-v16-verifier" "$CATS_PREFIX/bin/cats-usage-schema-v16-verifier"
+cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
+install -m 0755 "$CATS_REPO/target/release/cats-usage-terminal-receipt-verifier" "$CATS_PREFIX/bin/cats-usage-terminal-receipt-verifier"
+cats_worker_deployment_crash_probe after-install-cats-usage-terminal-receipt-verifier
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 cats_worker_deployment_crash_probe after-install-cats-blockd
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"

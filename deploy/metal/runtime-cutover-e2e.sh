@@ -670,7 +670,7 @@ jq -e '
   (keys == ["host_tools","members","service","version","worker_bundle_sha256"])
   and .version == 1 and .service == "cats-worker.service"
   and (.worker_bundle_sha256 | test("^sha256:[0-9a-f]{64}$"))
-  and (.members | keys) == ["cats","cats-blockd","cats-e3-guest-workload","cats-guest-agent","cats-noded","cats-route-v2-node-r1-validator","cats-runtime-e3-probe","cats-vmm-launcher"]
+  and (.members | keys) == ["cats","cats-blockd","cats-e3-guest-workload","cats-guest-agent","cats-noded","cats-route-v2-node-r1-validator","cats-runtime-e3-probe","cats-usage-schema-v16-verifier","cats-usage-terminal-receipt-verifier","cats-vmm-launcher"]
   and (.host_tools | keys) == ["curl","journalctl","systemctl","timeout"]
   and all(.members[];
     (keys == ["path","sha256","size_bytes"])

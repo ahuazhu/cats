@@ -34,6 +34,8 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
       target/release/cats-route-v2-node-r1-validator \
       target/release/cats-vmm-launcher \
       target/release/cats-runtime-e3-probe \
+      target/release/cats-usage-schema-v16-verifier \
+      target/release/cats-usage-terminal-receipt-verifier \
       target/release/cats-blockd \
       target/release/cats-guest-agent \
       target/release/cats-e3-guest-workload \
@@ -42,6 +44,8 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
     && install -D -m 0755 target/release/cats-route-v2-node-r1-validator /out/cats-route-v2-node-r1-validator \
     && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
     && install -D -m 0755 target/release/cats-runtime-e3-probe /out/cats-runtime-e3-probe \
+    && install -D -m 0755 target/release/cats-usage-schema-v16-verifier /out/cats-usage-schema-v16-verifier \
+    && install -D -m 0755 target/release/cats-usage-terminal-receipt-verifier /out/cats-usage-terminal-receipt-verifier \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent \
     && install -D -m 0755 target/release/cats-e3-guest-workload /out/cats-e3-guest-workload
@@ -63,6 +67,8 @@ COPY --from=builder /out/cats-noded /cats-noded
 COPY --from=builder /out/cats-route-v2-node-r1-validator /cats-route-v2-node-r1-validator
 COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
 COPY --from=builder /out/cats-runtime-e3-probe /cats-runtime-e3-probe
+COPY --from=builder /out/cats-usage-schema-v16-verifier /cats-usage-schema-v16-verifier
+COPY --from=builder /out/cats-usage-terminal-receipt-verifier /cats-usage-terminal-receipt-verifier
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/cats-e3-guest-workload /cats-e3-guest-workload

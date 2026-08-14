@@ -257,6 +257,10 @@ locals {
     cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
     install -D -m 0755 "$stage_path/cats-runtime-e3-probe" "${var.install_root}/bin/cats-runtime-e3-probe"
     cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
+    install -D -m 0755 "$stage_path/cats-usage-schema-v16-verifier" "${var.install_root}/bin/cats-usage-schema-v16-verifier"
+    cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
+    install -D -m 0755 "$stage_path/cats-usage-terminal-receipt-verifier" "${var.install_root}/bin/cats-usage-terminal-receipt-verifier"
+    cats_worker_deployment_crash_probe after-install-cats-usage-terminal-receipt-verifier
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
     cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
@@ -373,6 +377,8 @@ member_names = (
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
     "cats-runtime-e3-probe",
+    "cats-usage-schema-v16-verifier",
+    "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
     "cats-guest-agent",
     "cats-e3-guest-workload",
