@@ -400,6 +400,7 @@ verifier_arguments=(
   --input-file "worker_dockerfile=$source_root/deploy/aws/Dockerfile.worker-artifact"
   --input-file "old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py"
   --input-file "production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py"
+  --input-file "production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py"
   --input-file "qualification_catalog=$source_root/deploy/metal/runtime-cutover-e2e-catalog.v1.json"
   --input-file "guest_builder=$source_root/deploy/metal/build-guest-image.sh"
   --input-file "guest_host_kernel=$guest_kernel"

@@ -3862,6 +3862,7 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--input-file \"guest_host_kernel=$guest_kernel\"",
         "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
         "--input-file \"production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py\"",
+        "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
         "--input-file \"qualification_catalog=$source_root/deploy/metal/runtime-cutover-e2e-catalog.v1.json\"",
         "--export-images",
         "type=oci,dest=$control_archive",
