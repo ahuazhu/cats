@@ -3,6 +3,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 const CASES: [&str; 11] = [
     "control-startup-schema",
@@ -801,6 +803,7 @@ fn runner_removes_private_token_stage_after_failure() {
     fs::create_dir(&private_root).expect("create private stage root");
     fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
         .expect("protect private stage root");
+    let private_root = fs::canonicalize(private_root).expect("canonical private stage root");
     let runner = fixture.root.join("deploy/metal/runtime-cutover-e2e.sh");
     let secret = "fixture-control-token-must-not-survive";
     let script = r#"
@@ -834,6 +837,7 @@ fn runner_removes_private_token_stage_after_term() {
     fs::create_dir(&private_root).expect("create private stage root");
     fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
         .expect("protect private stage root");
+    let private_root = fs::canonicalize(private_root).expect("canonical private stage root");
     let runner = fixture.root.join("deploy/metal/runtime-cutover-e2e.sh");
     let secret = "fixture-control-token-must-not-survive-term";
     let script = r#"
@@ -1296,6 +1300,10 @@ fn runtime_cutover_runner_persists_exact_reentry_and_close_authority() {
     let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     for required in [
         "--state-directory </absolute/persistent/root-only/directory>",
+        "cats_e3_pin_private_directory \"$state_directory_requested\"",
+        "state_directory=$state_directory_fd_path",
+        "cats_e3_create_pinned_output_directory \"$output_parent_fd\"",
+        "output_dir=$output_dir_fd_path",
         "flock -n \"$state_lock_fd\"",
         "qualification-state-binding.v1.json",
         "qualification-close-decision.v1.json",
@@ -1443,8 +1451,14 @@ assert list(state.iterdir()) == []
 #[test]
 fn runner_binds_emergency_before_g3_and_reentry_cannot_upgrade_to_end() {
     let fixture = Fixture::new();
-    let trace = fixture._temp.path().join("runner-emergency-before-g3.trace");
-    let state = fixture._temp.path().join("runner-emergency-before-g3.state");
+    let trace = fixture
+        ._temp
+        .path()
+        .join("runner-emergency-before-g3.trace");
+    let state = fixture
+        ._temp
+        .path()
+        .join("runner-emergency-before-g3.state");
     fs::create_dir(&state).expect("create emergency decision state");
     let script = r#"
 set -euo pipefail
@@ -1536,8 +1550,14 @@ cats_e3_close_on_exit
 #[test]
 fn runner_does_not_close_until_forward_g3_cleanup_succeeds_on_reentry() {
     let fixture = Fixture::new();
-    let trace = fixture._temp.path().join("runner-g3-failure-before-close.trace");
-    let state = fixture._temp.path().join("runner-g3-failure-before-close.state");
+    let trace = fixture
+        ._temp
+        .path()
+        .join("runner-g3-failure-before-close.trace");
+    let state = fixture
+        ._temp
+        .path()
+        .join("runner-g3-failure-before-close.state");
     fs::create_dir(&state).expect("create G3 recovery state");
     let script = r#"
 set -euo pipefail
@@ -1594,7 +1614,10 @@ cats_e3_close_on_exit
     };
 
     let first = invoke("fail");
-    assert!(!first.status.success(), "first G3 cleanup unexpectedly passed");
+    assert!(
+        !first.status.success(),
+        "first G3 cleanup unexpectedly passed"
+    );
     assert_eq!(
         fs::read_to_string(&trace).unwrap(),
         concat!("decision:fail:emergency_close\n", "g3:fail\n"),
@@ -1620,6 +1643,262 @@ cats_e3_close_on_exit
 }
 
 #[test]
+fn runner_pins_private_directories_and_two_runners_reject_a_writable_grandparent() {
+    let fixture = Fixture::new();
+    let fixture_temp = fs::canonicalize(fixture._temp.path()).expect("canonical fixture root");
+    let safe = fixture_temp.join("safe-pinned-parent");
+    fs::create_dir(&safe).expect("create safe pinned state");
+    fs::set_permissions(&safe, fs::Permissions::from_mode(0o700))
+        .expect("protect safe pinned state");
+    let positive = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args([
+            "-c",
+            concat!(
+                "set -euo pipefail; source \"$1\"; ",
+                "cats_e3_pin_private_directory \"$2\" state_fd state_alias private; ",
+                "cats_e3_open_pinned_state_lock \"$state_fd\" \"$state_alias\" lock_fd; ",
+                "cats_e3_create_pinned_output_directory \"$state_fd\" \"$state_alias\" ",
+                "output output_fd output_alias; ",
+                "printf '%s\\n' pinned >\"$output_alias/marker\"; ",
+                "cats_e3_private_state_subdirectory \"$2/child\"",
+            ),
+            "runtime-cutover-safe-private-directory",
+        ])
+        .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(&safe)
+        .output()
+        .expect("run safe directory calibration");
+    assert_success(&positive);
+    assert_eq!(
+        fs::read_to_string(safe.join("output/marker")).unwrap(),
+        "pinned\n"
+    );
+
+    let unsafe_grandparent = fixture_temp.join("writable-grandparent");
+    fs::create_dir(&unsafe_grandparent).expect("create writable grandparent");
+    fs::set_permissions(&unsafe_grandparent, fs::Permissions::from_mode(0o777))
+        .expect("make grandparent writable");
+    let checked = unsafe_grandparent.join("checked");
+    let alternate = unsafe_grandparent.join("alternate");
+    fs::create_dir(&checked).expect("create checked inode A");
+    fs::create_dir(&alternate).expect("create alternate inode B");
+    for path in [&checked, &alternate] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("protect swappable state parent");
+    }
+    let result_a = fixture._temp.path().join("runner-a.result");
+    let result_b = fixture._temp.path().join("runner-b.result");
+    let gate_a = fixture._temp.path().join("runner-a.go");
+    let gate_b = fixture._temp.path().join("runner-b.go");
+    let release = fixture._temp.path().join("runners.release");
+    let script = r#"
+set -euo pipefail
+source "$1"
+directory=$2/state
+result=$3
+gate=$4
+release=$5
+runner=$6
+while [[ ! -e $gate ]]; do sleep 0.01; done
+if cats_e3_private_state_subdirectory "$directory"; then
+  lock_ready=$result.locked
+  python3 - "$directory/.runtime-cutover.lock" "$lock_ready" "$release" <<'PY' &
+import fcntl
+import os
+import pathlib
+import sys
+import time
+lock_path, ready_path, release_path = map(pathlib.Path, sys.argv[1:])
+descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ready_path.write_text("locked\n", encoding="ascii")
+while not release_path.exists():
+    time.sleep(0.01)
+os.close(descriptor)
+PY
+  lock_pid=$!
+  while [[ ! -e $lock_ready ]]; do sleep 0.01; done
+  source_file=$directory/$runner.source
+  printf '{"runner":"%s"}\n' "$runner" >"$source_file"
+  chmod 0600 "$source_file"
+  cats_e3_bind_persistent_state "$directory" "$source_file" runtime-state.json
+  rm -f "$source_file"
+  identity=$(python3 - "$directory" <<'PY'
+import os
+import sys
+value = os.stat(sys.argv[1], follow_symlinks=False)
+print(f"{value.st_dev}:{value.st_ino}")
+PY
+  )
+  printf 'accepted:%s\n' "$identity" >"$result"
+  while [[ ! -e $release ]]; do sleep 0.01; done
+  wait "$lock_pid"
+else
+  printf '%s\n' rejected >"$result"
+fi
+"#;
+    let run = |result: &Path, gate: &Path, runner: &str| {
+        Command::new("bash")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .args(["-c", script, "runtime-cutover-writable-grandparent"])
+            .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+            .arg(&checked)
+            .arg(result)
+            .arg(gate)
+            .arg(&release)
+            .arg(runner)
+            .spawn()
+            .expect("spawn writable-grandparent fixture")
+    };
+
+    let child_a = run(&result_a, &gate_a, "runner-a");
+    let child_b = run(&result_b, &gate_b, "runner-b");
+    fs::write(&gate_a, b"go\n").expect("release runner A");
+    for _ in 0..500 {
+        if result_a.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(result_a.exists(), "runner A did not reach the barrier");
+    let held_a = unsafe_grandparent.join("held-a");
+    fs::rename(&checked, &held_a).expect("move checked inode A aside");
+    fs::rename(&alternate, &checked).expect("install checked inode B");
+    fs::write(&gate_b, b"go\n").expect("release runner B");
+    for _ in 0..500 {
+        if result_b.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(result_b.exists(), "runner B did not reach the barrier");
+    fs::write(&release, b"release\n").expect("release both runners");
+    let output_a = child_a.wait_with_output().expect("wait for runner A");
+    let output_b = child_b.wait_with_output().expect("wait for runner B");
+    assert_success(&output_a);
+    assert_success(&output_b);
+    let observed_a = fs::read_to_string(&result_a).unwrap();
+    let observed_b = fs::read_to_string(&result_b).unwrap();
+    assert_eq!(
+        (observed_a.as_str(), observed_b.as_str()),
+        ("rejected\n", "rejected\n"),
+        "two runners acquired the same lexical state through different inodes: \
+         runner-a={observed_a:?} runner-b={observed_b:?}; \
+         marker-a={} marker-b={}",
+        held_a.join("state/runtime-state.json").exists(),
+        checked.join("state/runtime-state.json").exists(),
+    );
+}
+
+#[test]
+fn runner_adopts_a_same_inode_runtime_state_temp_after_link_crash_before_strict_read() {
+    let fixture = Fixture::new();
+    let root = fs::canonicalize(fixture._temp.path()).expect("canonical fixture root");
+    let state = root.join("nlink-runtime-state");
+    let prefix = state.join("case-prefix");
+    let cases = state.join("cases");
+    let work = root.join("nlink-runtime-work");
+    for directory in [&state, &prefix, &cases, &work] {
+        fs::create_dir(directory).expect("create nlink recovery directory");
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("protect nlink recovery directory");
+    }
+    let script = r#"
+set -euo pipefail
+source "$1"
+state_directory=$2
+persistent_case_prefix_dir=$state_directory/case-prefix
+persistent_cases_dir=$state_directory/cases
+persistent_runtime_state=$state_directory/runtime-state.json
+work=$3
+catalog=$4
+catalog_work=$work/catalog.jsonl
+results_work=$work/results.jsonl
+evidence_work=$work/evidence.jsonl
+journal_work=$work/journal.txt
+jq -S -c '.framework_required_evidence as $framework | .cases[] |
+  .required_evidence = (.required_evidence + $framework)' "$catalog" >"$catalog_work"
+: >"$results_work"
+: >"$evidence_work"
+: >"$journal_work"
+run_id=fixture-nlink-runtime
+block_path=kernel-nbd
+workspace_id=fixture-workspace
+exact_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+qualification_catalog_authority_sha256=$(sha256sum "$catalog" | awk '{print $1}')
+printf '%s\n' '{}' >"$state_directory/qualification-state-binding.v1.json"
+chmod 0600 "$state_directory/qualification-state-binding.v1.json"
+ln "$state_directory/qualification-state-binding.v1.json" \
+  "$state_directory/.qualification-state-binding.v1.json.crash-after-link"
+jq -S -c -n --arg run_id "$run_id" --arg block_path "$block_path" \
+  --arg exact_commit "$exact_commit" \
+  '{block_path:$block_path,cat_id:null,exact_commit:$exact_commit,run_id:$run_id,version:1}' \
+  >"$persistent_runtime_state"
+chmod 0600 "$persistent_runtime_state"
+ln "$persistent_runtime_state" "$state_directory/.runtime-state.json.crash-after-link"
+printf '%s\n' '{}' >"$state_directory/qualification-close-decision.v1.json"
+chmod 0600 "$state_directory/qualification-close-decision.v1.json"
+ln "$state_directory/qualification-close-decision.v1.json" \
+  "$state_directory/.qualification-close-decision.v1.json.crash-after-link"
+test "$(python3 - "$persistent_runtime_state" <<'PY'
+import os
+import sys
+print(os.stat(sys.argv[1], follow_symlinks=False).st_nlink)
+PY
+)" = 2
+cats_e3_recover_persistent_state_link "$state_directory" \
+  qualification-close-decision.v1.json
+test "$(cats_e3_restore_case_prefix)" = 0
+test ! -e "$state_directory/.qualification-state-binding.v1.json.crash-after-link"
+test ! -e "$state_directory/.runtime-state.json.crash-after-link"
+test ! -e "$state_directory/.qualification-close-decision.v1.json.crash-after-link"
+for canonical in qualification-state-binding.v1.json runtime-state.json \
+  qualification-close-decision.v1.json; do
+  test "$(python3 - "$state_directory/$canonical" <<'PY'
+import os
+import sys
+print(os.stat(sys.argv[1], follow_symlinks=False).st_nlink)
+PY
+)" = 1
+done
+ln "$state_directory/qualification-close-decision.v1.json" \
+  "$state_directory/.qualification-close-decision.v1.json.ambiguous-a"
+ln "$state_directory/qualification-close-decision.v1.json" \
+  "$state_directory/.qualification-close-decision.v1.json.ambiguous-b"
+! cats_e3_recover_persistent_state_link "$state_directory" \
+  qualification-close-decision.v1.json
+test -e "$state_directory/.qualification-close-decision.v1.json.ambiguous-a"
+test -e "$state_directory/.qualification-close-decision.v1.json.ambiguous-b"
+rm "$state_directory/.qualification-close-decision.v1.json.ambiguous-a" \
+  "$state_directory/.qualification-close-decision.v1.json.ambiguous-b"
+test "$(python3 - "$persistent_runtime_state" <<'PY'
+import os
+import sys
+print(os.stat(sys.argv[1], follow_symlinks=False).st_nlink)
+PY
+)" = 1
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-nlink-runtime"])
+        .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(&state)
+        .arg(&work)
+        .arg(
+            fixture
+                .root
+                .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
+        )
+        .output()
+        .expect("run runtime-state nlink recovery fixture");
+    assert_success(&output);
+}
+
+#[test]
 fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
     let fixture = Fixture::new();
     let harness = fixture._temp.path().join("runner-reentry-harness.sh");
@@ -1627,6 +1906,7 @@ fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
     let state = fixture._temp.path().join("runner-reentry-state");
     fs::create_dir(&state).expect("create reentry state");
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("protect reentry state");
+    let state = fs::canonicalize(state).expect("canonical reentry state");
     fs::write(
         &harness,
         r#"#!/usr/bin/env bash

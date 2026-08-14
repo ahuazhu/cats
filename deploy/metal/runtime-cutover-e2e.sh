@@ -646,6 +646,257 @@ cats_e3_environment_labels_are_unique() {
   done
 }
 
+# Validate every component from / through one existing directory, then retain
+# the exact checked inode in this shell.  Production runs as root, so the
+# actor-or-root rule below collapses to root:root for every component.  Tests
+# exercise the same walk as their unprivileged actor.
+cats_e3_pin_private_directory() {
+  local path=$1 fd_variable=$2 alias_variable=$3 final_policy=${4:-private}
+  local expected_identity descriptor alias
+  [[ $fd_variable =~ ^[A-Za-z_][A-Za-z0-9_]*$ && \
+    $alias_variable =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  expected_identity=$(python3 - "$path" "$final_policy" <<'PY'
+import os
+import stat
+import sys
+
+
+path, final_policy = sys.argv[1:]
+if (
+    not path.startswith("/")
+    or path == "/"
+    or path != os.path.normpath(path)
+    or final_policy not in {"private", "ancestor"}
+):
+    raise SystemExit(1)
+components = path.split("/")[1:]
+flags = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+effective_uid = os.geteuid()
+effective_gid = os.getegid()
+
+
+def permitted_owner(value):
+    if effective_uid == 0:
+        return (value.st_uid, value.st_gid) == (0, 0)
+    return (value.st_uid, value.st_gid) in {(0, 0), (effective_uid, effective_gid)}
+
+
+directory = os.open("/", flags)
+try:
+    root = os.fstat(directory)
+    if not stat.S_ISDIR(root.st_mode) or not permitted_owner(root) or root.st_mode & 0o022:
+        raise SystemExit(1)
+    for index, component in enumerate(components):
+        if component in {"", ".", ".."}:
+            raise SystemExit(1)
+        child = os.open(component, flags, dir_fd=directory)
+        value = os.fstat(child)
+        final = index == len(components) - 1
+        valid_mode = not value.st_mode & 0o022
+        if final and final_policy == "private":
+            valid_mode = stat.S_IMODE(value.st_mode) == 0o700
+        if (
+            not stat.S_ISDIR(value.st_mode)
+            or not permitted_owner(value)
+            or not valid_mode
+        ):
+            os.close(child)
+            raise SystemExit(1)
+        os.close(directory)
+        directory = child
+    value = os.fstat(directory)
+    print(f"{value.st_dev}:{value.st_ino}")
+finally:
+    os.close(directory)
+PY
+  ) || return 1
+  exec {descriptor}<"$path" || return 1
+  if ! python3 - "$descriptor" "$expected_identity" "$final_policy" <<'PY'
+import os
+import stat
+import sys
+
+
+descriptor = int(sys.argv[1])
+expected_identity = sys.argv[2]
+final_policy = sys.argv[3]
+value = os.fstat(descriptor)
+effective_uid = os.geteuid()
+effective_gid = os.getegid()
+owner = (
+    (value.st_uid, value.st_gid) == (0, 0)
+    if effective_uid == 0
+    else (value.st_uid, value.st_gid) in {(0, 0), (effective_uid, effective_gid)}
+)
+mode = stat.S_IMODE(value.st_mode)
+if (
+    not stat.S_ISDIR(value.st_mode)
+    or not owner
+    or mode & 0o022
+    or (final_policy == "private" and mode != 0o700)
+    or f"{value.st_dev}:{value.st_ino}" != expected_identity
+):
+    raise SystemExit(1)
+PY
+  then
+    exec {descriptor}<&-
+    return 1
+  fi
+  if [[ -d /proc/self/fd ]]; then
+    alias=/proc/self/fd/$descriptor
+  else
+    alias=$(python3 - "$descriptor" <<'PY'
+import fcntl
+import sys
+try:
+    raw = fcntl.fcntl(int(sys.argv[1]), 50, b"\0" * 1024)
+except (AttributeError, OSError):
+    raise SystemExit(1)
+print(raw.split(b"\0", 1)[0].decode("utf-8"))
+PY
+    ) || {
+      exec {descriptor}<&-
+      return 1
+    }
+  fi
+  printf -v "$fd_variable" '%s' "$descriptor"
+  printf -v "$alias_variable" '%s' "$alias"
+}
+
+cats_e3_fd_directory_identity() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+value = os.fstat(int(sys.argv[1]))
+if not stat.S_ISDIR(value.st_mode):
+    raise SystemExit(1)
+print(f"{value.st_dev}:{value.st_ino}")
+PY
+}
+
+cats_e3_open_pinned_state_lock() {
+  local directory_fd=$1 directory_alias=$2 fd_variable=$3
+  local expected_identity descriptor
+  [[ $directory_fd =~ ^[0-9]+$ && $fd_variable =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  expected_identity=$(python3 - "$directory_fd" <<'PY'
+import os
+import stat
+import sys
+
+
+directory_fd = int(sys.argv[1])
+flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(".runtime-cutover.lock", flags, 0o600, dir_fd=directory_fd)
+try:
+    os.fchmod(descriptor, 0o600)
+    value = os.fstat(descriptor)
+    expected_owner = (os.geteuid(), os.getegid())
+    if os.geteuid() == 0:
+        expected_owner = (0, 0)
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or (value.st_uid, value.st_gid) != expected_owner
+        or stat.S_IMODE(value.st_mode) != 0o600
+        or value.st_nlink != 1
+    ):
+        raise SystemExit(1)
+    os.fsync(descriptor)
+    os.fsync(directory_fd)
+    print(f"{value.st_dev}:{value.st_ino}")
+finally:
+    os.close(descriptor)
+PY
+  ) || return 1
+  exec {descriptor}<>"$directory_alias/.runtime-cutover.lock" || return 1
+  if ! python3 - "$descriptor" "$expected_identity" <<'PY'
+import os
+import stat
+import sys
+value = os.fstat(int(sys.argv[1]))
+expected_owner = (os.geteuid(), os.getegid())
+if os.geteuid() == 0:
+    expected_owner = (0, 0)
+if (
+    not stat.S_ISREG(value.st_mode)
+    or (value.st_uid, value.st_gid) != expected_owner
+    or stat.S_IMODE(value.st_mode) != 0o600
+    or value.st_nlink != 1
+    or f"{value.st_dev}:{value.st_ino}" != sys.argv[2]
+):
+    raise SystemExit(1)
+PY
+  then
+    exec {descriptor}<&-
+    return 1
+  fi
+  printf -v "$fd_variable" '%s' "$descriptor"
+}
+
+cats_e3_create_pinned_output_directory() {
+  local parent_fd=$1 parent_alias=$2 name=$3 fd_variable=$4 alias_variable=$5
+  local expected_identity descriptor alias
+  [[ $parent_fd =~ ^[0-9]+$ && -n $name && $name != . && $name != .. && \
+    $name != */* && ${#name} -le 255 ]] || return 1
+  expected_identity=$(python3 - "$parent_fd" "$name" <<'PY'
+import os
+import stat
+import sys
+
+
+parent_fd = int(sys.argv[1])
+name = sys.argv[2]
+os.mkdir(name, 0o700, dir_fd=parent_fd)
+os.fsync(parent_fd)
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(name, flags, dir_fd=parent_fd)
+try:
+    value = os.fstat(descriptor)
+    expected_owner = (os.geteuid(), os.getegid())
+    if os.geteuid() == 0:
+        expected_owner = (0, 0)
+    if (
+        not stat.S_ISDIR(value.st_mode)
+        or (value.st_uid, value.st_gid) != expected_owner
+        or stat.S_IMODE(value.st_mode) != 0o700
+    ):
+        raise SystemExit(1)
+    print(f"{value.st_dev}:{value.st_ino}")
+finally:
+    os.close(descriptor)
+PY
+  ) || return 1
+  exec {descriptor}<"$parent_alias/$name" || return 1
+  if [[ $(cats_e3_fd_directory_identity "$descriptor") != "$expected_identity" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  if [[ -d /proc/self/fd ]]; then
+    alias=/proc/self/fd/$descriptor
+  else
+    alias=$(python3 - "$descriptor" <<'PY'
+import fcntl
+import sys
+try:
+    raw = fcntl.fcntl(int(sys.argv[1]), 50, b"\0" * 1024)
+except (AttributeError, OSError):
+    raise SystemExit(1)
+print(raw.split(b"\0", 1)[0].decode("utf-8"))
+PY
+    ) || {
+      exec {descriptor}<&-
+      return 1
+    }
+  fi
+  printf -v "$fd_variable" '%s' "$descriptor"
+  printf -v "$alias_variable" '%s' "$alias"
+}
+
 cats_e3_validate_private_key_input() {
   python3 - "$1" <<'PY'
 import os
@@ -919,8 +1170,102 @@ finally:
 PY
 }
 
+cats_e3_recover_persistent_state_link() {
+  local directory=$1 name=$2 directory_fd=-1
+  if [[ -n ${state_directory_fd:-} && $directory == "$state_directory" ]]; then
+    directory_fd=$state_directory_fd
+  fi
+  python3 - "$directory" "$name" "$directory_fd" <<'PY'
+import os
+import stat
+import sys
+
+
+directory, name = sys.argv[1:3]
+inherited_directory_fd = int(sys.argv[3])
+if name not in {
+    "qualification-state-binding.v1.json",
+    "runtime-state.json",
+    "qualification-close-decision.v1.json",
+}:
+    raise SystemExit(1)
+if inherited_directory_fd >= 0:
+    directory_fd = os.dup(inherited_directory_fd)
+else:
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+effective_uid = os.geteuid()
+prefix = f".{name}."
+
+
+def actor_owned(value):
+    return value.st_uid == effective_uid and (effective_uid != 0 or value.st_gid == 0)
+
+
+try:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        canonical = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(canonical.st_mode)
+            or not actor_owned(canonical)
+            or stat.S_IMODE(canonical.st_mode) != 0o600
+            or canonical.st_nlink not in {1, 2}
+        ):
+            raise SystemExit(1)
+        temporaries = []
+        for candidate in os.listdir(directory_fd):
+            if not candidate.startswith(prefix):
+                continue
+            value = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(value.st_mode)
+                or not actor_owned(value)
+                or stat.S_IMODE(value.st_mode) != 0o600
+            ):
+                raise SystemExit(1)
+            temporaries.append((candidate, value))
+        if canonical.st_nlink == 1:
+            if temporaries:
+                raise SystemExit(1)
+            raise SystemExit(0)
+        matches = [
+            candidate
+            for candidate, value in temporaries
+            if (value.st_dev, value.st_ino) == (canonical.st_dev, canonical.st_ino)
+            and value.st_nlink == 2
+        ]
+        if len(temporaries) != 1 or len(matches) != 1:
+            raise SystemExit(1)
+        os.unlink(matches[0], dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        after = os.fstat(descriptor)
+        if (
+            after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
+            or after.st_size != canonical.st_size
+            or after.st_mtime_ns != canonical.st_mtime_ns
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory_fd)
+PY
+}
+
 cats_e3_bind_persistent_state() {
-  python3 - "$1" "$2" "${3:-qualification-state-binding.v1.json}" <<'PY'
+  local directory=$1 source=$2 name=${3:-qualification-state-binding.v1.json} directory_fd=-1
+  if [[ -n ${state_directory_fd:-} && $directory == "$state_directory" ]]; then
+    directory_fd=$state_directory_fd
+  fi
+  python3 - "$directory" "$source" "$name" "$directory_fd" <<'PY'
 import os
 from pathlib import Path
 import re
@@ -932,6 +1277,7 @@ import tempfile
 directory = Path(sys.argv[1])
 source = Path(sys.argv[2])
 name = sys.argv[3]
+inherited_directory_fd = int(sys.argv[4])
 effective_uid = os.geteuid()
 
 
@@ -952,13 +1298,16 @@ expected = source.read_bytes()
 maximum = 16 * 1024 * 1024 if case_prefix is not None else 65536
 if not 1 <= len(expected) <= maximum:
     raise SystemExit(1)
-directory_fd = os.open(
-    directory,
-    os.O_RDONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0),
-)
+if inherited_directory_fd >= 0:
+    directory_fd = os.dup(inherited_directory_fd)
+else:
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
 
 
 def identity(value):
@@ -1068,6 +1417,8 @@ cats_e3_load_close_decision() {
   local decision=$state_directory/qualification-close-decision.v1.json
   local canonical=$scratch/qualification-close-decision.canonical.json
   local state_binding_sha256
+  cats_e3_recover_persistent_state_link "$state_directory" \
+    qualification-close-decision.v1.json || return 1
   state_binding_sha256=sha256:$(
     sha256sum "$state_directory/qualification-state-binding.v1.json" | awk '{print $1}'
   )
@@ -1144,6 +1495,9 @@ cats_e3_persist_case_prefix() {
 }
 
 cats_e3_restore_case_prefix() {
+  cats_e3_recover_persistent_state_link "$state_directory" \
+    qualification-state-binding.v1.json || return 1
+  cats_e3_recover_persistent_state_link "$state_directory" runtime-state.json || return 1
   python3 - \
     "$persistent_case_prefix_dir" \
     "$state_directory/qualification-state-binding.v1.json" \
@@ -1606,54 +1960,91 @@ PY
 }
 
 cats_e3_private_state_subdirectory() {
-  local path=$1
-  python3 - "$path" <<'PY'
+  local path=$1 parent base parent_fd parent_alias relative
+  [[ $path == /* && $path != */. && $path != */.. ]] || return 1
+  if [[ -n ${state_directory_fd:-} && $path == "$state_directory"/* ]]; then
+    relative=${path#"$state_directory"/}
+    python3 - "$state_directory_fd" "$relative" <<'PY'
 import os
-from pathlib import Path
 import stat
 import sys
 
 
-path = Path(sys.argv[1])
+directory_fd = os.dup(int(sys.argv[1]))
+components = sys.argv[2].split("/")
 effective_uid = os.geteuid()
-if not path.is_absolute() or str(path) != os.path.normpath(path):
+effective_gid = os.getegid()
+if not components or any(component in {"", ".", ".."} for component in components):
     raise SystemExit(1)
-parent = path.parent
-parent_fd = os.open(
-    parent,
-    os.O_RDONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0),
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def valid(value):
+    owner = (value.st_uid, value.st_gid) == (effective_uid, effective_gid)
+    if effective_uid == 0:
+        owner = (value.st_uid, value.st_gid) == (0, 0)
+    return stat.S_ISDIR(value.st_mode) and owner and stat.S_IMODE(value.st_mode) == 0o700
+
+
+try:
+    for index, component in enumerate(components):
+        final = index == len(components) - 1
+        if final:
+            try:
+                os.mkdir(component, 0o700, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except FileExistsError:
+                pass
+        child = os.open(component, flags, dir_fd=directory_fd)
+        if not valid(os.fstat(child)):
+            os.close(child)
+            raise SystemExit(1)
+        os.close(directory_fd)
+        directory_fd = child
+finally:
+    os.close(directory_fd)
+PY
+    return
+  fi
+  parent=${path%/*}
+  base=${path##*/}
+  [[ -n $parent && -n $base ]] || return 1
+  cats_e3_pin_private_directory "$parent" parent_fd parent_alias ancestor || return 1
+  if ! python3 - "$parent_fd" "$base" <<'PY'
+import os
+import stat
+import sys
+
+
+parent_fd = int(sys.argv[1])
+name = sys.argv[2]
+effective_uid = os.geteuid()
+effective_gid = os.getegid()
+try:
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+except FileExistsError:
+    pass
+descriptor = os.open(
+    name,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    dir_fd=parent_fd,
 )
 try:
-    try:
-        os.mkdir(path.name, 0o700, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-    except FileExistsError:
-        pass
-    directory_fd = os.open(
-        path.name,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent_fd,
-    )
-    try:
-        metadata = os.fstat(directory_fd)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != effective_uid
-            or (effective_uid == 0 and metadata.st_gid != 0)
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
-            raise SystemExit(1)
-    finally:
-        os.close(directory_fd)
+    value = os.fstat(descriptor)
+    owner = (value.st_uid, value.st_gid) == (effective_uid, effective_gid)
+    if effective_uid == 0:
+        owner = (value.st_uid, value.st_gid) == (0, 0)
+    if not stat.S_ISDIR(value.st_mode) or not owner or stat.S_IMODE(value.st_mode) != 0o700:
+        raise SystemExit(1)
 finally:
-    os.close(parent_fd)
+    os.close(descriptor)
 PY
+  then
+    exec {parent_fd}<&-
+    return 1
+  fi
+  exec {parent_fd}<&-
 }
 
 cats_e3_private_stage=
@@ -1668,13 +2059,21 @@ import sys
 parent = sys.argv[1]
 name = "invocation-secrets"
 effective_uid = os.geteuid()
-parent_fd = os.open(
-    parent,
-    os.O_RDONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0),
-)
+inherited = None
+for prefix in ("/proc/self/fd/", "/dev/fd/"):
+    if parent.startswith(prefix) and parent[len(prefix):].isdigit():
+        inherited = int(parent[len(prefix):])
+        break
+if inherited is None:
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+else:
+    parent_fd = os.dup(inherited)
 try:
     try:
         directory_fd = os.open(
@@ -1935,56 +2334,51 @@ print(os.path.realpath(sys.argv[1]))
 PY
 }
 
-canonical_output() {
-  local requested=$1 parent base
-  parent=${requested%/*}
-  base=${requested##*/}
-  [[ -n $parent && -n $base && $base != . && $base != .. ]] || return 1
-  [[ -d $parent && ! -L $parent ]] || return 1
-  parent=$(cd "$parent" && pwd -P) || return 1
-  printf '%s/%s\n' "$parent" "$base"
-}
-
 build_receipt=$(canonical_existing "$build_receipt") || fail "build receipt must be a regular non-symlink file"
 release_manifest=$(canonical_existing "$release_manifest") || fail "release manifest must be a regular non-symlink file"
 installer_receipt=$(canonical_existing "$installer_receipt") || fail "installer receipt must be a regular non-symlink file"
 token_file=$(canonical_existing "$token_file") || fail "token file must be a regular non-symlink file"
 state_directory_requested=$state_directory
-state_directory=$(canonical_existing "$state_directory") || \
-  fail "state directory must be an existing non-symlink directory"
-[[ $state_directory == "$state_directory_requested" && -d $state_directory ]] || \
-  fail "state directory path and ancestors must be canonical real directories"
-python3 - "$state_directory" <<'PY' || fail "state directory must be protected root-only persistence"
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-metadata = os.stat(path, follow_symlinks=False)
-parent = os.stat(os.path.dirname(path), follow_symlinks=False)
-assert stat.S_ISDIR(metadata.st_mode) and not os.path.islink(path)
-assert (metadata.st_uid, metadata.st_gid) == (0, 0)
-assert stat.S_IMODE(metadata.st_mode) == 0o700
-assert stat.S_ISDIR(parent.st_mode) and (parent.st_uid, parent.st_gid) == (0, 0)
-assert stat.S_IMODE(parent.st_mode) & 0o022 == 0
-PY
-state_lock=$state_directory/.runtime-cutover.lock
-[[ ! -L $state_lock ]] || fail "persistent state lock must not be a symlink"
-(umask 077; : >>"$state_lock") || fail "persistent state lock is unavailable"
-[[ -f $state_lock && ! -L $state_lock && -O $state_lock && \
-  $(stat -c '%u:%g:%a:%h' "$state_lock") == 0:0:600:1 ]] || \
-  fail "persistent state lock is not protected root-only state"
-exec {state_lock_fd}<>"$state_lock"
-flock -n "$state_lock_fd" || fail "another runner owns this persistent qualification state"
+cats_e3_pin_private_directory "$state_directory_requested" \
+  state_directory_fd state_directory_fd_path private || \
+  fail "state directory and every ancestor must be pinned protected root-only directories"
+state_directory_display=$state_directory_requested
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "installer receipt path must resolve to the canonical production path"
 scenario_driver=$(canonical_existing "$scenario_driver") || fail "scenario driver must be a regular non-symlink file"
 qualification_catalog=$(canonical_existing "$qualification_catalog") || \
   fail "qualification catalog must be the fixed regular non-symlink repository file"
-output_dir=$(canonical_output "$output_dir") || fail "absolute output parent must already exist and be a real directory"
-[[ ! -e $output_dir && ! -L $output_dir ]] || fail "output directory already exists; refusing to overwrite evidence"
-case "$output_dir/" in "$state_directory/"*) fail "output directory must not be inside persistent state" ;; esac
-case "$state_directory/" in "$output_dir/"*) fail "persistent state must not be inside output evidence" ;; esac
+output_dir_display=$output_dir
+output_parent_display=${output_dir_display%/*}
+output_base=${output_dir_display##*/}
+[[ -n $output_parent_display && -n $output_base && $output_base != . && $output_base != .. ]] || \
+  fail "output directory has no bounded parent/name split"
+python3 - "$output_dir_display" <<'PY' || fail "output directory path must be canonical"
+import os
+import sys
+path = sys.argv[1]
+if not path.startswith("/") or path != os.path.normpath(path):
+    raise SystemExit(1)
+PY
+cats_e3_pin_private_directory "$output_parent_display" \
+  output_parent_fd output_parent_fd_path ancestor || \
+  fail "output parent and every ancestor must be pinned protected root-only directories"
+python3 - "$output_parent_fd" "$output_base" <<'PY' || \
+  fail "output directory already exists; refusing to overwrite evidence"
+import os
+import sys
+try:
+    os.stat(sys.argv[2], dir_fd=int(sys.argv[1]), follow_symlinks=False)
+except FileNotFoundError:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+case "$output_dir_display/" in "$state_directory_display/"*) fail "output directory must not be inside persistent state" ;; esac
+case "$state_directory_display/" in "$output_dir_display/"*) fail "persistent state must not be inside output evidence" ;; esac
+state_directory=$state_directory_fd_path
+cats_e3_open_pinned_state_lock "$state_directory_fd" "$state_directory_fd_path" \
+  state_lock_fd || fail "persistent state lock is not protected descriptor-relative state"
+flock -n "$state_lock_fd" || fail "another runner owns this persistent qualification state"
 
 [[ $(git -C "$repo" rev-parse HEAD) == "$exact_commit" ]] || fail "checkout HEAD does not equal the exact commit"
 [[ $(git -C "$repo" rev-parse "${exact_commit}^{commit}") == "$exact_commit" ]] || fail "exact commit is not a commit object"
@@ -2263,7 +2657,10 @@ schema_version=$(git -C "$repo" show "${exact_commit}:storage/src/authority.rs" 
   sed -nE 's/^pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p')
 [[ $schema_version == 16 ]] || fail "exact source must expose the one frozen authority schema version 16"
 
-mkdir -m 0700 "$output_dir"
+cats_e3_create_pinned_output_directory "$output_parent_fd" "$output_parent_fd_path" \
+  "$output_base" output_dir_fd output_dir_fd_path || \
+  fail "create and pin descriptor-relative output directory"
+output_dir=$output_dir_fd_path
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$scratch"
 stage=$scratch/stage
@@ -2787,6 +3184,12 @@ route_rotation_server_ca_sha256=sha256:$(
 host_kernel=$(uname -r)
 [[ $host_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || \
   fail "Host kernel release is not a bounded nonsecret string"
+if [[ -e $state_directory/qualification-state-binding.v1.json || \
+  -L $state_directory/qualification-state-binding.v1.json ]]; then
+  cats_e3_recover_persistent_state_link "$state_directory" \
+    qualification-state-binding.v1.json || \
+    fail "persistent qualification binding has an unsafe interrupted adoption"
+fi
 started_at_unix_seconds=$(python3 - \
   "$state_directory/qualification-state-binding.v1.json" \
   "$run_id" "$block_path" "$workspace_id" "$exact_commit" <<'PY'

@@ -312,6 +312,21 @@ def read_stable_file(path: Path, label: str, maximum: int, *, private: bool) -> 
 def validate_private_directory(path: Path) -> None:
     if not path.is_absolute():
         raise AdmissionError("state directory must be absolute")
+    inherited = re.fullmatch(r"/(?:proc/self|dev)/fd/([0-9]+)", str(path))
+    if inherited is not None:
+        try:
+            metadata = os.fstat(int(inherited.group(1)))
+        except OSError as error:
+            raise AdmissionError("inherited state directory descriptor is unavailable") from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise AdmissionError(
+                "inherited state directory must be an actor-owned mode-0700 directory"
+            )
+        return
     try:
         metadata = path.stat(follow_symlinks=False)
     except OSError as error:
