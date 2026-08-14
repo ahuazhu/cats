@@ -44,13 +44,30 @@ impl AwsHostFenceConfig {
         object_store_scope_id: AsciiText,
         hosts: BTreeMap<Id, AwsHostTarget>,
     ) -> Result<Self, HostFenceProviderError> {
-        if provider_scope.provider.as_str() != "aws"
-            || hosts.is_empty()
-            || hosts.values().any(|host| {
-                host.network_interface_ids.is_empty()
-                    || host.network_interface_ids.len() > MAX_HOST_FENCE_NETWORK_INTERFACES
-            })
-        {
+        if provider_scope.provider.as_str() != "aws" || hosts.is_empty() {
+            return Err(HostFenceProviderError::InvalidRequest);
+        }
+        let mut node_ids = BTreeSet::new();
+        let mut vpc_ids = BTreeSet::new();
+        let mut writer_authority_ids = BTreeSet::new();
+        let mut workload_principal_ids = BTreeSet::new();
+        let mut network_interface_ids = BTreeSet::new();
+        for host in hosts.values() {
+            vpc_ids.insert(host.vpc_id.clone());
+            if host.network_interface_ids.is_empty()
+                || host.network_interface_ids.len() > MAX_HOST_FENCE_NETWORK_INTERFACES
+                || !node_ids.insert(host.node_id.clone())
+                || !writer_authority_ids.insert(host.writer_authority_id.clone())
+                || !workload_principal_ids.insert(host.workload_principal_id.clone())
+                || host
+                    .network_interface_ids
+                    .iter()
+                    .any(|interface_id| !network_interface_ids.insert(interface_id.clone()))
+            {
+                return Err(HostFenceProviderError::InvalidRequest);
+            }
+        }
+        if vpc_ids.len() != 1 {
             return Err(HostFenceProviderError::InvalidRequest);
         }
         Ok(Self {
@@ -928,6 +945,41 @@ mod tests {
 
     fn time(value: u64) -> UnixMillis {
         UnixMillis::new(value).unwrap()
+    }
+
+    #[test]
+    fn configuration_rejects_shared_writer_or_interface_bindings() {
+        let hosts = BTreeMap::from([
+            (
+                id("i-0123456789abcdef0"),
+                AwsHostTarget {
+                    node_id: id("metal-1"),
+                    vpc_id: id("vpc-0123456789abcdef0"),
+                    network_interface_ids: BTreeSet::from([id("eni-shared")]),
+                    writer_authority_id: id("writer-shared"),
+                    workload_principal_id: text("host-writer-1"),
+                },
+            ),
+            (
+                id("i-1123456789abcdef0"),
+                AwsHostTarget {
+                    node_id: id("metal-2"),
+                    vpc_id: id("vpc-0123456789abcdef0"),
+                    network_interface_ids: BTreeSet::from([id("eni-shared")]),
+                    writer_authority_id: id("writer-shared"),
+                    workload_principal_id: text("host-writer-2"),
+                },
+            ),
+        ]);
+        assert_eq!(
+            AwsHostFenceConfig::new(
+                scope("us-east-1"),
+                id("sg-0fence000000000001"),
+                text("production-chunkstore"),
+                hosts,
+            ),
+            Err(HostFenceProviderError::InvalidRequest)
+        );
     }
 
     fn host(state: Ec2InstanceState, at: u64, observation: &str) -> HostObservation {

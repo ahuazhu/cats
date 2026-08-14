@@ -12,6 +12,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use cats_api::object_write_gateway::object_write_key;
 #[cfg(test)]
 use cats_api::runtime_reconciliation::Id;
 use cats_api::runtime_reconciliation::{AsciiText, ProviderScope, Sha256Digest, UnixMillis};
@@ -48,16 +49,24 @@ impl AwsObjectWriteConfig {
         object_store_scope_id: AsciiText,
         durable_spool_root: PathBuf,
     ) -> Result<Self, ObjectWriteDownstreamError> {
+        let expected_object_store_scope_id = format!(
+            "arn:{}:s3:::{}/{}",
+            provider_scope.partition, bucket, object_store_prefix
+        );
         if provider_scope.provider.as_str() != "aws"
             || !valid_bucket_name(&bucket)
             || !valid_provider_prefix(&object_store_prefix)
+            || object_store_scope_id.as_str() != expected_object_store_scope_id
             || !durable_spool_root.is_absolute()
         {
             return Err(ObjectWriteDownstreamError::InvalidRequest);
         }
         let metadata = std::fs::symlink_metadata(&durable_spool_root)
             .map_err(|_| ObjectWriteDownstreamError::Unavailable)?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
             return Err(ObjectWriteDownstreamError::InvalidRequest);
         }
         let durable_spool_root = std::fs::canonicalize(durable_spool_root)
@@ -102,9 +111,15 @@ impl AwsObjectWriteConfig {
         &self,
         descriptor: &ObjectPutDescriptor,
     ) -> Result<(), ObjectWriteDownstreamError> {
+        let expected_key = object_write_key(
+            &descriptor.volume_id,
+            &descriptor.key,
+            &descriptor.content_sha256,
+        )
+        .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?;
         if descriptor.target.object_provider_scope != self.provider_scope
             || descriptor.target.object_store_scope_id != self.object_store_scope_id
-            || !is_runtime_immutable_object_key(&descriptor.target.canonical_logical_key)
+            || descriptor.target.canonical_logical_key != expected_key
         {
             return Err(ObjectWriteDownstreamError::InvalidRequest);
         }
@@ -297,31 +312,6 @@ fn validate_descriptor_for_discovery(
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
     Ok(())
-}
-
-fn is_runtime_immutable_object_key(key: &str) -> bool {
-    let segments = key.split('/').collect::<Vec<_>>();
-    if segments.len() != 4
-        || segments[0] != "volumes"
-        || segments[1].is_empty()
-        || segments[3].is_empty()
-    {
-        return false;
-    }
-    match segments[2] {
-        "data" => true,
-        "maps" => {
-            let Some(digest) = segments[3].strip_suffix(".node") else {
-                return false;
-            };
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }
-        "commits" => segments[3].ends_with(".json"),
-        _ => false,
-    }
 }
 
 fn valid_bucket_name(bucket: &str) -> bool {
@@ -961,6 +951,7 @@ mod tests {
     }
 
     fn config(root: &Path) -> AwsObjectWriteConfig {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         AwsObjectWriteConfig::new(
             provider_scope(),
             "cats-chunks-test".to_owned(),
@@ -1000,6 +991,33 @@ mod tests {
             version_id: Some(ascii("version-1")),
             observed_at_unix_ms: millis(31),
         }
+    }
+
+    #[test]
+    fn configuration_binds_bucket_prefix_and_private_spool_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert_eq!(
+            AwsObjectWriteConfig::new(
+                provider_scope(),
+                "cats-chunks-test".to_owned(),
+                "production/chunks".to_owned(),
+                ascii("arn:aws:s3:::another-bucket/production/chunks"),
+                temporary.path().to_owned(),
+            ),
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
+
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(
+            AwsObjectWriteConfig::new(
+                provider_scope(),
+                "cats-chunks-test".to_owned(),
+                "production/chunks".to_owned(),
+                ascii("arn:aws:s3:::cats-chunks-test/production/chunks"),
+                temporary.path().to_owned(),
+            ),
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
     }
 
     #[tokio::test]
@@ -1179,5 +1197,18 @@ mod tests {
             Err(ObjectWriteDownstreamError::InvalidRequest)
         );
         assert!(s3.puts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn caller_supplied_cross_volume_key_is_rederived_and_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"sealed target";
+        let mut descriptor = descriptor(body);
+        descriptor.target.canonical_logical_key =
+            "volumes/vol-victim/data/11111111111111111111111111111111-c0".to_owned();
+        assert_eq!(
+            config(temporary.path()).provider_key(&descriptor),
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
     }
 }
