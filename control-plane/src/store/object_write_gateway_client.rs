@@ -1383,7 +1383,7 @@ fn qualification_database_now(
     let value: i64 = client
         .query_one(
             "SELECT pg_catalog.floor(
-                pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+                pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
             )::BIGINT",
             &[],
         )

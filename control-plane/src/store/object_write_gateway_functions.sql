@@ -65,9 +65,9 @@ BEGIN
                        pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(
                                function.prosrc,
                                pg_catalog.chr(34) || __CATS_SCHEMA_LITERAL__ || pg_catalog.chr(34),
-                               '__CATS_SCHEMA_IDENT__'
+                               '__CATS_SCHEMA_' || 'IDENT__'
                            ), pg_catalog.quote_literal(__CATS_SCHEMA_LITERAL__),
-                              '__CATS_SCHEMA_LITERAL__'),
+                              '__CATS_SCHEMA_' || 'LITERAL__'),
                            '__CATS_OBJECT_WRITE_GATEWAY_CONTRACT_SHA256_VALUE__',
                            '__CATS_OBJECT_WRITE_GATEWAY_' ||
                                'CONTRACT_SHA256_VALUE__'),
@@ -200,7 +200,7 @@ BEGIN
      WHERE session.node_id=identity_row.node_id
      FOR UPDATE;
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     IF NOT FOUND
        OR session_row.immutable_host_id IS DISTINCT FROM identity_row.immutable_host_id
@@ -451,7 +451,7 @@ BEGIN
                 USING ERRCODE = '22023';
         END IF;
         object_key := 'volumes/' || requested_descriptor #>> '{volume_id}' ||
-            '/maps/' || pg_catalog.substring(content_sha256 FROM 8) || '.node';
+            '/maps/' || pg_catalog.substr(content_sha256, 8) || '.node';
     ELSIF key_kind = 'volume_commit' THEN
         IF pg_catalog.jsonb_typeof(requested_descriptor -> 'key')
                 IS DISTINCT FROM 'object'
@@ -540,7 +540,7 @@ BEGIN
     END IF;
     request_id := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     ingress_record := pg_catalog.jsonb_build_object(
         'ingress', pg_catalog.jsonb_build_object(
@@ -643,7 +643,7 @@ BEGIN
             USING ERRCODE = 'P0002';
     END IF;
     IF requested_spool #>> '{spool_id}'
-            IS DISTINCT FROM 'owsp1_' || pg_catalog.substring(requested_request_id FROM 8)
+            IS DISTINCT FROM 'owsp1_' || pg_catalog.substr(requested_request_id, 8)
        OR requested_spool #>> '{request_id}' IS DISTINCT FROM requested_request_id
        OR requested_spool #>> '{content_sha256}'
             IS DISTINCT FROM attempt_row.content_sha256
@@ -675,7 +675,7 @@ BEGIN
         RETURN;
     END IF;
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     durable_spool := pg_catalog.jsonb_set(
         requested_spool, '{durable_at_unix_ms}', pg_catalog.to_jsonb(now_ms), TRUE
@@ -775,11 +775,11 @@ BEGIN
         END IF;
     END IF;
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     IF rejection_kind IS NOT NULL THEN
         rejection_receipt_id := 'owrej1_' ||
-            pg_catalog.substring(requested_request_id FROM 8) || '_' || rejection_kind;
+            pg_catalog.substr(requested_request_id, 8) || '_' || rejection_kind;
         updated_record := pg_catalog.jsonb_set(
             attempt_row.record, '{state}',
             pg_catalog.jsonb_build_object(
@@ -818,7 +818,7 @@ BEGIN
         'content_length', attempt_row.record #> '{ingress,content_length}',
         'qualification_fault', attempt_row.record #> '{ingress,qualification_fault}',
         'provider_attempt_id', 'owpa1_' ||
-            pg_catalog.substring(requested_request_id FROM 8),
+            pg_catalog.substr(requested_request_id, 8),
         'accepted_at_unix_ms', pg_catalog.to_jsonb(now_ms)
     );
     updated_record := pg_catalog.jsonb_build_object(
@@ -846,7 +846,7 @@ BEGIN
        SET record=updated_record, state='accepted_spooled',
            accepted_sequence=accepted_sequence, accepted_at_unix_ms=now_ms,
            provider_attempt_id='owpa1_' ||
-                pg_catalog.substring(requested_request_id FROM 8)
+                pg_catalog.substr(requested_request_id, 8)
      WHERE attempt.request_id=requested_request_id
        AND attempt.state='durable_spooled';
     IF NOT FOUND THEN
@@ -902,7 +902,7 @@ BEGIN
         RETURN;
     END IF;
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     updated_record := pg_catalog.jsonb_set(
         attempt_row.record, '{state}',
@@ -1312,7 +1312,7 @@ BEGIN
     END IF;
 
     injected_at := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     IF (successful_put_json #>> '{completed_at_unix_ms}')::BIGINT
             < authorization_row.authorized_at_unix_ms
@@ -2130,7 +2130,7 @@ BEGIN
             END IF;
 
             terminal_at := pg_catalog.floor(
-                pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+                pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
             )::BIGINT;
             IF terminal_at <
                     (requested_outcome #>> '{head_evidence,observed_at_unix_ms}')::BIGINT THEN
@@ -2467,7 +2467,7 @@ BEGIN
         attempt_row.qualification_unproven_at_unix_ms
     );
     now_ms := pg_catalog.floor(
-        pg_catalog.extract(epoch FROM pg_catalog.clock_timestamp()) * 1000
+        pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     IF now_ms < terminal_at THEN
         RAISE EXCEPTION 'object-write spool removal precedes terminal result'

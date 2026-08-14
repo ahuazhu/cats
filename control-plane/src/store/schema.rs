@@ -816,7 +816,7 @@ fn verify_host_fence_provider_function_catalog(
             2,
             true,
             "plpgsql",
-            "e9a94b7a38573e85ea139a13706d691a92bdf4f5f3a8a1804a5742425ce5f3ea",
+            "c5e6a02bd09a6df2283af80b7408e864d2b3441f4cba6ff1e568c3ce2335865e",
         ),
         (
             "control_host_fence_provider_complete_v1",
@@ -1454,157 +1454,157 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_release_sha_ck",
-        "CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+        "CHECK ((release_commit_sha ~ '^[0-9a-f]{40}$'::text))",
     ),
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_trust_sha_ck",
-        "CHECK (trust_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((trust_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_threshold_ck",
-        "CHECK (threshold >= 1 AND threshold <= 8)",
+        "CHECK (((threshold >= 1) AND (threshold <= 8)))",
     ),
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_trust_bytes_ck",
-        "CHECK (octet_length(trust_bytes) >= 1 AND octet_length(trust_bytes) <= 16384)",
+        "CHECK (((octet_length(trust_bytes) >= 1) AND (octet_length(trust_bytes) <= 16384)))",
     ),
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_committed_at_ck",
-        "CHECK (first_committed_at_unix_ms >= 0)",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
     ),
     (
         "route_v2_rotation_operator_credentials",
         "route_v2_rotation_operator_ordinal_ck",
-        "CHECK (credential_ordinal >= 0 AND credential_ordinal <= 7)",
+        "CHECK (((credential_ordinal >= 0) AND (credential_ordinal <= 7)))",
     ),
     (
         "route_v2_rotation_operator_credentials",
         "route_v2_rotation_operator_spki_sha_ck",
-        "CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_rotation_operator_credentials",
         "route_v2_rotation_operator_credential_committed_at_ck",
-        "CHECK (first_committed_at_unix_ms >= 0)",
+        "CHECK ((first_committed_at_unix_ms >= 0))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_id_ck",
-        "CHECK (command_id ~ '^[0-9a-f]{32}$'::text)",
+        "CHECK ((command_id ~ '^[0-9a-f]{32}$'::text))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_release_sha_ck",
-        "CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+        "CHECK ((release_commit_sha ~ '^[0-9a-f]{40}$'::text))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_credential_set_sha_ck",
-        "CHECK (credential_set_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((credential_set_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_exact_sha_ck",
-        "CHECK (exact_command_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((exact_command_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_exact_bytes_ck",
-        "CHECK (octet_length(exact_command_bytes) >= 1 AND octet_length(exact_command_bytes) <= 65536)",
+        "CHECK (((octet_length(exact_command_bytes) >= 1) AND (octet_length(exact_command_bytes) <= 65536)))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_kind_ck",
-        "CHECK (command_kind = ANY (ARRAY['publish_overlap'::text, 'switch_active'::text, 'publish_new_only'::text, 'retire'::text, 'disable'::text, 'activate'::text]))",
+        "CHECK ((command_kind = ANY (ARRAY['publish_overlap'::text, 'switch_active'::text, 'publish_new_only'::text, 'retire'::text, 'disable'::text, 'activate'::text])))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_expected_revision_ck",
-        "CHECK (expected_signer_revision > 0)",
+        "CHECK ((expected_signer_revision > 0))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_expected_sha_ck",
-        "CHECK (expected_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((expected_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_terminal_outcome_ck",
-        "CHECK (terminal_outcome = ANY (ARRAY['applied'::text, 'authority_precondition_failed'::text]))",
+        "CHECK ((terminal_outcome = ANY (ARRAY['applied'::text, 'authority_precondition_failed'::text])))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_result_revision_ck",
-        "CHECK (resulting_signer_revision > 0)",
+        "CHECK ((resulting_signer_revision > 0))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_result_ring_ck",
-        "CHECK (resulting_ring_version > 0)",
+        "CHECK ((resulting_ring_version > 0))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_result_bytes_ck",
-        "CHECK (octet_length(exact_result_bytes) >= 1 AND octet_length(exact_result_bytes) <= 16384)",
+        "CHECK (((octet_length(exact_result_bytes) >= 1) AND (octet_length(exact_result_bytes) <= 16384)))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_committed_at_ck",
-        "CHECK (committed_at_unix_ms >= 0)",
+        "CHECK ((committed_at_unix_ms >= 0))",
     ),
     (
         "route_v2_signing_command_receipts",
         "route_v2_signing_command_result_projection_ck",
-        "CHECK (terminal_outcome = 'applied'::text AND resulting_signer_revision IS NOT NULL AND resulting_ring_version IS NOT NULL OR terminal_outcome = 'authority_precondition_failed'::text AND resulting_signer_revision IS NULL AND resulting_ring_version IS NULL)",
+        "CHECK ((((terminal_outcome = 'applied'::text) AND (resulting_signer_revision IS NOT NULL) AND (resulting_ring_version IS NOT NULL)) OR ((terminal_outcome = 'authority_precondition_failed'::text) AND (resulting_signer_revision IS NULL) AND (resulting_ring_version IS NULL))))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_version_ck",
-        "CHECK (ring_version > 1)",
+        "CHECK ((ring_version > 1))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_digest_ck",
-        "CHECK (key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_previous_version_ck",
-        "CHECK (expected_previous_ring_version > 0)",
+        "CHECK ((expected_previous_ring_version > 0))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_previous_digest_ck",
-        "CHECK (expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_release_sha_ck",
-        "CHECK (source_release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+        "CHECK ((source_release_commit_sha ~ '^[0-9a-f]{40}$'::text))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_envelope_sha_ck",
-        "CHECK (exact_signed_envelope_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+        "CHECK ((exact_signed_envelope_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_envelope_bytes_ck",
-        "CHECK (octet_length(exact_signed_envelope_bytes) >= 1 AND octet_length(exact_signed_envelope_bytes) <= 65536)",
+        "CHECK (((octet_length(exact_signed_envelope_bytes) >= 1) AND (octet_length(exact_signed_envelope_bytes) <= 65536)))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_committed_at_ck",
-        "CHECK (committed_at_unix_ms >= 0)",
+        "CHECK ((committed_at_unix_ms >= 0))",
     ),
     (
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_adjacency_ck",
-        "CHECK (expected_previous_ring_version = (ring_version - 1))",
+        "CHECK ((expected_previous_ring_version = (ring_version - 1)))",
     ),
     (
         "route_v2_signing_authority",
@@ -5817,7 +5817,7 @@ CREATE TABLE IF NOT EXISTS object_write_attempts (
           AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
           AND record #> '{state,outcome,qualification_ambiguity}' IS NOT NULL
           AND record #> '{state,outcome,qualification_ambiguity}' <> 'null'::JSONB)
-            = (qualification_visibility_head_canonical IS NOT NULL)
+            = (qualification_visibility_head_canonical IS NOT NULL))
     ),
     CONSTRAINT object_write_attempts_failure_terminal_shape_check
     CHECK ((terminal_kind = 'permanently_failed'
