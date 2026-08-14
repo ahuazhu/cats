@@ -15491,8 +15491,12 @@ mod tests {
 
     #[test]
     fn authority_record_for_a_local_only_volume_is_never_folded_into_desired() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let environment = TestEnvironment::new();
-        std::fs::create_dir_all(environment.state.join(DATA_NAMESPACE).join("vol_orphan")).unwrap();
+        let orphan = environment.state.join(DATA_NAMESPACE).join("vol_orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (authority, calls) = TestVolumeDataAuthority::present();
         let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
         let error = metadata_probe(&environment, reader)
