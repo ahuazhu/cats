@@ -194,7 +194,7 @@ impl AwsObjectWriteGatewayDownstream {
         ]);
         let put = ExactPutRequest {
             bucket: self.config.bucket.clone(),
-            key: provider_key,
+            key: provider_key.clone(),
             spool_path,
             content_length: request.descriptor.content_length.get(),
             checksum_sha256,
@@ -214,31 +214,34 @@ impl AwsObjectWriteGatewayDownstream {
                     completed_at_unix_ms: observation.completed_at_unix_ms,
                 })
             }
-            Err(S3CallError::PreconditionFailed) => {
-                match self
-                    .discover(&request.descriptor, absolute_deadline)
-                    .await?
-                {
-                    ObjectWriteVisibilityOutcome::VisibleExact {
-                        observed_at_unix_ms,
-                        visibility_receipt_id,
-                        ..
-                    } => Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
+            Err(S3CallError::PreconditionFailed) => match self
+                .s3
+                .head_exact(&self.config.bucket, &provider_key, absolute_deadline)
+                .await
+            {
+                Ok(observation) if head_matches(&request.descriptor, &observation) => {
+                    let visibility_receipt_id =
+                        visibility_receipt_id(&request.descriptor, &observation)?;
+                    Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
                         provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
                         put_receipt_id: replay_put_receipt_id(
                             &request.descriptor,
                             &visibility_receipt_id,
                         )?,
-                        completed_at_unix_ms: observed_at_unix_ms,
-                    }),
-                    ObjectWriteVisibilityOutcome::ConflictingObject => {
-                        Err(ObjectWriteDownstreamError::ConflictingObject)
-                    }
-                    ObjectWriteVisibilityOutcome::NotVisible => {
-                        Err(ObjectWriteDownstreamError::Ambiguous)
-                    }
+                        completed_at_unix_ms: observation.observed_at_unix_ms,
+                    })
                 }
-            }
+                Ok(observation) => Ok(ObjectWriteDownstreamPutOutcome::PermanentlyFailed {
+                    provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
+                    failure_receipt_id: conflict_failure_receipt_id(
+                        &request.descriptor,
+                        &observation,
+                    )?,
+                    failed_at_unix_ms: observation.observed_at_unix_ms,
+                }),
+                Err(S3CallError::NotFound) => Err(ObjectWriteDownstreamError::Ambiguous),
+                Err(error) => Err(map_read_error(error)),
+            },
             Err(error) => Err(map_put_error(error)),
         }
     }
@@ -664,10 +667,6 @@ fn map_read_error(error: S3CallError) -> ObjectWriteDownstreamError {
 fn head_matches(descriptor: &ObjectPutDescriptor, observation: &HeadObservation) -> bool {
     observation.content_length == descriptor.content_length.get()
         && observation.checksum_sha256 == STANDARD.encode(descriptor.content_sha256.as_bytes())
-        && observation.metadata.get(CONTENT_SHA256_METADATA)
-            == Some(&descriptor.content_sha256.as_str().to_owned())
-        && observation.metadata.get(CONTENT_LENGTH_METADATA)
-            == Some(&descriptor.content_length.get().to_string())
 }
 
 fn put_receipt_id(
@@ -754,6 +753,66 @@ fn replay_put_receipt_id(
     )?;
     hash_frame(&mut hasher, visibility_receipt_id.as_str().as_bytes())?;
     ascii_digest("awss3replay1_", hasher.finalize())
+}
+
+fn conflict_failure_receipt_id(
+    descriptor: &ObjectPutDescriptor,
+    observation: &HeadObservation,
+) -> Result<AsciiText, ObjectWriteDownstreamError> {
+    let mut hasher = Sha256::new();
+    hash_frame(
+        &mut hasher,
+        b"cats.aws-s3-conflicting-object-failure-receipt.v1",
+    )?;
+    hash_frame(&mut hasher, descriptor.request_id.as_str().as_bytes())?;
+    hash_frame(
+        &mut hasher,
+        descriptor.provider_attempt_id.as_str().as_bytes(),
+    )?;
+    for scope in [
+        &descriptor.target.object_provider_scope.provider,
+        &descriptor.target.object_provider_scope.partition,
+        &descriptor.target.object_provider_scope.account_id,
+        &descriptor.target.object_provider_scope.region,
+    ] {
+        hash_frame(&mut hasher, scope.as_str().as_bytes())?;
+    }
+    hash_frame(
+        &mut hasher,
+        descriptor.target.object_store_scope_id.as_str().as_bytes(),
+    )?;
+    hash_frame(
+        &mut hasher,
+        descriptor.target.canonical_logical_key.as_bytes(),
+    )?;
+    hash_frame(&mut hasher, descriptor.content_sha256.as_str().as_bytes())?;
+    hash_frame(&mut hasher, &descriptor.content_length.get().to_be_bytes())?;
+    hash_frame(&mut hasher, observation.request_id.as_str().as_bytes())?;
+    hash_frame(&mut hasher, observation.checksum_sha256.as_bytes())?;
+    hash_frame(&mut hasher, &observation.content_length.to_be_bytes())?;
+    for (key, value) in &observation.metadata {
+        hash_frame(&mut hasher, key.as_bytes())?;
+        hash_frame(&mut hasher, value.as_bytes())?;
+    }
+    hash_frame(
+        &mut hasher,
+        observation
+            .e_tag
+            .as_ref()
+            .map_or(b"", |value| value.as_str().as_bytes()),
+    )?;
+    hash_frame(
+        &mut hasher,
+        observation
+            .version_id
+            .as_ref()
+            .map_or(b"", |value| value.as_str().as_bytes()),
+    )?;
+    hash_frame(
+        &mut hasher,
+        &observation.observed_at_unix_ms.get().to_be_bytes(),
+    )?;
+    ascii_digest("awss3conflict1_", hasher.finalize())
 }
 
 fn hash_frame(hasher: &mut Sha256, value: &[u8]) -> Result<(), ObjectWriteDownstreamError> {
@@ -1117,7 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_key_with_different_bytes_is_a_conflict() {
+    async fn exact_key_with_different_bytes_is_a_permanent_provider_failure() {
         let temporary = tempfile::tempdir().unwrap();
         let body = b"new bytes";
         let descriptor = descriptor(body);
@@ -1132,15 +1191,50 @@ mod tests {
             )),
         );
 
-        assert_eq!(
+        let outcome = downstream
+            .put_exact(
+                ObjectWriteDownstreamPut { descriptor, spool },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ObjectWriteDownstreamPutOutcome::PermanentlyFailed {
+                failure_receipt_id,
+                failed_at_unix_ms,
+                ..
+            } if failure_receipt_id.as_str().starts_with("awss3conflict1_")
+                && failed_at_unix_ms == millis(31)
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_checksum_and_length_replay_does_not_depend_on_user_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"same immutable bytes";
+        let descriptor = descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let mut existing = head_observation(&descriptor);
+        existing.metadata.clear();
+        let downstream = AwsObjectWriteGatewayDownstream::with_api(
+            config(temporary.path()),
+            Arc::new(FakeS3::new(
+                vec![Err(S3CallError::PreconditionFailed)],
+                vec![Ok(existing)],
+            )),
+        );
+
+        assert!(matches!(
             downstream
                 .put_exact(
                     ObjectWriteDownstreamPut { descriptor, spool },
                     Instant::now() + Duration::from_secs(2),
                 )
-                .await,
-            Err(ObjectWriteDownstreamError::ConflictingObject)
-        );
+                .await
+                .unwrap(),
+            ObjectWriteDownstreamPutOutcome::Succeeded { .. }
+        ));
     }
 
     #[tokio::test]
