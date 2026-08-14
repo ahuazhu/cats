@@ -1140,13 +1140,11 @@ discover_usage_source_terminal() {
   return 75
 }
 
-run_usage_final() {
+run_usage_source_terminals() {
   local cat workspace from_ms to_ms report keys previous_keys receipt_dir sources_work
   local attempt stable all_terminal index source_id source_epoch receipt receipt_sha256
-  local sources_json source_set_sha256 config_path config_sha256 terminal_epoch_id created_at_ms
-  local request_source request_journal begin_response begin_status request_sha256
-  local complete_response complete_status target_source selected_source_id selected_source_epoch
-  local selected_index selected_receipt rediscovered post_report post_keys live_source ready
+  local sources_json source_set_sha256 selected_source_id selected_source_epoch
+  local selected_index selected_receipt live_source aggregate_source ready
   cat=$(cat_id)
   workspace=$(required CATS_E3_WORKSPACE_ID)
   from_ms=$(required CATS_E3_RUN_STARTED_AT_UNIX_MS)
@@ -1208,7 +1206,7 @@ run_usage_final() {
     sleep 2
   done
   [[ $ready == true ]] || \
-    fail "run-bound Usage source set did not become stably terminal before target closure"
+    fail "run-bound Usage source set did not become stably terminal"
 
   # Select one already-produced complete nonzero pair for the live-delivery
   # receipt. The source terminal artifact below must close this exact pair.
@@ -1252,169 +1250,42 @@ run_usage_final() {
     >"$CASE_DIR/usage-live-delivery-receipt.bound.json"
   atomic_json usage-live-delivery-receipt.json \
     "$CASE_DIR/usage-live-delivery-receipt.bound.json"
-  atomic_json usage-source-terminal-receipt.json "$selected_receipt"
 
   sources_json=$(jq -s -c '
     sort_by([.source_id,.source_epoch])
     | map({source_id:.source_id,source_epoch:.source_epoch,receipt_sha256:.receipt_sha256})' \
     "$sources_work")
   source_set_sha256=sha256:$(printf '%s' "$sources_json" | sha256sum | awk '{print $1}')
-  config_path=$(config usage-terminal-targets)
-  config_sha256=$(sha256sum "$config_path" | awk '{print $1}')
-  terminal_epoch_id=$(printf '%s\n' usage-terminal-v1 "$CATS_E3_EXACT_COMMIT" \
-    "$CATS_E3_RUN_ID" "$BLOCK_PATH" "$config_sha256" "$source_set_sha256" | \
-    sha256sum | awk '{print substr($1,1,32)}')
-  [[ $terminal_epoch_id =~ ^[0-9a-f]{32}$ && $terminal_epoch_id != 00000000000000000000000000000000 ]] || \
-    fail "derived terminal epoch ID is not canonical"
-  request_source=$CASE_DIR/usage-target-terminal-request.source.json
-  request_journal=$CASE_DIR/usage-target-terminal-request.json
-  if [[ -e $request_journal ]]; then
-    [[ -f $request_journal && ! -L $request_journal ]] || \
-      fail "target terminal request journal is not a regular no-symlink file"
-    [[ $(stat -c '%a:%u:%h' "$request_journal") == "400:$EUID:1" ]] || \
-      fail "target terminal request journal lost its private immutable file contract"
-    jq -S -c . "$request_journal" >"$request_source"
-    cmp -s "$request_source" "$request_journal" || \
-      fail "target terminal request journal is not canonical JSON"
-    jq -e --slurpfile config "$config_path" --argjson sources "$sources_json" \
-      --arg terminal_epoch_id "$terminal_epoch_id" \
-      --arg release_commit "$CATS_E3_EXACT_COMMIT" \
-      --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
-      --arg source_set_sha256 "$source_set_sha256" '
-      keys == ["artifact_sha256","contract_version","created_at_unix_ms","fresh_target",
-        "old_target","release_commit","shards","source_set_sha256","sources","terminal_epoch_id"]
-      and .contract_version == 1 and .terminal_epoch_id == $terminal_epoch_id
-      and .release_commit == $release_commit and .artifact_sha256 == $artifact_sha256
-      and (.created_at_unix_ms | type == "number" and . >= 0 and floor == .)
-      and .old_target == $config[0].old_target and .fresh_target == $config[0].fresh_target
-      and .sources == $sources and .source_set_sha256 == $source_set_sha256
-      and .shards == $config[0].shards' "$request_journal" >/dev/null || \
-      fail "target terminal request journal does not match this exact run and source set"
-    created_at_ms=$(jq -er '.created_at_unix_ms' "$request_journal")
-  else
-    created_at_ms=$(( $(date +%s) * 1000 ))
-    jq -S -c -n --slurpfile config "$config_path" --argjson sources "$sources_json" \
-      --arg terminal_epoch_id "$terminal_epoch_id" \
-      --arg release_commit "$CATS_E3_EXACT_COMMIT" \
-      --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
-      --argjson created_at_unix_ms "$created_at_ms" \
-      --arg source_set_sha256 "$source_set_sha256" '
-      {contract_version:1,terminal_epoch_id:$terminal_epoch_id,
-       release_commit:$release_commit,artifact_sha256:$artifact_sha256,
-       created_at_unix_ms:$created_at_unix_ms,
-       old_target:$config[0].old_target,fresh_target:$config[0].fresh_target,
-       sources:$sources,source_set_sha256:$source_set_sha256,shards:$config[0].shards}' \
-      >"$request_source"
-    chmod 0400 "$request_source"
-    if ! ln "$request_source" "$request_journal"; then
-      fail "target terminal request journal lost no-replace publication"
-    fi
-    rm -f "$request_source"
-  fi
-
-  begin_response=$CASE_DIR/usage-target-terminal-begin.json
-  begin_status=75
-  for attempt in 1 2; do
-    set +e
-    curl_json POST "$(control_origin)/v1/admin/usage/target-terminal/begin" \
-      "$begin_response" 200 --header 'content-type: application/json' \
-      --data-binary "@$request_journal"
-    begin_status=$?
-    set -e
-    [[ $begin_status -eq 75 ]] || break
-  done
-  [[ $begin_status -eq 0 ]] || \
-    fail "target terminal begin remained ambiguous after one exact journal replay"
-  request_sha256=$(jq -er '
-    select((.state == "prepared" or .state == "exact_replay")
-      and (.request_sha256 | test("^sha256:[0-9a-f]{64}$")))
-    | .request_sha256' "$begin_response") || fail "target terminal begin response is not exact"
-
-  complete_response=$CASE_DIR/usage-target-terminal-complete.json
-  complete_status=75
-  ready=false
-  attempt=0
-  while [[ $attempt -lt 120 ]]; do
-    attempt=$((attempt + 1))
-    set +e
-    curl_json POST "$(control_origin)/v1/admin/usage/target-terminal/complete" \
-      "$complete_response" 200,202 --header 'content-type: application/json' \
-      --data-binary "@$request_journal"
-    complete_status=$?
-    set -e
-    if [[ $complete_status -eq 75 ]]; then
-      continue
-    fi
-    [[ $complete_status -eq 0 ]] || fail "target terminal discovery failed"
-    if [[ $CURL_JSON_STATUS == 202 ]]; then
-      jq -e --arg request_sha256 "$request_sha256" '
-        .state == "pending" and .request_sha256 == $request_sha256 and .receipt == null' \
-        "$complete_response" >/dev/null || fail "pending target terminal response is not exact"
-      sleep 2
-      continue
-    fi
-    if [[ $CURL_JSON_STATUS == 200 ]] && jq -e --arg request_sha256 "$request_sha256" '
-      .state == "terminal" and .request_sha256 == $request_sha256
-      and (.receipt | type == "object")' "$complete_response" >/dev/null; then
-      ready=true
-      break
-    fi
-    fail "target terminal completion returned a foreign outcome"
-  done
-  [[ $ready == true ]] || fail "target terminal barriers did not converge before deadline"
-
-  target_source=$CASE_DIR/usage-target-terminal-receipt.source.json
-  jq -c '.receipt' "$complete_response" >"$target_source"
-  jq -e --slurpfile request "$request_journal" --slurpfile sources "$sources_work" \
-    --arg request_sha256 "$request_sha256" '
-    .contract_version == 1 and .request == $request[0]
-    and .request_sha256 == $request_sha256
-    and (.source_receipts | length) == ($request[0].sources | length)
-    and (.barriers | length) == ($request[0].shards | length)
-    and ([.source_receipts[] | {source_id,source_epoch}]
-      == [$request[0].sources[] | {source_id,source_epoch}])
-    and all(.barriers[];
-      .marker.contract_version == 1
-      and .marker.terminal_epoch_id == $request[0].terminal_epoch_id
-      and .marker.request_sha256 == $request_sha256
-      and (.marker.marker_id | test("^usage_terminal_marker_[0-9a-f]{64}$"))
-      and .archive.stream_name == $request[0].old_target.stream_name
-      and .archive.archive_bucket == $request[0].old_target.archive_bucket_name)' \
-    "$target_source" >/dev/null || fail "target terminal receipt does not close the exact request"
-  atomic_json usage-target-terminal-receipt.json "$target_source"
-
-  # Only read-only discovery and fleet checks are permitted after the target
-  # barrier. Exact source bytes and the run-bound source set must remain fixed.
-  rediscovered=$CASE_DIR/usage-source-terminal-rediscovered.json
-  discover_usage_source_terminal "$selected_source_id" "$selected_source_epoch" \
-    "$rediscovered" || fail "terminal source receipt disappeared after target closure"
-  cmp -s "$selected_receipt" "$rediscovered" || \
-    fail "terminal source receipt bytes changed after target closure"
-  post_report=$CASE_DIR/usage-post-terminal.json
-  post_keys=$CASE_DIR/usage-post-terminal-source-keys.json
-  usage_report_to "$post_report" "$workspace" "$cat" "$from_ms" \
-    "$(( $(date +%s) * 1000 + 60000 ))"
-  usage_source_keys_to "$post_report" "$post_keys" "$cat"
-  cmp -s "$keys" "$post_keys" || fail "Usage source set changed after target terminal receipt"
-  fleet_verify_to "$CASE_DIR/usage-post-terminal-fleet.json"
-  jq -e --arg commit "$CATS_E3_EXACT_COMMIT" '
-    .release_commit_sha == $commit
-    and .snapshot.desired_runtime_count == 0
-    and .snapshot.current_runtime_observation_count == 0
-    and all(.snapshot.nodes[];
-      .inventory.runtime_count == 0 and .inventory.residue_count == 0
-      and .inventory.lifecycle_open_count == 0 and .inventory.route_active_count == 0
-      and .inventory.active_guard_count == 0)' \
-    "$CASE_DIR/usage-post-terminal-fleet.json" >/dev/null || \
-    fail "post-terminal fleet check is not exact clean read-only inventory"
+  aggregate_source=$CASE_DIR/usage-source-terminal-receipts.source.json
+  jq -S -c -n \
+    --arg block_path "$BLOCK_PATH" \
+    --arg cat_id "$cat" \
+    --arg qualification_catalog_sha256 "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --arg release_commit "$CATS_E3_EXACT_COMMIT" \
+    --arg run_id "$CATS_E3_RUN_ID" \
+    --argjson run_window_from_unix_ms "$from_ms" \
+    --argjson run_window_to_unix_ms "$to_ms" \
+    --arg source_set_sha256 "$source_set_sha256" \
+    --argjson sources "$sources_json" \
+    --arg worker_bundle_sha256 "sha256:$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
+    --arg workspace_id "$workspace" '
+    {block_path:$block_path,cat_id:$cat_id,
+     kind:"cats.usage-source-terminal-receipts.v1",
+     qualification_catalog_sha256:$qualification_catalog_sha256,
+     release_commit:$release_commit,run_id:$run_id,
+     run_window_from_unix_ms:$run_window_from_unix_ms,
+     run_window_to_unix_ms:$run_window_to_unix_ms,
+     source_set_sha256:$source_set_sha256,sources:$sources,version:1,
+     worker_bundle_sha256:$worker_bundle_sha256,workspace_id:$workspace_id}' \
+    >"$aggregate_source"
+  atomic_json usage-source-terminal-receipts.json "$aggregate_source"
 
   rm -rf "$receipt_dir"
-  rm -f "$sources_work" "$previous_keys" "$request_source" "$begin_response" \
-    "$complete_response" "$target_source" "$rediscovered" "$post_report" "$post_keys" \
+  rm -f "$sources_work" "$previous_keys" \
     "$CASE_DIR/usage-live-delivery-receipt.bound.json" \
-    "$CASE_DIR/usage-post-terminal-fleet.json" "$live_source" "$report" "$keys"
-  printf 'USAGE_TERMINAL_RECEIPT terminal_epoch_id=%s request_sha256=%s\n' \
-    "$terminal_epoch_id" "$request_sha256"
+    "$aggregate_source" "$live_source" "$report" "$keys"
+  printf 'USAGE_SOURCE_TERMINAL_RECEIPTS source_count=%s source_set_sha256=%s\n' \
+    "$(jq 'length' <<<"$sources_json")" "$source_set_sha256"
 }
 
 run_delete() {
@@ -1435,7 +1306,7 @@ run_case() {
     route-http-ws) run_route ;;
     agent-restart-adoption) run_restart ;;
     volume-init-matrix) run_volume_init_matrix ;;
-    usage-final-terminal-receipt) run_usage_final ;;
+    usage-source-terminal-receipts) run_usage_source_terminals ;;
     delete-cleanup) run_delete ;;
     *) fail "unknown scenario case $CASE_ID" ;;
   esac
@@ -1465,8 +1336,8 @@ cleanup() {
     atomic_json workload-remove-receipt.json "$source"
     rm -f "$source"
     policy=removed_run_bound_guest_workload_after_restart_reprobe
-  elif [[ $CASE_ID == usage-final-terminal-receipt ]]; then
-    policy=terminal_read_only_no_product_mutation
+  elif [[ $CASE_ID == usage-source-terminal-receipts ]]; then
+    policy=source_terminal_read_only_no_product_mutation
   fi
   # Product teardown remains the numbered delete-cleanup case. No failure path
   # guesses physical ownership or issues an extra destructive transition.
