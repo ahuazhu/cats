@@ -197,6 +197,36 @@ pub fn test_runtime_provisioner_trust_bundle(
     }
 }
 
+/// Independent E13 offline-operator public trust for server tests.
+pub fn test_production_cutover_operator_trust_bundle(
+) -> cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionCutoverAwsRoleScope,
+        ProductionCutoverOperatorCredential, ProductionCutoverOperatorTrustBundle,
+    };
+    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
+
+    ProductionCutoverOperatorTrustBundle {
+        version: ContractVersion::V1,
+        deployment_id: Id::new("deployment_a").expect("valid test deployment ID"),
+        release_id: Id::new("release_a").expect("valid test release ID"),
+        source_commit_sha: "a".repeat(40),
+        signature_threshold: WireU64::new(1).expect("valid test threshold"),
+        credentials: vec![ProductionCutoverOperatorCredential {
+            credential_id: Id::new("cutover_a").expect("valid test credential ID"),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            )
+            .expect("canonical test Ed25519 SPKI"),
+            scope: ProductionCutoverAwsRoleScope {
+                aws_partition: ProductionCutoverAwsPartition::Aws,
+                account_id: "123456789012".to_owned(),
+                role_arn: "arn:aws:iam::123456789012:role/cats-production-cutover".to_owned(),
+            },
+        }],
+    }
+}
+
 /// Seed a disposable schema with a typed provisioner-trust revision before a
 /// server using the next revision is started.
 pub fn seed_runtime_provisioner_trust_bundle(

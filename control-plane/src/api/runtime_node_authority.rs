@@ -16,6 +16,18 @@ use cats_api::agent_registration::{
     NODE_SIGNATURE_HEADER,
 };
 use cats_api::error::{ApiError, ErrorCode};
+use cats_api::production_mutation_admission::{
+    decode_production_mutation_admission_command,
+    encode_production_mutation_admission_command_receipt,
+    encode_production_mutation_admission_state, verify_production_mutation_admission_command,
+    verify_production_mutation_admission_command_discovery, ProductionCutoverOperatorPrincipal,
+    ProductionMutationAdmissionStoredOutcome, PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER,
+    PRODUCTION_CUTOVER_SIGNATURE_HEADER, PRODUCTION_MUTATION_ADMISSION_COMMANDS_PATH,
+    PRODUCTION_MUTATION_ADMISSION_DISCOVERY_PATH,
+    PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
+    PRODUCTION_MUTATION_ADMISSION_STATE_PATH,
+};
 use cats_api::runtime_node_authority::{
     verify_runtime_node_authority_request, NODE_AUTHORITY_APPLY_ID_HEADER,
     PROVISIONER_CREDENTIAL_ID_HEADER, PROVISIONER_SIGNATURE_HEADER,
@@ -31,6 +43,7 @@ use cats_api::runtime_reconciliation::{
 
 use crate::server::AppState;
 use crate::store::runtime_authority::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
+use crate::store::runtime_authority::production_mutation_admission::ProductionMutationAdmissionCommandStoreOutcome;
 use crate::store::AuthorityRequestContext;
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
@@ -55,11 +68,15 @@ const TEMPORARILY_UNAVAILABLE: &[u8] = br#"{"code":"temporarily_unavailable","me
 const PRINCIPAL_REQUEST_IN_FLIGHT: &[u8] = br#"{"code":"principal_request_in_flight","message":"runtime node authority request already in flight for this principal"}"#;
 const APPLY_ID_CONFLICT: &[u8] = br#"{"code":"apply_id_conflict","message":"runtime node authority apply ID conflicts with another request"}"#;
 const AUTHORITY_PRECONDITION_FAILED: &[u8] = br#"{"code":"authority_precondition_failed","message":"runtime node authority precondition failed"}"#;
+const PRODUCTION_COMMAND_ID_CONFLICT: &[u8] = br#"{"code":"command_id_conflict","message":"production mutation admission command ID conflicts with another request"}"#;
+const PRODUCTION_COMMAND_NOT_FOUND: &[u8] =
+    br#"{"code":"not_found","message":"production mutation admission command was not found"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PrincipalAdmissionKey {
     DeploymentProvisioner(String, String),
     WorkosFleetAdministrator(String, String),
+    ProductionCutoverOperator(String),
 }
 
 impl PrincipalAdmissionKey {
@@ -81,6 +98,10 @@ impl PrincipalAdmissionKey {
                 organization_id.as_str().to_owned(),
             ),
         }
+    }
+
+    fn from_production_cutover(principal: &ProductionCutoverOperatorPrincipal) -> Self {
+        Self::ProductionCutoverOperator(principal.credential_id.to_string())
     }
 }
 
@@ -108,6 +129,21 @@ impl RuntimeNodeAuthorityAdmission {
         principal: &FleetPolicyPrincipal,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
         let key = PrincipalAdmissionKey::from_principal(principal);
+        self.try_key(key)
+    }
+
+    fn try_production_cutover(
+        &self,
+        principal: &ProductionCutoverOperatorPrincipal,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        let key = PrincipalAdmissionKey::from_production_cutover(principal);
+        self.try_key(key)
+    }
+
+    fn try_key(
+        &self,
+        key: PrincipalAdmissionKey,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
         let semaphore = {
             let mut principals = self
                 .principals
@@ -225,6 +261,8 @@ impl Drop for CancelRequestOnDrop {
 pub(crate) struct RuntimeNodeAuthorityService {
     store: Arc<crate::store::Store>,
     trust_bundle: RuntimeProvisionerTrustBundle,
+    production_cutover_trust:
+        cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
     readiness: Arc<crate::server::ReadinessLatch>,
     admission: RuntimeNodeAuthorityAdmission,
     accepting: tokio::sync::watch::Sender<bool>,
@@ -241,12 +279,15 @@ impl RuntimeNodeAuthorityService {
     pub(crate) fn new(
         store: Arc<crate::store::Store>,
         trust_bundle: RuntimeProvisionerTrustBundle,
+        production_cutover_trust:
+            cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
         readiness: Arc<crate::server::ReadinessLatch>,
     ) -> Self {
         let (accepting, _) = tokio::sync::watch::channel(true);
         Self {
             store,
             trust_bundle,
+            production_cutover_trust,
             readiness,
             admission: RuntimeNodeAuthorityAdmission::new(),
             accepting,
@@ -419,6 +460,124 @@ impl RuntimeNodeAuthorityService {
                     })?
                 }
             },
+        }
+    }
+
+    async fn apply_production_mutation_admission(
+        &self,
+        principal: ProductionCutoverOperatorPrincipal,
+        command: cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+        deadline: Instant,
+        permits: Arc<ApplyPermits>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<ProductionMutationAdmissionCommandStoreOutcome, ApiError> {
+        let request = AuthorityRequestContext::new(deadline);
+        let _cancel_on_drop = CancelRequestOnDrop(request.clone());
+        if Instant::now() >= deadline {
+            return Err(ApiError::unavailable(
+                "production mutation admission request exceeded its deadline",
+            ));
+        }
+        let active = self.resolutions.try_begin().ok_or_else(|| {
+            ApiError::unavailable("production mutation admission service is shutting down")
+        })?;
+        let worker_request = request.clone();
+        let worker_observer = request.clone();
+        let store = Arc::clone(&self.store);
+        let resolution_store = Arc::clone(&self.store);
+        let resolution_command = command.clone();
+        let readiness = Arc::clone(&self.readiness);
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _permits = permits;
+            let worker_command = command;
+            let worker_principal = principal;
+            let outcome = store
+                .execute(move |store| {
+                    store.apply_production_mutation_admission_command_request(
+                        &worker_principal,
+                        &worker_command,
+                        &worker_request,
+                    )
+                })
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => Ok(outcome),
+                Err(error) if worker_observer.commit_was_attempted() => {
+                    resolve_ambiguous_production_mutation_admission(
+                        resolution_store,
+                        resolution_command,
+                        error,
+                        readiness,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = result_tx.send(outcome);
+            drop(active);
+        });
+
+        let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(timeout);
+        tokio::select! {
+            biased;
+            () = &mut timeout => {
+                request.cancel();
+                Err(ApiError::unavailable(
+                    "production mutation admission request exceeded its deadline",
+                ))
+            }
+            () = wait_for_shutdown(&mut shutdown) => {
+                request.cancel();
+                Err(ApiError::unavailable(
+                    "production mutation admission service is shutting down",
+                ))
+            }
+            result = &mut result_rx => {
+                if Instant::now() >= deadline {
+                    request.cancel();
+                    Err(ApiError::unavailable(
+                        "production mutation admission request exceeded its deadline",
+                    ))
+                } else {
+                    result.map_err(|_| ApiError::internal(
+                        "production mutation admission commit owner stopped without a result"
+                    ))?
+                }
+            },
+        }
+    }
+}
+
+async fn resolve_ambiguous_production_mutation_admission(
+    store: Arc<crate::store::Store>,
+    command: cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+    original_error: ApiError,
+    readiness: Arc<crate::server::ReadinessLatch>,
+) -> Result<ProductionMutationAdmissionCommandStoreOutcome, ApiError> {
+    loop {
+        let lookup = command.clone();
+        match store
+            .execute(move |store| store.resolve_production_mutation_admission_command(&lookup))
+            .await
+        {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => return Err(original_error),
+            Err(error) => {
+                if !matches!(
+                    error.code,
+                    ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+                ) {
+                    readiness.poison();
+                }
+                tracing::warn!(
+                    error = %error,
+                    command_id = command.command_id.as_str(),
+                    "production mutation admission commit resolution lookup failed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 }
@@ -601,6 +760,353 @@ pub(super) async fn apply_runtime_node_authority(
     response
 }
 
+pub(super) async fn apply_production_mutation_admission(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let service = Arc::clone(&state.runtime_node_authority);
+    let mut shutdown = service.subscribe();
+    if !*shutdown.borrow() {
+        return temporarily_unavailable();
+    }
+    if request.uri().path() != PRODUCTION_MUTATION_ADMISSION_COMMANDS_PATH {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if request.method() != axum::http::Method::POST || request.uri().query().is_some() {
+        return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST_TARGET, &[]);
+    }
+    let headers = request.headers().clone();
+    if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
+        !value
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case(JSON_CONTENT_TYPE)
+    }) || headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            UNSUPPORTED_MEDIA_TYPE,
+            &[],
+        );
+    }
+    let (credential_id, signature) = match classify_production_cutover_signature(&headers) {
+        Some(proof) => proof,
+        None => return authentication_failed(),
+    };
+    let global = match service.admission.try_global() {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    if declared_body_exceeds(
+        &headers,
+        PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    ) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, REQUEST_TOO_LARGE, &[]);
+    }
+    let body = match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        to_bytes(
+            request.into_body(),
+            PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+        ),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(body)) => body,
+        AwaitOutcome::Completed(Err(error))
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
+        {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, REQUEST_TOO_LARGE, &[]);
+        }
+        AwaitOutcome::Completed(Err(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+        }
+        AwaitOutcome::Deadline | AwaitOutcome::Shutdown => return temporarily_unavailable(),
+    };
+    let principal = match verify_production_mutation_admission_command(
+        &service.production_cutover_trust,
+        &credential_id,
+        &signature,
+        &body,
+        system_now_unix_ms(),
+    ) {
+        Ok(principal) => principal,
+        Err(_) => return authentication_failed(),
+    };
+    let principal_permit = match service.admission.try_production_cutover(&principal) {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                PRINCIPAL_REQUEST_IN_FLIGHT,
+                &[(header::RETRY_AFTER, HeaderValue::from_static("1"))],
+            );
+        }
+    };
+    let command = match decode_production_mutation_admission_command(&body) {
+        Ok(command) => command,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]),
+    };
+    let permits = Arc::new(ApplyPermits {
+        _global: global,
+        _principal: principal_permit,
+    });
+    let response_permits = Arc::clone(&permits);
+    let outcome = service
+        .apply_production_mutation_admission(principal, command, deadline, permits, shutdown)
+        .await;
+    let response = match outcome {
+        Ok(ProductionMutationAdmissionCommandStoreOutcome::Stored(receipt)) => {
+            let status = match &receipt.outcome {
+                ProductionMutationAdmissionStoredOutcome::Applied { .. } => StatusCode::OK,
+                ProductionMutationAdmissionStoredOutcome::AuthorityPreconditionFailed => {
+                    StatusCode::CONFLICT
+                }
+            };
+            match encode_production_mutation_admission_command_receipt(&receipt) {
+                Ok(body) if body.len() <= PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES => {
+                    json_response(status, body)
+                }
+                _ => {
+                    state.readiness.poison();
+                    temporarily_unavailable()
+                }
+            }
+        }
+        Ok(ProductionMutationAdmissionCommandStoreOutcome::CommandIdConflict) => {
+            error_response(StatusCode::CONFLICT, PRODUCTION_COMMAND_ID_CONFLICT, &[])
+        }
+        Ok(ProductionMutationAdmissionCommandStoreOutcome::AuthenticationFailed) => {
+            authentication_failed()
+        }
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            temporarily_unavailable()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "production mutation admission Store failed closed");
+            state.readiness.poison();
+            temporarily_unavailable()
+        }
+    };
+    drop(response_permits);
+    response
+}
+
+pub(super) async fn discover_production_mutation_admission_command(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let service = Arc::clone(&state.runtime_node_authority);
+    let mut shutdown = service.subscribe();
+    if !*shutdown.borrow()
+        || request.uri().path() != PRODUCTION_MUTATION_ADMISSION_DISCOVERY_PATH
+        || request.method() != axum::http::Method::POST
+        || request.uri().query().is_some()
+    {
+        return temporarily_unavailable();
+    }
+    let headers = request.headers().clone();
+    if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
+        !value
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case(JSON_CONTENT_TYPE)
+    }) || headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            UNSUPPORTED_MEDIA_TYPE,
+            &[],
+        );
+    }
+    let (credential_id, signature) = match classify_production_cutover_signature(&headers) {
+        Some(proof) => proof,
+        None => return authentication_failed(),
+    };
+    if declared_body_exceeds(
+        &headers,
+        PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    ) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, REQUEST_TOO_LARGE, &[]);
+    }
+    let body = match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        to_bytes(
+            request.into_body(),
+            PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+        ),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(body)) => body,
+        AwaitOutcome::Completed(Err(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+        }
+        AwaitOutcome::Deadline | AwaitOutcome::Shutdown => return temporarily_unavailable(),
+    };
+    let principal = match verify_production_mutation_admission_command_discovery(
+        &service.production_cutover_trust,
+        &credential_id,
+        &signature,
+        &body,
+    ) {
+        Ok(principal) => principal,
+        Err(_) => return authentication_failed(),
+    };
+    let command = match decode_production_mutation_admission_command(&body) {
+        Ok(command) => command,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]),
+    };
+    let _principal_permit = match service.admission.try_production_cutover(&principal) {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    let store = Arc::clone(&service.store);
+    let outcome = await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        store.execute(move |store| store.resolve_production_mutation_admission_command(&command)),
+    )
+    .await;
+    match outcome {
+        AwaitOutcome::Completed(Ok(Some(
+            ProductionMutationAdmissionCommandStoreOutcome::Stored(receipt),
+        ))) => match encode_production_mutation_admission_command_receipt(&receipt) {
+            Ok(body) if body.len() <= PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES => {
+                json_response(StatusCode::OK, body)
+            }
+            _ => {
+                state.readiness.poison();
+                temporarily_unavailable()
+            }
+        },
+        AwaitOutcome::Completed(Ok(Some(
+            ProductionMutationAdmissionCommandStoreOutcome::CommandIdConflict,
+        ))) => error_response(StatusCode::CONFLICT, PRODUCTION_COMMAND_ID_CONFLICT, &[]),
+        AwaitOutcome::Completed(Ok(Some(
+            ProductionMutationAdmissionCommandStoreOutcome::AuthenticationFailed,
+        ))) => authentication_failed(),
+        AwaitOutcome::Completed(Ok(None)) => {
+            error_response(StatusCode::NOT_FOUND, PRODUCTION_COMMAND_NOT_FOUND, &[])
+        }
+        AwaitOutcome::Completed(Err(error))
+            if !matches!(
+                error.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            state.readiness.poison();
+            temporarily_unavailable()
+        }
+        AwaitOutcome::Completed(Err(_)) | AwaitOutcome::Deadline | AwaitOutcome::Shutdown => {
+            temporarily_unavailable()
+        }
+    }
+}
+
+pub(super) async fn get_production_mutation_admission_state(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let service = Arc::clone(&state.runtime_node_authority);
+    let mut shutdown = service.subscribe();
+    if !*shutdown.borrow()
+        || request.uri().path() != PRODUCTION_MUTATION_ADMISSION_STATE_PATH
+        || request.method() != axum::http::Method::POST
+        || request.uri().query().is_some()
+    {
+        return temporarily_unavailable();
+    }
+    let headers = request.headers().clone();
+    if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
+        !value
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case(JSON_CONTENT_TYPE)
+    }) || headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            UNSUPPORTED_MEDIA_TYPE,
+            &[],
+        );
+    }
+    let (credential_id, signature) = match classify_production_cutover_signature(&headers) {
+        Some(proof) => proof,
+        None => return authentication_failed(),
+    };
+    let body = match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        to_bytes(
+            request.into_body(),
+            PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+        ),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(body)) => body,
+        AwaitOutcome::Completed(Err(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+        }
+        AwaitOutcome::Deadline | AwaitOutcome::Shutdown => return temporarily_unavailable(),
+    };
+    let principal = match verify_production_mutation_admission_command_discovery(
+        &service.production_cutover_trust,
+        &credential_id,
+        &signature,
+        &body,
+    ) {
+        Ok(principal) => principal,
+        Err(_) => return authentication_failed(),
+    };
+    let _principal_permit = match service.admission.try_production_cutover(&principal) {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    let store = Arc::clone(&service.store);
+    match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        store.execute(|store| store.production_mutation_admission_state()),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(admission)) => {
+            match encode_production_mutation_admission_state(&admission) {
+                Ok(body) if body.len() <= PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES => {
+                    json_response(StatusCode::OK, body)
+                }
+                _ => {
+                    state.readiness.poison();
+                    temporarily_unavailable()
+                }
+            }
+        }
+        AwaitOutcome::Completed(Err(error))
+            if !matches!(
+                error.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            state.readiness.poison();
+            temporarily_unavailable()
+        }
+        AwaitOutcome::Completed(Err(_)) | AwaitOutcome::Deadline | AwaitOutcome::Shutdown => {
+            temporarily_unavailable()
+        }
+    }
+}
+
 enum AuthEnvelope {
     Machine {
         credential_id: String,
@@ -677,6 +1183,31 @@ fn classify_auth_envelope(headers: &HeaderMap) -> Option<AuthEnvelope> {
     } else {
         None
     }
+}
+
+fn classify_production_cutover_signature(headers: &HeaderMap) -> Option<(String, String)> {
+    let forbidden = [
+        NODE_CREDENTIAL_ID_HEADER,
+        NODE_PUBLIC_KEY_SPKI_HEADER,
+        NODE_SIGNATURE_HEADER,
+        PROVISIONER_CREDENTIAL_ID_HEADER,
+        PROVISIONER_SIGNATURE_HEADER,
+        header::AUTHORIZATION.as_str(),
+        header::COOKIE.as_str(),
+    ];
+    if forbidden.into_iter().any(|name| headers.contains_key(name)) {
+        return None;
+    }
+    let credential_id = single_header_text(headers, PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER)?;
+    let signature = single_header_text(headers, PRODUCTION_CUTOVER_SIGNATURE_HEADER)?;
+    Some((credential_id.to_owned(), signature.to_owned()))
+}
+
+fn system_now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 async fn authenticate(
@@ -873,6 +1404,10 @@ fn single_header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str>
 }
 
 fn declared_body_exceeds_limit(headers: &HeaderMap) -> bool {
+    declared_body_exceeds(headers, RUNTIME_NODE_AUTHORITY_REQUEST_MAX_WIRE_BYTES)
+}
+
+fn declared_body_exceeds(headers: &HeaderMap, maximum: usize) -> bool {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return false;
@@ -884,7 +1419,7 @@ fn declared_body_exceeds_limit(headers: &HeaderMap) -> bool {
         .to_str()
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .is_none_or(|length| length > RUNTIME_NODE_AUTHORITY_REQUEST_MAX_WIRE_BYTES as u64)
+        .is_none_or(|length| length > maximum as u64)
 }
 
 fn authentication_failed() -> Response {
@@ -900,7 +1435,11 @@ fn temporarily_unavailable() -> Response {
 }
 
 fn success_response(body: Vec<u8>) -> Response {
-    let mut response = (StatusCode::OK, body).into_response();
+    json_response(StatusCode::OK, body)
+}
+
+fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
+    let mut response = (status, body).into_response();
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -990,6 +1529,8 @@ mod tests {
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                crate::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "runtime-node-authority-unit-admin-token".into(),
             workos: None,

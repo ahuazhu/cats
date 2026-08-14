@@ -20,6 +20,10 @@ use crate::gateway_workload_identity::{
     GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, GATEWAY_CLIENT_CA_BUNDLE_PATH,
     GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_MAX_WIRE_BYTES, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
 };
+use crate::production_mutation_admission::{
+    decode_production_cutover_operator_trust_bundle, ProductionCutoverOperatorTrustBundle,
+    PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+};
 use crate::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
     RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
@@ -49,6 +53,10 @@ pub const GUEST_INITRAMFS_PATH: &str = "/opt/cats/guest/initramfs.img";
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_ENV: &str = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE";
 pub const RUNTIME_PROVISIONER_TRUST_PATH: &str =
     "/etc/cats/identity/runtime-provisioner-trust.v1.json";
+pub const PRODUCTION_CUTOVER_OPERATOR_TRUST_PATH: &str =
+    "/etc/cats/production-cutover-operator-trust.v1.json";
+pub const PRODUCTION_CUTOVER_OPERATOR_TRUST_ENV: &str =
+    "CATS_PRODUCTION_CUTOVER_OPERATOR_TRUST_FILE";
 pub const GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES: usize = 4_096;
 pub const GUEST_BOOT_MEMBER_MAX_BYTES: usize = 536_870_912;
 
@@ -83,6 +91,12 @@ pub struct InstalledGuestRuntimeProfileReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledRuntimeProvisionerTrustBundle {
     bundle: RuntimeProvisionerTrustBundle,
+    exact_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledProductionCutoverOperatorTrustBundle {
+    bundle: ProductionCutoverOperatorTrustBundle,
     exact_bytes: Vec<u8>,
 }
 
@@ -324,6 +338,16 @@ impl InstalledRuntimeProvisionerTrustBundle {
     }
 }
 
+impl InstalledProductionCutoverOperatorTrustBundle {
+    pub fn bundle(&self) -> &ProductionCutoverOperatorTrustBundle {
+        &self.bundle
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestRuntimeBootContract {
     kernel: GuestRuntimeReleaseMember,
@@ -394,6 +418,8 @@ pub enum RuntimeArtifactError {
     WrongReceiptPath,
     #[error("Runtime provisioner trust path must be the canonical installed path")]
     WrongProvisionerTrustPath,
+    #[error("Production cutover operator trust path must be the canonical installed path")]
+    WrongProductionCutoverOperatorTrustPath,
     #[error("Route Grant v2 public-key ring path must be the canonical installed path")]
     WrongRouteGrantV2PublicKeyRingPath,
     #[error("Route Grant v2 signer paths must be the canonical installed paths")]
@@ -416,6 +442,8 @@ pub enum RuntimeArtifactError {
     InvalidReceipt,
     #[error("Runtime provisioner trust bundle is invalid")]
     InvalidProvisionerTrust,
+    #[error("Production cutover operator trust bundle is invalid")]
+    InvalidProductionCutoverOperatorTrust,
     #[error("Route Grant v2 public-key ring is invalid")]
     InvalidRouteGrantV2PublicKeyRing,
     #[error("Route Grant v2 signer artifact set is invalid")]
@@ -1246,6 +1274,46 @@ pub fn load_installed_runtime_provisioner_trust_bundle(
         return Err(RuntimeArtifactError::WrongProvisionerTrustPath);
     }
     load_installed_runtime_provisioner_trust_bundle_platform(selected_path)
+}
+
+/// Read and pin the independent E13 offline-operator public trust before the
+/// administrator listener or any Store-backed admission command can run.
+pub fn load_installed_production_cutover_operator_trust_bundle(
+    selected_path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    if selected_path != Path::new(PRODUCTION_CUTOVER_OPERATOR_TRUST_PATH) {
+        return Err(RuntimeArtifactError::WrongProductionCutoverOperatorTrustPath);
+    }
+    load_installed_production_cutover_operator_trust_bundle_platform(selected_path)
+}
+
+#[cfg(unix)]
+fn load_installed_production_cutover_operator_trust_bundle_platform(
+    path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    let cats_directory = open_installed_directory(
+        &["etc", "cats"],
+        InstalledDirectoryMode::ProvisionerIdentity,
+    )?;
+    let exact_bytes = read_exact_installed_file_at(
+        cats_directory.final_descriptor(),
+        "production-cutover-operator-trust.v1.json",
+        path,
+        PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    )?;
+    let bundle = decode_production_cutover_operator_trust_bundle(&exact_bytes)
+        .map_err(|_| RuntimeArtifactError::InvalidProductionCutoverOperatorTrust)?;
+    Ok(InstalledProductionCutoverOperatorTrustBundle {
+        bundle,
+        exact_bytes,
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_production_cutover_operator_trust_bundle_platform(
+    _path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -2729,6 +2797,14 @@ mod tests {
         assert!(matches!(
             load_installed_runtime_provisioner_trust_bundle(Path::new("relative.json")),
             Err(RuntimeArtifactError::WrongProvisionerTrustPath)
+        ));
+    }
+
+    #[test]
+    fn production_cutover_trust_path_rejects_every_alternate_before_filesystem_access() {
+        assert!(matches!(
+            load_installed_production_cutover_operator_trust_bundle(Path::new("relative.json")),
+            Err(RuntimeArtifactError::WrongProductionCutoverOperatorTrustPath)
         ));
     }
 

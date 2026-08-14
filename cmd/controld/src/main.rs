@@ -118,6 +118,15 @@ struct Args {
     /// alternate.
     #[arg(long, value_name = "PATH")]
     runtime_provisioner_trust_file: std::path::PathBuf,
+    /// Independent release-bound E13 offline operator public trust. The
+    /// loader accepts only the canonical installed path.
+    #[arg(
+        long,
+        env = "CATS_PRODUCTION_CUTOVER_OPERATOR_TRUST_FILE",
+        default_value = "/etc/cats/production-cutover-operator-trust.v1.json",
+        value_name = "PATH"
+    )]
+    production_cutover_operator_trust_file: std::path::PathBuf,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
     /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
@@ -534,6 +543,10 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_runtime_provisioner_trust_bundle(
             &args.runtime_provisioner_trust_file,
         )?;
+    let production_cutover_operator_trust =
+        cats_api::runtime_artifacts::load_installed_production_cutover_operator_trust_bundle(
+            &args.production_cutover_operator_trust_file,
+        )?;
     let gateway_machine = if let Some(listen) = args.route_v2_machine_listen {
         use cats_api::gateway_workload_identity::{
             CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
@@ -584,6 +597,9 @@ async fn main() -> anyhow::Result<()> {
         auth_token: args.auth_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
         runtime_provisioner_trust_bundle: runtime_provisioner_trust.bundle().clone(),
+        production_cutover_operator_trust_bundle: production_cutover_operator_trust
+            .bundle()
+            .clone(),
         route_grant_signer,
         admin_token: args.admin_token,
         workos,

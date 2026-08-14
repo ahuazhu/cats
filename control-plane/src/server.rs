@@ -550,6 +550,10 @@ pub struct Config {
     /// installed path. Startup persists/exact-replays its monotonic lineage
     /// before opening the administrator listener.
     pub runtime_provisioner_trust_bundle: RuntimeProvisionerTrustBundle,
+    /// Independent release-bound public trust for the offline E13 cutover
+    /// operator key. It is loaded only from its canonical installed path.
+    pub production_cutover_operator_trust_bundle:
+        cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
     /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
     /// intentionally absent from Gateway and Node configuration.
     pub route_grant_signer: Arc<crate::route_grant::RouteGrantSigner>,
@@ -1379,6 +1383,24 @@ async fn spawn_inner(
         .execute(move |store| store.install_runtime_provisioner_trust_bundle(&trust_bundle))
         .await
         .context("install runtime provisioner trust bundle")?;
+    anyhow::ensure!(
+        cfg.production_cutover_operator_trust_bundle.deployment_id
+            == cfg.runtime_provisioner_trust_bundle.deployment_id,
+        "production cutover operator trust deployment does not match Control deployment"
+    );
+    match option_env!("CATS_RELEASE_COMMIT_SHA") {
+        Some(release_commit) => anyhow::ensure!(
+            release_commit
+                == cfg
+                    .production_cutover_operator_trust_bundle
+                    .source_commit_sha,
+            "production cutover operator trust is not bound to this qualified Control release"
+        ),
+        None => anyhow::ensure!(
+            cfg!(any(debug_assertions, feature = "test-support")),
+            "production Control build has no qualified release commit"
+        ),
+    }
     if let Some(machine) = &gateway_machine {
         if let Some(installed) = &machine.rotation_operator_trust {
             let trust = installed.trust().clone();
@@ -1530,6 +1552,7 @@ async fn spawn_inner(
             crate::api::runtime_node_authority::RuntimeNodeAuthorityService::new(
                 store.clone(),
                 cfg.runtime_provisioner_trust_bundle.clone(),
+                cfg.production_cutover_operator_trust_bundle.clone(),
                 Arc::clone(&readiness),
             ),
         ),

@@ -134,6 +134,8 @@ mod tests {
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                crate::testsupport::test_production_cutover_operator_trust_bundle(),
             auth_token: "service-token".into(),
             route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),

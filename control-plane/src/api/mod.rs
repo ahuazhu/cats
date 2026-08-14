@@ -907,6 +907,19 @@ pub fn router(state: AppState) -> Router {
                 .fallback(runtime_node_authority::apply_runtime_node_authority),
         )
         .route(
+            "/v1/admin/production/mutation-admission-commands",
+            post(runtime_node_authority::apply_production_mutation_admission)
+                .fallback(runtime_node_authority::apply_production_mutation_admission),
+        )
+        .route(
+            "/v1/admin/production/mutation-admission-command-discoveries",
+            post(runtime_node_authority::discover_production_mutation_admission_command),
+        )
+        .route(
+            "/v1/admin/production/mutation-admission-state-discoveries",
+            post(runtime_node_authority::get_production_mutation_admission_state),
+        )
+        .route(
             "/v1/admin/runtime/fleet-verification",
             get(fleet_verification::fleet_verification),
         )
@@ -1127,6 +1140,9 @@ POST /v1/accounts/{account}/invitations
 POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
 POST /v1/accounts/{account}/workspaces
 POST /v1/admin/nodes/{id}/actions/{verb}
+POST /v1/admin/production/mutation-admission-command-discoveries
+POST /v1/admin/production/mutation-admission-commands
+POST /v1/admin/production/mutation-admission-state-discoveries
 POST /v1/admin/runtime/node-authority-applies
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
