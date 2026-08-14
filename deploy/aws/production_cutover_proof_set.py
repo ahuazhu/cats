@@ -16,7 +16,10 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -119,8 +122,10 @@ USAGE_SOURCE_TERMINAL_SET_KIND = (
 )
 MAX_PROOF_SET_BYTES = 2 * 1024 * 1024
 MAX_PROOF_FILE_BYTES = 16 * 1024 * 1024
+MAX_VERIFIER_BINARY_BYTES = 256 * 1024 * 1024
 FLEET_MAX_AGE_MS = 60_000
 PROOF_SET_MAX_AGE_SECONDS = 15 * 60
+USAGE_VERIFIER_TIMEOUT_SECONDS = 120
 
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 RAW_SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -534,6 +539,300 @@ class _UnavailableQualificationAdmissionVerifier:
         raise ProofSetError(
             "Qualification admission live-discovery verifier is not wired"
         )
+
+
+def _require_root_private_directory(path: Path, label: str) -> None:
+    if os.geteuid() != 0:
+        raise ProofSetError(f"{label} requires the root production operator")
+    if not path.is_absolute():
+        raise ProofSetError(f"{label} must be an absolute path")
+    try:
+        if path.resolve(strict=True) != path:
+            raise ProofSetError(f"{label} or an ancestor is a symlink")
+        metadata = path.stat(follow_symlinks=False)
+        for parent in path.parents:
+            parent_metadata = parent.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != 0
+                or parent_metadata.st_mode & 0o022
+            ):
+                raise ProofSetError(f"{label} ancestor is not root-controlled")
+    except OSError as error:
+        raise ProofSetError(f"{label} is unavailable") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o077
+    ):
+        raise ProofSetError(f"{label} must be root-owned mode 0700")
+
+
+def _open_release_bound_executable(
+    path: Path,
+    expected_sha256: str,
+) -> tuple[int, _FileIdentity]:
+    if not path.is_absolute() or path != USAGE_TERMINAL_VERIFIER:
+        raise ProofSetError("E9 terminal verifier path is not canonical")
+    try:
+        if path.resolve(strict=True) != path:
+            raise ProofSetError("E9 terminal verifier path contains a symlink")
+        for parent in path.parents:
+            metadata = parent.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_mode & 0o022
+            ):
+                raise ProofSetError(
+                    "E9 terminal verifier ancestor is not root-controlled"
+                )
+    except OSError as error:
+        raise ProofSetError("E9 terminal verifier path is unavailable") from error
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ProofSetError("E9 terminal verifier cannot be opened") from error
+    try:
+        identity = _FileIdentity.from_stat(os.fstat(descriptor))
+        if (
+            not stat.S_ISREG(identity.mode)
+            or identity.uid != 0
+            or identity.links != 1
+            or identity.mode & 0o022
+            or not identity.mode & 0o111
+            or identity.size <= 0
+            or identity.size > MAX_VERIFIER_BINARY_BYTES
+        ):
+            raise ProofSetError("E9 terminal verifier metadata is unsafe")
+        hasher = hashlib.sha256()
+        remaining = identity.size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ProofSetError("E9 terminal verifier changed during hashing")
+            hasher.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ProofSetError("E9 terminal verifier grew during hashing")
+        if _FileIdentity.from_stat(os.fstat(descriptor)) != identity:
+            raise ProofSetError("E9 terminal verifier changed during hashing")
+        if "sha256:" + hasher.hexdigest() != expected_sha256:
+            raise ProofSetError("E9 terminal verifier differs from the release")
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_private_staged_file(path: Path, data: bytes) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ProofSetError("cannot create the private E9 verifier input") from error
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ProofSetError("cannot write the private E9 verifier input")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _terminate_subprocess(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+class SubprocessUsageTargetTerminalVerifier:
+    """Invoke the exact release-bound Rust E9 verifier in a private directory."""
+
+    def __init__(
+        self,
+        state_directory: Path,
+        *,
+        timeout_seconds: int = USAGE_VERIFIER_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            type(timeout_seconds) is not int
+            or timeout_seconds <= 0
+            or timeout_seconds > 300
+        ):
+            raise ProofSetError("E9 terminal verifier timeout is outside 1..300")
+        self._state_directory = state_directory
+        self._timeout_seconds = timeout_seconds
+
+    def verify(
+        self,
+        _finalization_manifest: VerifiedFile,
+        expected_targets: VerifiedFile,
+        receipt: VerifiedFile,
+        expected_request: VerifiedFile,
+        verification_receipt: VerifiedFile,
+        _qualified_runs: tuple[QualifiedRun, QualifiedRun],
+        context: ProducerContext,
+    ) -> None:
+        _require_root_private_directory(
+            self._state_directory,
+            "E9 terminal verifier state directory",
+        )
+        binary_descriptor, binary_identity = _open_release_bound_executable(
+            USAGE_TERMINAL_VERIFIER,
+            context.usage_terminal_verifier_binary_sha256,
+        )
+        invocation: Path | None = None
+        try:
+            try:
+                invocation = Path(
+                    tempfile.mkdtemp(
+                        prefix=".usage-terminal-verifier.",
+                        dir=self._state_directory,
+                    )
+                )
+            except OSError as error:
+                raise ProofSetError(
+                    "cannot create the private E9 verifier invocation directory"
+                ) from error
+            receipt_path = invocation / USAGE_TERMINAL_RECEIPT_FILE
+            request_path = invocation / USAGE_TERMINAL_REQUEST_FILE
+            targets_path = invocation / USAGE_TERMINAL_TARGETS_FILE
+            output_path = invocation / USAGE_TERMINAL_VERIFICATION_FILE
+            _write_private_staged_file(receipt_path, receipt.data)
+            _write_private_staged_file(request_path, expected_request.data)
+            _write_private_staged_file(targets_path, expected_targets.data)
+            directory_descriptor = os.open(
+                invocation,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+            argv = [
+                str(USAGE_TERMINAL_VERIFIER),
+                "--receipt-file",
+                str(receipt_path),
+                "--expected-request-file",
+                str(request_path),
+                "--expected-targets-file",
+                str(targets_path),
+                "--expected-targets-sha256",
+                expected_targets.sha256,
+                "--release-commit",
+                context.release_commit,
+                "--worker-bundle-sha256",
+                context.worker_bundle_sha256,
+                "--receipt-out",
+                str(output_path),
+            ]
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    cwd=invocation,
+                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                raise ProofSetError("cannot execute the E9 terminal verifier") from error
+            try:
+                stdout, stderr = process.communicate(timeout=self._timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                _terminate_subprocess(process)
+                raise ProofSetError("E9 terminal verifier timed out") from error
+            except BaseException:
+                _terminate_subprocess(process)
+                raise
+            if (
+                process.returncode != 0
+                or stdout != USAGE_TERMINAL_SUCCESS_STDOUT.encode("ascii")
+                or stderr
+            ):
+                raise ProofSetError("E9 terminal verifier rejected the proof")
+            try:
+                path_identity = _FileIdentity.from_stat(
+                    USAGE_TERMINAL_VERIFIER.stat(follow_symlinks=False)
+                )
+                descriptor_identity = _FileIdentity.from_stat(
+                    os.fstat(binary_descriptor)
+                )
+            except OSError as error:
+                raise ProofSetError(
+                    "E9 terminal verifier identity is unavailable after execution"
+                ) from error
+            if path_identity != binary_identity or descriptor_identity != binary_identity:
+                raise ProofSetError("E9 terminal verifier changed during execution")
+            try:
+                output_metadata = output_path.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ProofSetError("E9 terminal verifier emitted no receipt") from error
+            if (
+                not stat.S_ISREG(output_metadata.st_mode)
+                or output_path.is_symlink()
+                or output_metadata.st_uid != os.geteuid()
+                or output_metadata.st_nlink != 1
+                or stat.S_IMODE(output_metadata.st_mode) not in {0o400, 0o600}
+            ):
+                raise ProofSetError("E9 terminal verifier receipt metadata is unsafe")
+            with ProofDirectory(invocation) as directory:
+                actual = directory.read_named(
+                    USAGE_TERMINAL_VERIFICATION_FILE,
+                    "E9 terminal verifier emitted receipt",
+                    MAX_PROOF_FILE_BYTES,
+                )
+            if actual != verification_receipt:
+                raise ProofSetError(
+                    "E9 terminal verifier receipt differs from the proof set"
+                )
+        finally:
+            os.close(binary_descriptor)
+            if invocation is not None:
+                expected_names = {
+                    USAGE_TERMINAL_RECEIPT_FILE,
+                    USAGE_TERMINAL_REQUEST_FILE,
+                    USAGE_TERMINAL_TARGETS_FILE,
+                    USAGE_TERMINAL_VERIFICATION_FILE,
+                }
+                try:
+                    actual_names = {entry.name for entry in os.scandir(invocation)}
+                    if actual_names.issubset(expected_names):
+                        for name in actual_names:
+                            (invocation / name).unlink()
+                        invocation.rmdir()
+                        parent_descriptor = os.open(
+                            self._state_directory,
+                            os.O_RDONLY
+                            | getattr(os, "O_CLOEXEC", 0)
+                            | getattr(os, "O_DIRECTORY", 0),
+                        )
+                        try:
+                            os.fsync(parent_descriptor)
+                        finally:
+                            os.close(parent_descriptor)
+                except OSError:
+                    # Failure leaves a root-only invocation directory for diagnosis.
+                    pass
 
 
 UNAVAILABLE_ROUTE_V2_VERIFIER: RouteV2QualificationVerifier = _UnavailableRouteV2Verifier()

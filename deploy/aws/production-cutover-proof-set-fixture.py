@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -309,6 +310,108 @@ def validate_inventory_is_observation_only() -> None:
             ADMISSION.time.sleep = original_sleep
 
 
+def validate_release_bound_usage_subprocess() -> None:
+    (
+        manifest,
+        targets,
+        request,
+        receipt,
+        verification_file,
+        context,
+        runs,
+        _verification,
+    ) = fixture()
+    original_binary = PROOF.USAGE_TERMINAL_VERIFIER
+    original_private_directory = PROOF._require_root_private_directory
+    original_open_executable = PROOF._open_release_bound_executable
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        executable = root / "cats-usage-terminal-receipt-verifier"
+        executable.write_text(
+            f"""#!{sys.executable}
+import argparse
+import os
+from pathlib import Path
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--receipt-file", required=True)
+parser.add_argument("--expected-request-file", required=True)
+parser.add_argument("--expected-targets-file", required=True)
+parser.add_argument("--expected-targets-sha256", required=True)
+parser.add_argument("--release-commit", required=True)
+parser.add_argument("--worker-bundle-sha256", required=True)
+parser.add_argument("--receipt-out", required=True)
+args = parser.parse_args()
+if (
+    Path(args.receipt_file).name != {PROOF.USAGE_TERMINAL_RECEIPT_FILE!r}
+    or Path(args.expected_request_file).name != {PROOF.USAGE_TERMINAL_REQUEST_FILE!r}
+    or Path(args.expected_targets_file).name != {PROOF.USAGE_TERMINAL_TARGETS_FILE!r}
+    or args.expected_targets_sha256 != {targets.sha256!r}
+    or args.release_commit != {context.release_commit!r}
+    or args.worker_bundle_sha256 != {context.worker_bundle_sha256!r}
+):
+    raise SystemExit(2)
+output = Path(args.receipt_out)
+output.write_bytes(bytes.fromhex({verification_file.data.hex()!r}))
+os.chmod(output, 0o600)
+sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(0o500)
+        opened: list[str] = []
+
+        def open_fixture_executable(path: Path, expected_sha256: str) -> Any:
+            if (
+                path != executable
+                or expected_sha256
+                != context.usage_terminal_verifier_binary_sha256
+            ):
+                raise AssertionError("subprocess adapter did not use the release verifier")
+            descriptor = os.open(path, os.O_RDONLY)
+            opened.append(expected_sha256)
+            return descriptor, PROOF._FileIdentity.from_stat(os.fstat(descriptor))
+
+        try:
+            PROOF.USAGE_TERMINAL_VERIFIER = executable
+            PROOF._require_root_private_directory = lambda _path, _label: None
+            PROOF._open_release_bound_executable = open_fixture_executable
+            verifier = PROOF.SubprocessUsageTargetTerminalVerifier(state)
+            verifier.verify(
+                manifest,
+                targets,
+                receipt,
+                request,
+                verification_file,
+                runs,
+                context,
+            )
+            if opened != [context.usage_terminal_verifier_binary_sha256]:
+                raise AssertionError("subprocess adapter did not pin the verifier binary")
+            wrong = opaque(PROOF.USAGE_TERMINAL_VERIFICATION_FILE, "foreign")
+            try:
+                verifier.verify(
+                    manifest,
+                    targets,
+                    receipt,
+                    request,
+                    wrong,
+                    runs,
+                    context,
+                )
+            except PROOF.ProofSetError:
+                pass
+            else:
+                raise AssertionError("subprocess adapter accepted foreign verifier bytes")
+        finally:
+            PROOF.USAGE_TERMINAL_VERIFIER = original_binary
+            PROOF._require_root_private_directory = original_private_directory
+            PROOF._open_release_bound_executable = original_open_executable
+
+
 def main() -> int:
     if not PROOF.version_one(1) or PROOF.version_one(True):
         raise AssertionError("closed contract version accepted a JSON boolean")
@@ -408,6 +511,7 @@ def main() -> int:
             continue
         raise AssertionError("non-closed per-run SHA256SUMS was accepted")
     validate_inventory_is_observation_only()
+    validate_release_bound_usage_subprocess()
     return 0
 
 
