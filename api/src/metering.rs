@@ -7,6 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_reconciliation::SessionBinding;
+
+/// The one production ingestion route shared by legacy development producers
+/// and the signed runtime spine.
+pub const USAGE_CHECKPOINTS_METHOD: &str = "POST";
+pub const USAGE_CHECKPOINTS_PATH: &str = "/v1/internal/usage/checkpoints";
+
 /// Hard limit enforced by the control-plane JSON extractor. Producers should
 /// target materially less than this so headers and intermediary framing never
 /// put an otherwise valid checkpoint batch on the boundary.
@@ -79,6 +86,10 @@ pub struct CatUsageCheckpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestUsageCheckpointsRequest {
+    /// The exact AgentSession which sampled these checkpoints. Ingestion
+    /// rejects a stale session even when the Node credential itself remains
+    /// valid.
+    pub session: SessionBinding,
     pub node_id: String,
     pub checkpoints: Vec<CatUsageCheckpoint>,
 }

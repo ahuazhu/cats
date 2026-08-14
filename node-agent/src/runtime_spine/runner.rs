@@ -2855,6 +2855,15 @@ impl RuntimeSpineRunner {
         })
     }
 
+    /// Returns only the current-process complete observation whose accepted
+    /// attestation opened this effect admission. Usage sampling must never be
+    /// reconstructed from a retained checkpoint or a partial heartbeat.
+    pub(crate) fn accepted_full_observation(&self) -> Option<NodeObservation> {
+        self.effect_admission
+            .as_ref()
+            .map(|admission| admission.observation().clone())
+    }
+
     pub async fn run_once_with_deadlines(
         &mut self,
         deadlines: RuntimeSpineRunDeadlines,

@@ -45,6 +45,15 @@ use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
 
+fn usage_session(node_id: &str) -> SessionBinding {
+    SessionBinding {
+        node_id: Id::new(node_id).unwrap(),
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+        agent_session_epoch: Epoch::new(1).unwrap(),
+    }
+}
+
 async fn reject_unexpected_production_node_call(
     State(calls): State<Arc<AtomicUsize>>,
 ) -> StatusCode {
@@ -2896,6 +2905,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         ),
     ];
     let request = IngestUsageCheckpointsRequest {
+        session: usage_session("node_a"),
         node_id: "node_a".to_string(),
         checkpoints,
     };
@@ -3018,6 +3028,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     let transitioned = ctx.wait_observed("metered", ObservedState::Suspended).await;
     assert!(transitioned.generation > cat.generation);
     let historical = IngestUsageCheckpointsRequest {
+        session: usage_session("node_a"),
         node_id: "node_a".to_string(),
         checkpoints: vec![make_checkpoint(
             UsageMetric::CpuUsec,
@@ -3039,6 +3050,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         .post(ctx.url("/v1/internal/usage/checkpoints"))
         .bearer_auth(SERVICE_TOKEN)
         .json(&IngestUsageCheckpointsRequest {
+            session: usage_session("node_a"),
             node_id: "node_a".to_string(),
             checkpoints: vec![future_checkpoint],
         })
@@ -3078,6 +3090,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         .post(ctx.url("/v1/internal/usage/checkpoints"))
         .bearer_auth(SERVICE_TOKEN)
         .json(&IngestUsageCheckpointsRequest {
+            session: usage_session("node_a"),
             node_id: "node_a".to_string(),
             checkpoints: vec![make_checkpoint(
                 UsageMetric::CpuUsec,
@@ -3166,6 +3179,7 @@ async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
         .post(ctx.url("/v1/internal/usage/checkpoints"))
         .bearer_auth(SERVICE_TOKEN)
         .json(&IngestUsageCheckpointsRequest {
+            session: usage_session("node_a"),
             node_id: "node_a".to_string(),
             checkpoints: vec![
                 checkpoint(0, 1_000, 0),
@@ -4776,6 +4790,7 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
         .post(ctx.url("/v1/internal/usage/checkpoints"))
         .bearer_auth(SERVICE_TOKEN)
         .json(&IngestUsageCheckpointsRequest {
+            session: usage_session("node_a"),
             node_id: "node_a".to_string(),
             checkpoints: vec![
                 poison.clone(),

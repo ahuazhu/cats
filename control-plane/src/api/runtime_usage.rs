@@ -1,0 +1,456 @@
+//! Signed, session-fenced ingestion into the existing UsageStore.
+
+use std::error::Error as _;
+use std::time::{Duration, Instant};
+
+use axum::body::{to_bytes, Body};
+use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use cats_api::agent_registration::{
+    verify_request_proof, JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER,
+    NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
+};
+use cats_api::error::{ApiError, ErrorBody, ErrorCode};
+use cats_api::metering::{
+    IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, RejectedCheckpoint,
+    MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_METHOD,
+    USAGE_CHECKPOINTS_PATH,
+};
+use cats_api::runtime_reconciliation::Id;
+use cats_metering::{AttributedCheckpoint, IngestOutcome, UsageAttribution};
+
+use crate::server::AppState;
+use crate::store::runtime_authority::volume_transition_auth::{
+    VolumeTransitionStoreOutcome, VolumeTransitionStoreRejection,
+};
+use crate::store::AuthorityRequestContext;
+
+const HANDLER_DEADLINE: Duration = Duration::from_secs(10);
+const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-internal\"";
+
+struct CancelRequestOnDrop(AuthorityRequestContext);
+
+impl Drop for CancelRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+pub(super) async fn ingest(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let deadline = Instant::now() + HANDLER_DEADLINE;
+    let request_context = AuthorityRequestContext::new(deadline);
+    let _cancel_on_drop = CancelRequestOnDrop(request_context.clone());
+
+    if request.method().as_str() != USAGE_CHECKPOINTS_METHOD {
+        return error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            ErrorCode::InvalidArgument,
+            "usage checkpoint ingestion requires POST",
+            &[(
+                header::ALLOW,
+                HeaderValue::from_static(USAGE_CHECKPOINTS_METHOD),
+            )],
+        );
+    }
+    if request.uri().query().is_some() {
+        return invalid("usage checkpoint ingestion does not accept a query");
+    }
+
+    let headers = request.headers().clone();
+    if single_header_text(&headers, header::CONTENT_TYPE.as_str()).is_none_or(|value| {
+        !value
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case(JSON_CONTENT_TYPE)
+    }) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::InvalidArgument,
+            "usage checkpoint ingestion requires application/json",
+            &[],
+        );
+    }
+    if headers.contains_key(header::CONTENT_ENCODING) {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::InvalidArgument,
+            "usage checkpoint ingestion does not accept Content-Encoding",
+            &[],
+        );
+    }
+    if headers.contains_key(header::AUTHORIZATION) {
+        return invalid("usage checkpoint ingestion does not accept Authorization");
+    }
+    if declared_body_exceeds_limit(&headers, MAX_USAGE_INGEST_BODY_BYTES) {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::InvalidArgument,
+            "usage checkpoint request exceeds the wire limit",
+            &[],
+        );
+    }
+
+    let _global_permit = match state.runtime_spine_admission.try_global() {
+        Ok(permit) => permit,
+        Err(_) => return unavailable("usage checkpoint admission is saturated"),
+    };
+    let body = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        to_bytes(request.into_body(), MAX_USAGE_INGEST_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error))
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
+        {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::InvalidArgument,
+                "usage checkpoint request exceeds the wire limit",
+                &[],
+            );
+        }
+        Ok(Err(_)) => return internal(),
+        Err(_) => return deadline_exceeded(),
+    };
+
+    let authenticated = match (
+        single_header_text(&headers, NODE_CREDENTIAL_ID_HEADER),
+        single_header_text(&headers, NODE_PUBLIC_KEY_SPKI_HEADER),
+        single_header_text(&headers, NODE_SIGNATURE_HEADER),
+    ) {
+        (Some(credential_id), Some(public_key_spki), Some(signature)) => verify_request_proof(
+            USAGE_CHECKPOINTS_METHOD,
+            USAGE_CHECKPOINTS_PATH,
+            &body,
+            credential_id,
+            public_key_spki,
+            signature,
+        ),
+        _ => Err(cats_api::agent_registration::RequestProofError),
+    };
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(_) => return authentication_failed(),
+    };
+    let request: IngestUsageCheckpointsRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid("usage checkpoint request is malformed"),
+    };
+    if request.checkpoints.len() > MAX_USAGE_CHECKPOINTS_PER_REQUEST {
+        return invalid(format!(
+            "at most {MAX_USAGE_CHECKPOINTS_PER_REQUEST} checkpoints are allowed per request"
+        ));
+    }
+    if request.node_id != request.session.node_id.as_str() {
+        return conflict("usage checkpoint node_id does not match its AgentSession");
+    }
+
+    let active_guest_digest = state
+        .agent_session_registration_policy
+        .approved_guest_config_digest()
+        .clone();
+    let lookup_credential = authenticated.clone();
+    let lookup_session = request.session.clone();
+    let lookup_context = request_context.clone();
+    let store = state.store.clone();
+    let authenticated_node = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        store.execute(move |store| {
+            store.runtime_node_session_for_request(
+                &lookup_credential,
+                &lookup_session,
+                &active_guest_digest,
+                &lookup_context,
+            )
+        }),
+    )
+    .await
+    {
+        Ok(Ok(VolumeTransitionStoreOutcome::Accepted(node_id))) => node_id,
+        Ok(Ok(VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::IdentityNotEligible,
+        ))) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                ErrorCode::PermissionDenied,
+                "usage checkpoint identity is not eligible",
+                &[],
+            )
+        }
+        Ok(Ok(VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::Contract(_),
+        ))) => return conflict("usage checkpoint AgentSession is not current"),
+        Ok(Ok(VolumeTransitionStoreOutcome::Rejected(_))) => return internal(),
+        Ok(Err(error)) if transient_store_error(&error) => {
+            return unavailable("usage checkpoint authority is unavailable")
+        }
+        Ok(Err(_)) => return internal(),
+        Err(_) => return deadline_exceeded(),
+    };
+    if authenticated_node != request.session.node_id {
+        return conflict("usage checkpoint identity does not match its AgentSession");
+    }
+    drop(_global_permit);
+
+    ingest_authenticated(&state, request).await
+}
+
+async fn ingest_authenticated(
+    state: &AppState,
+    request: IngestUsageCheckpointsRequest,
+) -> Response {
+    let mut accepted = 0_u64;
+    let mut duplicates = 0_u64;
+    let mut rejected = Vec::new();
+    for checkpoint in request.checkpoints {
+        let expected_source = format!("node/{}/cat/{}", request.node_id, checkpoint.cat_id);
+        if checkpoint.source_id != expected_source {
+            return invalid(format!("checkpoint source_id must be {expected_source}"));
+        }
+        let frozen_attribution = match state
+            .usage
+            .source_epoch_attribution(&checkpoint.source_id, &checkpoint.source_epoch)
+            .await
+        {
+            Ok(attribution) => attribution,
+            Err(error) => return metering_error(error),
+        };
+        let cat_id = match Id::new(checkpoint.cat_id.clone()) {
+            Some(cat_id) => cat_id,
+            None => return invalid("checkpoint cat_id is not canonical"),
+        };
+        let cat = match state
+            .store
+            .execute(move |store| store.get_runtime_cat_for_usage(&cat_id))
+            .await
+        {
+            Ok(cat) => cat,
+            Err(error) if transient_store_error(&error) => {
+                return unavailable("usage attribution authority is unavailable")
+            }
+            Err(_) => return internal(),
+        };
+        let attribution = match cat {
+            Some(cat) => {
+                if cat.node_id.as_str() != request.node_id {
+                    return conflict(format!(
+                        "node {} does not own Cat {}",
+                        request.node_id, checkpoint.cat_id
+                    ));
+                }
+                let generation = match u64::try_from(checkpoint.cat_generation) {
+                    Ok(generation) => generation,
+                    Err(_) => return invalid("checkpoint Cat generation must be nonnegative"),
+                };
+                if generation > cat.desired_revision.get() {
+                    return conflict(format!(
+                        "Cat {} checkpoint generation {} is newer than current {}",
+                        checkpoint.cat_id,
+                        checkpoint.cat_generation,
+                        cat.desired_revision.get()
+                    ));
+                }
+                if let Some(attribution) = frozen_attribution {
+                    if !cat_attribution_matches(
+                        &attribution,
+                        &checkpoint.cat_id,
+                        Some(cat.workspace_id.as_str()),
+                    ) {
+                        return conflict(
+                            "stored source-epoch attribution does not match current Cat ownership",
+                        );
+                    }
+                    attribution
+                } else {
+                    let workspace_id = cat.workspace_id.to_string();
+                    let billing_account_id =
+                        match super::billing_account_id_for_workspace(state, &workspace_id).await {
+                            Ok(account) => account,
+                            Err(error) => return api_error(error),
+                        };
+                    UsageAttribution {
+                        billing_account_id,
+                        workspace_id,
+                        resource_type: "cat".to_owned(),
+                        resource_id: checkpoint.cat_id.clone(),
+                        attributed_cat_id: Some(checkpoint.cat_id.clone()),
+                    }
+                }
+            }
+            None => {
+                let Some(attribution) = frozen_attribution else {
+                    let reason = format!(
+                        "no frozen attribution exists for deleted Cat {} source epoch",
+                        checkpoint.cat_id
+                    );
+                    tracing::warn!(
+                        event = %checkpoint.event_id,
+                        cat = %checkpoint.cat_id,
+                        source_epoch = %checkpoint.source_epoch,
+                        "rejecting an unattributable usage checkpoint; its usage is not billed"
+                    );
+                    rejected.push(RejectedCheckpoint {
+                        event_id: checkpoint.event_id,
+                        reason,
+                    });
+                    continue;
+                };
+                if !cat_attribution_matches(&attribution, &checkpoint.cat_id, None) {
+                    return conflict(
+                        "stored source-epoch attribution does not match checkpoint Cat",
+                    );
+                }
+                attribution
+            }
+        };
+        let value = AttributedCheckpoint {
+            attribution,
+            checkpoint,
+        };
+        match state.usage.ingest(&value).await {
+            Ok(IngestOutcome::Accepted) => accepted += 1,
+            Ok(IngestOutcome::Duplicate) => duplicates += 1,
+            Err(error) => return metering_error(error),
+        }
+    }
+    Json(IngestUsageCheckpointsResponse {
+        accepted,
+        duplicates,
+        rejected,
+    })
+    .into_response()
+}
+
+fn cat_attribution_matches(
+    attribution: &UsageAttribution,
+    cat_id: &str,
+    workspace_id: Option<&str>,
+) -> bool {
+    attribution.resource_type == "cat"
+        && attribution.resource_id == cat_id
+        && attribution.attributed_cat_id.as_deref() == Some(cat_id)
+        && workspace_id.is_none_or(|workspace| attribution.workspace_id == workspace)
+}
+
+fn transient_store_error(error: &ApiError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+    )
+}
+
+fn single_header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+fn declared_body_exceeds_limit(headers: &HeaderMap, maximum: usize) -> bool {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return true;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|length| length > maximum as u64)
+}
+
+fn authentication_failed() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        ErrorCode::Unauthenticated,
+        "usage checkpoint authentication failed",
+        &[(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(NODE_AUTHENTICATE_CHALLENGE),
+        )],
+    )
+}
+
+fn invalid(message: impl Into<String>) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidArgument,
+        message,
+        &[],
+    )
+}
+
+fn conflict(message: impl Into<String>) -> Response {
+    error_response(StatusCode::CONFLICT, ErrorCode::Conflict, message, &[])
+}
+
+fn unavailable(message: impl Into<String>) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+        message,
+        &[],
+    )
+}
+
+fn deadline_exceeded() -> Response {
+    error_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        ErrorCode::DeadlineExceeded,
+        "usage checkpoint request exceeded its deadline",
+        &[],
+    )
+}
+
+fn internal() -> Response {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        "usage checkpoint ingestion failed internally",
+        &[],
+    )
+}
+
+fn api_error(error: ApiError) -> Response {
+    let status =
+        StatusCode::from_u16(error.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    error_response(status, error.code, error.message, &[])
+}
+
+fn metering_error(error: cats_metering::MeteringError) -> Response {
+    match error {
+        cats_metering::MeteringError::Invalid(message) => invalid(message),
+        cats_metering::MeteringError::Conflict(message) => conflict(message),
+        other => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            other.to_string(),
+            &[],
+        ),
+    }
+}
+
+fn error_response(
+    status: StatusCode,
+    code: ErrorCode,
+    message: impl Into<String>,
+    extra_headers: &[(header::HeaderName, HeaderValue)],
+) -> Response {
+    let mut response = (status, Json(ErrorBody::new(code, message))).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    for (name, value) in extra_headers {
+        response.headers_mut().insert(name, value.clone());
+    }
+    response
+}

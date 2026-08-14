@@ -152,6 +152,35 @@ impl<'transaction, 'connection> EvidenceTransactionContext<'transaction, 'connec
 }
 
 impl Store {
+    /// Reuses the A22 read-strength identity prefix for signed usage ingress.
+    /// This is an authentication read only: no usage row or receipt is added
+    /// to the Control store, and the configured UsageStore remains the one
+    /// ingestion boundary.
+    pub(crate) fn runtime_node_session_for_request(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        session: &SessionBinding,
+        active_guest_config_digest: &Sha256Digest,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<VolumeTransitionStoreOutcome<Id>> {
+        self.authority_request_locking_read_snapshot(request_context, |transaction| {
+            match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => {
+                    let (_, node_id, _) = context.into_parts();
+                    Ok(VolumeTransitionStoreOutcome::Accepted(node_id))
+                }
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    Ok(VolumeTransitionStoreOutcome::Rejected(rejection))
+                }
+            }
+        })
+    }
+
     /// Executes the complete closed A22 mutation union. Every branch starts
     /// from the same mutation-strength NodeIdentity/credential/session prefix
     /// and commits its domain rows in that one request-owned transaction.

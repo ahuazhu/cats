@@ -45,6 +45,10 @@ use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
     RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
+use crate::signed_usage::{
+    run_delivery as run_signed_usage_delivery, run_sampler as run_signed_usage_sampler,
+    MeteredRuntimeDesiredEffect, SignedUsagePipeline,
+};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -498,6 +502,21 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .register_until_session(&config.control_plane_url)
         .await
         .context("establish durable Agent session")?;
+    let usage_pipeline = config
+        .metering_cgroup_root
+        .as_deref()
+        .map(|metering_cgroup_root| {
+            SignedUsagePipeline::open(
+                &session,
+                config.agent_registration.runtime_request_signer(),
+                &config.control_plane_url,
+                config.agent_registration.runtime_state_directory().path(),
+                metering_cgroup_root,
+            )
+        })
+        .transpose()
+        .context("compose signed Runtime usage pipeline")?
+        .map(Arc::new);
     #[cfg(not(test))]
     let client = RuntimeSpineHttpClient::for_production(
         &config.control_plane_url,
@@ -535,6 +554,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
+    let effect_usage_pipeline = usage_pipeline.clone();
     let runner_effect_resource_owner = resource_owner_override.unwrap_or_else(|| {
         Arc::clone(&kernel_nbd_cleanup_owner) as Arc<dyn RuntimeEffectResourceOwner>
     });
@@ -639,6 +659,11 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     .as_ref()
                     .context("test platform composition lacks installed process ports")?)?),
             };
+        let effect: Arc<dyn crate::runtime_spine::RuntimeDesiredEffect> =
+            match effect_usage_pipeline {
+                Some(usage) => Arc::new(MeteredRuntimeDesiredEffect::new(effect, usage)),
+                None => effect,
+            };
         let recovery = match recovery_override {
             Some(recovery) => recovery,
             None => {
@@ -721,21 +746,52 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     // can only request (not await) that shutdown sequence.
     let registration_lease = config.agent_registration;
     let deadline_policy = config.deadline_policy;
+    let runner_usage_pipeline = usage_pipeline;
     #[cfg(test)]
     let observation_barrier_for_test = config.observation_barrier_for_test;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
-        let run_result = tokio::select! {
+        let (usage_shutdown, usage_shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut usage_task = runner_usage_pipeline.clone().map(|pipeline| {
+            let sampler = Arc::clone(&pipeline);
+            let sampler_shutdown = usage_shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::try_join!(
+                    run_signed_usage_sampler(sampler, sampler_shutdown),
+                    run_signed_usage_delivery(pipeline, usage_shutdown_rx),
+                )?;
+                Ok(())
+            })
+        });
+        let (mut run_result, usage_already_joined) = tokio::select! {
             result = run_signed_spine(
                 &mut runner,
                 &runner_readiness,
                 deadline_policy,
+                runner_usage_pipeline,
                 #[cfg(test)]
                 observation_barrier_for_test,
-            ) => result,
-            _ = &mut runner_shutdown => Ok(()),
+            ) => (result, false),
+            _ = &mut runner_shutdown => (Ok(()), false),
+            result = wait_usage_task(&mut usage_task) => (result, true),
         };
         runner_readiness.set(false);
+        let _ = usage_shutdown.send(true);
+        if !usage_already_joined {
+            if let Some(task) = usage_task.take() {
+                let usage_result = match task.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        Err(anyhow::Error::new(error).context("join signed usage shutdown"))
+                    }
+                };
+                if let Err(error) = usage_result {
+                    if run_result.is_ok() {
+                        run_result = Err(error);
+                    }
+                }
+            }
+        }
         let shutdown_result = runner.shutdown().await;
         drop(registration_lease);
         match (run_result, shutdown_result) {
@@ -768,6 +824,7 @@ async fn run_signed_spine(
     runner: &mut RuntimeSpineRunner,
     readiness: &Readiness,
     deadline_policy: RuntimeSpineDeadlinePolicy,
+    usage_pipeline: Option<Arc<SignedUsagePipeline>>,
     #[cfg(test)] mut observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
 ) -> anyhow::Result<()> {
     loop {
@@ -776,6 +833,17 @@ async fn run_signed_spine(
         // a later blocking boundary.
         let deadlines = deadline_policy.deadlines_from(Instant::now())?;
         let step = runner.run_once_with_deadlines(deadlines).await?;
+        if matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. }) {
+            let observation = runner
+                .accepted_full_observation()
+                .context("accepted full observation did not retain its usage evidence")?;
+            if let Some(pipeline) = usage_pipeline.as_ref() {
+                let pipeline = Arc::clone(pipeline);
+                tokio::task::spawn_blocking(move || pipeline.update_observation(&observation))
+                    .await
+                    .context("join signed usage target update")??;
+            }
+        }
         #[cfg(test)]
         let observation_accepted = matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. });
         #[cfg(test)]
@@ -803,6 +871,15 @@ async fn run_signed_spine(
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+async fn wait_usage_task(
+    task: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
+    match task {
+        Some(task) => task.await.context("join signed usage task")?,
+        None => std::future::pending().await,
     }
 }
 

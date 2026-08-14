@@ -6,7 +6,7 @@ use cats_api::runtime_product_reads::{
 };
 use cats_api::runtime_reconciliation::{
     AuthorizationConsumedReceipt, AuthorizationState, Condition, ContractVersion,
-    DeleteCompletionReceipt, DesiredRuntimeSpec, DiskKind, Durability, Id, RuntimeTarget,
+    DeleteCompletionReceipt, DesiredRuntimeSpec, DiskKind, Durability, Id, Revision, RuntimeTarget,
     VolumeAuthorization, VolumeDisposition,
 };
 use cats_storage::authority::VolumeDurability;
@@ -14,8 +14,8 @@ use postgres::{Row, Transaction};
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
 use super::product_rows::{
-    decode_cat, decode_desired, decode_disk, load_desired_unlocked, CAT_COLUMNS, DESIRED_COLUMNS,
-    DISK_COLUMNS,
+    decode_cat, decode_desired, decode_disk, load_cat_by_id_unlocked, load_desired_unlocked,
+    CAT_COLUMNS, DESIRED_COLUMNS, DISK_COLUMNS,
 };
 use super::rows::{
     load_disposable_root_graph_authorizations, load_root_delete_completion_candidates,
@@ -37,7 +37,40 @@ pub(crate) enum ProductPageRead<T> {
     Corrupt,
 }
 
+/// The existing product facts needed to attribute one usage checkpoint.
+/// DesiredRuntimeSpec remains the sole placement/generation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeUsageCatRead {
+    pub(crate) workspace_id: Id,
+    pub(crate) desired_revision: Revision,
+    pub(crate) node_id: Id,
+}
+
 impl Store {
+    pub(crate) fn get_runtime_cat_for_usage(
+        &self,
+        cat_id: &Id,
+    ) -> StoreResult<Option<RuntimeUsageCatRead>> {
+        self.authority_read_snapshot(|transaction| {
+            let Some(cat) = load_cat_by_id_unlocked(transaction, cat_id)? else {
+                return Ok(None);
+            };
+            let desired = load_desired_unlocked(transaction, cat_id)?
+                .ok_or_else(|| corrupt("runtime Cat has no DesiredRuntimeSpec"))?;
+            if cat.cat_id != *cat_id
+                || desired.cat_id != cat.cat_id
+                || desired.workspace_id != cat.workspace_id
+            {
+                return Err(corrupt("runtime Cat/Desired usage projection mismatch"));
+            }
+            Ok(Some(RuntimeUsageCatRead {
+                workspace_id: cat.workspace_id,
+                desired_revision: desired.desired_revision,
+                node_id: desired.placement.node_id,
+            }))
+        })
+    }
+
     pub(crate) fn get_runtime_cat(
         &self,
         workspace_id: &Id,

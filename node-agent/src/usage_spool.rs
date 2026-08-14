@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest};
+use cats_api::runtime_reconciliation::SessionBinding;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub struct UsageSpool {
@@ -113,7 +114,7 @@ impl UsageSpool {
     /// valid 10,000-item request exceeded the HTTP body limit forever.
     pub fn peek_request_batch(
         &self,
-        node_id: &str,
+        session: &SessionBinding,
         max_checkpoints: usize,
         max_request_bytes: usize,
     ) -> Result<Vec<CatUsageCheckpoint>> {
@@ -121,7 +122,8 @@ impl UsageSpool {
             return Ok(Vec::new());
         }
         let empty_request_bytes = serde_json::to_vec(&IngestUsageCheckpointsRequest {
-            node_id: node_id.to_string(),
+            session: session.clone(),
+            node_id: session.node_id.to_string(),
             checkpoints: Vec::new(),
         })?
         .len();
@@ -213,6 +215,16 @@ fn now_unix_ms() -> Result<i64> {
 mod tests {
     use super::*;
     use cats_api::metering::{UsageMetric, MAX_USAGE_CHECKPOINTS_PER_REQUEST};
+    use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128};
+
+    fn session() -> SessionBinding {
+        SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        }
+    }
 
     fn checkpoint(event_id: &str, sequence: u64) -> CatUsageCheckpoint {
         CatUsageCheckpoint {
@@ -275,7 +287,9 @@ mod tests {
             checkpoint("event-3", 3),
         ];
         spool.enqueue(&checkpoints).unwrap();
+        let session = session();
         let two_checkpoint_bytes = serde_json::to_vec(&IngestUsageCheckpointsRequest {
+            session: session.clone(),
             node_id: "node-a".to_string(),
             checkpoints: checkpoints[..2].to_vec(),
         })
@@ -283,13 +297,14 @@ mod tests {
         .len();
 
         let batch = spool
-            .peek_request_batch("node-a", 10, two_checkpoint_bytes)
+            .peek_request_batch(&session, 10, two_checkpoint_bytes)
             .unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].event_id, "event-1");
         assert_eq!(batch[1].event_id, "event-2");
         assert_eq!(
             serde_json::to_vec(&IngestUsageCheckpointsRequest {
+                session,
                 node_id: "node-a".to_string(),
                 checkpoints: batch,
             })
@@ -304,7 +319,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let spool = UsageSpool::open(&directory.path().join("usage-spool.sqlite3")).unwrap();
         spool.enqueue(&[checkpoint("event-1", 1)]).unwrap();
+        let session = session();
         let empty_request_bytes = serde_json::to_vec(&IngestUsageCheckpointsRequest {
+            session: session.clone(),
             node_id: "node-a".to_string(),
             checkpoints: Vec::new(),
         })
@@ -312,7 +329,7 @@ mod tests {
         .len();
 
         let error = spool
-            .peek_request_batch("node-a", 10, empty_request_bytes)
+            .peek_request_batch(&session, 10, empty_request_bytes)
             .unwrap_err();
         assert!(error.to_string().contains("event-1 cannot fit"));
         assert_eq!(spool.len().unwrap(), 1);
@@ -334,16 +351,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         spool.enqueue(&checkpoints).unwrap();
+        let session = session();
 
         let mut next_sequence = 0_u64;
         let mut batches = 0;
         while !spool.is_empty().unwrap() {
             let batch = spool
-                .peek_request_batch("node-a", MAX_USAGE_CHECKPOINTS_PER_REQUEST, REQUEST_BUDGET)
+                .peek_request_batch(&session, MAX_USAGE_CHECKPOINTS_PER_REQUEST, REQUEST_BUDGET)
                 .unwrap();
             assert!(!batch.is_empty());
             assert!(batch.len() <= MAX_USAGE_CHECKPOINTS_PER_REQUEST);
             let request_bytes = serde_json::to_vec(&IngestUsageCheckpointsRequest {
+                session: session.clone(),
                 node_id: "node-a".to_string(),
                 checkpoints: batch.clone(),
             })

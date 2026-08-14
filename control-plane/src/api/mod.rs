@@ -9,8 +9,6 @@ use axum::body::Bytes;
 #[cfg(debug_assertions)]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 #[cfg(debug_assertions)]
-use axum::extract::DefaultBodyLimit;
-#[cfg(debug_assertions)]
 use axum::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -30,26 +28,18 @@ use cats_api::auth::{
 };
 use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutResponse};
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
-#[cfg(debug_assertions)]
-use cats_api::metering::MAX_USAGE_INGEST_BODY_BYTES;
-#[cfg(debug_assertions)]
 use cats_api::metering::{
-    CatUsageSummary, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
-    RejectedCheckpoint, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine,
-    UsageTimeBucket,
+    CatUsageSummary, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
 };
 #[cfg(debug_assertions)]
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::*;
 use cats_api::resources::*;
-#[cfg(debug_assertions)]
-use cats_metering::{
-    AttributedCheckpoint, IngestOutcome, UsageAttribution, UsageInterval, UsageView,
-};
 use cats_metering::{
     CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, RateCard,
     UsageQuery as MeterUsageQuery,
 };
+use cats_metering::{UsageInterval, UsageView};
 
 use crate::server::AppState;
 #[cfg(debug_assertions)]
@@ -78,10 +68,10 @@ pub(crate) mod runtime_node_authority;
 mod runtime_operations;
 mod runtime_product_reads;
 mod runtime_spine;
+mod runtime_usage;
 mod runtime_volume_transitions;
 #[cfg(debug_assertions)]
 mod sessions;
-#[cfg(debug_assertions)]
 mod usage;
 
 use accounts::*;
@@ -102,7 +92,6 @@ use product_mutations_v2::*;
 use routes::*;
 #[cfg(debug_assertions)]
 use sessions::*;
-#[cfg(debug_assertions)]
 use usage::*;
 
 pub(crate) use billing::enforce_exhausted_billing_accounts;
@@ -679,15 +668,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/operations",
             get(list_operations),
         )
-        .route(
-            "/v1/internal/usage/checkpoints",
-            post(ingest_usage_checkpoints)
-                .layer(DefaultBodyLimit::max(MAX_USAGE_INGEST_BODY_BYTES)),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/billing/usage",
-            get(workspace_usage),
-        )
         .route("/v1/nodes/{id}/actions/cordon", post(cordon_node))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/admin/nodes", get(admin_list_nodes))
@@ -884,6 +864,10 @@ pub fn router(state: AppState) -> Router {
             post(runtime_spine::observation).fallback(runtime_spine::observation),
         )
         .route(
+            cats_api::metering::USAGE_CHECKPOINTS_PATH,
+            post(runtime_usage::ingest).fallback(runtime_usage::ingest),
+        )
+        .route(
             "/v1/admin/runtime/node-authority-applies",
             post(runtime_node_authority::apply_runtime_node_authority)
                 .fallback(runtime_node_authority::apply_runtime_node_authority),
@@ -899,6 +883,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/workspaces/{workspace}/billing/checkout",
             post(create_billing_checkout),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/billing/usage",
+            get(workspace_usage),
         )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))

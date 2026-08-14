@@ -15,6 +15,8 @@ pub mod runtime;
 pub mod runtime_cutover;
 pub mod runtime_spine;
 pub mod server;
+pub(crate) mod signed_usage;
 pub mod state_directory;
+pub(crate) mod usage_delivery;
 pub mod usage_spool;
 pub mod vmm_launcher;

@@ -244,6 +244,9 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(args.runtime_effect_step_timeout_ms),
     )
     .context("validate signed Runtime scan/effect deadline policy")?;
+    let metering_cgroup_root = args
+        .metering_cgroup_root
+        .context("--metering-cgroup-root or CATS_METERING_CGROUP_ROOT is required")?;
     let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
         route_v2_machine,
@@ -252,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
         ch_config,
         authorized_blockd_launch,
         guest_agent_binary: args.guest_agent_bin,
-        metering_cgroup_root: args.metering_cgroup_root,
+        metering_cgroup_root: Some(metering_cgroup_root),
         volume_data_authority,
         volume_inventory_authority,
         blob_store,
