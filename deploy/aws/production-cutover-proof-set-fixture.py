@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused synthetic regressions for the E13 global Usage outer binding."""
+"""Focused synthetic regressions for E13 proof and operator boundaries."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -21,6 +23,15 @@ if SPEC is None or SPEC.loader is None:
 PROOF = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PROOF
 SPEC.loader.exec_module(PROOF)
+ADMISSION_SPEC = importlib.util.spec_from_file_location(
+    "production_mutation_admission",
+    HERE / "production-mutation-admission.py",
+)
+if ADMISSION_SPEC is None or ADMISSION_SPEC.loader is None:
+    raise SystemExit("production mutation admission module is unavailable")
+ADMISSION = importlib.util.module_from_spec(ADMISSION_SPEC)
+sys.modules[ADMISSION_SPEC.name] = ADMISSION
+ADMISSION_SPEC.loader.exec_module(ADMISSION)
 
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
@@ -167,6 +178,137 @@ def validate_with_request(request_value: dict[str, Any]) -> None:
     )
 
 
+def validate_inventory_is_observation_only() -> None:
+    original_load_pending = ADMISSION.load_pending
+    original_post_exact = ADMISSION.post_exact
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        pending_path = directory / "close.pending.v1.json"
+        calls: list[tuple[str, str, bytes]] = []
+        try:
+            ADMISSION.load_pending = lambda _path, _trust: (
+                {},
+                b"{}",
+                {"command_id": "0" * 32},
+            )
+
+            def unexpected_post(origin: str, target: str, pending: Any, body: bytes) -> Any:
+                calls.append((origin, target, body))
+                raise AssertionError("missing applied close receipt reached the network")
+
+            ADMISSION.post_exact = unexpected_post
+            try:
+                ADMISSION.load_existing_qualification_pending_receipt(
+                    pending_path,
+                    SimpleNamespace(trust_file=directory / "trust.json"),
+                    "Qualification close",
+                )
+            except ADMISSION.AdmissionError:
+                pass
+            else:
+                raise AssertionError("missing applied close receipt was accepted")
+            if calls:
+                raise AssertionError("missing applied close receipt caused network I/O")
+        finally:
+            ADMISSION.load_pending = original_load_pending
+            ADMISSION.post_exact = original_post_exact
+
+    original_functions = {
+        name: getattr(ADMISSION, name)
+        for name in (
+            "validate_qualification_authority_inputs",
+            "load_qualification_begin_for_close",
+            "qualification_pending_path",
+            "load_existing_qualification_pending_receipt",
+            "validate_applied_qualification_receipt",
+            "load_pending",
+            "post_exact",
+            "validate_product_inventory",
+        )
+    }
+    original_sleep = ADMISSION.time.sleep
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        evidence = root / "evidence"
+        state = root / "state"
+        evidence.mkdir(mode=0o700)
+        state.mkdir(mode=0o700)
+        pending_path = state / "close.pending.v1.json"
+        pending_path.write_bytes(b"pending")
+        response = ADMISSION.canonical_json({"product_resource_count": 0})
+        calls = []
+        begin_modes: list[bool] = []
+        attempts = 0
+        try:
+            ADMISSION.validate_qualification_authority_inputs = lambda _args: {
+                "qualification_id": "run_a"
+            }
+
+            def load_begin(_args: Any, _binding: Any, *, existing_receipt_only: bool = False) -> Any:
+                begin_modes.append(existing_receipt_only)
+                return {}
+
+            ADMISSION.load_qualification_begin_for_close = load_begin
+            ADMISSION.qualification_pending_path = (
+                lambda _state, _binding, _kind: pending_path
+            )
+            ADMISSION.load_existing_qualification_pending_receipt = (
+                lambda _pending, _args, _label: ({"outcome": {"kind": "applied"}}, b"r", SHA_A)
+            )
+            ADMISSION.validate_applied_qualification_receipt = (
+                lambda _receipt, _binding, _kind: {}
+            )
+            ADMISSION.load_pending = lambda _pending, _trust: (
+                {"origin": "https://control.example"},
+                b"same-signed-close",
+                {},
+            )
+
+            def post_inventory(origin: str, target: str, pending: Any, body: bytes) -> Any:
+                nonlocal attempts
+                attempts += 1
+                calls.append((origin, target, body))
+                if attempts == 1:
+                    raise ADMISSION.AdmissionError("ambiguous read response")
+                return ADMISSION.HttpResult(
+                    200,
+                    [
+                        ("Content-Type", ADMISSION.CONTENT_TYPE),
+                        ("Cache-Control", "no-store"),
+                    ],
+                    response,
+                )
+
+            ADMISSION.post_exact = post_inventory
+            ADMISSION.validate_product_inventory = (
+                lambda value, _binding, _receipt, _sha, _kind: value
+            )
+            ADMISSION.time.sleep = lambda _seconds: None
+            path, _digest = ADMISSION.qualification_product_inventory(
+                SimpleNamespace(
+                    state_directory=state,
+                    evidence_directory=evidence,
+                    trust_file=root / "trust.json",
+                    close_kind="end_qualification",
+                    resolution_timeout_seconds=2,
+                )
+            )
+            if begin_modes != [True] or len(calls) != 2:
+                raise AssertionError("inventory replay did not require existing authority")
+            if any(
+                target != ADMISSION.PRODUCT_INVENTORY_PATH
+                or body != b"same-signed-close"
+                for _origin, target, body in calls
+            ):
+                raise AssertionError("inventory replay changed endpoint or signed bytes")
+            if path.read_bytes() != response:
+                raise AssertionError("inventory replay did not durably publish exact bytes")
+        finally:
+            for name, function in original_functions.items():
+                setattr(ADMISSION, name, function)
+            ADMISSION.time.sleep = original_sleep
+
+
 def main() -> int:
     if not PROOF.version_one(1) or PROOF.version_one(True):
         raise AssertionError("closed contract version accepted a JSON boolean")
@@ -265,6 +407,7 @@ def main() -> int:
         except PROOF.ProofSetError:
             continue
         raise AssertionError("non-closed per-run SHA256SUMS was accepted")
+    validate_inventory_is_observation_only()
     return 0
 
 

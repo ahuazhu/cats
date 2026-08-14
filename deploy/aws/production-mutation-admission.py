@@ -1217,6 +1217,38 @@ def settle_qualification_pending(
     return receipt, raw, receipt_sha256
 
 
+def load_existing_qualification_pending_receipt(
+    pending_path: Path,
+    args: argparse.Namespace,
+    label: str,
+) -> tuple[dict[str, Any], bytes, str]:
+    pending, body, command = load_pending(pending_path, args.trust_file)
+    receipt_path = pending_path.parent / f"{command['command_id']}.receipt.v1.json"
+    if not receipt_path.exists() or receipt_path.is_symlink():
+        raise AdmissionError(f"{label} durable applied receipt is unavailable")
+    receipt_raw = read_stable_file(
+        receipt_path,
+        f"{label} durable applied receipt",
+        MAX_RESPONSE_BYTES,
+        private=True,
+    )
+    receipt = decode_json(receipt_raw, f"{label} durable applied receipt")
+    status = 200 if receipt.get("outcome", {}).get("kind") == "applied" else 409
+    validate_receipt(
+        HttpResult(
+            status,
+            [("Content-Type", CONTENT_TYPE), ("Cache-Control", "no-store")],
+            receipt_raw,
+        ),
+        command,
+        body,
+        pending,
+    )
+    if receipt["outcome"]["kind"] != "applied":
+        raise AdmissionError(f"{label} did not reach Applied")
+    return receipt, receipt_raw, sha256(receipt_raw)
+
+
 def validate_qualification_authority_inputs(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -1672,6 +1704,8 @@ def validate_qualification_final_fleet(
 def load_qualification_begin_for_close(
     args: argparse.Namespace,
     binding: dict[str, Any],
+    *,
+    existing_receipt_only: bool = False,
 ) -> dict[str, Any]:
     begin_pending = qualification_pending_path(
         args.state_directory,
@@ -1680,9 +1714,18 @@ def load_qualification_begin_for_close(
     )
     if not begin_pending.exists() or begin_pending.is_symlink():
         raise AdmissionError("Qualification Begin pending authority is unavailable")
-    begin_command_receipt, _receipt_raw, begin_command_receipt_sha256 = (
-        settle_qualification_pending(begin_pending, args)
-    )
+    if existing_receipt_only:
+        begin_command_receipt, _receipt_raw, begin_command_receipt_sha256 = (
+            load_existing_qualification_pending_receipt(
+                begin_pending,
+                args,
+                "Qualification Begin",
+            )
+        )
+    else:
+        begin_command_receipt, _receipt_raw, begin_command_receipt_sha256 = (
+            settle_qualification_pending(begin_pending, args)
+        )
     expected_begin = qualification_begin_framework(
         binding,
         begin_command_receipt,
@@ -1790,7 +1833,11 @@ def qualification_close(args: argparse.Namespace) -> tuple[Path, str]:
 
 def qualification_product_inventory(args: argparse.Namespace) -> tuple[Path, str]:
     binding = validate_qualification_authority_inputs(args)
-    load_qualification_begin_for_close(args, binding)
+    load_qualification_begin_for_close(
+        args,
+        binding,
+        existing_receipt_only=True,
+    )
     close_pending = qualification_pending_path(
         args.state_directory,
         binding,
@@ -1798,9 +1845,12 @@ def qualification_product_inventory(args: argparse.Namespace) -> tuple[Path, str
     )
     if not close_pending.exists() or close_pending.is_symlink():
         raise AdmissionError("Qualification close pending authority is unavailable")
-    close_receipt, _close_raw, close_receipt_sha256 = settle_qualification_pending(
-        close_pending,
-        args,
+    close_receipt, _close_raw, close_receipt_sha256 = (
+        load_existing_qualification_pending_receipt(
+            close_pending,
+            args,
+            "Qualification close",
+        )
     )
     validate_applied_qualification_receipt(
         close_receipt,
