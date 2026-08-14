@@ -9,8 +9,8 @@ use aws_sdk_ec2::operation::RequestId as _;
 use cats_api::runtime_reconciliation::{AsciiText, Id, ProviderScope, UnixMillis};
 use cats_storage::host_fence::{
     host_fence_effect_token, host_fence_provider_attempt_id, validate_host_fence_provider_evidence,
-    HostExecutionCutoffEvidence, HostFenceAttemptRequest, HostFencePortFuture,
-    HostFenceProviderError, HostFenceProviderEvidence, HostFenceProviderPort,
+    validate_object_write_cutoff_evidence, HostExecutionCutoffEvidence, HostFenceAttemptRequest,
+    HostFencePortFuture, HostFenceProviderError, HostFenceProviderEvidence, HostFenceProviderPort,
     ObjectWriteCutoffPort, QuarantinedNetworkInterfaceEvidence, WorkloadNetworkCutoffEvidence,
     HOST_FENCE_PROVIDER_EVIDENCE_VERSION, MAX_HOST_FENCE_NETWORK_INTERFACES,
 };
@@ -251,6 +251,7 @@ impl AwsHostFenceProvider {
             .object_write_cutoff
             .establish_cutoff(request, absolute_deadline)
             .await?;
+        validate_object_write_cutoff_evidence(request, &object_write_cutoff)?;
 
         let policy = self
             .ec2
@@ -1032,34 +1033,50 @@ mod tests {
             _deadline: Instant,
         ) -> HostFencePortFuture<'a, ObjectWriteCutoffEvidence> {
             *self.calls.lock().unwrap() += 1;
+            Box::pin(async move { Ok(cutoff_evidence(request)) })
+        }
+    }
+
+    fn cutoff_evidence(request: &HostFenceAttemptRequest) -> ObjectWriteCutoffEvidence {
+        ObjectWriteCutoffEvidence::PrincipalCutoffWithAcceptedPutTerminalBarrier {
+            binding: request.binding.clone(),
+            object_writer: request.object_writer.clone(),
+            effect_token: host_fence_effect_token(
+                &request.binding,
+                b"object-write-cutoff",
+                &object_target_bytes(&request.object_writer),
+            )
+            .unwrap(),
+            provider_attempt_id: host_fence_provider_attempt_id(
+                &request.binding,
+                b"object-write-cutoff",
+                &object_target_bytes(&request.object_writer),
+            )
+            .unwrap(),
+            cutoff_receipt_id: text("cutoff-receipt-1"),
+            cutoff_effective_at_unix_ms: time(10),
+            cutoff_sequence: WireU64::new(3).unwrap(),
+            accepted_put_terminal_receipt_id: text("terminal-receipt-1"),
+            accepted_puts_terminal_at_unix_ms: time(11),
+            terminal_sequence: WireU64::new(3).unwrap(),
+            terminal_prefix_sha256: Sha256Digest::from_bytes([7; 32]),
+            successful_put_visibility_receipt_id: text("visibility-receipt-1"),
+            successful_puts_visible_at_unix_ms: time(12),
+        }
+    }
+
+    struct MismatchedCutoff;
+
+    impl ObjectWriteCutoffPort for MismatchedCutoff {
+        fn establish_cutoff<'a>(
+            &'a self,
+            request: &'a HostFenceAttemptRequest,
+            _deadline: Instant,
+        ) -> HostFencePortFuture<'a, ObjectWriteCutoffEvidence> {
             Box::pin(async move {
-                Ok(
-                    ObjectWriteCutoffEvidence::PrincipalCutoffWithAcceptedPutTerminalBarrier {
-                        binding: request.binding.clone(),
-                        object_writer: request.object_writer.clone(),
-                        effect_token: host_fence_effect_token(
-                            &request.binding,
-                            b"object-write-cutoff",
-                            &object_target_bytes(&request.object_writer),
-                        )
-                        .unwrap(),
-                        provider_attempt_id: host_fence_provider_attempt_id(
-                            &request.binding,
-                            b"object-write-cutoff",
-                            &object_target_bytes(&request.object_writer),
-                        )
-                        .unwrap(),
-                        cutoff_receipt_id: text("cutoff-receipt-1"),
-                        cutoff_effective_at_unix_ms: time(10),
-                        cutoff_sequence: WireU64::new(3).unwrap(),
-                        accepted_put_terminal_receipt_id: text("terminal-receipt-1"),
-                        accepted_puts_terminal_at_unix_ms: time(11),
-                        terminal_sequence: WireU64::new(3).unwrap(),
-                        terminal_prefix_sha256: Sha256Digest::from_bytes([7; 32]),
-                        successful_put_visibility_receipt_id: text("visibility-receipt-1"),
-                        successful_puts_visible_at_unix_ms: time(12),
-                    },
-                )
+                let mut other = request.clone();
+                other.object_writer.object_store_scope_id = text("other-object-store");
+                Ok(cutoff_evidence(&other))
             })
         }
     }
@@ -1227,6 +1244,23 @@ mod tests {
         assert_eq!(cutoff.calls(), 0);
         assert_eq!(*ec2.read_calls.lock().unwrap(), 0);
         assert_eq!(*ec2.stop_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mismatched_writer_cutoff_evidence_prevents_all_aws_effects() {
+        let ec2 = Arc::new(FakeEc2::no_calls());
+        let provider =
+            AwsHostFenceProvider::with_api(config(), ec2.clone(), Arc::new(MismatchedCutoff));
+
+        assert_eq!(
+            provider
+                .establish_fence(&request(), Instant::now() + Duration::from_secs(2))
+                .await,
+            Err(HostFenceProviderError::EvidenceMismatch)
+        );
+        assert_eq!(*ec2.read_calls.lock().unwrap(), 0);
+        assert_eq!(*ec2.stop_calls.lock().unwrap(), 0);
+        assert_eq!(*ec2.quarantine_calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]
