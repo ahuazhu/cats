@@ -12,9 +12,9 @@ const CASES: [&str; 11] = [
     "route-v2-rotation-disable-live-delivery",
     "agent-restart-adoption",
     "volume-init-matrix",
-    "usage-final-terminal-receipt",
     "v3-aws-host-fence-authority",
     "delete-cleanup",
+    "usage-final-terminal-receipt",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -1013,14 +1013,11 @@ fn runtime_cutover_runner_rejects_evidence_outside_the_catalog_union() {
 }
 
 #[test]
-fn final_catalog_treats_every_typed_block_as_a_failed_expected_pass() {
+fn production_v2_driver_places_usage_terminal_after_delete_and_preserves_typed_blocks() {
     let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("seven-plus-two");
+    let output_dir = fixture.output_dir("ten-plus-one");
     let output = fixture.run_post_preflight(&output_dir, |command| {
-        command.env(
-            "CATS_E3_FIXTURE_BLOCK_CASES",
-            "volume-init-matrix,usage-final-terminal-receipt",
-        );
+        command.env("CATS_E3_FIXTURE_BLOCK_CASES", "volume-init-matrix");
     });
     assert_success(&output);
     let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
@@ -1031,11 +1028,11 @@ fn final_catalog_treats_every_typed_block_as_a_failed_expected_pass() {
     assert_eq!(rows.len(), CASES.len());
     assert_eq!(
         rows.iter().filter(|row| row["status"] == "passed").count(),
-        CASES.len() - 2
+        CASES.len() - 1
     );
     assert_eq!(
         rows.iter().filter(|row| row["status"] == "failed").count(),
-        2
+        1
     );
     let restart = rows
         .iter()
@@ -1043,15 +1040,26 @@ fn final_catalog_treats_every_typed_block_as_a_failed_expected_pass() {
         .unwrap();
     assert_eq!(restart["status"], "passed");
     assert_eq!(restart["evidence_exit_code"], 0);
-    for blocked in ["volume-init-matrix", "usage-final-terminal-receipt"] {
-        let row = rows.iter().find(|row| row["case_id"] == blocked).unwrap();
-        assert_eq!(row["run_exit_code"], 78);
-        assert_eq!(row["cleanup_exit_code"], 0);
-        assert_eq!(row["evidence_exit_code"], 0);
-        assert_eq!(row["observed_outcome"], "blocked");
-        assert_eq!(row["expected_outcome"]["kind"], "passed");
-        assert_eq!(row["outcome_matches"], false);
-    }
+    let volume = rows
+        .iter()
+        .find(|row| row["case_id"] == "volume-init-matrix")
+        .unwrap();
+    assert_eq!(volume["run_exit_code"], 78);
+    assert_eq!(volume["cleanup_exit_code"], 0);
+    assert_eq!(volume["evidence_exit_code"], 0);
+    assert_eq!(volume["observed_outcome"], "blocked");
+    assert_eq!(volume["expected_outcome"]["kind"], "passed");
+    assert_eq!(volume["outcome_matches"], false);
+    let deletion_index = rows
+        .iter()
+        .position(|row| row["case_id"] == "delete-cleanup")
+        .unwrap();
+    let terminal_index = rows
+        .iter()
+        .position(|row| row["case_id"] == "usage-final-terminal-receipt")
+        .unwrap();
+    assert!(deletion_index < terminal_index);
+    assert_eq!(rows[terminal_index]["status"], "passed");
 
     let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
@@ -1060,6 +1068,16 @@ fn final_catalog_treats_every_typed_block_as_a_failed_expected_pass() {
         assert!(runner.contains(case_id));
         assert!(catalog.contains(case_id));
     }
+    assert!(driver.contains("DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)"));
+    assert!(driver.contains("/v1/admin/usage/source-terminal/discover"));
+    assert!(driver.contains("/v1/admin/usage/target-terminal/begin"));
+    assert!(driver.contains("/v1/admin/usage/target-terminal/complete"));
+    assert!(driver.contains("usage-source-terminal-receipt.json"));
+    assert!(driver.contains("usage-target-terminal-receipt.json"));
+    assert!(driver.contains("CATS_E3_RUN_STARTED_AT_UNIX_MS"));
+    assert!(
+        driver.contains("target terminal begin remained ambiguous after one exact journal replay")
+    );
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
     assert!(!driver.contains("before_agent_session:"));

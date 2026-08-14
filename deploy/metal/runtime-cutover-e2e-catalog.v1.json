@@ -161,27 +161,6 @@
       ]
     },
     {
-      "case_id": "usage-final-terminal-receipt",
-      "deadline_seconds": 300,
-      "expected_outcome": {
-        "kind": "passed"
-      },
-      "required_evidence": [
-        {
-          "filename": "usage-live-delivery-receipt.json",
-          "kind": "json"
-        },
-        {
-          "filename": "usage-source-terminal-receipt.json",
-          "kind": "json"
-        },
-        {
-          "filename": "usage-target-terminal-receipt.json",
-          "kind": "json"
-        }
-      ]
-    },
-    {
       "case_id": "v3-aws-host-fence-authority",
       "deadline_seconds": 600,
       "expected_outcome": {
@@ -227,6 +206,27 @@
         },
         {
           "filename": "fleet-verification-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "usage-final-terminal-receipt",
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "usage-live-delivery-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-source-terminal-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-target-terminal-receipt.json",
           "kind": "json"
         }
       ]

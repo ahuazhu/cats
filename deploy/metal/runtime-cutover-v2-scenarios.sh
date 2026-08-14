@@ -62,6 +62,7 @@ read_token() {
   printf '%s' "$value"
 }
 AUTHORIZATION_TEMP=
+CURL_JSON_STATUS=
 cleanup_authorization_temp() {
   if [[ -n $AUTHORIZATION_TEMP ]]; then
     rm -f "$AUTHORIZATION_TEMP"
@@ -154,6 +155,7 @@ curl_json() {
   rm -f "$auth_header"
   AUTHORIZATION_TEMP=
   if [[ $curl_status -ne 0 ]]; then
+    CURL_JSON_STATUS=
     rm -f "$response_headers" "$output"
     return 75
   fi
@@ -173,6 +175,7 @@ curl_json() {
       fail "$method returned HTTP $status, expected $expected_status"
       ;;
   esac
+  CURL_JSON_STATUS=$status
   content_types=$(awk 'BEGIN{IGNORECASE=1} /^Content-Type:/{sub(/\r$/,""); sub(/^[^:]*:[[:space:]]*/,""); print}' "$response_headers")
   encodings=$(awk 'BEGIN{IGNORECASE=1} /^Content-Encoding:/{sub(/\r$/,""); sub(/^[^:]*:[[:space:]]*/,""); print}' "$response_headers")
   rm -f "$response_headers"
@@ -696,89 +699,331 @@ run_volume_init_matrix() {
   blocked 'DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION): production v2 exposes PersistentDisk create/read/delete but no attach mutation; add the separately reviewed product attach entry before live first-mkfs-response-loss, exact filesystem UUID, mounted-set, Agent-restart remount and Strict-write qualification'
 }
 
-run_usage_final() {
-  local cat workspace from_ms to_ms before before_sequence after source attempt query_status ready
-  cat=$(cat_id)
-  workspace=$(required CATS_E3_WORKSPACE_ID)
-  from_ms=$(( $(date +%s) * 1000 - 3600000 ))
-  before=$CASE_DIR/usage-before.json
-  to_ms=$(( $(date +%s) * 1000 + 60000 ))
+usage_report_to() {
+  local destination=$1 workspace=$2 cat=$3 from_ms=$4 to_ms=$5
   curl_json GET \
     "$(control_origin)/v1/workspaces/$workspace/billing/usage?from_ms=$from_ms&to_ms=$to_ms&cat_id=$cat&detail=true" \
-    "$before" 200
-  jq -e --arg workspace "$workspace" \
-    '.workspace_id == $workspace and .status == "provisional" and (.details | type == "array")' \
-    "$before" >/dev/null || fail "baseline usage projection is not the canonical workspace report"
-  before_sequence=$(jq -r --arg cat "$cat" '
-    [.details[] | select(.attributed_cat_id == $cat) | .end_sequence] | max // -1' \
-    "$before")
-  [[ $before_sequence =~ ^-?[0-9]+$ ]] || fail "baseline usage sequence is not an integer"
+    "$destination" 200 || return $?
+  jq -e --arg workspace "$workspace" '
+    .workspace_id == $workspace and .status == "provisional"
+    and (.details | type == "array")' "$destination" >/dev/null || \
+    fail "usage projection is not the canonical workspace report"
+}
 
-  after=$CASE_DIR/usage-after.json
-  attempt=0
-  query_status=1
+usage_source_keys_to() {
+  local report=$1 destination=$2 cat=$3
+  jq -c --arg cat "$cat" '
+    [.details[]
+      | select(.attributed_cat_id == $cat
+        and (.source_id | type == "string"
+          and startswith("node/") and endswith("/cat/" + $cat))
+        and (.source_epoch | type == "string" and length > 0)
+        and (.metric == "cpu_usec" or .metric == "memory_byte_millis"))
+      | {source_id,source_epoch}]
+    | sort_by([.source_id,.source_epoch])
+    | unique_by([.source_id,.source_epoch])' "$report" >"$destination"
+}
+
+discover_usage_source_terminal() {
+  local source_id=$1 source_epoch=$2 destination=$3 request attempt request_status
+  request=$CASE_DIR/usage-source-terminal-discover.request.json
+  jq -c -n --arg source_id "$source_id" --arg source_epoch "$source_epoch" \
+    '{source_id:$source_id,source_epoch:$source_epoch}' >"$request"
+  for attempt in 1 2; do
+    set +e
+    curl_json POST \
+      "$(control_origin)/v1/admin/usage/source-terminal/discover" \
+      "$destination" 200,404 \
+      --header 'content-type: application/json' --data-binary "@$request"
+    request_status=$?
+    set -e
+    [[ $request_status -eq 75 ]] && continue
+    [[ $request_status -eq 0 ]] || fail "source terminal discovery failed"
+    case "$CURL_JSON_STATUS" in
+      200)
+        jq -e --arg source_id "$source_id" --arg source_epoch "$source_epoch" '
+          (keys == ["cat_id","contract_version","final_events",
+            "final_observed_at_unix_ms","final_sequence","source_binding",
+            "source_epoch","source_id"])
+          and .contract_version == 1
+          and .source_id == $source_id and .source_epoch == $source_epoch
+          and (.cat_id | type == "string" and length > 0)
+          and (.source_binding | keys == ["agent_epoch","agent_instance_id",
+            "desired_revision","node_boot_id","node_id","runtime_incarnation"])
+          and (.final_sequence | type == "number" and . >= 0 and floor == .)
+          and (.final_observed_at_unix_ms | type == "number" and . >= 0 and floor == .)
+          and (.final_events | type == "array" and length == 2)
+          and ([.final_events[].metric] == ["cpu_usec","memory_byte_millis"])
+          and all(.final_events[];
+            keys == ["archive","cumulative_quantity","event_id","metric"]
+            and (.event_id | type == "string" and length > 0)
+            and (.cumulative_quantity | type == "number" and . >= 0 and floor == .)
+            and (.archive | keys == ["archive_bucket","archive_key","archive_sha256",
+              "sequence_number","shard_id","stream_name"])
+            and (.archive.sequence_number | test("^(0|[1-9][0-9]{0,77})$"))
+            and (.archive.archive_sha256 | test("^sha256:[0-9a-f]{64}$"))))' \
+          "$destination" >/dev/null || fail "source terminal receipt has a foreign shape"
+        rm -f "$request"
+        return 0
+        ;;
+      404)
+        rm -f "$destination" "$request"
+        return 1
+        ;;
+      *) fail "source terminal discovery returned an unexpected status" ;;
+    esac
+  done
+  rm -f "$request"
+  return 75
+}
+
+run_usage_final() {
+  local cat workspace from_ms to_ms report keys previous_keys receipt_dir sources_work
+  local attempt stable all_terminal index source_id source_epoch receipt receipt_sha256
+  local sources_json source_set_sha256 config_path config_sha256 terminal_epoch_id created_at_ms
+  local request_source request_journal begin_response begin_status request_sha256
+  local complete_response complete_status target_source selected_source_id selected_source_epoch
+  local selected_index selected_receipt rediscovered post_report post_keys live_source ready
+  cat=$(cat_id)
+  workspace=$(required CATS_E3_WORKSPACE_ID)
+  from_ms=$(required CATS_E3_RUN_STARTED_AT_UNIX_MS)
+  [[ $from_ms =~ ^[1-9][0-9]{12}$ ]] || fail "run start is not canonical Unix milliseconds"
+  to_ms=$(( $(date +%s) * 1000 + 60000 ))
+  report=$CASE_DIR/usage-run-window.json
+  keys=$CASE_DIR/usage-source-keys.json
+  previous_keys=$CASE_DIR/usage-source-keys.previous.json
+  receipt_dir=$CASE_DIR/source-terminal-receipts
+  sources_work=$CASE_DIR/usage-terminal-sources.jsonl
+  mkdir -m 0700 "$receipt_dir"
+  : >"$sources_work"
+
+  # Product deletion and the framework EndQualification/Closed hook have
+  # already drained every Usage writer. Poll only previously produced records
+  # from this exact run window; do not manufacture a post-delete sample.
+  stable=0
   ready=false
-  while [[ $attempt -lt 45 ]]; do
+  attempt=0
+  while [[ $attempt -lt 120 ]]; do
     attempt=$((attempt + 1))
     to_ms=$(( $(date +%s) * 1000 + 60000 ))
-    set +e
-    curl_json GET \
-      "$(control_origin)/v1/workspaces/$workspace/billing/usage?from_ms=$from_ms&to_ms=$to_ms&cat_id=$cat&detail=true" \
-      "$after" 200
-    query_status=$?
-    set -e
-    if [[ $query_status -eq 0 ]] && jq -e \
-      --arg workspace "$workspace" --arg cat "$cat" --argjson before "$before_sequence" '
-      .workspace_id == $workspace and .status == "provisional"
-      and ([.details[]
-        | select(.attributed_cat_id == $cat
-          and (.source_id | startswith("node/") and endswith("/cat/" + $cat))
-          and (.source_epoch | type == "string" and length > 0)
-          and (.metric == "cpu_usec" or .metric == "memory_byte_millis")
-          and (.quantity | test("^(0|[1-9][0-9]*)$")))]
-        | group_by([.source_id,.source_epoch,.end_sequence])
-        | any(.[];
-            length == 2
-            and ([.[].metric] | sort) == ["cpu_usec","memory_byte_millis"]
-            and (.[0].end_sequence > $before)
-            and any(.[]; .quantity != "0")))' \
-      "$after" >/dev/null; then
+    if ! usage_report_to "$report" "$workspace" "$cat" "$from_ms" "$to_ms"; then
+      sleep 2
+      continue
+    fi
+    usage_source_keys_to "$report" "$keys" "$cat"
+    if [[ $(jq 'length' "$keys") -eq 0 ]]; then
+      stable=0
+      sleep 2
+      continue
+    fi
+    : >"$sources_work"
+    all_terminal=true
+    index=0
+    while IFS=$'\t' read -r source_id source_epoch; do
+      receipt=$receipt_dir/source-$index.json
+      if ! discover_usage_source_terminal "$source_id" "$source_epoch" "$receipt"; then
+        all_terminal=false
+        break
+      fi
+      receipt_sha256=sha256:$(sha256sum "$receipt" | awk '{print $1}')
+      jq -c -n --arg source_id "$source_id" --arg source_epoch "$source_epoch" \
+        --arg receipt_sha256 "$receipt_sha256" \
+        '{source_id:$source_id,source_epoch:$source_epoch,receipt_sha256:$receipt_sha256}' \
+        >>"$sources_work"
+      index=$((index + 1))
+    done < <(jq -r '.[] | [.source_id,.source_epoch] | @tsv' "$keys")
+    if [[ $all_terminal == true && -f $previous_keys ]] && cmp -s "$keys" "$previous_keys"; then
+      stable=$((stable + 1))
+    else
+      stable=0
+    fi
+    cp "$keys" "$previous_keys"
+    if [[ $all_terminal == true && $stable -ge 2 ]]; then
       ready=true
       break
     fi
     sleep 2
   done
-  [[ $ready == true ]] || fail "live usage projection did not advance one complete Cat meter pair"
-  source=$CASE_DIR/usage-live-delivery-receipt.source.json
-  jq -S -c --arg workspace "$workspace" --arg cat "$cat" \
-    --argjson before "$before_sequence" '
+  [[ $ready == true ]] || \
+    fail "run-bound Usage source set did not become stably terminal before target closure"
+
+  # Select one already-produced complete nonzero pair for the live-delivery
+  # receipt. The source terminal artifact below must close this exact pair.
+  live_source=$CASE_DIR/usage-live-delivery-receipt.source.json
+  jq -c --arg workspace "$workspace" --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" \
+    --argjson from_ms "$from_ms" --argjson to_ms "$to_ms" '
     [.details[]
       | select(.attributed_cat_id == $cat
         and (.source_id | startswith("node/") and endswith("/cat/" + $cat))
         and (.source_epoch | type == "string" and length > 0)
-        and (.metric == "cpu_usec" or .metric == "memory_byte_millis"))]
-      | group_by([.source_id,.source_epoch,.end_sequence])
-      | map(select(length == 2
-          and ([.[].metric] | sort) == ["cpu_usec","memory_byte_millis"]
-          and .[0].end_sequence > $before
-          and any(.[]; .quantity != "0")))
-      | sort_by(.[0].end_sequence)
-      | last as $pair
-    | {version:1,proof:"sampler_spool_signed_ingest_projection",
-        workspace_id:$workspace,cat_id:$cat,source_id:$pair[0].source_id,
-        source_epoch:$pair[0].source_epoch,before_end_sequence:$before,
-        after_end_sequence:$pair[0].end_sequence,
-        interval_end_unix_ms:$pair[0].interval_end_unix_ms,
-        metrics:[$pair[] | {metric,quantity,unit}],
-        durable_spool_on_delivery_path:true,
-        exact_current_agent_binding_required:true,
-        projector_delivery_eventual:true,
-        spool_absence_used_as_authority:false,
-        terminal_archive_projector_receipt_proved:false}' \
-    "$after" >"$source"
-  atomic_json usage-live-delivery-receipt.json "$source"
-  rm -f "$source" "$before" "$after"
-  blocked 'E9 live sampler/spool/signed ingest passed; accepted terminal archive/projector receipt remains unavailable'
+        and (.metric == "cpu_usec" or .metric == "memory_byte_millis")
+        and (.quantity | test("^(0|[1-9][0-9]*)$")))]
+    | sort_by([.source_id,.source_epoch,.end_sequence,.metric])
+    | group_by([.source_id,.source_epoch,.end_sequence])
+    | map(select(length == 2
+        and ([.[].metric] | sort) == ["cpu_usec","memory_byte_millis"]
+        and any(.[]; .quantity != "0")))
+    | sort_by([.[0].interval_end_unix_ms,.[0].source_id,.[0].source_epoch,.[0].end_sequence])
+    | last as $pair
+    | if $pair == null then error("no complete nonzero run-bound meter pair") else
+      {version:1,proof:"sampler_spool_signed_ingest_projection",
+       run_id:$run_id,run_window_from_unix_ms:$from_ms,run_window_to_unix_ms:$to_ms,
+       workspace_id:$workspace,cat_id:$cat,source_id:$pair[0].source_id,
+       source_epoch:$pair[0].source_epoch,end_sequence:$pair[0].end_sequence,
+       interval_end_unix_ms:$pair[0].interval_end_unix_ms,
+       metrics:[$pair[] | {metric,quantity,unit}],
+       durable_spool_on_delivery_path:true,exact_current_agent_binding_required:true,
+       spool_absence_used_as_authority:false,source_terminal_receipt_proved:true}
+      end' "$report" >"$live_source" || \
+    fail "run window has no previously produced complete nonzero Usage pair"
+  selected_source_id=$(jq -er '.source_id' "$live_source")
+  selected_source_epoch=$(jq -er '.source_epoch' "$live_source")
+  selected_index=$(jq -er --arg source_id "$selected_source_id" --arg source_epoch "$selected_source_epoch" '
+    to_entries[] | select(.value.source_id == $source_id and .value.source_epoch == $source_epoch)
+    | .key' "$keys")
+  [[ $selected_index =~ ^[0-9]+$ ]] || fail "live Usage pair is outside the terminal source set"
+  selected_receipt=$receipt_dir/source-$selected_index.json
+  receipt_sha256=sha256:$(sha256sum "$selected_receipt" | awk '{print $1}')
+  jq --arg receipt_sha256 "$receipt_sha256" \
+    '. + {source_terminal_receipt_sha256:$receipt_sha256}' "$live_source" \
+    >"$CASE_DIR/usage-live-delivery-receipt.bound.json"
+  atomic_json usage-live-delivery-receipt.json \
+    "$CASE_DIR/usage-live-delivery-receipt.bound.json"
+  atomic_json usage-source-terminal-receipt.json "$selected_receipt"
+
+  sources_json=$(jq -s -c '
+    sort_by([.source_id,.source_epoch])
+    | map({source_id:.source_id,source_epoch:.source_epoch,receipt_sha256:.receipt_sha256})' \
+    "$sources_work")
+  source_set_sha256=sha256:$(printf '%s' "$sources_json" | sha256sum | awk '{print $1}')
+  config_path=$(config usage-terminal-targets)
+  config_sha256=$(sha256sum "$config_path" | awk '{print $1}')
+  terminal_epoch_id=$(printf '%s\n' usage-terminal-v1 "$CATS_E3_EXACT_COMMIT" \
+    "$CATS_E3_RUN_ID" "$BLOCK_PATH" "$config_sha256" "$source_set_sha256" | \
+    sha256sum | awk '{print substr($1,1,32)}')
+  [[ $terminal_epoch_id =~ ^[0-9a-f]{32}$ && $terminal_epoch_id != 00000000000000000000000000000000 ]] || \
+    fail "derived terminal epoch ID is not canonical"
+  created_at_ms=$(( $(date +%s) * 1000 ))
+  request_source=$CASE_DIR/usage-target-terminal-request.source.json
+  request_journal=$CASE_DIR/usage-target-terminal-request.json
+  jq -c -n --slurpfile config "$config_path" --argjson sources "$sources_json" \
+    --arg terminal_epoch_id "$terminal_epoch_id" \
+    --arg release_commit "$CATS_E3_EXACT_COMMIT" \
+    --arg artifact_sha256 "$(required CATS_E3_WORKER_BUNDLE_SHA256)" \
+    --argjson created_at_unix_ms "$created_at_ms" \
+    --arg source_set_sha256 "$source_set_sha256" '
+    {contract_version:1,terminal_epoch_id:$terminal_epoch_id,
+     release_commit:$release_commit,artifact_sha256:$artifact_sha256,
+     created_at_unix_ms:$created_at_unix_ms,
+     old_target:$config[0].old_target,fresh_target:$config[0].fresh_target,
+     sources:$sources,source_set_sha256:$source_set_sha256,shards:$config[0].shards}' \
+    >"$request_source"
+  atomic_json usage-target-terminal-request.json "$request_source"
+  chmod 0400 "$request_journal"
+
+  begin_response=$CASE_DIR/usage-target-terminal-begin.json
+  begin_status=75
+  for attempt in 1 2; do
+    set +e
+    curl_json POST "$(control_origin)/v1/admin/usage/target-terminal/begin" \
+      "$begin_response" 200 --header 'content-type: application/json' \
+      --data-binary "@$request_journal"
+    begin_status=$?
+    set -e
+    [[ $begin_status -eq 75 ]] || break
+  done
+  [[ $begin_status -eq 0 ]] || \
+    fail "target terminal begin remained ambiguous after one exact journal replay"
+  request_sha256=$(jq -er '
+    select((.state == "prepared" or .state == "exact_replay")
+      and (.request_sha256 | test("^sha256:[0-9a-f]{64}$")))
+    | .request_sha256' "$begin_response") || fail "target terminal begin response is not exact"
+
+  complete_response=$CASE_DIR/usage-target-terminal-complete.json
+  complete_status=75
+  ready=false
+  attempt=0
+  while [[ $attempt -lt 120 ]]; do
+    attempt=$((attempt + 1))
+    set +e
+    curl_json POST "$(control_origin)/v1/admin/usage/target-terminal/complete" \
+      "$complete_response" 200,202 --header 'content-type: application/json' \
+      --data-binary "@$request_journal"
+    complete_status=$?
+    set -e
+    if [[ $complete_status -eq 75 ]]; then
+      continue
+    fi
+    [[ $complete_status -eq 0 ]] || fail "target terminal discovery failed"
+    if [[ $CURL_JSON_STATUS == 202 ]]; then
+      jq -e --arg request_sha256 "$request_sha256" '
+        .state == "pending" and .request_sha256 == $request_sha256 and .receipt == null' \
+        "$complete_response" >/dev/null || fail "pending target terminal response is not exact"
+      sleep 2
+      continue
+    fi
+    if [[ $CURL_JSON_STATUS == 200 ]] && jq -e --arg request_sha256 "$request_sha256" '
+      .state == "terminal" and .request_sha256 == $request_sha256
+      and (.receipt | type == "object")' "$complete_response" >/dev/null; then
+      ready=true
+      break
+    fi
+    fail "target terminal completion returned a foreign outcome"
+  done
+  [[ $ready == true ]] || fail "target terminal barriers did not converge before deadline"
+
+  target_source=$CASE_DIR/usage-target-terminal-receipt.source.json
+  jq -c '.receipt' "$complete_response" >"$target_source"
+  jq -e --slurpfile request "$request_journal" --slurpfile sources "$sources_work" \
+    --arg request_sha256 "$request_sha256" '
+    .contract_version == 1 and .request == $request[0]
+    and .request_sha256 == $request_sha256
+    and (.source_receipts | length) == ($request[0].sources | length)
+    and (.barriers | length) == ($request[0].shards | length)
+    and ([.source_receipts[] | {source_id,source_epoch}]
+      == [$request[0].sources[] | {source_id,source_epoch}])
+    and all(.barriers[];
+      .marker.contract_version == 1
+      and .marker.terminal_epoch_id == $request[0].terminal_epoch_id
+      and .marker.request_sha256 == $request_sha256
+      and (.marker.marker_id | test("^usage_terminal_marker_[0-9a-f]{64}$"))
+      and .archive.stream_name == $request[0].old_target.stream_name
+      and .archive.archive_bucket == $request[0].old_target.archive_bucket_name)' \
+    "$target_source" >/dev/null || fail "target terminal receipt does not close the exact request"
+  atomic_json usage-target-terminal-receipt.json "$target_source"
+
+  # Only read-only discovery and fleet checks are permitted after the target
+  # barrier. Exact source bytes and the run-bound source set must remain fixed.
+  rediscovered=$CASE_DIR/usage-source-terminal-rediscovered.json
+  discover_usage_source_terminal "$selected_source_id" "$selected_source_epoch" \
+    "$rediscovered" || fail "terminal source receipt disappeared after target closure"
+  cmp -s "$selected_receipt" "$rediscovered" || \
+    fail "terminal source receipt bytes changed after target closure"
+  post_report=$CASE_DIR/usage-post-terminal.json
+  post_keys=$CASE_DIR/usage-post-terminal-source-keys.json
+  usage_report_to "$post_report" "$workspace" "$cat" "$from_ms" \
+    "$(( $(date +%s) * 1000 + 60000 ))"
+  usage_source_keys_to "$post_report" "$post_keys" "$cat"
+  cmp -s "$keys" "$post_keys" || fail "Usage source set changed after target terminal receipt"
+  fleet_verify_to "$CASE_DIR/usage-post-terminal-fleet.json"
+  jq -e --arg commit "$CATS_E3_EXACT_COMMIT" '
+    .release_commit_sha == $commit
+    and .snapshot.desired_runtime_count == 0
+    and .snapshot.current_runtime_observation_count == 0
+    and all(.snapshot.nodes[];
+      .inventory.runtime_count == 0 and .inventory.residue_count == 0
+      and .inventory.lifecycle_open_count == 0 and .inventory.route_active_count == 0
+      and .inventory.active_guard_count == 0)' \
+    "$CASE_DIR/usage-post-terminal-fleet.json" >/dev/null || \
+    fail "post-terminal fleet check is not exact clean read-only inventory"
+
+  rm -rf "$receipt_dir"
+  rm -f "$sources_work" "$previous_keys" "$request_source" "$begin_response" \
+    "$complete_response" "$target_source" "$rediscovered" "$post_report" "$post_keys" \
+    "$CASE_DIR/usage-live-delivery-receipt.bound.json" \
+    "$CASE_DIR/usage-post-terminal-fleet.json" "$live_source" "$report" "$keys"
+  printf 'USAGE_TERMINAL_RECEIPT terminal_epoch_id=%s request_sha256=%s\n' \
+    "$terminal_epoch_id" "$request_sha256"
 }
 
 run_delete() {
@@ -829,6 +1074,8 @@ cleanup() {
     atomic_json workload-remove-receipt.json "$source"
     rm -f "$source"
     policy=removed_run_bound_guest_workload_after_restart_reprobe
+  elif [[ $CASE_ID == usage-final-terminal-receipt ]]; then
+    policy=terminal_read_only_no_product_mutation
   fi
   # Product teardown remains the numbered delete-cleanup case. No failure path
   # guesses physical ownership or issues an extra destructive transition.

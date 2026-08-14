@@ -1113,10 +1113,28 @@ done
 for required_config in \
   qualification-ingress-open-plan \
   qualification-ingress-close-plan \
-  route-rotation-operator-trust; do
+  route-rotation-operator-trust \
+  usage-terminal-targets; do
   jq -e --arg label "$required_config" 'select(.label == $label)' "$configs_work" >/dev/null || \
     fail "--config $required_config is required by the production qualification contract"
 done
+
+usage_terminal_targets=$stage/configs/usage-terminal-targets
+jq -e '
+  (keys == ["fresh_target","old_target","shards","version"])
+  and .version == 1
+  and ([.old_target,.fresh_target] | all(.;
+    keys == ["archive_bucket_arn","archive_bucket_name","aws_account_id","aws_region",
+      "checkpoint_table_arn","checkpoint_table_name","stream_arn","stream_name","usage_schema"]
+    and all(.[]; type == "string" and length > 0)))
+  and (.shards | type == "array" and length > 0)
+  and all(.shards[];
+    keys == ["explicit_hash_key","shard_id"]
+    and (.shard_id | test("^shardId-[0-9]{12}$"))
+    and (.explicit_hash_key | test("^(0|[1-9][0-9]{0,38})$")))
+  and ([.shards[].shard_id] == ([.shards[].shard_id] | sort | unique))' \
+  "$usage_terminal_targets" >/dev/null || \
+  fail "--config usage-terminal-targets has the wrong closed E9 target shape"
 
 cats_e3_export_qualification_environment
 seen_key_fingerprint_labels='|'
@@ -1249,6 +1267,8 @@ export CATS_E3_BLOCK_PATH=$block_path
 export CATS_E3_RUN_ID=$run_id
 export CATS_E3_OUTPUT_DIR=$output_dir
 export CATS_E3_RUNTIME_STATE=$output_dir/runtime-state.json
+export CATS_E3_RUN_STARTED_AT_UNIX_MS=$((started_at_unix_seconds * 1000))
+export CATS_E3_WORKER_BUNDLE_SHA256=${manifest_worker_bundle_sha256#sha256:}
 
 jq -S -c -n \
   --arg exact_commit "$exact_commit" --arg block_path "$block_path" --arg run_id "$run_id" \
