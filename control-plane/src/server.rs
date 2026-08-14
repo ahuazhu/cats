@@ -1038,21 +1038,27 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
 }
 
 async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
+    let mut cursor = crate::store::runtime_authority::sweepers::RuntimeMaintenanceCursor::default();
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        let page_cursor = cursor.clone();
         match store
-            .execute(|store| store.runtime_maintenance_scan())
+            .execute(move |store| store.runtime_maintenance_scan_page(&page_cursor))
             .await
         {
-            Ok(report) => tracing::debug!(
-                sampled_pending_operations = report.sampled_pending_operations,
-                sampled_pending_on_fenced_node = report.sampled_pending_on_fenced_node,
-                sampled_deleted_tombstones = report.sampled_deleted_tombstones,
-                sampled_retained_api_results = report.sampled_retained_api_results,
-                "completed production runtime maintenance scan"
-            ),
+            Ok(report) => {
+                cursor = report.next_cursor.clone();
+                tracing::debug!(
+                    sampled_pending_operations = report.sampled_pending_operations,
+                    settled_host_lost_operations = report.settled_host_lost_operations,
+                    retained_suspected_operations = report.retained_suspected_operations,
+                    sampled_deleted_tombstones = report.sampled_deleted_tombstones,
+                    sampled_retained_api_results = report.sampled_retained_api_results,
+                    "completed production runtime maintenance scan"
+                );
+            }
             Err(error) => tracing::error!(%error, "production runtime maintenance scan failed"),
         }
     }

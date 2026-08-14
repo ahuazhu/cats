@@ -13,11 +13,12 @@ use cats_api::runtime_reconciliation::{
     Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, GuestDeviceIdentity,
     GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Hostname, HttpProtocol, Id,
     Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeIdentity, NodeIdentityState,
-    NodePlacementPolicy, NodeResidue, NodeTransportTarget, OperationPhase, OperationTerminal,
-    OwnershipTokenEvidence, RandomId128, Revision, RuntimeConfig, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
-    UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition, VolumeIntent,
+    NodePlacementPolicy, NodeResidue, NodeTransportTarget, OperationFailure, OperationPhase,
+    OperationTerminal, OwnershipTokenEvidence, RandomId128, Revision, RuntimeConfig,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
+    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeDisposition,
+    VolumeIntent,
 };
 use cats_storage::authority::{
     begin_delete, complete_disposable_root_delete, complete_normal_delete,
@@ -1374,30 +1375,55 @@ fn production_billing_composition_uses_only_the_typed_system_boundary() {
 }
 
 #[test]
-fn maintenance_scan_never_guesses_host_lost_or_gcs_retained_results() {
+fn maintenance_scan_retains_session_expiry_as_suspicion() {
     let (_url, store, _second, workspace) = stores();
-    let mut create = request(&workspace, "maintenance", 83, "maintenance-create");
+    let mut create = request(
+        &workspace,
+        "maintenance-expiry",
+        83,
+        "maintenance-expiry-create",
+    );
     let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 83);
     store
         .create_cat_covered_without_admission_for_product_test(&create)
         .unwrap();
-
-    let without_fence = store.runtime_maintenance_scan().unwrap();
-    assert_eq!(without_fence.sampled_pending_operations, 1);
-    assert_eq!(without_fence.sampled_pending_on_fenced_node, 0);
-    assert_eq!(without_fence.sampled_retained_api_results, 1);
-
-    let target = refresh_mutation_target(&store, &identity, &policy, &release, 830);
-    let event = active_host_fence_event(&target, 831);
-    store
-        .authority_transaction(|transaction| insert_event(transaction, &event))
+    let _target = refresh_mutation_target(&store, &identity, &policy, &release, 830);
+    let expired = store
+        .with(|client| {
+            let mut transaction = client.transaction()?;
+            transaction
+                .batch_execute("ALTER TABLE agent_registration_attempts DISABLE TRIGGER USER")?;
+            let attempts = transaction.execute(
+                "UPDATE agent_registration_attempts
+                    SET lease_deadline_unix_ms=1,
+                        session_record=jsonb_set(
+                            session_record, '{lease_deadline_unix_ms}', to_jsonb(1::BIGINT)
+                        )
+                  WHERE node_id=$1",
+                &[&create.candidate.desired.placement.node_id.as_str()],
+            )?;
+            let current = transaction.execute(
+                "UPDATE current_agent_sessions
+                    SET lease_deadline_unix_ms=1,
+                        record=jsonb_set(
+                            record, '{lease_deadline_unix_ms}', to_jsonb(1::BIGINT)
+                        )
+                  WHERE node_id=$1",
+                &[&create.candidate.desired.placement.node_id.as_str()],
+            )?;
+            transaction
+                .batch_execute("ALTER TABLE agent_registration_attempts ENABLE TRIGGER USER")?;
+            transaction.commit()?;
+            Ok((attempts, current))
+        })
         .unwrap();
-    let with_fence = store.runtime_maintenance_scan().unwrap();
-    assert_eq!(with_fence.sampled_pending_operations, 1);
-    assert_eq!(with_fence.sampled_pending_on_fenced_node, 1);
-    assert_eq!(with_fence.sampled_retained_api_results, 1);
+    assert_eq!(expired, (1, 1));
 
-    let pending = store
+    let report = store.runtime_maintenance_scan().unwrap();
+    assert_eq!(report.sampled_pending_operations, 1);
+    assert_eq!(report.retained_suspected_operations, 1);
+    assert_eq!(report.settled_host_lost_operations, 0);
+    let operation = store
         .authority_transaction(|transaction| {
             load_operation_by_cat_revision_unlocked(
                 transaction,
@@ -1407,8 +1433,56 @@ fn maintenance_scan_never_guesses_host_lost_or_gcs_retained_results() {
         })
         .unwrap()
         .unwrap();
-    assert_eq!(pending.phase, OperationPhase::Pending);
-    assert!(pending.terminal.is_none());
+    assert_eq!(operation.phase, OperationPhase::Pending);
+    assert!(operation.terminal.is_none());
+}
+
+#[test]
+fn maintenance_scan_settles_exact_active_fence_as_host_lost() {
+    let (_url, store, _second, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "maintenance-fenced",
+        84,
+        "maintenance-fenced-create",
+    );
+    let (identity, policy, release) = prepare_mutation_node(&store, &mut create, 84);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let target = refresh_mutation_target(&store, &identity, &policy, &release, 840);
+    let event = active_host_fence_event(&target, 841);
+    store
+        .authority_transaction(|transaction| insert_event(transaction, &event))
+        .unwrap();
+    let report = store.runtime_maintenance_scan().unwrap();
+    assert_eq!(report.sampled_pending_operations, 1);
+    assert_eq!(report.settled_host_lost_operations, 1);
+    assert_eq!(report.retained_suspected_operations, 0);
+    assert_eq!(report.sampled_retained_api_results, 1);
+
+    let settled = store
+        .authority_transaction(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(1),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.phase, OperationPhase::Failed);
+    let Some(OperationTerminal::Failed { error, .. }) = settled.terminal else {
+        panic!("exact Active HostFenceEvent did not produce a Failed terminal");
+    };
+    assert_eq!(
+        *error,
+        OperationFailure::HostLost {
+            node_id: event.node_id,
+            agent_session_epoch: event.expected_agent_session_epoch,
+            host_fence_event_id: event.event_id,
+        }
+    );
 }
 
 #[test]
