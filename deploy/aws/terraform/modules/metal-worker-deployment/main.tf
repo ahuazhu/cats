@@ -162,7 +162,8 @@ locals {
         "gateway_client_ca_bundle_pem_b64",
         "node_machine_server_certificate_pem_b64",
         "node_machine_server_private_key_pem_b64",
-        "public_key_ring_v1_json_b64"
+        "public_key_ring_v1_json_b64",
+        "rotation_operator_trust_v1_json_b64"
       ] and
       all(.[]; type == "string" and length > 0)
     ' "$route_v2_secret" >/dev/null
@@ -177,6 +178,7 @@ locals {
       chmod "$mode" "$destination"
     }
     decode_route_v2_artifact public_key_ring_v1_json_b64 "$route_v2_stage/public-key-ring.v1.json" 0644
+    decode_route_v2_artifact rotation_operator_trust_v1_json_b64 "$route_v2_stage/rotation-operator-trust.v1.json" 0644
     decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
     decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
     decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600

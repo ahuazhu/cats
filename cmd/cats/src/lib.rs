@@ -487,6 +487,9 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
         #[arg(long)]
         node_secret_name: String,
+        /// Exact lowercase source commit shared by Control and Node binaries.
+        #[arg(long)]
+        release_commit_sha: String,
         /// Absolute trusted OpenSSL executable used only by this offline operator.
         #[arg(long, default_value = "/usr/bin/openssl")]
         openssl: std::path::PathBuf,
@@ -508,6 +511,9 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
         #[arg(long)]
         node_secret_name: String,
+        /// Exact lowercase source commit shared by Control and Node binaries.
+        #[arg(long)]
+        release_commit_sha: String,
     },
 }
 
@@ -2648,6 +2654,8 @@ mod tests {
             "cats-route-v2-gateway-r1",
             "--node-secret-name",
             "cats-production-route-v2-node-r1",
+            "--release-commit-sha",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--openssl",
             "/usr/bin/openssl",
         ])

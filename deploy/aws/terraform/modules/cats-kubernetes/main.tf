@@ -297,9 +297,9 @@ resource "kubernetes_deployment_v1" "control_plane" {
           image_pull_policy = "IfNotPresent"
           command           = ["/bin/sh", "-ceu"]
           args = [<<-EOT
-            expected='gateway-workload-authority.v1.json gateway-client-ca-bundle.pem control-machine-server-certificate.pem control-machine-server-private-key.pem signer.v1.json public-key-ring.v1.json signer-private-key.pem'
+            expected='gateway-workload-authority.v1.json gateway-client-ca-bundle.pem control-machine-server-certificate.pem control-machine-server-private-key.pem signer.v1.json public-key-ring.v1.json rotation-operator-trust.v1.json signer-private-key.pem'
             actual_count=$(find -L /var/run/cats/route-v2-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
-            test "$actual_count" = 7
+            test "$actual_count" = 8
             install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
             for name in $expected; do
               test -f "/var/run/cats/route-v2-source/$name"

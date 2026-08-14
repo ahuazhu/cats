@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shared immutable revision-1 Node Route v2 installation transaction.
 
-CATS_ROUTE_V2_NODE_R1_NAMES='public-key-ring.v1.json gateway-client-ca-bundle.pem node-machine-server-certificate.pem node-machine-server-private-key.pem'
+CATS_ROUTE_V2_NODE_R1_NAMES='public-key-ring.v1.json rotation-operator-trust.v1.json gateway-client-ca-bundle.pem node-machine-server-certificate.pem node-machine-server-private-key.pem'
 
 cats_route_v2_node_r1_compare() (
   candidate=$1

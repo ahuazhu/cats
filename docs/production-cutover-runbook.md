@@ -411,6 +411,7 @@ sudo /approved/staged-worker/cats --json \
   --control-secret-name <FRESH_CONTROL_ROUTE_SECRET_NAME_R1> \
   --gateway-secret-name <FRESH_GATEWAY_ROUTE_SECRET_NAME_R1> \
   --node-secret-name cats-<CURRENT_INFRASTRUCTURE_ENVIRONMENT>-route-v2-node-r1 \
+  --release-commit-sha <EXACT_RELEASE_COMMIT_SHA> \
   --openssl /usr/bin/openssl
 
 sudo /approved/staged-worker/cats --json \
@@ -421,6 +422,7 @@ sudo /approved/staged-worker/cats --json \
   --control-secret-name <FRESH_CONTROL_ROUTE_SECRET_NAME_R1> \
   --gateway-secret-name <FRESH_GATEWAY_ROUTE_SECRET_NAME_R1> \
   --node-secret-name cats-<CURRENT_INFRASTRUCTURE_ENVIRONMENT>-route-v2-node-r1 \
+  --release-commit-sha <EXACT_RELEASE_COMMIT_SHA> \
   > /approved/evidence/<CUTOVER_ID>/40-route-v2-verify.json
 
 sudo /approved/staged-worker/cats-route-v2-node-r1-validator \

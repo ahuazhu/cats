@@ -181,7 +181,7 @@ variable "worker_runtime_secret_data" {
 }
 
 variable "route_v2_node_artifact_secret_arn" {
-  description = "ARN of the pre-created Secrets Manager value containing the exact four base64-encoded Node Route v2 artifacts. Terraform receives only the ARN."
+  description = "ARN of the pre-created Secrets Manager value containing the exact five base64-encoded Node Route v2 artifacts. Terraform receives only the ARN."
   type        = string
 
   validation {

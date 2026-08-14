@@ -75,17 +75,20 @@ keys are `0600`. Main containers run as uid 0 only because the frozen reader
 requires those exact owners/modes; both have a read-only root filesystem, no
 privilege escalation and all Linux capabilities dropped.
 
-The worker Secrets Manager `SecretString` is a JSON object with exactly four
+The worker Secrets Manager `SecretString` is a JSON object with exactly five
 non-empty base64 fields:
-`public_key_ring_v1_json_b64`, `gateway_client_ca_bundle_pem_b64`,
+`public_key_ring_v1_json_b64`, `rotation_operator_trust_v1_json_b64`,
+`gateway_client_ca_bundle_pem_b64`,
 `node_machine_server_certificate_pem_b64` and
 `node_machine_server_private_key_pem_b64`. The instance role can read only that
 ARN (plus its already-scoped runtime/database secrets). Terraform also pins
 the exact Secrets Manager version ID, so a later `AWSCURRENT` change cannot
 alter a fresh Host's revision-1 bytes. The SSM transaction decodes, validates
-and installs the four fixed Node files with the same owner,
+and installs the five fixed Node files with the same owner,
 directory and mode contract through the same Rust ring/rustls validator used
-at daemon startup before starting `cats-noded`; the production unit passes the
+at daemon startup before starting `cats-noded`. The fixed operator trust then
+authenticates adjacent public-ring delivery without giving Node a Control
+credential; the production unit passes the
 literal Route v2 listener `0.0.0.0:7444` and removes stale environment overrides.
 A23 `node_transport_target` must therefore be the reviewed canonical
 `https://<node-private-dns>:7444`, never the signed Runtime port 7301.
@@ -97,10 +100,9 @@ account and region. A fresh Pod renders a
 fresh emptyDir; a worker publishes `/etc/cats/route-v2` only when it is absent.
 An existing worker directory is accepted only when the closed set, ownership,
 modes, link counts and every byte are identical; any difference fails before
-the deployment mutates installed binaries or units. G2 performs no hot reload,
-ring replacement, signer switch, overlap window or loaded-ring ACK rollout;
-all successor revision and emergency rotation behavior remains the separate G3
-contract.
+the deployment mutates installed binaries or units. Runtime G3 successor
+delivery advances only one exact predecessor at a time through the durable
+installer; full signed inventory remains the ACK authority.
 
 The approved initial credential workflow is the offline, root-only command in
 the exact release `cats` binary. Supply every reviewed private-DNS name that
@@ -116,6 +118,7 @@ sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 g
   --control-secret-name cats-route-v2-control-r1 \
   --gateway-secret-name cats-route-v2-gateway-r1 \
   --node-secret-name cats-production-route-v2-node-r1 \
+  --release-commit-sha "$source_sha" \
   --openssl /usr/bin/openssl
 
 sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 verify \
@@ -124,15 +127,17 @@ sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 v
   --node-server-dns "$metal_2_private_dns" \
   --control-secret-name cats-route-v2-control-r1 \
   --gateway-secret-name cats-route-v2-gateway-r1 \
-  --node-secret-name cats-production-route-v2-node-r1
+  --node-secret-name cats-production-route-v2-node-r1 \
+  --release-commit-sha "$source_sha"
 
 sudo /approved/staged-worker/cats-route-v2-node-r1-validator \
   --directory /approved/credentials/route-v2-r1/node
 ```
 
 Generation creates no cloud resource. It writes five exact root-owned `0700`
-directories: the retained CA pair, Control seven-file set, Gateway three-file
-set, Node four-file set, and three provider inputs. Before returning it
+directories: retained CA and offline rotation private material, Control
+eight-file set, Gateway three-file set, Node five-file set, and three provider
+inputs. Before returning it
 reopens every file, checks the canonical signer/ring and Gateway policy, proves
 the CA/key pairs, passes the Node set through the production candidate reader,
 completes TLS 1.3 mutual-auth handshakes for Control and every Node DNS name,
@@ -206,7 +211,7 @@ does not qualify as rollback. `metal/install-worker.sh` remains a
 bootstrap/development helper. It requires
 `CATS_ROUTE_V2_NODE_ARTIFACT_DIR=/approved/root-only/node-route-v2` before it
 changes packages, installed files or services. The source must be one real
-directory containing exactly the fixed four Node artifacts documented above.
+directory containing exactly the fixed five Node artifacts documented above.
 The helper stages and validates the canonical ring, CA sequence and matching
 Node certificate/private key, then installs the closed set at
 `/etc/cats/route-v2` before enabling `cats-worker`. Cloud Hypervisor stays under

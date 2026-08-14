@@ -564,6 +564,7 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
         "route_v2_node_artifact_secret_version_id",
         "secretsmanager:GetSecretValue",
         "public-key-ring.v1.json",
+        "rotation-operator-trust.v1.json",
         "gateway-client-ca-bundle.pem",
         "node-machine-server-certificate.pem",
         "node-machine-server-private-key.pem",
@@ -3747,6 +3748,16 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     assert!(worker_image.contains(
         "COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py"
     ));
+    for release_binding in [
+        "ARG CATS_RELEASE_COMMIT_SHA",
+        "ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}",
+        "grep -Eq '^[0-9a-f]{40}$'",
+    ] {
+        assert!(
+            worker_image.contains(release_binding),
+            "worker image lost qualified source binding {release_binding:?}"
+        );
+    }
     let noded = read_workspace_file("cmd/noded/src/main.rs");
     assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
     assert!(noded.contains("validate_installed_node_guest_runtime"));

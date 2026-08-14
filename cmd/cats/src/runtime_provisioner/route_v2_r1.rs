@@ -22,8 +22,13 @@ use cats_api::route_grant_v2::{
     RouteGrantV2PublicKey, RouteGrantV2PublicKeyEntry, RouteGrantV2PublicKeyRingArtifact,
     RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
 };
+use cats_api::route_signing_operator::{
+    decode_route_v2_rotation_operator_trust, encode_route_v2_rotation_operator_trust,
+    RouteV2RotationOperatorCredential, RouteV2RotationOperatorTrust,
+};
 use cats_api::runtime_reconciliation::{
-    Base64UrlNoPad, ContractVersion, Epoch, Hostname, Id, Sha256Digest,
+    canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Hostname, Id,
+    Sha256Digest,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 use rustls::pki_types::pem::PemObject as _;
@@ -46,16 +51,18 @@ const MAX_PEM_BYTES: usize = 65_536;
 const MAX_PRIVATE_KEY_BYTES: usize = 16_384;
 const MAX_JSON_BYTES: usize = 262_144;
 const ROOT_DIRECTORIES: [&str; 5] = ["authority", "control", "gateway", "node", "provider"];
-const AUTHORITY_FILES: [(&str, u32); 2] = [
+const AUTHORITY_FILES: [(&str, u32); 3] = [
     ("route-v2-ca-certificate.pem", 0o644),
     ("route-v2-ca-private-key.pem", 0o600),
+    ("rotation-operator-private-key.pem", 0o600),
 ];
-const CONTROL_FILES: [(&str, u32); 7] = [
+const CONTROL_FILES: [(&str, u32); 8] = [
     ("control-machine-server-certificate.pem", 0o644),
     ("control-machine-server-private-key.pem", 0o600),
     ("gateway-client-ca-bundle.pem", 0o644),
     ("gateway-workload-authority.v1.json", 0o644),
     ("public-key-ring.v1.json", 0o644),
+    ("rotation-operator-trust.v1.json", 0o644),
     ("signer-private-key.pem", 0o600),
     ("signer.v1.json", 0o644),
 ];
@@ -64,11 +71,12 @@ const GATEWAY_FILES: [(&str, u32); 3] = [
     ("gateway-machine-client-private-key.pem", 0o600),
     ("node-server-ca-bundle.pem", 0o644),
 ];
-const NODE_FILES: [(&str, u32); 4] = [
+const NODE_FILES: [(&str, u32); 5] = [
     ("gateway-client-ca-bundle.pem", 0o644),
     ("node-machine-server-certificate.pem", 0o644),
     ("node-machine-server-private-key.pem", 0o600),
     ("public-key-ring.v1.json", 0o644),
+    ("rotation-operator-trust.v1.json", 0o644),
 ];
 const PROVIDER_FILES: [(&str, u32); 3] = [
     ("control-secret.v1.json", 0o600),
@@ -84,6 +92,7 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
             control_secret_name,
             gateway_secret_name,
             node_secret_name,
+            release_commit_sha,
             openssl,
         } => {
             let inputs = Inputs::new(
@@ -92,6 +101,7 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
                 control_secret_name,
                 gateway_secret_name,
                 node_secret_name,
+                release_commit_sha,
             )?;
             let (candidate, created) = Candidate::open_or_create(&inputs.root, 0)?;
             if created {
@@ -106,12 +116,14 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
             control_secret_name,
             gateway_secret_name,
             node_secret_name,
+            release_commit_sha,
         } => Inputs::new(
             input,
             node_server_dns,
             control_secret_name,
             gateway_secret_name,
             node_secret_name,
+            release_commit_sha,
         )?,
     };
     let candidate = Candidate::open_existing(&inputs.root, 0)?;
@@ -125,6 +137,7 @@ struct Inputs {
     control_secret_name: String,
     gateway_secret_name: String,
     node_secret_name: String,
+    release_commit_sha: String,
 }
 
 impl Inputs {
@@ -134,6 +147,7 @@ impl Inputs {
         control_secret_name: &str,
         gateway_secret_name: &str,
         node_secret_name: &str,
+        release_commit_sha: &str,
     ) -> Result<Self> {
         anyhow::ensure!(
             root.is_absolute() && root != Path::new("/"),
@@ -154,6 +168,13 @@ impl Inputs {
         validate_kubernetes_secret_name(control_secret_name)?;
         validate_kubernetes_secret_name(gateway_secret_name)?;
         anyhow::ensure!(
+            release_commit_sha.len() == 40
+                && release_commit_sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "Route v2 release commit SHA must be exact lowercase 40-hex"
+        );
+        anyhow::ensure!(
             node_secret_name.len() <= 512
                 && node_secret_name.ends_with("-route-v2-node-r1")
                 && node_secret_name.bytes().all(|byte| {
@@ -167,6 +188,7 @@ impl Inputs {
             control_secret_name: control_secret_name.to_owned(),
             gateway_secret_name: gateway_secret_name.to_owned(),
             node_secret_name: node_secret_name.to_owned(),
+            release_commit_sha: release_commit_sha.to_owned(),
         })
     }
 }
@@ -462,6 +484,34 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
     };
     let signer_reference_bytes = encode_route_grant_v2_signer_reference(&signer_reference)
         .map_err(|error| anyhow!("encode generated Route v2 signer reference: {error:?}"))?;
+    let mut rotation_operator_private_key = generate_pkcs8_v2_pem()?;
+    let rotation_operator_credential_id = Id::new(random_id("route_rotation_operator")?)
+        .expect("generated Route rotation operator credential ID is valid");
+    let rotation_operator_signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        rotation_operator_credential_id.clone(),
+        &rotation_operator_private_key,
+    )
+    .map_err(|_| anyhow!("generated Route rotation operator key is not strict PKCS#8 v2"))?;
+    let rotation_operator_spki =
+        Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(rotation_operator_signer.public_key_spki_der()))
+            .expect("generated Route rotation operator SPKI is canonical base64url");
+    let rotation_operator_trust = RouteV2RotationOperatorTrust {
+        version: ContractVersion::V1,
+        authority_id: Id::new(random_id("route_rotation_authority")?)
+            .expect("generated Route rotation authority ID is valid"),
+        route_deployment_id: signer_reference.deployment_id.clone(),
+        release_commit_sha: inputs.release_commit_sha.clone(),
+        threshold: 1,
+        credentials: vec![RouteV2RotationOperatorCredential {
+            credential_id: rotation_operator_credential_id,
+            public_key_spki_sha256: canonical_ed25519_spki_sha256(&rotation_operator_spki)
+                .expect("generated Route rotation operator SPKI is canonical Ed25519"),
+            public_key_spki: rotation_operator_spki,
+        }],
+    };
+    let rotation_operator_trust_bytes =
+        encode_route_v2_rotation_operator_trust(&rotation_operator_trust)
+            .map_err(|error| anyhow!("encode Route rotation operator trust: {error}"))?;
 
     let gateway_credential_id = Id::new(random_id("gateway_credential")?)
         .expect("generated Gateway credential ID is valid");
@@ -500,6 +550,13 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
         0o600,
     )?;
     publish(
+        &candidate.authority,
+        "rotation-operator-private-key.pem",
+        &rotation_operator_private_key,
+        0o600,
+    )?;
+    rotation_operator_private_key.fill(0);
+    publish(
         &candidate.control,
         "gateway-workload-authority.v1.json",
         &gateway_authority_bytes,
@@ -537,6 +594,12 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
     )?;
     publish(
         &candidate.control,
+        "rotation-operator-trust.v1.json",
+        &rotation_operator_trust_bytes,
+        0o644,
+    )?;
+    publish(
+        &candidate.control,
         "signer-private-key.pem",
         &signer_private_key,
         0o600,
@@ -564,6 +627,12 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
         &candidate.node,
         "public-key-ring.v1.json",
         &ring_bytes,
+        0o644,
+    )?;
+    publish(
+        &candidate.node,
+        "rotation-operator-trust.v1.json",
+        &rotation_operator_trust_bytes,
         0o644,
     )?;
     publish(
@@ -851,6 +920,10 @@ fn encode_node_secret(name: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<V
             "public_key_ring_v1_json_b64".to_owned(),
             STANDARD.encode(required(files, "public-key-ring.v1.json")?),
         ),
+        (
+            "rotation_operator_trust_v1_json_b64".to_owned(),
+            STANDARD.encode(required(files, "rotation-operator-trust.v1.json")?),
+        ),
     ]);
     let secret_string = serde_json::to_string(&fields).context("encode Node SecretString")?;
     serde_json::to_vec(&AwsCreateSecretInput {
@@ -871,6 +944,7 @@ fn required<'a>(files: &'a BTreeMap<String, Vec<u8>>, name: &str) -> Result<&'a 
 #[derive(Serialize)]
 struct VerificationReceipt {
     version: u32,
+    release_commit_sha: String,
     output_directory: String,
     control_secret_name: String,
     gateway_secret_name: String,
@@ -880,6 +954,9 @@ struct VerificationReceipt {
     signer_reference_sha256: String,
     public_key_ring_sha256: String,
     public_key_ring_digest: String,
+    rotation_operator_authority_id: String,
+    rotation_operator_route_deployment_id: String,
+    rotation_operator_trust_sha256: String,
     ca_certificate_sha256: String,
 }
 
@@ -923,7 +1000,9 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
                 && installed.server_certificate_pem()
                     == required(&node, "node-machine-server-certificate.pem")?
                 && installed.server_private_key_pem()
-                    == required(&node, "node-machine-server-private-key.pem")?,
+                    == required(&node, "node-machine-server-private-key.pem")?
+                && installed.rotation_operator_trust().exact_bytes()
+                    == required(&node, "rotation-operator-trust.v1.json")?,
             "production Node Route v2 reader returned different candidate bytes"
         );
     }
@@ -969,6 +1048,33 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
     anyhow::ensure!(
         signer_reference.signer_revision.get() == 1 && signer_reference.expected_previous.is_none(),
         "Route v2 signer is not revision 1"
+    );
+    let rotation_operator_trust_bytes = required(&control, "rotation-operator-trust.v1.json")?;
+    anyhow::ensure!(
+        rotation_operator_trust_bytes == required(&node, "rotation-operator-trust.v1.json")?,
+        "Control and Node Route rotation operator trusts differ"
+    );
+    let rotation_operator_trust =
+        decode_route_v2_rotation_operator_trust(rotation_operator_trust_bytes)
+            .map_err(|error| anyhow!("decode Route rotation operator trust: {error}"))?;
+    anyhow::ensure!(
+        rotation_operator_trust.route_deployment_id == signer_reference.deployment_id
+            && rotation_operator_trust.release_commit_sha == inputs.release_commit_sha
+            && rotation_operator_trust.threshold == 1
+            && rotation_operator_trust.credentials.len() == 1,
+        "Route rotation operator trust does not bind revision one and the exact release"
+    );
+    let rotation_operator_private_key = required(&authority, "rotation-operator-private-key.pem")?;
+    let rotation_operator_signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+        rotation_operator_trust.credentials[0].credential_id.clone(),
+        rotation_operator_private_key,
+    )
+    .map_err(|_| anyhow!("Route rotation operator private key is not canonical PKCS#8 v2 PEM"))?;
+    anyhow::ensure!(
+        Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(rotation_operator_signer.public_key_spki_der()))
+            .as_ref()
+            == Some(&rotation_operator_trust.credentials[0].public_key_spki),
+        "Route rotation operator private key does not match its fixed trust"
     );
     let signer_private_key = required(&control, "signer-private-key.pem")?;
     let signer_validator = Ed25519RequestSigner::from_pkcs8_v2_pem(
@@ -1107,6 +1213,7 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
 
     Ok(VerificationReceipt {
         version: 1,
+        release_commit_sha: inputs.release_commit_sha.clone(),
         output_directory: candidate.root_path.display().to_string(),
         control_secret_name: inputs.control_secret_name.clone(),
         gateway_secret_name: inputs.gateway_secret_name.clone(),
@@ -1119,6 +1226,11 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
             .digest()
             .map_err(|error| anyhow!("digest verified Route v2 ring: {error:?}"))?
             .to_string(),
+        rotation_operator_authority_id: rotation_operator_trust.authority_id.to_string(),
+        rotation_operator_route_deployment_id: rotation_operator_trust
+            .route_deployment_id
+            .to_string(),
+        rotation_operator_trust_sha256: sha256(rotation_operator_trust_bytes),
         ca_certificate_sha256: sha256(ca_certificate),
     })
 }
@@ -1410,8 +1522,9 @@ fn verify_node_secret(
                     "node_machine_server_certificate_pem_b64",
                     "node_machine_server_private_key_pem_b64",
                     "public_key_ring_v1_json_b64",
+                    "rotation_operator_trust_v1_json_b64",
                 ],
-        "Node SecretString is not the exact four-field shape"
+        "Node SecretString is not the exact five-field shape"
     );
     let mapping = [
         (
@@ -1427,6 +1540,10 @@ fn verify_node_secret(
             "node-machine-server-private-key.pem",
         ),
         ("public_key_ring_v1_json_b64", "public-key-ring.v1.json"),
+        (
+            "rotation_operator_trust_v1_json_b64",
+            "rotation-operator-trust.v1.json",
+        ),
     ];
     for (field, file) in mapping {
         let decoded = STANDARD
@@ -1473,6 +1590,10 @@ mod tests {
                 b"key".to_vec(),
             ),
             ("public-key-ring.v1.json".to_owned(), b"ring".to_vec()),
+            (
+                "rotation-operator-trust.v1.json".to_owned(),
+                b"trust".to_vec(),
+            ),
         ]);
         let encoded = encode_node_secret("cats-production-route-v2-node-r1", &node).unwrap();
         verify_node_secret(encoded, "cats-production-route-v2-node-r1", &node).unwrap();
@@ -1488,6 +1609,7 @@ mod tests {
             "cats-route-v2-control-r1",
             "cats-route-v2-gateway-r1",
             "cats-production-route-v2-node-r1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .unwrap();
         let uid = super::super::effective_uid();

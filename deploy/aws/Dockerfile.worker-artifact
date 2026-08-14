@@ -11,6 +11,8 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ARG CATS_RELEASE_COMMIT_SHA
+ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json \
     -p cats-cli \
@@ -19,7 +21,9 @@ RUN cargo chef cook --locked --release --recipe-path recipe.json \
     -p cats-guest-agent
 
 COPY . .
-RUN cargo build --locked --release \
+RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
+    && printf '%s' "${CATS_RELEASE_COMMIT_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
+    && cargo build --locked --release \
       -p cats-cli \
       -p cats-node-agent-daemon \
       -p cats-blockd-daemon \

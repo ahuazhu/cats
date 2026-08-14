@@ -45,16 +45,17 @@ cleanup_route_v2_artifacts() {
 trap cleanup_route_v2_artifacts EXIT
 route_v2_expected=(
   public-key-ring.v1.json
+  rotation-operator-trust.v1.json
   gateway-client-ca-bundle.pem
   node-machine-server-certificate.pem
   node-machine-server-private-key.pem
 )
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 4 ]] || {
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 5 ]] || {
   echo "Node Route v2 artifact source contains an unexpected entry" >&2
   exit 1
 }
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 4 ]] || {
-  echo "Node Route v2 artifact source must contain exactly four single-link regular files" >&2
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 5 ]] || {
+  echo "Node Route v2 artifact source must contain exactly five single-link regular files" >&2
   exit 1
 }
 for name in "${route_v2_expected[@]}"; do

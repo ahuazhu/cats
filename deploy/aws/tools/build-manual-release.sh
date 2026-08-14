@@ -368,6 +368,7 @@ docker buildx build \
   --target artifact \
   --platform linux/amd64 \
   --provenance=false \
+  --build-arg "CATS_RELEASE_COMMIT_SHA=$source_sha" \
   --metadata-file "$worker_metadata" \
   --output "type=local,dest=$worker_root" \
   "$source_root"

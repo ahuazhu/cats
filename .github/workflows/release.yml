@@ -266,6 +266,7 @@ jobs:
           file: deploy/aws/Dockerfile.worker-artifact
           target: artifact
           platforms: linux/amd64
+          build-args: CATS_RELEASE_COMMIT_SHA=${{ github.sha }}
           outputs: type=local,dest=worker-out
           provenance: false
           cache-from: type=gha,scope=worker-bundle

@@ -17,6 +17,7 @@ import time
 
 NAMES = {
     "public-key-ring.v1.json": 0o644,
+    "rotation-operator-trust.v1.json": 0o644,
     "gateway-client-ca-bundle.pem": 0o644,
     "node-machine-server-certificate.pem": 0o644,
     "node-machine-server-private-key.pem": 0o600,
@@ -34,6 +35,7 @@ def make_candidate(root: Path, suffix: bytes = b"") -> Path:
     root.mkdir(mode=0o700)
     payloads = {
         "public-key-ring.v1.json": RING,
+        "rotation-operator-trust.v1.json": b"fixture-rotation-trust" + suffix,
         "gateway-client-ca-bundle.pem": b"fixture-ca" + suffix,
         "node-machine-server-certificate.pem": b"fixture-certificate",
         "node-machine-server-private-key.pem": b"fixture-private-key",
