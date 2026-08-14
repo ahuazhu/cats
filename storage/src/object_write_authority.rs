@@ -1,12 +1,11 @@
 //! Provider-neutral authority for Host-scoped immutable object writes.
 //!
-//! The gateway records acceptance before invoking a provider and is the only
-//! process that owns object-store write credentials.  Closing an authority
-//! snapshots the maximum accepted sequence and prevents any later acceptance.
+//! The gateway first durably spools and verifies a body, then records its
+//! acceptance before invoking a provider. It is the only process that owns
+//! object-store write credentials. Closing an authority snapshots only the
+//! assigned accepted sequence and prevents any later acceptance.
 
-use std::fs::File;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
 use std::pin::Pin;
 use std::time::Instant;
 
@@ -87,6 +86,58 @@ pub struct ObjectPutDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteIngress {
+    pub writer_authority_id: Id,
+    pub request_id: Sha256Digest,
+    pub object_key: String,
+    pub content_sha256: Sha256Digest,
+    pub content_length: WireU64,
+    pub receiving_started_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableObjectWriteSpoolReceipt {
+    /// Opaque stable identifier resolved only by the configured durable spool
+    /// adapter. It is never an ambient or caller-selected filesystem path.
+    pub spool_id: AsciiText,
+    pub request_id: Sha256Digest,
+    pub content_sha256: Sha256Digest,
+    pub content_length: WireU64,
+    pub file_fsync_receipt_id: AsciiText,
+    pub directory_fsync_receipt_id: AsciiText,
+    pub durable_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectWriteIngressState {
+    /// Provisional only: it has no accepted sequence and is outside every
+    /// writer cutoff prefix.
+    Receiving,
+    /// The exact body is now crash-safe and reopenable by another gateway
+    /// replica, but still has no accepted sequence.
+    DurableSpooled {
+        spool: DurableObjectWriteSpoolReceipt,
+    },
+    /// The authority closed before the transaction could assign a sequence.
+    /// This body must never be sent to the object provider.
+    RejectedBeforeAccept {
+        spool: DurableObjectWriteSpoolReceipt,
+        rejection_receipt_id: AsciiText,
+        rejected_at_unix_ms: UnixMillis,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteIngressAttempt {
+    pub ingress: ObjectWriteIngress,
+    pub state: ObjectWriteIngressState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObjectPutTerminalState {
     SucceededVisible {
@@ -104,8 +155,17 @@ pub enum ObjectPutTerminalState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObjectPutState {
-    Accepted,
-    Terminal { outcome: ObjectPutTerminalState },
+    AcceptedSpooled {
+        spool: DurableObjectWriteSpoolReceipt,
+    },
+    ProviderIssued {
+        spool: DurableObjectWriteSpoolReceipt,
+        issued_at_unix_ms: UnixMillis,
+    },
+    Terminal {
+        outcome: ObjectPutTerminalState,
+        spool: TerminalObjectWriteSpool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,43 +175,25 @@ pub struct ObjectPutAttempt {
     pub state: ObjectPutState,
 }
 
-#[derive(Debug)]
-pub struct ValidatedObjectWriteSpool {
-    file: File,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TerminalObjectWriteSpool {
+    Retained {
+        spool: DurableObjectWriteSpoolReceipt,
+    },
+    Removed {
+        spool: DurableObjectWriteSpoolReceipt,
+        removal_receipt_id: AsciiText,
+        removed_at_unix_ms: UnixMillis,
+    },
 }
 
-impl ValidatedObjectWriteSpool {
-    /// Accept an already descriptor-stable private spool. The gateway streams
-    /// the HTTP body into a mode-0600 temporary file; no whole-object buffer
-    /// crosses this boundary.
-    pub fn from_mode_0600_file(file: File) -> Result<Self, ObjectWriteAuthorityError> {
-        let metadata = file
-            .metadata()
-            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-        let maximum = u64::try_from(OBJECT_WRITE_REQUEST_MAX_BYTES)
-            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-        if !metadata.is_file() || metadata.len() > maximum {
-            return Err(ObjectWriteAuthorityError::InvalidRequest);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if metadata.permissions().mode() & 0o777 != 0o600 {
-                return Err(ObjectWriteAuthorityError::InvalidRequest);
-            }
-        }
-        Ok(Self { file })
-    }
-
-    pub fn into_file(self) -> File {
-        self.file
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectWriteDownstreamPut {
     pub descriptor: ObjectPutDescriptor,
-    pub spool: ValidatedObjectWriteSpool,
+    /// A durable, cross-replica handle. The provider adapter reopens the exact
+    /// body for every retry; the core never passes a process-local file.
+    pub spool: DurableObjectWriteSpoolReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +233,10 @@ pub enum ObjectWriteAuthorityError {
     BindingMismatch,
     #[error("object write attempt is stale or reused with another payload")]
     StaleAttempt,
+    #[error("object write body does not have an exact durable spool receipt")]
+    SpoolNotDurable,
+    #[error("object write state transition is invalid")]
+    InvalidTransition,
     #[error("object write terminal state is not a contiguous prefix")]
     NonContiguousTerminalPrefix,
     #[error("object write cutoff is not ready")]
@@ -259,16 +305,83 @@ pub fn validate_object_put_attempt(
     {
         return Err(ObjectWriteAuthorityError::StaleAttempt);
     }
-    if let ObjectPutState::Terminal { outcome } = &attempt.state {
-        match outcome {
-            ObjectPutTerminalState::SucceededVisible {
-                put_completed_at_unix_ms,
-                visible_at_unix_ms,
-                ..
-            } if put_completed_at_unix_ms > visible_at_unix_ms => {
-                return Err(ObjectWriteAuthorityError::CorruptState);
+    match &attempt.state {
+        ObjectPutState::AcceptedSpooled { spool }
+        | ObjectPutState::ProviderIssued { spool, .. } => {
+            validate_durable_spool_receipt(spool, descriptor)?;
+            if let ObjectPutState::ProviderIssued {
+                issued_at_unix_ms, ..
+            } = &attempt.state
+            {
+                if *issued_at_unix_ms < descriptor.accepted_at_unix_ms {
+                    return Err(ObjectWriteAuthorityError::CorruptState);
+                }
             }
-            _ => {}
+        }
+        ObjectPutState::Terminal { outcome, spool } => {
+            match spool {
+                TerminalObjectWriteSpool::Retained { spool } => {
+                    validate_durable_spool_receipt(spool, descriptor)?;
+                }
+                TerminalObjectWriteSpool::Removed {
+                    spool,
+                    removed_at_unix_ms,
+                    ..
+                } => {
+                    validate_durable_spool_receipt(spool, descriptor)?;
+                    if *removed_at_unix_ms < terminal_at(outcome) {
+                        return Err(ObjectWriteAuthorityError::CorruptState);
+                    }
+                }
+            }
+            match outcome {
+                ObjectPutTerminalState::SucceededVisible {
+                    put_completed_at_unix_ms,
+                    visible_at_unix_ms,
+                    ..
+                } if put_completed_at_unix_ms > visible_at_unix_ms => {
+                    return Err(ObjectWriteAuthorityError::CorruptState);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_object_write_ingress_attempt(
+    attempt: &ObjectWriteIngressAttempt,
+) -> Result<(), ObjectWriteAuthorityError> {
+    let ingress = &attempt.ingress;
+    validate_key(&ingress.object_key).map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+    let maximum = u64::try_from(OBJECT_WRITE_REQUEST_MAX_BYTES)
+        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+    if ingress.content_length.get() > maximum
+        || ingress.request_id
+            != object_put_request_id(
+                &ingress.writer_authority_id,
+                &ingress.object_key,
+                &ingress.content_sha256,
+                ingress.content_length,
+            )?
+    {
+        return Err(ObjectWriteAuthorityError::StaleAttempt);
+    }
+    match &attempt.state {
+        ObjectWriteIngressState::Receiving => {}
+        ObjectWriteIngressState::DurableSpooled { spool }
+        | ObjectWriteIngressState::RejectedBeforeAccept { spool, .. } => {
+            validate_ingress_spool_receipt(spool, ingress)?;
+        }
+    }
+    if let ObjectWriteIngressState::RejectedBeforeAccept {
+        rejected_at_unix_ms,
+        spool,
+        ..
+    } = &attempt.state
+    {
+        if *rejected_at_unix_ms < spool.durable_at_unix_ms {
+            return Err(ObjectWriteAuthorityError::CorruptState);
         }
     }
     Ok(())
@@ -300,44 +413,167 @@ pub fn object_put_provider_attempt_id(
     AsciiText::new(format!("owpa1_{value}")).ok_or(ObjectWriteAuthorityError::InvalidRequest)
 }
 
-pub fn validate_downstream_put(
-    request: &mut ObjectWriteDownstreamPut,
-    absolute_deadline: Instant,
+pub fn object_write_spool_id(
+    request_id: &Sha256Digest,
+) -> Result<AsciiText, ObjectWriteAuthorityError> {
+    let value = request_id
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or(ObjectWriteAuthorityError::InvalidRequest)?;
+    AsciiText::new(format!("owsp1_{value}")).ok_or(ObjectWriteAuthorityError::InvalidRequest)
+}
+
+pub fn validate_durable_spool_receipt(
+    spool: &DurableObjectWriteSpoolReceipt,
+    descriptor: &ObjectPutDescriptor,
 ) -> Result<(), ObjectWriteAuthorityError> {
+    validate_spool_receipt_fields(
+        spool,
+        &descriptor.request_id,
+        &descriptor.content_sha256,
+        descriptor.content_length,
+    )?;
+    if spool.durable_at_unix_ms > descriptor.accepted_at_unix_ms {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn validate_ingress_spool_receipt(
+    spool: &DurableObjectWriteSpoolReceipt,
+    ingress: &ObjectWriteIngress,
+) -> Result<(), ObjectWriteAuthorityError> {
+    validate_spool_receipt_fields(
+        spool,
+        &ingress.request_id,
+        &ingress.content_sha256,
+        ingress.content_length,
+    )?;
+    if spool.durable_at_unix_ms < ingress.receiving_started_at_unix_ms {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn validate_spool_receipt_fields(
+    spool: &DurableObjectWriteSpoolReceipt,
+    request_id: &Sha256Digest,
+    content_sha256: &Sha256Digest,
+    content_length: WireU64,
+) -> Result<(), ObjectWriteAuthorityError> {
+    if spool.spool_id != object_write_spool_id(request_id)?
+        || &spool.request_id != request_id
+        || &spool.content_sha256 != content_sha256
+        || spool.content_length != content_length
+    {
+        return Err(ObjectWriteAuthorityError::SpoolNotDurable);
+    }
     let maximum = u64::try_from(OBJECT_WRITE_REQUEST_MAX_BYTES)
         .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-    let file = &mut request.spool.file;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-    let mut hasher = Sha256::new();
-    let mut observed = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        if Instant::now() >= absolute_deadline {
-            return Err(ObjectWriteAuthorityError::InvalidRequest);
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-        if read == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(
-                u64::try_from(read).map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?,
-            )
-            .ok_or(ObjectWriteAuthorityError::InvalidRequest)?;
-        if observed > maximum {
-            return Err(ObjectWriteAuthorityError::InvalidRequest);
-        }
-        hasher.update(&buffer[..read]);
+    if content_length.get() > maximum {
+        return Err(ObjectWriteAuthorityError::InvalidRequest);
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-    if request.descriptor.content_length.get() != observed
-        || request.descriptor.content_sha256 != Sha256Digest::from_bytes(hasher.finalize().into())
-    {
-        return Err(ObjectWriteAuthorityError::StaleAttempt);
+    Ok(())
+}
+
+fn terminal_at(outcome: &ObjectPutTerminalState) -> UnixMillis {
+    match outcome {
+        ObjectPutTerminalState::SucceededVisible {
+            visible_at_unix_ms, ..
+        } => *visible_at_unix_ms,
+        ObjectPutTerminalState::PermanentlyFailed {
+            failed_at_unix_ms, ..
+        } => *failed_at_unix_ms,
+    }
+}
+
+/// Assign the accepted sequence only after the exact body has a stable,
+/// cross-replica durable spool receipt. The caller persists the returned
+/// authority and attempt in one transaction while holding the authority row
+/// lock; observing a cutoff state therefore rejects before provider issue.
+pub fn accept_durable_object_write(
+    authority: &ObjectWriteAuthority,
+    ingress_attempt: &ObjectWriteIngressAttempt,
+    accepted_at_unix_ms: UnixMillis,
+) -> Result<(ObjectWriteAuthority, ObjectPutAttempt), ObjectWriteAuthorityError> {
+    validate_object_write_authority(authority)?;
+    validate_object_write_ingress_attempt(ingress_attempt)?;
+    if !matches!(authority.state, ObjectWriteAuthorityState::Open) {
+        return Err(ObjectWriteAuthorityError::WriterClosed);
+    }
+    if ingress_attempt.ingress.writer_authority_id != authority.writer.authority_id {
+        return Err(ObjectWriteAuthorityError::BindingMismatch);
+    }
+    let ObjectWriteIngressState::DurableSpooled { spool } = &ingress_attempt.state else {
+        return Err(ObjectWriteAuthorityError::SpoolNotDurable);
+    };
+    if accepted_at_unix_ms < spool.durable_at_unix_ms {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    let accepted_sequence = authority
+        .max_accepted_sequence
+        .get()
+        .checked_add(1)
+        .and_then(WireU64::new)
+        .ok_or(ObjectWriteAuthorityError::SequenceExhausted)?;
+    let ingress = &ingress_attempt.ingress;
+    let descriptor = ObjectPutDescriptor {
+        writer_authority_id: ingress.writer_authority_id.clone(),
+        accepted_sequence,
+        request_id: ingress.request_id.clone(),
+        object_key: ingress.object_key.clone(),
+        content_sha256: ingress.content_sha256.clone(),
+        content_length: ingress.content_length,
+        provider_attempt_id: object_put_provider_attempt_id(&ingress.request_id)?,
+        accepted_at_unix_ms,
+    };
+    let attempt = ObjectPutAttempt {
+        descriptor,
+        state: ObjectPutState::AcceptedSpooled {
+            spool: spool.clone(),
+        },
+    };
+    let mut updated = authority.clone();
+    updated.max_accepted_sequence = accepted_sequence;
+    validate_object_put_attempt(&updated, &attempt)?;
+    Ok((updated, attempt))
+}
+
+pub fn reject_object_write_before_accept(
+    authority: &ObjectWriteAuthority,
+    ingress_attempt: &ObjectWriteIngressAttempt,
+    rejection_receipt_id: AsciiText,
+    rejected_at_unix_ms: UnixMillis,
+) -> Result<ObjectWriteIngressAttempt, ObjectWriteAuthorityError> {
+    validate_object_write_authority(authority)?;
+    validate_object_write_ingress_attempt(ingress_attempt)?;
+    if matches!(authority.state, ObjectWriteAuthorityState::Open) {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    if ingress_attempt.ingress.writer_authority_id != authority.writer.authority_id {
+        return Err(ObjectWriteAuthorityError::BindingMismatch);
+    }
+    let ObjectWriteIngressState::DurableSpooled { spool } = &ingress_attempt.state else {
+        return Err(ObjectWriteAuthorityError::SpoolNotDurable);
+    };
+    let rejected = ObjectWriteIngressAttempt {
+        ingress: ingress_attempt.ingress.clone(),
+        state: ObjectWriteIngressState::RejectedBeforeAccept {
+            spool: spool.clone(),
+            rejection_receipt_id,
+            rejected_at_unix_ms,
+        },
+    };
+    validate_object_write_ingress_attempt(&rejected)?;
+    Ok(rejected)
+}
+
+pub fn validate_downstream_put(
+    request: &ObjectWriteDownstreamPut,
+    absolute_deadline: Instant,
+) -> Result<(), ObjectWriteAuthorityError> {
+    if Instant::now() >= absolute_deadline {
+        return Err(ObjectWriteAuthorityError::InvalidRequest);
     }
     let request_id = object_put_request_id(
         &request.descriptor.writer_authority_id,
@@ -350,7 +586,7 @@ pub fn validate_downstream_put(
     {
         return Err(ObjectWriteAuthorityError::StaleAttempt);
     }
-    Ok(())
+    validate_durable_spool_receipt(&request.spool, &request.descriptor)
 }
 
 pub fn begin_object_writer_cutoff(
@@ -433,7 +669,7 @@ pub fn advance_terminal_prefix_sha256(
     previous: &Sha256Digest,
     attempt: &ObjectPutAttempt,
 ) -> Result<Sha256Digest, ObjectWriteAuthorityError> {
-    let ObjectPutState::Terminal { outcome } = &attempt.state else {
+    let ObjectPutState::Terminal { outcome, .. } = &attempt.state else {
         return Err(ObjectWriteAuthorityError::NonContiguousTerminalPrefix);
     };
     let mut hasher = Sha256::new();
