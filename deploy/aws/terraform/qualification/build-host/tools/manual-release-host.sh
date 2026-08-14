@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: manual-release-host.sh <prepare|verify|build> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256>
+usage: manual-release-host.sh <prepare|verify|build> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256> <control-repository:tag> <gateway-repository:tag>
 
 The exact source must already have been delivered by cats-checkout-exact-sha.
 prepare installs only the version-locked Guest/buildx/Rust prerequisites.
@@ -13,7 +13,7 @@ ordinary qualification build receipt; it never pushes or logs in to a registry.
 EOF
 }
 
-if [[ $# -ne 4 || ! $2 =~ ^[0-9a-f]{40}$ || ! $3 =~ ^[0-9a-f]{64}$ || ! $4 =~ ^[0-9a-f]{64}$ ]]; then
+if [[ $# -ne 6 || ! $2 =~ ^[0-9a-f]{40}$ || ! $3 =~ ^[0-9a-f]{64}$ || ! $4 =~ ^[0-9a-f]{64}$ ]]; then
   usage
   exit 64
 fi
@@ -29,6 +29,14 @@ fi
 readonly source_sha="$2"
 readonly manifest_sha256="$3"
 readonly bundle_sha256="$4"
+readonly control_image_reference="$5"
+readonly gateway_image_reference="$6"
+for image_reference in "${control_image_reference}" "${gateway_image_reference}"; do
+  [[ ${image_reference} == */*:* && ${image_reference} != *@* && ${image_reference} != *[[:space:]]* ]] || {
+    echo "manual release image references must be explicit repository:tag values" >&2
+    exit 64
+  }
+done
 readonly source_dir="/srv/cats-build/source"
 readonly target_parent="/srv/cats-build/target"
 readonly build_receipt_dir="/var/lib/cats-build/build-receipts"
@@ -430,8 +438,9 @@ EOF
       GIT_CONFIG_NOSYSTEM=1 \
       GIT_CONFIG_GLOBAL=/dev/null \
       GIT_TERMINAL_PROMPT=0 \
-      bash -c 'cd /srv/cats-build/source && exec deploy/aws/tools/build-manual-release.sh --source-sha "$1" --output "$2" --export-images' \
+      bash -c 'cd /srv/cats-build/source && exec deploy/aws/tools/build-manual-release.sh --source-sha "$1" --output "$2" --image "$3" --gateway-image "$4" --export-images' \
       cats-manual-release "${source_sha}" "${release_dir}" \
+      "${control_image_reference}" "${gateway_image_reference}" \
     2>&1 | tee "${build_log}"
   local -a pipeline_status=("${PIPESTATUS[@]}")
   status=${pipeline_status[0]}
@@ -447,7 +456,11 @@ EOF
       sha256sum --check SHA256SUMS
       jq -e \
         --arg source_sha "${source_sha}" \
+        --arg control_image_reference "${control_image_reference}" \
+        --arg gateway_image_reference "${gateway_image_reference}" \
         '.source.commit == $source_sha and
+         .artifacts.control_plane.image_reference == $control_image_reference and
+         .artifacts.gateway.image_reference == $gateway_image_reference and
          .artifacts.control_plane.registry_verified == false and
          .artifacts.gateway.registry_verified == false' \
         release-manifest.v1.json >/dev/null
@@ -475,7 +488,9 @@ EOF
   build_receipt_path="${build_receipt_dir}/${job_id}.json"
   command_json="$(printf '%s\0' \
     deploy/aws/tools/build-manual-release.sh \
-    --source-sha "${source_sha}" --output "${release_dir}" --export-images \
+    --source-sha "${source_sha}" --output "${release_dir}" \
+    --image "${control_image_reference}" \
+    --gateway-image "${gateway_image_reference}" --export-images \
     | jq -Rs 'split("\u0000")[:-1]')"
   archive_sha256=""
   [[ ! -f ${transport_archive} ]] || archive_sha256="$(hash_file "${transport_archive}")"
@@ -484,6 +499,8 @@ EOF
     --arg tree_sha "${tree_sha}" \
     --arg manifest_sha256 "${manifest_sha256}" \
     --arg bundle_sha256 "${bundle_sha256}" \
+    --arg control_image_reference "${control_image_reference}" \
+    --arg gateway_image_reference "${gateway_image_reference}" \
     --arg job_id "${job_id}" \
     --arg job_dir "${job_dir}" \
     --arg output_dir "${output_dir}" \
@@ -499,6 +516,8 @@ EOF
     --argjson exit_status "${status}" \
     '{schema_version:1,source_sha:$source_sha,tree_sha:$tree_sha,
       manifest_sha256:$manifest_sha256,bundle_sha256:$bundle_sha256,
+      control_image_reference:$control_image_reference,
+      gateway_image_reference:$gateway_image_reference,
       job_id:$job_id,job_dir:$job_dir,output_dir:$output_dir,
       source_receipt:$source_receipt,command:$command,with_postgres:false,
       exit_status:$exit_status,bootstrap_payload_sha256:$bootstrap_payload_sha256,
