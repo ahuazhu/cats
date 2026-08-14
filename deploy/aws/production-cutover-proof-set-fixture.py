@@ -168,6 +168,32 @@ def validate_with_request(request_value: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    expected_typed_digest = (
+        "sha256:1ecc587146a29898f40be96fb88679c68106813997ce5778fc046c86388e2ec1"
+    )
+    typed_sources = (
+        (
+            "node/node-a/cat/cat-a",
+            "epoch-a",
+            "sha256:" + "1" * 64,
+        ),
+        (
+            "node/node-b/cat/cat-b",
+            "epoch-b",
+            "sha256:" + "2" * 64,
+        ),
+    )
+    actual_typed_digest = PROOF._usage_source_set_sha256(
+        typed_sources
+    )
+    if actual_typed_digest != expected_typed_digest:
+        raise AssertionError("Usage typed source-set digest ordering drifted")
+    generic_sorted_digest = "sha256:" + hashlib.sha256(
+        PROOF.canonical_json(PROOF._usage_sources_json(typed_sources))
+    ).hexdigest()
+    if actual_typed_digest == generic_sorted_digest:
+        raise AssertionError("Usage typed digest silently became generic sorted JSON")
+
     manifest, targets, request, receipt, verification_file, context, runs, verification = fixture()
     PROOF._validate_global_usage_finalization(
         PROOF.decode_json(manifest.data, "manifest", canonical_lf=True),

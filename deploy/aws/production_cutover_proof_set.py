@@ -1374,8 +1374,17 @@ def _usage_sources_json(
 def _usage_source_set_sha256(
     value: tuple[tuple[str, str, str], ...],
 ) -> str:
+    # This is the Rust typed request digest, not the recursively key-sorted
+    # evidence-file encoding.  `UsageTerminalSourceReceiptRef` declares these
+    # fields in this exact order and serde_json emits UTF-8 compact JSON.
+    typed_bytes = json.dumps(
+        _usage_sources_json(value),
+        sort_keys=False,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
     return "sha256:" + hashlib.sha256(
-        canonical_json(_usage_sources_json(value))
+        typed_bytes
     ).hexdigest()
 
 
