@@ -271,7 +271,8 @@ fn production_worker_release_rejects_and_removes_the_shared_control_bearer() {
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     assert!(deployment.contains("if (keys - [\"CATS_POSTGRES_URL\"]) != []"));
     assert!(deployment.contains("[to_entries[] | \"\\(.key)=\\(.value)\"] | join(\"\\n\")"));
-    assert!(deployment.contains("if (key == \"CATS_AUTH_TOKEN\")"));
+    assert!(deployment
+        .contains("if (key == \"CATS_AUTH_TOKEN\" || key == \"CATS_ROUTE_V2_MACHINE_LISTEN\")"));
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
     assert!(installer.contains("$1 != \"CATS_AUTH_TOKEN\""));
