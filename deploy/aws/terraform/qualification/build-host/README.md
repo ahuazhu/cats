@@ -97,6 +97,43 @@ cats-publish-content-addressed evidence <frozen-output-file>
 The publisher accepts only the frozen form. It opens every path component with `O_NOFOLLOW`, copies
 from the held file descriptor into root-only staging, and uploads one content-addressed object.
 
+## Trusted native manual release
+
+The Docker/Guest manual release is a separate root/operator lane. It does not run as `cats-build`
+and does not weaken that candidate uid's Docker, BuildKit, sudo, AWS or IMDS isolation. After the
+same exact source delivery, the trusted operator prepares one versioned tool root, verifies it, and
+builds the exporter output:
+
+```sh
+/bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
+  prepare "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256"
+/bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
+  verify "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256"
+/bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
+  build "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256"
+```
+
+`prepare` is the only mutating Host step. It accepts only the existing reviewed Ubuntu snapshot,
+installs exact Guest-builder package versions, and installs digest-pinned Buildx plus the repository's
+exact Rust toolchain and musl target under a lock-digest path in `/opt/cats-manual-release/`. It never
+changes the `cats-build` uid or its frozen toolchain. `verify` is read-only. `build` uses a fresh
+Docker config with no registry credentials, calls `build-manual-release.sh --export-images`, and
+never accepts `--push`.
+
+The build output and log are frozen below the ordinary per-source per-job target. The runner writes
+the ordinary immutable build receipt in `/var/lib/cats-build/build-receipts/`, so the existing
+publisher can retain the transport archive without a new artifact authority:
+
+```sh
+cats-publish-content-addressed artifacts \
+  /srv/cats-build/target/$EXACT_40_HEX_COMMIT-$MANIFEST_SHA256-$BUNDLE_SHA256/\
+$JOB_ID/output/cats-manual-release-$EXACT_40_HEX_COMMIT.tar.zst
+```
+
+Do not run `prepare` until the exact source, helper SHA-256 and
+`manual-release-toolchain-lock-v1.json` versions have been reviewed. Do not retry a timed-out build:
+retain the SSM command id and inspect the immutable receipt/output first.
+
 ## Reuse preflight and retry boundary
 
 Run one fail-fast preflight for the whole build:

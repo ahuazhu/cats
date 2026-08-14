@@ -115,6 +115,65 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn(f"PATH={build_path}", runner)
         self.assertIn("RUST_TEST_THREADS=4", runner)
 
+    def test_manual_release_has_a_separate_pinned_root_operator_lane(self) -> None:
+        base_lock_path = BOOTSTRAP_DIR / "toolchain-lock-v1.json"
+        manual_lock_path = (
+            BUILD_HOST_DIR / "tools" / "manual-release-toolchain-lock-v1.json"
+        )
+        manual_lock = json.loads(manual_lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(manual_lock["schema_version"], 1)
+        self.assertEqual(
+            manual_lock["base_toolchain_lock_sha256"],
+            hashlib.sha256(base_lock_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            manual_lock["apt_snapshot_id"],
+            json.loads(base_lock_path.read_text(encoding="utf-8"))["apt_snapshot"][
+                "snapshot_id"
+            ],
+        )
+        self.assertEqual(
+            set(manual_lock["apt_packages"]),
+            {
+                "busybox-static",
+                "cpio",
+                "debootstrap",
+                "gzip",
+                "kmod",
+                "musl-tools",
+                "sudo",
+            },
+        )
+        for download in manual_lock["downloads"].values():
+            self.assertRegex(download["sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(download["url"].startswith("https://"))
+
+        helper = self.text("tools/manual-release-host.sh")
+        self.assertIn("trusted root/operator actions", helper)
+        self.assertIn("cats-source-delivery.lock", helper)
+        self.assertIn("cats-active-delivery-v1.json", helper)
+        self.assertIn("source_writable_by_build == false", helper)
+        self.assertIn("manual-release-toolchain-lock-v1.json", helper)
+        self.assertIn("/opt/cats-manual-release/${manual_lock_sha256}", helper)
+        self.assertIn("--export-images", helper)
+        self.assertNotIn("--push", helper)
+        self.assertNotIn("docker push", helper)
+        self.assertIn("/boot/vmlinuz-", helper)
+        self.assertIn("/lib/modules/", helper)
+        self.assertIn("/srv/cats-build/target", helper)
+        self.assertIn("/var/lib/cats-build/build-receipts", helper)
+        self.assertIn("aws_environment_forwarded:false", helper)
+        self.assertIn("registry_credentials_used:false", helper)
+        self.assertIn("candidate_build_uid_changed:false", helper)
+        self.assertIn("DOCKER_CONFIG=", helper)
+        self.assertIn("/usr/bin/env -i", helper)
+        self.assertIn("job_cgroup_drained:true", helper)
+        self.assertIn("output_frozen:true", helper)
+
+        snapshot_verifier = self.text("tools/verify_apt_snapshot.py")
+        self.assertIn("manual-release-toolchain-lock-v1.json", snapshot_verifier)
+        self.assertIn("manual_release_lock[\"apt_packages\"]", snapshot_verifier)
+
     def test_bootstrap_refreezes_toolchain_after_success_and_failure(self) -> None:
         bootstrap = self.text("bootstrap/bootstrap.sh")
         start = "toolchain_needs_refreeze=false"
