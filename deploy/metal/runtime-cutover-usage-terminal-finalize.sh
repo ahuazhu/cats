@@ -197,7 +197,9 @@ import sys
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
-EXPECTED_RUN_FILES = {
+WIRE_MAX = (1 << 64) - 1
+COUNT_MAX = (1 << 63) - 1
+BASE_RUN_FILES = {
     "SHA256SUMS",
     "case-evidence.jsonl",
     "component-journal-summary.txt",
@@ -208,15 +210,51 @@ EXPECTED_RUN_FILES = {
     "runtime-state.json",
     "scenario-results.jsonl",
 }
-CHECKSUM_FILES = [
-    "component-journal-summary.txt",
-    "case-evidence.jsonl",
-    "exit-code",
-    "final-inventory.json",
-    "manifest.json",
-    "qualification-catalog.v1.json",
-    "runtime-state.json",
-    "scenario-results.jsonl",
+QUALIFICATION_BEGIN_FILE = "production-mutation-qualification-begin.receipt.json"
+QUALIFICATION_TERMINAL_FILE = "production-mutation-qualification-terminal.receipt.json"
+QUALIFICATION_BEGIN_PENDING_FILE = "production-mutation-qualification-begin.pending.json"
+QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-begin.command-receipt.json"
+)
+QUALIFICATION_CLOSE_PENDING_FILE = "production-mutation-qualification-close.pending.json"
+QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-close.command-receipt.json"
+)
+QUALIFICATION_FINAL_STATE_FILE = (
+    "production-mutation-qualification-final-admission-state.json"
+)
+QUALIFICATION_FINAL_FLEET_FILE = (
+    "production-mutation-qualification-final-fleet-closed.receipt.json"
+)
+QUALIFICATION_CLEANUP_INVENTORY_FILE = (
+    "production-mutation-qualification-cleanup-inventory.receipt.json"
+)
+QUALIFICATION_PRODUCT_INVENTORY_FILE = (
+    "production-mutation-qualification-product-inventory.receipt.json"
+)
+QUALIFICATION_SUPPORT_FILES = {
+    QUALIFICATION_BEGIN_FILE,
+    QUALIFICATION_TERMINAL_FILE,
+    QUALIFICATION_BEGIN_PENDING_FILE,
+    QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE,
+    QUALIFICATION_CLOSE_PENDING_FILE,
+    QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE,
+    QUALIFICATION_FINAL_STATE_FILE,
+    QUALIFICATION_FINAL_FLEET_FILE,
+    QUALIFICATION_CLEANUP_INVENTORY_FILE,
+    QUALIFICATION_PRODUCT_INVENTORY_FILE,
+}
+EXPECTED_RUN_FILES = BASE_RUN_FILES | QUALIFICATION_SUPPORT_FILES
+CHECKSUM_FILES = sorted(EXPECTED_RUN_FILES - {"SHA256SUMS"})
+QUALIFICATION_REQUIRED_EVIDENCE = [
+    {"filename": QUALIFICATION_BEGIN_FILE, "kind": "json"},
+    {"filename": QUALIFICATION_TERMINAL_FILE, "kind": "json"},
+]
+QUALIFICATION_MUTATION_CLASSES = [
+    "cat_create",
+    "disk_create",
+    "disk_delete",
+    "runtime_mutation",
 ]
 SOURCE_CASE = "usage-source-terminal-receipts"
 
@@ -331,6 +369,10 @@ def load_json(path, kind, maximum=1_048_576, canonical=None):
     value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
     if canonical == "compact" and raw != compact(value) + b"\n":
         raise ValueError(f"{kind} is not canonical compact JSON")
+    if canonical == "cats" and raw not in {compact(value), compact(value) + b"\n"}:
+        raise ValueError(f"{kind} is not canonical Cats JSON")
+    if canonical == "cats-no-lf" and raw != compact(value):
+        raise ValueError(f"{kind} is not canonical Cats wire JSON")
     if canonical == "pretty":
         expected = (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
         if raw != expected:
@@ -416,9 +458,16 @@ verifier_path, verifier_sha256 = installed_executable(
 
 catalog, catalog_raw = load_json(catalog_path, "qualification catalog", canonical="pretty")
 qualification_catalog_sha256 = sha(catalog_raw)
-if set(catalog) != {"cases", "framework_required_evidence", "post_block_path_cases", "version"}:
+if set(catalog) != {
+    "cases", "framework_required_evidence", "post_block_path_cases",
+    "qualification_admission_required_evidence", "version",
+}:
     raise ValueError("qualification catalog top-level shape is foreign")
-if catalog["version"] != 1 or catalog["post_block_path_cases"] != [{
+if (
+    catalog["version"] != 1
+    or catalog["qualification_admission_required_evidence"]
+    != QUALIFICATION_REQUIRED_EVIDENCE
+    or catalog["post_block_path_cases"] != [{
     "case_id": "usage-target-terminal-receipt",
     "deadline_seconds": 600,
     "expected_outcome": {"kind": "passed"},
@@ -427,7 +476,8 @@ if catalog["version"] != 1 or catalog["post_block_path_cases"] != [{
         {"filename": "usage-target-terminal-receipt.json", "kind": "json"},
         {"filename": "usage-target-terminal-verification.receipt.json", "kind": "json"},
     ],
-}]:
+}]
+):
     raise ValueError("qualification catalog post-block-path case is foreign")
 
 targets, targets_raw = load_json(targets_path, "Usage target descriptor", canonical="compact")
@@ -459,12 +509,395 @@ if [item["shard_id"] for item in shards] != sorted({item["shard_id"] for item in
 target_binding_sha256 = sha(compact(targets))
 
 
+# QUALIFICATION_CLOSED_SUPPORT_BEGIN
+def validate_exact_run_file_names(names):
+    if set(names) != EXPECTED_RUN_FILES or len(names) != len(EXPECTED_RUN_FILES):
+        raise ValueError("qualification directory is not the exact closed artifact set")
+
+
+def require_fields(value, expected, kind):
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{kind} has a foreign shape")
+    return value
+
+
+def require_digest(value, kind):
+    if not isinstance(value, str) or DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{kind} is not a canonical digest")
+    return value
+
+
+def positive_integer(value, kind):
+    if type(value) is not int or not 1 <= value <= WIRE_MAX:
+        raise ValueError(f"{kind} is not a positive integer")
+    return value
+
+
+def zero(value, kind):
+    if type(value) is not int or value != 0:
+        raise ValueError(f"{kind} is not zero")
+
+
+def support_sha256(directory, filename):
+    return sha((directory / filename).read_bytes())
+
+
+def validate_qualification_closed_support(
+    directory,
+    manifest,
+    run_id,
+    workspace_id,
+    expected_block_path,
+):
+    begin, begin_raw = load_json(
+        directory / QUALIFICATION_BEGIN_FILE,
+        "Qualification Begin receipt",
+        canonical="cats-no-lf",
+    )
+    terminal, terminal_raw = load_json(
+        directory / QUALIFICATION_TERMINAL_FILE,
+        "Qualification terminal receipt",
+        canonical="cats-no-lf",
+    )
+    product, product_raw = load_json(
+        directory / QUALIFICATION_PRODUCT_INVENTORY_FILE,
+        "Qualification product inventory receipt",
+        canonical="cats-no-lf",
+    )
+    cleanup, cleanup_raw = load_json(
+        directory / QUALIFICATION_CLEANUP_INVENTORY_FILE,
+        "Qualification cleanup inventory receipt",
+        canonical="cats",
+    )
+    final_state, final_state_raw = load_json(
+        directory / QUALIFICATION_FINAL_STATE_FILE,
+        "Qualification final admission state",
+        canonical="cats-no-lf",
+    )
+    fleet, fleet_raw = load_json(
+        directory / QUALIFICATION_FINAL_FLEET_FILE,
+        "Qualification final Fleet Closed receipt",
+        canonical="cats",
+    )
+
+    begin_fields = {
+        "kind", "version", "qualification_id", "workspace_id", "release_id",
+        "source_commit_sha", "qualification_catalog_sha256",
+        "allowed_mutation_classes", "binding_sha256", "begin_command_id",
+        "begin_request_sha256", "begin_command_receipt_sha256",
+        "resulting_revision", "qualification_expires_at_unix_ms",
+    }
+    terminal_fields = {
+        "kind", "version", "qualification_id", "workspace_id", "release_id",
+        "source_commit_sha", "qualification_catalog_sha256",
+        "allowed_mutation_classes", "qualification_expires_at_unix_ms",
+        "binding_sha256", "begin_command_id", "begin_request_sha256",
+        "begin_command_receipt_sha256", "begin_resulting_revision", "close_kind",
+        "terminal_outcome", "close_command_id", "close_request_sha256",
+        "close_command_receipt_sha256", "final_admission_state_sha256",
+        "final_closed_revision", "fleet_closed_receipt_sha256",
+        "product_inventory_receipt_sha256", "cleanup_inventory_receipt_sha256",
+        "active_guard_count", "product_resource_count", "residue_count",
+        "completed_at_unix_ms",
+    }
+    require_fields(begin, begin_fields, "Qualification Begin receipt")
+    require_fields(terminal, terminal_fields, "Qualification terminal receipt")
+    if (
+        begin["kind"] != "cats.production-mutation-qualification-begin-receipt.v1"
+        or type(begin["version"]) is not int
+        or begin["version"] != 1
+        or begin["qualification_id"] != run_id
+        or begin["workspace_id"] != workspace_id
+        or begin["source_commit_sha"] != exact_commit
+        or begin["qualification_catalog_sha256"] != qualification_catalog_sha256
+        or begin["allowed_mutation_classes"] != QUALIFICATION_MUTATION_CLASSES
+        or not isinstance(begin["release_id"], str)
+        or ID.fullmatch(begin["release_id"]) is None
+        or not isinstance(begin["begin_command_id"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", begin["begin_command_id"]) is None
+    ):
+        raise ValueError("Qualification Begin receipt binding differs")
+    for field in (
+        "binding_sha256", "begin_request_sha256", "begin_command_receipt_sha256",
+    ):
+        require_digest(begin[field], f"Qualification Begin {field}")
+    begin_revision = positive_integer(
+        begin["resulting_revision"], "Qualification Begin resulting revision"
+    )
+    positive_integer(
+        begin["qualification_expires_at_unix_ms"], "Qualification expiry"
+    )
+
+    shared_terminal = {
+        "qualification_id": "qualification_id",
+        "workspace_id": "workspace_id",
+        "release_id": "release_id",
+        "source_commit_sha": "source_commit_sha",
+        "qualification_catalog_sha256": "qualification_catalog_sha256",
+        "allowed_mutation_classes": "allowed_mutation_classes",
+        "qualification_expires_at_unix_ms": "qualification_expires_at_unix_ms",
+        "binding_sha256": "binding_sha256",
+        "begin_command_id": "begin_command_id",
+        "begin_request_sha256": "begin_request_sha256",
+        "begin_command_receipt_sha256": "begin_command_receipt_sha256",
+    }
+    if any(terminal[field] != begin[source] for field, source in shared_terminal.items()):
+        raise ValueError("Qualification terminal receipt rebound its Begin authority")
+    if (
+        terminal["kind"]
+        != "cats.production-mutation-qualification-terminal-receipt.v1"
+        or type(terminal["version"]) is not int
+        or terminal["version"] != 1
+        or terminal["begin_resulting_revision"] != begin_revision
+        or terminal["final_closed_revision"] != begin_revision + 1
+        or terminal["close_kind"] != "end_qualification"
+        or terminal["terminal_outcome"] != "qualified_closed"
+        or not isinstance(terminal["close_command_id"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", terminal["close_command_id"]) is None
+        or terminal["close_command_id"] == begin["begin_command_id"]
+    ):
+        raise ValueError("Qualification did not reach exact End -> qualified_closed")
+    for field in (
+        "close_request_sha256", "close_command_receipt_sha256",
+        "final_admission_state_sha256", "fleet_closed_receipt_sha256",
+        "product_inventory_receipt_sha256", "cleanup_inventory_receipt_sha256",
+    ):
+        require_digest(terminal[field], f"Qualification terminal {field}")
+    for field in ("active_guard_count", "product_resource_count", "residue_count"):
+        zero(terminal[field], f"Qualification terminal {field}")
+    completed_at = positive_integer(
+        terminal["completed_at_unix_ms"], "Qualification terminal completion time"
+    )
+
+    actual_support_digests = {
+        "begin_command_receipt_sha256": support_sha256(
+            directory, QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE
+        ),
+        "close_command_receipt_sha256": support_sha256(
+            directory, QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE
+        ),
+        "final_admission_state_sha256": sha(final_state_raw),
+        "fleet_closed_receipt_sha256": sha(fleet_raw),
+        "product_inventory_receipt_sha256": sha(product_raw),
+        "cleanup_inventory_receipt_sha256": sha(cleanup_raw),
+    }
+    if begin["begin_command_receipt_sha256"] != actual_support_digests[
+        "begin_command_receipt_sha256"
+    ]:
+        raise ValueError("Qualification Begin command receipt digest differs")
+    if any(
+        terminal[field] != actual_support_digests[field]
+        for field in actual_support_digests
+        if field != "begin_command_receipt_sha256"
+    ):
+        raise ValueError("Qualification terminal support digest differs")
+
+    required_manifest_evidence = [
+        {
+            "filename": QUALIFICATION_BEGIN_FILE,
+            "kind": "json",
+            "sha256": sha(begin_raw),
+            "size_bytes": len(begin_raw),
+        },
+        {
+            "filename": QUALIFICATION_TERMINAL_FILE,
+            "kind": "json",
+            "sha256": sha(terminal_raw),
+            "size_bytes": len(terminal_raw),
+        },
+    ]
+    if manifest.get("qualification_admission_required_evidence") != required_manifest_evidence:
+        raise ValueError("qualification manifest does not bind exact admission evidence")
+
+    product_fields = {
+        "kind", "version", "qualification_id", "workspace_id", "release_id",
+        "source_commit_sha", "qualification_catalog_sha256", "binding_sha256",
+        "close_kind", "close_command_id", "close_request_sha256",
+        "close_command_receipt_sha256", "closed_revision", "evaluated_at_unix_ms",
+        "complete", "counts", "product_resource_count",
+    }
+    count_fields = {
+        "current_cat_count", "root_disk_count", "persistent_disk_count",
+        "disk_snapshot_count", "endpoint_count", "hostname_desired_lookup_count",
+        "pending_runtime_operation_count", "deleted_cat_tombstone_count",
+        "terminal_runtime_operation_history_count", "api_idempotency_receipt_count",
+    }
+    require_fields(product, product_fields, "Qualification product inventory receipt")
+    counts = require_fields(product["counts"], count_fields, "Qualification product counts")
+    if any(
+        type(value) is not int or not 0 <= value <= COUNT_MAX
+        for value in counts.values()
+    ):
+        raise ValueError("Qualification product inventory count is invalid")
+    current_count_fields = (
+        "current_cat_count", "root_disk_count", "persistent_disk_count",
+        "disk_snapshot_count", "endpoint_count", "hostname_desired_lookup_count",
+        "pending_runtime_operation_count",
+    )
+    current_total = sum(counts[field] for field in current_count_fields)
+    if (
+        product["kind"] != "cats.production-mutation-qualification-product-inventory.v1"
+        or type(product["version"]) is not int
+        or product["version"] != 1
+        or product["qualification_id"] != run_id
+        or product["workspace_id"] != workspace_id
+        or product["release_id"] != begin["release_id"]
+        or product["source_commit_sha"] != exact_commit
+        or product["qualification_catalog_sha256"] != qualification_catalog_sha256
+        or product["binding_sha256"] != begin["binding_sha256"]
+        or product["close_kind"] != "end_qualification"
+        or product["close_command_id"] != terminal["close_command_id"]
+        or product["close_request_sha256"] != terminal["close_request_sha256"]
+        or product["close_command_receipt_sha256"]
+        != terminal["close_command_receipt_sha256"]
+        or product["closed_revision"] != terminal["final_closed_revision"]
+        or product["complete"] is not True
+        or type(product["product_resource_count"]) is not int
+        or not 0 <= product["product_resource_count"] <= COUNT_MAX
+        or product["product_resource_count"] != current_total
+        or current_total != 0
+    ):
+        raise ValueError("Qualification product inventory is not exact and empty")
+    product_evaluated_at = positive_integer(
+        product["evaluated_at_unix_ms"], "Qualification product inventory time"
+    )
+
+    cleanup_fields = {
+        "kind", "version", "qualification_id", "workspace_id", "source_commit_sha",
+        "block_path", "evaluated_at_unix_ms", "complete",
+        "product_inventory_receipt_sha256", "product_resource_count",
+        "desired_runtime_count", "current_runtime_observation_count",
+        "active_guard_count", "residue_count",
+    }
+    require_fields(cleanup, cleanup_fields, "Qualification cleanup inventory receipt")
+    if (
+        cleanup["kind"] != "cats.production-mutation-qualification-cleanup-inventory.v1"
+        or type(cleanup["version"]) is not int
+        or cleanup["version"] != 1
+        or cleanup["qualification_id"] != run_id
+        or cleanup["workspace_id"] != workspace_id
+        or cleanup["source_commit_sha"] != exact_commit
+        or cleanup["block_path"] != expected_block_path
+        or cleanup["complete"] is not True
+        or cleanup["product_inventory_receipt_sha256"] != sha(product_raw)
+        or cleanup["product_resource_count"] != product["product_resource_count"]
+    ):
+        raise ValueError("Qualification cleanup inventory binding differs")
+    for field in (
+        "product_resource_count", "desired_runtime_count",
+        "current_runtime_observation_count", "active_guard_count", "residue_count",
+    ):
+        zero(cleanup[field], f"Qualification cleanup {field}")
+    cleanup_evaluated_at = positive_integer(
+        cleanup["evaluated_at_unix_ms"], "Qualification cleanup time"
+    )
+
+    fleet_fields = {
+        "kind", "version", "qualification_id", "workspace_id", "source_commit_sha",
+        "block_path", "evaluated_at_unix_ms", "complete", "expected_node_ids",
+        "desired_runtime_count", "current_runtime_observation_count",
+        "active_guard_count", "residue_count", "fleet_verification_receipt_sha256",
+    }
+    require_fields(fleet, fleet_fields, "Qualification final Fleet Closed receipt")
+    expected_nodes = fleet["expected_node_ids"]
+    if (
+        fleet["kind"] != "cats.production-mutation-qualification-final-fleet-closed.v1"
+        or type(fleet["version"]) is not int
+        or fleet["version"] != 1
+        or fleet["qualification_id"] != run_id
+        or fleet["workspace_id"] != workspace_id
+        or fleet["source_commit_sha"] != exact_commit
+        or fleet["block_path"] != expected_block_path
+        or fleet["complete"] is not True
+        or not isinstance(expected_nodes, list)
+        or not expected_nodes
+        or expected_nodes != sorted(set(expected_nodes))
+        or any(not isinstance(node, str) or ID.fullmatch(node) is None for node in expected_nodes)
+    ):
+        raise ValueError("Qualification final Fleet binding differs")
+    require_digest(
+        fleet["fleet_verification_receipt_sha256"],
+        "Qualification final Fleet verifier receipt",
+    )
+    for field in (
+        "desired_runtime_count", "current_runtime_observation_count",
+        "active_guard_count", "residue_count",
+    ):
+        zero(fleet[field], f"Qualification final Fleet {field}")
+    fleet_evaluated_at = positive_integer(
+        fleet["evaluated_at_unix_ms"], "Qualification final Fleet time"
+    )
+
+    require_fields(
+        final_state,
+        {"version", "revision", "mode", "binding", "last_command_id", "updated_at_unix_ms"},
+        "Qualification final admission state",
+    )
+    state_binding = require_fields(
+        final_state["binding"], {"kind", "binding"}, "Qualification final state binding"
+    )
+    binding_fields = {
+        "qualification_id", "deployment_id", "release_id", "source_commit_sha",
+        "control_schema_version", "source_manifest_sha256", "source_bundle_sha256",
+        "build_receipt_sha256", "release_manifest_sha256", "worker_bundle_sha256",
+        "qualification_catalog_sha256", "qualification_cell_manifest_sha256",
+        "aws_partition", "aws_account_id", "aws_region", "cell_id", "cell_namespace",
+        "cats_account_id", "workspace_id", "allowed_mutation_classes",
+        "qualification_expires_at_unix_ms",
+    }
+    binding = require_fields(
+        state_binding["binding"], binding_fields, "Qualification final binding"
+    )
+    if (
+        type(final_state["version"]) is not int
+        or final_state["version"] != 1
+        or final_state["mode"] != "closed"
+        or final_state["revision"] != terminal["final_closed_revision"]
+        or final_state["last_command_id"] != terminal["close_command_id"]
+        or state_binding["kind"] != "qualification"
+        or sha(compact(state_binding)) != begin["binding_sha256"]
+        or binding["qualification_id"] != run_id
+        or binding["workspace_id"] != workspace_id
+        or binding["release_id"] != begin["release_id"]
+        or binding["source_commit_sha"] != exact_commit
+        or binding["control_schema_version"] != 16
+        or binding["release_manifest_sha256"] != release_sha256
+        or binding["worker_bundle_sha256"] != worker_bundle_sha256
+        or binding["qualification_catalog_sha256"] != qualification_catalog_sha256
+        or binding["allowed_mutation_classes"] != QUALIFICATION_MUTATION_CLASSES
+        or binding["qualification_expires_at_unix_ms"]
+        != begin["qualification_expires_at_unix_ms"]
+    ):
+        raise ValueError("Qualification final Closed state binding differs")
+    for field in (
+        "source_manifest_sha256", "source_bundle_sha256", "build_receipt_sha256",
+        "release_manifest_sha256", "worker_bundle_sha256",
+        "qualification_catalog_sha256", "qualification_cell_manifest_sha256",
+    ):
+        require_digest(binding[field], f"Qualification binding {field}")
+    state_updated_at = positive_integer(
+        final_state["updated_at_unix_ms"], "Qualification final state update time"
+    )
+    if not (
+        state_updated_at <= product_evaluated_at
+        and product_evaluated_at <= cleanup_evaluated_at
+        and product_evaluated_at <= fleet_evaluated_at
+        and completed_at == max(cleanup_evaluated_at, fleet_evaluated_at)
+    ):
+        raise ValueError("Qualification Closed evidence order differs")
+# QUALIFICATION_CLOSED_SUPPORT_END
+
+
 def verify_run(raw_dir, expected_block_path):
     directory = safe_dir(raw_dir, f"{expected_block_path} qualification directory")
-    if {entry.name for entry in directory.iterdir()} != EXPECTED_RUN_FILES:
-        raise ValueError("qualification directory is not the exact closed artifact set")
+    validate_exact_run_file_names([entry.name for entry in directory.iterdir()])
     for name in EXPECTED_RUN_FILES:
-        safe_path(str(directory / name), f"qualification {name}", {0o600}, 32 * 1_048_576)
+        maximum = (
+            1_048_576
+            if name in QUALIFICATION_SUPPORT_FILES
+            else 32 * 1_048_576
+        )
+        safe_path(str(directory / name), f"qualification {name}", {0o600}, maximum)
     checksums = (directory / "SHA256SUMS").read_text(encoding="ascii")
     expected_lines = []
     for name in CHECKSUM_FILES:
@@ -513,6 +946,14 @@ def verify_run(raw_dir, expected_block_path):
         raise ValueError("qualification target descriptor digest differs")
     if target_configs[0].get("size_bytes") != len(targets_raw):
         raise ValueError("qualification target descriptor size differs")
+
+    validate_qualification_closed_support(
+        directory,
+        manifest,
+        run_id,
+        workspace_id,
+        expected_block_path,
+    )
 
     evidence, evidence_raw = load_json_lines(directory / "case-evidence.jsonl", "case evidence")
     if manifest.get("case_evidence") != {"count": len(evidence), "sha256": sha(evidence_raw)}:

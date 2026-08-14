@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use cats_metering::{sha256_prefixed, UsageTerminalSourceExpectation};
@@ -18,6 +19,16 @@ const GOLDEN_SHA256: &str =
 
 fn finalizer() -> &'static str {
     include_str!("../../../deploy/metal/runtime-cutover-usage-terminal-finalize.sh")
+}
+
+fn finalizer_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/metal/runtime-cutover-usage-terminal-finalize.sh")
+}
+
+fn closed_support_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/metal/tests/runtime-cutover-usage-terminal-finalize-fixture.py")
 }
 
 fn source_set_python() -> String {
@@ -141,4 +152,50 @@ fn finalizer_closes_one_run_wide_target_and_seven_file_evidence_set() {
     assert!(script.contains("len(encoded).to_bytes(8, \"big\")"));
     assert!(!script.contains("$BLOCK_PATH"));
     assert!(!script.contains("usage-final-terminal-receipt"));
+}
+
+#[test]
+fn finalizer_requires_exact_qualified_closed_support_and_empty_product_oracle() {
+    let script = finalizer();
+    for required in [
+        "EXPECTED_RUN_FILES = BASE_RUN_FILES | QUALIFICATION_SUPPORT_FILES",
+        "CHECKSUM_FILES = sorted(EXPECTED_RUN_FILES - {\"SHA256SUMS\"})",
+        "production-mutation-qualification-begin.receipt.json",
+        "production-mutation-qualification-terminal.receipt.json",
+        "production-mutation-qualification-begin.pending.json",
+        "production-mutation-qualification-begin.command-receipt.json",
+        "production-mutation-qualification-close.pending.json",
+        "production-mutation-qualification-close.command-receipt.json",
+        "production-mutation-qualification-final-admission-state.json",
+        "production-mutation-qualification-final-fleet-closed.receipt.json",
+        "production-mutation-qualification-cleanup-inventory.receipt.json",
+        "production-mutation-qualification-product-inventory.receipt.json",
+        "product_inventory_receipt_sha256",
+        "terminal[\"close_kind\"] != \"end_qualification\"",
+        "terminal[\"terminal_outcome\"] != \"qualified_closed\"",
+    ] {
+        assert!(script.contains(required), "missing Closed gate {required}");
+    }
+
+    for mode in [
+        "positive",
+        "emergency",
+        "foreign",
+        "extra",
+        "missing",
+        "nonzero",
+    ] {
+        let output = Command::new("python3")
+            .arg(closed_support_fixture_path())
+            .arg(finalizer_path())
+            .arg(mode)
+            .output()
+            .expect("run finalizer Closed-support fixture");
+        assert!(
+            output.status.success(),
+            "Closed-support fixture {mode} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
