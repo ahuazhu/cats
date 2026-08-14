@@ -3270,9 +3270,10 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 .to_str()
                 .context("authorized blockd epoch path is not UTF-8")?
                 .to_owned();
-            // Classify leaf names before measuring allocation. The allocation
-            // walker deliberately cannot open special inodes, but a foreign
-            // socket is stable residue that must be rejected explicitly.
+            // Classify stable leaf names and inode shapes before measuring
+            // allocation. The allocation walker deliberately cannot open
+            // special inodes, but they are corrupt residue rather than a
+            // transiently unavailable source.
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
             else {
@@ -3312,6 +3313,14 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 !allowed.contains(&name.as_str()) && !is_serving_handoff_artifact_name(name)
             }) {
                 bail!("authorized blockd leaf retains foreign entry {foreign}")
+            }
+            if let Some((name, _)) = by_name.iter().find(|(_, entry)| {
+                !matches!(
+                    entry.metadata.st_mode & libc::S_IFMT,
+                    libc::S_IFDIR | libc::S_IFREG
+                )
+            }) {
+                bail!("authorized blockd leaf retains special inode {name}")
             }
             #[cfg(feature = "proposed-node-residue-reclamation")]
             let Some(allocated_bytes) = observed_allocated_bytes_at(
@@ -13984,34 +13993,60 @@ mod tests {
     }
 
     #[test]
-    fn authorized_data_probe_rejects_and_preserves_a_legacy_data_directory_socket() {
-        let environment = TestEnvironment::new();
-        let scan_context = assigned_context(true);
-        let desired = &scan_context.coordinates().desired.desired_specs[0];
-        let (_record, attachment) = exact_owned_record_and_attachment(desired);
-        let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
-        install_exact_control_only_files(&data_directory, attachment.size_bytes);
-        let legacy_socket = data_directory.join("root-provision.sock");
-        // Bind below SUN_LEN through a short pathname, then move the socket
-        // inode into the deliberately long legacy data-directory location.
-        // The probe only trusts the final descriptor-relative entry; keeping
-        // the listener open preserves the socket inode without making
-        // this fixture depend on the host's temporary-directory prefix.
-        let short_socket = environment._root.path().join("legacy.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&short_socket).unwrap();
-        std::fs::rename(&short_socket, &legacy_socket).unwrap();
+    fn authorized_data_probe_rejects_and_preserves_special_inode_names_before_allocation() {
+        for (name, foreign_name) in [
+            ("root-provision.sock", true),
+            (PENDING_PACK_DIR, false),
+            (IDENTITY_FILE, false),
+            ("serving-handoff-foreign.sock", false),
+        ] {
+            let environment = TestEnvironment::new();
+            let scan_context = assigned_context(true);
+            let desired = &scan_context.coordinates().desired.desired_specs[0];
+            let (_record, attachment) = exact_owned_record_and_attachment(desired);
+            let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let socket = data_directory.join(name);
+            if socket.is_dir() {
+                std::fs::remove_dir(&socket).unwrap();
+            } else if socket.exists() {
+                std::fs::remove_file(&socket).unwrap();
+            }
+            // Bind below SUN_LEN through a short pathname, then move the socket
+            // inode into the deliberately long data-directory location. The
+            // probe only trusts the final descriptor-relative entry; keeping
+            // the listener open preserves it without depending on the host's
+            // temporary-directory prefix.
+            let short_socket = environment._root.path().join("special.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&short_socket).unwrap();
+            std::fs::rename(&short_socket, &socket).unwrap();
 
-        let error = authorized_data_probe(&environment)
-            .prove_absent(&scan_context)
-            .expect_err("the old data-directory socket is foreign residue");
-
-        assert!(format!("{error:#}").contains("foreign entry root-provision.sock"));
-        assert!(legacy_socket
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
+            let error = match authorized_data_probe(&environment).prove_absent(&scan_context) {
+                Err(error) => error,
+                Ok(outcome) => {
+                    panic!("stable special inode {name} did not fail closed: {outcome:?}")
+                }
+            };
+            let expected_error = if foreign_name {
+                format!("foreign entry {name}")
+            } else {
+                format!("special inode {name}")
+            };
+            assert!(
+                format!("{error:#}").contains(&expected_error),
+                "unexpected error for {name}: {error:#}"
+            );
+            let full_error = scanner(environment.config())
+                .unwrap()
+                .scan_complete(scan_context)
+                .expect_err("the full scanner must not downgrade a special inode to Incomplete");
+            assert!(
+                format!("{full_error:#}").contains(&expected_error),
+                "unexpected full-scanner error for {name}: {full_error:#}"
+            );
+            assert!(socket.symlink_metadata().unwrap().file_type().is_socket());
+            drop(listener);
+        }
     }
 
     #[test]
