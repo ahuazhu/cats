@@ -34,6 +34,78 @@ impl Store {
             commit_response_loss_delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
+
+    /// Verify a pre-existing Control schema without installing or repairing
+    /// any object. Reset and release preflight callers must bind the DSN's
+    /// search path to the exact explicit target and use this read-only path;
+    /// ordinary `connect_from` remains the sole fresh-schema installer.
+    pub fn verify_existing_schema(
+        dsn: &DsnSource,
+        ca_file: Option<&str>,
+        expected_schema: &str,
+    ) -> Result<()> {
+        let mut schema_characters = expected_schema.chars();
+        if expected_schema.len() > 63
+            || !schema_characters
+                .next()
+                .is_some_and(|value| value == '_' || value.is_ascii_lowercase())
+            || !schema_characters
+                .all(|value| value == '_' || value.is_ascii_lowercase() || value.is_ascii_digit())
+        {
+            return Err(ApiError::invalid(
+                "expected Control schema must match [a-z_][a-z0-9_]{0,62}",
+            ));
+        }
+        off_runtime(|| {
+            let mut client = connect_client(dsn, ca_file)?;
+            client
+                .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '2s'")
+                .map_err(internal)?;
+            let mut transaction = client.transaction().map_err(internal)?;
+            transaction
+                .batch_execute("SET TRANSACTION READ ONLY")
+                .map_err(internal)?;
+            let actual_schema: String = transaction
+                .query_one("SELECT COALESCE(current_schema(), '')", &[])
+                .map_err(internal)?
+                .get(0);
+            if actual_schema != expected_schema {
+                return Err(ApiError::failed_precondition(format!(
+                    "Control DSN selects schema {actual_schema}, expected exact schema {expected_schema}"
+                )));
+            }
+            transaction
+                .query_one(
+                    "SELECT pg_advisory_xact_lock_shared(hashtext(current_schema()), 420103)",
+                    &[],
+                )
+                .map_err(internal)?;
+            if !relation_exists(&mut transaction, "control_schema_version")? {
+                return Err(ApiError::failed_precondition(format!(
+                    "Control schema {expected_schema} has no release stamp; refusing installation"
+                )));
+            }
+            let stamped = transaction
+                .query_opt(
+                    "SELECT version FROM control_schema_version WHERE singleton",
+                    &[],
+                )
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    ApiError::failed_precondition(
+                        "control-plane schema stamp is missing its singleton row; recreate it",
+                    )
+                })?
+                .get::<_, i64>(0);
+            if stamped != SCHEMA_VERSION {
+                return Err(ApiError::failed_precondition(format!(
+                    "control-plane database is at schema version {stamped}, this build requires exact clean-slate version {SCHEMA_VERSION}; recreate it"
+                )));
+            }
+            verify_current_schema(&mut transaction)?;
+            transaction.commit().map_err(internal)
+        })
+    }
 }
 
 pub(super) fn connect_client(dsn: &DsnSource, ca_file: Option<&str>) -> Result<Client> {

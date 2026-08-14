@@ -289,6 +289,66 @@ fn state_survives_a_reconnect() {
 }
 
 #[test]
+fn read_only_schema_verifier_requires_exact_preexisting_shape_without_repair() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let dsn = DsnSource::Literal(url.clone());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let schema: String = admin
+        .query_one("SELECT current_schema()", &[])
+        .unwrap()
+        .get(0);
+
+    let absent_error = Store::verify_existing_schema(&dsn, None, &schema).unwrap_err();
+    assert_eq!(absent_error.code, ErrorCode::FailedPrecondition);
+    assert!(absent_error.to_string().contains("refusing installation"));
+    let marker_absent: bool = admin
+        .query_one("SELECT to_regclass('control_schema_version') IS NULL", &[])
+        .unwrap()
+        .get(0);
+    assert!(marker_absent, "read-only verification must not install DDL");
+
+    drop(Store::connect_from(&dsn, None).unwrap());
+    Store::verify_existing_schema(&dsn, None, &schema).unwrap();
+    let wrong_schema_error = Store::verify_existing_schema(&dsn, None, "cats_wrong").unwrap_err();
+    assert_eq!(wrong_schema_error.code, ErrorCode::FailedPrecondition);
+    assert!(wrong_schema_error
+        .to_string()
+        .contains("expected exact schema"));
+
+    admin
+        .batch_execute(
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_trust_sha_ck",
+        )
+        .unwrap();
+    let drift_error = Store::verify_existing_schema(&dsn, None, &schema).unwrap_err();
+    assert_eq!(drift_error.code, ErrorCode::FailedPrecondition);
+    assert!(
+        drift_error
+            .to_string()
+            .contains("route_v2_rotation_operator_trust_sha_ck"),
+        "{drift_error}"
+    );
+    let constraint_absent: bool = admin
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                  FROM pg_constraint constraint_row
+                  JOIN pg_class source ON source.oid=constraint_row.conrelid
+                  JOIN pg_namespace namespace_row ON namespace_row.oid=source.relnamespace
+                 WHERE namespace_row.nspname=current_schema()
+                   AND constraint_row.conname='route_v2_rotation_operator_trust_sha_ck')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        constraint_absent,
+        "read-only verification must not repair drift"
+    );
+}
+
+#[test]
 fn reconnect_rereads_a_dsn_file() {
     let first_url = crate::testsupport::isolated_control_store_url();
     let second_url = crate::testsupport::isolated_control_store_url();
