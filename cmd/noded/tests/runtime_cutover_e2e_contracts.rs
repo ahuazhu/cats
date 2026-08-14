@@ -1343,7 +1343,7 @@ fn runtime_cutover_runner_persists_exact_reentry_and_close_authority() {
 }
 
 #[test]
-fn runner_exit_recovery_forward_completes_g3_before_emergency_terminalization() {
+fn runner_exit_without_an_existing_begin_pending_has_zero_begin_or_close_effects() {
     let fixture = Fixture::new();
     let trace = fixture._temp.path().join("runner-exit-recovery.trace");
     let state = fixture._temp.path().join("runner-exit-recovery-state");
@@ -1359,24 +1359,23 @@ qualification_close_applied=false
 qualification_close_forbidden=false
 qualification_close_kind=
 cats_e3_qualification_begin() {
-  printf '%s\n' begin-replay >>"$trace"
-  qualification_begin_applied=true
+  printf '%s\n' forbidden-new-begin >>"$trace"
+  return 91
 }
-cats_e3_forward_recover_g3_on_exit() { printf '%s\n' g3-forward >>"$trace"; }
+cats_e3_resolve_existing_qualification_begin() {
+  printf '%s\n' resolve-existing-only >>"$trace"
+  return 1
+}
+cats_e3_forward_recover_g3_on_exit() { printf '%s\n' forbidden-g3 >>"$trace"; }
 cats_e3_persist_close_decision() {
-  test "$1" = emergency_close
-  printf '%s\n' decision >>"$trace"
+  printf '%s\n' forbidden-decision >>"$trace"
 }
 cats_e3_qualification_close() {
-  test "$1" = emergency_close
-  printf '%s\n' close >>"$trace"
-  qualification_close_applied=true
+  printf '%s\n' forbidden-close >>"$trace"
 }
-cats_e3_qualification_product_inventory() { printf '%s\n' product-inventory >>"$trace"; }
-cats_e3_collect_final_inventory() { printf '%s\n' fleet-inventory >>"$trace"; }
-cats_e3_publish_qualification_zero_wrappers() { printf '%s\n' wrappers >>"$trace"; }
-cats_e3_qualification_terminalize() { printf '%s\n' terminalize >>"$trace"; }
-cats_e3_close_on_exit
+if cats_e3_close_on_exit; then
+  exit 90
+fi
 "#;
     let output = Command::new("bash")
         .env_clear()
@@ -1390,15 +1389,146 @@ cats_e3_close_on_exit
     assert_success(&output);
     assert_eq!(
         fs::read_to_string(trace).unwrap(),
+        "resolve-existing-only\n"
+    );
+}
+
+#[test]
+fn qualification_begin_existing_only_never_prepares_missing_authority() {
+    let fixture = Fixture::new();
+    let state = fixture._temp.path().join("missing-begin-state");
+    fs::create_dir(&state).expect("create missing Begin state");
+    let script = r#"
+import importlib.util
+import pathlib
+import sys
+import types
+
+operator_path = pathlib.Path(sys.argv[1])
+state = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("production_mutation_admission", operator_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.validate_qualification_authority_inputs = lambda _args: {
+    "qualification_id": "fixture-qualification",
+}
+def forbidden_prepare(*_args, **_kwargs):
+    raise AssertionError("existing-only resolution attempted to prepare a command")
+module.ensure_qualification_pending = forbidden_prepare
+args = types.SimpleNamespace(state_directory=state, existing_pending_only=True)
+try:
+    module.qualification_begin(args)
+except module.AdmissionError as error:
+    assert str(error) == "Qualification Begin pending authority is unavailable"
+else:
+    raise AssertionError("missing deterministic Begin pending was accepted")
+assert list(state.iterdir()) == []
+"#;
+    let output = Command::new("python3")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script])
+        .arg(
+            fixture
+                .root
+                .join("deploy/aws/production-mutation-admission.py"),
+        )
+        .arg(&state)
+        .output()
+        .expect("run existing-only Begin operator fixture");
+    assert_success(&output);
+}
+
+#[test]
+fn runner_binds_emergency_before_g3_and_reentry_cannot_upgrade_to_end() {
+    let fixture = Fixture::new();
+    let trace = fixture._temp.path().join("runner-emergency-before-g3.trace");
+    let state = fixture._temp.path().join("runner-emergency-before-g3.state");
+    fs::create_dir(&state).expect("create emergency decision state");
+    let script = r#"
+set -euo pipefail
+source "$1"
+trace=$2
+state_directory=$3
+mode=$4
+decision=$state_directory/qualification-close-decision.v1.json
+qualification_lifecycle_attempted=true
+qualification_begin_applied=true
+qualification_close_applied=false
+qualification_close_forbidden=false
+qualification_terminalized=false
+qualification_close_kind=
+if [[ $mode == resume ]]; then
+  if [[ -f $decision ]]; then
+    qualification_close_kind=$(cat "$decision")
+  else
+    qualification_close_kind=end_qualification
+  fi
+fi
+cats_e3_persist_close_decision() {
+  if [[ -f $decision ]]; then
+    test "$(cat "$decision")" = "$1"
+  else
+    (umask 077; printf '%s\n' "$1" >"$decision")
+    sync -f "$state_directory"
+  fi
+  printf 'decision:%s\n' "$1" >>"$trace"
+}
+cats_e3_forward_recover_g3_on_exit() {
+  printf 'g3:%s\n' "$mode" >>"$trace"
+  if [[ $mode == kill ]]; then
+    kill -KILL $$
+  fi
+}
+cats_e3_qualification_close() {
+  printf 'close:%s\n' "$1" >>"$trace"
+  test "$1" = emergency_close
+  qualification_close_applied=true
+}
+cats_e3_qualification_product_inventory() { :; }
+cats_e3_collect_final_inventory() { :; }
+cats_e3_publish_qualification_zero_wrappers() { :; }
+cats_e3_qualification_terminalize() { qualification_terminalized=true; }
+cats_e3_close_on_exit
+"#;
+    let invoke = |mode: &str| {
+        Command::new("bash")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .args(["-c", script, "runtime-cutover-emergency-before-g3"])
+            .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+            .arg(&trace)
+            .arg(&state)
+            .arg(mode)
+            .output()
+            .expect("run emergency decision crash fixture")
+    };
+
+    let killed = invoke("kill");
+    assert_eq!(
+        killed.status.signal(),
+        Some(9),
+        "first process was not SIGKILLed: status={:?} stderr={}",
+        killed.status,
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("qualification-close-decision.v1.json")).unwrap(),
+        "emergency_close\n",
+        "TERM/red authority must be durable before long G3 cleanup"
+    );
+
+    let resumed = invoke("resume");
+    assert_success(&resumed);
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
         concat!(
-            "begin-replay\n",
-            "g3-forward\n",
-            "decision\n",
-            "close\n",
-            "product-inventory\n",
-            "fleet-inventory\n",
-            "wrappers\n",
-            "terminalize\n"
+            "decision:emergency_close\n",
+            "g3:kill\n",
+            "decision:emergency_close\n",
+            "g3:resume\n",
+            "close:emergency_close\n"
         )
     );
 }

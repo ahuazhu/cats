@@ -404,6 +404,15 @@ cats_e3_qualification_begin() {
   qualification_begin_applied=true
 }
 
+cats_e3_resolve_existing_qualification_begin() {
+  qualification_lifecycle_attempted=true
+  cats_e3_run_qualification_operator qualification-begin \
+    --private-key-file "$production_cutover_operator_private_key_file" \
+    --command-lifetime-seconds 240 \
+    --existing-pending-only || return $?
+  qualification_begin_applied=true
+}
+
 cats_e3_qualification_close() {
   local close_kind=$1
   qualification_close_attempted=true
@@ -519,18 +528,13 @@ cats_e3_close_on_exit() {
   local decision=$state_directory/qualification-close-decision.v1.json
   local begin_status=0 cleanup_status=0 close_status=0 proof_status=0
   if [[ ${qualification_begin_applied:-false} != true ]]; then
-    if cats_e3_qualification_begin >/dev/null 2>&1; then
+    if cats_e3_resolve_existing_qualification_begin >/dev/null 2>&1; then
       begin_status=0
     else
       begin_status=$?
     fi
   fi
   [[ $begin_status -eq 0 ]] || return "$begin_status"
-  if cats_e3_forward_recover_g3_on_exit; then
-    cleanup_status=0
-  else
-    cleanup_status=$?
-  fi
   if [[ -z ${qualification_close_kind:-} ]]; then
     if [[ -e $decision || -L $decision ]]; then
       qualification_close_kind=$(cats_e3_load_close_decision) || return 1
@@ -539,6 +543,12 @@ cats_e3_close_on_exit() {
     fi
   fi
   cats_e3_persist_close_decision "$qualification_close_kind" >/dev/null 2>&1 || close_status=125
+  [[ $close_status -eq 0 ]] || return "$close_status"
+  if cats_e3_forward_recover_g3_on_exit; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+  fi
   if [[ $close_status -eq 0 && ${qualification_close_applied:-false} != true ]]; then
     if cats_e3_qualification_close "$qualification_close_kind" >/dev/null 2>&1; then
       close_status=0

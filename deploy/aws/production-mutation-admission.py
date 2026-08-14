@@ -1427,6 +1427,8 @@ def qualification_begin(args: argparse.Namespace) -> tuple[Path, str]:
         "begin",
     )
     if not begin_pending.exists() and not begin_pending.is_symlink():
+        if args.existing_pending_only:
+            raise AdmissionError("Qualification Begin pending authority is unavailable")
         probe = ensure_qualification_pending(
             args,
             binding,
@@ -2133,6 +2135,11 @@ def parser() -> argparse.ArgumentParser:
         help="discover Closed, apply exact BeginQualification and publish its framework receipt",
     )
     add_qualification_hook_arguments(qualification_begin_parser, signing=True)
+    qualification_begin_parser.add_argument(
+        "--existing-pending-only",
+        action="store_true",
+        help="resolve only the deterministic durable Begin pending; never prepare a command",
+    )
     qualification_close_parser = commands.add_parser(
         "qualification-close",
         help="apply exact EndQualification/EmergencyClose and publish its final state",
