@@ -618,6 +618,132 @@ fi
     assert!(output.stdout.is_empty(), "private-key helper wrote stdout");
 }
 
+#[test]
+fn runner_stages_the_route_rotation_key_without_manifesting_its_authority() {
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    for required in [
+        "cats_e3_stage_route_rotation_operator_key",
+        "getattr(os, \"O_NOFOLLOW\", 0)",
+        "os.O_EXCL",
+        "(before.st_uid, before.st_gid) != (0, 0)",
+        "before.st_nlink != 1",
+        "stat.S_IMODE(before.st_mode) != 0o600",
+        "not 1 <= before.st_size <= 65_536",
+        "identity(os.fstat(source)) != identity(before)",
+        "stat.S_IMODE(metadata.st_mode) != 0o700",
+        "CATS_E3_CONFIG_ROUTE_ROTATION_OPERATOR_KEY=$staged",
+        "route_rotation_operator_key_seen=true",
+    ] {
+        assert!(
+            runner.contains(required),
+            "missing secret config guard {required}"
+        );
+    }
+    for required_config in [
+        "route-rotation-command-bundle",
+        "route-rotation-recovery",
+        "route-rotation-server-ca",
+    ] {
+        assert!(
+            runner.contains(required_config),
+            "missing Route rotation config {required_config}"
+        );
+    }
+    for forbidden in [
+        "route_rotation_operator_key_sha256",
+        "remember_original \"config:route-rotation-operator-key\"",
+        "stage_input \"config:route-rotation-operator-key\"",
+        "--arg route_rotation_operator_key",
+    ] {
+        assert!(
+            !runner.contains(forbidden),
+            "Route rotation private key leaked through {forbidden}"
+        );
+    }
+    let secret_branch = runner
+        .find("if [[ $label == route-rotation-operator-key ]]")
+        .expect("Route rotation secret config branch");
+    let branch_end = runner[secret_branch..]
+        .find("continue")
+        .map(|offset| secret_branch + offset)
+        .expect("secret config branch bypasses generic staging");
+    let generic_digest = runner[secret_branch..]
+        .find("digest=$(sha256sum \"$canonical\"")
+        .map(|offset| secret_branch + offset)
+        .expect("generic config digest boundary");
+    assert!(branch_end < generic_digest);
+}
+
+#[test]
+fn route_rotation_key_stage_rejects_path_inode_and_mode_substitution() {
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("read fixture uid");
+    assert_success(&uid);
+    if uid.stdout != b"0\n" {
+        // The production runner itself requires root. The native/Linux root
+        // gate executes the inode and ownership matrix below.
+        return;
+    }
+    let root_parent = [Path::new("/root"), Path::new("/var/root")]
+        .into_iter()
+        .find(|path| path.is_dir())
+        .expect("root-only fixture parent");
+    let temp = tempfile::tempdir_in(root_parent).expect("Route rotation key fixture");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .expect("protect Route rotation key fixture");
+    let script = r#"
+set -euo pipefail
+source "$1"
+root=$2
+source_dir=$root/source
+destination_dir=$root/destination
+mkdir "$source_dir" "$destination_dir"
+chmod 0700 "$source_dir" "$destination_dir"
+key=$source_dir/operator.pem
+printf '%s' route-rotation-private-key >"$key"
+chmod 0600 "$key"
+destination=$destination_dir/staged.pem
+cats_e3_stage_route_rotation_operator_key "$key" "$destination"
+cmp -s "$key" "$destination"
+[[ $(stat -c '%a:%u:%g:%h:%s' "$destination") == 600:0:0:1:26 ]]
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination"
+! cats_e3_stage_route_rotation_operator_key relative.pem "$destination_dir/relative.pem"
+! cats_e3_stage_route_rotation_operator_key "$source_dir/missing.pem" "$destination_dir/missing.pem"
+ln -s "$key" "$source_dir/symlink.pem"
+! cats_e3_stage_route_rotation_operator_key "$source_dir/symlink.pem" "$destination_dir/symlink.pem"
+unlink "$source_dir/symlink.pem"
+ln "$key" "$source_dir/hardlink.pem"
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination_dir/hardlink.pem"
+unlink "$source_dir/hardlink.pem"
+chmod 0644 "$key"
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination_dir/mode.pem"
+chmod 0600 "$key"
+chmod 0750 "$source_dir"
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination_dir/source-parent.pem"
+chmod 0700 "$source_dir"
+chmod 0750 "$destination_dir"
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination_dir/destination-parent.pem"
+chmod 0700 "$destination_dir"
+ln -s "$source_dir" "$root/source-link"
+! cats_e3_stage_route_rotation_operator_key "$root/source-link/operator.pem" "$destination_dir/ancestor.pem"
+unlink "$root/source-link"
+chown 1:1 "$key"
+! cats_e3_stage_route_rotation_operator_key "$key" "$destination_dir/owner.pem"
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-route-rotation-key-fixture"])
+        .arg(workspace_root().join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(temp.path())
+        .output()
+        .expect("run Route rotation key fixture");
+    assert_success(&output);
+    assert!(output.stdout.is_empty(), "secret staging wrote stdout");
+}
+
 fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) {
     let stage =
         fs::read_to_string(output_dir.join("private-stage-path")).expect("read private stage path");

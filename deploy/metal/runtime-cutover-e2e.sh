@@ -426,6 +426,171 @@ finally:
 PY
 }
 
+cats_e3_stage_route_rotation_operator_key() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import stat
+import sys
+
+
+def fail():
+    raise SystemExit(1)
+
+
+def open_checked(name, flags, *, mode=None, dir_fd=None):
+    try:
+        if mode is None:
+            return os.open(name, flags, dir_fd=dir_fd)
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+    except OSError:
+        fail()
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def open_parent(path):
+    if not path.startswith("/") or path != os.path.normpath(path) or path == "/":
+        fail()
+    components = path.split("/")[1:]
+    if not components or components[-1] in {"", ".", ".."}:
+        fail()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory = open_checked("/", flags)
+    try:
+        for index, component in enumerate(components[:-1]):
+            if component in {"", ".", ".."}:
+                fail()
+            child = open_checked(component, flags, dir_fd=directory)
+            metadata = os.fstat(child)
+            direct_parent = index == len(components) - 2
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_uid, metadata.st_gid) != (0, 0)
+                or (
+                    stat.S_IMODE(metadata.st_mode) != 0o700
+                    if direct_parent
+                    else stat.S_IMODE(metadata.st_mode) & 0o022 != 0
+                )
+            ):
+                os.close(child)
+                fail()
+            os.close(directory)
+            directory = child
+        parent = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or (parent.st_uid, parent.st_gid) != (0, 0)
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            fail()
+        return directory, components[-1]
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+source_path, destination_path = sys.argv[1:]
+source_parent, source_name = open_parent(source_path)
+destination_parent = -1
+source = -1
+destination = -1
+destination_created = False
+try:
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source = open_checked(source_name, source_flags, dir_fd=source_parent)
+    before = os.fstat(source)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or (before.st_uid, before.st_gid) != (0, 0)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or not 1 <= before.st_size <= 65_536
+    ):
+        fail()
+    remaining = before.st_size
+    chunks = []
+    while remaining:
+        chunk = os.read(source, min(remaining, 65_536))
+        if not chunk:
+            fail()
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(source, 1) or identity(os.fstat(source)) != identity(before):
+        fail()
+    data = b"".join(chunks)
+
+    destination_parent, destination_name = open_parent(destination_path)
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    destination = open_checked(
+        destination_name,
+        destination_flags,
+        mode=0o600,
+        dir_fd=destination_parent,
+    )
+    destination_created = True
+    os.fchmod(destination, 0o600)
+    written = 0
+    while written < len(data):
+        count = os.write(destination, data[written:])
+        if count <= 0:
+            fail()
+        written += count
+    os.fsync(destination)
+    staged = os.fstat(destination)
+    if (
+        not stat.S_ISREG(staged.st_mode)
+        or (staged.st_uid, staged.st_gid) != (0, 0)
+        or staged.st_nlink != 1
+        or stat.S_IMODE(staged.st_mode) != 0o600
+        or staged.st_size != before.st_size
+    ):
+        fail()
+    os.fsync(destination_parent)
+except BaseException:
+    if destination >= 0:
+        os.close(destination)
+        destination = -1
+    if destination_created:
+        try:
+            os.unlink(destination_name, dir_fd=destination_parent)
+            os.fsync(destination_parent)
+        except OSError:
+            pass
+    raise
+finally:
+    if destination >= 0:
+        os.close(destination)
+    if source >= 0:
+        os.close(source)
+    if destination_parent >= 0:
+        os.close(destination_parent)
+    os.close(source_parent)
+PY
+}
+
 cats_e3_private_stage=
 cats_e3_cleanup_private_stage() {
   local status=$?
@@ -1140,6 +1305,7 @@ seen_config_environment_labels='|'
 route_rotation_operator_authority_id=
 route_rotation_operator_route_deployment_id=
 route_rotation_operator_trust_sha256=
+route_rotation_operator_key_seen=false
 for entry in "${config_entries[@]}"; do
   label=${entry%%=*}
   path=${entry#*=}
@@ -1151,6 +1317,15 @@ for entry in "${config_entries[@]}"; do
     *"|$environment_label|"*) fail "config label $label collides after environment normalization" ;;
   esac
   seen_config_environment_labels+="$environment_label|"
+  if [[ $label == route-rotation-operator-key ]]; then
+    staged=$stage/configs/route-rotation-operator-key
+    cats_e3_stage_route_rotation_operator_key "$path" "$staged" || \
+      fail "route-rotation-operator-key is not one protected root-only secret input"
+    CATS_E3_CONFIG_ROUTE_ROTATION_OPERATOR_KEY=$staged
+    export CATS_E3_CONFIG_ROUTE_ROTATION_OPERATOR_KEY
+    route_rotation_operator_key_seen=true
+    continue
+  fi
   canonical=$(canonical_existing "$path") || fail "config $label must name a regular non-symlink file"
   [[ -f $canonical ]] || fail "config $label is not a regular file"
   digest=$(sha256sum "$canonical" | awk '{print $1}')
@@ -1300,10 +1475,15 @@ for required_config in \
   qualification-ingress-open-plan \
   qualification-ingress-close-plan \
   route-rotation-operator-trust \
+  route-rotation-command-bundle \
+  route-rotation-recovery \
+  route-rotation-server-ca \
   usage-terminal-targets; do
   jq -e --arg label "$required_config" 'select(.label == $label)' "$configs_work" >/dev/null || \
     fail "--config $required_config is required by the production qualification contract"
 done
+[[ $route_rotation_operator_key_seen == true ]] || \
+  fail "--config route-rotation-operator-key is required by the production qualification contract"
 
 usage_terminal_targets=$stage/configs/usage-terminal-targets
 jq -e '
