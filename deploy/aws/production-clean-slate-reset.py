@@ -242,6 +242,16 @@ class VerifiedCutoverAuthority:
     projection: dict[str, Any]
 
 
+@dataclasses.dataclass(frozen=True)
+class VerifiedResetCompletion:
+    authority: VerifiedCutoverAuthority
+    plan_sha256: str
+    stable_preflight_sha256: str
+    reset_complete_path: Path
+    reset_complete_sha256: str
+    reset_complete: dict[str, Any]
+
+
 def canonical_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -2416,6 +2426,75 @@ COMMIT;
             "rollback_boundary": "before execute: retain old namespace; after execute starts: fresh namespace forward-fix only",
         }
         return self._write_receipt("plan", receipt)
+
+    def verify_complete(
+        self,
+        plan_path: Path,
+        supplied_plan_sha256: str,
+    ) -> VerifiedResetCompletion:
+        """Read-only proof that the exact reviewed reset reached its final receipt."""
+
+        if not HEX_SHA256.fullmatch(supplied_plan_sha256):
+            raise ResetError("reset plan SHA-256 must be exact lowercase hex")
+        plan, actual_plan_digest = read_json_file(
+            plan_path,
+            "reset plan receipt",
+            canonical=True,
+        )
+        if actual_plan_digest != supplied_plan_sha256:
+            raise ResetError("reset plan receipt SHA-256 drifted")
+        plan_checksum = plan_path.with_suffix(".sha256")
+        expected_plan_checksum = (
+            f"{actual_plan_digest}  {plan_path.name}\n".encode("ascii")
+        )
+        if plan_checksum.exists() or plan_checksum.is_symlink():
+            if (
+                read_small_file(plan_checksum, "reset plan receipt checksum", 256)
+                != expected_plan_checksum
+            ):
+                raise ResetError(
+                    "reset plan receipt checksum does not match its canonical bytes"
+                )
+        else:
+            atomic_write_new(
+                plan_checksum,
+                expected_plan_checksum,
+                accept_exact_existing=True,
+            )
+        stable = self._validate_plan_receipt(plan)
+        stable_digest = plan["stable_preflight_sha256"]
+        authority_digest = plan["cutover_authority_sha256"]
+        common = self._receipt_common(
+            actual_plan_digest,
+            stable_digest,
+            authority_digest,
+            stable["cutover_authority"],
+        )
+        chain = self._load_receipt_chain(common, stable)
+        if "reset-complete" not in chain:
+            raise ResetError("the reviewed reset has no terminal reset-complete receipt")
+        _started_path, started, _started_digest = chain["reset-started"]
+        self._resume_preflight(stable, authority_digest, started)
+        live = self._production_cutover_authority(self._current_time())
+        if (
+            live.projection != stable["cutover_authority"]
+            or "sha256:" + sha256_bytes(canonical_bytes(live.projection))
+            != authority_digest
+        ):
+            raise ResetError("live cutover authority differs from reset-complete")
+        self._s3_empty_proof()
+        self._assert_old_usage_transport_absent()
+        self._assert_schema_absent(self.control_dsn, self.config.control_schema)
+        self._assert_schema_absent(self.usage_dsn, self.config.usage_schema)
+        complete_path, complete, complete_digest = chain["reset-complete"]
+        return VerifiedResetCompletion(
+            authority=live,
+            plan_sha256=actual_plan_digest,
+            stable_preflight_sha256=stable_digest,
+            reset_complete_path=complete_path,
+            reset_complete_sha256="sha256:" + complete_digest,
+            reset_complete=complete,
+        )
 
     def apply(
         self,
