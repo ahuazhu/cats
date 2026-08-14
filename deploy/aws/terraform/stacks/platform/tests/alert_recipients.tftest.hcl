@@ -45,6 +45,7 @@ override_module {
     cluster_arn               = "arn:aws:eks:us-east-1:123456789012:cluster/cats-production"
     cluster_endpoint          = "https://cluster.example.invalid"
     cluster_security_group_id = "sg-0123456789abcdef0"
+    node_role_name            = "cats-production-node"
   }
 }
 
