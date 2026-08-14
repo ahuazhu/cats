@@ -20,7 +20,7 @@ use cats_api::runtime_reconciliation::{
     Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization, Generation, Hostname,
     HttpProtocol, Id, NodeIdentityState, Operation, OperationPhase, OperationTerminal, RandomId128,
     Revision, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, UnixMillis, VolumeAccess,
-    VolumeAcquire, VolumeDisposition,
+    VolumeAcquire, VolumeDisposition, VolumeIntent,
 };
 use cats_storage::authority::{
     AuthorityError, RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord,
@@ -45,13 +45,14 @@ use super::product_rows::{
     load_any_disk_by_filesystem_uuid_for_update, load_any_disk_by_id_for_update,
     load_any_disk_by_initialization_token_for_update, load_any_disk_by_name_unlocked,
     load_api_result_for_update, load_cat_by_id_for_update, load_cat_by_name_unlocked,
-    load_desired_by_network_id_unlocked, load_desired_for_update, load_desired_unlocked,
-    load_disk_by_id_for_update, load_disk_by_name_for_update, load_endpoint_by_cat_name_unlocked,
-    load_endpoint_by_id_for_update, load_endpoint_by_id_unlocked, load_hostname_lookup_for_update,
-    load_hostname_lookup_unlocked, load_hostname_lookups_by_cat_unlocked,
-    load_operation_by_cat_revision_for_update, load_operation_by_cat_revision_unlocked,
-    load_operation_by_workspace_unlocked, load_operation_for_update, load_operation_unlocked,
-    load_pending_operation_by_cat_for_update, load_root_disk_by_cat_unlocked, replace_desired,
+    load_desired_by_disk_unlocked, load_desired_by_network_id_unlocked, load_desired_for_update,
+    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_name_for_update,
+    load_endpoint_by_cat_name_unlocked, load_endpoint_by_id_for_update,
+    load_endpoint_by_id_unlocked, load_hostname_lookup_for_update, load_hostname_lookup_unlocked,
+    load_hostname_lookups_by_cat_unlocked, load_operation_by_cat_revision_for_update,
+    load_operation_by_cat_revision_unlocked, load_operation_by_workspace_unlocked,
+    load_operation_for_update, load_operation_unlocked, load_pending_operation_by_cat_for_update,
+    load_root_disk_by_cat_unlocked, persistent_intent_identity_exists_unlocked, replace_desired,
     update_operation,
 };
 use super::route_epoch_engine::{
@@ -62,7 +63,8 @@ use super::rows::{
     volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
-    lock_placement_admission_for_desired_mutation, validate_require_idle_attempt_source_in,
+    load_placement_admission_at_in_checked, lock_placement_admission_for_desired_mutation,
+    placement_admission_has_stable_cold_in, validate_require_idle_attempt_source_in,
     validate_require_idle_busy_evidence_in, validate_require_idle_open_busy_proof_in,
     PlacementAdmissionLoad, PlacementAdmissionSnapshot,
 };
@@ -440,7 +442,30 @@ pub(crate) struct CoveredDesiredMutationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DesiredVolumeMutation {
     Preserve,
-    DeleteCat { delete_id: Id },
+    DeleteCat {
+        delete_id: Id,
+    },
+    AttachPersistent {
+        disk_id: Id,
+        volume_id: Id,
+        volume_intent_id: Id,
+        attachment_id: Id,
+    },
+    DetachPersistent {
+        disk_id: Id,
+        volume_id: Id,
+        volume_intent_id: Id,
+        attachment_id: Id,
+    },
+}
+
+impl DesiredVolumeMutation {
+    fn requires_stable_cold(&self) -> bool {
+        matches!(
+            self,
+            Self::AttachPersistent { .. } | Self::DetachPersistent { .. }
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -776,6 +801,7 @@ pub(crate) enum CandidateCollision {
     NetworkId,
     InitializationToken,
     FilesystemUuid,
+    VolumeIntentIdentity,
 }
 
 #[derive(Debug)]
@@ -2064,6 +2090,31 @@ fn commit_desired_publication_in(
         }
     }
 
+    // Attach/detach consumes the current session's complete, fresh inventory
+    // under the same NodeIdentity barrier as Desired publication. A historical
+    // Cold observation or an unlocked preflight read is never mutation
+    // authority.
+    let binding_admission = if publication.volume_mutation.requires_stable_cold() {
+        let now = database_now(transaction)?;
+        let mut checkpoint = |transaction: &mut Transaction<'_>| {
+            checkpoint_covered_commit(transaction, commit_state)
+        };
+        match load_placement_admission_at_in_checked(
+            transaction,
+            &publication.expected_current.placement.node_id,
+            publication.active_guest_digest,
+            now,
+            &mut checkpoint,
+        )? {
+            PlacementAdmissionLoad::Accepted(admission) => Some(admission),
+            PlacementAdmissionLoad::Rejected(_) => {
+                return Ok(DesiredPublicationOutcome::Stale);
+            }
+        }
+    } else {
+        None
+    };
+
     // A committed system event normally returned from the retained Operation
     // lookup before entering this suffix. Two concurrent publishers can both
     // miss that first unlocked read, however; the NodeIdentity prefix above
@@ -2146,8 +2197,30 @@ fn commit_desired_publication_in(
         }
     }
 
-    let locked_volumes =
-        lock_desired_mutation_volumes(transaction, publication.expected_current, commit_state)?;
+    if let DesiredVolumeMutation::AttachPersistent {
+        volume_intent_id,
+        attachment_id,
+        ..
+    } = publication.volume_mutation
+    {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        lock_candidate_id(transaction, "persistent-attachment", attachment_id)?;
+        checkpoint_covered_commit(transaction, commit_state)?;
+        lock_candidate_id(transaction, "persistent-volume-intent", volume_intent_id)?;
+        if persistent_intent_identity_exists_unlocked(transaction, volume_intent_id, attachment_id)?
+        {
+            return Ok(DesiredPublicationOutcome::CandidateCollision(
+                CandidateCollision::VolumeIntentIdentity,
+            ));
+        }
+    }
+
+    let locked_volumes = lock_desired_mutation_volumes(
+        transaction,
+        publication.expected_current,
+        publication.desired,
+        commit_state,
+    )?;
     checkpoint_covered_commit(transaction, commit_state)?;
     let Some(cat) = load_cat_by_id_for_update(transaction, &publication.expected_current.cat_id)?
     else {
@@ -2160,14 +2233,16 @@ fn commit_desired_publication_in(
             "current Desired belongs to another Workspace",
         ));
     }
-    validate_desired_mutation_disks(
+    if !validate_desired_mutation_disks(
         transaction,
         publication.expected_current,
         publication.desired,
         publication.volume_mutation,
         &locked_volumes,
         commit_state,
-    )?;
+    )? {
+        return Ok(DesiredPublicationOutcome::Stale);
+    }
 
     checkpoint_covered_commit(transaction, commit_state)?;
     let Some(current) = load_desired_for_update(transaction, &publication.expected_current.cat_id)?
@@ -2191,6 +2266,12 @@ fn commit_desired_publication_in(
             return Ok(DesiredPublicationOutcome::Replayed);
         }
         return Ok(DesiredPublicationOutcome::Stale);
+    }
+    if let Some(admission) = binding_admission.as_deref() {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        if !placement_admission_has_stable_cold_in(transaction, admission, &current)? {
+            return Ok(DesiredPublicationOutcome::Stale);
+        }
     }
 
     lock_desired_mutation_endpoint_graph(
@@ -2226,6 +2307,11 @@ fn commit_desired_publication_in(
         return Err(stored_corruption("current Desired has no exact Operation"));
     };
     validate_operation_binding(&current_operation, &current)?;
+    if publication.volume_mutation.requires_stable_cold()
+        && current_operation.phase != OperationPhase::Succeeded
+    {
+        return Ok(DesiredPublicationOutcome::Stale);
+    }
     if current_operation.phase == OperationPhase::Superseded {
         return Err(stored_corruption(
             "current Desired is bound to an already-superseded Operation",
@@ -2321,28 +2407,35 @@ fn commit_desired_publication_in(
 
 fn lock_desired_mutation_volumes(
     transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
     desired: &DesiredRuntimeSpec,
     commit_state: Option<&CoveredCommitState>,
 ) -> AuthorityTxResult<BTreeMap<Id, VolumeRecord>> {
-    let mut intents = desired.volumes.iter().collect::<Vec<_>>();
-    intents.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+    let mut intents = BTreeMap::<Id, Vec<&VolumeIntent>>::new();
+    for intent in expected_current.volumes.iter().chain(&desired.volumes) {
+        intents
+            .entry(intent.volume_id.clone())
+            .or_default()
+            .push(intent);
+    }
     let mut volumes = BTreeMap::new();
-    for intent in intents {
+    for (volume_id, matching_intents) in intents {
         checkpoint_covered_commit(transaction, commit_state)?;
-        lock_candidate_id(transaction, "volume", &intent.volume_id)?;
+        lock_candidate_id(transaction, "volume", &volume_id)?;
         checkpoint_covered_commit(transaction, commit_state)?;
-        let volume = load_volume_for_update(transaction, &intent.volume_id)?
-            .ok_or_else(|| stored_corruption("current Desired Volume disappeared"))?;
-        if volume.volume_id != intent.volume_id
-            || volume.size_bytes != intent.size_bytes
-            || !volume_durability_matches(intent.durability, volume.durability)
-            || !matches!(volume.admin_state, VolumeAdminState::Active)
-        {
+        let volume = load_volume_for_update(transaction, &volume_id)?
+            .ok_or_else(|| stored_corruption("participating Desired Volume disappeared"))?;
+        if matching_intents.iter().any(|intent| {
+            volume.volume_id != intent.volume_id
+                || volume.size_bytes != intent.size_bytes
+                || !volume_durability_matches(intent.durability, volume.durability)
+                || !matches!(volume.admin_state, VolumeAdminState::Active)
+        }) {
             return Err(stored_corruption(
-                "current Desired Volume authority does not match its intent",
+                "participating Desired Volume authority does not match its intent",
             ));
         }
-        volumes.insert(intent.volume_id.clone(), volume);
+        volumes.insert(volume_id, volume);
     }
     Ok(volumes)
 }
@@ -2354,15 +2447,17 @@ fn validate_desired_mutation_disks(
     volume_mutation: &DesiredVolumeMutation,
     volumes: &BTreeMap<Id, VolumeRecord>,
     commit_state: Option<&CoveredCommitState>,
-) -> AuthorityTxResult<()> {
-    let mut intents = expected_current.volumes.iter().collect::<Vec<_>>();
-    intents.sort_by(|left, right| left.disk_id.cmp(&right.disk_id));
-    for intent in intents {
+) -> AuthorityTxResult<bool> {
+    let mut intents = BTreeMap::<Id, &VolumeIntent>::new();
+    for intent in expected_current.volumes.iter().chain(&desired.volumes) {
+        intents.insert(intent.disk_id.clone(), intent);
+    }
+    for (disk_id, intent) in intents {
         checkpoint_covered_commit(transaction, commit_state)?;
-        lock_candidate_id(transaction, "disk", &intent.disk_id)?;
+        lock_candidate_id(transaction, "disk", &disk_id)?;
         checkpoint_covered_commit(transaction, commit_state)?;
-        let disk = load_disk_by_id_for_update(transaction, &intent.disk_id)?
-            .ok_or_else(|| stored_corruption("current Desired Disk disappeared"))?;
+        let disk = load_disk_by_id_for_update(transaction, &disk_id)?
+            .ok_or_else(|| stored_corruption("participating Desired Disk disappeared"))?;
         let volume = volumes
             .get(&intent.volume_id)
             .ok_or_else(|| stored_corruption("locked Desired Volume set is incomplete"))?;
@@ -2413,7 +2508,73 @@ fn validate_desired_mutation_disks(
             }
         }
     }
-    Ok(())
+
+    let (disk_id, volume_id, volume_intent_id, attachment_id, source, expect_bound) =
+        match volume_mutation {
+            DesiredVolumeMutation::AttachPersistent {
+                disk_id,
+                volume_id,
+                volume_intent_id,
+                attachment_id,
+            } => (
+                disk_id,
+                volume_id,
+                volume_intent_id,
+                attachment_id,
+                desired,
+                false,
+            ),
+            DesiredVolumeMutation::DetachPersistent {
+                disk_id,
+                volume_id,
+                volume_intent_id,
+                attachment_id,
+            } => (
+                disk_id,
+                volume_id,
+                volume_intent_id,
+                attachment_id,
+                expected_current,
+                true,
+            ),
+            DesiredVolumeMutation::Preserve | DesiredVolumeMutation::DeleteCat { .. } => {
+                return Ok(true);
+            }
+        };
+    let Some(intent) = source.volumes.iter().find(|intent| {
+        intent.disk_id == *disk_id
+            && intent.volume_id == *volume_id
+            && intent.volume_intent_id == *volume_intent_id
+            && intent.attachment_id == *attachment_id
+    }) else {
+        return Err(stored_corruption(
+            "PersistentDisk mutation identity is absent from its declared Desired",
+        ));
+    };
+    let volume = volumes
+        .get(volume_id)
+        .ok_or_else(|| stored_corruption("PersistentDisk mutation Volume was not locked"))?;
+    if intent.disk_kind != DiskKind::Persistent
+        || intent.access != VolumeAccess::ReadWriteOnce
+        || intent.disposition != VolumeDisposition::Retain
+        || volume.lease_owner.is_some()
+        || volume.lease_expires_at.is_some()
+        || !matches!(
+            intent.acquire,
+            VolumeAcquire::Normal {
+                expected_unowned_epoch,
+                ..
+            } if expected_unowned_epoch == volume.lease_epoch
+        )
+    {
+        return Ok(false);
+    }
+    let binding = load_desired_by_disk_unlocked(transaction, disk_id)?;
+    Ok(if expect_bound {
+        binding.as_ref() == Some(expected_current)
+    } else {
+        binding.is_none()
+    })
 }
 
 fn volume_durability_matches(desired: Durability, stored: VolumeDurability) -> bool {
@@ -3351,6 +3512,94 @@ fn validate_desired_volume_mutation(
                 ));
             }
         }
+        DesiredVolumeMutation::AttachPersistent {
+            disk_id,
+            volume_id,
+            volume_intent_id,
+            attachment_id,
+        } => {
+            validate_persistent_binding_non_volume_successor(expected_current, desired)?;
+            let Some(intent) = desired.volumes.last() else {
+                return Err(invalid_desired_mutation_bundle(
+                    "PersistentDisk attach omitted its new VolumeIntent",
+                ));
+            };
+            if expected_current.target != RuntimeTarget::Cold
+                || desired.target != RuntimeTarget::Cold
+                || desired.volumes.len() != expected_current.volumes.len().saturating_add(1)
+                || desired.volumes[..desired.volumes.len() - 1] != expected_current.volumes
+                || intent.disk_id != *disk_id
+                || intent.volume_id != *volume_id
+                || intent.volume_intent_id != *volume_intent_id
+                || intent.attachment_id != *attachment_id
+                || intent.disk_kind != DiskKind::Persistent
+                || intent.access != VolumeAccess::ReadWriteOnce
+                || intent.disposition != VolumeDisposition::Retain
+                || intent.mount.is_none()
+                || usize::from(intent.guest_device.slot) != expected_current.volumes.len()
+                || expected_current.volumes.iter().any(|current| {
+                    current.disk_id == *disk_id
+                        || current.volume_id == *volume_id
+                        || current.volume_intent_id == *volume_intent_id
+                        || current.attachment_id == *attachment_id
+                })
+            {
+                return Err(invalid_desired_mutation_bundle(
+                    "PersistentDisk attach is not one exact appended Cold membership",
+                ));
+            }
+        }
+        DesiredVolumeMutation::DetachPersistent {
+            disk_id,
+            volume_id,
+            volume_intent_id,
+            attachment_id,
+        } => {
+            validate_persistent_binding_non_volume_successor(expected_current, desired)?;
+            let Some(index) = expected_current.volumes.iter().position(|intent| {
+                intent.disk_id == *disk_id
+                    && intent.volume_id == *volume_id
+                    && intent.volume_intent_id == *volume_intent_id
+                    && intent.attachment_id == *attachment_id
+            }) else {
+                return Err(invalid_desired_mutation_bundle(
+                    "PersistentDisk detach identity is not current",
+                ));
+            };
+            let mut remaining = expected_current.volumes.clone();
+            let removed = remaining.remove(index);
+            for (slot, intent) in remaining.iter_mut().enumerate() {
+                intent.guest_device.slot = u16::try_from(slot).map_err(|_| {
+                    invalid_desired_mutation_bundle("PersistentDisk slot does not fit u16")
+                })?;
+            }
+            if expected_current.target != RuntimeTarget::Cold
+                || desired.target != RuntimeTarget::Cold
+                || removed.disk_kind != DiskKind::Persistent
+                || removed.disposition != VolumeDisposition::Retain
+                || desired.volumes != remaining
+            {
+                return Err(invalid_desired_mutation_bundle(
+                    "PersistentDisk detach is not one exact retained Cold membership removal",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_persistent_binding_non_volume_successor(
+    expected_current: &DesiredRuntimeSpec,
+    desired: &DesiredRuntimeSpec,
+) -> Result<()> {
+    let mut normalized = desired.clone();
+    normalized.desired_revision = expected_current.desired_revision;
+    normalized.spec_digest = expected_current.spec_digest.clone();
+    normalized.volumes = expected_current.volumes.clone();
+    if normalized != *expected_current {
+        return Err(invalid_desired_mutation_bundle(
+            "PersistentDisk binding changed authority outside revision, digest and VolumeIntent set",
+        ));
     }
     Ok(())
 }

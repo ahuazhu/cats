@@ -9,10 +9,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cats_api::error::{ApiError, ErrorCode};
-use cats_api::runtime_reconciliation::{
-    spec_digest, AsciiText, DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Revision,
-    RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeDisposition,
+use cats_api::persistent_disk::{
+    PersistentDiskBindingV2Request,
+    PERSISTENT_DISK_BINDING_CONFLICT_BODY as DISK_BINDING_CONFLICT_BODY,
+    PERSISTENT_DISK_BINDING_PRECONDITION_BODY as DISK_BINDING_PRECONDITION_BODY,
 };
+use cats_api::runtime_reconciliation::{
+    spec_digest, AsciiText, DesiredRuntimeSpec, DiskKind, Durability, Epoch, Ext4MountIntent,
+    FilesystemInitialization, Generation, GuestDeviceIdentity, HostPath, Hostname, Id, RandomId128,
+    Revision, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess, VolumeAcquire,
+    VolumeDisposition, VolumeIntent,
+};
+use cats_storage::authority::{VolumeAdminState, VolumeDurability};
 use postgres::Transaction;
 use serde::Deserialize;
 
@@ -22,19 +30,25 @@ use super::placement_policy::load_policy_unlocked;
 use super::product::{
     api_request_fingerprint, ApiIdempotencyRequest, ApiIdempotencyResult, CandidateCollision,
     CoveredDesiredMutationError, CoveredDesiredMutationRequest, CoveredDiskDeleteRequest,
-    CoveredPlannedDesiredMutation, DesiredMutationCommit, DesiredVolumeMutation,
-    EndpointRecordCandidate, ExactContentType, ExactHttpResponse, IfMatchFingerprint,
+    CoveredPlannedDesiredMutation, DesiredMutationCommit, DesiredVolumeMutation, DiskAdminState,
+    DiskRole, EndpointRecordCandidate, ExactContentType, ExactHttpResponse, IfMatchFingerprint,
+    PersistentDiskInitialization,
 };
 use super::product_identity::ProductIdentitySource;
 use super::product_rows::{
-    load_cat_by_id_unlocked, load_desired_unlocked, load_endpoint_by_id_unlocked,
+    load_cat_by_id_unlocked, load_desired_by_disk_unlocked, load_desired_unlocked,
+    load_disk_by_id_unlocked, load_endpoint_by_id_unlocked,
+    load_operation_by_cat_revision_unlocked,
 };
 use super::route_epoch_engine::{
     plan_endpoint_route_mutation_in, EndpointBindingWithoutEpoch, EndpointMutation,
     RouteEpochMutationPlan,
 };
-use super::rows::{database_now, load_active_event_by_node_unlocked};
-use super::runtime_spine::{load_placement_admission_at_in, PlacementAdmissionLoad};
+use super::rows::{database_now, load_active_event_by_node_unlocked, load_volume_unlocked};
+use super::runtime_spine::{
+    load_placement_admission_at_in, placement_admission_observes_stable_cold,
+    PlacementAdmissionLoad,
+};
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result, Store};
 
@@ -46,6 +60,10 @@ pub(crate) const ENDPOINT_BIND_ROUTE: &str = "POST /v1/workspaces/{workspace}/ca
 pub(crate) const ENDPOINT_UNBIND_ROUTE: &str =
     "DELETE /v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}";
 pub(crate) const DISK_DELETE_ROUTE: &str = "DELETE /v1/workspaces/{workspace}/disks/{disk}";
+pub(crate) const DISK_ATTACH_ROUTE: &str =
+    "POST /v1/workspaces/{workspace}/disks/{disk}/actions/attach";
+pub(crate) const DISK_DETACH_ROUTE: &str =
+    "POST /v1/workspaces/{workspace}/disks/{disk}/actions/detach";
 
 const TOTAL_DEADLINE: Duration = Duration::from_secs(10);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
@@ -105,8 +123,20 @@ pub(crate) enum ProductMutation {
     Lifecycle(CatLifecycleAction),
     DeleteCat,
     BindEndpoint(EndpointBindBody),
-    UnbindEndpoint { endpoint_id: Id },
-    DeleteDisk { disk_id: Id },
+    UnbindEndpoint {
+        endpoint_id: Id,
+    },
+    DeleteDisk {
+        disk_id: Id,
+    },
+    AttachDisk {
+        disk_id: Id,
+        binding: PersistentDiskBindingV2Request,
+    },
+    DetachDisk {
+        disk_id: Id,
+        binding: PersistentDiskBindingV2Request,
+    },
 }
 
 impl ProductMutation {
@@ -117,12 +147,23 @@ impl ProductMutation {
             Self::BindEndpoint(_) => ENDPOINT_BIND_ROUTE,
             Self::UnbindEndpoint { .. } => ENDPOINT_UNBIND_ROUTE,
             Self::DeleteDisk { .. } => DISK_DELETE_ROUTE,
+            Self::AttachDisk { .. } => DISK_ATTACH_ROUTE,
+            Self::DetachDisk { .. } => DISK_DETACH_ROUTE,
         }
     }
 
     fn has_json_body(&self) -> bool {
-        matches!(self, Self::BindEndpoint(_))
+        matches!(
+            self,
+            Self::BindEndpoint(_) | Self::AttachDisk { .. } | Self::DetachDisk { .. }
+        )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistentDiskBindingAction {
+    Attach,
+    Detach,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +324,60 @@ pub(crate) fn parse_authorized_endpoint_bind(
     Ok(ingress)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_authorized_persistent_disk_binding(
+    authenticated_workspace_id: &Id,
+    disk_id: &str,
+    received_at: Instant,
+    raw_path_and_query: &[u8],
+    fields: &ProductMutationHttpFields,
+    raw_body: &[u8],
+    action: PersistentDiskBindingAction,
+) -> Result<AuthorizedProductMutationIngress> {
+    let disk_id = Id::new(disk_id.to_owned())
+        .ok_or_else(|| ApiError::invalid("Disk ID is not a canonical runtime ID"))?;
+    if !disk_id.as_str().starts_with("disk_") {
+        return Err(ApiError::invalid("Disk ID is not an immutable Disk ID"));
+    }
+    let placeholder = PersistentDiskBindingV2Request {
+        cat_id: Id::new("placeholder").expect("static placeholder ID is valid"),
+        mount_path: HostPath::new("/placeholder").expect("static placeholder path is valid"),
+    };
+    let mutation = match action {
+        PersistentDiskBindingAction::Attach => ProductMutation::AttachDisk {
+            disk_id: disk_id.clone(),
+            binding: placeholder,
+        },
+        PersistentDiskBindingAction::Detach => ProductMutation::DetachDisk {
+            disk_id: disk_id.clone(),
+            binding: placeholder,
+        },
+    };
+    let mut ingress = parse_authorized_product_mutation(
+        authenticated_workspace_id,
+        None,
+        received_at,
+        raw_path_and_query,
+        fields,
+        raw_body,
+        mutation,
+    )?;
+    let mut decoder = serde_json::Deserializer::from_slice(raw_body);
+    let binding = PersistentDiskBindingV2Request::deserialize(&mut decoder)
+        .map_err(|_| ApiError::invalid("PersistentDisk binding body is malformed"))?;
+    decoder
+        .end()
+        .map_err(|_| ApiError::invalid("PersistentDisk binding body has a non-whitespace tail"))?;
+    binding
+        .validate()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    ingress.mutation = match action {
+        PersistentDiskBindingAction::Attach => ProductMutation::AttachDisk { disk_id, binding },
+        PersistentDiskBindingAction::Detach => ProductMutation::DetachDisk { disk_id, binding },
+    };
+    Ok(ingress)
+}
+
 fn validate_canonical_path(
     workspace_id: &Id,
     cat_id: Option<&Id>,
@@ -321,6 +416,18 @@ fn validate_canonical_path(
                 return Err(ApiError::invalid("Disk delete cannot carry a Cat ID"));
             }
             format!("/v1/workspaces/{workspace_id}/disks/{disk_id}")
+        }
+        ProductMutation::AttachDisk { disk_id, .. } => {
+            if cat_id.is_some() {
+                return Err(ApiError::invalid("Disk attach cannot carry a path Cat ID"));
+            }
+            format!("/v1/workspaces/{workspace_id}/disks/{disk_id}/actions/attach")
+        }
+        ProductMutation::DetachDisk { disk_id, .. } => {
+            if cat_id.is_some() {
+                return Err(ApiError::invalid("Disk detach cannot carry a path Cat ID"));
+            }
+            format!("/v1/workspaces/{workspace_id}/disks/{disk_id}/actions/detach")
         }
     };
     if raw != expected.as_bytes() {
@@ -450,6 +557,298 @@ fn enrich_lifecycle_placement_in(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_persistent_disk_binding_in(
+    transaction: &mut Transaction<'_>,
+    ingress: &AuthorizedProductMutationIngress,
+    disk_id: &Id,
+    binding: &PersistentDiskBindingV2Request,
+    action: PersistentDiskBindingAction,
+    attach_candidate: Option<&PersistentDiskAttachCandidate>,
+    operation_id: Id,
+    active_guest_digest: &Sha256Digest,
+) -> AuthorityTxResult<CoveredPlannedDesiredMutation> {
+    let workspace_id = &ingress.idempotency.authenticated_workspace_id;
+    let snapshot = load_lifecycle_snapshot_in(transaction, workspace_id, &binding.cat_id)?;
+    if ingress
+        .if_match
+        .is_some_and(|if_match| if_match.get() != snapshot.current.desired_revision.get())
+    {
+        return fixed_planned_result(409, IF_MATCH_BODY);
+    }
+    let disk = load_disk_by_id_unlocked(transaction, disk_id)?
+        .filter(|disk| disk.workspace_id == *workspace_id)
+        .ok_or_else(|| ApiError::not_found("Disk"))?;
+    let volume = load_volume_unlocked(transaction, &disk.volume_id)?
+        .ok_or_else(|| ApiError::internal("PersistentDisk Volume is missing"))?;
+    if disk.disk_id != *disk_id
+        || disk.volume_id != volume.volume_id
+        || disk.size_bytes != volume.size_bytes
+        || !stored_durability_matches(disk.durability, volume.durability)
+    {
+        return Err(ApiError::internal("PersistentDisk product authority is corrupt").into());
+    }
+    let current_binding = load_desired_by_disk_unlocked(transaction, disk_id)?;
+    let precondition = matches!(disk.admin_state, DiskAdminState::Active)
+        && matches!(volume.admin_state, VolumeAdminState::Active)
+        && volume.lease_owner.is_none()
+        && volume.lease_expires_at.is_none()
+        && snapshot.current.target == RuntimeTarget::Cold
+        && exact_settled_cold_in(transaction, &snapshot.current, active_guest_digest)?;
+
+    let (desired, volume_mutation) = match action {
+        PersistentDiskBindingAction::Attach => {
+            if current_binding.is_some() {
+                return fixed_planned_result(409, DISK_BINDING_CONFLICT_BODY);
+            }
+            let Some(candidate) = attach_candidate else {
+                return Err(ApiError::internal("Disk attach identity candidate is missing").into());
+            };
+            if !precondition || snapshot.current.volumes.len() >= 64 {
+                return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+            }
+            let DiskRole::Persistent { initialization } = &disk.role else {
+                return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+            };
+            if snapshot.current.volumes.iter().any(|intent| {
+                intent.disk_id == disk.disk_id
+                    || intent.volume_id == disk.volume_id
+                    || intent
+                        .mount
+                        .as_ref()
+                        .is_some_and(|mount| mount.mount_path == binding.mount_path)
+            }) {
+                return fixed_planned_result(409, DISK_BINDING_CONFLICT_BODY);
+            }
+            let next_revision = next_desired_revision(snapshot.current.desired_revision)?;
+            let volume_intent_id = Id::new(format!(
+                "vint_z{:016x}_{}",
+                next_revision.get(),
+                candidate.binding_random.as_str()
+            ))
+            .ok_or_else(|| ApiError::internal("Disk attach VolumeIntent ID is invalid"))?;
+            if snapshot
+                .current
+                .volumes
+                .last()
+                .is_some_and(|intent| intent.volume_intent_id >= volume_intent_id)
+            {
+                return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+            }
+            let attachment_id = Id::new(format!("att_{}", candidate.binding_random.as_str()))
+                .ok_or_else(|| ApiError::internal("Disk attach attachment ID is invalid"))?;
+            let serial = Id::new(format!(
+                "cats-pd-{}",
+                &candidate.serial_random.as_str()[..12]
+            ))
+            .ok_or_else(|| ApiError::internal("Disk attach Guest serial is invalid"))?;
+            if snapshot
+                .current
+                .volumes
+                .iter()
+                .any(|intent| intent.guest_device.serial == serial)
+            {
+                return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+            }
+            let filesystem_uuid = match initialization.as_ref() {
+                PersistentDiskInitialization::Uninitialized {
+                    filesystem_uuid, ..
+                }
+                | PersistentDiskInitialization::Initialized {
+                    filesystem_uuid, ..
+                } => filesystem_uuid.clone(),
+            };
+            let filesystem_initialization = match initialization.as_ref() {
+                PersistentDiskInitialization::Uninitialized {
+                    initialization_token,
+                    filesystem_uuid: _,
+                    expected_blank_head,
+                } => {
+                    if volume.head != *expected_blank_head {
+                        return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+                    }
+                    FilesystemInitialization::Initialize {
+                        initialization_token: initialization_token.clone(),
+                        expected_blank_head: expected_blank_head.clone(),
+                    }
+                }
+                PersistentDiskInitialization::Initialized {
+                    initialized_head, ..
+                } => {
+                    if initialized_head.generation.get() == 0
+                        || (volume.head.generation.get() < initialized_head.generation.get())
+                        || (volume.head.generation == initialized_head.generation
+                            && volume.head != *initialized_head)
+                    {
+                        return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+                    }
+                    FilesystemInitialization::Existing
+                }
+            };
+            let mut desired = snapshot.current.clone();
+            desired.desired_revision = next_revision;
+            desired.volumes.push(VolumeIntent {
+                volume_intent_id: volume_intent_id.clone(),
+                disk_id: disk.disk_id.clone(),
+                volume_id: disk.volume_id.clone(),
+                attachment_id: attachment_id.clone(),
+                size_bytes: disk.size_bytes,
+                disk_kind: DiskKind::Persistent,
+                access: VolumeAccess::ReadWriteOnce,
+                durability: intent_durability(disk.durability),
+                guest_device: GuestDeviceIdentity {
+                    serial,
+                    slot: u16::try_from(snapshot.current.volumes.len()).map_err(|_| {
+                        ApiError::failed_precondition("PersistentDisk slot space is exhausted")
+                    })?,
+                },
+                acquire: VolumeAcquire::Normal {
+                    transition_id: candidate.transition_id.clone(),
+                    expected_unowned_epoch: volume.lease_epoch,
+                },
+                disposition: VolumeDisposition::Retain,
+                mount: Some(Ext4MountIntent {
+                    filesystem_uuid,
+                    mount_path: binding.mount_path.clone(),
+                    initialization: filesystem_initialization,
+                }),
+            });
+            finalize_binding_desired(&mut desired)?;
+            (
+                desired,
+                DesiredVolumeMutation::AttachPersistent {
+                    disk_id: disk.disk_id.clone(),
+                    volume_id: disk.volume_id.clone(),
+                    volume_intent_id,
+                    attachment_id,
+                },
+            )
+        }
+        PersistentDiskBindingAction::Detach => {
+            let Some(bound) = current_binding.as_ref() else {
+                return fixed_planned_result(409, DISK_BINDING_CONFLICT_BODY);
+            };
+            let Some(index) = bound.volumes.iter().position(|intent| {
+                intent.disk_id == *disk_id
+                    && intent.disk_kind == DiskKind::Persistent
+                    && intent
+                        .mount
+                        .as_ref()
+                        .is_some_and(|mount| mount.mount_path == binding.mount_path)
+            }) else {
+                return fixed_planned_result(409, DISK_BINDING_CONFLICT_BODY);
+            };
+            if bound != &snapshot.current || bound.cat_id != binding.cat_id {
+                return fixed_planned_result(409, DISK_BINDING_CONFLICT_BODY);
+            }
+            if !precondition {
+                return fixed_planned_result(412, DISK_BINDING_PRECONDITION_BODY);
+            }
+            let removed = snapshot.current.volumes[index].clone();
+            let mut desired = snapshot.current.clone();
+            desired.desired_revision = next_desired_revision(desired.desired_revision)?;
+            desired.volumes.remove(index);
+            for (slot, intent) in desired.volumes.iter_mut().enumerate() {
+                intent.guest_device.slot = u16::try_from(slot).map_err(|_| {
+                    ApiError::failed_precondition("PersistentDisk slot space is exhausted")
+                })?;
+            }
+            finalize_binding_desired(&mut desired)?;
+            (
+                desired,
+                DesiredVolumeMutation::DetachPersistent {
+                    disk_id: removed.disk_id,
+                    volume_id: removed.volume_id,
+                    volume_intent_id: removed.volume_intent_id,
+                    attachment_id: removed.attachment_id,
+                },
+            )
+        }
+    };
+    Ok(CoveredPlannedDesiredMutation::Mutation {
+        request: Box::new(CoveredDesiredMutationRequest {
+            idempotency: ingress.idempotency.clone(),
+            expected_current: snapshot.current,
+            desired,
+            operation_id,
+            placement_snapshots: Vec::new(),
+            active_guest_digest: active_guest_digest.clone(),
+            endpoint_records: snapshot.endpoint_records,
+            volume_mutation,
+            require_idle_open_busy_proof: None,
+        }),
+        fixed_collision: None,
+    })
+}
+
+fn exact_settled_cold_in(
+    transaction: &mut Transaction<'_>,
+    desired: &DesiredRuntimeSpec,
+    active_guest_digest: &Sha256Digest,
+) -> AuthorityTxResult<bool> {
+    let operation = load_operation_by_cat_revision_unlocked(
+        transaction,
+        &desired.cat_id,
+        desired.desired_revision,
+    )?
+    .ok_or_else(|| ApiError::internal("current Desired has no exact Operation"))?;
+    if operation.workspace_id != desired.workspace_id
+        || operation.cat_id != desired.cat_id
+        || operation.desired_revision != desired.desired_revision
+        || operation.desired_spec_digest != desired.spec_digest
+        || operation.placement != desired.placement
+        || operation.target != desired.target
+    {
+        return Err(ApiError::internal("current Desired/Operation binding is corrupt").into());
+    }
+    if operation.phase != cats_api::runtime_reconciliation::OperationPhase::Succeeded {
+        return Ok(false);
+    }
+    let now = database_now(transaction)?;
+    let admission = match load_placement_admission_at_in(
+        transaction,
+        &desired.placement.node_id,
+        active_guest_digest,
+        now,
+    )? {
+        PlacementAdmissionLoad::Accepted(admission) => admission,
+        PlacementAdmissionLoad::Rejected(_) => return Ok(false),
+    };
+    Ok(placement_admission_observes_stable_cold(
+        &admission, desired,
+    ))
+}
+
+fn next_desired_revision(current: Revision) -> Result<Revision> {
+    current
+        .get()
+        .checked_add(1)
+        .and_then(Revision::new)
+        .ok_or_else(|| ApiError::failed_precondition("Desired revision is exhausted"))
+}
+
+fn finalize_binding_desired(desired: &mut DesiredRuntimeSpec) -> Result<()> {
+    desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+    desired.spec_digest = spec_digest(desired)
+        .map_err(|_| ApiError::internal("constructed PersistentDisk Desired is invalid"))?;
+    Ok(())
+}
+
+fn intent_durability(durability: VolumeDurability) -> Durability {
+    match durability {
+        VolumeDurability::Strict => Durability::Strict,
+        VolumeDurability::Relaxed => Durability::Relaxed,
+    }
+}
+
+fn stored_durability_matches(left: VolumeDurability, right: VolumeDurability) -> bool {
+    matches!(
+        (left, right),
+        (VolumeDurability::Strict, VolumeDurability::Strict)
+            | (VolumeDurability::Relaxed, VolumeDurability::Relaxed)
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProductMutationHttpResult {
     pub(crate) http_status: u16,
@@ -511,6 +910,22 @@ enum PlannedProductMutationRequest {
         mutation: EndpointMutation,
         operation_id: Id,
     },
+    PersistentDisk {
+        ingress: AuthorizedProductMutationIngress,
+        disk_id: Id,
+        binding: PersistentDiskBindingV2Request,
+        action: PersistentDiskBindingAction,
+        attach_candidate: Option<PersistentDiskAttachCandidate>,
+        operation_id: Id,
+        active_guest_digest: Sha256Digest,
+    },
+}
+
+#[derive(Clone)]
+struct PersistentDiskAttachCandidate {
+    binding_random: RandomId128,
+    transition_id: RandomId128,
+    serial_random: RandomId128,
 }
 
 impl Store {
@@ -521,7 +936,8 @@ impl Store {
     ) -> std::result::Result<DesiredMutationCommit, CoveredDesiredMutationError> {
         let idempotency = match request {
             PlannedProductMutationRequest::Lifecycle { ingress, .. }
-            | PlannedProductMutationRequest::Endpoint { ingress, .. } => {
+            | PlannedProductMutationRequest::Endpoint { ingress, .. }
+            | PlannedProductMutationRequest::PersistentDisk { ingress, .. } => {
                 ingress.idempotency.clone()
             }
         };
@@ -631,6 +1047,24 @@ impl Store {
                         )),
                     })
                 }
+                PlannedProductMutationRequest::PersistentDisk {
+                    ingress,
+                    disk_id,
+                    binding,
+                    action,
+                    attach_candidate,
+                    operation_id,
+                    active_guest_digest,
+                } => plan_persistent_disk_binding_in(
+                    transaction,
+                    ingress,
+                    disk_id,
+                    binding,
+                    *action,
+                    attach_candidate.as_ref(),
+                    operation_id.clone(),
+                    active_guest_digest,
+                ),
             }
         })
     }
@@ -707,6 +1141,26 @@ impl ProductMutationService {
             (ProductMutation::DeleteCat, Some(cat_id)) => (None, cat_id),
             (ProductMutation::DeleteDisk { disk_id }, None) => {
                 return self.delete_disk(ingress, disk_id).await;
+            }
+            (ProductMutation::AttachDisk { disk_id, binding }, None) => {
+                return self
+                    .mutate_persistent_disk(
+                        ingress,
+                        disk_id,
+                        binding,
+                        PersistentDiskBindingAction::Attach,
+                    )
+                    .await;
+            }
+            (ProductMutation::DetachDisk { disk_id, binding }, None) => {
+                return self
+                    .mutate_persistent_disk(
+                        ingress,
+                        disk_id,
+                        binding,
+                        PersistentDiskBindingAction::Detach,
+                    )
+                    .await;
             }
             (ProductMutation::BindEndpoint(body), Some(cat_id)) => {
                 return self
@@ -827,6 +1281,57 @@ impl ProductMutationService {
         Err(ProductMutationServiceError::TemporarilyUnavailable)
     }
 
+    async fn mutate_persistent_disk(
+        &self,
+        ingress: AuthorizedProductMutationIngress,
+        disk_id: Id,
+        binding: PersistentDiskBindingV2Request,
+        action: PersistentDiskBindingAction,
+    ) -> std::result::Result<ProductMutationHttpResult, ProductMutationServiceError> {
+        let mut shutdown = self.admission.subscribe();
+        for _ in 0..MAX_REPLANS {
+            if Instant::now() >= ingress.absolute_deadline || !*shutdown.borrow() {
+                return Err(ProductMutationServiceError::TemporarilyUnavailable);
+            }
+            let attach_candidate = (action == PersistentDiskBindingAction::Attach)
+                .then(|| {
+                    Ok::<_, ApiError>(PersistentDiskAttachCandidate {
+                        binding_random: self.identities.random_id()?,
+                        transition_id: self.identities.random_id()?,
+                        serial_random: self.identities.random_id()?,
+                    })
+                })
+                .transpose()?;
+            let operation_id = prefixed_id("op_", self.identities.random_id()?)?;
+            let planned = PlannedProductMutationRequest::PersistentDisk {
+                ingress: ingress.clone(),
+                disk_id: disk_id.clone(),
+                binding: binding.clone(),
+                action,
+                attach_candidate,
+                operation_id,
+                active_guest_digest: self.active_guest_digest.clone(),
+            };
+            match self
+                .commit(planned, ingress.absolute_deadline, &mut shutdown)
+                .await?
+            {
+                CommitOutcome::Committed(result) => return Ok(http_result(result)),
+                CommitOutcome::Stale
+                | CommitOutcome::CandidateCollision(CandidateCollision::OperationId)
+                | CommitOutcome::CandidateCollision(CandidateCollision::VolumeIntentIdentity) => {
+                    continue;
+                }
+                CommitOutcome::CandidateCollision(_) => {
+                    return Err(ProductMutationServiceError::Fatal(ApiError::internal(
+                        "PersistentDisk mutation returned an impossible candidate collision",
+                    )));
+                }
+            }
+        }
+        Err(ProductMutationServiceError::TemporarilyUnavailable)
+    }
+
     async fn delete_disk(
         &self,
         ingress: AuthorizedProductMutationIngress,
@@ -895,7 +1400,8 @@ impl ProductMutationService {
     ) -> std::result::Result<CommitOutcome, ProductMutationServiceError> {
         let resolution_request = match &planned {
             PlannedProductMutationRequest::Lifecycle { ingress, .. }
-            | PlannedProductMutationRequest::Endpoint { ingress, .. } => {
+            | PlannedProductMutationRequest::Endpoint { ingress, .. }
+            | PlannedProductMutationRequest::PersistentDisk { ingress, .. } => {
                 ingress.idempotency.clone()
             }
         };
@@ -1275,6 +1781,102 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn persistent_disk_binding_parser_uses_only_clean_slate_exact_routes() {
+        let workspace = id("ws_binding");
+        let mut binding_fields = fields(&[]);
+        binding_fields.content_type = vec![b"application/json".to_vec()];
+        let body = br#"{"cat_id":"cat_binding","mount_path":"/srv/data"}"#;
+        let attach_path = b"/v1/workspaces/ws_binding/disks/disk_binding/actions/attach";
+        let attach = parse_authorized_persistent_disk_binding(
+            &workspace,
+            "disk_binding",
+            Instant::now(),
+            attach_path,
+            &binding_fields,
+            body,
+            PersistentDiskBindingAction::Attach,
+        )
+        .unwrap();
+        assert!(matches!(
+            attach.mutation,
+            ProductMutation::AttachDisk {
+                disk_id,
+                binding: PersistentDiskBindingV2Request { cat_id, mount_path },
+            } if disk_id == id("disk_binding")
+                && cat_id == id("cat_binding")
+                && mount_path.as_str() == "/srv/data"
+        ));
+        assert_eq!(
+            attach.idempotency.canonical_route.as_str(),
+            DISK_ATTACH_ROUTE
+        );
+
+        let detach_path = b"/v1/workspaces/ws_binding/disks/disk_binding/actions/detach";
+        let detach = parse_authorized_persistent_disk_binding(
+            &workspace,
+            "disk_binding",
+            Instant::now(),
+            detach_path,
+            &binding_fields,
+            body,
+            PersistentDiskBindingAction::Detach,
+        )
+        .unwrap();
+        assert!(matches!(
+            detach.mutation,
+            ProductMutation::DetachDisk { .. }
+        ));
+        assert_eq!(
+            detach.idempotency.canonical_route.as_str(),
+            DISK_DETACH_ROUTE
+        );
+
+        for retired_or_aliased in [
+            b"/v1/workspaces/ws_binding/disks/disk_binding/actions/mount".as_slice(),
+            b"/v1/workspaces/ws_binding/disks/disk_binding/actions/unmount".as_slice(),
+            b"/v1/workspaces/ws_binding/disks/disk_binding/actions/attach?".as_slice(),
+        ] {
+            assert!(parse_authorized_persistent_disk_binding(
+                &workspace,
+                "disk_binding",
+                Instant::now(),
+                retired_or_aliased,
+                &binding_fields,
+                body,
+                PersistentDiskBindingAction::Attach,
+            )
+            .is_err());
+        }
+        for malformed in [
+            br#"{"cat_id":"dev","mount_path":"/srv/data"}"#.as_slice(),
+            br#"{"cat_id":"cat_binding","mount_path":"/"}"#.as_slice(),
+            br#"{"cat_id":"cat_binding","mount_path":"/srv/data","mount_at":"/legacy"}"#,
+            br#"{"cat_id":"cat_binding","mount_path":"relative"}"#,
+        ] {
+            assert!(parse_authorized_persistent_disk_binding(
+                &workspace,
+                "disk_binding",
+                Instant::now(),
+                attach_path,
+                &binding_fields,
+                malformed,
+                PersistentDiskBindingAction::Attach,
+            )
+            .is_err());
+        }
+        assert!(parse_authorized_persistent_disk_binding(
+            &workspace,
+            "data",
+            Instant::now(),
+            b"/v1/workspaces/ws_binding/disks/data/actions/attach",
+            &binding_fields,
+            body,
+            PersistentDiskBindingAction::Attach,
+        )
+        .is_err());
     }
 
     #[test]

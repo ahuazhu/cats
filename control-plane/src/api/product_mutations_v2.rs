@@ -12,8 +12,9 @@ use cats_api::runtime_reconciliation::Id;
 use super::{check_workspace_auth, require_funded, ApiResult, Failure};
 use crate::server::AppState;
 use crate::store::runtime_authority::product_mutation_service::{
-    parse_authorized_endpoint_bind, parse_authorized_product_mutation,
-    product_mutation_absolute_deadline, AuthorizedProductMutationIngress, CatLifecycleAction,
+    parse_authorized_endpoint_bind, parse_authorized_persistent_disk_binding,
+    parse_authorized_product_mutation, product_mutation_absolute_deadline,
+    AuthorizedProductMutationIngress, CatLifecycleAction, PersistentDiskBindingAction,
     ProductMutation, ProductMutationHttpFields, ProductMutationHttpResult,
     ProductMutationServiceError, PRODUCT_MUTATION_MAX_BODY_BYTES,
 };
@@ -199,6 +200,66 @@ pub(crate) async fn delete_disk_v2(
         ProductMutation::DeleteDisk { disk_id },
     )
     .await?;
+    execute(&state, ingress).await
+}
+
+pub(crate) async fn attach_disk_v2(
+    State(state): State<AppState>,
+    Path((workspace, disk)): Path<(String, String)>,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    persistent_disk_binding_v2(
+        state,
+        workspace,
+        disk,
+        request,
+        PersistentDiskBindingAction::Attach,
+    )
+    .await
+}
+
+pub(crate) async fn detach_disk_v2(
+    State(state): State<AppState>,
+    Path((workspace, disk)): Path<(String, String)>,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    persistent_disk_binding_v2(
+        state,
+        workspace,
+        disk,
+        request,
+        PersistentDiskBindingAction::Detach,
+    )
+    .await
+}
+
+async fn persistent_disk_binding_v2(
+    state: AppState,
+    workspace: String,
+    disk: String,
+    request: Request<Body>,
+    action: PersistentDiskBindingAction,
+) -> ApiResult<Response> {
+    let received_at = Instant::now();
+    let deadline = product_mutation_absolute_deadline(received_at)?;
+    let scope = timeout_at(
+        deadline,
+        check_workspace_auth(&state, request.headers(), &workspace),
+    )
+    .await??;
+    let workspace_id = authenticated_workspace_id(&scope.workspace.id)?;
+    let raw_path = raw_path_and_query(request.uri());
+    let fields = http_fields(request.headers());
+    let body = timeout_at(deadline, read_body(request.into_body())).await??;
+    let ingress = parse_authorized_persistent_disk_binding(
+        &workspace_id,
+        &disk,
+        received_at,
+        &raw_path,
+        &fields,
+        &body,
+        action,
+    )?;
     execute(&state, ingress).await
 }
 

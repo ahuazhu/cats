@@ -597,6 +597,14 @@ pub fn router(state: AppState) -> Router {
                 "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
                 axum::routing::delete(unbind_endpoint_v2),
             )
+            .route(
+                "/v1/workspaces/{workspace}/disks/{disk}/actions/attach",
+                post(attach_disk_v2),
+            )
+            .route(
+                "/v1/workspaces/{workspace}/disks/{disk}/actions/detach",
+                post(detach_disk_v2),
+            )
     };
     #[cfg(not(debug_assertions))]
     let product_mutations_v2 = Router::new()
@@ -619,6 +627,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
             axum::routing::delete(unbind_endpoint_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks/{disk}/actions/attach",
+            post(attach_disk_v2),
+        )
+        .route(
+            "/v1/workspaces/{workspace}/disks/{disk}/actions/detach",
+            post(detach_disk_v2),
         );
     #[cfg(debug_assertions)]
     let retired_cat_action = if state.retired_product_authority_for_tests() {
@@ -1023,6 +1039,10 @@ mod tests {
         routes.push("GET /v1/workspaces/{workspace}/disks/{disk}".to_string());
         routes.sort();
         routes.dedup();
+        assert!(!routes.iter().any(|route| {
+            route.contains("/disks/{disk}/actions/mount")
+                || route.contains("/disks/{disk}/actions/unmount")
+        }));
 
         let expected = r#"DELETE /v1/accounts/{account}/members/{membership}
 DELETE /v1/admin/nodes/{id}
@@ -1132,6 +1152,8 @@ POST /v1/workspaces/{workspace}/cats/{cat}/endpoints
 POST /v1/workspaces/{workspace}/cats/{cat}/exec
 POST /v1/workspaces/{workspace}/cats/{cat}/oci-deployments
 POST /v1/workspaces/{workspace}/disks
+POST /v1/workspaces/{workspace}/disks/{disk}/actions/attach
+POST /v1/workspaces/{workspace}/disks/{disk}/actions/detach
 POST /v1/workspaces/{workspace}/disks/{disk}/snapshots
 POST /v1/workspaces/{workspace}/tokens
 PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend

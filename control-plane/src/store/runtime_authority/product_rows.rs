@@ -641,7 +641,6 @@ pub(super) fn load_disk_by_id_for_update(
         .transpose()
 }
 
-#[cfg(feature = "proposed-node-residue-reclamation")]
 pub(super) fn load_disk_by_id_unlocked(
     transaction: &mut Transaction<'_>,
     disk_id: &Id,
@@ -1052,6 +1051,65 @@ pub(super) fn load_desired_unlocked(
         .query_opt(&sql, &[&cat_id.as_str()])?
         .map(|row| decode_desired(&row))
         .transpose()
+}
+
+/// Resolves the sole current Desired that names a Disk. The Disk/Volume row
+/// lock is the serialization barrier for attach/detach callers; this lookup
+/// deliberately does not manufacture a second binding table.
+pub(super) fn load_desired_by_disk_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE record->'volumes' @>
+                jsonb_build_array(jsonb_build_object('disk_id', $1::text))
+          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt(()));
+    }
+    let desired = rows.first().map(decode_desired).transpose()?;
+    if desired.as_ref().is_some_and(|desired| {
+        desired
+            .volumes
+            .iter()
+            .filter(|intent| intent.disk_id == *disk_id)
+            .count()
+            != 1
+    }) {
+        return Err(corrupt(()));
+    }
+    Ok(desired)
+}
+
+/// Candidate collision probe for the two identities that are globally unique
+/// in one Node's complete Desired set. Callers hold both namespaced advisory
+/// candidate locks before invoking this read.
+pub(super) fn persistent_intent_identity_exists_unlocked(
+    transaction: &mut Transaction<'_>,
+    volume_intent_id: &Id,
+    attachment_id: &Id,
+) -> AuthorityTxResult<bool> {
+    transaction
+        .query_one(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM desired_runtime_specs
+                     WHERE record->'volumes' @> jsonb_build_array(
+                         jsonb_build_object('volume_intent_id', $1::text)
+                     )
+                ) OR EXISTS (
+                    SELECT 1 FROM desired_runtime_specs
+                     WHERE record->'volumes' @> jsonb_build_array(
+                         jsonb_build_object('attachment_id', $2::text)
+                     )
+                ) AS present",
+            &[&volume_intent_id.as_str(), &attachment_id.as_str()],
+        )
+        .map(|row| row.get("present"))
+        .map_err(Into::into)
 }
 
 /// Looks up the globally unique Guest network identity without introducing a

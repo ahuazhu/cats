@@ -6,6 +6,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use cats_api::error::{ApiError, ErrorCode};
+use cats_api::persistent_disk::decode_persistent_disk_binding_v2_accepted_response;
 use cats_api::runtime_reconciliation::{
     encode_desired_runtime_spec, encode_operation, guest_config_digest, spec_digest,
     AllocatableMemoryBytes, AllocatableVcpus, AsciiText, AssignedKind, AssignedPlacement,
@@ -51,13 +52,15 @@ use super::product::{
 };
 use super::product_identity::UuidProductIdentitySource;
 use super::product_mutation_service::{
-    parse_authorized_endpoint_bind, parse_authorized_product_mutation, CatLifecycleAction,
+    parse_authorized_endpoint_bind, parse_authorized_persistent_disk_binding,
+    parse_authorized_product_mutation, CatLifecycleAction, PersistentDiskBindingAction,
     ProductMutation, ProductMutationHttpFields, ProductMutationService,
     ProductMutationServiceError,
 };
 use super::product_reads::{ProductPageRead, ProductRead};
 use super::product_rows::{
-    insert_cat, insert_disk, load_cat_by_id_unlocked, load_disk_by_id_for_update,
+    insert_cat, insert_disk, load_cat_by_id_unlocked, load_desired_by_disk_unlocked,
+    load_desired_unlocked, load_disk_by_id_for_update, load_disk_by_id_unlocked,
     load_operation_by_cat_revision_unlocked, operation_by_workspace_candidates_sql,
 };
 use super::route_epoch_engine::{
@@ -66,7 +69,7 @@ use super::route_epoch_engine::{
 };
 use super::rows::{
     database_now, insert_authorization, insert_delete_completion, insert_event, insert_volume,
-    update_authorization,
+    update_authorization, update_volume,
 };
 use crate::store::{internal, DsnSource, SingletonRole, Store};
 
@@ -2262,6 +2265,381 @@ fn a2_cat_and_endpoint_cross_workspace_misses_persist_nothing() {
         })
         .unwrap();
     assert_eq!(result_count, 0);
+}
+
+#[test]
+fn persistent_disk_attach_fails_closed_before_cold_and_replays_exact_result() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "binding-precondition",
+        0xa2_701,
+        "binding-precondition-create",
+    );
+    let (_identity, _policy, release) = prepare_mutation_node(&store, &mut create, 102);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let volume = blank_volume("volume_binding_precondition");
+    let disk = persistent_disk(
+        &workspace,
+        "disk_binding_precondition",
+        "binding-precondition-data",
+        &volume,
+        PersistentDiskInitialization::Uninitialized {
+            initialization_token: random_id(0xa2_702),
+            filesystem_uuid: random_id(0xa2_703),
+            expected_blank_head: volume.head.clone(),
+        },
+    );
+    store
+        .authority_transaction(|transaction| {
+            insert_volume(transaction, &volume)?;
+            insert_disk(transaction, &disk)
+        })
+        .unwrap();
+    let store = Arc::new(store);
+    let service = ProductMutationService::new(
+        Arc::clone(&store),
+        Arc::new(UuidProductIdentitySource),
+        guest_config_digest(&release).unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fields = ProductMutationHttpFields {
+        content_type: vec![b"application/json".to_vec()],
+        idempotency_key: vec![b"binding-precondition-exact".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let path = format!(
+        "/v1/workspaces/{workspace}/disks/{}/actions/attach",
+        disk.disk_id
+    );
+    let body = format!(
+        r#"{{"cat_id":"{}","mount_path":"/srv/data"}}"#,
+        create.candidate.cat_id
+    );
+    let ingress = parse_authorized_persistent_disk_binding(
+        &workspace,
+        disk.disk_id.as_str(),
+        Instant::now(),
+        path.as_bytes(),
+        &fields,
+        body.as_bytes(),
+        PersistentDiskBindingAction::Attach,
+    )
+    .unwrap();
+    let rejected = runtime.block_on(service.mutate(ingress.clone())).unwrap();
+    assert_eq!(rejected.http_status, 412);
+    assert_eq!(runtime.block_on(service.mutate(ingress)).unwrap(), rejected);
+
+    let conflicting_body = format!(
+        r#"{{"cat_id":"{}","mount_path":"/srv/other"}}"#,
+        create.candidate.cat_id
+    );
+    let conflicting = parse_authorized_persistent_disk_binding(
+        &workspace,
+        disk.disk_id.as_str(),
+        Instant::now(),
+        path.as_bytes(),
+        &fields,
+        conflicting_body.as_bytes(),
+        PersistentDiskBindingAction::Attach,
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime.block_on(service.mutate(conflicting)),
+        Err(ProductMutationServiceError::Request(ref error))
+            if error.code == ErrorCode::Conflict
+    ));
+    store
+        .authority_transaction(|transaction| {
+            let current = load_desired_unlocked(transaction, &create.candidate.cat_id)?
+                .expect("Cat Desired remains current");
+            assert_eq!(current, create.candidate.desired);
+            assert!(load_desired_by_disk_unlocked(transaction, &disk.disk_id)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    let results: i64 = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT count(*) FROM api_idempotency_results
+                      WHERE authenticated_workspace_id=$1
+                        AND idempotency_key='binding-precondition-exact'",
+                    &[&workspace.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(results, 1);
+}
+
+#[test]
+fn persistent_disk_attach_and_detach_publish_exact_cold_membership_and_settle() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(
+        &workspace,
+        "binding-success",
+        0xa2_711,
+        "binding-success-create",
+    );
+    // Production Cat-create identities sort below every later vint_z revision
+    // identity; retain that invariant in this older product fixture.
+    create.candidate.desired.volumes[0].volume_intent_id =
+        id("vint_00000000000000000000000000000001");
+    refresh_candidate_contract(&mut create);
+    let (identity, _policy, release) = prepare_mutation_node(&store, &mut create, 103);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+    let persistent = blank_volume("volume_binding_success");
+    let disk = persistent_disk(
+        &workspace,
+        "disk_binding_success",
+        "binding-success-data",
+        &persistent,
+        PersistentDiskInitialization::Uninitialized {
+            initialization_token: random_id(0xa2_712),
+            filesystem_uuid: random_id(0xa2_713),
+            expected_blank_head: persistent.head.clone(),
+        },
+    );
+    store
+        .authority_transaction(|transaction| {
+            insert_volume(transaction, &persistent)?;
+            insert_disk(transaction, &disk)
+        })
+        .unwrap();
+    let active_digest = guest_config_digest(&release).unwrap();
+    let store = Arc::new(store);
+    let service = ProductMutationService::new(
+        Arc::clone(&store),
+        Arc::new(UuidProductIdentitySource),
+        active_digest,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let stop_fields = ProductMutationHttpFields {
+        idempotency_key: vec![b"binding-success-stop".to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let stop_path = format!(
+        "/v1/workspaces/{workspace}/cats/{}/actions/stop",
+        create.candidate.cat_id
+    );
+    let stop = parse_authorized_product_mutation(
+        &workspace,
+        Some(create.candidate.cat_id.as_str()),
+        Instant::now(),
+        stop_path.as_bytes(),
+        &stop_fields,
+        b"",
+        ProductMutation::Lifecycle(CatLifecycleAction::Stop),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.block_on(service.mutate(stop)).unwrap().http_status,
+        202
+    );
+    store
+        .authority_transaction(|transaction| {
+            let mut root = super::rows::load_volume_for_update(
+                transaction,
+                &create.candidate.volume.volume_id,
+            )?
+            .expect("Root Volume exists");
+            root.head = RemoteHead {
+                generation: generation(1),
+                root_hash: Some(Sha256Digest::from_bytes([0x71; 32])),
+                root_object_id: Some(AsciiText::new("root-binding-success").unwrap()),
+            };
+            update_volume(transaction, &root)
+        })
+        .unwrap();
+    super::runtime_spine_tests::refresh_assigned_stable_cold_for_test(
+        &store, &identity, &release, 0xa2_714,
+    );
+
+    let binding_fields = |key: &'static [u8]| ProductMutationHttpFields {
+        content_type: vec![b"application/json".to_vec()],
+        idempotency_key: vec![key.to_vec()],
+        ..ProductMutationHttpFields::default()
+    };
+    let attach_path = format!(
+        "/v1/workspaces/{workspace}/disks/{}/actions/attach",
+        disk.disk_id
+    );
+    let body = format!(
+        r#"{{"cat_id":"{}","mount_path":"/srv/data"}}"#,
+        create.candidate.cat_id
+    );
+    let attach = parse_authorized_persistent_disk_binding(
+        &workspace,
+        disk.disk_id.as_str(),
+        Instant::now(),
+        attach_path.as_bytes(),
+        &binding_fields(b"binding-success-attach"),
+        body.as_bytes(),
+        PersistentDiskBindingAction::Attach,
+    )
+    .unwrap();
+    let accepted_attach = runtime.block_on(service.mutate(attach.clone())).unwrap();
+    assert_eq!(accepted_attach.http_status, 202);
+    let attach_acceptance =
+        decode_persistent_disk_binding_v2_accepted_response(&accepted_attach.response_body)
+            .unwrap();
+    assert_eq!(attach_acceptance.desired_revision, revision(3));
+    let attached = store
+        .authority_read_snapshot(|transaction| {
+            load_desired_unlocked(transaction, &create.candidate.cat_id)?
+                .ok_or_else(|| ApiError::internal("attached Desired disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(attached.target, RuntimeTarget::Cold);
+    assert_eq!(attached.desired_revision, revision(3));
+    assert_eq!(attached.volumes.len(), 2);
+    let attached_intent = &attached.volumes[1];
+    assert_eq!(attached_intent.disk_id, disk.disk_id);
+    assert_eq!(attached_intent.volume_id, disk.volume_id);
+    assert_eq!(attached_intent.guest_device.slot, 1);
+    assert!(matches!(
+        &attached_intent.mount,
+        Some(Ext4MountIntent {
+            filesystem_uuid,
+            mount_path,
+            initialization: FilesystemInitialization::Initialize {
+                initialization_token,
+                expected_blank_head,
+            },
+        }) if filesystem_uuid == &random_id(0xa2_713)
+            && mount_path.as_str() == "/srv/data"
+            && initialization_token == &random_id(0xa2_712)
+            && expected_blank_head == &persistent.head
+    ));
+    assert_eq!(
+        runtime.block_on(service.mutate(attach)).unwrap(),
+        accepted_attach
+    );
+    let pending_attach_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(3),
+            )?
+            .ok_or_else(|| ApiError::internal("pending attach Operation disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(
+        pending_attach_operation.operation_id,
+        attach_acceptance.operation_id
+    );
+    assert_eq!(pending_attach_operation.phase, OperationPhase::Pending);
+    super::runtime_spine_tests::refresh_assigned_stable_cold_for_test(
+        &store, &identity, &release, 0xa2_715,
+    );
+    let attach_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(3),
+            )?
+            .ok_or_else(|| ApiError::internal("attach Operation disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(
+        attach_operation.operation_id,
+        attach_acceptance.operation_id
+    );
+    assert_eq!(attach_operation.phase, OperationPhase::Succeeded);
+
+    let detach_path = format!(
+        "/v1/workspaces/{workspace}/disks/{}/actions/detach",
+        disk.disk_id
+    );
+    let detach = parse_authorized_persistent_disk_binding(
+        &workspace,
+        disk.disk_id.as_str(),
+        Instant::now(),
+        detach_path.as_bytes(),
+        &binding_fields(b"binding-success-detach"),
+        body.as_bytes(),
+        PersistentDiskBindingAction::Detach,
+    )
+    .unwrap();
+    let accepted_detach = runtime.block_on(service.mutate(detach.clone())).unwrap();
+    assert_eq!(accepted_detach.http_status, 202);
+    let detach_acceptance =
+        decode_persistent_disk_binding_v2_accepted_response(&accepted_detach.response_body)
+            .unwrap();
+    assert_eq!(detach_acceptance.desired_revision, revision(4));
+    assert_eq!(
+        runtime.block_on(service.mutate(detach)).unwrap(),
+        accepted_detach
+    );
+    let detached = store
+        .authority_read_snapshot(|transaction| {
+            load_desired_unlocked(transaction, &create.candidate.cat_id)?
+                .ok_or_else(|| ApiError::internal("detached Desired disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(detached.target, RuntimeTarget::Cold);
+    assert_eq!(detached.desired_revision, revision(4));
+    assert_eq!(detached.volumes.len(), 1);
+    assert_eq!(detached.volumes[0].guest_device.slot, 0);
+    assert!(store
+        .authority_read_snapshot(|transaction| {
+            load_desired_by_disk_unlocked(transaction, &disk.disk_id)
+        })
+        .unwrap()
+        .is_none());
+    assert!(store
+        .authority_read_snapshot(|transaction| {
+            load_disk_by_id_unlocked(transaction, &disk.disk_id)
+        })
+        .unwrap()
+        .is_some());
+    let pending_detach_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(4),
+            )?
+            .ok_or_else(|| ApiError::internal("pending detach Operation disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(
+        pending_detach_operation.operation_id,
+        detach_acceptance.operation_id
+    );
+    assert_eq!(pending_detach_operation.phase, OperationPhase::Pending);
+    super::runtime_spine_tests::refresh_assigned_stable_cold_for_test(
+        &store, &identity, &release, 0xa2_716,
+    );
+    let detach_operation = store
+        .authority_read_snapshot(|transaction| {
+            load_operation_by_cat_revision_unlocked(
+                transaction,
+                &create.candidate.cat_id,
+                revision(4),
+            )?
+            .ok_or_else(|| ApiError::internal("detach Operation disappeared").into())
+        })
+        .unwrap();
+    assert_eq!(
+        detach_operation.operation_id,
+        detach_acceptance.operation_id
+    );
+    assert_eq!(detach_operation.phase, OperationPhase::Succeeded);
 }
 
 #[test]

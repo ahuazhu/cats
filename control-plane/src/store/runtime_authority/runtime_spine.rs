@@ -2213,12 +2213,28 @@ fn stable_postcondition_satisfied(
     runtime: &ObservedRuntimeStatus,
     desired: &DesiredRuntimeSpec,
 ) -> AuthorityTxResult<bool> {
+    let full_residue_empty = match inventory {
+        ValidatedInventory::Full { .. } => observation.residue.is_empty(),
+        ValidatedInventory::Partial { inventory } => inventory.full_observation.residue.is_empty(),
+    };
+    if !logical_stable_postcondition_satisfied(observation, runtime, desired, full_residue_empty) {
+        return Ok(false);
+    }
+    database_postcondition_satisfied(transaction, runtime, desired)
+}
+
+fn logical_stable_postcondition_satisfied(
+    observation: &NodeObservation,
+    runtime: &ObservedRuntimeStatus,
+    desired: &DesiredRuntimeSpec,
+    full_residue_empty: bool,
+) -> bool {
     if runtime
         .applied_desired
         .as_ref()
         .is_none_or(|applied| applied.target != desired.target)
     {
-        return Ok(false);
+        return false;
     }
     let stable_target = runtime.stable_state.map(|state| match state {
         StableState::Running => RuntimeTarget::Running,
@@ -2246,19 +2262,76 @@ fn stable_postcondition_satisfied(
                 StableState::Deleted => RuntimeTarget::Deleted,
             })
     );
-    let full_residue_empty = match inventory {
-        ValidatedInventory::Full { .. } => observation.residue.is_empty(),
-        ValidatedInventory::Partial { inventory } => inventory.full_observation.residue.is_empty(),
-    };
-    let logical = ready
+    ready
         && stable_target == Some(desired.target)
         && step_matches
         && desired.placement.node_id == observation.node_id
         && full_residue_empty
-        && (desired.target == RuntimeTarget::Running || runtime.platform_guards == 0);
-    if !logical {
+        && (desired.target == RuntimeTarget::Running || runtime.platform_guards == 0)
+}
+
+/// Read-only preflight for the clean-slate PersistentDisk action. The covered
+/// commit repeats this test and the database postcondition under the exact
+/// Node/Volume/Disk/Desired locks; callers must not treat this optimization as
+/// mutation authority.
+pub(super) fn placement_admission_observes_stable_cold(
+    admission: &PlacementAdmissionSnapshot,
+    desired: &DesiredRuntimeSpec,
+) -> bool {
+    if desired.target != RuntimeTarget::Cold
+        || !admission.full_inventory_observation.complete_inventory
+        || admission
+            .assigned_desired_specs
+            .iter()
+            .filter(|assigned| assigned.cat_id == desired.cat_id)
+            .count()
+            != 1
+        || admission
+            .assigned_desired_specs
+            .iter()
+            .find(|assigned| assigned.cat_id == desired.cat_id)
+            != Some(desired)
+    {
+        return false;
+    }
+    let observation = &admission.full_inventory_observation;
+    let mut runtimes = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id == desired.cat_id);
+    let Some(runtime) = runtimes.next() else {
+        return false;
+    };
+    if runtimes.next().is_some()
+        || runtime.applied_desired.as_ref() != Some(&applied_projection(desired))
+    {
+        return false;
+    }
+    logical_stable_postcondition_satisfied(
+        observation,
+        runtime,
+        desired,
+        observation.residue.is_empty(),
+    )
+}
+
+/// Final attach/detach authority check. It consumes no boolean proof: the
+/// accepted full observation, current Desired and locked product/Volume rows
+/// are compared field-for-field by the same settlement oracle as Operations.
+pub(super) fn placement_admission_has_stable_cold_in(
+    transaction: &mut Transaction<'_>,
+    admission: &PlacementAdmissionSnapshot,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<bool> {
+    if !placement_admission_observes_stable_cold(admission, desired) {
         return Ok(false);
     }
+    let runtime = admission
+        .full_inventory_observation
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.cat_id == desired.cat_id)
+        .ok_or_else(|| corrupt("stable-Cold admission lost its exact runtime"))?;
     database_postcondition_satisfied(transaction, runtime, desired)
 }
 
@@ -2635,8 +2708,7 @@ fn cold_volume_evidence_matches(
     volume: &cats_storage::authority::VolumeRecord,
     desired: &DesiredRuntimeSpec,
 ) -> bool {
-    observed.devices.is_empty()
-        && observed.local_lineages.len() == 1
+    let released_lineage = observed.local_lineages.len() == 1
         && observed.local_lineages.first().is_some_and(|lineage| {
             lineage.attachment_id == intent.attachment_id
                 && lineage.attachment_epoch == volume.lease_epoch
@@ -2648,7 +2720,34 @@ fn cold_volume_evidence_matches(
                 && lineage.pending_pack_count.get() == 0
                 && lineage.fenced
                 && lineage.state == LocalLineageState::Released
-        })
+        });
+    // A Cold->Cold attach has deliberately performed no acquire and created
+    // no local frontend or data directory. Its current normal-acquire
+    // predecessor epoch is therefore still the exact Unowned epoch. Accept
+    // that physical absence only for PersistentDisk; after any real acquire
+    // and release the Volume epoch advances, so this branch closes and the
+    // ordinary fenced Released lineage is required.
+    let never_acquired_persistent_absence = intent.disk_kind
+        == cats_api::runtime_reconciliation::DiskKind::Persistent
+        && observed.local_lineages.is_empty()
+        && matches!(
+            intent.acquire,
+            cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                expected_unowned_epoch,
+                ..
+            } if expected_unowned_epoch == volume.lease_epoch
+        );
+    observed.devices.is_empty() && (released_lineage || never_acquired_persistent_absence)
+}
+
+#[cfg(test)]
+pub(super) fn cold_volume_evidence_matches_for_test(
+    observed: &cats_api::runtime_reconciliation::ObservedVolume,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    volume: &cats_storage::authority::VolumeRecord,
+    desired: &DesiredRuntimeSpec,
+) -> bool {
+    cold_volume_evidence_matches(observed, intent, volume, desired)
 }
 
 fn acquire_origin_matches(

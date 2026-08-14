@@ -15,16 +15,17 @@ use cats_api::route_grant_v2::{
 use cats_api::runtime_reconciliation::{
     decode_operation, decode_runtime_checkpoint, encode_admission_inventory_attestation,
     encode_agent_session, encode_desired_read_snapshot, encode_node_observation,
-    guest_config_digest, inventory_digest, key_ring_digest, spec_digest, AgentRegistrationAttempt,
-    AgentSession, AllocatableMemoryBytes, AllocatableVcpus, AppliedDesiredEvidence, AsciiText,
-    AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
-    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
-    DesiredRuntimeSpec, EndpointIntent, Epoch, GuestBootId, GuestIpv4Pool, GuestIpv4PoolKind,
-    GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id,
-    InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress,
-    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    NodePlacementPolicy, NodeResidue, NodeTransportTarget, ObservationInventoryAcceptance,
-    ObservedNetwork, ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation,
+    guest_config_digest, inventory_digest, key_ring_digest, spec_digest, AcquireOrigin,
+    AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes, AllocatableVcpus,
+    AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, BlockedReason,
+    CheckpointEvidence, Condition, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
+    CredentialBinding, DesiredRuntimeSpec, DiskKind, EndpointIntent, Epoch, GuestBootId,
+    GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath,
+    Hostname, HttpProtocol, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId,
+    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, NetworkConfig,
+    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodePlacementPolicy, NodeResidue,
+    NodeTransportTarget, ObservationInventoryAcceptance, ObservedDiskKind, ObservedNetwork,
+    ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, ObservedVolume, Operation,
     OperationFailure, OperationPhase, OperationTerminal, OwnershipTokenEvidence,
     PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence, ProcessRole,
     ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
@@ -32,9 +33,9 @@ use cats_api::runtime_reconciliation::{
     RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
     RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
     RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState, UnixMillis,
-    WarmSnapshotEvidence, WireU64,
+    VolumeAcquire, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
-use cats_storage::authority::Generation;
+use cats_storage::authority::{Generation, VolumeAdminState, VolumeRecord};
 
 use super::placement_policy::insert_policy_on_store_for_test;
 use super::product::{CatRecord, EndpointRecord, HostnameDesiredLookup};
@@ -42,11 +43,12 @@ use super::product_rows::{
     insert_cat, insert_desired, insert_endpoint, insert_hostname_lookup, insert_operation,
 };
 use super::route_signer::{RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection};
-use super::rows::database_now;
+use super::rows::{database_now, load_volume_unlocked};
 use super::runtime_spine::{
-    active_lineage_generations_match_for_test, lock_placement_admission_for_desired_mutation,
-    PlacementAdmissionLoad, PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection,
-    RuntimeSpineOutcome, RuntimeSpineRejection,
+    active_lineage_generations_match_for_test, cold_volume_evidence_matches_for_test,
+    lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
+    PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection, RuntimeSpineOutcome,
+    RuntimeSpineRejection,
 };
 use crate::store::agent_sessions::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy};
 use crate::store::AuthorityRequestContext;
@@ -89,6 +91,51 @@ fn running_active_lineage_accepts_a_relaxed_local_tail() {
     let local = Generation::new(5).unwrap();
     assert!(active_lineage_generations_match_for_test(local, remote));
     assert!(!active_lineage_generations_match_for_test(remote, local));
+}
+
+#[test]
+fn cold_zero_lineage_exception_is_only_fresh_unacquired_persistent_membership() {
+    let workspace = id("ws_cold_membership_unit");
+    let create = super::product_tests::request(
+        &workspace,
+        "cold-membership-unit",
+        41,
+        "cold-membership-unit",
+    );
+    let mut desired = create.candidate.desired;
+    desired.target = RuntimeTarget::Cold;
+    desired.volumes[0].disk_kind = DiskKind::Persistent;
+    let intent = desired.volumes[0].clone();
+    let mut volume = create.candidate.volume;
+    let observed = ObservedVolume {
+        volume_intent_id: Some(intent.volume_intent_id.clone()),
+        disk_id: Some(intent.disk_id.clone()),
+        volume_id: intent.volume_id.clone(),
+        disk_kind: ObservedDiskKind::Persistent,
+        size_bytes: Some(intent.size_bytes),
+        durability: Some(intent.durability),
+        authority: VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: volume.lease_epoch,
+            head: volume.head.clone(),
+        },
+        local_lineages: Vec::new(),
+        devices: Vec::new(),
+    };
+    assert!(cold_volume_evidence_matches_for_test(
+        &observed, &intent, &volume, &desired
+    ));
+
+    let mut root = intent.clone();
+    root.disk_kind = DiskKind::Root;
+    assert!(!cold_volume_evidence_matches_for_test(
+        &observed, &root, &volume, &desired
+    ));
+
+    volume.lease_epoch =
+        cats_api::runtime_reconciliation::FenceEpoch::new(volume.lease_epoch.get() + 1).unwrap();
+    assert!(!cold_volume_evidence_matches_for_test(
+        &observed, &intent, &volume, &desired
+    ));
 }
 
 fn release() -> GuestRuntimeProfileReceipt {
@@ -986,6 +1033,213 @@ pub(super) fn refresh_assigned_admission_for_test(
     number: u128,
 ) -> super::runtime_spine::PlacementAdmissionSnapshot {
     refresh_assigned_admission_with_residue_for_test(store, identity, release, number, Vec::new())
+}
+
+/// Establish a fresh complete inventory whose exact current Desired set is
+/// terminal Cold. Persistent members whose normal acquire still names the
+/// current Unowned epoch model the no-effect Cold->Cold attach projection and
+/// therefore have no synthetic Released lineage.
+pub(super) fn refresh_assigned_stable_cold_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let desired_snapshot = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&session),
+                    request_sequence: Sequence::new(1).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let runtimes = desired_snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            assert_eq!(desired.target, RuntimeTarget::Cold);
+            let mut volumes = desired
+                .volumes
+                .iter()
+                .map(|intent| {
+                    let volume: VolumeRecord = store
+                        .authority_read_snapshot(|transaction| {
+                            load_volume_unlocked(transaction, &intent.volume_id)?.ok_or_else(|| {
+                                cats_api::error::ApiError::internal(
+                                    "stable-Cold test Volume is missing",
+                                )
+                                .into()
+                            })
+                        })
+                        .unwrap();
+                    assert!(matches!(volume.admin_state, VolumeAdminState::Active));
+                    assert!(volume.lease_owner.is_none());
+                    let origin = match &intent.acquire {
+                        VolumeAcquire::Normal { transition_id, .. } => AcquireOrigin::Normal {
+                            transition_id: transition_id.clone(),
+                        },
+                        VolumeAcquire::Takeover { authorization_id } => AcquireOrigin::Takeover {
+                            authorization_id: authorization_id.clone(),
+                        },
+                    };
+                    let no_effect_attach = intent.disk_kind == DiskKind::Persistent
+                        && matches!(
+                            intent.acquire,
+                            VolumeAcquire::Normal {
+                                expected_unowned_epoch,
+                                ..
+                            } if expected_unowned_epoch == volume.lease_epoch
+                        );
+                    let local_lineages = (!no_effect_attach)
+                        .then(|| LocalVolumeLineage {
+                            attachment_id: intent.attachment_id.clone(),
+                            attachment_epoch: volume.lease_epoch,
+                            acquire_origin: origin,
+                            node_id: desired.placement.node_id.clone(),
+                            placement_epoch: desired.placement.placement_epoch,
+                            local_durable_generation: volume.head.generation,
+                            remote_durable_generation: volume.head.generation,
+                            data_directory: HostPath::new(format!(
+                                "/var/lib/cats/volumes/{}",
+                                volume.volume_id
+                            ))
+                            .unwrap(),
+                            pending_pack_count: WireU64::new(0).unwrap(),
+                            fenced: true,
+                            state: LocalLineageState::Released,
+                        })
+                        .into_iter()
+                        .collect();
+                    ObservedVolume {
+                        volume_intent_id: Some(intent.volume_intent_id.clone()),
+                        disk_id: Some(intent.disk_id.clone()),
+                        volume_id: intent.volume_id.clone(),
+                        disk_kind: match intent.disk_kind {
+                            DiskKind::Root => ObservedDiskKind::Root,
+                            DiskKind::Persistent => ObservedDiskKind::Persistent,
+                        },
+                        size_bytes: Some(intent.size_bytes),
+                        durability: Some(intent.durability),
+                        authority: VolumeAuthorityEvidence::Unowned {
+                            attachment_epoch: volume.lease_epoch,
+                            head: volume.head,
+                        },
+                        local_lineages,
+                        devices: Vec::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            volumes.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+            let step = ReconcileStep::Stable {
+                state: StableState::Cold,
+            };
+            ObservedRuntimeStatus {
+                cat_id: desired.cat_id.clone(),
+                applied_desired: Some(AppliedDesiredEvidence {
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement: desired.placement.clone(),
+                    target: RuntimeTarget::Cold,
+                }),
+                runtime_incarnation: None,
+                stable_state: Some(StableState::Cold),
+                step: step.clone(),
+                checkpoint: CheckpointEvidence::Valid {
+                    checkpoint_path: HostPath::new(format!(
+                        "/var/lib/cats/checkpoints/{}.json",
+                        desired.cat_id
+                    ))
+                    .unwrap(),
+                    content_digest: digest(0xc8),
+                    version: ContractVersion::V1,
+                    cat_id: desired.cat_id.clone(),
+                    node_id: desired.placement.node_id.clone(),
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement_epoch: desired.placement.placement_epoch,
+                    runtime_incarnation: None,
+                    runtime_launch: Box::new(RuntimeLaunch::Absent),
+                    stable_state: Some(StableState::Cold),
+                    step: Box::new(step),
+                    require_idle: Box::new(RequireIdleCheckpoint::NotApplicable),
+                    updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+                },
+                processes: Vec::new(),
+                volumes,
+                mounts: Vec::new(),
+                networks: Vec::new(),
+                guest_transport: GuestTransportEvidence::Unavailable,
+                warm_snapshot: WarmSnapshotEvidence::Absent,
+                lifecycle_admission: LifecycleAdmission::Closed,
+                routes: Vec::new(),
+                platform_guards: 0,
+                conditions: vec![Condition::Ready {
+                    reason: ReadyReason::PostconditionSatisfied {
+                        target: RuntimeTarget::Cold,
+                    },
+                }],
+            }
+        })
+        .collect();
+    let mut full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(desired_snapshot.read_position),
+        runtimes,
+    );
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("stable-Cold admission unexpectedly rejected: {rejection:?}")
+        }
+    }
 }
 
 pub(super) fn refresh_assigned_admission_with_residue_for_test(
