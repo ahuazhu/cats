@@ -1297,7 +1297,6 @@ GET /v1/admin/nodes/{id}
 GET /v1/admin/nodes/{id}/cats
 GET /v1/admin/runtime/fleet-verification
 GET /v1/admin/workspaces
-GET /v1/internal/route-v2/public-ring-successors
 GET /v1/me
 GET /v1/nodes
 GET /v1/operations/{id}
@@ -1341,7 +1340,6 @@ POST /v1/admin/usage/target-terminal/begin
 POST /v1/admin/usage/target-terminal/complete
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
-POST /v1/internal/route-v2/signing-authority-commands
 POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
@@ -1370,6 +1368,48 @@ POST /v1/workspaces/{workspace}/tokens
 PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend
 PUT /v1/workspaces/{workspace}/cats/{cat}/expiry"#;
         assert_eq!(routes, expected.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn route_v2_rotation_routes_are_exclusive_to_machine_listener() {
+        let source = include_str!("mod.rs");
+        let main_router = source
+            .split_once("pub fn router")
+            .expect("main router declaration")
+            .1
+            .split_once(".fallback(crate::ui::not_found)")
+            .expect("main router fallback")
+            .0;
+        let rotation_router = source
+            .split_once("pub(crate) fn route_v2_rotation_machine_router")
+            .expect("rotation machine router declaration")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("rotation machine router boundary")
+            .0;
+
+        for (path, method) in [
+            (
+                "/v1/internal/route-v2/signing-authority-commands",
+                "post(route_signing_operator::apply)",
+            ),
+            (
+                "/v1/internal/route-v2/public-ring-successors",
+                "get(route_signing_operator::discover_successor)",
+            ),
+            (
+                "/v1/internal/route-v2/signing-authority-current",
+                "get(route_signing_operator::discover_current)",
+            ),
+        ] {
+            assert!(!main_router.contains(path), "{path} leaked onto port 7300");
+            assert_eq!(
+                rotation_router.matches(path).count(),
+                1,
+                "{path} must be registered exactly once on the rotation listener",
+            );
+            assert!(rotation_router.contains(method));
+        }
     }
 
     #[test]
