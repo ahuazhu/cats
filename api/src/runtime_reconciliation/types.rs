@@ -379,6 +379,15 @@ impl<'de> Deserialize<'de> for Sha256Digest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderScope {
+    pub provider: Id,
+    pub partition: Id,
+    pub account_id: Id,
+    pub region: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
     pub version: ContractVersion,
     pub node_id: Id,
