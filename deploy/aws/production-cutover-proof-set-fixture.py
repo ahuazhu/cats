@@ -528,7 +528,7 @@ def validate_release_bound_usage_schema_subprocess() -> None:
                 PROOF.canonical_json(
                     {
                         "binary_sha256": executable_sha256,
-                        "catalog_sha256": PROOF.USAGE_SCHEMA_CATALOG_SHA256,
+                        "catalog_sha256": SHA_C,
                         "kind": PROOF.USAGE_SCHEMA_VERIFICATION_KIND,
                         "release_commit": context.release_commit,
                         "schema": "cats_usage_fresh",

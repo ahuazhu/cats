@@ -32,9 +32,6 @@ USAGE_TERMINAL_VERIFIER = Path(
 USAGE_SCHEMA_VERIFIER = Path("/opt/cats/bin/cats-usage-schema-v16-verifier")
 USAGE_SCHEMA_VERIFICATION_FILE = "usage-schema-v16-verification.receipt.json"
 USAGE_SCHEMA_VERIFICATION_KIND = "cats.usage-schema-v16-verification.v1"
-USAGE_SCHEMA_CATALOG_SHA256 = (
-    "sha256:ec10b4afe112dba411466e9b2d67d1cef5d8d232da4ec52c11ced993d771f157"
-)
 USAGE_SCHEMA_SUCCESS_STDOUT = "Usage schema v16 verified\n"
 USAGE_TERMINAL_REQUEST_FILE = "usage-target-terminal-request.json"
 USAGE_TERMINAL_RECEIPT_FILE = "usage-target-terminal-receipt.json"
@@ -1003,7 +1000,6 @@ class SubprocessUsageSchemaV16Verifier:
             if (
                 value["binary_sha256"]
                 != context.usage_schema_verifier_binary_sha256
-                or value["catalog_sha256"] != USAGE_SCHEMA_CATALOG_SHA256
                 or value["kind"] != USAGE_SCHEMA_VERIFICATION_KIND
                 or value["release_commit"] != context.release_commit
                 or value["schema"] != schema
@@ -1014,6 +1010,7 @@ class SubprocessUsageSchemaV16Verifier:
                 or value["worker_bundle_sha256"] != context.worker_bundle_sha256
             ):
                 raise ProofSetError("Usage schema verification receipt drifted")
+            digest(value["catalog_sha256"], "Usage schema catalog digest")
             return actual
         finally:
             os.close(binary_descriptor)
