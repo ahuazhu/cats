@@ -3270,18 +3270,9 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 .to_str()
                 .context("authorized blockd epoch path is not UTF-8")?
                 .to_owned();
-            #[cfg(feature = "proposed-node-residue-reclamation")]
-            let Some(allocated_bytes) = observed_allocated_bytes_at(
-                &epoch_directory,
-                root,
-                &mut budget,
-                context,
-                limits.recursion_depth,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
+            // Classify leaf names before measuring allocation. The allocation
+            // walker deliberately cannot open special inodes, but a foreign
+            // socket is stable residue that must be rejected explicitly.
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
             else {
@@ -3322,6 +3313,18 @@ fn scan_authorized_blockd_data_with_projection_barrier(
             }) {
                 bail!("authorized blockd leaf retains foreign entry {foreign}")
             }
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let Some(allocated_bytes) = observed_allocated_bytes_at(
+                &epoch_directory,
+                root,
+                &mut budget,
+                context,
+                limits.recursion_depth,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
             #[cfg(feature = "proposed-node-residue-reclamation")]
             let reclaim_checkpoint = if by_name.contains_key(LAUNCH_CHECKPOINT_FILE)
                 && !has_unvalidated_handoff_artifact
