@@ -235,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 agent_registration.identity().node_id.clone(),
                 &artifacts,
+                &args.control_plane_url,
             )?)
         }
         None => None,

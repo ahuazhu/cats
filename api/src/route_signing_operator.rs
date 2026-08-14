@@ -27,6 +27,9 @@ pub const ROUTE_V2_RING_SUCCESSOR_PATH: &str = "/v1/internal/route-v2/public-rin
 pub const ROUTE_V2_RING_SUCCESSOR_METHOD: &str = "GET";
 pub const ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES: usize = 65_536;
 pub const ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES: usize = 16_384;
+pub const ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES: usize =
+    ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES;
+pub const ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE: &str = "application/json";
 pub const ROUTE_V2_ROTATION_OPERATOR_MAX_CREDENTIALS: usize = 8;
 pub const ROUTE_V2_ROTATION_OPERATOR_MAX_COMMAND_LIFETIME_MILLIS: u64 = 10 * 60 * 1_000;
 
@@ -49,6 +52,8 @@ pub struct RouteV2RotationOperatorCredential {
 pub struct RouteV2RotationOperatorTrust {
     pub version: ContractVersion,
     pub authority_id: Id,
+    /// The one Route v2 deployment this operator may transition and deliver.
+    pub route_deployment_id: Id,
     /// Exact lowercase 40-hex source commit embedded in every release binary.
     pub release_commit_sha: String,
     pub threshold: u16,
@@ -223,7 +228,9 @@ impl SignedRouteV2SigningCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRouteV2RotationOperatorPrincipal {
     pub authority_id: Id,
+    pub route_deployment_id: Id,
     pub release_commit_sha: String,
+    pub trust_sha256: Sha256Digest,
     pub credential_ids: Vec<Id>,
     pub credential_set_sha256: Sha256Digest,
 }
@@ -324,6 +331,38 @@ pub fn encode_route_v2_signing_command_receipt(
     Ok(bytes)
 }
 
+pub fn decode_route_v2_signing_command_receipt(
+    bytes: &[u8],
+) -> Result<RouteV2SigningCommandReceipt, RouteV2RotationOperatorError> {
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let receipt: RouteV2SigningCommandReceipt =
+        serde_json::from_slice(bytes).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if encode_route_v2_signing_command_receipt(&receipt)? != bytes {
+        return Err(RouteV2RotationOperatorError::NonCanonical);
+    }
+    Ok(receipt)
+}
+
+/// Canonical, percent-free discovery query. All three value alphabets exclude
+/// `&`, `=` and `%`, so intermediaries cannot create a second interpretation.
+pub fn route_v2_ring_successor_query(
+    deployment_id: &Id,
+    current_ring_version: Epoch,
+    current_ring_digest: &Sha256Digest,
+) -> String {
+    let digest_hex = current_ring_digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("Sha256Digest always has its typed prefix");
+    format!(
+        "deployment_id={}&current_ring_version={}&current_key_ring_sha256={digest_hex}",
+        deployment_id.as_str(),
+        current_ring_version.get(),
+    )
+}
+
 pub fn sign_route_v2_signing_command(
     payload: &RouteV2SigningCommandPayload,
     signer: &Ed25519RequestSigner,
@@ -346,6 +385,7 @@ pub fn verify_signed_route_v2_signing_command(
     trust.validate()?;
     signed.validate_shape()?;
     if signed.payload.authority_id != trust.authority_id
+        || signed.payload.command.successor.deployment_id != trust.route_deployment_id
         || signed.payload.release_commit_sha != trust.release_commit_sha
         || signed.payload.release_commit_sha != expected_release_commit_sha
     {
@@ -371,7 +411,9 @@ pub fn verify_signed_route_v2_signing_command(
     }
     Ok(VerifiedRouteV2RotationOperatorPrincipal {
         authority_id: trust.authority_id.clone(),
+        route_deployment_id: trust.route_deployment_id.clone(),
         release_commit_sha: trust.release_commit_sha.clone(),
+        trust_sha256: trust.exact_digest()?,
         credential_ids: accepted,
         credential_set_sha256: Sha256Digest::from_bytes(Sha256::digest(digest_input).into()),
     })
@@ -501,6 +543,7 @@ mod tests {
         let trust = RouteV2RotationOperatorTrust {
             version: ContractVersion::V1,
             authority_id: Id::new("route_operator".to_owned()).unwrap(),
+            route_deployment_id: payload().command.successor.deployment_id,
             release_commit_sha: "a".repeat(40),
             threshold: 2,
             credentials: vec![credential(&first), credential(&second)],

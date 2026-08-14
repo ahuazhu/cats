@@ -60,6 +60,7 @@ mod operations;
 mod persistent_disk_create_v1;
 mod product_mutations_v2;
 pub(crate) mod route_resolve_v2;
+pub(crate) mod route_signing_operator;
 #[cfg(debug_assertions)]
 mod routes;
 pub(crate) mod runtime_node_authority;
@@ -768,6 +769,16 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::Extension(std::sync::Arc::new(
             route_resolve_v2::RouteResolveV2Service::from_app_state(&state),
         )));
+    let route_v2_rotation_operator = Router::<AppState>::new()
+        .route(
+            "/v1/internal/route-v2/signing-authority-commands",
+            post(route_signing_operator::apply).fallback(route_signing_operator::apply),
+        )
+        .route(
+            "/v1/internal/route-v2/public-ring-successors",
+            get(route_signing_operator::discover_successor)
+                .fallback(route_signing_operator::discover_successor),
+        );
 
     Router::new()
         .route("/", get(crate::ui::portal))
@@ -901,6 +912,7 @@ pub fn router(state: AppState) -> Router {
         .merge(runtime_product_read)
         .merge(runtime_volume_authority)
         .merge(route_resolve_v2)
+        .merge(route_v2_rotation_operator)
         .merge(product_mutations_v2)
         .merge(retired_product_support)
         .merge(retired_cat_action)
@@ -1060,6 +1072,7 @@ GET /v1/admin/nodes/{id}
 GET /v1/admin/nodes/{id}/cats
 GET /v1/admin/runtime/fleet-verification
 GET /v1/admin/workspaces
+GET /v1/internal/route-v2/public-ring-successors
 GET /v1/me
 GET /v1/nodes
 GET /v1/operations/{id}
@@ -1097,6 +1110,7 @@ POST /v1/admin/nodes/{id}/actions/{verb}
 POST /v1/admin/runtime/node-authority-applies
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
+POST /v1/internal/route-v2/signing-authority-commands
 POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads

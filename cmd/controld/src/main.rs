@@ -556,10 +556,17 @@ async fn main() -> anyhow::Result<()> {
             std::path::Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
             std::path::Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
         )?;
+        let rotation_operator_trust =
+            cats_api::runtime_artifacts::load_installed_route_v2_rotation_operator_trust(
+                std::path::Path::new(
+                    cats_api::route_signing_operator::ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
+                ),
+            )?;
         Some(cats_control_plane::server::GatewayMachineConfig::new(
             listen,
             gateway_artifacts,
             signer_artifacts,
+            rotation_operator_trust,
             args.route_grant_v2_ttl_seconds,
         )?)
     } else {

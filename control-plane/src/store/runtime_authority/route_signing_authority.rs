@@ -11,6 +11,16 @@ use cats_api::route_grant_v2::{
     RouteGrantV2SignerSelection, MAX_ROUTE_GRANT_V2_CLOCK_SKEW_SECONDS,
     MAX_ROUTE_GRANT_V2_TTL_SECONDS,
 };
+use cats_api::route_signing_operator::{
+    decode_route_v2_signing_command_receipt, encode_route_v2_rotation_operator_trust,
+    encode_route_v2_signing_command_receipt, encode_signed_route_v2_signing_command,
+    RouteV2RotationOperatorTrust, RouteV2SigningCommandReceipt, SignedRouteV2SigningCommand,
+    VerifiedRouteV2RotationOperatorPrincipal,
+};
+pub(crate) use cats_api::route_signing_operator::{
+    RouteGrantV2SigningAuthorityCommand, RouteGrantV2SigningAuthorityCommandKind,
+    RouteGrantV2SigningAuthorityCommandResult,
+};
 use cats_api::runtime_reconciliation::{
     key_ring_digest, Base64UrlNoPad, Epoch, Id, KeyId, LifecycleAdmission, NodeIdentityState,
     RouteGateState, RuntimeSchedulingState, Sha256Digest, UnixMillis,
@@ -40,47 +50,26 @@ use crate::store::{ApiError, AuthorityRequestContext, Result, Store};
 pub(super) const RETENTION_MILLIS: u64 =
     (MAX_ROUTE_GRANT_V2_TTL_SECONDS + MAX_ROUTE_GRANT_V2_CLOCK_SKEW_SECONDS) * 1_000;
 
-/// One explicit, non-secret authority command. The caller cannot supply DB
-/// time, an ACK boolean, or private bytes; all preconditions are recomputed in
-/// the transaction that advances the current pointer.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum RouteGrantV2SigningAuthorityCommandKind {
-    PublishOverlap {
-        successor_ring: RouteGrantV2PublicKeyRingArtifact,
-        new_secret_reference_id: Id,
-    },
-    SwitchActive,
-    PublishNewOnly {
-        successor_ring: RouteGrantV2PublicKeyRingArtifact,
-    },
-    Retire,
-    Disable {
-        successor_ring: RouteGrantV2PublicKeyRingArtifact,
-    },
-    Activate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RouteGrantV2SigningAuthorityCommand {
-    pub(crate) successor: RouteGrantV2SignerReference,
-    pub(crate) kind: RouteGrantV2SigningAuthorityCommandKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum RouteGrantV2SigningAuthorityCommandResult {
-    Applied {
-        signer_revision: Epoch,
-        public_key_ring_version: Epoch,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteGrantV2SigningAuthorityStoreOutcome {
     Committed(RouteGrantV2SigningAuthorityCommandResult),
     PreconditionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthenticatedRouteV2SigningCommandOutcome {
+    Stored(RouteV2SigningCommandReceipt),
+    CommandIdConflict,
+    AuthenticationFailed,
+    CommandOutsideExecutionWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouteV2PublicRingDelivery {
+    pub(crate) exact_signed_envelope_bytes: Vec<u8>,
+    pub(crate) exact_signed_envelope_sha256: Sha256Digest,
+    pub(crate) ring_version: Epoch,
+    pub(crate) key_ring_digest: Sha256Digest,
 }
 
 /// Startup-pinned, non-secret signer facts compared on every resolve. The
@@ -160,6 +149,25 @@ struct RouteV2SignerPointer {
 }
 
 impl Store {
+    /// Install the one release-pinned Route rotation operator trust or prove
+    /// an exact replay. The trust cannot advance the signer by itself.
+    pub(crate) fn install_route_v2_rotation_operator_trust(
+        &self,
+        trust: &RouteV2RotationOperatorTrust,
+        exact_bytes: &[u8],
+    ) -> Result<()> {
+        let canonical = encode_route_v2_rotation_operator_trust(trust)
+            .map_err(|_| ApiError::invalid("Route v2 rotation operator trust is invalid"))?;
+        if canonical != exact_bytes {
+            return Err(ApiError::invalid(
+                "Route v2 rotation operator trust is not exact canonical bytes",
+            ));
+        }
+        self.authority_transaction(|transaction| {
+            install_rotation_operator_trust_in(transaction, trust, exact_bytes)
+        })
+    }
+
     /// Install revision one or prove an exact zero-write replay. A different
     /// persisted current is an ordinary startup-closed result, never a local
     /// rotation request.
@@ -198,6 +206,93 @@ impl Store {
         })
     }
 
+    /// Apply or exact-replay one independently authenticated production
+    /// command. Every terminal authority precondition is stored with the exact
+    /// command in the same transaction, closing delayed-replay ambiguity.
+    pub(crate) fn apply_authenticated_route_v2_signing_command(
+        &self,
+        principal: &VerifiedRouteV2RotationOperatorPrincipal,
+        signed: &SignedRouteV2SigningCommand,
+        exact_bytes: &[u8],
+        request: &AuthorityRequestContext,
+    ) -> Result<AuthenticatedRouteV2SigningCommandOutcome> {
+        let canonical = encode_signed_route_v2_signing_command(signed)
+            .map_err(|_| ApiError::invalid("Route v2 signing command is invalid"))?;
+        if canonical != exact_bytes {
+            return Err(ApiError::invalid(
+                "Route v2 signing command is not exact canonical bytes",
+            ));
+        }
+        self.authority_request_transaction(request, |transaction| {
+            let outcome =
+                apply_authenticated_command_in(transaction, principal, signed, exact_bytes)?;
+            Ok(match outcome {
+                AuthenticatedRouteV2SigningCommandOutcome::Stored(_) => {
+                    AuthorityRequestDisposition::Commit(outcome)
+                }
+                AuthenticatedRouteV2SigningCommandOutcome::CommandIdConflict
+                | AuthenticatedRouteV2SigningCommandOutcome::AuthenticationFailed
+                | AuthenticatedRouteV2SigningCommandOutcome::CommandOutsideExecutionWindow => {
+                    AuthorityRequestDisposition::Reject(outcome)
+                }
+            })
+        })
+    }
+
+    /// Resolve a possibly committed request without executing its transition
+    /// a second time. The post-lock miss proves the original transaction did
+    /// not commit.
+    pub(crate) fn resolve_authenticated_route_v2_signing_command(
+        &self,
+        signed: &SignedRouteV2SigningCommand,
+        exact_bytes: &[u8],
+    ) -> Result<Option<AuthenticatedRouteV2SigningCommandOutcome>> {
+        let canonical = encode_signed_route_v2_signing_command(signed)
+            .map_err(|_| ApiError::invalid("Route v2 signing command is invalid"))?;
+        if canonical != exact_bytes {
+            return Err(ApiError::invalid(
+                "Route v2 signing command is not exact canonical bytes",
+            ));
+        }
+        self.authority_transaction(|transaction| {
+            lock_route_v2_signing_command(
+                transaction,
+                signed.payload.authority_id.as_str(),
+                signed.payload.command_id.as_str(),
+            )?;
+            let stored = load_signing_command_receipt(
+                transaction,
+                signed.payload.authority_id.as_str(),
+                signed.payload.command_id.as_str(),
+            )?;
+            Ok(stored.map(|stored| {
+                if stored.exact_command_bytes == exact_bytes {
+                    AuthenticatedRouteV2SigningCommandOutcome::Stored(stored.receipt)
+                } else {
+                    AuthenticatedRouteV2SigningCommandOutcome::CommandIdConflict
+                }
+            }))
+        })
+    }
+
+    /// Return only the exact adjacent signed public successor. The envelope is
+    /// public; authenticity is established by the independent operator proof.
+    pub(crate) fn load_route_v2_public_ring_successor(
+        &self,
+        deployment_id: &Id,
+        current_ring_version: Epoch,
+        current_ring_digest: &Sha256Digest,
+    ) -> Result<Option<RouteV2PublicRingDelivery>> {
+        self.authority_read_snapshot(|transaction| {
+            load_public_ring_successor_in(
+                transaction,
+                deployment_id,
+                current_ring_version,
+                current_ring_digest,
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn route_grant_v2_signer_is_current_for_test(
         &self,
@@ -232,6 +327,479 @@ fn validate_command(command: &RouteGrantV2SigningAuthorityCommand) -> Result<()>
         _ => {}
     }
     Ok(())
+}
+
+fn install_rotation_operator_trust_in(
+    transaction: &mut Transaction<'_>,
+    trust: &RouteV2RotationOperatorTrust,
+    exact_bytes: &[u8],
+) -> AuthorityTxResult<()> {
+    lock_route_v2_machine_authority_exclusive(transaction)?;
+    let digest = trust.exact_digest().map_err(corrupt)?;
+    let current = transaction.query_opt(
+        "SELECT authority_id, route_deployment_id, release_commit_sha, trust_sha256, threshold,
+                trust_bytes, first_committed_at_unix_ms
+           FROM route_v2_rotation_operator_authority
+          WHERE singleton FOR UPDATE",
+        &[],
+    )?;
+    if let Some(current) = current {
+        let authority_id: String = current.try_get("authority_id")?;
+        let route_deployment_id: String = current.try_get("route_deployment_id")?;
+        let release_commit_sha: String = current.try_get("release_commit_sha")?;
+        let trust_sha256: String = current.try_get("trust_sha256")?;
+        let threshold: i16 = current.try_get("threshold")?;
+        let stored_bytes: Vec<u8> = current.try_get("trust_bytes")?;
+        let _: UnixMillis = from_pg(current.try_get("first_committed_at_unix_ms")?)?;
+        let credentials = load_rotation_operator_credentials(transaction, &authority_id)?;
+        if authority_id != trust.authority_id.as_str()
+            || route_deployment_id != trust.route_deployment_id.as_str()
+            || release_commit_sha != trust.release_commit_sha
+            || trust_sha256 != digest.as_str()
+            || usize::try_from(threshold).ok() != Some(usize::from(trust.threshold))
+            || stored_bytes != exact_bytes
+            || credentials != trust.credentials
+        {
+            return Err(rejected(
+                "installed Route v2 rotation operator trust does not exactly replay PostgreSQL current",
+            ));
+        }
+        return Ok(());
+    }
+    let orphan_count: i64 = transaction
+        .query_one(
+            "SELECT count(*) FROM route_v2_rotation_operator_credentials",
+            &[],
+        )?
+        .try_get(0)?;
+    if orphan_count != 0 {
+        return Err(corrupt(
+            "Route v2 rotation operator pointer is absent with credential rows",
+        ));
+    }
+    let committed_at = database_now(transaction)?;
+    let committed_at_pg = committed_at.to_pg().map_err(corrupt)?;
+    let threshold = i16::try_from(trust.threshold).map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO route_v2_rotation_operator_authority (
+            singleton, authority_id, route_deployment_id, release_commit_sha, trust_sha256,
+            threshold, trust_bytes, first_committed_at_unix_ms
+         ) VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)",
+        &[
+            &trust.authority_id.as_str(),
+            &trust.route_deployment_id.as_str(),
+            &trust.release_commit_sha,
+            &digest.as_str(),
+            &threshold,
+            &exact_bytes,
+            &committed_at_pg,
+        ],
+    )?)?;
+    for (ordinal, credential) in trust.credentials.iter().enumerate() {
+        let ordinal = i16::try_from(ordinal).map_err(corrupt)?;
+        exactly_one(transaction.execute(
+            "INSERT INTO route_v2_rotation_operator_credentials (
+                credential_id, authority_id, credential_ordinal,
+                public_key_spki, public_key_spki_sha256,
+                first_committed_at_unix_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &credential.credential_id.as_str(),
+                &trust.authority_id.as_str(),
+                &ordinal,
+                &credential.public_key_spki.as_str(),
+                &credential.public_key_spki_sha256.as_str(),
+                &committed_at_pg,
+            ],
+        )?)?;
+    }
+    Ok(())
+}
+
+fn load_rotation_operator_credentials(
+    transaction: &mut Transaction<'_>,
+    authority_id: &str,
+) -> AuthorityTxResult<Vec<cats_api::route_signing_operator::RouteV2RotationOperatorCredential>> {
+    transaction
+        .query(
+            "SELECT credential_id, credential_ordinal, public_key_spki,
+                    public_key_spki_sha256, first_committed_at_unix_ms
+               FROM route_v2_rotation_operator_credentials
+              WHERE authority_id=$1
+              ORDER BY credential_ordinal",
+            &[&authority_id],
+        )?
+        .into_iter()
+        .enumerate()
+        .map(|(expected_ordinal, row)| {
+            let ordinal: i16 = row.try_get("credential_ordinal")?;
+            let public_key_spki: String = row.try_get("public_key_spki")?;
+            let _: UnixMillis = from_pg(row.try_get("first_committed_at_unix_ms")?)?;
+            if usize::try_from(ordinal).ok() != Some(expected_ordinal) {
+                return Err(corrupt(
+                    "Route v2 rotation operator credential ordinal is not contiguous",
+                ));
+            }
+            Ok(
+                cats_api::route_signing_operator::RouteV2RotationOperatorCredential {
+                    credential_id: parse_id(row.try_get("credential_id")?)?,
+                    public_key_spki: Base64UrlNoPad::new(public_key_spki).ok_or_else(|| {
+                        corrupt("stored Route v2 rotation operator SPKI is invalid")
+                    })?,
+                    public_key_spki_sha256: parse_digest(row.try_get("public_key_spki_sha256")?)?,
+                },
+            )
+        })
+        .collect()
+}
+
+fn lock_route_v2_signing_command(
+    transaction: &mut Transaction<'_>,
+    authority_id: &str,
+    command_id: &str,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':route-v2-signing-command:' || $1 || ':' || $2,
+            0::BIGINT))",
+        &[&authority_id, &command_id],
+    )?;
+    Ok(())
+}
+
+fn apply_authenticated_command_in(
+    transaction: &mut Transaction<'_>,
+    principal: &VerifiedRouteV2RotationOperatorPrincipal,
+    signed: &SignedRouteV2SigningCommand,
+    exact_bytes: &[u8],
+) -> AuthorityTxResult<AuthenticatedRouteV2SigningCommandOutcome> {
+    lock_route_v2_machine_authority_exclusive(transaction)?;
+    lock_route_v2_signing_command(
+        transaction,
+        signed.payload.authority_id.as_str(),
+        signed.payload.command_id.as_str(),
+    )?;
+    if !rotation_operator_principal_is_current(transaction, principal)? {
+        return Ok(AuthenticatedRouteV2SigningCommandOutcome::AuthenticationFailed);
+    }
+    if let Some(stored) = load_signing_command_receipt(
+        transaction,
+        signed.payload.authority_id.as_str(),
+        signed.payload.command_id.as_str(),
+    )? {
+        return Ok(if stored.exact_command_bytes == exact_bytes {
+            AuthenticatedRouteV2SigningCommandOutcome::Stored(stored.receipt)
+        } else {
+            AuthenticatedRouteV2SigningCommandOutcome::CommandIdConflict
+        });
+    }
+    let committed_at = database_now(transaction)?;
+    if committed_at < signed.payload.issued_at_unix_ms
+        || committed_at >= signed.payload.expires_at_unix_ms
+    {
+        return Ok(AuthenticatedRouteV2SigningCommandOutcome::CommandOutsideExecutionWindow);
+    }
+
+    let store_outcome =
+        apply_command_after_exclusive_lock_in(transaction, &signed.payload.command)?;
+    let result = match store_outcome {
+        RouteGrantV2SigningAuthorityStoreOutcome::Committed(result) => result,
+        RouteGrantV2SigningAuthorityStoreOutcome::PreconditionFailed => {
+            RouteGrantV2SigningAuthorityCommandResult::AuthorityPreconditionFailed
+        }
+    };
+    let exact_command_sha256 = Sha256Digest::from_bytes(Sha256::digest(exact_bytes).into());
+    let receipt = RouteV2SigningCommandReceipt {
+        version: signed.payload.version,
+        authority_id: signed.payload.authority_id.clone(),
+        release_commit_sha: signed.payload.release_commit_sha.clone(),
+        command_id: signed.payload.command_id.clone(),
+        exact_command_sha256: exact_command_sha256.clone(),
+        result,
+        committed_at_unix_ms: committed_at,
+    };
+    let exact_result_bytes = encode_route_v2_signing_command_receipt(&receipt).map_err(corrupt)?;
+    insert_signing_command_receipt(
+        transaction,
+        principal,
+        signed,
+        exact_bytes,
+        &exact_command_sha256,
+        &receipt,
+        &exact_result_bytes,
+    )?;
+    if matches!(
+        receipt.result,
+        RouteGrantV2SigningAuthorityCommandResult::Applied { .. }
+    ) {
+        if let Some(successor_ring) = signed.payload.command.kind.successor_ring() {
+            insert_public_ring_delivery(
+                transaction,
+                signed,
+                exact_bytes,
+                &exact_command_sha256,
+                successor_ring,
+                committed_at,
+            )?;
+        }
+    }
+    Ok(AuthenticatedRouteV2SigningCommandOutcome::Stored(receipt))
+}
+
+fn rotation_operator_principal_is_current(
+    transaction: &mut Transaction<'_>,
+    principal: &VerifiedRouteV2RotationOperatorPrincipal,
+) -> AuthorityTxResult<bool> {
+    let Some(row) = transaction.query_opt(
+        "SELECT authority_id, route_deployment_id, release_commit_sha, trust_sha256, threshold
+           FROM route_v2_rotation_operator_authority
+          WHERE singleton FOR SHARE",
+        &[],
+    )?
+    else {
+        return Ok(false);
+    };
+    let authority_id: String = row.try_get("authority_id")?;
+    let route_deployment_id: String = row.try_get("route_deployment_id")?;
+    let release_commit_sha: String = row.try_get("release_commit_sha")?;
+    let trust_sha256: String = row.try_get("trust_sha256")?;
+    let threshold: i16 = row.try_get("threshold")?;
+    if authority_id != principal.authority_id.as_str()
+        || route_deployment_id != principal.route_deployment_id.as_str()
+        || release_commit_sha != principal.release_commit_sha
+        || trust_sha256 != principal.trust_sha256.as_str()
+        || usize::try_from(threshold)
+            .ok()
+            .is_none_or(|threshold| principal.credential_ids.len() < threshold)
+    {
+        return Ok(false);
+    }
+    let rows = transaction.query(
+        "SELECT credential_id
+           FROM route_v2_rotation_operator_credentials
+          WHERE authority_id=$1 AND credential_id = ANY($2)
+          ORDER BY credential_id COLLATE \"C\" FOR SHARE",
+        &[
+            &authority_id,
+            &principal
+                .credential_ids
+                .iter()
+                .map(Id::as_str)
+                .collect::<Vec<_>>(),
+        ],
+    )?;
+    let stored = rows
+        .into_iter()
+        .map(|row| parse_id(row.try_get("credential_id")?))
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    if stored != principal.credential_ids {
+        return Ok(false);
+    }
+    let mut digest_input = Vec::new();
+    for id in &stored {
+        digest_input.extend_from_slice(&(id.as_str().len() as u64).to_be_bytes());
+        digest_input.extend_from_slice(id.as_str().as_bytes());
+    }
+    Ok(
+        Sha256Digest::from_bytes(Sha256::digest(digest_input).into())
+            == principal.credential_set_sha256,
+    )
+}
+
+#[derive(Debug)]
+struct StoredSigningCommandReceipt {
+    exact_command_bytes: Vec<u8>,
+    receipt: RouteV2SigningCommandReceipt,
+}
+
+fn load_signing_command_receipt(
+    transaction: &mut Transaction<'_>,
+    authority_id: &str,
+    command_id: &str,
+) -> AuthorityTxResult<Option<StoredSigningCommandReceipt>> {
+    transaction
+        .query_opt(
+            "SELECT release_commit_sha, exact_command_sha256,
+                    exact_command_bytes, exact_result_bytes,
+                    committed_at_unix_ms
+               FROM route_v2_signing_command_receipts
+              WHERE authority_id=$1 AND command_id=$2",
+            &[&authority_id, &command_id],
+        )?
+        .map(|row| {
+            let exact_command_bytes: Vec<u8> = row.try_get("exact_command_bytes")?;
+            let exact_command_sha256 = parse_digest(row.try_get("exact_command_sha256")?)?;
+            if Sha256Digest::from_bytes(Sha256::digest(&exact_command_bytes).into())
+                != exact_command_sha256
+            {
+                return Err(corrupt("stored Route v2 signing command digest diverged"));
+            }
+            let exact_result_bytes: Vec<u8> = row.try_get("exact_result_bytes")?;
+            let receipt =
+                decode_route_v2_signing_command_receipt(&exact_result_bytes).map_err(corrupt)?;
+            let committed_at: UnixMillis = from_pg(row.try_get("committed_at_unix_ms")?)?;
+            let release_commit_sha: String = row.try_get("release_commit_sha")?;
+            if receipt.authority_id.as_str() != authority_id
+                || receipt.command_id.as_str() != command_id
+                || receipt.release_commit_sha != release_commit_sha
+                || receipt.exact_command_sha256 != exact_command_sha256
+                || receipt.committed_at_unix_ms != committed_at
+            {
+                return Err(corrupt(
+                    "stored Route v2 signing receipt projection diverged",
+                ));
+            }
+            Ok(StoredSigningCommandReceipt {
+                exact_command_bytes,
+                receipt,
+            })
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_signing_command_receipt(
+    transaction: &mut Transaction<'_>,
+    principal: &VerifiedRouteV2RotationOperatorPrincipal,
+    signed: &SignedRouteV2SigningCommand,
+    exact_bytes: &[u8],
+    exact_command_sha256: &Sha256Digest,
+    receipt: &RouteV2SigningCommandReceipt,
+    exact_result_bytes: &[u8],
+) -> AuthorityTxResult<()> {
+    let previous = signed
+        .payload
+        .command
+        .successor
+        .expected_previous
+        .as_ref()
+        .ok_or_else(|| corrupt("validated Route v2 successor has no predecessor"))?;
+    let expected_revision = previous.signer_revision.to_pg().map_err(corrupt)?;
+    let committed_at = receipt.committed_at_unix_ms.to_pg().map_err(corrupt)?;
+    let (terminal_outcome, resulting_signer_revision, resulting_ring_version) =
+        match &receipt.result {
+            RouteGrantV2SigningAuthorityCommandResult::Applied {
+                signer_revision,
+                public_key_ring_version,
+            } => (
+                "applied",
+                Some(signer_revision.to_pg().map_err(corrupt)?),
+                Some(public_key_ring_version.to_pg().map_err(corrupt)?),
+            ),
+            RouteGrantV2SigningAuthorityCommandResult::AuthorityPreconditionFailed => {
+                ("authority_precondition_failed", None, None)
+            }
+        };
+    exactly_one(transaction.execute(
+        "INSERT INTO route_v2_signing_command_receipts (
+            authority_id, command_id, release_commit_sha,
+            credential_set_sha256, exact_command_sha256, exact_command_bytes,
+            command_kind, target_deployment_id, expected_signer_revision,
+            expected_signer_reference_sha256, terminal_outcome,
+            resulting_signer_revision, resulting_ring_version,
+            exact_result_bytes, committed_at_unix_ms
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        &[
+            &signed.payload.authority_id.as_str(),
+            &signed.payload.command_id.as_str(),
+            &signed.payload.release_commit_sha,
+            &principal.credential_set_sha256.as_str(),
+            &exact_command_sha256.as_str(),
+            &exact_bytes,
+            &signed.payload.command.kind.name(),
+            &signed.payload.command.successor.deployment_id.as_str(),
+            &expected_revision,
+            &previous.signer_reference_sha256.as_str(),
+            &terminal_outcome,
+            &resulting_signer_revision,
+            &resulting_ring_version,
+            &exact_result_bytes,
+            &committed_at,
+        ],
+    )?)
+}
+
+fn insert_public_ring_delivery(
+    transaction: &mut Transaction<'_>,
+    signed: &SignedRouteV2SigningCommand,
+    exact_bytes: &[u8],
+    exact_command_sha256: &Sha256Digest,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+    committed_at: UnixMillis,
+) -> AuthorityTxResult<()> {
+    let previous = ring
+        .expected_previous
+        .as_ref()
+        .ok_or_else(|| corrupt("validated Route v2 ring successor has no predecessor"))?;
+    let ring_version = ring.ring_version.to_pg().map_err(corrupt)?;
+    let previous_version = previous.ring_version.to_pg().map_err(corrupt)?;
+    let committed_at = committed_at.to_pg().map_err(corrupt)?;
+    let ring_digest = ring.digest().map_err(corrupt)?;
+    exactly_one(transaction.execute(
+        "INSERT INTO route_v2_public_ring_deliveries (
+            deployment_id, ring_version, key_ring_digest,
+            expected_previous_ring_version, expected_previous_key_ring_digest,
+            source_authority_id, source_command_id, source_release_commit_sha,
+            exact_signed_envelope_sha256, exact_signed_envelope_bytes,
+            committed_at_unix_ms
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        &[
+            &signed.payload.command.successor.deployment_id.as_str(),
+            &ring_version,
+            &ring_digest.as_str(),
+            &previous_version,
+            &previous.key_ring_digest.as_str(),
+            &signed.payload.authority_id.as_str(),
+            &signed.payload.command_id.as_str(),
+            &signed.payload.release_commit_sha,
+            &exact_command_sha256.as_str(),
+            &exact_bytes,
+            &committed_at,
+        ],
+    )?)
+}
+
+fn load_public_ring_successor_in(
+    transaction: &mut Transaction<'_>,
+    deployment_id: &Id,
+    current_ring_version: Epoch,
+    current_ring_digest: &Sha256Digest,
+) -> AuthorityTxResult<Option<RouteV2PublicRingDelivery>> {
+    let version = current_ring_version.to_pg().map_err(corrupt)?;
+    transaction
+        .query_opt(
+            "SELECT ring_version, key_ring_digest,
+                    exact_signed_envelope_sha256,
+                    exact_signed_envelope_bytes
+               FROM route_v2_public_ring_deliveries
+              WHERE deployment_id=$1
+                AND expected_previous_ring_version=$2
+                AND expected_previous_key_ring_digest=$3",
+            &[
+                &deployment_id.as_str(),
+                &version,
+                &current_ring_digest.as_str(),
+            ],
+        )?
+        .map(|row| {
+            let exact_signed_envelope_bytes: Vec<u8> =
+                row.try_get("exact_signed_envelope_bytes")?;
+            let exact_signed_envelope_sha256 =
+                parse_digest(row.try_get("exact_signed_envelope_sha256")?)?;
+            if Sha256Digest::from_bytes(Sha256::digest(&exact_signed_envelope_bytes).into())
+                != exact_signed_envelope_sha256
+            {
+                return Err(corrupt("stored Route v2 public delivery digest diverged"));
+            }
+            Ok(RouteV2PublicRingDelivery {
+                exact_signed_envelope_bytes,
+                exact_signed_envelope_sha256,
+                ring_version: from_pg(row.try_get("ring_version")?)?,
+                key_ring_digest: parse_digest(row.try_get("key_ring_digest")?)?,
+            })
+        })
+        .transpose()
 }
 
 /// Compare the in-process fixed signer with PG current. The caller must hold
@@ -394,6 +962,13 @@ fn apply_command_in(
     command: &RouteGrantV2SigningAuthorityCommand,
 ) -> AuthorityTxResult<RouteGrantV2SigningAuthorityStoreOutcome> {
     lock_route_v2_machine_authority_exclusive(transaction)?;
+    apply_command_after_exclusive_lock_in(transaction, command)
+}
+
+fn apply_command_after_exclusive_lock_in(
+    transaction: &mut Transaction<'_>,
+    command: &RouteGrantV2SigningAuthorityCommand,
+) -> AuthorityTxResult<RouteGrantV2SigningAuthorityStoreOutcome> {
     let Some(pointer) = load_pointer(transaction, "FOR UPDATE")? else {
         return Ok(precondition_failed());
     };

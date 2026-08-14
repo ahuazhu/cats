@@ -15,10 +15,16 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use cats_api::gateway_workload_identity::canonical_gateway_leaf_spki_sha256;
 use cats_api::route_grant_v2::{
-    decode_route_tunnel_v2_request, encode_route_admission_v2_failure, RouteAdmissionV2Failure,
-    RouteAdmissionV2Reason, ROUTE_TUNNEL_V2_CONNECT_DEADLINE_MILLIS, ROUTE_TUNNEL_V2_METHOD,
-    ROUTE_TUNNEL_V2_PATH, ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES, ROUTE_TUNNEL_V2_UPGRADE,
-    ROUTE_V2_JSON_CONTENT_TYPE,
+    decode_route_tunnel_v2_request, encode_route_admission_v2_failure,
+    encode_route_grant_v2_public_key_ring, RouteAdmissionV2Failure, RouteAdmissionV2Reason,
+    ROUTE_TUNNEL_V2_CONNECT_DEADLINE_MILLIS, ROUTE_TUNNEL_V2_METHOD, ROUTE_TUNNEL_V2_PATH,
+    ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES, ROUTE_TUNNEL_V2_UPGRADE, ROUTE_V2_JSON_CONTENT_TYPE,
+};
+use cats_api::route_signing_operator::{
+    decode_signed_route_v2_signing_command, route_v2_ring_successor_query,
+    verify_signed_route_v2_signing_command, RouteV2RotationOperatorTrust,
+    ROUTE_V2_RING_SUCCESSOR_PATH, ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES,
+    ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE,
 };
 use cats_api::runtime_artifacts::InstalledNodeRouteV2MachineArtifacts;
 use cats_api::runtime_reconciliation::{HttpProtocol, Id, Sha256Digest};
@@ -42,7 +48,7 @@ use crate::route_grant_v2::{
     AdmittedRouteV2, AuthenticatedGatewayPrincipal, RouteAdmissionV2RequestBinding,
     RouteGrantV2KeyRing, RouteGrantV2Verifier,
 };
-use crate::route_signing_rotation::RouteGrantV2RingInstaller;
+use crate::route_signing_rotation::{RouteGrantV2RingInstallContext, RouteGrantV2RingInstaller};
 use crate::runtime::reconciliation::AdmissionCellRegistry;
 
 const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
@@ -51,6 +57,9 @@ const REQUEST_BODY_DEADLINE: Duration = Duration::from_secs(2);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(35);
 const CONNECTION_LIMIT: usize = 64;
 const TUNNEL_LIMIT: usize = 256;
+const RING_DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RING_DELIVERY_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+const RING_DELIVERY_MAX_CATCH_UP: usize = 8;
 const HTTP_11_ALPN: &[u8] = b"http/1.1";
 #[cfg(test)]
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -64,6 +73,14 @@ pub struct RouteV2MachineConfig {
     tls: Arc<ServerConfig>,
     verifier: Arc<RouteGrantV2Verifier>,
     ring_install_serialized: Arc<Mutex<()>>,
+    delivery: Option<RouteV2RingDeliveryConfig>,
+}
+
+#[derive(Clone)]
+struct RouteV2RingDeliveryConfig {
+    control_plane_origin: reqwest::Url,
+    trust: RouteV2RotationOperatorTrust,
+    expected_release_commit_sha: String,
 }
 
 impl std::fmt::Debug for RouteV2MachineConfig {
@@ -83,14 +100,23 @@ impl RouteV2MachineConfig {
         listen: String,
         local_node_id: Id,
         artifacts: &InstalledNodeRouteV2MachineArtifacts,
+        control_plane_url: &str,
     ) -> anyhow::Result<Self> {
         let (ring, tls) = compose_node_route_v2_machine_artifacts(artifacts)?;
+        let trust = artifacts.rotation_operator_trust().trust().clone();
+        let expected_release_commit_sha =
+            embedded_route_v2_rotation_release_commit_sha(&trust.release_commit_sha)?;
         Ok(Self {
             listen,
             local_node_id,
             tls,
             verifier: Arc::new(RouteGrantV2Verifier::new(ring)),
             ring_install_serialized: Arc::new(Mutex::new(())),
+            delivery: Some(RouteV2RingDeliveryConfig {
+                control_plane_origin: validate_control_plane_origin(control_plane_url)?,
+                trust,
+                expected_release_commit_sha,
+            }),
         })
     }
 
@@ -138,8 +164,38 @@ impl RouteV2MachineConfig {
             )?,
             verifier,
             ring_install_serialized: Arc::new(Mutex::new(())),
+            delivery: None,
         })
     }
+}
+
+fn embedded_route_v2_rotation_release_commit_sha(trust_release: &str) -> anyhow::Result<String> {
+    let embedded = option_env!("CATS_RELEASE_COMMIT_SHA");
+    #[cfg(debug_assertions)]
+    let embedded = embedded.unwrap_or(trust_release);
+    #[cfg(not(debug_assertions))]
+    let embedded = embedded
+        .context("release build omitted CATS_RELEASE_COMMIT_SHA for Route v2 ring delivery")?;
+    anyhow::ensure!(
+        embedded == trust_release,
+        "Route v2 rotation operator trust does not bind this exact Node release"
+    );
+    Ok(embedded.to_owned())
+}
+
+fn validate_control_plane_origin(input: &str) -> anyhow::Result<reqwest::Url> {
+    let origin = reqwest::Url::parse(input).context("parse Route v2 delivery Control origin")?;
+    anyhow::ensure!(
+        origin.scheme() == "https"
+            && origin.host_str().is_some()
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none(),
+        "Route v2 delivery Control origin must be one HTTPS origin"
+    );
+    Ok(origin)
 }
 
 /// Validate the complete, immutable revision-1 Node artifact transaction.
@@ -155,6 +211,12 @@ pub fn validate_initial_node_route_v2_machine_artifacts(
             && artifacts.ring().ring().expected_previous.is_none(),
         "Node Route v2 initial artifact ring is not revision 1"
     );
+    embedded_route_v2_rotation_release_commit_sha(
+        &artifacts
+            .rotation_operator_trust()
+            .trust()
+            .release_commit_sha,
+    )?;
     compose_node_route_v2_machine_artifacts(artifacts).map(drop)
 }
 
@@ -176,9 +238,7 @@ pub(crate) struct RouteV2MachineListener {
     service: Arc<RouteV2MachineService>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
-    // Composed now so any future accepted delivery transport can only use the
-    // installer that closes this listener's exact admission registry.
-    ring_installer: RouteGrantV2RingInstaller,
+    delivery_task: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl RouteV2MachineListener {
@@ -186,12 +246,17 @@ impl RouteV2MachineListener {
         config: RouteV2MachineConfig,
         registry: Arc<AdmissionCellRegistry>,
     ) -> anyhow::Result<Self> {
-        let ring_installer = config.ring_installer(Arc::clone(&registry));
+        let ring_installer = Arc::new(config.ring_installer(Arc::clone(&registry)));
         let listener = TcpListener::bind(&config.listen)
             .await
             .with_context(|| format!("bind Node Route v2 machine listener {}", config.listen))?;
         let addr = listener.local_addr()?;
         let (stop, shutdown) = watch::channel(false);
+        let delivery_shutdown = stop.subscribe();
+        let delivery = config.delivery.clone();
+        let delivery_verifier = Arc::clone(&config.verifier);
+        let delivery_installer = Arc::clone(&ring_installer);
+        let delivery_registry = Arc::clone(&registry);
         let service = Arc::new(RouteV2MachineService::new(
             config.local_node_id,
             config.verifier,
@@ -199,25 +264,36 @@ impl RouteV2MachineListener {
         ));
         let run_service = Arc::clone(&service);
         let task = tokio::spawn(run_listener(listener, config.tls, run_service, shutdown));
+        let delivery_task = delivery.map(|delivery| {
+            tokio::spawn(async move {
+                let result = run_ring_delivery(
+                    delivery,
+                    delivery_verifier,
+                    delivery_installer,
+                    delivery_shutdown,
+                )
+                .await;
+                if let Err(error) = &result {
+                    tracing::error!(
+                        %error,
+                        "Route v2 ring delivery stopped; latching route admission closed"
+                    );
+                    delivery_registry.latch_emergency_route_disable();
+                }
+                result
+            })
+        });
         Ok(Self {
             addr,
             service,
             stop,
             task: Some(task),
-            ring_installer,
+            delivery_task,
         })
     }
 
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    #[allow(
-        dead_code,
-        reason = "G3 core is composed but its accepted delivery transport is still absent"
-    )]
-    pub(crate) fn ring_installer(&self) -> &RouteGrantV2RingInstaller {
-        &self.ring_installer
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -232,19 +308,38 @@ impl RouteV2MachineListener {
             .context("Node Route v2 listener already joined")?;
         let joined = task.await;
         self.task.take();
-        joined.context("Node Route v2 listener task panicked")?
+        self.stop.send_replace(true);
+        let delivery = join_optional_task(&mut self.delivery_task, "Route v2 delivery task").await;
+        joined.context("Node Route v2 listener task panicked")??;
+        delivery
     }
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.begin_shutdown();
-        let Some(mut task) = self.task.take() else {
-            return Ok(());
-        };
-        match tokio::time::timeout(SHUTDOWN_DEADLINE, &mut task).await {
-            Ok(joined) => joined.context("Node Route v2 listener task panicked")?,
+        let mut task = self.task.take();
+        let mut delivery_task = self.delivery_task.take();
+        match tokio::time::timeout(SHUTDOWN_DEADLINE, async {
+            if let Some(task) = task.as_mut() {
+                task.await
+                    .context("Node Route v2 listener task panicked")??;
+            }
+            if let Some(task) = delivery_task.as_mut() {
+                task.await.context("Route v2 delivery task panicked")??;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        {
+            Ok(joined) => joined,
             Err(_) => {
-                task.abort();
-                let _ = task.await;
+                if let Some(task) = task {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if let Some(task) = delivery_task {
+                    task.abort();
+                    let _ = task.await;
+                }
                 anyhow::bail!("Node Route v2 listener exceeded its shutdown deadline");
             }
         }
@@ -257,7 +352,288 @@ impl Drop for RouteV2MachineListener {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        if let Some(task) = self.delivery_task.take() {
+            task.abort();
+        }
     }
+}
+
+async fn join_optional_task(
+    task: &mut Option<JoinHandle<anyhow::Result<()>>>,
+    name: &str,
+) -> anyhow::Result<()> {
+    let Some(task_ref) = task.as_mut() else {
+        return Ok(());
+    };
+    let result = task_ref.await.with_context(|| format!("{name} panicked"))?;
+    task.take();
+    result
+}
+
+async fn run_ring_delivery(
+    config: RouteV2RingDeliveryConfig,
+    verifier: Arc<RouteGrantV2Verifier>,
+    installer: Arc<RouteGrantV2RingInstaller>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(RING_DELIVERY_REQUEST_DEADLINE)
+        .timeout(RING_DELIVERY_REQUEST_DEADLINE)
+        .build()
+        .context("build Route v2 ring delivery client")?;
+    let mut interval = tokio::time::interval(RING_DELIVERY_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = interval.tick() => {}
+        }
+        for _ in 0..RING_DELIVERY_MAX_CATCH_UP {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let current = match verifier.current_ring() {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::error!(%error, "Route v2 verifier unavailable during ring delivery");
+                    break;
+                }
+            };
+            let query = route_v2_ring_successor_query(
+                &config.trust.route_deployment_id,
+                current.version(),
+                current.digest(),
+            );
+            let mut url = config
+                .control_plane_origin
+                .join(ROUTE_V2_RING_SUCCESSOR_PATH)
+                .context("compose Route v2 ring delivery URL")?;
+            url.set_query(Some(&query));
+            let response = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                response = client
+                    .get(url)
+                    .header(reqwest::header::ACCEPT, ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE)
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                    .send() => response,
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(%error, "Route v2 ring successor request failed");
+                    break;
+                }
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::NO_CONTENT {
+                if !valid_no_content_delivery_response(&response) {
+                    tracing::warn!("Route v2 no-successor response had invalid headers");
+                }
+                break;
+            }
+            if status != reqwest::StatusCode::OK {
+                tracing::warn!(%status, "Route v2 ring successor request was not successful");
+                break;
+            }
+            if !valid_json_delivery_response(&response) {
+                tracing::warn!("Route v2 ring successor response had invalid headers");
+                break;
+            }
+            let bytes = match read_bounded_delivery_body(
+                response,
+                ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES,
+            )
+            .await
+            {
+                Some(bytes) => bytes,
+                None => {
+                    tracing::warn!("Route v2 ring successor response exceeded its wire bound");
+                    break;
+                }
+            };
+            let signed = match decode_signed_route_v2_signing_command(&bytes) {
+                Ok(signed) => signed,
+                Err(error) => {
+                    tracing::warn!(%error, "Route v2 ring successor was not canonical");
+                    break;
+                }
+            };
+            if let Err(error) = verify_signed_route_v2_signing_command(
+                &config.trust,
+                &config.expected_release_commit_sha,
+                &signed,
+            ) {
+                tracing::warn!(%error, "Route v2 ring successor proof was rejected");
+                break;
+            }
+            let Some(candidate) = signed.payload.command.kind.successor_ring() else {
+                tracing::warn!("Route v2 ring delivery carried no public successor");
+                break;
+            };
+            let Some(previous) = candidate.expected_previous.as_ref() else {
+                tracing::warn!("Route v2 ring delivery omitted its predecessor");
+                break;
+            };
+            if previous.ring_version != current.version()
+                || &previous.key_ring_digest != current.digest()
+            {
+                tracing::warn!("Route v2 ring delivery did not name the exact current predecessor");
+                break;
+            }
+            let candidate_bytes = match encode_route_grant_v2_public_key_ring(candidate) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, "Route v2 ring delivery candidate was invalid");
+                    break;
+                }
+            };
+            match install_delivered_ring(Arc::clone(&installer), candidate_bytes, &mut shutdown)
+                .await
+            {
+                DeliveredRingInstall::Settled(Ok(outcome)) => {
+                    tracing::info!(
+                        ring_version = candidate.ring_version.get(),
+                        ?outcome,
+                        "Route v2 public ring successor durably installed"
+                    );
+                }
+                DeliveredRingInstall::Settled(Err(error)) => {
+                    tracing::warn!(%error, "Route v2 public ring successor installation failed");
+                    break;
+                }
+                DeliveredRingInstall::Shutdown => return Ok(()),
+            }
+        }
+    }
+}
+
+enum DeliveredRingInstall {
+    Settled(
+        Result<
+            crate::route_signing_rotation::RouteGrantV2DurableInstallOutcome,
+            crate::route_signing_rotation::RouteGrantV2DurableInstallError,
+        >,
+    ),
+    Shutdown,
+}
+
+async fn install_delivered_ring(
+    installer: Arc<RouteGrantV2RingInstaller>,
+    candidate_bytes: Vec<u8>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> DeliveredRingInstall {
+    let context = RouteGrantV2RingInstallContext::default();
+    let worker_context = context.clone();
+    let mut task =
+        tokio::task::spawn_blocking(move || installer.install(&candidate_bytes, &worker_context));
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                context.cancel();
+                let _ = task.await;
+                DeliveredRingInstall::Shutdown
+            } else {
+                match task.await {
+                    Ok(result) => DeliveredRingInstall::Settled(result),
+                    Err(_) => DeliveredRingInstall::Settled(Err(
+                        crate::route_signing_rotation::RouteGrantV2DurableInstallError::Filesystem
+                    )),
+                }
+            }
+        }
+        joined = &mut task => match joined {
+            Ok(result) => DeliveredRingInstall::Settled(result),
+            Err(_) => DeliveredRingInstall::Settled(Err(
+                crate::route_signing_rotation::RouteGrantV2DurableInstallError::Filesystem
+            )),
+        },
+    }
+}
+
+fn valid_json_delivery_response(response: &reqwest::Response) -> bool {
+    !response
+        .headers()
+        .contains_key(reqwest::header::CONTENT_ENCODING)
+        && single_exact_response_header(response.headers(), reqwest::header::CONTENT_TYPE)
+            .is_some_and(|value| {
+                value
+                    .trim_matches([' ', '\t'])
+                    .eq_ignore_ascii_case(ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE)
+            })
+        && single_exact_response_header(response.headers(), reqwest::header::CACHE_CONTROL)
+            == Some("no-store")
+        && !declared_delivery_response_exceeds(
+            response.headers(),
+            ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES,
+        )
+}
+
+fn valid_no_content_delivery_response(response: &reqwest::Response) -> bool {
+    !response
+        .headers()
+        .contains_key(reqwest::header::CONTENT_ENCODING)
+        && !response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_TYPE)
+        && single_exact_response_header(response.headers(), reqwest::header::CACHE_CONTROL)
+            == Some("no-store")
+        && !declared_delivery_response_exceeds(response.headers(), 0)
+}
+
+fn single_exact_response_header(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+fn declared_delivery_response_exceeds(headers: &reqwest::header::HeaderMap, cap: usize) -> bool {
+    let mut values = headers.get_all(reqwest::header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return true;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|length| length > cap as u64)
+}
+
+async fn read_bounded_delivery_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        let remaining = cap.checked_sub(body.len())?;
+        if chunk.len() > remaining {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    (!body.is_empty()).then_some(body)
 }
 
 struct RouteV2MachineService {

@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority;
-use cats_api::runtime_artifacts::{InstalledGatewayMachineArtifacts, InstalledRouteGrantV2Signer};
+use cats_api::runtime_artifacts::{
+    InstalledGatewayMachineArtifacts, InstalledRouteGrantV2Signer,
+    InstalledRouteV2RotationOperatorTrust,
+};
 use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::BlobStore;
@@ -585,6 +588,8 @@ pub struct GatewayMachineConfig {
     gateway_authority: GatewayWorkloadIdentityAuthority,
     tls_config: crate::gateway_machine::GatewayMachineTlsConfig,
     signing_authority: Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
+    rotation_operator_trust: Option<InstalledRouteV2RotationOperatorTrust>,
+    rotation_release_commit_sha: Option<String>,
 }
 
 impl GatewayMachineConfig {
@@ -592,6 +597,7 @@ impl GatewayMachineConfig {
         listen: impl Into<String>,
         gateway_artifacts: InstalledGatewayMachineArtifacts,
         signer_artifacts: InstalledRouteGrantV2Signer,
+        rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
         route_grant_ttl_seconds: u64,
     ) -> anyhow::Result<Self> {
         let listen = listen.into();
@@ -610,11 +616,16 @@ impl GatewayMachineConfig {
                 route_grant_ttl_seconds,
             )?,
         );
+        let rotation_release_commit_sha = embedded_route_v2_rotation_release_commit_sha(
+            rotation_operator_trust.trust().release_commit_sha.as_str(),
+        )?;
         Ok(Self {
             listen,
             gateway_authority: gateway_artifacts.authority().clone(),
             tls_config,
             signing_authority,
+            rotation_operator_trust: Some(rotation_operator_trust),
+            rotation_release_commit_sha: Some(rotation_release_commit_sha),
         })
     }
 
@@ -635,8 +646,24 @@ impl GatewayMachineConfig {
             gateway_authority,
             tls_config,
             signing_authority,
+            rotation_operator_trust: None,
+            rotation_release_commit_sha: None,
         })
     }
+}
+
+fn embedded_route_v2_rotation_release_commit_sha(trust_release: &str) -> anyhow::Result<String> {
+    let embedded = option_env!("CATS_RELEASE_COMMIT_SHA");
+    #[cfg(debug_assertions)]
+    let embedded = embedded.unwrap_or(trust_release);
+    #[cfg(not(debug_assertions))]
+    let embedded = embedded
+        .context("release build omitted CATS_RELEASE_COMMIT_SHA for Route v2 rotation authority")?;
+    anyhow::ensure!(
+        embedded == trust_release,
+        "Route v2 rotation operator trust does not bind this exact release"
+    );
+    Ok(embedded.to_owned())
 }
 
 /// Default synchronous wait for an OCI deploy.
@@ -676,6 +703,8 @@ pub struct AppState {
     pub(crate) fleet_verification_service: Arc<FleetVerificationService>,
     pub(crate) runtime_node_authority:
         Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
+    pub(crate) route_v2_signing_operator:
+        Option<Arc<crate::api::route_signing_operator::RouteV2SigningOperatorService>>,
     /// The retired product authority exists only in debug test compositions.
     #[cfg(debug_assertions)]
     pub(crate) retired_product_authority_for_tests: bool,
@@ -774,6 +803,9 @@ impl Handle {
         self.state.fleet_verification_service.begin_shutdown();
         self.state.route_resolve_admission.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
+        if let Some(service) = &self.state.route_v2_signing_operator {
+            service.begin_shutdown();
+        }
         self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
         if let Some(shutdown) = self
@@ -815,6 +847,13 @@ impl Handle {
             .state
             .runtime_node_authority
             .shutdown_commit_resolutions();
+        let route_rotation_resolutions = async {
+            if let Some(service) = &self.state.route_v2_signing_operator {
+                service.shutdown_commit_resolutions().await
+            } else {
+                Ok(())
+            }
+        };
         let manifest_reads = self.image_manifest_resolver.shutdown();
         let reconciler = async {
             if let Some(task) = &self.reconciler_task {
@@ -853,6 +892,7 @@ impl Handle {
             persistent_disk_commit_result,
             product_mutation_commit_result,
             node_authority_result,
+            route_rotation_result,
             manifest_result,
             gateway_machine_result,
             reconciler_result,
@@ -867,6 +907,7 @@ impl Handle {
             persistent_disk_commit_resolutions,
             product_mutation_commit_resolutions,
             node_authority_resolutions,
+            route_rotation_resolutions,
             manifest_reads,
             gateway_machine,
             reconciler,
@@ -889,7 +930,8 @@ impl Handle {
         commit_result.map_err(anyhow::Error::from)?;
         persistent_disk_commit_result.map_err(anyhow::Error::from)?;
         product_mutation_commit_result.map_err(anyhow::Error::from)?;
-        node_authority_result.map_err(anyhow::Error::from)
+        node_authority_result.map_err(anyhow::Error::from)?;
+        route_rotation_result
     }
 }
 
@@ -1338,6 +1380,16 @@ async fn spawn_inner(
         .await
         .context("install runtime provisioner trust bundle")?;
     if let Some(machine) = &gateway_machine {
+        if let Some(installed) = &machine.rotation_operator_trust {
+            let trust = installed.trust().clone();
+            let exact_bytes = installed.exact_bytes().to_vec();
+            store
+                .execute(move |store| {
+                    store.install_route_v2_rotation_operator_trust(&trust, &exact_bytes)
+                })
+                .await
+                .context("install Route v2 rotation operator trust")?;
+        }
         let signing_authority = Arc::clone(&machine.signing_authority);
         store
             .execute(move |store| store.install_route_grant_v2_signer_authority(&signing_authority))
@@ -1440,6 +1492,24 @@ async fn spawn_inner(
         ),
     );
     let readiness = Arc::new(ReadinessLatch::new());
+    let route_v2_signing_operator = match gateway_machine.as_ref() {
+        Some(machine) => match (
+            machine.rotation_operator_trust.as_ref(),
+            machine.rotation_release_commit_sha.as_ref(),
+        ) {
+            (Some(installed), Some(release)) => Some(Arc::new(
+                crate::api::route_signing_operator::RouteV2SigningOperatorService::new(
+                    Arc::clone(&store),
+                    installed.trust().clone(),
+                    release.clone(),
+                    Arc::clone(&readiness),
+                )?,
+            )),
+            (None, None) => None,
+            _ => anyhow::bail!("incomplete Route v2 rotation operator composition"),
+        },
+        None => None,
+    };
     let notify = Arc::new(tokio::sync::Notify::new());
     let controller = Controller::new_with_liveness_authority(
         store.clone(),
@@ -1463,6 +1533,7 @@ async fn spawn_inner(
                 Arc::clone(&readiness),
             ),
         ),
+        route_v2_signing_operator,
         store,
         observation_store,
         usage,

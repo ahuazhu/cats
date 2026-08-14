@@ -30,6 +30,10 @@ use crate::route_grant_v2::{
     ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
     ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
 };
+use crate::route_signing_operator::{
+    decode_route_v2_rotation_operator_trust, RouteV2RotationOperatorTrust,
+    ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES, ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
+};
 use crate::runtime_reconciliation::{
     decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
     GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest, WireU64,
@@ -88,6 +92,22 @@ pub struct InstalledRouteGrantV2PublicKeyRing {
     exact_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledRouteV2RotationOperatorTrust {
+    trust: RouteV2RotationOperatorTrust,
+    exact_bytes: Vec<u8>,
+}
+
+impl InstalledRouteV2RotationOperatorTrust {
+    pub fn trust(&self) -> &RouteV2RotationOperatorTrust {
+        &self.trust
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+}
+
 /// Read-only state of the one fixed Node public-ring artifact.
 ///
 /// An absent fixed path is an ordinary unavailable observation. Once any
@@ -140,17 +160,19 @@ pub struct InstalledGatewayMachineArtifacts {
 /// Startup-pinned Node Route v2 verification and mTLS server material.
 pub struct InstalledNodeRouteV2MachineArtifacts {
     ring: InstalledRouteGrantV2PublicKeyRing,
+    rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
     gateway_client_ca_bundle_pem: Vec<u8>,
     server_certificate_pem: Vec<u8>,
     server_private_key_pem: Vec<u8>,
 }
 
 #[cfg(unix)]
-const NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES: [&str; 4] = [
+const NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES: [&str; 5] = [
     "gateway-client-ca-bundle.pem",
     "node-machine-server-certificate.pem",
     "node-machine-server-private-key.pem",
     "public-key-ring.v1.json",
+    "rotation-operator-trust.v1.json",
 ];
 
 /// Startup-pinned Gateway identity and trust material for the Node hop.
@@ -186,6 +208,10 @@ impl std::fmt::Debug for InstalledGatewayNodeRouteV2MachineArtifacts {
 impl InstalledNodeRouteV2MachineArtifacts {
     pub fn ring(&self) -> &InstalledRouteGrantV2PublicKeyRing {
         &self.ring
+    }
+
+    pub fn rotation_operator_trust(&self) -> &InstalledRouteV2RotationOperatorTrust {
+        &self.rotation_operator_trust
     }
 
     pub fn gateway_client_ca_bundle_pem(&self) -> &[u8] {
@@ -372,6 +398,8 @@ pub enum RuntimeArtifactError {
     WrongRouteGrantV2PublicKeyRingPath,
     #[error("Route Grant v2 signer paths must be the canonical installed paths")]
     WrongRouteGrantV2SignerPath,
+    #[error("Route v2 rotation operator trust path must be the canonical installed path")]
+    WrongRouteV2RotationOperatorTrustPath,
     #[error("Gateway machine artifact paths must be the canonical installed paths")]
     WrongGatewayMachineArtifactPath,
     #[error("Node Route v2 machine artifact paths must be the canonical installed paths")]
@@ -392,6 +420,8 @@ pub enum RuntimeArtifactError {
     InvalidRouteGrantV2PublicKeyRing,
     #[error("Route Grant v2 signer artifact set is invalid")]
     InvalidRouteGrantV2Signer,
+    #[error("Route v2 rotation operator trust is invalid")]
+    InvalidRouteV2RotationOperatorTrust,
     #[error("Gateway machine artifact set is invalid")]
     InvalidGatewayMachineArtifacts,
     #[error("Node Route v2 machine artifact set is invalid")]
@@ -573,7 +603,7 @@ pub fn load_installed_node_route_v2_machine_artifacts(
 ///
 /// The caller may select only the staging directory. Every path component is
 /// opened descriptor-relative without following symlinks, and the directory
-/// must contain exactly the four Node artifacts with the same ownership,
+/// must contain exactly the five Node artifacts with the same ownership,
 /// mode, link-count, size and canonical-wire contracts used at daemon startup.
 /// TLS composition remains a Node concern and is validated by
 /// `cats-node-agent` before an installer may publish these bytes.
@@ -699,6 +729,13 @@ fn load_node_route_v2_machine_artifacts_from(
         ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
         public,
     )?;
+    let rotation_operator_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "rotation-operator-trust.v1.json",
+        Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH),
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
     let client_ca_file = read_pinned_installed_file_at_with_contract(
         directory.final_descriptor(),
         "gateway-client-ca-bundle.pem",
@@ -732,6 +769,11 @@ fn load_node_route_v2_machine_artifacts_from(
         &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
     )?;
     ring_file.revalidate_from(&fresh, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, public)?;
+    rotation_operator_file.revalidate_from(
+        &fresh,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
     client_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
     server_certificate_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
     server_private_key_file.revalidate_from(
@@ -754,6 +796,11 @@ fn load_node_route_v2_machine_artifacts_from(
         &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
     )?;
     ring_file.revalidate_from(&closing, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, public)?;
+    rotation_operator_file.revalidate_from(
+        &closing,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
     client_ca_file.revalidate_from(&closing, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
     server_certificate_file.revalidate_from(
         &closing,
@@ -778,15 +825,68 @@ fn load_node_route_v2_machine_artifacts_from(
     }
     let ring = decode_route_grant_v2_public_key_ring(ring_file.exact_bytes())
         .map_err(|_| RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)?;
+    let rotation_operator_trust =
+        decode_route_v2_rotation_operator_trust(rotation_operator_file.exact_bytes())
+            .map_err(|_| RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)?;
     Ok(InstalledNodeRouteV2MachineArtifacts {
         ring: InstalledRouteGrantV2PublicKeyRing {
             ring,
             exact_bytes: ring_file.into_exact_bytes(),
         },
+        rotation_operator_trust: InstalledRouteV2RotationOperatorTrust {
+            trust: rotation_operator_trust,
+            exact_bytes: rotation_operator_file.into_exact_bytes(),
+        },
         gateway_client_ca_bundle_pem: client_ca_file.into_exact_bytes(),
         server_certificate_pem: server_certificate_file.into_exact_bytes(),
         server_private_key_pem: server_private_key_file.into_exact_bytes(),
     })
+}
+
+/// Load the one public trust artifact that authenticates Route v2 rotation
+/// commands on Control. A path argument exists only to prove that startup did
+/// not accept an alternate operator authority.
+pub fn load_installed_route_v2_rotation_operator_trust(
+    selected_path: &Path,
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    if selected_path != Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH) {
+        return Err(RuntimeArtifactError::WrongRouteV2RotationOperatorTrustPath);
+    }
+    load_installed_route_v2_rotation_operator_trust_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_route_v2_rotation_operator_trust_platform(
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    let file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "rotation-operator-trust.v1.json",
+        Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH),
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        InstalledFileContract::root(0o644),
+    )?;
+    let fresh = directory.reopen_canonical_path()?;
+    file.revalidate_from(
+        &fresh,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        InstalledFileContract::root(0o644),
+    )?;
+    let trust = decode_route_v2_rotation_operator_trust(file.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidRouteV2RotationOperatorTrust)?;
+    Ok(InstalledRouteV2RotationOperatorTrust {
+        trust,
+        exact_bytes: file.into_exact_bytes(),
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_route_v2_rotation_operator_trust_platform(
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
@@ -2259,6 +2359,7 @@ mod tests {
     const RECEIPT: &[u8] = br#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
     const MANIFEST: &[u8] = br#"{"guest_runtime_profile":{"path":"guest-runtime-profile.v1.json","sha256":"sha256:dae6f9b08706e17d03cbeece8141fef960185fe0758f80f999f9f2218d43e10a","size_bytes":301},"initramfs":{"path":"guest/initramfs.img","sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size_bytes":8388608},"kernel":{"path":"guest/vmlinuz","sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size_bytes":16777216},"version":1}"#;
     const ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+    const ROTATION_OPERATOR_TRUST: &[u8] = br#"{"version":1,"authority_id":"route_rotation_authority_a","route_deployment_id":"route_deployment_a","release_commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","threshold":1,"credentials":[{"credential_id":"route_rotation_operator_a","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To","public_key_spki_sha256":"sha256:2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"}]}"#;
     const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
     const ROUTE_PRIVATE_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/route_grant_v2_private_ed25519.pem");
@@ -2364,6 +2465,11 @@ mod tests {
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         for (basename, bytes, mode) in [
             ("public-key-ring.v1.json", ROUTE_RING, 0o644),
+            (
+                "rotation-operator-trust.v1.json",
+                ROTATION_OPERATOR_TRUST,
+                0o644,
+            ),
             ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
             (
                 "node-machine-server-certificate.pem",

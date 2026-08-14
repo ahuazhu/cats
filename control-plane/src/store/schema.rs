@@ -3110,6 +3110,161 @@ CREATE TABLE IF NOT EXISTS route_v2_signer_retirements (
 CREATE UNIQUE INDEX route_v2_signer_one_pending_normal_retirement
     ON route_v2_signer_retirements(deployment_id)
     WHERE source = 'normal' AND state <> 'retired';
+CREATE TABLE IF NOT EXISTS route_v2_rotation_operator_authority (
+    singleton BOOLEAN
+        CONSTRAINT route_v2_rotation_operator_authority_pkey PRIMARY KEY
+        DEFAULT TRUE
+        CONSTRAINT route_v2_rotation_operator_singleton_ck CHECK (singleton),
+    authority_id TEXT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_authority_id_key UNIQUE,
+    route_deployment_id TEXT NOT NULL,
+    release_commit_sha TEXT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_release_sha_ck
+        CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'),
+    trust_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_trust_sha_ck
+        CHECK (trust_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    threshold SMALLINT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_threshold_ck
+        CHECK (threshold BETWEEN 1 AND 8),
+    trust_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_rotation_operator_trust_bytes_ck
+        CHECK (octet_length(trust_bytes) BETWEEN 1 AND 16384),
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_committed_at_ck
+        CHECK (first_committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_rotation_operator_identity_key
+        UNIQUE (authority_id, route_deployment_id, release_commit_sha, trust_sha256)
+);
+CREATE TABLE IF NOT EXISTS route_v2_rotation_operator_credentials (
+    credential_id TEXT
+        CONSTRAINT route_v2_rotation_operator_credentials_pkey PRIMARY KEY,
+    authority_id TEXT NOT NULL,
+    credential_ordinal SMALLINT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_ordinal_ck
+        CHECK (credential_ordinal BETWEEN 0 AND 7),
+    public_key_spki TEXT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_spki_key UNIQUE,
+    public_key_spki_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_spki_sha_key UNIQUE
+        CONSTRAINT route_v2_rotation_operator_spki_sha_ck
+        CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    first_committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_rotation_operator_credential_committed_at_ck
+        CHECK (first_committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_rotation_operator_ordinal_key
+        UNIQUE (authority_id, credential_ordinal),
+    CONSTRAINT route_v2_rotation_operator_credential_authority_fkey
+        FOREIGN KEY (authority_id)
+        REFERENCES route_v2_rotation_operator_authority(authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE TABLE IF NOT EXISTS route_v2_signing_command_receipts (
+    authority_id TEXT NOT NULL,
+    command_id TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_id_ck
+        CHECK (command_id ~ '^[0-9a-f]{32}$'),
+    release_commit_sha TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_release_sha_ck
+        CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'),
+    credential_set_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_credential_set_sha_ck
+        CHECK (credential_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    exact_command_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_exact_sha_ck
+        CHECK (exact_command_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    exact_command_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_signing_command_exact_bytes_ck
+        CHECK (octet_length(exact_command_bytes) BETWEEN 1 AND 65536),
+    command_kind TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_kind_ck CHECK (command_kind IN (
+        'publish_overlap', 'switch_active', 'publish_new_only',
+        'retire', 'disable', 'activate')),
+    target_deployment_id TEXT NOT NULL,
+    expected_signer_revision BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_command_expected_revision_ck
+        CHECK (expected_signer_revision > 0),
+    expected_signer_reference_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_expected_sha_ck
+        CHECK (expected_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    terminal_outcome TEXT NOT NULL
+        CONSTRAINT route_v2_signing_command_terminal_outcome_ck CHECK (
+        terminal_outcome IN ('applied', 'authority_precondition_failed')),
+    resulting_signer_revision BIGINT NULL
+        CONSTRAINT route_v2_signing_command_result_revision_ck
+        CHECK (resulting_signer_revision > 0),
+    resulting_ring_version BIGINT NULL
+        CONSTRAINT route_v2_signing_command_result_ring_ck
+        CHECK (resulting_ring_version > 0),
+    exact_result_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_signing_command_result_bytes_ck
+        CHECK (octet_length(exact_result_bytes) BETWEEN 1 AND 16384),
+    committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_signing_command_committed_at_ck
+        CHECK (committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_signing_command_receipts_pkey
+        PRIMARY KEY (authority_id, command_id),
+    CONSTRAINT route_v2_signing_command_result_projection_ck CHECK (
+        (terminal_outcome = 'applied'
+            AND resulting_signer_revision IS NOT NULL
+            AND resulting_ring_version IS NOT NULL) OR
+        (terminal_outcome = 'authority_precondition_failed'
+            AND resulting_signer_revision IS NULL
+            AND resulting_ring_version IS NULL)),
+    CONSTRAINT route_v2_signing_command_operator_fkey
+        FOREIGN KEY (authority_id)
+        REFERENCES route_v2_rotation_operator_authority(authority_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT route_v2_signing_command_target_fkey
+        FOREIGN KEY (target_deployment_id)
+        REFERENCES route_v2_signing_authority(deployment_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+CREATE TABLE IF NOT EXISTS route_v2_public_ring_deliveries (
+    deployment_id TEXT NOT NULL,
+    ring_version BIGINT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_version_ck CHECK (ring_version > 1),
+    key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_digest_ck
+        CHECK (key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    expected_previous_ring_version BIGINT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_previous_version_ck
+        CHECK (expected_previous_ring_version > 0),
+    expected_previous_key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_previous_digest_ck
+        CHECK (expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    source_authority_id TEXT NOT NULL,
+    source_command_id TEXT NOT NULL,
+    source_release_commit_sha TEXT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_release_sha_ck
+        CHECK (source_release_commit_sha ~ '^[0-9a-f]{40}$'),
+    exact_signed_envelope_sha256 TEXT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_envelope_sha_key UNIQUE
+        CONSTRAINT route_v2_public_ring_delivery_envelope_sha_ck
+        CHECK (exact_signed_envelope_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    exact_signed_envelope_bytes BYTEA NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_envelope_bytes_ck
+        CHECK (octet_length(exact_signed_envelope_bytes) BETWEEN 1 AND 65536),
+    committed_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_v2_public_ring_delivery_committed_at_ck
+        CHECK (committed_at_unix_ms >= 0),
+    CONSTRAINT route_v2_public_ring_deliveries_pkey
+        PRIMARY KEY (deployment_id, ring_version),
+    CONSTRAINT route_v2_public_ring_delivery_predecessor_key
+        UNIQUE (deployment_id, expected_previous_ring_version,
+                expected_previous_key_ring_digest),
+    CONSTRAINT route_v2_public_ring_delivery_adjacency_ck
+        CHECK (expected_previous_ring_version = ring_version - 1),
+    CONSTRAINT route_v2_public_ring_delivery_ring_fkey
+        FOREIGN KEY (deployment_id, ring_version, key_ring_digest)
+        REFERENCES route_v2_public_key_ring_revisions(
+            deployment_id, ring_version, key_ring_digest)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT route_v2_public_ring_delivery_command_fkey
+        FOREIGN KEY (source_authority_id, source_command_id)
+        REFERENCES route_v2_signing_command_receipts(authority_id, command_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
 CREATE TABLE IF NOT EXISTS route_v2_gateway_identity_authority (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
         CONSTRAINT route_v2_gateway_authority_singleton_ck CHECK (singleton),
@@ -3522,6 +3677,24 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER route_v2_public_ring_revision_is_immutable
     BEFORE UPDATE OR DELETE ON route_v2_public_key_ring_revisions
     FOR EACH ROW EXECUTE FUNCTION control_route_v2_public_ring_revision_is_immutable();
+CREATE OR REPLACE FUNCTION control_route_v2_rotation_record_is_immutable()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Route v2 rotation operator and delivery records are immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER route_v2_rotation_operator_authority_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_rotation_operator_authority
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_rotation_record_is_immutable();
+CREATE TRIGGER route_v2_rotation_operator_credential_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_rotation_operator_credentials
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_rotation_record_is_immutable();
+CREATE TRIGGER route_v2_signing_command_receipt_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_signing_command_receipts
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_rotation_record_is_immutable();
+CREATE TRIGGER route_v2_public_ring_delivery_is_immutable
+    BEFORE UPDATE OR DELETE ON route_v2_public_ring_deliveries
+    FOR EACH ROW EXECUTE FUNCTION control_route_v2_rotation_record_is_immutable();
 CREATE OR REPLACE FUNCTION control_route_v2_signer_retirement_update()
 RETURNS trigger AS $$
 BEGIN
