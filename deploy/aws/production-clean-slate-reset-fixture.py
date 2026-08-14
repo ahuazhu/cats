@@ -1172,12 +1172,12 @@ def assert_binding_failures(parent: Path) -> None:
             plan_path, plan_digest, config.reset_id, execute=True
         )
     except reset.ResetError as error:
-        if "evidence changed" not in str(error):
+        if "cutover authority changed" not in str(error):
             raise
     else:
-        raise AssertionError("changed post-green evidence resumed an existing reset")
+        raise AssertionError("changed cutover authority resumed an existing reset")
     if mutation_counts(runner) != before:
-        raise AssertionError("changed post-green evidence executed a resumed effect")
+        raise AssertionError("changed cutover authority executed a resumed effect")
 
     plan_config, plan_runner, plan_executor, original_plan, original_digest = build_scenario(
         parent, "cutover-wrong-plan-0001"
