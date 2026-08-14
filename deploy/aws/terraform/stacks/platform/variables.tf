@@ -103,6 +103,12 @@ variable "cluster_admin_principal_arns" {
   default     = []
 }
 
+variable "efs_csi_addon_version" {
+  type        = string
+  description = "Pinned aws-efs-csi-driver EKS add-on version; null selects the cluster default."
+  default     = null
+}
+
 # Database ------------------------------------------------------------------
 
 variable "database_engine_version" {

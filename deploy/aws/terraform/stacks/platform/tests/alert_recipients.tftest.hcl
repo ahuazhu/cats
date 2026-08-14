@@ -120,6 +120,16 @@ override_data {
   values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
 }
 
+override_data {
+  target = data.aws_iam_policy_document.efs_csi_assume
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
+override_data {
+  target = data.aws_iam_policy_document.efs_csi_static
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
 variables {
   expected_account_id = "123456789012"
   alert_email_recipients = {

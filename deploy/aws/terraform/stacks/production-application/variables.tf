@@ -49,6 +49,70 @@ variable "gateway_image" {
   type        = string
 }
 
+variable "object_write_gateway_image" {
+  description = "Immutable ECR image containing cats-object-write-gatewayd, pinned by sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.object_write_gateway_image))
+    error_message = "object_write_gateway_image must be pinned by sha256 digest."
+  }
+}
+
+variable "object_write_gateway_replicas" {
+  description = "Active-active ObjectWrite Gateway replicas."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.object_write_gateway_replicas >= 2 && floor(var.object_write_gateway_replicas) == var.object_write_gateway_replicas
+    error_message = "object_write_gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "object_write_gateway_tls_secret_name" {
+  description = "Pre-created immutable two-file Secret for the node-server-CA-issued serverAuth leaf."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.object_write_gateway_tls_secret_name)) &&
+      endswith(var.object_write_gateway_tls_secret_name, "-r1")
+    )
+    error_message = "object_write_gateway_tls_secret_name must end in -r1."
+  }
+}
+
+variable "object_write_gateway_nlb_security_group_id" {
+  description = "Platform output for the internal NLB frontend SG."
+  type        = string
+}
+
+variable "object_write_gateway_private_zone_id" {
+  description = "Platform private Route53 zone ID for the stable gateway name."
+  type        = string
+}
+
+variable "object_write_gateway_private_dns_name" {
+  description = "Exact serverAuth SAN and Node CATS_OBJECT_WRITE_GATEWAY_URL hostname."
+  type        = string
+
+  validation {
+    condition     = can(regex("^gateway\\.object-write\\.[a-z0-9-]+\\.cats\\.internal$", var.object_write_gateway_private_dns_name))
+    error_message = "object_write_gateway_private_dns_name must be the platform-owned gateway.object-write.<environment>.cats.internal name."
+  }
+}
+
+variable "object_write_spool_file_system_id" {
+  description = "Platform encrypted EFS spool file system ID."
+  type        = string
+}
+
+variable "object_write_spool_access_point_id" {
+  description = "Platform EFS spool access point ID."
+  type        = string
+}
+
 variable "control_plane_replicas" {
   description = "Active-active cats-controld API replica count."
   type        = number
@@ -263,6 +327,16 @@ variable "acm_certificate_arn" {
 variable "public_subnet_ids" {
   description = "Public subnet IDs used by the EKS Auto Mode ALB."
   type        = list(string)
+}
+
+variable "private_subnet_ids" {
+  description = "Private subnet IDs used by the ObjectWrite Gateway internal NLB."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.private_subnet_ids) >= 2
+    error_message = "private_subnet_ids must span at least two subnets."
+  }
 }
 
 variable "control_plane_hosts" {

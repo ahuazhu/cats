@@ -28,11 +28,12 @@ module "network" {
 module "cluster" {
   source = "../../modules/platform-cluster"
 
-  cluster_name        = var.cluster_name
-  kubernetes_version  = var.kubernetes_version
-  public_subnet_ids   = module.network.public_subnet_ids
-  private_subnet_ids  = module.network.private_subnet_ids
-  public_access_cidrs = var.cluster_public_access_cidrs
+  cluster_name          = var.cluster_name
+  kubernetes_version    = var.kubernetes_version
+  public_subnet_ids     = module.network.public_subnet_ids
+  private_subnet_ids    = module.network.private_subnet_ids
+  public_access_cidrs   = var.cluster_public_access_cidrs
+  efs_csi_addon_version = var.efs_csi_addon_version
   cluster_admin_principal_arns = distinct(concat(
     var.cluster_admin_principal_arns,
     [module.github_release.release_role_arn],
@@ -228,6 +229,7 @@ data "aws_iam_policy_document" "github_application_deploy" {
     ]
     resources = [
       "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${module.dns.zone_id}",
+      "arn:${data.aws_partition.current.partition}:route53:::hostedzone/${aws_route53_zone.object_write_internal.zone_id}",
     ]
   }
 
@@ -330,6 +332,62 @@ resource "aws_security_group" "metal_worker_fence" {
 
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+# VPC-internal TLS pass-through for the ObjectWrite Gateway. The frontend has
+# one ingress source: the exact metal-worker security group. It is not a
+# public endpoint and no CIDR-wide rule can silently admit a non-worker.
+resource "aws_security_group" "object_write_gateway_nlb" {
+  name                   = "${var.name_prefix}-${var.environment}-object-write-gateway-nlb"
+  description            = "Internal ObjectWrite Gateway NLB; metal workers only"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-object-write-gateway-nlb"
+    Authority = "transport-only"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "object_write_gateway_nlb_from_workers" {
+  security_group_id            = aws_security_group.object_write_gateway_nlb.id
+  referenced_security_group_id = aws_security_group.metal_worker.id
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  description                  = "TLS from exact Cats metal worker boundary"
+}
+
+resource "aws_vpc_security_group_egress_rule" "object_write_gateway_nlb_to_cluster" {
+  security_group_id            = aws_security_group.object_write_gateway_nlb.id
+  referenced_security_group_id = module.cluster.cluster_security_group_id
+  from_port                    = 7444
+  to_port                      = 7444
+  ip_protocol                  = "tcp"
+  description                  = "TLS pass-through to ObjectWrite Gateway Pods"
+}
+
+# A stable private name is required for release-bound server certificates. The
+# application state aliases this zone to the NLB that EKS creates for the
+# Service; the generated elb.amazonaws.com name is never a certificate SAN.
+resource "aws_route53_zone" "object_write_internal" {
+  name = "object-write.${var.environment}.cats.internal"
+
+  vpc {
+    vpc_id = module.network.vpc_id
+  }
+
+  tags = merge(var.tags, {
+    Name = "object-write.${var.environment}.cats.internal"
+  })
+
+  lifecycle {
+    prevent_destroy = true
   }
 }
 
@@ -616,6 +674,142 @@ resource "aws_eks_pod_identity_association" "object_write_gateway" {
   tags = var.tags
 }
 
+# Durable spool ----------------------------------------------------------------
+
+# The receiving row does not enter the accepted prefix until its exact body is
+# on this regional EFS file system and both file and directory fsync receipts
+# exist. Elastic throughput avoids a small provisioned ceiling; application
+# admission still bounds every object to the ChunkStore 32 MiB maximum and a
+# fixed number of concurrent receiving streams.
+resource "aws_efs_file_system" "object_write_spool" {
+  encrypted        = true
+  performance_mode = "generalPurpose"
+  throughput_mode  = "elastic"
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-object-write-spool"
+    Authority = "accepted-put-recovery"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_efs_backup_policy" "object_write_spool" {
+  file_system_id = aws_efs_file_system.object_write_spool.id
+
+  backup_policy {
+    status = "ENABLED"
+  }
+}
+
+resource "aws_security_group" "object_write_spool" {
+  name                   = "${var.name_prefix}-${var.environment}-object-write-spool"
+  description            = "NFS only from the exact EKS cluster security group"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-${var.environment}-object-write-spool"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "object_write_spool_nfs" {
+  security_group_id            = aws_security_group.object_write_spool.id
+  referenced_security_group_id = module.cluster.cluster_security_group_id
+  from_port                    = 2049
+  to_port                      = 2049
+  ip_protocol                  = "tcp"
+  description                  = "NFS from EKS ObjectWrite Gateway Pods"
+}
+
+resource "aws_efs_mount_target" "object_write_spool" {
+  for_each = toset(module.network.private_subnet_ids)
+
+  file_system_id  = aws_efs_file_system.object_write_spool.id
+  subnet_id       = each.value
+  security_groups = [aws_security_group.object_write_spool.id]
+}
+
+resource "aws_efs_access_point" "object_write_spool" {
+  file_system_id = aws_efs_file_system.object_write_spool.id
+
+  posix_user {
+    uid = 10001
+    gid = 10001
+  }
+
+  root_directory {
+    path = "/object-write-spools"
+
+    creation_info {
+      owner_uid   = 10001
+      owner_gid   = 10001
+      permissions = "0700"
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-${var.environment}-object-write-spool"
+  })
+}
+
+# Static provisioning needs discovery only. In particular this role cannot
+# create/delete access points or touch an EFS file; Terraform owns the sole
+# access point above and the mount itself is constrained by its POSIX root.
+data "aws_iam_policy_document" "efs_csi_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "efs_csi" {
+  name               = "${var.name_prefix}-${var.environment}-efs-csi-static"
+  description        = "Read-only EFS discovery for the static ObjectWrite spool PV"
+  assume_role_policy = data.aws_iam_policy_document.efs_csi_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "efs_csi_static" {
+  statement {
+    sid    = "DiscoverStaticObjectWriteSpool"
+    effect = "Allow"
+    actions = [
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:DescribeFileSystems",
+      "elasticfilesystem:DescribeMountTargets",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "efs_csi_static" {
+  name   = "object-write-spool-discovery"
+  role   = aws_iam_role.efs_csi.id
+  policy = data.aws_iam_policy_document.efs_csi_static.json
+}
+
+resource "aws_eks_pod_identity_association" "efs_csi" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = "kube-system"
+  service_account = "efs-csi-controller-sa"
+  role_arn        = aws_iam_role.efs_csi.arn
+
+  tags = var.tags
+}
+
 # HostFence provider permissions are deliberately separate from the object
 # writer. Read-only Describe calls must be global because EC2 does not support
 # resource scoping for them; every mutation is limited to the immutable worker
@@ -643,9 +837,13 @@ resource "aws_iam_role" "host_fence_provider" {
 
 data "aws_iam_policy_document" "host_fence_provider" {
   statement {
-    sid       = "RediscoverFencePostconditions"
-    effect    = "Allow"
-    actions   = ["ec2:DescribeInstances", "ec2:DescribeNetworkInterfaces"]
+    sid    = "RediscoverFencePostconditions"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeSecurityGroups",
+    ]
     resources = ["*"]
   }
 
