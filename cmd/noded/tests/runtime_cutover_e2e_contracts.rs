@@ -219,7 +219,7 @@ case "$role" in
           [[ $1 == --write-out ]] && write_out=true
           shift 2
           ;;
-        --fail|--silent|--show-error|--tlsv1.2) shift ;;
+        --disable|--fail|--silent|--show-error|--tlsv1.2|--tlsv1.3|--http1.1) shift ;;
         https://*) url=$1; shift ;;
         *) exit 64 ;;
       esac
@@ -1444,6 +1444,19 @@ fn production_v2_rotation_recovery_keeps_a_durable_prefix_and_closed_evidence_se
     assert!(driver.contains("\"$ROTATION_JOURNAL\" \"fresh-endpoint-bind-\""));
     assert!(driver.contains("run_probe public-route-closed"));
     assert!(driver.contains("curl_bin\" --disable"));
+    let transport_start = driver
+        .find("curl_secret_url() {")
+        .expect("rotation HTTPS transport");
+    let transport_end = driver[transport_start..]
+        .find("\nrotation_json_request() {")
+        .map(|offset| transport_start + offset)
+        .expect("rotation HTTPS transport boundary");
+    let transport = &driver[transport_start..transport_end];
+    assert!(transport.contains("--tlsv1.3 --http1.1"));
+    assert!(!transport.contains("--tlsv1.2"));
+    assert!(driver.contains("in_flight_attempt = $attempt"));
+    assert!(driver.contains("unknown_probe_reset"));
+    assert!(driver.contains("three_consecutive_public_ingress_reachable_route_v2_closed"));
     assert!(driver.contains("rotation_mutation_started"));
     assert!(driver.contains("policy=forward_recovered_active_fresh_endpoint_for_agent_restart"));
     assert!(!driver.contains("signed_command_exact_json"));
@@ -1454,5 +1467,384 @@ fn production_v2_rotation_recovery_keeps_a_durable_prefix_and_closed_evidence_se
         "route-v2-rotation-disable-live-delivery.transcript.log",
     ] {
         assert!(driver.contains(terminal));
+    }
+}
+
+fn shell_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start = source.find(start).expect("shell section start");
+    let end = source[start..]
+        .find(end)
+        .map(|offset| start + offset)
+        .expect("shell section end");
+    &source[start..end]
+}
+
+#[test]
+fn disabled_route_probe_crashes_never_promote_one_or_two_observations() {
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let production = shell_section(
+        driver,
+        "disabled_public_route_observation_is_exact() {",
+        "\nrotation_disabled_fleet_is_exact() {",
+    );
+    let temp = tempfile::tempdir().expect("disabled probe fixture");
+    let harness = temp.path().join("disabled-probe-harness.sh");
+    let preamble = r#"#!/usr/bin/env bash
+set -euo pipefail
+CASE_DIR=$1
+readonly CASE_DIR
+readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
+CATS_E3_RUN_ID=fixture-run
+CATS_E3_PUBLIC_ORIGIN=https://fixture.example
+CATS_E3_ENDPOINT_HOSTNAME=fixture.example
+PROBE_SEQUENCE=$2
+CRASH_AFTER_OBSERVATIONS=${CRASH_AFTER_OBSERVATIONS:-0}
+mkdir -p "$ROTATION_JOURNAL"
+chmod 0700 "$ROTATION_JOURNAL"
+fail() { printf 'fixture failure: %s\n' "$*" >&2; exit 64; }
+durable_case_file() { chmod 0600 "$1"; }
+atomic_json_path() {
+  local destination=$1 source=$2 temporary observations
+  temporary=$(mktemp "${destination%/*}/.fixture-atomic.XXXXXX")
+  jq -S -c . "$source" >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$destination"
+  if [[ $destination == "$ROTATION_JOURNAL/disabled-public-route-probe-state.json" &&
+        $CRASH_AFTER_OBSERVATIONS -gt 0 && ! -e $CASE_DIR/crash-fired ]]; then
+    observations=$(jq -r '.observations | length' "$destination")
+    if [[ $observations -eq $CRASH_AFTER_OBSERVATIONS ]]; then
+      : >"$CASE_DIR/crash-fired"
+      exit 99
+    fi
+  fi
+}
+publish_json_idempotent_path() { atomic_json_path "$1" "$2"; }
+rotation_transcript() { :; }
+rotation_require_budget() { :; }
+run_probe() {
+  local counter=$ROTATION_JOURNAL/probe-counter index outcome
+  if [[ -e $counter ]]; then index=$(<"$counter"); else index=0; fi
+  outcome=$(sed -n "$((index + 1))p" "$PROBE_SEQUENCE")
+  printf '%s' "$((index + 1))" >"$counter"
+  [[ $outcome == ok ]] || return 1
+  printf '%s\n' '{"version":1,"kind":"route_v2_public_admission_closed_v1","origin":"https://fixture.example","path":"/e3/fixture-run","run_id":"fixture-run","tls_reachable":true,"http_status":503,"content_type":"text/plain","retry_after_seconds":1,"content_encoding_absent":true,"body_sha256":"sha256:3993919ba29fc397f3bbc6bf5d814e9caa9f184b557eb9c5fd7a59d45a2ac609","terminal_marker":"public_ingress_reachable_route_v2_closed"}'
+}
+"#;
+    fs::write(
+        &harness,
+        [preamble, production, "prove_rotation_disable_observed\n"].join("\n"),
+    )
+    .expect("write disabled probe harness");
+
+    let run = |case_dir: &Path, sequence: &Path, crash_after: Option<u8>| {
+        let mut command = Command::new("bash");
+        command.arg(&harness).arg(case_dir).arg(sequence);
+        if let Some(value) = crash_after {
+            command.env("CRASH_AFTER_OBSERVATIONS", value.to_string());
+        }
+        command.output().expect("run disabled probe harness")
+    };
+    for crash_after in [1, 2] {
+        let case_dir = temp.path().join(format!("crash-{crash_after}"));
+        fs::create_dir(&case_dir).unwrap();
+        let sequence = case_dir.join("sequence");
+        fs::write(&sequence, "ok\nok\nok\nok\n").unwrap();
+        let crashed = run(&case_dir, &sequence, Some(crash_after));
+        assert_eq!(crashed.status.code(), Some(99));
+        assert!(!case_dir
+            .join("route-v2-rotation-journal.v1/disabled-public-route.json")
+            .exists());
+        let resumed = run(&case_dir, &sequence, None);
+        assert!(
+            resumed.status.success(),
+            "resume failed: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(case_dir.join("route-v2-rotation-journal.v1/disabled-public-route.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["observation_count"], 3);
+        assert_eq!(receipt["observations"].as_array().unwrap().len(), 3);
+    }
+
+    let case_dir = temp.path().join("failure-resets-prefix");
+    fs::create_dir(&case_dir).unwrap();
+    let sequence = case_dir.join("sequence");
+    fs::write(&sequence, "ok\nfailed\nok\nok\nok\n").unwrap();
+    let completed = run(&case_dir, &sequence, None);
+    assert!(completed.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(case_dir.join("route-v2-rotation-journal.v1/disabled-public-route.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let attempts = receipt["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["attempt_index"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(attempts, vec![3, 4, 5]);
+}
+
+#[test]
+fn rotation_resume_rejects_noncurrent_process_without_a_durable_adjacent_command() {
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let production = shell_section(
+        driver,
+        "rotation_incomplete_phase_has_pending_command() {",
+        "\nappend_rotation_phase_receipt() {",
+    );
+    let temp = tempfile::tempdir().expect("rotation current fixture");
+    let case_dir = temp.path().join("case");
+    let journal = case_dir.join("route-v2-rotation-journal.v1");
+    fs::create_dir_all(&journal).unwrap();
+    let harness = temp.path().join("rotation-current-harness.sh");
+    let preamble = r#"#!/usr/bin/env bash
+set -euo pipefail
+CASE_DIR=$1
+readonly CASE_DIR
+readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
+DISCOVERY=$2
+BUNDLE=$3
+CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID=authority_fixture
+CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID=deployment_fixture
+CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+CATS_E3_EXACT_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fail() { printf 'fixture failure: %s\n' "$*" >&2; exit 64; }
+required() { local value=${!1:-}; [[ -n $value ]] || exit 64; printf '%s' "$value"; }
+rotation_input() { printf '%s' "$BUNDLE"; }
+rotation_json_request() { cp "$DISCOVERY" "$3"; }
+durable_case_file() { :; }
+rotation_transcript() { :; }
+"#;
+    fs::write(
+        &harness,
+        [preamble, production, "discover_rotation_resume_state\n"].join("\n"),
+    )
+    .unwrap();
+    let digest_b = format!("sha256:{}", "b".repeat(64));
+    let digest_c = format!("sha256:{}", "c".repeat(64));
+    let bundle = temp.path().join("bundle.json");
+    fs::write(
+        &bundle,
+        serde_json::to_vec(&serde_json::json!({
+            "commands": [
+                {"signer_revision": 2, "ring_version": 2,
+                 "exact_authority_command_json": serde_json::json!({
+                     "successor": {"signer": {"state": "active", "active_kid": "kid_two"}}
+                 }).to_string()},
+                {"signer_revision": 6, "ring_version": 4,
+                 "exact_authority_command_json": serde_json::json!({
+                     "successor": {"signer": {"state": "disabled"}}
+                 }).to_string()}
+            ],
+            "control_rollouts": [
+                {"signer_revision": 2, "signer_reference_sha256": digest_b,
+                 "public_key_ring_digest": digest_c},
+                {"signer_revision": 6, "signer_reference_sha256": digest_b,
+                 "public_key_ring_digest": digest_c}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let discovery = temp.path().join("discovery.json");
+    let prefix = journal.join("rotation-phase-receipts.json");
+    let invoke = |value: serde_json::Value, count: usize| {
+        fs::write(&discovery, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::write(
+            &prefix,
+            serde_json::to_vec(&vec![serde_json::json!({}); count]).unwrap(),
+        )
+        .unwrap();
+        Command::new("bash")
+            .arg(&harness)
+            .arg(&case_dir)
+            .arg(&discovery)
+            .arg(&bundle)
+            .output()
+            .unwrap()
+    };
+    let current = |revision: u64,
+                   ring_version: u64,
+                   state: &str,
+                   kid: Option<&str>,
+                   database_current: bool,
+                   process_ready: bool| {
+        serde_json::json!({
+            "authority_id":"authority_fixture","database_current":database_current,
+            "loaded_active_kid":kid,"loaded_public_key_ring_digest":digest_c,
+            "loaded_public_key_ring_version":ring_version,
+            "loaded_signer_reference_sha256":digest_b,"loaded_signer_revision":revision,
+            "loaded_signer_state":state,"process_ready":process_ready,
+            "release_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "rotation_operator_trust_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "route_deployment_id":"deployment_fixture","version":1
+        })
+    };
+
+    let stale_initial = invoke(current(1, 1, "active", Some("kid_one"), false, false), 0);
+    assert_eq!(
+        stale_initial.status.code(),
+        Some(64),
+        "unexpected stale-initial result: {}",
+        String::from_utf8_lossy(&stale_initial.stderr)
+    );
+    let stale_active = invoke(current(2, 2, "active", Some("kid_two"), false, false), 1);
+    assert_eq!(
+        stale_active.status.code(),
+        Some(64),
+        "unexpected stale-active result: {}",
+        String::from_utf8_lossy(&stale_active.stderr)
+    );
+    assert!(
+        invoke(current(2, 2, "active", Some("kid_two"), true, true), 1)
+            .status
+            .success()
+    );
+    assert!(invoke(current(6, 4, "disabled", None, true, false), 5)
+        .status
+        .success());
+}
+
+#[test]
+fn rotation_replay_probes_never_overwrite_canonical_crash_artifacts() {
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let adoption = shell_section(
+        driver,
+        "adopt_rotation_file() {",
+        "\ninitialize_rotation_journal() {",
+    );
+    let mutations = shell_section(driver, "operation_wait() {", "\nfleet_verify_to() {");
+    let rotation = shell_section(
+        driver,
+        "sign_rotation_attempt() {",
+        "\nwait_rotation_store_precondition() {",
+    );
+    let temp = tempfile::tempdir().expect("immutable replay fixture");
+    let harness = temp.path().join("immutable-replay-harness.sh");
+    let fake_cats = temp.path().join("fake-cats");
+    fs::write(
+        &fake_cats,
+        "#!/usr/bin/env bash\nprintf '%s\\n' '{\"foreign\":true}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cats, fs::Permissions::from_mode(0o755)).unwrap();
+    let preamble = r#"#!/usr/bin/env bash
+set -euo pipefail
+CASE_DIR=$1
+readonly CASE_DIR
+MODE=$2
+FAKE_CATS=$3
+readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
+CATS_E3_WORKSPACE_ID=workspace_fixture
+CATS_E3_RUN_ID=run_fixture
+mkdir -p "$ROTATION_JOURNAL"
+chmod 0700 "$ROTATION_JOURNAL"
+fail() { printf 'fixture failure: %s\n' "$*" >&2; exit 64; }
+sync() { :; }
+binary() { printf '%s' "$FAKE_CATS"; }
+rotation_input() { printf '%s' /dev/null; }
+rotation_transport_field() { printf '%s' https://rotation.fixture; }
+rotation_transcript() { :; }
+rotation_phase_revision() { printf '%s' 2; }
+rotation_phase_ring_version() { printf '%s' 2; }
+required() { local value=${!1:-}; [[ -n $value ]] || exit 64; printf '%s' "$value"; }
+canonical_id() { :; }
+control_origin() { printf '%s' https://control.fixture; }
+sha256_wire() { printf 'sha256:%s' "$(sha256sum "$1" | awk '{print $1}')"; }
+durable_case_file() { chmod 0600 "$1"; }
+curl_secret_url() { local output=$3; printf '%s\n' '{"foreign":true}' >"$output"; printf '%s' 200; }
+curl_json() { local output=$3; printf '%s\n' '{"foreign":true}' >"$output"; }
+run_cats() { printf '%s\n' '{"foreign":true}'; }
+"#;
+    let dispatch = r#"
+case "$MODE" in
+  race)
+    candidate=$CASE_DIR/race-candidate.json
+    destination=$CASE_DIR/race-canonical.json
+    foreign=$CASE_DIR/race-foreign.json
+    printf '%s\n' '{"candidate":true}' >"$candidate"
+    printf '%s\n' '{"foreign":true}' >"$foreign"
+    ln() { cp "$foreign" "$2"; command ln "$@"; }
+    adopt_case_file "$candidate" "$destination"
+    ;;
+  signing)
+    pending=$ROTATION_JOURNAL/publish_overlap.attempt-1.command.json
+    signing=$ROTATION_JOURNAL/publish_overlap.attempt-1.signing-receipt.json
+    printf '%s\n' '{"payload":{"command_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' >"$pending"
+    printf '%s\n' '{"canonical":"signing"}' >"$signing"
+    sign_rotation_attempt publish_overlap 1 "$pending" "$signing"
+    ;;
+  store)
+    pending=$ROTATION_JOURNAL/publish_overlap.attempt-1.command.json
+    response=$ROTATION_JOURNAL/publish_overlap.attempt-1.store-receipt.json
+    printf '%s\n' '{"payload":{"command_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' >"$pending"
+    printf '%s\n' '{"canonical":"store"}' >"$response"
+    post_rotation_attempt publish_overlap "$pending" "$response"
+    ;;
+  mutation)
+    printf '%s\n' '{"canonical":"mutation"}' >"$ROTATION_JOURNAL/fixture-mutation-response.json"
+    product_mutation POST /fixture fixture-key running '' "$ROTATION_JOURNAL" fixture-
+    ;;
+  operation)
+    printf '%s\n' '{"canonical":"operation"}' >"$ROTATION_JOURNAL/fixture-operation-op_fixture.json"
+    operation_wait op_fixture running "$ROTATION_JOURNAL" fixture-
+    ;;
+  *) exit 65 ;;
+esac
+"#;
+    fs::write(
+        &harness,
+        [preamble, adoption, mutations, rotation, dispatch].join("\n"),
+    )
+    .unwrap();
+
+    let cases = [
+        ("race", "race-canonical.json", "{\"foreign\":true}\n"),
+        (
+            "signing",
+            "route-v2-rotation-journal.v1/publish_overlap.attempt-1.signing-receipt.json",
+            "{\"canonical\":\"signing\"}\n",
+        ),
+        (
+            "store",
+            "route-v2-rotation-journal.v1/publish_overlap.attempt-1.store-receipt.json",
+            "{\"canonical\":\"store\"}\n",
+        ),
+        (
+            "mutation",
+            "route-v2-rotation-journal.v1/fixture-mutation-response.json",
+            "{\"canonical\":\"mutation\"}\n",
+        ),
+        (
+            "operation",
+            "route-v2-rotation-journal.v1/fixture-operation-op_fixture.json",
+            "{\"canonical\":\"operation\"}\n",
+        ),
+    ];
+    for (mode, relative, original) in cases {
+        let case_dir = temp.path().join(mode);
+        fs::create_dir(&case_dir).unwrap();
+        let output = Command::new("bash")
+            .arg(&harness)
+            .arg(&case_dir)
+            .arg(mode)
+            .arg(&fake_cats)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{mode} unexpectedly accepted a foreign replay: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(case_dir.join(relative)).unwrap(),
+            original
+        );
     }
 }
