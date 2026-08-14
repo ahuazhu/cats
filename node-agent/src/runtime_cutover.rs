@@ -1169,7 +1169,7 @@ mod tests {
                     }
                 })
                 .collect();
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::from_validated_coverage(
                     coverage.finish()?,
                     UnixMillis::new(1_900_000_006_000).unwrap(),
@@ -1178,7 +1178,7 @@ mod tests {
                     Vec::new(),
                     Default::default(),
                 ),
-            ))
+            )))
         }
     }
 

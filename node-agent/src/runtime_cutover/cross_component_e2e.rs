@@ -345,7 +345,7 @@ impl RuntimeInventoryScanner for CompleteAssignedScanner {
             .iter()
             .map(|desired| observed_missing_runtime(desired, coordinates.inventory_epoch))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(RuntimeInventoryScanOutcome::Complete(
+        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
             CompleteRuntimeInventory::from_validated_coverage(
                 coverage.finish()?,
                 UnixMillis::new(1_900_000_006_000).unwrap(),
@@ -354,7 +354,7 @@ impl RuntimeInventoryScanner for CompleteAssignedScanner {
                 Vec::new(),
                 Default::default(),
             ),
-        ))
+        )))
     }
 }
 
@@ -402,7 +402,7 @@ impl RuntimeInventoryScanner for RouteReadyScanner {
             .iter()
             .map(route_ready_runtime)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(RuntimeInventoryScanOutcome::Complete(
+        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
             CompleteRuntimeInventory::from_validated_coverage(
                 coverage.finish()?,
                 UnixMillis::new(1_900_000_006_000).unwrap(),
@@ -415,7 +415,7 @@ impl RuntimeInventoryScanner for RouteReadyScanner {
                 Vec::new(),
                 BTreeSet::new(),
             ),
-        ))
+        )))
     }
 }
 

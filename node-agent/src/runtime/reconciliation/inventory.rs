@@ -1352,7 +1352,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             (!data_directory_reclaim_admission.is_empty())
                 .then_some(data_directory_reclaim_admission),
         );
-        Ok(RuntimeInventoryScanOutcome::Complete(inventory))
+        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(inventory)))
     }
 }
 

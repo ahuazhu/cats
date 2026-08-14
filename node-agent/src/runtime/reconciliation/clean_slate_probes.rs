@@ -19073,7 +19073,7 @@ mod tests {
                 panic!("filesystem phase must retain one complete physical inventory")
             };
             let context = bind_inventory_for_running_effect(
-                inventory,
+                *inventory,
                 &scan_context,
                 state_directory.clone(),
             );
@@ -20617,7 +20617,7 @@ mod tests {
             panic!("exact released cleanup must form a complete reclaim admission")
         };
         let context = bind_inventory_for_running_effect(
-            inventory,
+            *inventory,
             &fixture.scan_context,
             StateDirectory::unanchored(environment.state.clone()),
         );
@@ -20668,7 +20668,7 @@ mod tests {
             panic!("partial reclaim with its launch anchor must remain rediscoverable")
         };
         let context = bind_inventory_for_running_effect(
-            inventory,
+            *inventory,
             &fixture.scan_context,
             StateDirectory::unanchored(environment.state.clone()),
         );

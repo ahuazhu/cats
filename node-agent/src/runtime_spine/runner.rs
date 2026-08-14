@@ -1297,7 +1297,7 @@ impl InventoryCoverageAggregator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeInventoryScanOutcome {
-    Complete(CompleteRuntimeInventory),
+    Complete(Box<CompleteRuntimeInventory>),
     Incomplete {
         unavailable_sources: Vec<InventorySource>,
         /// Per-Cat physical negatives completed before a later source became
@@ -3002,7 +3002,7 @@ impl RuntimeSpineRunner {
                         .await;
                 }
                 let mut inventory = match outcome {
-                    RuntimeInventoryScanOutcome::Complete(inventory) => inventory,
+                    RuntimeInventoryScanOutcome::Complete(inventory) => *inventory,
                     RuntimeInventoryScanOutcome::Incomplete {
                         unavailable_sources,
                         exact_physical_negative_cats,
@@ -4304,7 +4304,7 @@ mod tests {
             inventory
                 .residue_sources
                 .insert(InventorySource::ControlSocket);
-            Ok(RuntimeInventoryScanOutcome::Complete(inventory))
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(inventory)))
         }
     }
 
@@ -4355,7 +4355,7 @@ mod tests {
             inventory
                 .residue_sources
                 .insert(InventorySource::ControlSocket);
-            Ok(RuntimeInventoryScanOutcome::Complete(inventory))
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(inventory)))
         }
     }
 
@@ -4380,14 +4380,14 @@ mod tests {
                 .desired_specs
                 .first()
                 .expect("test Desired contains the Running Cat");
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::for_test(
                     UnixMillis::new(1_720_000_020_000).unwrap(),
                     RuntimeInventoryKeyRing::Unavailable,
                     vec![ready_running_runtime(desired)],
                     Vec::new(),
                 ),
-            ))
+            )))
         }
     }
 
@@ -4414,14 +4414,14 @@ mod tests {
                 .desired_specs
                 .first()
                 .expect("test Desired contains the Running Cat");
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::for_test(
                     UnixMillis::new(1_720_000_020_000).unwrap(),
                     RuntimeInventoryKeyRing::Unavailable,
                     vec![ready_running_runtime(desired)],
                     Vec::new(),
                 ),
-            ))
+            )))
         }
     }
 
@@ -4497,14 +4497,14 @@ mod tests {
                     conditions: Vec::new(),
                 })
                 .collect();
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::for_test(
                     UnixMillis::new(1_720_000_004_000).unwrap(),
                     RuntimeInventoryKeyRing::Unavailable,
                     runtimes,
                     Vec::new(),
                 ),
-            ))
+            )))
         }
     }
 
@@ -5661,14 +5661,14 @@ mod tests {
         ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             context.check_active()?;
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::for_test(
                     UnixMillis::new(1_720_000_004_000).unwrap(),
                     RuntimeInventoryKeyRing::Unavailable,
                     Vec::new(),
                     Vec::new(),
                 ),
-            ))
+            )))
         }
     }
 
