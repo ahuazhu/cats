@@ -1304,6 +1304,7 @@ dependencies = [
  "cats-object-store-aws-s3",
  "cats-object-store-file",
  "cats-storage",
+ "cats-usage-store-postgres",
  "clap",
  "futures-util",
  "hex",

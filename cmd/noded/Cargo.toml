@@ -21,11 +21,16 @@ path = "src/route_v2_node_r1_validator.rs"
 name = "cats-runtime-e3-probe"
 path = "src/runtime_e3_probe.rs"
 
+[[bin]]
+name = "cats-usage-schema-v16-verifier"
+path = "src/usage_schema_v16_verifier.rs"
+
 [dependencies]
 cats-api = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
+cats-usage-store-postgres = { workspace = true }
 cats-object-store-file = { workspace = true }
 cats-object-store-aws-s3 = { workspace = true }
 anyhow = { workspace = true }
