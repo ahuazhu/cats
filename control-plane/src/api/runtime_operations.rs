@@ -162,6 +162,10 @@ mod tests {
             Id::new(workspace).unwrap()
         });
         let operation_id = tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &workspace_id,
+            );
             crate::store::runtime_authority::product_tests::create_runtime_operation_for_api_test(
                 handle.state.store.as_ref(),
                 &workspace_id,

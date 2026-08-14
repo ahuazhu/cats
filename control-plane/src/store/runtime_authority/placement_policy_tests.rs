@@ -227,6 +227,8 @@ fn pause_apply_commit(store: &Store, url: &str, barrier_key: i64) -> postgres::C
                      RETURN NEW;
                    END
                    $$;
+                 REVOKE ALL ON FUNCTION runtime_node_authority_pause_commit_for_test()
+                   FROM PUBLIC;
                  CREATE CONSTRAINT TRIGGER runtime_node_authority_pause_commit_for_test
                    AFTER INSERT ON runtime_node_authority_apply_records
                    DEFERRABLE INITIALLY DEFERRED

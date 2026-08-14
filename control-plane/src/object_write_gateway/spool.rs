@@ -717,7 +717,11 @@ mod tests {
     }
 
     fn private_root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        // The spool rejects roots whose canonical path differs (macOS tempdirs
+        // live behind the /var -> /private/var symlink), so create the
+        // directory under the canonicalized temp base.
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
     }

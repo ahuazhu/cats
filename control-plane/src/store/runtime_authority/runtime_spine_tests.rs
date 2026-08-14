@@ -324,7 +324,9 @@ fn cancellation_before_definite_commit_reset_prevents_retry_without_any_row_chan
                  CREATE CONSTRAINT TRIGGER fail_a20_commit_for_test
                    AFTER INSERT ON runtime_desired_read_states
                    DEFERRABLE INITIALLY DEFERRED
-                   FOR EACH ROW EXECUTE FUNCTION fail_a20_commit_for_test();",
+                   FOR EACH ROW EXECUTE FUNCTION fail_a20_commit_for_test();
+                 REVOKE ALL ON FUNCTION count_a20_operation_for_test() FROM PUBLIC;
+                 REVOKE ALL ON FUNCTION fail_a20_commit_for_test() FROM PUBLIC;",
             )
         })
         .unwrap();
@@ -386,7 +388,8 @@ fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
                  $$ LANGUAGE plpgsql;
                  CREATE TRIGGER pause_runtime_desired_insert
                    BEFORE INSERT ON runtime_desired_read_states
-                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_insert();",
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_insert();
+                 REVOKE ALL ON FUNCTION pause_runtime_desired_insert() FROM PUBLIC;",
             )
         })
         .unwrap();
@@ -461,7 +464,8 @@ fn authority_request_uses_its_remaining_deadline_as_the_postgres_timeout() {
                  $$ LANGUAGE plpgsql;
                  CREATE TRIGGER pause_runtime_desired_until_deadline
                    BEFORE INSERT ON runtime_desired_read_states
-                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_until_deadline();",
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_until_deadline();
+                 REVOKE ALL ON FUNCTION pause_runtime_desired_until_deadline() FROM PUBLIC;",
             )
         })
         .unwrap();

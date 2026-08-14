@@ -507,7 +507,7 @@ fn least_privilege_functions_claim_recover_cutoff_and_complete_exactly() {
                     &scope.region.as_str(),
                     &"worker-provider-test",
                     &claim_token_1,
-                    &1_i64,
+                    &200_i64,
                 ],
             )
             .unwrap();
@@ -521,7 +521,7 @@ fn least_privilege_functions_claim_recover_cutoff_and_complete_exactly() {
                     &scope.region.as_str(),
                     &"worker-provider-test",
                     &claim_token_1,
-                    &1_i64,
+                    &200_i64,
                 ],
             )
             .unwrap();
@@ -530,7 +530,7 @@ fn least_privilege_functions_claim_recover_cutoff_and_complete_exactly() {
             first.get::<_, i64>("claim_lease_expires_at_unix_ms"),
             replay.get::<_, i64>("claim_lease_expires_at_unix_ms")
         );
-        std::thread::sleep(std::time::Duration::from_millis(3));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         let expired_replay = client.query_one(
             &claim_sql,
             &[
@@ -540,7 +540,7 @@ fn least_privilege_functions_claim_recover_cutoff_and_complete_exactly() {
                 &scope.region.as_str(),
                 &"worker-provider-test",
                 &claim_token_1,
-                &1_i64,
+                &200_i64,
             ],
         );
         assert_eq!(expired_replay.unwrap_err().code().unwrap().code(), "55000");

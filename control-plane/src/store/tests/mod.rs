@@ -948,7 +948,7 @@ fn refuses_an_old_stamp_without_repairing_its_shape() {
 
 #[test]
 fn refuses_current_stamp_without_node_transport_target_projection() {
-    assert_eq!(SCHEMA_VERSION, 15);
+    assert_eq!(SCHEMA_VERSION, 16);
     let url = crate::testsupport::isolated_control_store_url();
     drop(Store::connect(&url, None).unwrap());
     {
