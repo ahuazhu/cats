@@ -9631,11 +9631,9 @@ fn scan_process_residue(
         return scan_process_residue_allowing(paths, &BTreeSet::new(), context);
     };
     match inspect_static_service_process(paths, expected, context)? {
-        StaticProcessInspection::Exact => scan_process_residue_allowing(
-            paths,
-            &BTreeSet::from([expected.process_id]),
-            context,
-        ),
+        StaticProcessInspection::Exact => {
+            scan_process_residue_allowing(paths, &BTreeSet::from([expected.process_id]), context)
+        }
         StaticProcessInspection::Unavailable => Ok(None),
         StaticProcessInspection::Conflict => {
             let residue = scan_process_residue_allowing(paths, &BTreeSet::new(), context)?;
