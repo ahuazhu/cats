@@ -663,10 +663,14 @@ mod usage_delivery_tests {
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::Router;
-    use cats_api::agent_registration::Ed25519RequestSigner;
-    use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
+    use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
+    use cats_api::metering::{
+        CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
+        UsageMetric,
+    };
     use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
     use ring::rand::SystemRandom;
     use ring::signature::Ed25519KeyPair;
@@ -710,8 +714,23 @@ mod usage_delivery_tests {
         accepted: Arc<Mutex<Vec<String>>>,
     }
 
-    async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> StatusCode {
+    fn accepted_response(status: StatusCode, checkpoint_count: usize) -> Response {
+        let response = IngestUsageCheckpointsResponse {
+            accepted: u64::try_from(checkpoint_count).unwrap(),
+            duplicates: 0,
+            rejected: Vec::new(),
+        };
+        (
+            status,
+            [(axum::http::header::CONTENT_TYPE, JSON_CONTENT_TYPE)],
+            serde_json::to_vec(&response).unwrap(),
+        )
+            .into_response()
+    }
+
+    async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> Response {
         let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+        let checkpoint_count = request.checkpoints.len();
         state.requests.lock().unwrap().push(
             request
                 .checkpoints
@@ -719,18 +738,23 @@ mod usage_delivery_tests {
                 .map(|checkpoint| checkpoint.event_id.clone())
                 .collect(),
         );
-        state
+        let status = state
             .responses
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(StatusCode::OK)
+            .unwrap_or(StatusCode::OK);
+        if status.is_success() {
+            accepted_response(status, checkpoint_count)
+        } else {
+            status.into_response()
+        }
     }
 
     async fn ingest_with_size_dependent_timeout(
         State(state): State<TimeoutSensitiveIngestion>,
         body: Bytes,
-    ) -> StatusCode {
+    ) -> Response {
         let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
         let event_ids = request
             .checkpoints
@@ -743,7 +767,7 @@ mod usage_delivery_tests {
         } else {
             state.accepted.lock().unwrap().extend(event_ids);
         }
-        StatusCode::OK
+        accepted_response(StatusCode::OK, request.checkpoints.len())
     }
 
     /// Answers every request with one status and one body, for asserting what

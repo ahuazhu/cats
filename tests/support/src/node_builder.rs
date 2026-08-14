@@ -1,7 +1,7 @@
 //! Node-runtime fixtures without a dependency back to `cats-node-agent`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use cats_storage::{AdapterConfig, AdapterSelection};
 
@@ -175,14 +175,24 @@ fn package_for(binary: &str) -> &'static str {
     }
 }
 
+fn workspace_build_command(profile_directory: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO"));
+    command.args(["build", "--locked"]).arg("--target-dir").arg(
+        profile_directory
+            .parent()
+            .expect("Cargo target profile has a root"),
+    );
+    command
+}
+
 /// Path to a workspace binary, building it once if Cargo did not provide it.
 pub fn workspace_bin(name: &str) -> PathBuf {
     static BUILD: Once = Once::new();
     let directory = target_profile_dir();
     let path = directory.join(name);
     let build = || {
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "-p", package_for(name)])
+        let status = workspace_build_command(&directory)
+            .args(["-p", package_for(name)])
             .args(profile_args(&directory))
             .status()
             .expect("run cargo build for test binaries");
@@ -200,4 +210,45 @@ pub fn workspace_bin(name: &str) -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Path to one explicit workspace example used only as an external test
+/// process, building it in the active Cargo profile when necessary.
+pub fn workspace_example(package: &str, name: &str) -> PathBuf {
+    static BUILD_EXAMPLE: Mutex<()> = Mutex::new(());
+
+    let directory = target_profile_dir();
+    let path = directory.join("examples").join(name);
+    let _build = BUILD_EXAMPLE.lock().expect("example build mutex");
+    let status = workspace_build_command(&directory)
+        .args(["-p", package, "--example", name])
+        .args(profile_args(&directory))
+        .status()
+        .expect("run cargo build for test example");
+    assert!(status.success(), "building test example failed");
+    assert!(
+        path.exists(),
+        "workspace example {name} not found at {}",
+        path.display()
+    );
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_workspace_build_reuses_the_active_custom_target_root() {
+        let target_root = Path::new("/tmp/cats-custom-target");
+        let profile_directory = target_root.join("debug");
+        let command = workspace_build_command(&profile_directory);
+        let arguments = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(arguments.len(), 4);
+        assert_eq!(arguments[0], "build");
+        assert_eq!(arguments[1], "--locked");
+        assert_eq!(arguments[2], "--target-dir");
+        assert_eq!(arguments[3], target_root.as_os_str());
+    }
 }
