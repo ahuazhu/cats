@@ -21,6 +21,7 @@ use crate::authority::{
     validate_authorization_record, validate_volume_record, VolumeOwnerBinding,
     MAX_NODE_OWNED_VOLUMES,
 };
+use crate::host_fence::validate_host_fence_provider_evidence;
 use crate::host_fence::{HostFenceAttemptRequest, HostFenceBinding};
 use crate::trusted_host_fence::{validate_trusted_host_fence_event_v1, TrustedHostFenceEventV1};
 
@@ -671,6 +672,11 @@ pub fn validate_trusted_host_fence_batch_recovery_commit_v1(
     }
     validate_trusted_host_fence_event_v1(&commit.terminal_event)
         .map_err(|_| TrustedHostFenceRecoveryError::TerminalEvent)?;
+    validate_host_fence_provider_evidence(
+        &attempt.provider_request,
+        &commit.terminal_event.provider_evidence,
+    )
+    .map_err(|_| TrustedHostFenceRecoveryError::TerminalEvent)?;
     let attempt_sha256 = trusted_host_fence_recovery_attempt_sha256(attempt)?;
     if commit.version != ContractVersion::V1
         || commit.fence_attempt_id != attempt.binding.fence_attempt_id
@@ -1132,7 +1138,13 @@ mod tests {
     };
 
     use crate::authority::normal_acquire;
-    use crate::host_fence::ObjectWriterFenceTarget;
+    use crate::host_fence::{
+        host_fence_effect_token, host_fence_provider_attempt_id, HostExecutionCutoffEvidence,
+        HostFenceProviderEvidence, ObjectWriteCutoffEvidence, ObjectWriterFenceTarget,
+        QuarantinedNetworkInterfaceEvidence, WorkloadNetworkCutoffEvidence,
+        HOST_FENCE_PROVIDER_EVIDENCE_VERSION,
+    };
+    use crate::trusted_host_fence::trusted_host_fence_event_v1;
 
     fn id(value: &str) -> Id {
         Id::new(value.to_owned()).expect("test ID is valid")
@@ -1436,6 +1448,117 @@ mod tests {
         attempt
     }
 
+    fn terminal_event(
+        attempt: &TrustedHostFenceRecoveryAttemptV1,
+        network_boundary: &str,
+    ) -> TrustedHostFenceEventV1 {
+        let binding = attempt.binding.clone();
+        let object_writer = attempt.provider_request.object_writer.clone();
+        let mut object_target = Vec::new();
+        for value in [
+            object_writer.writer_authority_id.as_str().as_bytes(),
+            object_writer.provider_scope.provider.as_str().as_bytes(),
+            object_writer.provider_scope.partition.as_str().as_bytes(),
+            object_writer.provider_scope.account_id.as_str().as_bytes(),
+            object_writer.provider_scope.region.as_str().as_bytes(),
+            object_writer.workload_principal_id.as_str().as_bytes(),
+            object_writer.object_store_scope_id.as_str().as_bytes(),
+        ] {
+            object_target.extend_from_slice(
+                &u64::try_from(value.len())
+                    .expect("test frame length fits u64")
+                    .to_be_bytes(),
+            );
+            object_target.extend_from_slice(value);
+        }
+        let boundary = ascii(network_boundary);
+        let interface_id = id("interface-1");
+        let evidence = HostFenceProviderEvidence {
+            version: HOST_FENCE_PROVIDER_EVIDENCE_VERSION,
+            binding: binding.clone(),
+            object_write_cutoff:
+                ObjectWriteCutoffEvidence::PrincipalCutoffWithAcceptedPutTerminalBarrier {
+                    binding: binding.clone(),
+                    object_writer,
+                    effect_token: host_fence_effect_token(
+                        &binding,
+                        b"object-write-cutoff",
+                        &object_target,
+                    )
+                    .expect("test cutoff token derives"),
+                    provider_attempt_id: host_fence_provider_attempt_id(
+                        &binding,
+                        b"object-write-cutoff",
+                        &object_target,
+                    )
+                    .expect("test cutoff attempt derives"),
+                    cutoff_receipt_id: ascii("cutoff-receipt-1"),
+                    cutoff_effective_at_unix_ms: time(20),
+                    cutoff_sequence: WireU64::new(4).expect("test sequence is valid"),
+                    accepted_put_terminal_receipt_id: ascii("terminal-receipt-1"),
+                    accepted_puts_terminal_at_unix_ms: time(30),
+                    terminal_sequence: WireU64::new(4).expect("test sequence is valid"),
+                    terminal_prefix_sha256: Sha256Digest::from_bytes([12; 32]),
+                    successful_put_visibility_receipt_id: ascii("visibility-receipt-1"),
+                    successful_puts_visible_at_unix_ms: time(40),
+                },
+            execution_cutoff: HostExecutionCutoffEvidence::HostDestroyed {
+                immutable_host_id: binding.immutable_host_id.clone(),
+                effect_token: host_fence_effect_token(
+                    &binding,
+                    b"host-execution-cutoff",
+                    binding.immutable_host_id.as_str().as_bytes(),
+                )
+                .expect("test execution token derives"),
+                provider_attempt_id: host_fence_provider_attempt_id(
+                    &binding,
+                    b"host-execution-cutoff",
+                    binding.immutable_host_id.as_str().as_bytes(),
+                )
+                .expect("test execution attempt derives"),
+                authoritative_observation_id: ascii("execution-observation-1"),
+                observed_at_unix_ms: time(50),
+            },
+            network_cutoff: WorkloadNetworkCutoffEvidence::WorkloadInterfacesQuarantined {
+                immutable_host_id: binding.immutable_host_id.clone(),
+                quarantine_policy_id: id(boundary.as_str()),
+                boundary_effect_token: host_fence_effect_token(
+                    &binding,
+                    b"network-boundary-cutoff",
+                    boundary.as_str().as_bytes(),
+                )
+                .expect("test boundary token derives"),
+                boundary_provider_attempt_id: host_fence_provider_attempt_id(
+                    &binding,
+                    b"network-boundary-cutoff",
+                    boundary.as_str().as_bytes(),
+                )
+                .expect("test boundary attempt derives"),
+                policy_observation_id: ascii("policy-observation-1"),
+                policy_observed_at_unix_ms: time(60),
+                interfaces: vec![QuarantinedNetworkInterfaceEvidence {
+                    interface_id: interface_id.clone(),
+                    effect_token: host_fence_effect_token(
+                        &binding,
+                        b"network-interface-cutoff",
+                        interface_id.as_str().as_bytes(),
+                    )
+                    .expect("test interface token derives"),
+                    provider_attempt_id: host_fence_provider_attempt_id(
+                        &binding,
+                        b"network-interface-cutoff",
+                        interface_id.as_str().as_bytes(),
+                    )
+                    .expect("test interface attempt derives"),
+                }],
+                authoritative_observation_id: ascii("network-observation-1"),
+                observed_at_unix_ms: time(60),
+            },
+            completed_at_unix_ms: time(60),
+        };
+        trusted_host_fence_event_v1(evidence, time(70)).expect("test terminal event is valid")
+    }
+
     #[test]
     fn current_authority_blocker_requires_coordinates_for_its_component() {
         let mut reasons = [
@@ -1548,6 +1671,40 @@ mod tests {
                     problem: TrustedHostFenceStrictVolumeProblemV1::ObservedVolumeBindingMismatch,
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn batch_rejects_a_self_consistent_terminal_event_for_another_network_boundary() {
+        let attempt = recovery_attempt(Durability::Strict, true);
+        let attempt_sha256 = trusted_host_fence_recovery_attempt_sha256(&attempt)
+            .expect("test attempt digest derives");
+        let matching = TrustedHostFenceBatchRecoveryCommitV1 {
+            version: ContractVersion::V1,
+            fence_attempt_id: attempt.binding.fence_attempt_id.clone(),
+            recovery_attempt_sha256: attempt_sha256.clone(),
+            terminal_event: terminal_event(
+                &attempt,
+                attempt
+                    .provider_request
+                    .network_quarantine_boundary_id
+                    .as_str(),
+            ),
+            recoveries: Vec::new(),
+        };
+        assert_eq!(
+            validate_trusted_host_fence_batch_recovery_commit_v1(&attempt, &matching),
+            Err(TrustedHostFenceRecoveryError::BatchBinding),
+            "the matching provider request passes before the intentionally empty recovery set"
+        );
+
+        let mismatched = TrustedHostFenceBatchRecoveryCommitV1 {
+            terminal_event: terminal_event(&attempt, "quarantine-boundary-other"),
+            ..matching
+        };
+        assert_eq!(
+            validate_trusted_host_fence_batch_recovery_commit_v1(&attempt, &mismatched),
+            Err(TrustedHostFenceRecoveryError::TerminalEvent)
         );
     }
 }
