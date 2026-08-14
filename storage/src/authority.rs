@@ -58,6 +58,9 @@ pub struct AuthorizedServingAttachment {
     /// every qualified object-write publish path must fail closed on it.
     /// Node-side credential generation and A19 registration are not composed
     /// yet (see DEFERRED), so ordinary serving attachments carry `None`.
+    /// The canonical encoding omits an unbound credential entirely, keeping
+    /// pre-field frozen artifacts byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_write_credential: Option<ObjectWriteCredentialReference>,
     pub size_bytes: u64,
     pub durability: VolumeDurability,
