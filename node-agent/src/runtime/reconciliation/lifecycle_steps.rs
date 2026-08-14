@@ -246,6 +246,21 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
                 Ok(LifecyclePhysicalAttempt::ExactPostcondition)
             }
             cats_api::runtime_reconciliation::ProcessState::Running => {
+                let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                };
+                if permit.runtime().guest_transport != permit.checkpoint().guest_transport
+                    || !guest_transport_matches_launch(permit.runtime(), launch)
+                {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                }
+                let guest = match ExactGuestQuiesce::prepare(context, launch, exact) {
+                    Ok(guest) => guest,
+                    Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+                };
+                if guest.revalidate(context, exact).is_err() {
+                    return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous);
+                }
                 exact.assert_current(context)?;
                 context.check_active()?;
                 // Any return after connecting to the VMM is an ambiguous
@@ -3221,11 +3236,22 @@ fn first_lifecycle_step(
     if desired.target == RuntimeTarget::Running {
         return Ok(None);
     }
+    let vmm = exact_vmm_process(runtime)?;
+    if desired.target == RuntimeTarget::Suspended {
+        let runtime_incarnation = runtime
+            .runtime_incarnation
+            .as_ref()
+            .context("Suspended lifecycle planner lost its runtime incarnation")?;
+        return Ok(Some(ReconcileStep::PauseRuntime {
+            runtime_incarnation: runtime_incarnation.clone(),
+            process_start_time_ticks: vmm.process_start_time_ticks,
+        }));
+    }
     // An accepted R==L observation predates this effect batch and says
-    // nothing about Guest/page-cache writes after the scan.  Every departure
-    // from Running therefore starts with a fresh quiesce+durability token;
-    // Pause/Stop may only be selected by a later exact Drain postcondition.
-    let _vmm = exact_vmm_process(runtime)?;
+    // nothing about Guest/page-cache writes after the scan.  Warm, Cold, and
+    // Deleted therefore start with a fresh quiesce+remote-durability token.
+    // Suspended performs its Guest-local quiesce in PauseRuntime and retains
+    // any Relaxed R<L journal on this Host.
     anyhow::ensure!(
         !desired.volumes.is_empty() && runtime.volumes.len() == desired.volumes.len(),
         "lifecycle drain planner lacks the complete Desired volume set"
@@ -3860,9 +3886,8 @@ mod tests {
     }
 
     #[test]
-    fn r_equals_l_still_requires_drain_before_any_pause_or_stop() {
+    fn r_equals_l_still_requires_drain_before_any_stop() {
         for target in [
-            RuntimeTarget::Suspended,
             RuntimeTarget::Warm,
             RuntimeTarget::Cold,
             RuntimeTarget::Deleted,
@@ -3888,24 +3913,44 @@ mod tests {
     }
 
     #[test]
-    fn planner_drains_exact_owned_lineage_before_pausing() {
-        let (desired, _, mut runtime) = fixtures(RuntimeTarget::Suspended);
-        let lineage = &mut runtime.volumes[0].local_lineages[0];
-        lineage.local_durable_generation =
-            cats_api::runtime_reconciliation::Generation::new(2).unwrap();
-        lineage.remote_durable_generation =
-            cats_api::runtime_reconciliation::Generation::new(1).unwrap();
-        assert!(matches!(
-            first_lifecycle_step(&desired, &runtime).unwrap(),
-            Some(ReconcileStep::DrainPublish {
-                ref volume_id,
-                local_generation,
-                remote_generation,
-                ..
-            }) if volume_id == &runtime.volumes[0].volume_id
-                && local_generation.get() == 2
-                && remote_generation.get() == 1
-        ));
+    fn relaxed_suspend_pauses_locally_while_deeper_targets_drain_publish() {
+        for target in [
+            RuntimeTarget::Suspended,
+            RuntimeTarget::Warm,
+            RuntimeTarget::Cold,
+        ] {
+            let (desired, _, mut runtime) = fixtures(target);
+            let lineage = &mut runtime.volumes[0].local_lineages[0];
+            lineage.local_durable_generation =
+                cats_api::runtime_reconciliation::Generation::new(2).unwrap();
+            lineage.remote_durable_generation =
+                cats_api::runtime_reconciliation::Generation::new(1).unwrap();
+            let process = exact_vmm_process(&runtime).unwrap();
+            let planned = first_lifecycle_step(&desired, &runtime).unwrap();
+
+            if target == RuntimeTarget::Suspended {
+                assert!(matches!(
+                    planned,
+                    Some(ReconcileStep::PauseRuntime {
+                        ref runtime_incarnation,
+                        process_start_time_ticks,
+                    }) if Some(runtime_incarnation) == runtime.runtime_incarnation.as_ref()
+                        && process_start_time_ticks == process.process_start_time_ticks
+                ));
+            } else {
+                assert!(matches!(
+                    planned,
+                    Some(ReconcileStep::DrainPublish {
+                        ref volume_id,
+                        local_generation,
+                        remote_generation,
+                        ..
+                    }) if volume_id == &runtime.volumes[0].volume_id
+                        && local_generation.get() == 2
+                        && remote_generation.get() == 1
+                ));
+            }
+        }
     }
 
     #[test]
