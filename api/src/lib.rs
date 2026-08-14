@@ -32,6 +32,7 @@ pub mod requests;
 pub mod resources;
 pub mod route_grant;
 pub mod route_grant_v2;
+pub mod route_signing_operator;
 pub mod runtime_artifacts;
 pub mod runtime_node_authority;
 pub mod runtime_product_reads;
