@@ -4839,6 +4839,7 @@ mod tests {
             .clone();
         runtime.processes.clear();
         runtime.volumes[0].devices.clear();
+        runtime.networks.clear();
         checkpoint.step = ReconcileStep::StopRuntime {
             runtime_incarnation: checkpoint.runtime_incarnation.clone().unwrap(),
             process_start_time_ticks: vmm.process_start_time_ticks,
@@ -4910,6 +4911,22 @@ mod tests {
         )
         .unwrap();
         let stored = store.create(&checkpoint).unwrap();
+        runtime.checkpoint = CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned()).unwrap(),
+            content_digest: stored.content_digest().clone(),
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+            stable_state: checkpoint.stable_state,
+            step: Box::new(checkpoint.step.clone()),
+            require_idle: Box::new(checkpoint.require_idle.clone()),
+            updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+        };
         let serving = Arc::new(VhostCleanupServingPort {
             retirements: Mutex::new(VecDeque::from([
                 ManagedBlockdSocketOwnerRetirement::Retired,
