@@ -48,9 +48,7 @@ fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
     );
     for contract in [
         "\"s3:GetObject\"",
-        "\"s3:GetObjectAttributes\"",
         "\"s3:PutObject\"",
-        "variable = \"s3:prefix\"",
         "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
     ] {
         assert!(
@@ -60,6 +58,9 @@ fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
     }
     for forbidden in [
         "s3:DeleteObject",
+        "s3:GetBucketLocation",
+        "s3:GetObjectAttributes",
+        "s3:ListBucket",
         "s3:PutBucket",
         "ec2:",
         "iam:",

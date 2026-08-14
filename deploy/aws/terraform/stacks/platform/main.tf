@@ -630,27 +630,10 @@ resource "aws_iam_role" "object_write_gateway" {
 
 data "aws_iam_policy_document" "object_write_gateway_chunkstore" {
   statement {
-    sid       = "DiscoverExactChunkStorePrefix"
-    effect    = "Allow"
-    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
-    resources = [aws_s3_bucket.chunkstore.arn]
-
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values = [
-        var.chunkstore_prefix,
-        "${var.chunkstore_prefix}/*",
-      ]
-    }
-  }
-
-  statement {
     sid    = "PublishAndVerifyAcceptedObjects"
     effect = "Allow"
     actions = [
       "s3:GetObject",
-      "s3:GetObjectAttributes",
       "s3:PutObject",
     ]
     resources = [
