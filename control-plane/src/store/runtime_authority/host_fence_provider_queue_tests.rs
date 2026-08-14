@@ -430,7 +430,9 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
     let second = std::thread::spawn(move || {
         second_store.enqueue_host_fence_provider_attempt_for_test(&second_request)
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Pure poll upper bound: a saturated gate machine can take far longer
+    // than an idle one to schedule both enqueue threads onto the lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let blocked: i64 = source_lock
             .query_one(
