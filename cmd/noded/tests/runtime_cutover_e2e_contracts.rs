@@ -886,6 +886,10 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
     assert!(runner.contains(".build_inputs.files.qualification_catalog"));
     assert!(runner.contains("differs from the exact commit"));
     assert!(runner.contains("actual_json == \"$expected_json\""));
+    assert!(runner.contains("route-rotation-operator-trust must use the canonical installed path"));
+    assert!(runner.contains("value[\"release_commit_sha\"] != exact_commit"));
+    assert!(runner.contains("route_v2_rotation_operator:{config_label:"));
+    assert!(runner.contains("CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID"));
     assert!(builder.contains("--input-file \"qualification_catalog="));
 }
 

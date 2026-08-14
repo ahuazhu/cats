@@ -285,6 +285,9 @@ cats_e3_export_qualification_environment() {
   printf -v CATS_E3_EXPECTED_NODES '%s,' "${expected_nodes[@]}"
   CATS_E3_EXPECTED_NODES=${CATS_E3_EXPECTED_NODES%,}
   export CATS_E3_EXPECTED_NODES
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID=$route_rotation_operator_authority_id
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID=$route_rotation_operator_route_deployment_id
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256=$route_rotation_operator_trust_sha256
 }
 
 cats_e3_environment_labels_are_unique() {
@@ -948,6 +951,9 @@ done
 
 seen_config_labels='|'
 seen_config_environment_labels='|'
+route_rotation_operator_authority_id=
+route_rotation_operator_route_deployment_id=
+route_rotation_operator_trust_sha256=
 for entry in "${config_entries[@]}"; do
   label=${entry%%=*}
   path=${entry#*=}
@@ -963,6 +969,138 @@ for entry in "${config_entries[@]}"; do
   [[ -f $canonical ]] || fail "config $label is not a regular file"
   digest=$(sha256sum "$canonical" | awk '{print $1}')
   size=$(wc -c <"$canonical" | tr -d ' ')
+  if [[ $label == route-rotation-operator-trust ]]; then
+    [[ $path == /etc/cats/route-v2/rotation-operator-trust.v1.json && $canonical == "$path" ]] || \
+      fail "route-rotation-operator-trust must use the canonical installed path"
+    if ! route_rotation_operator_coordinates=$(python3 - "$canonical" "$exact_commit" <<'PY'
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+
+class DuplicateKey(ValueError):
+    pass
+
+
+def closed_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKey
+        value[key] = item
+    return value
+
+
+path = Path(sys.argv[1])
+exact_commit = sys.argv[2]
+raw = path.read_bytes()
+if not 1 <= len(raw) <= 16384:
+    raise SystemExit(1)
+try:
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
+except (UnicodeDecodeError, json.JSONDecodeError, DuplicateKey):
+    raise SystemExit(1)
+if not isinstance(value, dict) or list(value) != [
+    "version",
+    "authority_id",
+    "route_deployment_id",
+    "release_commit_sha",
+    "threshold",
+    "credentials",
+]:
+    raise SystemExit(1)
+canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+if (
+    raw != canonical
+    or type(value["version"]) is not int
+    or value["version"] != 1
+    or value["release_commit_sha"] != exact_commit
+):
+    raise SystemExit(1)
+id_pattern = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+digest_pattern = re.compile(r"sha256:[0-9a-f]{64}\Z")
+base64url_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
+if (
+    not isinstance(value["authority_id"], str)
+    or id_pattern.fullmatch(value["authority_id"]) is None
+    or not isinstance(value["route_deployment_id"], str)
+    or id_pattern.fullmatch(value["route_deployment_id"]) is None
+):
+    raise SystemExit(1)
+credentials = value["credentials"]
+threshold = value["threshold"]
+if (
+    not isinstance(credentials, list)
+    or not 1 <= len(credentials) <= 8
+    or type(threshold) is not int
+    or not 1 <= threshold <= len(credentials)
+):
+    raise SystemExit(1)
+credential_ids = []
+spki_digests = set()
+ed25519_spki_prefix = bytes.fromhex("302a300506032b6570032100")
+for credential in credentials:
+    if not isinstance(credential, dict) or list(credential) != [
+        "credential_id",
+        "public_key_spki",
+        "public_key_spki_sha256",
+    ]:
+        raise SystemExit(1)
+    credential_id = credential["credential_id"]
+    public_key_spki = credential["public_key_spki"]
+    public_key_spki_sha256 = credential["public_key_spki_sha256"]
+    if (
+        not isinstance(credential_id, str)
+        or id_pattern.fullmatch(credential_id) is None
+        or not isinstance(public_key_spki, str)
+        or base64url_pattern.fullmatch(public_key_spki) is None
+        or not isinstance(public_key_spki_sha256, str)
+        or digest_pattern.fullmatch(public_key_spki_sha256) is None
+    ):
+        raise SystemExit(1)
+    try:
+        padding = "=" * ((4 - len(public_key_spki) % 4) % 4)
+        spki = base64.b64decode(public_key_spki + padding, altchars=b"-_", validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise SystemExit(1)
+    if len(spki) != 44 or not spki.startswith(ed25519_spki_prefix):
+        raise SystemExit(1)
+    if "sha256:" + hashlib.sha256(spki).hexdigest() != public_key_spki_sha256:
+        raise SystemExit(1)
+    credential_ids.append(credential_id)
+    spki_digests.add(public_key_spki_sha256)
+if credential_ids != sorted(set(credential_ids)) or len(spki_digests) != len(credentials):
+    raise SystemExit(1)
+metadata = os.stat(path, follow_symlinks=False)
+parent = os.stat(path.parent, follow_symlinks=False)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or metadata.st_nlink != 1
+    or stat.S_IMODE(metadata.st_mode) != 0o644
+    or not stat.S_ISDIR(parent.st_mode)
+    or parent.st_uid != 0
+    or parent.st_gid != 0
+    or stat.S_IMODE(parent.st_mode) != 0o700
+):
+    raise SystemExit(1)
+print(value["authority_id"] + "\t" + value["route_deployment_id"])
+PY
+    ); then
+      fail "route-rotation-operator-trust is not the exact canonical release trust"
+    fi
+    IFS=$'\t' read -r route_rotation_operator_authority_id \
+      route_rotation_operator_route_deployment_id <<<"$route_rotation_operator_coordinates"
+    [[ -n $route_rotation_operator_authority_id && -n $route_rotation_operator_route_deployment_id ]] || \
+      fail "route-rotation-operator-trust does not expose exact coordinates"
+    route_rotation_operator_trust_sha256=sha256:$digest
+  fi
   staged=$stage/configs/$label
   stage_input "config:$label" "$canonical" "$staged" 0600 "$digest"
   jq -S -c -n --arg label "$label" --arg path "$canonical" --arg staged_path "$staged" \
@@ -972,9 +1110,12 @@ for entry in "${config_entries[@]}"; do
   export "CATS_E3_CONFIG_${environment_label}"
 done
 
-for required_config in qualification-ingress-open-plan qualification-ingress-close-plan; do
+for required_config in \
+  qualification-ingress-open-plan \
+  qualification-ingress-close-plan \
+  route-rotation-operator-trust; do
   jq -e --arg label "$required_config" 'select(.label == $label)' "$configs_work" >/dev/null || \
-    fail "--config $required_config is required for the bounded qualification ingress window"
+    fail "--config $required_config is required by the production qualification contract"
 done
 
 cats_e3_export_qualification_environment
@@ -1057,6 +1198,9 @@ write_manifest() {
     --arg scenario_catalog_sha256 "$scenario_catalog_sha256" \
     --arg case_evidence_sha256 "sha256:$case_evidence_sha256" \
     --argjson case_evidence_count "$case_evidence_count" \
+    --arg route_rotation_operator_authority_id "$route_rotation_operator_authority_id" \
+    --arg route_rotation_operator_route_deployment_id "$route_rotation_operator_route_deployment_id" \
+    --arg route_rotation_operator_trust_sha256 "$route_rotation_operator_trust_sha256" \
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
     --argjson ended_at_unix_seconds "$ended" \
     --argjson exit_code "$exit_value" \
@@ -1075,6 +1219,10 @@ write_manifest() {
       scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},
       qualification_catalog:{path:$qualification_catalog,sha256:$qualification_catalog_sha256,
         size_bytes:$qualification_catalog_size_bytes},
+      route_v2_rotation_operator:{config_label:"route-rotation-operator-trust",
+        authority_id:$route_rotation_operator_authority_id,
+        route_deployment_id:$route_rotation_operator_route_deployment_id,
+        trust_sha256:$route_rotation_operator_trust_sha256},
       case_evidence:{sha256:$case_evidence_sha256,count:$case_evidence_count},
       timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},
       qualification:{control_origin:$control_origin,workspace_id:$workspace_id,
