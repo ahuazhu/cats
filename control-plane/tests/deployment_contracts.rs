@@ -814,7 +814,11 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     assert!(infrastructure
         .lines()
         .any(|line| line.split_whitespace().collect::<Vec<_>>()
-            == ["control_postgres_schema", "=", "var.control_postgres_schema"]));
+            == [
+                "control_postgres_schema",
+                "=",
+                "var.control_postgres_schema"
+            ]));
 
     let worker_variables =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
@@ -898,20 +902,20 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     assert!(application
         .lines()
         .any(|line| line.split_whitespace().collect::<Vec<_>>()
-            == ["control_postgres_schema", "=", "var.control_postgres_schema"]));
+            == [
+                "control_postgres_schema",
+                "=",
+                "var.control_postgres_schema"
+            ]));
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     assert!(kubernetes.contains("prefix=${var.chunkstore_prefix}"));
-    assert!(kubernetes.contains(
-        "options=-csearch_path%3D${var.control_postgres_schema}"
-    ));
+    assert!(kubernetes.contains("options=-csearch_path%3D${var.control_postgres_schema}"));
 
     let manual_environment = read_workspace_file("deploy/aws/metal/worker.env.example");
     assert!(manual_environment.contains("CATS_CHUNKSTORE_PREFIX=cats"));
     assert!(manual_environment.contains("CATS_POSTGRES_SCHEMA=cats_fresh"));
     let renderer = read_workspace_file("deploy/aws/metal/render-postgres-url.sh");
-    assert!(renderer.contains(
-        "options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"
-    ));
+    assert!(renderer.contains("options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"));
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("url-file=/run/cats/postgres-url"));
     let root_provision =
@@ -1052,9 +1056,7 @@ fn production_schema_probe_fails_closed() {
     assert!(probe.contains("query_status=$?"));
     assert!(probe.contains("deploy/aws/run-postgres-probe.sh"));
     assert!(probe.contains("SELECT current_schema()"));
-    assert!(probe.contains(
-        "SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version"
-    ));
+    assert!(probe.contains("SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
     assert!(probe.contains("$RUNNER_TEMP/proposed-control-postgres-url"));
     assert!(runner.contains("-v ON_ERROR_STOP=1"));
     assert!(runner.contains("create secret generic \"$runtime_secret\""));
