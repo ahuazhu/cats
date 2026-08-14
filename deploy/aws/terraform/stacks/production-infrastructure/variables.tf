@@ -113,6 +113,56 @@ variable "usage_consumer_lag_alarm_threshold_ms" {
   default     = 60000
 }
 
+# Clean-slate cutover lane. The reset executor
+# (deploy/aws/production-clean-slate-reset.py) requires the fresh usage
+# transport -- Kinesis stream, DynamoDB checkpoint table and Object-Locked
+# archive bucket -- to exist in parallel with the old set under strictly
+# different names. Enabling this creates a second, fully disjoint
+# usage-infrastructure instance; the old instance is untouched.
+variable "fresh_usage_enabled" {
+  description = "Create the parallel fresh usage transport set (stream, checkpoint table, archive, IAM, alarms) for the clean-slate cutover."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "fresh_usage_name_suffix" {
+  description = "Suffix joined into the fresh instance's name_prefix. Every regional usage name derives from that prefix, so the whole fresh set (stream, table, policies, role, alarms) differs from the old set by construction."
+  type        = string
+  default     = "fresh"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,15}$", var.fresh_usage_name_suffix))
+    error_message = "fresh_usage_name_suffix must be 1-16 lowercase letters, digits, or hyphens and start with a letter."
+  }
+}
+
+variable "fresh_usage_archive_bucket_name" {
+  description = "Globally unique S3 bucket name for the fresh immutable raw usage archive. Required when fresh_usage_enabled and must differ from usage_archive_bucket_name."
+  type        = string
+  default     = ""
+  nullable    = false
+}
+
+variable "fresh_usage_service_account_name" {
+  description = <<-EOT
+    Kubernetes service account receiving the fresh usage pipeline Pod Identity
+    association. EKS allows one association per cluster, namespace and service
+    account, and the old instance already binds cats-controld, so the fresh
+    instance must use a different name until the old association is retired at
+    cutover.
+  EOT
+  type        = string
+  default     = "cats-controld-fresh"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.fresh_usage_service_account_name))
+    error_message = "fresh_usage_service_account_name must be a DNS-label Kubernetes ServiceAccount name."
+  }
+}
+
 variable "platform_alert_sns_topic_arn" {
   description = "Exact alert_sns_topic_arn output from the reviewed platform Terraform state. Every usage-pipeline alarm uses this topic."
   type        = string

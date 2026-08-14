@@ -45,6 +45,16 @@ module and production stack default it to false. Starting Control replicas must
 not publish ingress or manufacture route/mutation admission. Do not point new
 components at the old schemas, prefixes, stream or checkpoint table.
 
+The parallel fresh usage transport comes from the second `usage_fresh`
+instance in the production-infrastructure stack: set `fresh_usage_enabled =
+true` with a distinct `fresh_usage_archive_bucket_name`, apply a reviewed
+plan, and read the `fresh_usage_kinesis_stream`, `fresh_usage_checkpoint_table`
+and `fresh_usage_archive_bucket` outputs into the `--fresh-usage-*` arguments
+below. Every other fresh name derives from `fresh_usage_name_suffix`, so the
+fresh stream, table, archive, IAM policies, pipeline role and alarms are
+disjoint from the old set by construction; the old instance is untouched and
+this executor rejects any old/fresh name collision.
+
 The reset executor runs only after the fresh deployment is green. It compares
 the kubeconfig context server with the named EKS cluster and requires at least
 two fully available `cats-controld` replicas, exactly that many Running/Ready

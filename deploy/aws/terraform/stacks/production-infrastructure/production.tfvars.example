@@ -15,6 +15,16 @@ usage_kinesis_retention_hours  = 24
 usage_consumer_lag_alarm_threshold_ms = 60000
 usage_archive_object_lock_days = 2555
 
+# Clean-slate cutover: enable the parallel fresh usage transport before the
+# reset window. The archive bucket name must differ from
+# usage_archive_bucket_name; every other fresh name derives from
+# fresh_usage_name_suffix. Read the fresh_usage_kinesis_stream,
+# fresh_usage_checkpoint_table and fresh_usage_archive_bucket outputs into
+# production-clean-slate-reset.py's --fresh-usage-* arguments.
+# fresh_usage_enabled             = true
+# fresh_usage_name_suffix         = "fresh"
+# fresh_usage_archive_bucket_name = "REPLACE_WITH_GLOBALLY_UNIQUE_FRESH_USAGE_BUCKET"
+
 # Copy this exact value from the reviewed platform state with:
 # terraform -chdir=../platform output -raw alert_sns_topic_arn
 # Keep the real account-specific ARN in the ignored operator tfvars, not here.
