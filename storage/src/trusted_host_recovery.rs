@@ -5,12 +5,14 @@
 //! with.  These closed records freeze the complete assigned set and let the
 //! PostgreSQL owner apply either every safe takeover or none of them.
 
+use std::collections::BTreeSet;
+
 use cats_api::runtime_reconciliation::{
-    AcquireOrigin, AdmissionInventoryAttestation, AuthorizationRecord, ContractVersion,
-    DesiredRuntimeSpec, Epoch, FleetPolicyPrincipal, Id, LastVolumeTransition, LocalLineageState,
-    NodeBootId, ObservedRuntimeStatus, ObservedVolume, Operation, OperationFailure, OperationPhase,
-    OperationTerminal, RandomId128, SessionBinding, Sha256Digest, UnixMillis, VolumeAuthorization,
-    VolumeDurability, VolumeRecord, WireU64,
+    spec_digest, AcquireOrigin, AdmissionInventoryAttestation, AuthorizationRecord,
+    AuthorizationState, ContractVersion, DesiredRuntimeSpec, Epoch, FleetPolicyPrincipal, Id,
+    LastVolumeTransition, LocalLineageState, NodeBootId, ObservedRuntimeStatus, ObservedVolume,
+    Operation, OperationFailure, OperationPhase, OperationTerminal, RandomId128, SessionBinding,
+    Sha256Digest, UnixMillis, VolumeAuthorization, VolumeDurability, VolumeRecord, WireU64,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -678,8 +680,25 @@ pub fn validate_trusted_host_fence_batch_recovery_commit_v1(
     {
         return Err(TrustedHostFenceRecoveryError::BatchBinding);
     }
+    let mut operation_ids = BTreeSet::new();
+    let mut authorization_ids = BTreeSet::new();
     for (assigned, recovery) in attempt.assigned_cats.iter().zip(&commit.recoveries) {
         validate_cat_recovery(assigned, recovery, &commit.terminal_event)?;
+        if !operation_ids.insert(assigned.expected_old_operation.operation_id.as_str())
+            || !operation_ids.insert(recovery.recovery_operation.operation_id.as_str())
+        {
+            return Err(TrustedHostFenceRecoveryError::BatchBinding);
+        }
+        for volume in &recovery.volumes {
+            let VolumeAuthorization::Takeover(authorization) =
+                &volume.takeover_authorization.authorization
+            else {
+                return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+            };
+            if !authorization_ids.insert(authorization.authorization_id.as_str()) {
+                return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+            }
+        }
     }
     let bytes =
         serde_json::to_vec(commit).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
@@ -696,6 +715,7 @@ fn validate_assigned_cat(
     let desired = &cat.expected_current_desired;
     let operation = &cat.expected_old_operation;
     if desired.version != ContractVersion::V1
+        || spec_digest(desired).ok().as_ref() != Some(&desired.spec_digest)
         || desired.placement.node_id != attempt.binding.node_id
         || operation.version != ContractVersion::V1
         || operation.workspace_id != desired.workspace_id
@@ -940,43 +960,77 @@ fn validate_cat_recovery(
     terminal_event: &TrustedHostFenceEventV1,
 ) -> Result<(), TrustedHostFenceRecoveryError> {
     let current = &assigned.expected_current_desired;
+    let replacement = &recovery.replacement_desired;
+    let completed_at = terminal_event.committed_at_unix_ms;
     if recovery.cat_id != current.cat_id
         || recovery.assigned_cat_sha256 != trusted_host_fence_assigned_cat_sha256(assigned)?
-        || recovery.replacement_desired.workspace_id != current.workspace_id
-        || recovery.replacement_desired.cat_id != current.cat_id
-        || recovery.replacement_desired.placement.node_id == terminal_event.binding.node_id
-        || recovery.replacement_desired.desired_revision.get()
+        || replacement.version != ContractVersion::V1
+        || spec_digest(replacement).ok().as_ref() != Some(&replacement.spec_digest)
+        || replacement.workspace_id != current.workspace_id
+        || replacement.cat_id != current.cat_id
+        || replacement.placement.node_id == terminal_event.binding.node_id
+        || replacement.desired_revision.get()
             != current
                 .desired_revision
                 .get()
                 .checked_add(1)
                 .ok_or(TrustedHostFenceRecoveryError::BatchBinding)?
-        || recovery.settled_old_operation.operation_id
-            != assigned.expected_old_operation.operation_id
-        || recovery.settled_old_operation.phase != OperationPhase::Failed
-        || recovery.recovery_operation.phase != OperationPhase::Pending
-        || recovery.recovery_operation.terminal.is_some()
+        || replacement.placement.placement_epoch.get()
+            != current
+                .placement
+                .placement_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(TrustedHostFenceRecoveryError::BatchBinding)?
+        || replacement.placement.kind != current.placement.kind
+        || replacement.target != current.target
+        || replacement.runtime != current.runtime
+        || replacement.endpoints != current.endpoints
+        || replacement.transition != current.transition
         || recovery.volumes.len() != assigned.volumes.len()
+        || replacement.volumes.len() != current.volumes.len()
     {
         return Err(TrustedHostFenceRecoveryError::BatchBinding);
     }
-    let Some(OperationTerminal::Failed { error, .. }) = &recovery.settled_old_operation.terminal
-    else {
-        return Err(TrustedHostFenceRecoveryError::BatchBinding);
-    };
-    if !matches!(
-        error.as_ref(),
-        OperationFailure::HostLost {
-            node_id,
-            agent_session_epoch,
-            host_fence_event_id,
-        } if node_id == &terminal_event.binding.node_id
-            && *agent_session_epoch == terminal_event.binding.expected_agent_session_epoch
-            && host_fence_event_id == &terminal_event.event_id
-    ) {
+    let mut exact_settlement = assigned.expected_old_operation.clone();
+    exact_settlement.phase = OperationPhase::Failed;
+    exact_settlement.terminal = Some(OperationTerminal::Failed {
+        error: Box::new(OperationFailure::HostLost {
+            node_id: terminal_event.binding.node_id.clone(),
+            agent_session_epoch: terminal_event.binding.expected_agent_session_epoch,
+            host_fence_event_id: terminal_event.event_id.clone(),
+        }),
+        completed_at_unix_ms: completed_at,
+    });
+    exact_settlement.updated_at_unix_ms = completed_at;
+    if recovery.settled_old_operation != exact_settlement
+        || completed_at < assigned.expected_old_operation.updated_at_unix_ms
+    {
         return Err(TrustedHostFenceRecoveryError::BatchBinding);
     }
-    for (expected, volume) in assigned.volumes.iter().zip(&recovery.volumes) {
+    let operation = &recovery.recovery_operation;
+    if operation.version != ContractVersion::V1
+        || operation.operation_id == assigned.expected_old_operation.operation_id
+        || operation.workspace_id != replacement.workspace_id
+        || operation.cat_id != replacement.cat_id
+        || operation.desired_revision != replacement.desired_revision
+        || operation.desired_spec_digest != replacement.spec_digest
+        || operation.placement != replacement.placement
+        || operation.target != replacement.target
+        || operation.phase != OperationPhase::Pending
+        || operation.terminal.is_some()
+        || operation.created_at_unix_ms != completed_at
+        || operation.updated_at_unix_ms != completed_at
+    {
+        return Err(TrustedHostFenceRecoveryError::BatchBinding);
+    }
+    for (((expected, volume), source_intent), successor_intent) in assigned
+        .volumes
+        .iter()
+        .zip(&recovery.volumes)
+        .zip(&current.volumes)
+        .zip(&replacement.volumes)
+    {
         if volume.volume_id != expected.expected_current_volume.volume_id
             || volume.expected_volume_sha256 != trusted_host_fence_assigned_volume_sha256(expected)?
         {
@@ -989,15 +1043,31 @@ fn validate_cat_recovery(
         else {
             return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
         };
-        if authorization.host_fence_event_id != terminal_event.event_id
+        if !matches!(
+            volume.takeover_authorization.state,
+            AuthorizationState::Unconsumed
+        ) || authorization.host_fence_event_id != terminal_event.event_id
             || authorization.volume_id != expected.expected_current_volume.volume_id
             || authorization.expected_attachment_id != expected.expected_owner.attachment_id
             || authorization.expected_epoch != expected.expected_owner.attachment_epoch
             || authorization.expected_head != expected.expected_current_volume.head
-            || authorization.authorized_node_id != recovery.replacement_desired.placement.node_id
-            || authorization.desired_revision != recovery.replacement_desired.desired_revision
-            || authorization.new_placement_epoch
-                != recovery.replacement_desired.placement.placement_epoch
+            || authorization.authorized_node_id != replacement.placement.node_id
+            || authorization.desired_revision != replacement.desired_revision
+            || authorization.new_placement_epoch != replacement.placement.placement_epoch
+            || authorization.not_after < completed_at
+        {
+            return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+        }
+        let mut exact_successor = source_intent.clone();
+        exact_successor.attachment_id = authorization.new_attachment_id.clone();
+        exact_successor.acquire = cats_api::runtime_reconciliation::VolumeAcquire::Takeover {
+            authorization_id: authorization.authorization_id.clone(),
+        };
+        if successor_intent != &exact_successor
+            || source_intent.volume_id != expected.expected_current_volume.volume_id
+            || source_intent.attachment_id != authorization.expected_attachment_id
+            || source_intent.size_bytes != expected.expected_current_volume.size_bytes
+            || source_intent.durability != expected.expected_current_volume.durability
         {
             return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
         }
