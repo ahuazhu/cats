@@ -9,6 +9,8 @@ readonly ACTION=${1:?missing scenario action}
 readonly CASE_ID=${2:?missing scenario case id}
 readonly BLOCK_PATH=${3:?missing scenario block path}
 readonly CASE_DIR=${4:?missing scenario case directory}
+readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
+ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS=
 
 fail() {
   printf 'runtime cutover v2 driver: %s\n' "$*" >&2
@@ -128,6 +130,103 @@ atomic_json() {
   mv -f "$temporary" "$CASE_DIR/$destination"
 }
 
+atomic_json_path() {
+  local destination=$1 source=$2 directory temporary
+  [[ $destination == "$CASE_DIR/"* ]] || fail "atomic JSON destination is outside the case directory"
+  directory=${destination%/*}
+  [[ -d $directory && ! -L $directory && -O $directory ]] || \
+    fail "atomic JSON parent is not an owner-controlled directory"
+  temporary=$(mktemp "$directory/.${destination##*/}.XXXXXX")
+  jq -S -c . "$source" >"$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$destination"
+  durable_case_file "$destination"
+}
+
+prepare_rotation_journal() {
+  local mode
+  if [[ ! -e $ROTATION_JOURNAL ]]; then
+    mkdir -m 0700 "$ROTATION_JOURNAL"
+    sync -f "$CASE_DIR"
+  fi
+  [[ -d $ROTATION_JOURNAL && ! -L $ROTATION_JOURNAL && -O $ROTATION_JOURNAL ]] || \
+    fail "Route rotation journal is not an owner-controlled directory"
+  mode=$(stat -c '%a' "$ROTATION_JOURNAL")
+  [[ $mode == 700 ]] || fail "Route rotation journal must have exact mode 0700"
+}
+
+durable_case_file() {
+  local path=$1
+  [[ $path == "$CASE_DIR/"* && -f $path && ! -L $path && -O $path ]] || \
+    fail "Route rotation journal entry is not an owner-controlled regular file"
+  chmod 0600 "$path"
+  sync -f "$path"
+  sync -f "${path%/*}"
+}
+
+adopt_rotation_file() {
+  local source=$1 destination=$2 temporary
+  [[ $source == "$ROTATION_JOURNAL/"* && $destination == "$ROTATION_JOURNAL/"* ]] || \
+    fail "Route rotation adoption escaped the private journal"
+  if [[ -e $destination ]]; then
+    [[ -f $destination && ! -L $destination && -O $destination ]] || \
+      fail "adopted Route rotation file is not an owner-controlled regular file"
+    cmp -s "$source" "$destination" || \
+      fail "adopted Route rotation bytes changed across resume"
+    return
+  fi
+  temporary=$(mktemp "$ROTATION_JOURNAL/.${destination##*/}.XXXXXX")
+  cp "$source" "$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$destination"
+  durable_case_file "$destination"
+}
+
+initialize_rotation_journal() {
+  local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log
+  local phases=$ROTATION_JOURNAL/rotation-phase-receipts.json temporary expected_header
+  prepare_rotation_journal
+  if [[ -z $ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS ]]; then
+    ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS=$(( $(date +%s) + 1740 ))
+  fi
+  expected_header="version=1 kind=route_v2_rotation_transcript_v1 case_id=$CASE_ID qualification_run_id=$CATS_E3_RUN_ID source_commit_sha=$CATS_E3_EXACT_COMMIT"
+  if [[ -e $transcript ]]; then
+    [[ -f $transcript && ! -L $transcript && -O $transcript ]] || \
+      fail "Route rotation transcript is not an owner-controlled regular file"
+    [[ $(sed -n '1p' "$transcript") == "$expected_header" ]] || \
+      fail "Route rotation transcript belongs to another run"
+    [[ $(grep -c '^terminal_marker=route_v2_rotation_disable_recovered_active_http_ws$' "$transcript" || true) -le 1 ]] || \
+      fail "Route rotation transcript repeats its terminal marker"
+  else
+    temporary=$(mktemp "$CASE_DIR/.route-v2-rotation-transcript.XXXXXX")
+    printf '%s\n' "$expected_header" >"$temporary"
+    chmod 0600 "$temporary"
+    mv "$temporary" "$transcript"
+    durable_case_file "$transcript"
+  fi
+  if [[ -e $phases ]]; then
+    [[ -f $phases && ! -L $phases && -O $phases ]] || \
+      fail "Route rotation phase aggregate is not an owner-controlled regular file"
+    jq -e -S -c . "$phases" >"$ROTATION_JOURNAL/.phase-prefix.canonical"
+    cmp -s "$phases" "$ROTATION_JOURNAL/.phase-prefix.canonical" || \
+      fail "Route rotation phase aggregate is not canonical JSON"
+    rm -f "$ROTATION_JOURNAL/.phase-prefix.canonical"
+  else
+    printf '[]' >"$phases"
+    durable_case_file "$phases"
+  fi
+}
+
+rotation_require_budget() {
+  local minimum_seconds=$1 now remaining
+  [[ $ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS =~ ^[0-9]+$ ]] || \
+    fail "Route rotation invocation deadline is unavailable"
+  now=$(date +%s)
+  remaining=$((ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS - now))
+  (( remaining >= minimum_seconds )) || \
+    fail "Route rotation invocation exhausted its forward-recovery budget"
+}
+
 run_cats() {
   local executable token
   executable=$(binary cats)
@@ -197,35 +296,246 @@ control_origin() {
   printf '%s' "$origin"
 }
 
+sha256_wire() {
+  printf 'sha256:%s' "$(sha256sum "$1" | awk '{print $1}')"
+}
+
+rotation_input() {
+  config "$1"
+}
+
+protected_rotation_operator_key() {
+  local path=$1 parent mode uid gid links size parent_mode parent_uid parent_gid
+  parent=${path%/*}
+  read -r mode uid gid links size < <(stat -c '%a %u %g %h %s' "$path")
+  read -r parent_mode parent_uid parent_gid < <(stat -c '%a %u %g' "$parent")
+  [[ -f $path && ! -L $path && $mode == 600 && $uid == 0 && $gid == 0 && $links == 1 ]] || \
+    fail "Route rotation operator key must be one root:root 0600 single-link regular file"
+  [[ $size =~ ^[1-9][0-9]*$ ]] && (( size <= 65536 )) || \
+    fail "Route rotation operator key exceeds its closed byte bound"
+  [[ -d $parent && ! -L $parent && $parent_mode == 700 && $parent_uid == 0 && $parent_gid == 0 ]] || \
+    fail "Route rotation operator key parent must be exact root:root 0700"
+}
+
+validate_rotation_recovery_inputs() {
+  local trust bundle operator_key transport ca canonical
+  local rotation_origin rotation_server inbox_server authority port
+  local phase receipt_url expected_url_sha actual_url_sha remainder
+  trust=$(rotation_input route-rotation-operator-trust)
+  bundle=$(rotation_input route-rotation-command-bundle)
+  operator_key=$(rotation_input route-rotation-operator-key)
+  transport=$(rotation_input route-rotation-recovery)
+  ca=$(rotation_input route-rotation-server-ca)
+  canonical=$CASE_DIR/rotation-recovery-transport.canonical.json
+  jq -S -c . "$transport" >"$canonical"
+  cmp -s "$transport" "$canonical" || fail "Route rotation recovery transport is not sorted canonical JSON"
+  rm -f "$canonical"
+  jq -e \
+    --arg case_id "$CASE_ID" \
+    --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg catalog "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg trust_sha "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256)" \
+    --arg ca_sha "$(sha256_wire "$ca")" '
+    . as $root
+    | (keys == ["authority_id","case_id","immutability_mode","kind","phases",
+        "qualification_catalog_sha256","qualification_run_id","receipt_inbox_server_name",
+        "rotation_operator_trust_sha256","rotation_origin","rotation_server_name",
+        "route_deployment_id","server_ca_bundle_sha256","source_commit_sha","version"])
+      and .version == 1
+      and .kind == "route_v2_rotation_recovery_transport_v1"
+      and .immutability_mode == "create_only_no_delete_v1"
+      and .case_id == $case_id and .qualification_run_id == $run_id
+      and .source_commit_sha == $commit
+      and .qualification_catalog_sha256 == $catalog
+      and .authority_id == $authority and .route_deployment_id == $deployment
+      and .rotation_operator_trust_sha256 == $trust_sha
+      and .server_ca_bundle_sha256 == $ca_sha
+      and (.rotation_origin | test("^https://[a-z0-9][a-z0-9.-]*[a-z0-9](:[1-9][0-9]{0,4})?$"))
+      and (.rotation_origin == ("https://" + $root.rotation_server_name)
+        or (.rotation_origin | startswith("https://" + $root.rotation_server_name + ":")))
+      and (.receipt_inbox_server_name | test("^[a-z0-9][a-z0-9.-]*[a-z0-9]$"))
+      and (.phases | type == "array" and length == 7)
+      and ([.phases[].phase] == ["publish_overlap","switch_active","publish_new_only",
+        "retire","disable","publish_recovery","activate"])
+      and ([.phases[].signer_revision] == [2,3,4,5,6,7,8])
+      and all(.phases[];
+        (keys == ["phase","plan_validation_receipt_sha256","receipt_url",
+          "receipt_url_sha256","saved_plan_sha256","signer_revision"])
+        and (.saved_plan_sha256 | test("^sha256:[0-9a-f]{64}$"))
+        and (.plan_validation_receipt_sha256 | test("^sha256:[0-9a-f]{64}$"))
+        and (.receipt_url | test("^https://[A-Za-z0-9./:_-]+$"))
+        and ((.receipt_url | startswith("https://" + $root.receipt_inbox_server_name + "/"))
+          or (.receipt_url | startswith("https://" + $root.receipt_inbox_server_name + ":")))
+        and (.receipt_url_sha256 | test("^sha256:[0-9a-f]{64}$")))' \
+    "$transport" >/dev/null || fail "Route rotation recovery transport does not bind this exact run"
+  jq -e \
+    --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg trust_sha "$(sha256_wire "$trust")" '
+    .version == 1 and .case_id == $case_id
+    and .qualification_run_id == $run_id and .source_commit_sha == $commit
+    and .rotation_operator_authority_id == $authority
+    and .route_deployment_id == $deployment
+    and .rotation_operator_trust_sha256 == $trust_sha
+    and ([.commands[].phase] == ["publish_overlap","switch_active","publish_new_only",
+      "retire","disable","publish_recovery","activate"])
+    and ([.commands[].signer_revision] == [2,3,4,5,6,7,8])
+    and ([.control_rollouts[].signer_revision] == [2,3,4,5,6,7,8])' \
+    "$bundle" >/dev/null || fail "Route rotation command bundle does not bind this exact run"
+  [[ $(sha256_wire "$trust") == "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256)" ]] || \
+    fail "Route rotation trust digest differs from runner authority"
+  [[ -s $operator_key && -s $ca ]] || fail "Route rotation key or server CA is empty"
+  protected_rotation_operator_key "$operator_key"
+  rotation_origin=$(jq -er '.rotation_origin' "$transport")
+  rotation_server=$(jq -er '.rotation_server_name' "$transport")
+  inbox_server=$(jq -er '.receipt_inbox_server_name' "$transport")
+  authority=${rotation_origin#https://}
+  [[ $authority == "$rotation_server" || $authority == "$rotation_server":* ]] || \
+    fail "Route rotation origin does not select the exact server identity"
+  if [[ $authority == *:* ]]; then
+    port=${authority##*:}
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port <= 65535 )) || \
+      fail "Route rotation origin has an invalid HTTPS port"
+  fi
+  while IFS=$'\t' read -r phase receipt_url expected_url_sha; do
+    [[ -n $phase && -n $receipt_url && -n $expected_url_sha ]] || \
+      fail "Route rotation recovery transport has an incomplete phase coordinate"
+    actual_url_sha="sha256:$(printf '%s' "$receipt_url" | sha256sum | awk '{print $1}')"
+    [[ $actual_url_sha == "$expected_url_sha" ]] || \
+      fail "Route rotation recovery transport has a mismatched URL digest for $phase"
+    remainder=${receipt_url#https://}
+    authority=${remainder%%/*}
+    [[ $remainder != "$authority" && $authority != *'@'* ]] || \
+      fail "Route rotation recovery transport has a malformed receipt URL"
+    [[ $authority == "$inbox_server" || $authority == "$inbox_server":* ]] || \
+      fail "Route rotation receipt URL does not select the exact inbox identity"
+    if [[ $authority == *:* ]]; then
+      port=${authority##*:}
+      [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port <= 65535 )) || \
+        fail "Route rotation receipt URL has an invalid HTTPS port"
+    fi
+  done < <(jq -r '.phases[] | [.phase,.receipt_url,.receipt_url_sha256] | @tsv' "$transport")
+}
+
+rotation_transport_field() {
+  jq -er "$1" "$(rotation_input route-rotation-recovery)"
+}
+
+curl_secret_url() {
+  local method=$1 url=$2 output=$3 expected=$4
+  shift 4
+  local curl_bin ca url_config headers errors status curl_status size content_types encodings
+  curl_bin=$(binary curl)
+  ca=$(rotation_input route-rotation-server-ca)
+  url_config=$(mktemp "$CASE_DIR/.curl-url.XXXXXX")
+  headers=$(mktemp "$CASE_DIR/.rotation-headers.XXXXXX")
+  errors=$(mktemp "$CASE_DIR/.rotation-curl-errors.XXXXXX")
+  chmod 0600 "$url_config" "$headers" "$errors"
+  [[ $url != *'"'* && $url != *'\'* && $url != *$'\n'* && $url != *$'\r'* ]] || \
+    fail "recovery transport URL is not config-safe"
+  printf 'url = "%s"\n' "$url" >"$url_config"
+  set +e
+  status=$(HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY='*' \
+    https_proxy= http_proxy= all_proxy= no_proxy='*' \
+    "$curl_bin" --disable --silent --show-error --config "$url_config" \
+    --proto '=https' --tlsv1.2 --max-time 30 --max-filesize 1048576 \
+    --noproxy '*' --max-redirs 0 \
+    --cacert "$ca" --request "$method" \
+    --header 'accept: application/json' --header 'accept-encoding: identity' \
+    --dump-header "$headers" --write-out '%{http_code}' \
+    "$@" --output "$output" 2>"$errors")
+  curl_status=$?
+  set -e
+  rm -f "$url_config" "$errors"
+  if [[ $curl_status -ne 0 || ! $status =~ ^[0-9]{3}$ ]]; then
+    rm -f "$headers" "$output"
+    return 75
+  fi
+  size=$(wc -c <"$output")
+  if [[ $size -gt 1048576 ]]; then
+    rm -f "$headers" "$output"
+    fail "recovery HTTPS response exceeds the closed byte bound"
+  fi
+  case ",$expected," in
+    *",$status,"*) ;;
+    *)
+      rm -f "$headers" "$output"
+      return 76
+      ;;
+  esac
+  if [[ $status == 200 || $status == 409 ]]; then
+    content_types=$(awk 'BEGIN{IGNORECASE=1} /^Content-Type:/{sub(/\r$/,""); sub(/^[^:]*:[[:space:]]*/,""); print}' "$headers")
+    encodings=$(awk 'BEGIN{IGNORECASE=1} /^Content-Encoding:/{sub(/\r$/,""); sub(/^[^:]*:[[:space:]]*/,""); print}' "$headers")
+    [[ $content_types == application/json ]] || {
+      rm -f "$headers" "$output"
+      fail "recovery HTTPS response Content-Type is not exact application/json"
+    }
+    [[ -z $encodings || $encodings == identity ]] || {
+      rm -f "$headers" "$output"
+      fail "recovery HTTPS response encoding is not identity"
+    }
+  fi
+  rm -f "$headers"
+  printf '%s' "$status"
+}
+
+rotation_json_request() {
+  local method=$1 path=$2 output=$3 expected=$4 origin status
+  shift 4
+  origin=$(rotation_transport_field '.rotation_origin')
+  status=$(curl_secret_url "$method" "$origin$path" "$output" "$expected" "$@") || return $?
+  [[ $status == 200 ]] || return 76
+  jq -e . "$output" >/dev/null || fail "Route rotation response is not JSON"
+}
+
 operation_wait() {
-  local operation_id=$1 expected_target=$2 origin workspace response
+  local operation_id=$1 expected_target=$2 artifact_dir=${3:-$CASE_DIR} prefix=${4:-}
+  local origin workspace response receipt_source receipt
   origin=$(control_origin)
   workspace=$(required CATS_E3_WORKSPACE_ID)
   canonical_id CATS_E3_WORKSPACE_ID "$workspace"
   canonical_id operation_id "$operation_id"
-  response=$CASE_DIR/operation-$operation_id.json
+  [[ $artifact_dir == "$CASE_DIR" || $artifact_dir == "$CASE_DIR/"* ]] || \
+    fail "Operation artifacts are outside the case directory"
+  response=$artifact_dir/${prefix}operation-$operation_id.json
   run_cats --api-url "$origin" --workspace "$workspace" --json \
     operation wait "$operation_id" >"$response"
+  durable_case_file "$response"
   jq -e \
     --arg operation "$operation_id" --arg workspace "$workspace" --arg target "$expected_target" \
     '.operation_id == $operation and .workspace_id == $workspace and .phase == "succeeded"
       and .target == $target and .terminal.kind == "succeeded"
       and .terminal.result.observed_target == $target' \
     "$response" >/dev/null || fail "canonical Operation does not prove exact $expected_target settlement"
+  receipt_source=$artifact_dir/.${prefix}operation-receipt.source.json
+  receipt=$artifact_dir/${prefix}operation-receipt.json
   jq -S -c \
     '{version:1,operation_id,workspace_id,target,phase,
       terminal:{kind:.terminal.kind,observed_target:.terminal.result.observed_target}}' \
-    "$response" >"$CASE_DIR/operation-receipt.source.json"
-  atomic_json operation-receipt.json "$CASE_DIR/operation-receipt.source.json"
-  rm -f "$CASE_DIR/operation-receipt.source.json"
+    "$response" >"$receipt_source"
+  atomic_json_path "$receipt" "$receipt_source"
+  rm -f "$receipt_source"
 }
 
 product_mutation() {
   local method=$1 path=$2 key=$3 expected_target=$4 body=${5:-}
-  local origin response replay operation_id replay_operation_id converged request_status attempt
+  local artifact_dir=${6:-$CASE_DIR} prefix=${7:-}
+  local origin response replay receipt_source receipt replay_source replay_receipt
+  local operation_id replay_operation_id converged request_status attempt
   origin=$(control_origin)
-  response=$CASE_DIR/mutation-response.json
-  replay=$CASE_DIR/mutation-replay.json
+  [[ $artifact_dir == "$CASE_DIR" || $artifact_dir == "$CASE_DIR/"* ]] || \
+    fail "mutation artifacts are outside the case directory"
+  response=$artifact_dir/${prefix}mutation-response.json
+  replay=$artifact_dir/${prefix}mutation-replay.json
+  receipt_source=$artifact_dir/.${prefix}mutation-receipt.source.json
+  receipt=$artifact_dir/${prefix}mutation-receipt.json
+  replay_source=$artifact_dir/.${prefix}idempotent-replay.source.json
+  replay_receipt=$artifact_dir/${prefix}idempotent-replay-receipt.json
   request_status=75
   for attempt in 1 2; do
     set +e
@@ -243,12 +553,13 @@ product_mutation() {
     [[ $request_status -eq 75 ]] || break
   done
   [[ $request_status -eq 0 ]] || fail "product mutation response remained ambiguous after one exact idempotent replay"
+  durable_case_file "$response"
   jq -S -c \
     '{version:1,operation_id:(.operation_id // null),
       desired_revision:(.desired_revision // null),converged:(.converged // null)}' \
-    "$response" >"$CASE_DIR/mutation-receipt.source.json"
-  atomic_json mutation-receipt.json "$CASE_DIR/mutation-receipt.source.json"
-  rm -f "$CASE_DIR/mutation-receipt.source.json"
+    "$response" >"$receipt_source"
+  atomic_json_path "$receipt" "$receipt_source"
+  rm -f "$receipt_source"
   operation_id=$(jq -er '.operation_id // empty' "$response" 2>/dev/null || true)
   if [[ -n $operation_id ]]; then
     if [[ -n $body ]]; then
@@ -262,12 +573,15 @@ product_mutation() {
     fi
     replay_operation_id=$(jq -er '.operation_id // empty' "$replay" 2>/dev/null || true)
     [[ $replay_operation_id == "$operation_id" ]] || fail "idempotent replay returned another Operation"
+    cmp -s "$response" "$replay" || \
+      fail "idempotent replay changed the exact mutation response bytes"
+    durable_case_file "$replay"
     jq -S -c -n --arg operation_id "$operation_id" \
       '{version:1,idempotent_replay:true,operation_id:$operation_id}' \
-      >"$CASE_DIR/idempotent-replay.source.json"
-    atomic_json idempotent-replay-receipt.json "$CASE_DIR/idempotent-replay.source.json"
-    rm -f "$CASE_DIR/idempotent-replay.source.json"
-    operation_wait "$operation_id" "$expected_target"
+      >"$replay_source"
+    atomic_json_path "$replay_receipt" "$replay_source"
+    rm -f "$replay_source"
+    operation_wait "$operation_id" "$expected_target" "$artifact_dir" "$prefix"
     return
   fi
   converged=$(jq -er '.converged // false' "$response" 2>/dev/null || true)
@@ -455,11 +769,13 @@ install_route_workload() {
 }
 
 probe_public_route() {
+  local destination=${1:-$CASE_DIR/public-route-receipt.json}
   local origin source attempt route_status
   origin=${CATS_E3_PUBLIC_ORIGIN:-https://$(required CATS_E3_ENDPOINT_HOSTNAME)}
   [[ $origin == "https://$(required CATS_E3_ENDPOINT_HOSTNAME)" ]] || \
     fail "CATS_E3_PUBLIC_ORIGIN must be the exact deployed endpoint origin"
-  source=$CASE_DIR/public-route.source.json
+  [[ $destination == "$CASE_DIR/"* ]] || fail "public Route receipt is outside the case directory"
+  source=${destination%/*}/.${destination##*/}.source
   attempt=0
   route_status=1
   while [[ $attempt -lt 12 ]]; do
@@ -476,8 +792,609 @@ probe_public_route() {
     '.version == 1 and .origin == $origin and .run_id == $run_id
       and .http_guest_body == true and .websocket_guest_echo == true' \
     "$source" >/dev/null || fail "public route receipt lacks live Guest HTTP and WebSocket proof"
-  atomic_json public-route-receipt.json "$source"
+  atomic_json_path "$destination" "$source"
   rm -f "$source"
+}
+
+rotation_transcript() {
+  local phase=$1 event=$2 detail=$3
+  local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log temporary
+  [[ $phase =~ ^[a-z0-9_]+$ && $event =~ ^[a-z0-9_]+$ && $detail =~ ^[A-Za-z0-9_:.-]+$ ]] || \
+    fail "Route rotation transcript event is not bounded text"
+  temporary=$(mktemp "$CASE_DIR/.route-v2-rotation-transcript.XXXXXX")
+  cat "$transcript" >"$temporary"
+  printf 'phase=%s event=%s detail=%s\n' "$phase" "$event" "$detail" >>"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$transcript"
+  durable_case_file "$transcript"
+}
+
+rotation_phase_revision() {
+  jq -er --arg phase "$1" '.commands[] | select(.phase == $phase) | .signer_revision' \
+    "$(rotation_input route-rotation-command-bundle)"
+}
+
+rotation_phase_ring_version() {
+  jq -er --arg phase "$1" '.commands[] | select(.phase == $phase) | .ring_version' \
+    "$(rotation_input route-rotation-command-bundle)"
+}
+
+rotation_phase_rollout_field() {
+  local phase=$1 expression=$2 revision
+  revision=$(rotation_phase_revision "$phase")
+  jq -er --argjson revision "$revision" \
+    ".control_rollouts[] | select(.signer_revision == \$revision) | $expression" \
+    "$(rotation_input route-rotation-command-bundle)"
+}
+
+sign_rotation_attempt() {
+  local phase=$1 attempt=$2 pending=$3 signing=$4 cats_bin authority_command_sha replayed
+  replayed=false
+  [[ ! -e $pending ]] || replayed=true
+  cats_bin=$(binary cats)
+  "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+    sign-prepared-rotation-phase \
+    --trust "$(rotation_input route-rotation-operator-trust)" \
+    --operator-private-key "$(rotation_input route-rotation-operator-key)" \
+    --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+    --phase "$phase" --output "$pending" >"$signing"
+  authority_command_sha=$(jq -er --arg phase "$phase" \
+    '.commands[] | select(.phase == $phase) | .exact_authority_command_sha256' \
+    "$(rotation_input route-rotation-command-bundle)")
+  jq -e --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg phase "$phase" --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg authority_command_sha "$authority_command_sha" \
+    --arg signed_command_sha "$(sha256_wire "$pending")" \
+    --arg pending_path "$pending" \
+    --argjson revision "$(rotation_phase_revision "$phase")" \
+    --argjson ring "$(rotation_phase_ring_version "$phase")" '
+    .version == 1 and .case_id == $case_id and .qualification_run_id == $run_id
+    and .phase == $phase and .release_commit_sha == $commit
+    and .authority_id == $authority and .route_deployment_id == $deployment
+    and .signer_revision == $revision and .ring_version == $ring
+    and (.command_id | test("^[0-9a-f]{32}$"))
+    and .exact_authority_command_sha256 == $authority_command_sha
+    and .exact_signed_command_sha256 == $signed_command_sha
+    and .pending_command_path == $pending_path
+    and (.issued_at_unix_ms | type == "number" and . > 0)
+    and (.expires_at_unix_ms - .issued_at_unix_ms == 300000)' \
+    "$signing" >/dev/null || fail "fresh Route rotation command signing receipt is not exact"
+  durable_case_file "$pending"
+  durable_case_file "$signing"
+  if [[ $replayed == true ]]; then
+    rotation_transcript "$phase" signed_replay "attempt_$attempt"
+  else
+    rotation_transcript "$phase" signed_fresh "attempt_$attempt"
+  fi
+}
+
+post_rotation_attempt() {
+  local phase=$1 pending=$2 response=$3 status transport_try command_id command_sha request_status
+  command_id=$(jq -er '.payload.command_id' "$pending")
+  command_sha=$(sha256_wire "$pending")
+  status=
+  for transport_try in 1 2 3 4 5; do
+    set +e
+    status=$(curl_secret_url POST \
+      "$(rotation_transport_field '.rotation_origin')/v1/internal/route-v2/signing-authority-commands" \
+      "$response" 200,409 \
+      --header 'content-type: application/json' --data-binary "@$pending")
+    request_status=$?
+    set -e
+    [[ $request_status -eq 0 ]] && break
+    sleep 1
+  done
+  [[ $status == 200 || $status == 409 ]] || fail "signed Route rotation command remained ambiguous"
+  durable_case_file "$response"
+  if [[ $status == 409 ]] && jq -e '
+    keys == ["code","message"]
+    and .code == "command_outside_execution_window"
+    and .message == "Route v2 rotation command is outside its execution window"' \
+    "$response" >/dev/null; then
+    # The Store checks this outcome under the same exclusive authority lock
+    # after proving command_id absence. A later attempt may therefore use a
+    # fresh ID without creating two effects.
+    printf '%s' expired_uncommitted
+    return
+  fi
+  jq -e --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" --arg command_id "$command_id" \
+    --arg command_sha "$command_sha" '
+    .version == 1 and .authority_id == $authority and .release_commit_sha == $commit
+    and .command_id == $command_id and .exact_command_sha256 == $command_sha
+    and (.committed_at_unix_ms | type == "number" and . > 0)
+    and (.result.outcome == "applied"
+      or .result.outcome == "authority_precondition_failed")' \
+    "$response" >/dev/null || fail "Route rotation Store receipt is not exact"
+  if [[ $status == 200 && $(jq -er '.result.outcome' "$response") == applied ]]; then
+    printf '%s' applied
+  elif [[ $status == 409 && $(jq -er '.result.outcome' "$response") == authority_precondition_failed ]]; then
+    printf '%s' precondition_failed
+  else
+    fail "Route rotation receipt status and outcome disagree"
+  fi
+}
+
+wait_rotation_store_precondition() {
+  local phase=$1 observed destination expected_ring_digest expected_kids expected_ring_version
+  local attempt status ready require_closed
+  case "$phase" in
+    switch_active) observed=publish_overlap; require_closed=false ;;
+    retire) observed=publish_new_only; require_closed=false ;;
+    activate) observed=publish_recovery; require_closed=true ;;
+    *) return ;;
+  esac
+  destination=$ROTATION_JOURNAL/$phase.precondition-fleet.json
+  expected_ring_digest=$(rotation_phase_rollout_field "$observed" '.public_key_ring_digest')
+  expected_ring_version=$(rotation_phase_ring_version "$observed")
+  expected_kids=$(jq -c --arg phase "$observed" '
+    .commands[] | select(.phase == $phase)
+    | .exact_authority_command_json | fromjson | .successor_ring.keys | map(.kid)' \
+    "$(rotation_input route-rotation-command-bundle)")
+  ready=false
+  attempt=0
+  while [[ $attempt -lt 240 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 45
+    set +e
+    raw_fleet_snapshot_to "$destination"
+    status=$?
+    set -e
+    if [[ $status -eq 0 ]] && jq -e \
+      --argjson ring_version "$expected_ring_version" \
+      --arg ring_digest "$expected_ring_digest" --argjson kids "$expected_kids" \
+      --argjson require_closed "$require_closed" \
+      --arg nodes "$(required CATS_E3_EXPECTED_NODES)" '
+      . as $root | ($nodes | split(",")) as $expected
+      | ([.nodes[].node_id] | sort) == ($expected | sort)
+      and all(.nodes[];
+        .session != null and .inventory != null and .inventory.complete_inventory == true
+        and .inventory.source_session.node_id == .session.node_id
+        and .inventory.source_session.node_boot_id == .session.node_boot_id
+        and .inventory.source_session.agent_instance_id == .session.agent_instance_id
+        and .inventory.source_session.agent_session_epoch == .session.agent_session_epoch
+        and .inventory.attestation.accepted_at_unix_ms <= $root.evaluated_at_unix_ms
+        and $root.evaluated_at_unix_ms < (.inventory.attestation.accepted_at_unix_ms + 60000)
+        and .inventory.key_ring_version == $ring_version
+        and .inventory.key_ring_digest == $ring_digest
+        and .inventory.loaded_kids == $kids
+        and (if $require_closed then
+          .inventory.route_active_count == 0 and .inventory.active_guard_count == 0
+          and .inventory.residue_count == 0
+          and .inventory.cancellation_pending_count == 0
+          and .inventory.quarantined_condition_count == 0
+        else true end))
+      and (if $require_closed then ([.nodes[].inventory.route_closed_count] | add) == 1
+        else true end)' "$destination" >/dev/null; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [[ $ready == true ]] || fail "Route rotation Store precondition did not become observable before signing"
+  durable_case_file "$destination"
+  rotation_transcript "$phase" store_precondition_observed "ring_$expected_ring_version"
+}
+
+advance_rotation_phase() {
+  local phase=$1 attempt pending signing response outcome revision ring_version
+  revision=$(rotation_phase_revision "$phase")
+  ring_version=$(rotation_phase_ring_version "$phase")
+  attempt=0
+  while [[ $attempt -lt 360 ]]; do
+    attempt=$((attempt + 1))
+    pending=$ROTATION_JOURNAL/$phase.attempt-$attempt.command.json
+    signing=$ROTATION_JOURNAL/$phase.attempt-$attempt.signing-receipt.json
+    response=$ROTATION_JOURNAL/$phase.attempt-$attempt.store-receipt.json
+    if [[ ! -e $pending ]]; then
+      wait_rotation_store_precondition "$phase"
+    fi
+    rotation_require_budget 45
+    sign_rotation_attempt "$phase" "$attempt" "$pending" "$signing"
+    outcome=$(post_rotation_attempt "$phase" "$pending" "$response")
+    if [[ $outcome == applied ]]; then
+      jq -e --argjson revision "$revision" --argjson ring "$ring_version" '
+        .result.signer_revision == $revision
+        and .result.public_key_ring_version == $ring' "$response" >/dev/null || \
+        fail "Route rotation Store applied another successor"
+      adopt_rotation_file "$pending" "$ROTATION_JOURNAL/$phase.signed-command.json"
+      adopt_rotation_file "$signing" "$ROTATION_JOURNAL/$phase.signing-receipt.json"
+      adopt_rotation_file "$response" "$ROTATION_JOURNAL/$phase.store-receipt.json"
+      rotation_transcript "$phase" store_applied "attempt_$attempt"
+      return
+    fi
+    [[ $outcome == precondition_failed || $outcome == expired_uncommitted ]] || \
+      fail "Route rotation phase returned a non-retryable Store result"
+    rotation_transcript "$phase" "$outcome" "attempt_$attempt"
+    sleep 1
+  done
+  fail "Route rotation phase did not satisfy its bounded Store precondition"
+}
+
+wait_rotation_retention() {
+  local committed_ms target_seconds now_seconds attempt
+  committed_ms=$(jq -er '.committed_at_unix_ms' "$ROTATION_JOURNAL/switch_active.store-receipt.json")
+  target_seconds=$(( (committed_ms + 305000) / 1000 + 1 ))
+  attempt=0
+  while [[ $attempt -lt 420 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 45
+    now_seconds=$(date +%s)
+    if [[ $now_seconds -gt $target_seconds ]]; then
+      rotation_transcript publish_new_only retention_elapsed "strictly_after_switch_plus_305s"
+      return
+    fi
+    sleep 1
+  done
+  fail "worker clock did not reach the bounded Route rotation retention deadline"
+}
+
+future_rotation_receipts_absent() {
+  local phase=$1 transport current_index future_url future_phase probe status fetch_status
+  transport=$(rotation_input route-rotation-recovery)
+  current_index=$(jq -er --arg phase "$phase" \
+    '.phases | map(.phase) | index($phase)' "$transport")
+  while IFS=$'\t' read -r future_phase future_url; do
+    [[ -n $future_phase && -n $future_url ]] || continue
+    probe=$ROTATION_JOURNAL/.future-$future_phase.probe
+    rotation_require_budget 45
+    set +e
+    status=$(curl_secret_url GET "$future_url" "$probe" 200,404)
+    fetch_status=$?
+    set -e
+    rm -f "$probe"
+    [[ $fetch_status -eq 0 ]] || return 75
+    [[ $status == 404 ]] || fail "a future rollout receipt appeared before its Store phase"
+  done < <(jq -r --argjson index "$current_index" \
+    '.phases[($index + 1):][] | [.phase,.receipt_url] | @tsv' "$transport")
+}
+
+fetch_rotation_apply_receipt() {
+  local phase=$1 transport url expected_url_sha actual_url_sha saved_plan_sha
+  local receipt second probe status fetch_status attempt cats_bin verification report
+  transport=$(rotation_input route-rotation-recovery)
+  url=$(jq -er --arg phase "$phase" '.phases[] | select(.phase == $phase) | .receipt_url' "$transport")
+  expected_url_sha=$(jq -er --arg phase "$phase" \
+    '.phases[] | select(.phase == $phase) | .receipt_url_sha256' "$transport")
+  actual_url_sha="sha256:$(printf '%s' "$url" | sha256sum | awk '{print $1}')"
+  [[ $actual_url_sha == "$expected_url_sha" ]] || fail "rollout receipt URL digest differs from descriptor"
+  saved_plan_sha=$(jq -er --arg phase "$phase" \
+    '.phases[] | select(.phase == $phase) | .saved_plan_sha256' "$transport")
+  receipt=$ROTATION_JOURNAL/$phase.apply-receipt.signed.json
+  second=$ROTATION_JOURNAL/.$phase.apply-receipt.second
+  probe=$ROTATION_JOURNAL/.$phase.apply-receipt.probe
+  attempt=0
+  while [[ $attempt -lt 600 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 45
+    if ! future_rotation_receipts_absent "$phase"; then
+      sleep 1
+      continue
+    fi
+    set +e
+    status=$(curl_secret_url GET "$url" "$probe" 200,404)
+    fetch_status=$?
+    set -e
+    if [[ $fetch_status -ne 0 ]]; then
+      rm -f "$probe"
+      sleep 1
+      continue
+    fi
+    if [[ $status == 404 ]]; then
+      rm -f "$probe"
+      sleep 1
+      continue
+    fi
+    [[ $(wc -c <"$probe") -le 32768 ]] || fail "signed rollout receipt exceeds its wire bound"
+    jq -e . "$probe" >/dev/null || fail "signed rollout receipt is not JSON"
+    set +e
+    status=$(curl_secret_url GET "$url" "$second" 200)
+    fetch_status=$?
+    set -e
+    [[ $fetch_status -eq 0 && $status == 200 ]] || fail "signed rollout receipt could not be re-read immutably"
+    cmp -s "$probe" "$second" || fail "same rollout phase returned different receipt bytes"
+    rm -f "$second"
+    if [[ -e $receipt ]]; then
+      cmp -s "$receipt" "$probe" || fail "durable rollout receipt changed across exact replay"
+      rm -f "$probe"
+    else
+      mv "$probe" "$receipt"
+      durable_case_file "$receipt"
+    fi
+    verification=$ROTATION_JOURNAL/$phase.apply-verification.json
+    report=$ROTATION_JOURNAL/$phase.apply-verification-report.json
+    cats_bin=$(binary cats)
+    "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+      verify-control-rollout-apply-receipt \
+      --trust "$(rotation_input route-rotation-operator-trust)" \
+      --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+      --phase "$phase" \
+      --qualification-catalog-sha256 "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+      --saved-plan-sha256 "$saved_plan_sha" \
+      --receipt "$receipt" --output "$verification" >"$report"
+    jq -e -n --slurpfile verification "$verification" --slurpfile report "$report" \
+      '$verification == $report' >/dev/null || fail "rollout receipt verifier report differs from durable output"
+    jq -e --arg cats_sha256 "sha256:$(binary_sha256 cats)" \
+      '.receipt_signer_executable_sha256 == $cats_sha256' "$verification" >/dev/null || \
+      fail "rollout receipt signer is not the exact qualification Cats executable"
+    durable_case_file "$verification"
+    durable_case_file "$report"
+    rotation_transcript "$phase" apply_receipt_verified "url_digest_$expected_url_sha"
+    return
+  done
+  fail "deployment controller did not publish the bounded rollout receipt"
+}
+
+verify_rotation_current_after_rollout() {
+  local phase=$1 revision discovery verification report cats_bin
+  revision=$(rotation_phase_revision "$phase")
+  discovery=$ROTATION_JOURNAL/$phase.current-discovery.json
+  rotation_json_request GET \
+    /v1/internal/route-v2/signing-authority-current "$discovery" 200 || \
+    fail "Route rotation current discovery is unavailable after rollout receipt"
+  durable_case_file "$discovery"
+  verification=$ROTATION_JOURNAL/$phase.current-verification.json
+  report=$ROTATION_JOURNAL/$phase.current-verification-report.json
+  cats_bin=$(binary cats)
+  "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+    verify-prepared-rotation-current \
+    --trust "$(rotation_input route-rotation-operator-trust)" \
+    --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+    --signer-revision "$revision" --discovery "$discovery" \
+    --output "$verification" >"$report"
+  jq -e -n --slurpfile verification "$verification" --slurpfile report "$report" \
+    '$verification == $report' >/dev/null || fail "current-binding verifier report differs from durable output"
+  [[ $(jq -er '.postcondition_discovery_sha256' "$ROTATION_JOURNAL/$phase.apply-verification.json") == \
+    "$(sha256_wire "$discovery")" ]] || \
+    fail "rollout receipt postcondition differs from worker current discovery"
+  durable_case_file "$verification"
+  durable_case_file "$report"
+  rotation_transcript "$phase" current_process_verified "signer_revision_$revision"
+}
+
+write_rotation_phase_summary() {
+  local phase=$1 summary=$2 transport url_sha saved_plan_sha
+  transport=$(rotation_input route-rotation-recovery)
+  url_sha=$(jq -er --arg phase "$phase" \
+    '.phases[] | select(.phase == $phase) | .receipt_url_sha256' "$transport")
+  saved_plan_sha=$(jq -er --arg phase "$phase" \
+    '.phases[] | select(.phase == $phase) | .saved_plan_sha256' "$transport")
+  jq -S -c -n \
+    --arg phase "$phase" \
+    --argjson signer_revision "$(rotation_phase_revision "$phase")" \
+    --argjson ring_version "$(rotation_phase_ring_version "$phase")" \
+    --arg saved_plan_sha256 "$saved_plan_sha" \
+    --arg receipt_url_sha256 "$url_sha" \
+    --arg signed_command_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.signed-command.json")" \
+    --arg store_command_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.store-receipt.json")" \
+    --arg signed_apply_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.apply-receipt.signed.json")" \
+    --arg apply_verification_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.apply-verification.json")" \
+    --arg current_discovery_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.current-discovery.json")" \
+    --arg current_verification_sha256 "$(sha256_wire "$ROTATION_JOURNAL/$phase.current-verification.json")" \
+    --slurpfile signing "$ROTATION_JOURNAL/$phase.signing-receipt.json" \
+    --slurpfile store "$ROTATION_JOURNAL/$phase.store-receipt.json" \
+    --slurpfile apply "$ROTATION_JOURNAL/$phase.apply-verification.json" \
+    --slurpfile current "$ROTATION_JOURNAL/$phase.current-verification.json" \
+    '{phase:$phase,signer_revision:$signer_revision,ring_version:$ring_version,
+      command_id:$signing[0].command_id,
+      issued_at_unix_ms:$signing[0].issued_at_unix_ms,
+      expires_at_unix_ms:$signing[0].expires_at_unix_ms,
+      authority_command_sha256:$signing[0].exact_authority_command_sha256,
+      signed_command_sha256:$signed_command_sha256,
+      store_command_receipt_sha256:$store_command_receipt_sha256,
+      store_outcome:$store[0].result.outcome,
+      committed_at_unix_ms:$store[0].committed_at_unix_ms,
+      saved_plan_sha256:$saved_plan_sha256,receipt_url_sha256:$receipt_url_sha256,
+      signed_apply_receipt_sha256:$signed_apply_receipt_sha256,
+      apply_verification_sha256:$apply_verification_sha256,
+      terraform_show_json_sha256:$apply[0].terraform_show_json_sha256,
+      plan_validation_receipt_sha256:$apply[0].plan_validation_receipt_sha256,
+      terraform_executable_sha256:$apply[0].terraform_executable_sha256,
+      deployment_operator_executable_sha256:$apply[0].deployment_operator_executable_sha256,
+      saved_plan_validator_executable_sha256:$apply[0].saved_plan_validator_executable_sha256,
+      receipt_signer_executable_sha256:$apply[0].receipt_signer_executable_sha256,
+      apply_outcome:$apply[0].apply_outcome,
+      terraform_apply_stdout_sha256:$apply[0].terraform_apply_stdout_sha256,
+      terraform_apply_stderr_sha256:$apply[0].terraform_apply_stderr_sha256,
+      postcondition_discovery_sha256:$apply[0].postcondition_discovery_sha256,
+      current_discovery_sha256:$current_discovery_sha256,
+      current_verification_sha256:$current_verification_sha256,
+      signer_state:$current[0].signer_state,active_kid:$current[0].active_kid,
+      public_key_ring_digest:$current[0].public_key_ring_digest,
+      database_current:$current[0].database_current,process_ready:$current[0].process_ready,
+      terminal_marker:$apply[0].terminal_marker}' >"$summary"
+}
+
+verify_completed_rotation_phase() {
+  local phase=$1 signing pending expected_summary report cats_bin saved_plan_sha artifact
+  for artifact in signed-command signing-receipt store-receipt apply-receipt.signed \
+    apply-verification apply-verification-report current-discovery current-verification \
+    current-verification-report phase-receipt; do
+    [[ -f $ROTATION_JOURNAL/$phase.$artifact.json && ! -L $ROTATION_JOURNAL/$phase.$artifact.json ]] || \
+      fail "completed Route rotation phase $phase is missing $artifact"
+  done
+  signing=$ROTATION_JOURNAL/$phase.signing-receipt.json
+  pending=$(jq -er '.pending_command_path' "$signing")
+  [[ $pending == "$ROTATION_JOURNAL/"* && -f $pending && ! -L $pending ]] || \
+    fail "completed Route rotation phase points outside its durable pending journal"
+  cmp -s "$pending" "$ROTATION_JOURNAL/$phase.signed-command.json" || \
+    fail "completed Route rotation signed command differs from its durable pending bytes"
+  report=$ROTATION_JOURNAL/.$phase.signing-reverify.json
+  cats_bin=$(binary cats)
+  "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+    sign-prepared-rotation-phase \
+    --trust "$(rotation_input route-rotation-operator-trust)" \
+    --operator-private-key "$(rotation_input route-rotation-operator-key)" \
+    --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+    --phase "$phase" --output "$pending" >"$report"
+  cmp -s "$report" "$signing" || \
+    fail "completed Route rotation signing receipt no longer verifies"
+  rm -f "$report"
+  jq -e --argjson revision "$(rotation_phase_revision "$phase")" \
+    --argjson ring "$(rotation_phase_ring_version "$phase")" \
+    --arg command_sha "$(sha256_wire "$ROTATION_JOURNAL/$phase.signed-command.json")" '
+    .result.outcome == "applied" and .result.signer_revision == $revision
+    and .result.public_key_ring_version == $ring
+    and .exact_command_sha256 == $command_sha' \
+    "$ROTATION_JOURNAL/$phase.store-receipt.json" >/dev/null || \
+    fail "completed Route rotation Store receipt is not exact"
+  saved_plan_sha=$(jq -er --arg phase "$phase" \
+    '.phases[] | select(.phase == $phase) | .saved_plan_sha256' \
+    "$(rotation_input route-rotation-recovery)")
+  report=$ROTATION_JOURNAL/.$phase.apply-reverify.json
+  "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+    verify-control-rollout-apply-receipt \
+    --trust "$(rotation_input route-rotation-operator-trust)" \
+    --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+    --phase "$phase" \
+    --qualification-catalog-sha256 "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --saved-plan-sha256 "$saved_plan_sha" \
+    --receipt "$ROTATION_JOURNAL/$phase.apply-receipt.signed.json" \
+    --output "$ROTATION_JOURNAL/$phase.apply-verification.json" >"$report"
+  cmp -s "$report" "$ROTATION_JOURNAL/$phase.apply-verification-report.json" || \
+    fail "completed Route rotation apply receipt no longer verifies"
+  rm -f "$report"
+  report=$ROTATION_JOURNAL/.$phase.current-reverify.json
+  "$cats_bin" --json admin runtime-provisioner route-v2-r1 \
+    verify-prepared-rotation-current \
+    --trust "$(rotation_input route-rotation-operator-trust)" \
+    --command-bundle "$(rotation_input route-rotation-command-bundle)" \
+    --signer-revision "$(rotation_phase_revision "$phase")" \
+    --discovery "$ROTATION_JOURNAL/$phase.current-discovery.json" \
+    --output "$ROTATION_JOURNAL/$phase.current-verification.json" >"$report"
+  cmp -s "$report" "$ROTATION_JOURNAL/$phase.current-verification-report.json" || \
+    fail "completed Route rotation current receipt no longer verifies"
+  rm -f "$report"
+  expected_summary=$(mktemp "$ROTATION_JOURNAL/.$phase.phase-summary.XXXXXX")
+  write_rotation_phase_summary "$phase" "$expected_summary"
+  cmp -s "$expected_summary" "$ROTATION_JOURNAL/$phase.phase-receipt.json" || \
+    fail "completed Route rotation phase summary differs from its closed artifacts"
+  rm -f "$expected_summary"
+}
+
+validate_rotation_phase_prefix() {
+  local aggregate=$ROTATION_JOURNAL/rotation-phase-receipts.json count index phase
+  local phases=(publish_overlap switch_active publish_new_only retire disable publish_recovery activate)
+  jq -e --argjson expected '["publish_overlap","switch_active","publish_new_only","retire","disable","publish_recovery","activate"]' '
+    type == "array" and length <= 7
+    and (length as $count | [.[].phase] == $expected[0:$count])' \
+    "$aggregate" >/dev/null || fail "Route rotation completed phases are not one exact prefix"
+  count=$(jq -er 'length' "$aggregate")
+  for ((index=0; index<count; index++)); do
+    phase=${phases[$index]}
+    verify_completed_rotation_phase "$phase"
+    jq -e -n --argjson index "$index" \
+      --slurpfile aggregate "$aggregate" \
+      --slurpfile phase "$ROTATION_JOURNAL/$phase.phase-receipt.json" \
+      '$aggregate[0][$index] == $phase[0]' >/dev/null || \
+      fail "Route rotation phase aggregate diverges at $phase"
+  done
+}
+
+discover_rotation_resume_state() {
+  local discovery=$ROTATION_JOURNAL/resume-current-latest.json
+  local revision count completed_revision next_revision
+  rotation_json_request GET \
+    /v1/internal/route-v2/signing-authority-current "$discovery" 200 || \
+    fail "Route rotation exact-current discovery is unavailable during resume"
+  durable_case_file "$discovery"
+  jq -e \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg trust "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256)" '
+    keys == ["authority_id","database_current","loaded_active_kid",
+      "loaded_public_key_ring_digest","loaded_public_key_ring_version",
+      "loaded_signer_reference_sha256","loaded_signer_revision","loaded_signer_state",
+      "process_ready","release_commit_sha","rotation_operator_trust_sha256",
+      "route_deployment_id","version"]
+    and .version == 1 and .authority_id == $authority
+    and .route_deployment_id == $deployment and .release_commit_sha == $commit
+    and .rotation_operator_trust_sha256 == $trust
+    and (.loaded_signer_revision | type == "number" and . >= 1 and . <= 8 and floor == .)
+    and (.loaded_public_key_ring_version | type == "number" and . >= 1 and floor == .)
+    and (.loaded_signer_reference_sha256 | test("^sha256:[0-9a-f]{64}$"))
+    and (.loaded_public_key_ring_digest | test("^sha256:[0-9a-f]{64}$"))
+    and (.database_current | type == "boolean") and (.process_ready | type == "boolean")' \
+    "$discovery" >/dev/null || fail "Route rotation exact-current discovery is not closed"
+  revision=$(jq -er '.loaded_signer_revision' "$discovery")
+  count=$(jq -er 'length' "$ROTATION_JOURNAL/rotation-phase-receipts.json")
+  completed_revision=$((count + 1))
+  next_revision=$((completed_revision + 1))
+  (( revision == completed_revision || (count < 7 && revision == next_revision) )) || \
+    fail "Route rotation live process is ahead of or behind the durable phase prefix"
+  if (( revision == 1 )); then
+    jq -e '
+      .loaded_signer_state == "active" and (.loaded_active_kid | type == "string" and length > 0)
+      and .loaded_public_key_ring_version == 1
+      and .process_ready == .database_current' \
+      "$discovery" >/dev/null || fail "initial Route rotation process is not exact-current Active"
+  else
+    jq -e --argjson revision "$revision" \
+      --slurpfile bundle "$(rotation_input route-rotation-command-bundle)" '
+      ($bundle[0].commands[] | select(.signer_revision == $revision)) as $entry
+      | ($entry.exact_authority_command_json | fromjson | .successor) as $successor
+      | ($bundle[0].control_rollouts[] | select(.signer_revision == $revision)) as $rollout
+      | .loaded_signer_reference_sha256 == $rollout.signer_reference_sha256
+        and .loaded_signer_state == $successor.signer.state
+        and .loaded_active_kid == (if $successor.signer.state == "active"
+          then $successor.signer.active_kid else null end)
+        and .loaded_public_key_ring_version == $entry.ring_version
+        and .loaded_public_key_ring_digest == $rollout.public_key_ring_digest
+        and .process_ready == (.database_current and $successor.signer.state == "active")' \
+      "$discovery" >/dev/null || fail "Route rotation live process differs from the prepared lineage"
+  fi
+  rotation_transcript setup resume_current "signer_revision_$revision"
+}
+
+append_rotation_phase_receipt() {
+  local phase=$1 summary=$ROTATION_JOURNAL/$phase.phase-receipt.json
+  local expected_summary temporary count expected_phase
+  local phases=(publish_overlap switch_active publish_new_only retire disable publish_recovery activate)
+  validate_rotation_phase_prefix
+  count=$(jq -er 'length' "$ROTATION_JOURNAL/rotation-phase-receipts.json")
+  expected_phase=${phases[$count]:-}
+  [[ $phase == "$expected_phase" ]] || fail "Route rotation phase completion is not adjacent"
+  expected_summary=$(mktemp "$ROTATION_JOURNAL/.$phase.phase-summary.XXXXXX")
+  write_rotation_phase_summary "$phase" "$expected_summary"
+  if [[ -e $summary ]]; then
+    cmp -s "$expected_summary" "$summary" || \
+      fail "Route rotation phase summary changed across resume"
+    rm -f "$expected_summary"
+  else
+    chmod 0600 "$expected_summary"
+    mv "$expected_summary" "$summary"
+    durable_case_file "$summary"
+  fi
+  temporary=$(mktemp "$ROTATION_JOURNAL/.rotation-phase-receipts.XXXXXX")
+  jq -S -c --slurpfile current "$ROTATION_JOURNAL/rotation-phase-receipts.json" \
+    --slurpfile addition "$summary" -n '$current[0] + [$addition[0]]' >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$ROTATION_JOURNAL/rotation-phase-receipts.json"
+  durable_case_file "$ROTATION_JOURNAL/rotation-phase-receipts.json"
+}
+
+settle_rotation_phase() {
+  local phase=$1 count index
+  local phases=(publish_overlap switch_active publish_new_only retire disable publish_recovery activate)
+  validate_rotation_phase_prefix
+  count=$(jq -er 'length' "$ROTATION_JOURNAL/rotation-phase-receipts.json")
+  for index in "${!phases[@]}"; do
+    if [[ ${phases[$index]} == "$phase" ]]; then
+      if (( index < count )); then
+        rotation_transcript "$phase" resumed_completed "durable_prefix"
+        return
+      fi
+      (( index == count )) || fail "Route rotation attempted a non-adjacent phase"
+      break
+    fi
+  done
+  advance_rotation_phase "$phase"
+  fetch_rotation_apply_receipt "$phase"
+  verify_rotation_current_after_rollout "$phase"
+  append_rotation_phase_receipt "$phase"
 }
 
 run_route() {
@@ -493,6 +1410,785 @@ run_route() {
   product_mutation POST "/v1/workspaces/$workspace/cats/$cat/endpoints" \
     "e3-$CATS_E3_RUN_ID-endpoint-$BLOCK_PATH" running "$body"
   probe_public_route
+}
+
+prove_rotation_disable_observed() {
+  local origin source receipt attempt status consecutive
+  origin=$CATS_E3_PUBLIC_ORIGIN
+  [[ -n $origin ]] || origin=https://$(required CATS_E3_ENDPOINT_HOSTNAME)
+  source=$ROTATION_JOURNAL/.disabled-public-route.probe.json
+  receipt=$ROTATION_JOURNAL/disabled-public-route.json
+  if [[ -e $receipt ]]; then
+    jq -e --arg origin "$origin" --arg run_id "$CATS_E3_RUN_ID" '
+      .version == 1 and .kind == "route_v2_public_admission_closed_v1"
+      and .origin == $origin and .path == ("/e3/" + $run_id) and .run_id == $run_id
+      and .tls_reachable == true and .http_status == 503
+      and .body_sha256 == "sha256:3993919ba29fc397f3bbc6bf5d814e9caa9f184b557eb9c5fd7a59d45a2ac609"
+      and .terminal_marker == "public_ingress_reachable_route_v2_closed"' \
+      "$receipt" >/dev/null || fail "durable disabled public Route proof is malformed"
+    rotation_transcript disable resumed_public_route_closed "durable_exact_503"
+    return
+  fi
+  consecutive=0
+  attempt=0
+  while [[ $attempt -lt 30 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 30
+    set +e
+    run_probe public-route-closed --origin "$origin" --run-id "$CATS_E3_RUN_ID" >"$source"
+    status=$?
+    set -e
+    if [[ $status -eq 0 ]] && jq -e --arg origin "$origin" --arg run_id "$CATS_E3_RUN_ID" '
+      keys == ["body_sha256","content_encoding_absent","content_type","http_status",
+        "kind","origin","path","retry_after_seconds","run_id","terminal_marker",
+        "tls_reachable","version"]
+      and .version == 1 and .kind == "route_v2_public_admission_closed_v1"
+      and .origin == $origin and .path == ("/e3/" + $run_id) and .run_id == $run_id
+      and .tls_reachable == true and .http_status == 503
+      and .content_type == "text/plain" and .retry_after_seconds == 1
+      and .content_encoding_absent == true
+      and .body_sha256 == "sha256:3993919ba29fc397f3bbc6bf5d814e9caa9f184b557eb9c5fd7a59d45a2ac609"
+      and .terminal_marker == "public_ingress_reachable_route_v2_closed"' \
+      "$source" >/dev/null; then
+      if [[ -e $receipt ]]; then
+        cmp -s "$source" "$receipt" || fail "disabled public Route proof changed across probes"
+      else
+        adopt_rotation_file "$source" "$receipt"
+      fi
+      consecutive=$((consecutive + 1))
+      [[ $consecutive -ge 3 ]] && break
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+  [[ $consecutive -ge 3 ]] || fail "disabled signer did not close the calibrated public route"
+  rm -f "$source"
+  rotation_transcript disable public_route_closed "three_exact_503_probes"
+}
+
+rotation_disabled_fleet_is_exact() {
+  local destination=$1 expected_ring_digest expected_kids
+  expected_ring_digest=$(rotation_phase_rollout_field disable '.public_key_ring_digest')
+  expected_kids=$(jq -c --arg phase disable '
+    .commands[] | select(.phase == $phase)
+    | .exact_authority_command_json | fromjson | .successor_ring.keys | map(.kid)' \
+    "$(rotation_input route-rotation-command-bundle)")
+  [[ $expected_kids == '[]' ]] || fail "disable phase does not carry the exact empty public ring"
+  jq -e \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg ring_digest "$expected_ring_digest" --argjson kids "$expected_kids" \
+    --arg nodes "$(required CATS_E3_EXPECTED_NODES)" '
+    . as $root | ($nodes | split(",")) as $expected
+    | .route_signing_authority.deployment_id == $deployment
+    and .route_signing_authority.signer_revision == 6
+    and .route_signing_authority.active_kid == null
+    and .route_signing_authority.public_key_ring_version == 4
+    and .route_signing_authority.public_key_ring_digest == $ring_digest
+    and ([.nodes[].node_id] | sort) == ($expected | sort)
+    and all(.nodes[];
+      .session != null and .inventory != null and .inventory.complete_inventory == true
+      and .inventory.source_session.node_id == .session.node_id
+      and .inventory.source_session.node_boot_id == .session.node_boot_id
+      and .inventory.source_session.agent_instance_id == .session.agent_instance_id
+      and .inventory.source_session.agent_session_epoch == .session.agent_session_epoch
+      and .inventory.attestation.accepted_at_unix_ms <= $root.evaluated_at_unix_ms
+      and $root.evaluated_at_unix_ms < (.inventory.attestation.accepted_at_unix_ms + 60000)
+      and .inventory.key_ring_version == 4
+      and .inventory.key_ring_digest == $ring_digest
+      and .inventory.loaded_kids == $kids
+      and .inventory.route_active_count == 0
+      and .inventory.active_guard_count == 0
+      and .inventory.residue_count == 0
+      and .inventory.cancellation_pending_count == 0
+      and .inventory.quarantined_condition_count == 0)
+    and ([.nodes[].inventory.route_closed_count] | add) == 1' "$destination" >/dev/null
+}
+
+wait_rotation_disabled_fleet() {
+  local destination=$ROTATION_JOURNAL/rotation-disabled-fleet.json attempt status ready
+  if [[ -e $destination ]]; then
+    rotation_disabled_fleet_is_exact "$destination" || \
+      fail "durable disabled Fleet proof is malformed"
+    rotation_transcript disable resumed_disabled_fleet "durable_empty_ring"
+    return
+  fi
+  ready=false
+  attempt=0
+  while [[ $attempt -lt 240 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 30
+    set +e
+    raw_fleet_snapshot_to "$destination"
+    status=$?
+    set -e
+    if [[ $status -eq 0 ]] && rotation_disabled_fleet_is_exact "$destination"; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [[ $ready == true ]] || fail "all Nodes did not prove fresh empty-ring Closed state with zero guards"
+  durable_case_file "$destination"
+  rotation_transcript disable disabled_fleet_verified "empty_ring_closed_guard_zero"
+}
+
+read_current_endpoints() {
+  local destination=$1 workspace cat origin
+  workspace=$(required CATS_E3_WORKSPACE_ID)
+  cat=$(cat_id)
+  origin=$(control_origin)
+  curl_json GET "$origin/v1/workspaces/$workspace/cats/$cat/endpoints" \
+    "$destination" 200 || fail "current Endpoint observation is unavailable"
+  jq -e --arg cat "$cat" '
+    keys == ["cat_id","complete","desired_revision","items","version"]
+    and .version == 1 and .cat_id == $cat and .complete == true
+    and (.desired_revision | type == "number" and . >= 1 and floor == .)
+    and (.items | type == "array" and length <= 256)
+    and (.items == (.items | sort_by(.endpoint_id)))
+    and all(.items[];
+      keys == ["endpoint_id","hostname","name","protocol","route_epoch",
+        "target_port","version","wake_policy"]
+      and .version == 1
+      and (.endpoint_id | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$"))
+      and (.name | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$"))
+      and (.hostname | type == "string" and length >= 1 and length <= 253)
+      and .target_port == 8080 and .protocol == "http" and .wake_policy == "disabled"
+      and (.route_epoch | type == "number" and . >= 1 and floor == .))' \
+    "$destination" >/dev/null || fail "current Endpoint observation is not the closed V1 DTO"
+}
+
+replace_endpoint_with_fresh_lineage() {
+  local workspace cat before live after_unbind after_bind lineage old_id old_name old_hostname
+  local old_revision unbound_revision fresh_name fresh_id fresh_hostname fresh_revision run_digest body
+  local unbind_operation_id bind_operation_id source
+  workspace=$(required CATS_E3_WORKSPACE_ID)
+  cat=$(cat_id)
+  before=$ROTATION_JOURNAL/fresh-endpoint-before.json
+  live=$ROTATION_JOURNAL/.fresh-endpoint-current.json
+  after_unbind=$ROTATION_JOURNAL/fresh-endpoint-after-unbind.json
+  after_bind=$ROTATION_JOURNAL/fresh-endpoint-after-bind.json
+  lineage=$ROTATION_JOURNAL/fresh-endpoint-lineage.json
+  if [[ ! -e $before ]]; then
+    read_current_endpoints "$live"
+    jq -e --arg name "$(required CATS_E3_ENDPOINT_NAME)" \
+      --arg hostname "$(required CATS_E3_ENDPOINT_HOSTNAME)" '
+      (.items | length) == 1
+      and .items[0].name == $name and .items[0].hostname == $hostname
+      and .items[0].target_port == 8080' "$live" >/dev/null || \
+      fail "initial Endpoint observation does not contain the calibrated binding"
+    adopt_rotation_file "$live" "$before"
+  fi
+  jq -e --arg name "$(required CATS_E3_ENDPOINT_NAME)" \
+    --arg hostname "$(required CATS_E3_ENDPOINT_HOSTNAME)" '
+    (.items | length) == 1 and .items[0].name == $name
+    and .items[0].hostname == $hostname and .items[0].target_port == 8080' \
+    "$before" >/dev/null || fail "durable old Endpoint binding is not exact"
+  old_id=$(jq -er '.items[0].endpoint_id' "$before")
+  old_name=$(jq -er '.items[0].name' "$before")
+  old_hostname=$(jq -er '.items[0].hostname' "$before")
+  old_revision=$(jq -er '.desired_revision' "$before")
+  canonical_id old_endpoint_id "$old_id"
+  canonical_id old_endpoint_name "$old_name"
+
+  run_digest=$(printf '%s' "$CASE_ID:$CATS_E3_RUN_ID" | sha256sum | awk '{print $1}')
+  fresh_name=g3-${run_digest:0:24}
+  canonical_id fresh_endpoint_name "$fresh_name"
+  [[ $fresh_name != "$old_name" ]] || fail "fresh Endpoint name reuses the retained binding name"
+
+  read_current_endpoints "$live"
+  jq -e --arg old_id "$old_id" --arg old_name "$old_name" \
+    --arg hostname "$old_hostname" --arg fresh_name "$fresh_name" \
+    --argjson old_revision "$old_revision" '
+    ((.desired_revision == $old_revision and (.items | length) == 1
+      and .items[0].endpoint_id == $old_id and .items[0].name == $old_name)
+    or (.desired_revision == ($old_revision + 1) and (.items | length) == 0)
+    or (.desired_revision == ($old_revision + 2) and (.items | length) == 1
+      and .items[0].endpoint_id != $old_id and .items[0].name == $fresh_name
+      and .items[0].hostname == $hostname and .items[0].route_epoch == 1))' \
+    "$live" >/dev/null || fail "Endpoint recovery found a foreign or non-adjacent current Desired"
+
+  product_mutation DELETE "/v1/workspaces/$workspace/cats/$cat/endpoints/$old_id" \
+    "g3-${run_digest:0:20}-unbind" running "" "$ROTATION_JOURNAL" "fresh-endpoint-unbind-"
+  jq -e --argjson expected_revision "$((old_revision + 1))" '
+    keys == ["desired_revision","operation_id"]
+    and .desired_revision == $expected_revision
+    and (.operation_id | type == "string" and length > 0)' \
+    "$ROTATION_JOURNAL/fresh-endpoint-unbind-mutation-response.json" >/dev/null || \
+    fail "Endpoint unbind response is not the closed adjacent mutation DTO"
+  unbind_operation_id=$(jq -er '.operation_id' \
+    "$ROTATION_JOURNAL/fresh-endpoint-unbind-mutation-receipt.json")
+  jq -e --argjson expected_revision "$((old_revision + 1))" '
+    keys == ["converged","desired_revision","operation_id","version"]
+    and .version == 1 and .desired_revision == $expected_revision
+    and (.operation_id | type == "string" and length > 0)' \
+    "$ROTATION_JOURNAL/fresh-endpoint-unbind-mutation-receipt.json" >/dev/null || \
+    fail "Endpoint unbind mutation did not return the exact adjacent Desired revision"
+  if [[ ! -e $after_unbind ]]; then
+    read_current_endpoints "$live"
+    jq -e --argjson old_revision "$old_revision" \
+      '.desired_revision == ($old_revision + 1) and (.items | length) == 0' \
+      "$live" >/dev/null || fail "old Endpoint remains in the current Desired projection"
+    adopt_rotation_file "$live" "$after_unbind"
+  fi
+  jq -e --argjson old_revision "$old_revision" \
+    '.desired_revision == ($old_revision + 1) and (.items | length) == 0' \
+    "$after_unbind" >/dev/null || fail "old Endpoint remains in the current Desired projection"
+  unbound_revision=$(jq -er '.desired_revision' "$after_unbind")
+
+  body=$ROTATION_JOURNAL/fresh-endpoint-bind.json
+  source=$ROTATION_JOURNAL/.fresh-endpoint-bind.source.json
+  jq -S -c -n --arg name "$fresh_name" --arg hostname "$old_hostname" \
+    '{name:$name,hostname:$hostname,target_port:8080}' >"$source"
+  if [[ -e $body ]]; then
+    cmp -s "$source" "$body" || fail "fresh Endpoint request changed across resume"
+    rm -f "$source"
+  else
+    adopt_rotation_file "$source" "$body"
+    rm -f "$source"
+  fi
+  product_mutation POST "/v1/workspaces/$workspace/cats/$cat/endpoints" \
+    "g3-${run_digest:0:20}-bind" running "$body" "$ROTATION_JOURNAL" "fresh-endpoint-bind-"
+  jq -e --argjson expected_revision "$((unbound_revision + 1))" '
+    keys == ["desired_revision","operation_id"]
+    and .desired_revision == $expected_revision
+    and (.operation_id | type == "string" and length > 0)' \
+    "$ROTATION_JOURNAL/fresh-endpoint-bind-mutation-response.json" >/dev/null || \
+    fail "Endpoint bind response is not the closed adjacent mutation DTO"
+  bind_operation_id=$(jq -er '.operation_id' \
+    "$ROTATION_JOURNAL/fresh-endpoint-bind-mutation-receipt.json")
+  jq -e --argjson expected_revision "$((unbound_revision + 1))" '
+    keys == ["converged","desired_revision","operation_id","version"]
+    and .version == 1 and .desired_revision == $expected_revision
+    and (.operation_id | type == "string" and length > 0)' \
+    "$ROTATION_JOURNAL/fresh-endpoint-bind-mutation-receipt.json" >/dev/null || \
+    fail "Endpoint bind mutation did not return the exact adjacent Desired revision"
+  read_current_endpoints "$live"
+  jq -e --arg old_id "$old_id" --arg old_name "$old_name" \
+    --arg name "$fresh_name" --arg hostname "$old_hostname" \
+    --argjson unbound_revision "$unbound_revision" '
+    .desired_revision == ($unbound_revision + 1) and (.items | length) == 1
+    and all(.items[]; .endpoint_id != $old_id and .name != $old_name)
+    and .items[0].name == $name and .items[0].hostname == $hostname
+    and .items[0].target_port == 8080 and .items[0].route_epoch == 1' \
+    "$live" >/dev/null || fail "fresh Endpoint binding did not establish a new epoch-one lineage"
+  if [[ -e $after_bind ]]; then
+    cmp -s "$live" "$after_bind" || fail "fresh Endpoint current projection changed across resume"
+  else
+    adopt_rotation_file "$live" "$after_bind"
+  fi
+  fresh_id=$(jq -er '.items[0].endpoint_id' "$after_bind")
+  fresh_hostname=$(jq -er '.items[0].hostname' "$after_bind")
+  fresh_revision=$(jq -er '.desired_revision' "$after_bind")
+  canonical_id fresh_endpoint_id "$fresh_id"
+  [[ $fresh_id != "$old_id" && $fresh_hostname == "$(required CATS_E3_ENDPOINT_HOSTNAME)" ]] || \
+    fail "fresh Endpoint identity or hostname is not exact"
+  jq -e --arg workspace "$workspace" --arg cat "$cat" \
+    --arg operation "$unbind_operation_id" \
+    --argjson unbound_revision "$(jq -er '.desired_revision' "$after_unbind")" '
+    keys == ["cat_id","created_at_unix_ms","desired_revision","desired_spec_digest",
+      "operation_id","phase","placement","target","terminal","updated_at_unix_ms",
+      "version","workspace_id"]
+    and .version == 1 and .operation_id == $operation
+    and .workspace_id == $workspace and .cat_id == $cat
+    and .desired_revision == $unbound_revision and .phase == "succeeded"
+    and .target == "running"
+    and (.terminal | keys) == ["completed_at_unix_ms","kind","result"]
+    and (.terminal.result | keys) == ["agent_session_epoch","heartbeat_sequence",
+      "node_id","observation_id","observed_target","runtime_incarnation"]
+    and .terminal.kind == "succeeded" and .terminal.result.observed_target == "running"
+    and (.terminal.result.observation_id | type == "string")' \
+    "$ROTATION_JOURNAL/fresh-endpoint-unbind-operation-$unbind_operation_id.json" >/dev/null || \
+    fail "Endpoint unbind Operation does not settle the observed empty Desired revision"
+  jq -e --arg workspace "$workspace" --arg cat "$cat" \
+    --arg operation "$bind_operation_id" \
+    --argjson fresh_revision "$fresh_revision" '
+    keys == ["cat_id","created_at_unix_ms","desired_revision","desired_spec_digest",
+      "operation_id","phase","placement","target","terminal","updated_at_unix_ms",
+      "version","workspace_id"]
+    and .version == 1 and .operation_id == $operation
+    and .workspace_id == $workspace and .cat_id == $cat
+    and .desired_revision == $fresh_revision and .phase == "succeeded"
+    and .target == "running"
+    and (.terminal | keys) == ["completed_at_unix_ms","kind","result"]
+    and (.terminal.result | keys) == ["agent_session_epoch","heartbeat_sequence",
+      "node_id","observation_id","observed_target","runtime_incarnation"]
+    and .terminal.kind == "succeeded" and .terminal.result.observed_target == "running"
+    and (.terminal.result.observation_id | type == "string")
+    and (.terminal.result.node_id | type == "string")
+    and (.terminal.result.agent_session_epoch | type == "number" and . >= 1)
+    and (.terminal.result.heartbeat_sequence | type == "number" and . >= 1)' \
+    "$ROTATION_JOURNAL/fresh-endpoint-bind-operation-$bind_operation_id.json" >/dev/null || \
+    fail "Endpoint bind Operation does not settle the fresh Desired revision"
+
+  source=$ROTATION_JOURNAL/.fresh-endpoint-lineage.source.json
+  jq -S -c -n \
+    --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg old_collection_sha256 "$(sha256_wire "$before")" \
+    --arg unbound_collection_sha256 "$(sha256_wire "$after_unbind")" \
+    --arg fresh_collection_sha256 "$(sha256_wire "$after_bind")" \
+    --arg unbind_mutation_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-unbind-mutation-receipt.json")" \
+    --arg unbind_replay_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-unbind-idempotent-replay-receipt.json")" \
+    --arg unbind_operation_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-unbind-operation-receipt.json")" \
+    --arg unbind_operation_full_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-unbind-operation-$unbind_operation_id.json")" \
+    --arg bind_mutation_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-bind-mutation-receipt.json")" \
+    --arg bind_replay_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-bind-idempotent-replay-receipt.json")" \
+    --arg bind_operation_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-bind-operation-receipt.json")" \
+    --arg bind_operation_full_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-bind-operation-$bind_operation_id.json")" \
+    --argjson old_revision "$old_revision" --argjson fresh_revision "$fresh_revision" \
+    --slurpfile before "$before" --slurpfile after "$after_bind" \
+    --slurpfile unbind_operation "$ROTATION_JOURNAL/fresh-endpoint-unbind-operation-$unbind_operation_id.json" \
+    --slurpfile bind_operation "$ROTATION_JOURNAL/fresh-endpoint-bind-operation-$bind_operation_id.json" '
+    {version:1,kind:"route_v2_fresh_endpoint_lineage_v1",case_id:$case_id,
+     qualification_run_id:$run_id,source_commit_sha:$commit,
+     old_desired_revision:$old_revision,old_endpoint:$before[0].items[0],
+     old_collection_sha256:$old_collection_sha256,
+     unbind:{mutation_receipt_sha256:$unbind_mutation_sha256,
+       replay_receipt_sha256:$unbind_replay_sha256,
+       operation_receipt_sha256:$unbind_operation_sha256,
+       full_operation_receipt_sha256:$unbind_operation_full_sha256,
+       operation_id:$unbind_operation[0].operation_id,
+       settled_observation_id:$unbind_operation[0].terminal.result.observation_id,
+       empty_current_collection_sha256:$unbound_collection_sha256},
+     fresh_desired_revision:$fresh_revision,fresh_endpoint:$after[0].items[0],
+     bind:{mutation_receipt_sha256:$bind_mutation_sha256,
+       replay_receipt_sha256:$bind_replay_sha256,
+       operation_receipt_sha256:$bind_operation_sha256,
+       full_operation_receipt_sha256:$bind_operation_full_sha256,
+       operation_id:$bind_operation[0].operation_id,
+       settled_observation_id:$bind_operation[0].terminal.result.observation_id,
+       settled_node_id:$bind_operation[0].terminal.result.node_id,
+       settled_agent_epoch:$bind_operation[0].terminal.result.agent_session_epoch,
+       settled_heartbeat_sequence:$bind_operation[0].terminal.result.heartbeat_sequence,
+       current_collection_sha256:$fresh_collection_sha256},
+     terminal_marker:"old_endpoint_unbound_fresh_epoch_one_bound"}' \
+    >"$source"
+  if [[ -e $lineage ]]; then
+    cmp -s "$source" "$lineage" || fail "fresh Endpoint lineage changed across resume"
+    rm -f "$source"
+  else
+    adopt_rotation_file "$source" "$lineage"
+    rm -f "$source"
+  fi
+  rotation_transcript activate fresh_endpoint_lineage "unbind_old_bind_fresh_epoch_one"
+}
+
+probe_fresh_endpoint_after_rotation() {
+  local current=$ROTATION_JOURNAL/fresh-endpoint-before-probe.json
+  read_current_endpoints "$current"
+  durable_case_file "$current"
+  jq -e -n --slurpfile lineage "$ROTATION_JOURNAL/fresh-endpoint-lineage.json" \
+    --slurpfile current "$current" '
+    ($current[0].items | length) == 1
+    and $current[0].items[0] == $lineage[0].fresh_endpoint
+    and $current[0].desired_revision == $lineage[0].fresh_desired_revision' >/dev/null || \
+    fail "fresh Endpoint lineage changed before the live HTTP/WebSocket probe"
+  probe_public_route "$ROTATION_JOURNAL/fresh-endpoint-public-route.json"
+  rotation_transcript activate fresh_endpoint_live "node_ack_then_http_ws"
+}
+
+terminal_rotation_fleet() {
+  local destination=$ROTATION_JOURNAL/rotation-terminal-fleet.json attempt status ready
+  local expected_ring_digest expected_kids bind_node bind_epoch bind_heartbeat
+  expected_ring_digest=$(rotation_phase_rollout_field publish_recovery '.public_key_ring_digest')
+  expected_kids=$(jq -c --arg phase publish_recovery '
+    .commands[] | select(.phase == $phase)
+    | .exact_authority_command_json | fromjson | .successor_ring.keys | map(.kid)' \
+    "$(rotation_input route-rotation-command-bundle)")
+  bind_node=$(jq -er '.bind.settled_node_id' "$ROTATION_JOURNAL/fresh-endpoint-lineage.json")
+  bind_epoch=$(jq -er '.bind.settled_agent_epoch' "$ROTATION_JOURNAL/fresh-endpoint-lineage.json")
+  bind_heartbeat=$(jq -er '.bind.settled_heartbeat_sequence' "$ROTATION_JOURNAL/fresh-endpoint-lineage.json")
+  canonical_id fresh_endpoint_settlement_node "$bind_node"
+  ready=false
+  attempt=0
+  while [[ $attempt -lt 240 ]]; do
+    attempt=$((attempt + 1))
+    rotation_require_budget 30
+    set +e
+    raw_fleet_snapshot_to "$destination"
+    status=$?
+    set -e
+    if [[ $status -eq 0 ]] && jq -e \
+      --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+      --arg ring_digest "$expected_ring_digest" --argjson kids "$expected_kids" \
+      --arg bind_node "$bind_node" --argjson bind_epoch "$bind_epoch" \
+      --argjson bind_heartbeat "$bind_heartbeat" \
+      --arg nodes "$(required CATS_E3_EXPECTED_NODES)" '
+      . as $root | ($nodes | split(",")) as $expected
+      | .route_signing_authority.deployment_id == $deployment
+      and .route_signing_authority.signer_revision == 8
+      and .route_signing_authority.active_kid == $kids[0]
+      and .route_signing_authority.public_key_ring_version == 5
+      and .route_signing_authority.public_key_ring_digest == $ring_digest
+      and ([.nodes[].node_id] | sort) == ($expected | sort)
+      and ([.nodes[] | select(.node_id == $bind_node)] | length) == 1
+      and ([.nodes[] | select(.node_id == $bind_node)][0] as $bound
+        | $bound.session.agent_session_epoch == $bind_epoch
+        and $bound.inventory.source_heartbeat_sequence >= $bind_heartbeat)
+      and all(.nodes[];
+        .session != null and .inventory != null and .inventory.complete_inventory == true
+        and .inventory.source_session.node_id == .session.node_id
+        and .inventory.source_session.node_boot_id == .session.node_boot_id
+        and .inventory.source_session.agent_instance_id == .session.agent_instance_id
+        and .inventory.source_session.agent_session_epoch == .session.agent_session_epoch
+        and .inventory.attestation.accepted_at_unix_ms <= $root.evaluated_at_unix_ms
+        and $root.evaluated_at_unix_ms < (.inventory.attestation.accepted_at_unix_ms + 60000)
+        and .inventory.key_ring_version == 5
+        and .inventory.key_ring_digest == $ring_digest
+        and .inventory.loaded_kids == $kids
+        and .inventory.active_guard_count == 0
+        and .inventory.residue_count == 0
+        and .inventory.cancellation_pending_count == 0
+        and .inventory.quarantined_condition_count == 0)
+      and ([.nodes[].inventory.route_active_count] | add) == 1
+      and ([.nodes[].inventory.route_closed_count] | add) == 0' \
+      "$destination" >/dev/null; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [[ $ready == true ]] || fail "terminal Fleet did not acknowledge the recovery ring and fresh route"
+  durable_case_file "$destination"
+  rotation_transcript activate terminal_fleet_verified "ring_5_active"
+}
+
+build_rotation_node_acks() {
+  local output=$CASE_DIR/route-v2-rotation-disable-live-delivery.node-acks.json
+  local source=$ROTATION_JOURNAL/route-v2-rotation-node-acks.source.json
+  local bundle fleet expected_nodes
+  bundle=$(rotation_input route-rotation-command-bundle)
+  fleet=$ROTATION_JOURNAL/rotation-terminal-fleet.json
+  expected_nodes=$(printf '%s' "$(required CATS_E3_EXPECTED_NODES)" | jq -R 'split(",")')
+  jq -S -c -n \
+    --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --argjson expected_nodes "$expected_nodes" \
+    --arg disabled_fleet_sha256 "$(sha256_wire "$ROTATION_JOURNAL/rotation-disabled-fleet.json")" \
+    --arg final_fleet_sha256 "$(sha256_wire "$fleet")" \
+    --arg switch_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/switch_active.store-receipt.json")" \
+    --arg retire_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/retire.store-receipt.json")" \
+    --arg recovery_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/publish_recovery.store-receipt.json")" \
+    --arg activate_receipt_sha256 "$(sha256_wire "$ROTATION_JOURNAL/activate.store-receipt.json")" \
+    --slurpfile bundle "$bundle" --slurpfile fleet "$fleet" \
+    --slurpfile disabled_fleet "$ROTATION_JOURNAL/rotation-disabled-fleet.json" \
+    --slurpfile switch_receipt "$ROTATION_JOURNAL/switch_active.store-receipt.json" \
+    --slurpfile retire_receipt "$ROTATION_JOURNAL/retire.store-receipt.json" \
+    --slurpfile recovery_receipt "$ROTATION_JOURNAL/publish_recovery.store-receipt.json" \
+    --slurpfile activate_receipt "$ROTATION_JOURNAL/activate.store-receipt.json" '
+    def command($phase):
+      $bundle[0].commands[] | select(.phase == $phase)
+      | . + {decoded:(.exact_authority_command_json | fromjson)};
+    def rollout($phase):
+      command($phase).signer_revision as $revision
+      | $bundle[0].control_rollouts[] | select(.signer_revision == $revision);
+    def checkpoint($observed; $settled; $condition; $receipt_sha256; $receipt):
+      command($observed) as $command
+      | rollout($observed) as $rollout
+      | {observed_phase:$observed,signer_revision:$command.signer_revision,
+         ring_version:$command.ring_version,
+         ring_digest:$rollout.public_key_ring_digest,
+         loaded_kids:($command.decoded.successor_ring.keys | map(.kid)),
+         settled_by_phase:$settled,required_store_precondition:$condition,
+         settled_by_store_receipt_sha256:$receipt_sha256,
+         settled_at_unix_ms:$receipt[0].committed_at_unix_ms,
+         store_precondition_satisfied:true};
+    def projected_nodes($snapshot):
+      [$snapshot.nodes[] |
+        {node_id,binding:{node_id:.session.node_id,node_boot_id:.session.node_boot_id,
+           agent_instance_id:.session.agent_instance_id,
+           agent_epoch:.session.agent_session_epoch},
+         inventory:{source_observation_id:.inventory.source_observation_id,
+           source_heartbeat_sequence:.inventory.source_heartbeat_sequence,
+           source_binding:{node_id:.inventory.source_session.node_id,
+             node_boot_id:.inventory.source_session.node_boot_id,
+             agent_instance_id:.inventory.source_session.agent_instance_id,
+             agent_epoch:.inventory.source_session.agent_session_epoch},
+           attestation_accepted_at_unix_ms:.inventory.attestation.accepted_at_unix_ms,
+           complete_inventory:.inventory.complete_inventory,
+           key_ring_version:.inventory.key_ring_version,
+           key_ring_digest:.inventory.key_ring_digest,loaded_kids:.inventory.loaded_kids,
+           route_active_count:.inventory.route_active_count,
+           route_closed_count:.inventory.route_closed_count,
+           active_guard_count:.inventory.active_guard_count,
+           residue_count:.inventory.residue_count,
+           cancellation_pending_count:.inventory.cancellation_pending_count,
+           quarantined_condition_count:.inventory.quarantined_condition_count}}]
+      | sort_by(.node_id);
+    ($expected_nodes | sort) as $expected
+    | projected_nodes($disabled_fleet[0]) as $disabled_nodes
+    | projected_nodes($fleet[0]) as $terminal_nodes
+    | (rollout("disable")) as $disabled_rollout
+    | (rollout("publish_recovery")) as $terminal_rollout
+    | (command("publish_recovery").decoded.successor_ring.keys | map(.kid)) as $terminal_kids
+    | {version:1,kind:"route_v2_node_ring_ack_set_v1",case_id:$case_id,
+     qualification_run_id:$run_id,source_commit_sha:$commit,
+     route_deployment_id:$deployment,expected_nodes:$expected,
+     disabled_fleet_sha256:$disabled_fleet_sha256,
+     disabled_evaluated_at_unix_ms:$disabled_fleet[0].evaluated_at_unix_ms,
+     disabled_nodes:$disabled_nodes,
+     disabled_all_nodes_closed_or_fenced:
+       (($disabled_nodes | map(.node_id)) == $expected
+        and all($disabled_nodes[];
+          .binding == .inventory.source_binding
+          and .inventory.complete_inventory == true
+          and .inventory.attestation_accepted_at_unix_ms <= $disabled_fleet[0].evaluated_at_unix_ms
+          and $disabled_fleet[0].evaluated_at_unix_ms
+            < (.inventory.attestation_accepted_at_unix_ms + 60000)
+          and .inventory.key_ring_version == 4
+          and .inventory.key_ring_digest == $disabled_rollout.public_key_ring_digest
+          and .inventory.loaded_kids == [] and .inventory.route_active_count == 0
+          and .inventory.active_guard_count == 0 and .inventory.residue_count == 0
+          and .inventory.cancellation_pending_count == 0
+          and .inventory.quarantined_condition_count == 0)
+        and ([$disabled_nodes[].inventory.route_closed_count] | add) == 1),
+     checkpoints:[
+       checkpoint("publish_overlap";"switch_active";"all_schedulable_nodes_ack_ring";
+         $switch_receipt_sha256;$switch_receipt),
+       checkpoint("publish_new_only";"retire";"all_schedulable_nodes_ack_ring";
+         $retire_receipt_sha256;$retire_receipt),
+       checkpoint("disable";"publish_recovery";"all_provisioned_nodes_closed_or_fenced";
+         $recovery_receipt_sha256;$recovery_receipt),
+       checkpoint("publish_recovery";"activate";
+         "all_provisioned_nodes_closed_or_fenced_and_ack_ring";
+         $activate_receipt_sha256;$activate_receipt)
+     ],
+     terminal_fleet_sha256:$final_fleet_sha256,
+     terminal_evaluated_at_unix_ms:$fleet[0].evaluated_at_unix_ms,
+     terminal_signing_authority:$fleet[0].route_signing_authority,
+     terminal_nodes:$terminal_nodes,
+     all_nodes_acknowledged:
+       (($terminal_nodes | map(.node_id)) == $expected
+        and all($terminal_nodes[];
+          .binding == .inventory.source_binding
+          and .inventory.complete_inventory == true
+          and .inventory.attestation_accepted_at_unix_ms <= $fleet[0].evaluated_at_unix_ms
+          and $fleet[0].evaluated_at_unix_ms
+            < (.inventory.attestation_accepted_at_unix_ms + 60000)
+          and .inventory.key_ring_version == 5
+          and .inventory.key_ring_digest == $terminal_rollout.public_key_ring_digest
+          and .inventory.loaded_kids == $terminal_kids
+          and .inventory.residue_count == 0
+          and .inventory.cancellation_pending_count == 0
+          and .inventory.quarantined_condition_count == 0)
+        and ([$terminal_nodes[].inventory.route_active_count] | add) == 1
+        and ([$terminal_nodes[].inventory.route_closed_count] | add) == 0),
+     all_active_guards_zero:all($terminal_nodes[]; .inventory.active_guard_count == 0),
+     terminal_marker:"recovery_ring_acked_and_active_routes_reopened"}' >"$source"
+  jq -e '
+    .disabled_all_nodes_closed_or_fenced == true
+    and .all_nodes_acknowledged == true and .all_active_guards_zero == true' \
+    "$source" >/dev/null || fail "Route rotation Node ACK projection is not independently closed"
+  atomic_json_path "$output" "$source"
+  rm -f "$source"
+}
+
+build_rotation_terminal_receipt() {
+  local output=$CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json
+  local source=$ROTATION_JOURNAL/route-v2-rotation-terminal-receipt.source.json
+  local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log
+  jq -S -c -n \
+    --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg catalog "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg trust_sha "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256)" \
+    --arg command_bundle_sha256 "$(sha256_wire "$(rotation_input route-rotation-command-bundle)")" \
+    --arg recovery_transport_sha256 "$(sha256_wire "$(rotation_input route-rotation-recovery)")" \
+    --arg node_acks_sha256 "$(sha256_wire "$CASE_DIR/route-v2-rotation-disable-live-delivery.node-acks.json")" \
+    --arg transcript_sha256 "$(sha256_wire "$transcript")" \
+    --arg disabled_fleet_sha256 "$(sha256_wire "$ROTATION_JOURNAL/rotation-disabled-fleet.json")" \
+    --arg disabled_route_sha256 "$(sha256_wire "$ROTATION_JOURNAL/disabled-public-route.json")" \
+    --arg baseline_route_sha256 "$(sha256_wire "$ROTATION_JOURNAL/rotation-baseline-public-route.json")" \
+    --arg endpoint_lineage_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-lineage.json")" \
+    --arg endpoint_probe_collection_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-before-probe.json")" \
+    --arg public_route_sha256 "$(sha256_wire "$ROTATION_JOURNAL/fresh-endpoint-public-route.json")" \
+    --arg terminal_fleet_sha256 "$(sha256_wire "$ROTATION_JOURNAL/rotation-terminal-fleet.json")" \
+    --slurpfile phases "$ROTATION_JOURNAL/rotation-phase-receipts.json" \
+    --slurpfile node_acks "$CASE_DIR/route-v2-rotation-disable-live-delivery.node-acks.json" \
+    --slurpfile disabled_fleet "$ROTATION_JOURNAL/rotation-disabled-fleet.json" \
+    --slurpfile disabled_route "$ROTATION_JOURNAL/disabled-public-route.json" \
+    --slurpfile terminal_fleet "$ROTATION_JOURNAL/rotation-terminal-fleet.json" \
+    --slurpfile endpoint_lineage "$ROTATION_JOURNAL/fresh-endpoint-lineage.json" \
+    --slurpfile final_route "$ROTATION_JOURNAL/fresh-endpoint-public-route.json" '
+    {version:1,kind:"route_v2_rotation_terminal_receipt_v1",case_id:$case_id,
+     qualification_run_id:$run_id,source_commit_sha:$commit,
+     qualification_catalog_sha256:$catalog,authority_id:$authority,
+     route_deployment_id:$deployment,rotation_operator_trust_sha256:$trust_sha,
+     command_bundle_sha256:$command_bundle_sha256,
+     recovery_transport_sha256:$recovery_transport_sha256,
+     phase_receipts:$phases[0],
+     disabled_checkpoint:{signer_revision:6,ring_version:4,signer_state:"disabled",
+       loaded_kids:[],public_route_closed:
+         ($disabled_route[0].terminal_marker == "public_ingress_reachable_route_v2_closed"),
+       disabled_public_route_sha256:$disabled_route_sha256,
+       all_nodes_closed_or_fenced:$node_acks[0].disabled_all_nodes_closed_or_fenced,
+       active_guard_count:([$disabled_fleet[0].nodes[].inventory.active_guard_count] | add),
+       disabled_fleet_sha256:$disabled_fleet_sha256,
+       disable_store_receipt_sha256:$phases[0][4].store_command_receipt_sha256,
+       closed_fleet_settlement_store_receipt_sha256:$phases[0][5].store_command_receipt_sha256},
+     recovery_checkpoint:{signer_revision:8,ring_version:5,signer_state:"active",
+       active_kid:$terminal_fleet[0].route_signing_authority.active_kid,
+       database_current:$phases[0][6].database_current,
+       process_ready:$phases[0][6].process_ready,
+       all_nodes_acknowledged:$node_acks[0].all_nodes_acknowledged,
+       all_active_guards_zero:$node_acks[0].all_active_guards_zero,
+       terminal_fleet_sha256:$terminal_fleet_sha256},
+     fresh_endpoint:{mechanism:"unbind_old_bind_fresh_endpoint",
+       calibrated_baseline_public_route_sha256:$baseline_route_sha256,
+       lineage_receipt_sha256:$endpoint_lineage_sha256,
+       old_endpoint:$endpoint_lineage[0].old_endpoint,
+       unbind:$endpoint_lineage[0].unbind,
+       fresh_endpoint:$endpoint_lineage[0].fresh_endpoint,
+       bind:$endpoint_lineage[0].bind,
+       pre_probe_collection_sha256:$endpoint_probe_collection_sha256,
+       public_route_receipt_sha256:$public_route_sha256,
+       http_guest_body:$final_route[0].http_guest_body,
+       websocket_guest_echo:$final_route[0].websocket_guest_echo},
+     node_acks_sha256:$node_acks_sha256,transcript_sha256:$transcript_sha256,
+     terminal_marker:"route_v2_rotation_disable_recovered_active_http_ws"}' >"$source"
+  jq -e '
+    (.phase_receipts | length) == 7
+    and .disabled_checkpoint.public_route_closed == true
+    and .disabled_checkpoint.all_nodes_closed_or_fenced == true
+    and .recovery_checkpoint.database_current == true
+    and .recovery_checkpoint.process_ready == true
+    and .recovery_checkpoint.all_nodes_acknowledged == true
+    and .recovery_checkpoint.all_active_guards_zero == true
+    and .fresh_endpoint.http_guest_body == true
+    and .fresh_endpoint.websocket_guest_echo == true
+    and .terminal_marker == "route_v2_rotation_disable_recovered_active_http_ws"' \
+    "$source" >/dev/null || fail "Route rotation terminal receipt is not a closed success"
+  atomic_json_path "$output" "$source"
+  rm -f "$source"
+}
+
+validate_rotation_terminal_evidence() {
+  local receipt=$CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json
+  local node_acks=$CASE_DIR/route-v2-rotation-disable-live-delivery.node-acks.json
+  local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log
+  local evidence filename
+  local top_evidence=()
+  for evidence in "$receipt" "$node_acks" "$transcript"; do
+    [[ -f $evidence && ! -L $evidence && -O $evidence ]] || \
+      fail "Route rotation terminal evidence is missing or unsafe"
+  done
+  [[ $(grep -c '^terminal_marker=route_v2_rotation_disable_recovered_active_http_ws$' "$transcript" || true) -eq 1 ]] || \
+    fail "Route rotation transcript has no single terminal marker"
+  jq -e \
+    --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg catalog "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --arg node_acks_sha "$(sha256_wire "$node_acks")" \
+    --arg transcript_sha "$(sha256_wire "$transcript")" '
+    .version == 1 and .kind == "route_v2_rotation_terminal_receipt_v1"
+    and .case_id == $case_id and .qualification_run_id == $run_id
+    and .source_commit_sha == $commit and .qualification_catalog_sha256 == $catalog
+    and (.phase_receipts | length) == 7
+    and .disabled_checkpoint.public_route_closed == true
+    and .disabled_checkpoint.all_nodes_closed_or_fenced == true
+    and .recovery_checkpoint.database_current == true
+    and .recovery_checkpoint.process_ready == true
+    and .recovery_checkpoint.all_nodes_acknowledged == true
+    and .recovery_checkpoint.all_active_guards_zero == true
+    and .fresh_endpoint.http_guest_body == true
+    and .fresh_endpoint.websocket_guest_echo == true
+    and .node_acks_sha256 == $node_acks_sha and .transcript_sha256 == $transcript_sha
+    and .terminal_marker == "route_v2_rotation_disable_recovered_active_http_ws"' \
+    "$receipt" >/dev/null || fail "Route rotation terminal receipt changed across resume"
+  jq -e --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg commit "$CATS_E3_EXACT_COMMIT" '
+    .version == 1 and .kind == "route_v2_node_ring_ack_set_v1"
+    and .case_id == $case_id and .qualification_run_id == $run_id
+    and .source_commit_sha == $commit
+    and .disabled_all_nodes_closed_or_fenced == true
+    and .all_nodes_acknowledged == true and .all_active_guards_zero == true
+    and .terminal_marker == "recovery_ring_acked_and_active_routes_reopened"' \
+    "$node_acks" >/dev/null || fail "Route rotation Node ACK evidence changed across resume"
+  shopt -s nullglob
+  top_evidence=("$CASE_DIR"/*receipt*.json "$CASE_DIR"/*.node-acks.json "$CASE_DIR"/*.transcript.log)
+  shopt -u nullglob
+  for evidence in "${top_evidence[@]}"; do
+    filename=${evidence##*/}
+    case "$filename" in
+      route-v2-rotation-disable-live-delivery.receipt.json | \
+      route-v2-rotation-disable-live-delivery.node-acks.json | \
+      route-v2-rotation-disable-live-delivery.transcript.log | \
+      cleanup-receipt.json) ;;
+      *) fail "Route rotation top-level evidence contains a non-canonical WIP artifact" ;;
+    esac
+  done
+}
+
+ensure_rotation_baseline() {
+  local baseline=$ROTATION_JOURNAL/rotation-baseline-public-route.json count revision
+  if [[ -e $baseline ]]; then
+    jq -e --arg origin "${CATS_E3_PUBLIC_ORIGIN:-https://$(required CATS_E3_ENDPOINT_HOSTNAME)}" \
+      --arg run_id "$CATS_E3_RUN_ID" '
+      .version == 1 and .origin == $origin and .run_id == $run_id
+      and .http_guest_body == true and .websocket_guest_echo == true' \
+      "$baseline" >/dev/null || fail "durable Route rotation baseline is not the run-bound HTTP/WebSocket proof"
+    return
+  fi
+  count=$(jq -er 'length' "$ROTATION_JOURNAL/rotation-phase-receipts.json")
+  revision=$(jq -er '.loaded_signer_revision' "$ROTATION_JOURNAL/resume-current-latest.json")
+  (( count == 0 && revision == 1 )) || \
+    fail "Route rotation mutation began without a durable positive public baseline"
+  probe_public_route "$baseline"
+  rotation_transcript setup calibrated_public_route "http_ws_positive"
+}
+
+append_rotation_terminal_marker() {
+  local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log temporary count
+  count=$(grep -c '^terminal_marker=route_v2_rotation_disable_recovered_active_http_ws$' "$transcript" || true)
+  (( count <= 1 )) || fail "Route rotation transcript repeats its terminal marker"
+  (( count == 0 )) || return
+  temporary=$(mktemp "$CASE_DIR/.route-v2-rotation-transcript.XXXXXX")
+  cat "$transcript" >"$temporary"
+  printf '%s\n' 'terminal_marker=route_v2_rotation_disable_recovered_active_http_ws' >>"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$transcript"
+  durable_case_file "$transcript"
+}
+
+run_route_rotation_recovery() {
+  validate_rotation_recovery_inputs
+  initialize_rotation_journal
+  if [[ -e $CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json ]]; then
+    validate_rotation_terminal_evidence
+    printf 'ROUTE_V2_ROTATION_TERMINAL_RECEIPT sha256=%s\n' \
+      "$(sha256sum "$CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json" | awk '{print $1}')"
+    return
+  fi
+  validate_rotation_phase_prefix
+  discover_rotation_resume_state
+  rotation_transcript setup validated "release_run_catalog_trust_transport"
+  ensure_rotation_baseline
+
+  settle_rotation_phase publish_overlap
+  settle_rotation_phase switch_active
+  wait_rotation_retention
+  settle_rotation_phase publish_new_only
+  settle_rotation_phase retire
+  settle_rotation_phase disable
+  prove_rotation_disable_observed
+  wait_rotation_disabled_fleet
+  settle_rotation_phase publish_recovery
+  settle_rotation_phase activate
+
+  replace_endpoint_with_fresh_lineage
+  terminal_rotation_fleet
+  probe_fresh_endpoint_after_rotation
+  rotation_transcript terminal completed "recovered_active_http_ws"
+  append_rotation_terminal_marker
+  build_rotation_node_acks
+  build_rotation_terminal_receipt
+  validate_rotation_terminal_evidence
+  printf 'ROUTE_V2_ROTATION_TERMINAL_RECEIPT sha256=%s\n' \
+    "$(sha256sum "$CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json" | awk '{print $1}')"
 }
 
 run_restart() {
@@ -1304,6 +3000,7 @@ run_case() {
     cat-create-running) run_create ;;
     durable-write-flush) run_guest_write ;;
     route-http-ws) run_route ;;
+    route-v2-rotation-disable-live-delivery) run_route_rotation_recovery ;;
     agent-restart-adoption) run_restart ;;
     volume-init-matrix) run_volume_init_matrix ;;
     usage-source-terminal-receipts) run_usage_source_terminals ;;
@@ -1320,10 +3017,35 @@ diagnostics() {
   "$journalctl_bin" --no-pager --output=short-monotonic --lines=200 --unit "$service" || true
 }
 
+rotation_mutation_started() {
+  local pending=()
+  [[ -d $ROTATION_JOURNAL && ! -L $ROTATION_JOURNAL ]] || return 1
+  if [[ -f $ROTATION_JOURNAL/rotation-phase-receipts.json ]] && \
+    [[ $(jq -er 'length' "$ROTATION_JOURNAL/rotation-phase-receipts.json") -gt 0 ]]; then
+    return 0
+  fi
+  shopt -s nullglob
+  pending=("$ROTATION_JOURNAL"/*.attempt-*.command.json)
+  shopt -u nullglob
+  ((${#pending[@]} > 0))
+}
+
 cleanup() {
   local policy source cat expected_node
   policy=observation_only
-  if [[ $CASE_ID == route-http-ws ]]; then
+  if [[ $CASE_ID == route-v2-rotation-disable-live-delivery ]]; then
+    if [[ -e $CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json ]] || \
+      rotation_mutation_started; then
+      # There is no rollback authority. Resolve every durable pending command,
+      # then continue the accepted adjacent lineage through r8, a fresh
+      # Endpoint epoch and full Node acknowledgement.
+      run_route_rotation_recovery
+      validate_rotation_terminal_evidence
+      policy=forward_recovered_active_fresh_endpoint_for_agent_restart
+    else
+      policy=no_route_rotation_mutation_observed
+    fi
+  elif [[ $CASE_ID == route-http-ws ]]; then
     policy=retained_run_bound_guest_workload_for_agent_restart
   elif [[ $CASE_ID == agent-restart-adoption ]]; then
     cat=$(cat_id)
@@ -1345,6 +3067,7 @@ cleanup() {
     '{version:1,case_id:$case_id,cleanup_status:"succeeded",policy:$policy}' \
     >"$CASE_DIR/cleanup-receipt.source.json"
   atomic_json cleanup-receipt.json "$CASE_DIR/cleanup-receipt.source.json"
+  durable_case_file "$CASE_DIR/cleanup-receipt.json"
   rm -f "$CASE_DIR/cleanup-receipt.source.json"
   printf 'cleanup policy: %s; delete-cleanup owns product teardown\n' "$policy"
 }

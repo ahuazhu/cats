@@ -288,6 +288,9 @@ case "$role" in
       public-route)
         printf '%s\n' '{"version":1,"origin":"https://e3.fixture.test","run_id":"v2-fixture-run","http_guest_body":true,"websocket_guest_echo":true}'
         ;;
+      public-route-closed)
+        printf '%s\n' '{"version":1,"kind":"route_v2_public_admission_closed_v1","origin":"https://e3.fixture.test","path":"/e3/v2-fixture-run","run_id":"v2-fixture-run","tls_reachable":true,"http_status":503,"content_type":"text/plain","retry_after_seconds":1,"content_encoding_absent":true,"body_sha256":"sha256:3993919ba29fc397f3bbc6bf5d814e9caa9f184b557eb9c5fd7a59d45a2ac609","terminal_marker":"public_ingress_reachable_route_v2_closed"}'
+        ;;
       *) exit 64 ;;
     esac
     ;;
@@ -1408,4 +1411,48 @@ fn production_v2_driver_places_source_terminal_after_delete_and_preserves_typed_
     assert!(driver.contains("export -n TOKEN_FILE"));
     assert!(runner.contains("cats_e3_run_cases_post_preflight"));
     assert!(runner.contains("[[ $EUID -eq 0 ]]"));
+}
+
+#[test]
+fn production_v2_rotation_recovery_keeps_a_durable_prefix_and_closed_evidence_set() {
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let run_start = driver
+        .find("run_route_rotation_recovery() {")
+        .expect("rotation recovery entry point");
+    let run_end = driver[run_start..]
+        .find("\nrun_restart() {")
+        .map(|offset| run_start + offset)
+        .expect("rotation recovery entry point boundary");
+    let run = &driver[run_start..run_end];
+
+    let initialize = run
+        .find("initialize_rotation_journal")
+        .expect("journal initialization");
+    let validate_prefix = run
+        .find("validate_rotation_phase_prefix")
+        .expect("durable prefix validation");
+    let discover_current = run
+        .find("discover_rotation_resume_state")
+        .expect("exact-current resume discovery");
+    assert!(initialize < validate_prefix && validate_prefix < discover_current);
+    assert!(!run.contains(": >\"$ROTATION_JOURNAL/rotation-phase-receipts.json\""));
+    assert!(driver.contains("revision == completed_revision"));
+    assert!(driver.contains("revision == next_revision"));
+    assert!(driver.contains(".desired_revision == ($old_revision + 1)"));
+    assert!(driver.contains(".desired_revision == ($old_revision + 2)"));
+    assert!(driver.contains("\"$ROTATION_JOURNAL\" \"fresh-endpoint-unbind-\""));
+    assert!(driver.contains("\"$ROTATION_JOURNAL\" \"fresh-endpoint-bind-\""));
+    assert!(driver.contains("run_probe public-route-closed"));
+    assert!(driver.contains("curl_bin\" --disable"));
+    assert!(driver.contains("rotation_mutation_started"));
+    assert!(driver.contains("policy=forward_recovered_active_fresh_endpoint_for_agent_restart"));
+    assert!(!driver.contains("signed_command_exact_json"));
+    assert!(!driver.contains("signed_apply_receipt_exact_json"));
+    for terminal in [
+        "route-v2-rotation-disable-live-delivery.receipt.json",
+        "route-v2-rotation-disable-live-delivery.node-acks.json",
+        "route-v2-rotation-disable-live-delivery.transcript.log",
+    ] {
+        assert!(driver.contains(terminal));
+    }
 }
