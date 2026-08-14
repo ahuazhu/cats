@@ -312,6 +312,27 @@ resource "aws_vpc_security_group_egress_rule" "metal_worker_all" {
   description       = "All outbound"
 }
 
+# Host fencing may replace a worker's primary ENI groups with this exact empty
+# boundary, but the group is never the HostFence authority: the authoritative
+# proof is the ObjectWrite Gateway's closed accepted-PUT prefix. Keeping this
+# as a dedicated, rule-free group makes the secondary observation exact and
+# prevents a broad account-wide network mutation.
+resource "aws_security_group" "metal_worker_fence" {
+  name                   = "${var.name_prefix}-${var.environment}-metal-worker-fence"
+  description            = "Deny-all secondary quarantine boundary for fenced Cats workers"
+  vpc_id                 = module.network.vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(var.tags, {
+    Name      = "${var.name_prefix}-${var.environment}-metal-worker-fence"
+    Authority = "secondary-only"
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_ecr_repository" "control_plane" {
   name                 = var.ecr_repository_name
   image_tag_mutability = var.ecr_image_tag_mutability
@@ -445,12 +466,10 @@ resource "aws_s3_bucket_policy" "chunkstore" {
   policy = data.aws_iam_policy_document.chunkstore_tls_only.json
 }
 
-# Bare-metal worker instance identity.
-#
-# The S3 adapter uses these instance credentials and refreshes them, so no
-# long-lived AWS key ever reaches worker.env. The infrastructure stack attaches
-# SSM and artifact-bucket access to this same role; what it cannot know about
-# is the ChunkStore, so that grant lives here with the bucket.
+# Bare-metal worker instance identity. Workers retain direct immutable-object
+# reads, but no direct ChunkStore write or delete authority. Every accepted PUT
+# passes through the repository-owned ObjectWrite Gateway so a Host-scoped
+# principal can be atomically closed and its accepted sequence prefix drained.
 data "aws_iam_policy_document" "metal_worker_assume" {
   statement {
     effect  = "Allow"
@@ -483,21 +502,40 @@ data "aws_iam_policy_document" "metal_worker_chunkstore" {
     effect    = "Allow"
     actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
     resources = [aws_s3_bucket.chunkstore.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values = [
+        var.chunkstore_prefix,
+        "${var.chunkstore_prefix}/*",
+      ]
+    }
   }
 
   statement {
-    sid    = "ReadWriteChunkStore"
-    effect = "Allow"
+    sid     = "ReadChunkStore"
+    effect  = "Allow"
+    actions = ["s3:GetObject"]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
 
+  # An explicit identity-policy deny prevents a later broad attachment from
+  # silently restoring direct writes to blockd. The Gateway role below is a
+  # different principal and is unaffected.
+  statement {
+    sid    = "DenyDirectChunkStoreMutation"
+    effect = "Deny"
     actions = [
       "s3:AbortMultipartUpload",
       "s3:DeleteObject",
-      "s3:GetObject",
-      "s3:ListMultipartUploadParts",
       "s3:PutObject",
     ]
-
-    resources = ["${aws_s3_bucket.chunkstore.arn}/*"]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
   }
 }
 
@@ -505,6 +543,162 @@ resource "aws_iam_role_policy" "metal_worker_chunkstore" {
   name   = "chunkstore"
   role   = aws_iam_role.metal_worker.id
   policy = data.aws_iam_policy_document.metal_worker_chunkstore.json
+}
+
+# The ObjectWrite Gateway is the sole principal permitted to publish new
+# ChunkStore objects. Its PostgreSQL authority issues and closes Host-scoped
+# accepted request sequences; this AWS role only performs the resulting exact
+# immutable PUT and visibility discovery. It cannot delete objects or mutate
+# compute/network state.
+data "aws_iam_policy_document" "object_write_gateway_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "object_write_gateway" {
+  name               = "${var.name_prefix}-${var.environment}-object-write-gateway"
+  description        = "Publishes only DB-accepted immutable Cats objects and proves their visibility"
+  assume_role_policy = data.aws_iam_policy_document.object_write_gateway_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "object_write_gateway_chunkstore" {
+  statement {
+    sid       = "DiscoverExactChunkStorePrefix"
+    effect    = "Allow"
+    actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
+    resources = [aws_s3_bucket.chunkstore.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values = [
+        var.chunkstore_prefix,
+        "${var.chunkstore_prefix}/*",
+      ]
+    }
+  }
+
+  statement {
+    sid    = "PublishAndVerifyAcceptedObjects"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectAttributes",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "object_write_gateway_chunkstore" {
+  name   = "accepted-object-publish"
+  role   = aws_iam_role.object_write_gateway.id
+  policy = data.aws_iam_policy_document.object_write_gateway_chunkstore.json
+}
+
+resource "aws_eks_pod_identity_association" "object_write_gateway" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = var.object_write_gateway_namespace
+  service_account = var.object_write_gateway_service_account
+  role_arn        = aws_iam_role.object_write_gateway.arn
+
+  tags = var.tags
+}
+
+# HostFence provider permissions are deliberately separate from the object
+# writer. Read-only Describe calls must be global because EC2 does not support
+# resource scoping for them; every mutation is limited to the immutable worker
+# instance IDs and primary ENIs declared in this same state. There is no Start,
+# IAM, credential, tag, or account-wide mutation permission.
+data "aws_iam_policy_document" "host_fence_provider_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "host_fence_provider" {
+  name               = "${var.name_prefix}-${var.environment}-host-fence-provider"
+  description        = "Observes and secondarily isolates only declared Cats bare-metal workers"
+  assume_role_policy = data.aws_iam_policy_document.host_fence_provider_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "host_fence_provider" {
+  statement {
+    sid       = "RediscoverFencePostconditions"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances", "ec2:DescribeNetworkInterfaces"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid     = "StopOnlyDeclaredWorkers"
+    effect  = "Allow"
+    actions = ["ec2:StopInstances"]
+    resources = [
+      for worker in aws_instance.metal_worker :
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${var.expected_account_id}:instance/${worker.id}"
+    ]
+  }
+
+  statement {
+    sid     = "QuarantineOnlyDeclaredWorkerPrimaryEnis"
+    effect  = "Allow"
+    actions = ["ec2:ModifyNetworkInterfaceAttribute"]
+    resources = [
+      for worker in aws_instance.metal_worker :
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${var.expected_account_id}:network-interface/${worker.primary_network_interface_id}"
+    ]
+  }
+
+  # The Control Plane invokes HostFence but is not the ObjectWrite Gateway.
+  # Keep this deny explicit so a future broad S3 attachment cannot collapse
+  # the independently fenced writer boundary back into cats-controld.
+  statement {
+    sid    = "DenyControlPlaneChunkStoreMutation"
+    effect = "Deny"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObject",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "host_fence_provider" {
+  name   = "exact-worker-secondary-isolation"
+  role   = aws_iam_role.host_fence_provider.id
+  policy = data.aws_iam_policy_document.host_fence_provider.json
+}
+
+resource "aws_eks_pod_identity_association" "host_fence_provider" {
+  cluster_name    = module.cluster.cluster_name
+  namespace       = var.host_fence_provider_namespace
+  service_account = var.host_fence_provider_service_account
+  role_arn        = aws_iam_role.host_fence_provider.arn
+
+  tags = var.tags
 }
 
 # The bare-metal worker itself.

@@ -81,6 +81,11 @@ output "metal_worker_security_group_id" {
   value = aws_security_group.metal_worker.id
 }
 
+output "metal_worker_fence_security_group_id" {
+  description = "Explicit deny-all secondary quarantine boundary; never sufficient HostFence authority by itself."
+  value       = aws_security_group.metal_worker_fence.id
+}
+
 output "route53_zone_id" {
   value = module.dns.zone_id
 }
@@ -106,6 +111,38 @@ output "github_release_role_arn" {
 
 output "chunkstore_bucket_name" {
   value = aws_s3_bucket.chunkstore.id
+}
+
+output "chunkstore_prefix" {
+  description = "Exact ObjectWrite Gateway-mediated ChunkStore prefix."
+  value       = var.chunkstore_prefix
+}
+
+output "object_write_gateway_role_arn" {
+  description = "Sole Pod Identity role allowed to PutObject in the production ChunkStore prefix."
+  value       = aws_iam_role.object_write_gateway.arn
+}
+
+output "host_fence_provider_role_arn" {
+  description = "Pod Identity role limited to exact-worker EC2 stop and primary-ENI quarantine."
+  value       = aws_iam_role.host_fence_provider.arn
+}
+
+output "host_fence_aws_bindings" {
+  description = "Provisioned provider scope and immutable AWS targets that NodeIdentity/HostFence configuration must match exactly."
+  value = {
+    for name, worker in aws_instance.metal_worker : name => {
+      provider                       = "aws"
+      partition                      = data.aws_partition.current.partition
+      account_id                     = var.expected_account_id
+      region                         = var.aws_region
+      immutable_host_id              = worker.id
+      primary_network_interface_id   = worker.primary_network_interface_id
+      network_quarantine_boundary_id = aws_security_group.metal_worker_fence.id
+      object_store_bucket            = aws_s3_bucket.chunkstore.id
+      object_store_prefix            = var.chunkstore_prefix
+    }
+  }
 }
 
 output "metal_worker_role_name" {

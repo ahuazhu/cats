@@ -39,6 +39,8 @@ alert_email_recipients = {
 # current unencrypted root so an ordinary plan does not replace it. In the
 # approved maintenance window, change only that value to true and retain the
 # exact reviewed replacement plan; never set metal-1 back to false.
+chunkstore_prefix = "cats-fresh"
+
 metal_workers = {
   "metal-2" = {
     subnet_index          = 0

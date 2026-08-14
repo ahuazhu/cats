@@ -100,6 +100,26 @@ override_data {
   values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
 }
 
+override_data {
+  target = data.aws_iam_policy_document.object_write_gateway_assume
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
+override_data {
+  target = data.aws_iam_policy_document.object_write_gateway_chunkstore
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
+override_data {
+  target = data.aws_iam_policy_document.host_fence_provider_assume
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
+override_data {
+  target = data.aws_iam_policy_document.host_fence_provider
+  values = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
+}
+
 variables {
   expected_account_id = "123456789012"
   alert_email_recipients = {
@@ -107,6 +127,7 @@ variables {
   }
   github_actions_application_state_bucket_arn = "arn:aws:s3:::cats-production-state-fixture"
   chunkstore_bucket_name                      = "cats-production-chunkstore-fixture"
+  chunkstore_prefix                           = "cats-fresh"
   metal_worker_ami                            = "ami-0123456789abcdef0"
 }
 

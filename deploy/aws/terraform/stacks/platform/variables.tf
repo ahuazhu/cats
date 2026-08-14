@@ -298,6 +298,23 @@ variable "chunkstore_bucket_name" {
   type        = string
 }
 
+variable "chunkstore_prefix" {
+  description = "Exact production object-key prefix mediated by the ObjectWrite Gateway."
+  type        = string
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..") &&
+      !strcontains(var.chunkstore_prefix, "//") &&
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", var.chunkstore_prefix))
+    )
+    error_message = "chunkstore_prefix must be one non-empty relative canonical prefix."
+  }
+}
+
 variable "chunkstore_versioning_enabled" {
   description = "Versioning on the ChunkStore bucket. Objects are immutable by construction; this only guards against an erroneous delete."
   type        = bool
@@ -308,6 +325,50 @@ variable "metal_worker_ssh_from_instance_connect" {
   description = "Allow sshd on the worker from an EC2 Instance Connect Endpoint in the same security group. The endpoint itself is created outside this stack."
   type        = bool
   default     = true
+}
+
+variable "object_write_gateway_namespace" {
+  description = "Kubernetes namespace containing the repository-owned ObjectWrite Gateway."
+  type        = string
+  default     = "cats"
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.object_write_gateway_namespace))
+    error_message = "object_write_gateway_namespace must be a DNS-label Kubernetes namespace."
+  }
+}
+
+variable "object_write_gateway_service_account" {
+  description = "Dedicated Kubernetes ServiceAccount whose Pod Identity is the only ChunkStore PutObject principal."
+  type        = string
+  default     = "cats-object-write-gateway"
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.object_write_gateway_service_account))
+    error_message = "object_write_gateway_service_account must be a DNS-label Kubernetes ServiceAccount name."
+  }
+}
+
+variable "host_fence_provider_namespace" {
+  description = "Kubernetes namespace containing the AWS HostFence provider."
+  type        = string
+  default     = "cats"
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_namespace))
+    error_message = "host_fence_provider_namespace must be a DNS-label Kubernetes namespace."
+  }
+}
+
+variable "host_fence_provider_service_account" {
+  description = "Kubernetes ServiceAccount allowed to stop only Cats workers and quarantine only their primary ENIs."
+  type        = string
+  default     = "cats-controld"
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_service_account))
+    error_message = "host_fence_provider_service_account must be a DNS-label Kubernetes ServiceAccount name."
+  }
 }
 
 variable "metal_workers" {
