@@ -25,14 +25,18 @@ use cats_api::route_grant_v2::{
     RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
 };
 use cats_api::route_signing_operator::{
-    decode_route_v2_rotation_operator_trust, decode_route_v2_signing_authority_current,
-    decode_route_v2_signing_command_payload, decode_signed_route_v2_signing_command,
+    decode_route_v2_control_rollout_apply_receipt_payload, decode_route_v2_rotation_operator_trust,
+    decode_route_v2_signing_authority_current, decode_route_v2_signing_command_payload,
+    decode_signed_route_v2_control_rollout_apply_receipt, decode_signed_route_v2_signing_command,
     encode_route_v2_rotation_operator_trust, encode_route_v2_signing_command_payload,
-    encode_signed_route_v2_signing_command, sign_route_v2_signing_command,
-    verify_signed_route_v2_signing_command, RouteGrantV2SigningAuthorityCommand,
-    RouteGrantV2SigningAuthorityCommandKind, RouteV2LoadedSignerState,
-    RouteV2RotationOperatorCredential, RouteV2RotationOperatorTrust, RouteV2SigningCommandPayload,
-    SignedRouteV2SigningCommand, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
+    encode_signed_route_v2_control_rollout_apply_receipt, encode_signed_route_v2_signing_command,
+    sign_route_v2_control_rollout_apply_receipt, sign_route_v2_signing_command,
+    verify_signed_route_v2_control_rollout_apply_receipt, verify_signed_route_v2_signing_command,
+    RouteGrantV2SigningAuthorityCommand, RouteGrantV2SigningAuthorityCommandKind,
+    RouteV2ControlRolloutApplyOutcome, RouteV2LoadedSignerState, RouteV2RotationOperatorCredential,
+    RouteV2RotationOperatorTrust, RouteV2SigningCommandPayload,
+    SignedRouteV2ControlRolloutApplyReceipt, SignedRouteV2SigningCommand,
+    ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
     ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES,
 };
 use cats_api::runtime_reconciliation::{
@@ -205,6 +209,40 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
                 command_bundle,
                 *signer_revision,
                 discovery,
+                output,
+            )
+        }
+        RuntimeProvisionerRouteV2R1Command::SignControlRolloutApplyReceipt {
+            trust,
+            operator_private_keys,
+            payload,
+            output,
+        } => {
+            return sign_control_rollout_apply_receipt(
+                cli,
+                trust,
+                operator_private_keys,
+                payload,
+                output,
+            )
+        }
+        RuntimeProvisionerRouteV2R1Command::VerifyControlRolloutApplyReceipt {
+            trust,
+            command_bundle,
+            phase,
+            qualification_catalog_sha256,
+            saved_plan_sha256,
+            receipt,
+            output,
+        } => {
+            return verify_control_rollout_apply_receipt(
+                cli,
+                trust,
+                command_bundle,
+                phase,
+                qualification_catalog_sha256,
+                saved_plan_sha256,
+                receipt,
                 output,
             )
         }
@@ -550,6 +588,51 @@ struct RotationCurrentVerificationReceipt {
     database_current: bool,
     process_ready: bool,
     exact_discovery_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ControlRolloutApplySigningReceipt {
+    version: u32,
+    case_id: String,
+    qualification_run_id: String,
+    source_commit_sha: String,
+    phase: String,
+    signer_revision: u64,
+    authority_id: String,
+    route_deployment_id: String,
+    rotation_operator_trust_sha256: String,
+    proof_credential_ids: Vec<String>,
+    exact_payload_sha256: String,
+    exact_signed_receipt_sha256: String,
+    terminal_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlRolloutApplyVerificationReceipt {
+    version: u32,
+    case_id: String,
+    qualification_run_id: String,
+    source_commit_sha: String,
+    qualification_catalog_sha256: String,
+    phase: String,
+    signer_revision: u64,
+    authority_id: String,
+    route_deployment_id: String,
+    rotation_operator_trust_sha256: String,
+    saved_plan_sha256: String,
+    successor_secret_name: String,
+    successor_secret_manifest_sha256: String,
+    successor_signer_reference_sha256: String,
+    successor_signer_state: String,
+    successor_active_kid: Option<String>,
+    successor_public_key_ring_version: u64,
+    successor_public_key_ring_digest: String,
+    apply_started_at_unix_ms: u64,
+    apply_completed_at_unix_ms: u64,
+    apply_outcome: String,
+    exact_signed_receipt_sha256: String,
+    terminal_marker: String,
 }
 
 struct RotationRecoverySource {
@@ -1805,9 +1888,7 @@ fn load_staged_rotation_contract(
     trust_path: &Path,
     bundle_path: &Path,
 ) -> Result<(RouteV2RotationOperatorTrust, RotationRecoveryCommandBundle)> {
-    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0o600, true)?;
-    let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
-        .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
+    let (trust, trust_bytes) = load_staged_rotation_trust(trust_path)?;
     let bundle_bytes =
         read_user_file(bundle_path, MAX_ROTATION_RECOVERY_BUNDLE_BYTES, 0o600, true)?;
     let bundle: RotationRecoveryCommandBundle = serde_json::from_slice(&bundle_bytes)
@@ -1832,6 +1913,15 @@ fn load_staged_rotation_contract(
     validate_rotation_recovery_run_id(&bundle.qualification_run_id)?;
     validate_staged_rotation_lineage(&bundle)?;
     Ok((trust, bundle))
+}
+
+fn load_staged_rotation_trust(
+    trust_path: &Path,
+) -> Result<(RouteV2RotationOperatorTrust, Vec<u8>)> {
+    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0o644, false)?;
+    let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
+        .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
+    Ok((trust, trust_bytes))
 }
 
 fn validate_staged_rotation_lineage(bundle: &RotationRecoveryCommandBundle) -> Result<()> {
@@ -2255,6 +2345,234 @@ fn verify_prepared_rotation_current(
         .context("encode staged Route v2 current verification receipt")?;
     publish_user_file_idempotent(output, &receipt_bytes, 0o600)?;
     report(cli, &receipt)
+}
+
+fn sign_control_rollout_apply_receipt(
+    cli: &Cli,
+    trust_path: &Path,
+    operator_private_key_paths: &[PathBuf],
+    payload_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    let (trust, _) = load_staged_rotation_trust(trust_path)?;
+    anyhow::ensure!(
+        !operator_private_key_paths.is_empty()
+            && operator_private_key_paths.len() <= trust.credentials.len(),
+        "apply receipt signer key count is outside the fixed operator trust"
+    );
+    let payload_bytes = read_user_file(
+        payload_path,
+        ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES,
+        0o600,
+        true,
+    )?;
+    let payload = decode_route_v2_control_rollout_apply_receipt_payload(&payload_bytes)
+        .map_err(|error| anyhow!("decode canonical Route v2 apply receipt payload: {error}"))?;
+
+    let signed_bytes = if output.exists() {
+        read_user_file(
+            output,
+            ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES,
+            0o600,
+            true,
+        )?
+    } else {
+        let mut proofs = Vec::with_capacity(operator_private_key_paths.len());
+        let mut credential_ids = BTreeSet::new();
+        for private_key_path in operator_private_key_paths {
+            let mut private_key =
+                read_user_file(private_key_path, MAX_PRIVATE_KEY_BYTES, 0o600, true)?;
+            let proof_result = (|| {
+                let matching = trust.credentials.iter().find_map(|credential| {
+                    let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(
+                        credential.credential_id.clone(),
+                        &private_key,
+                    )
+                    .ok()?;
+                    (Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(signer.public_key_spki_der()))
+                        .as_ref()
+                        == Some(&credential.public_key_spki))
+                    .then_some(signer)
+                });
+                let signer = matching.context(
+                    "apply receipt operator private key is not strict PKCS#8 v2 bound by trust",
+                )?;
+                anyhow::ensure!(
+                    credential_ids.insert(signer.credential_id().clone()),
+                    "apply receipt repeats an operator credential"
+                );
+                sign_route_v2_control_rollout_apply_receipt(&payload, &signer)
+                    .map_err(|error| anyhow!("sign Route v2 apply receipt: {error}"))
+            })();
+            private_key.fill(0);
+            proofs.push(proof_result?);
+        }
+        proofs.sort_by(|left, right| left.credential_id.cmp(&right.credential_id));
+        anyhow::ensure!(
+            proofs.len() >= usize::from(trust.threshold),
+            "apply receipt does not satisfy the operator trust threshold"
+        );
+        let signed = SignedRouteV2ControlRolloutApplyReceipt {
+            payload: payload.clone(),
+            proofs,
+        };
+        verify_signed_route_v2_control_rollout_apply_receipt(
+            &trust,
+            &trust.release_commit_sha,
+            &signed,
+        )
+        .map_err(|error| anyhow!("verify freshly signed Route v2 apply receipt: {error}"))?;
+        let bytes = encode_signed_route_v2_control_rollout_apply_receipt(&signed)
+            .map_err(|error| anyhow!("encode signed Route v2 apply receipt: {error}"))?;
+        publish_user_file_idempotent(output, &bytes, 0o600)?;
+        bytes
+    };
+    let signed = decode_signed_route_v2_control_rollout_apply_receipt(&signed_bytes)
+        .map_err(|error| anyhow!("decode durable Route v2 apply receipt: {error}"))?;
+    verify_signed_route_v2_control_rollout_apply_receipt(
+        &trust,
+        &trust.release_commit_sha,
+        &signed,
+    )
+    .map_err(|error| anyhow!("verify durable Route v2 apply receipt: {error}"))?;
+    anyhow::ensure!(
+        signed.payload == payload,
+        "durable Route v2 apply receipt differs from the fresh discovered payload"
+    );
+    report(
+        cli,
+        &ControlRolloutApplySigningReceipt {
+            version: 1,
+            case_id: payload.case_id,
+            qualification_run_id: payload.qualification_run_id,
+            source_commit_sha: payload.source_commit_sha,
+            phase: payload.phase,
+            signer_revision: payload.signer_revision.get(),
+            authority_id: payload.authority_id.to_string(),
+            route_deployment_id: payload.route_deployment_id.to_string(),
+            rotation_operator_trust_sha256: payload.rotation_operator_trust_sha256.to_string(),
+            proof_credential_ids: signed
+                .proofs
+                .into_iter()
+                .map(|proof| proof.credential_id.to_string())
+                .collect(),
+            exact_payload_sha256: sha256(&payload_bytes),
+            exact_signed_receipt_sha256: sha256(&signed_bytes),
+            terminal_marker: payload.terminal_marker,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_control_rollout_apply_receipt(
+    cli: &Cli,
+    trust_path: &Path,
+    bundle_path: &Path,
+    phase: &str,
+    qualification_catalog_sha256: &str,
+    saved_plan_sha256: &str,
+    receipt_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    let (trust, bundle) = load_staged_rotation_contract(trust_path, bundle_path)?;
+    let entry = bundle
+        .commands
+        .iter()
+        .find(|entry| entry.phase == phase)
+        .context("staged Route rotation bundle has no requested apply phase")?;
+    let rollout = bundle
+        .control_rollouts
+        .iter()
+        .find(|rollout| rollout.signer_revision == entry.signer_revision)
+        .context("staged Route rotation bundle has no requested rollout")?;
+    let command = decode_authority_command(entry.exact_authority_command_json.as_bytes())?;
+    let expected_reference = command.successor;
+    let (expected_state, expected_active_kid) = match &expected_reference.signer {
+        RouteGrantV2SignerSelection::Active { active_kid, .. } => {
+            (RouteV2LoadedSignerState::Active, Some(active_kid.clone()))
+        }
+        RouteGrantV2SignerSelection::Disabled => (RouteV2LoadedSignerState::Disabled, None),
+    };
+    let expected_catalog = Sha256Digest::new(qualification_catalog_sha256.to_owned())
+        .context("invalid qualification catalog digest")?;
+    let expected_plan = Sha256Digest::new(saved_plan_sha256.to_owned())
+        .context("invalid reviewed saved-plan digest")?;
+    let receipt_bytes = read_user_file(
+        receipt_path,
+        ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES,
+        0o600,
+        true,
+    )?;
+    let signed = decode_signed_route_v2_control_rollout_apply_receipt(&receipt_bytes)
+        .map_err(|error| anyhow!("decode canonical signed Route v2 apply receipt: {error}"))?;
+    verify_signed_route_v2_control_rollout_apply_receipt(
+        &trust,
+        &trust.release_commit_sha,
+        &signed,
+    )
+    .map_err(|error| anyhow!("verify signed Route v2 apply receipt: {error}"))?;
+    let payload = &signed.payload;
+    anyhow::ensure!(
+        payload.qualification_run_id == bundle.qualification_run_id
+            && payload.qualification_catalog_sha256 == expected_catalog
+            && payload.phase == phase
+            && payload.signer_revision.get() == entry.signer_revision
+            && payload.saved_plan_sha256 == expected_plan
+            && payload.successor_secret_name == rollout.secret_name
+            && payload.successor_secret_manifest_sha256.to_string()
+                == rollout.secret_manifest_sha256
+            && payload.successor_signer_reference_sha256.to_string()
+                == rollout.signer_reference_sha256
+            && payload.successor_signer_state == expected_state
+            && payload.successor_active_kid == expected_active_kid
+            && payload.successor_public_key_ring_version
+                == expected_reference.public_key_ring_version
+            && payload.successor_public_key_ring_digest
+                == expected_reference.public_key_ring_digest,
+        "signed Route v2 apply receipt differs from the exact next frozen phase"
+    );
+    let verification = ControlRolloutApplyVerificationReceipt {
+        version: 1,
+        case_id: payload.case_id.clone(),
+        qualification_run_id: payload.qualification_run_id.clone(),
+        source_commit_sha: payload.source_commit_sha.clone(),
+        qualification_catalog_sha256: payload.qualification_catalog_sha256.to_string(),
+        phase: payload.phase.clone(),
+        signer_revision: payload.signer_revision.get(),
+        authority_id: payload.authority_id.to_string(),
+        route_deployment_id: payload.route_deployment_id.to_string(),
+        rotation_operator_trust_sha256: payload.rotation_operator_trust_sha256.to_string(),
+        saved_plan_sha256: payload.saved_plan_sha256.to_string(),
+        successor_secret_name: payload.successor_secret_name.clone(),
+        successor_secret_manifest_sha256: payload.successor_secret_manifest_sha256.to_string(),
+        successor_signer_reference_sha256: payload.successor_signer_reference_sha256.to_string(),
+        successor_signer_state: match payload.successor_signer_state {
+            RouteV2LoadedSignerState::Active => "active",
+            RouteV2LoadedSignerState::Disabled => "disabled",
+        }
+        .to_owned(),
+        successor_active_kid: payload
+            .successor_active_kid
+            .as_ref()
+            .map(ToString::to_string),
+        successor_public_key_ring_version: payload.successor_public_key_ring_version.get(),
+        successor_public_key_ring_digest: payload.successor_public_key_ring_digest.to_string(),
+        apply_started_at_unix_ms: payload.apply_started_at_unix_ms.get(),
+        apply_completed_at_unix_ms: payload.apply_completed_at_unix_ms.get(),
+        apply_outcome: match payload.apply_outcome {
+            RouteV2ControlRolloutApplyOutcome::Succeeded => "succeeded",
+            RouteV2ControlRolloutApplyOutcome::AmbiguousResolvedCurrent => {
+                "ambiguous_resolved_current"
+            }
+        }
+        .to_owned(),
+        exact_signed_receipt_sha256: sha256(&receipt_bytes),
+        terminal_marker: payload.terminal_marker.clone(),
+    };
+    let verification_bytes =
+        serde_json::to_vec(&verification).context("encode Route v2 apply receipt verification")?;
+    publish_user_file_idempotent(output, &verification_bytes, 0o600)?;
+    report(cli, &verification)
 }
 
 struct Inputs {

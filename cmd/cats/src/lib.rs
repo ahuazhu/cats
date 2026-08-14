@@ -645,6 +645,45 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         #[arg(long)]
         output: std::path::PathBuf,
     },
+    /// Sign one deployment-side post-apply receipt in an independent domain.
+    SignControlRolloutApplyReceipt {
+        /// Fixed public operator trust JSON (mode 0644 under a root-only directory).
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only operator PKCS#8 v2 PEMs needed by the trust threshold.
+        #[arg(long = "operator-private-key", required = true)]
+        operator_private_keys: Vec<std::path::PathBuf>,
+        /// Canonical unsigned apply-receipt payload produced after fresh discovery.
+        #[arg(long)]
+        payload: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only signed receipt file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify one immutable deployment receipt against its exact recovery phase.
+    VerifyControlRolloutApplyReceipt {
+        /// Fixed public operator trust JSON (mode 0644 under a root-only directory).
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact prepared phase name expected next by the worker.
+        #[arg(long)]
+        phase: String,
+        /// Exact qualification catalog digest bound by this run.
+        #[arg(long)]
+        qualification_catalog_sha256: String,
+        /// Exact reviewed saved-plan file digest frozen for this phase.
+        #[arg(long)]
+        saved_plan_sha256: String,
+        /// Root-only canonical signed apply receipt fetched from the inbox.
+        #[arg(long)]
+        receipt: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -3110,6 +3149,46 @@ mod tests {
             "/approved/current-r8.json",
             "--output",
             "/approved/current-r8.receipt.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-control-rollout-apply-receipt",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--operator-private-key",
+            "/approved/operator-a.pem",
+            "--operator-private-key",
+            "/approved/operator-b.pem",
+            "--payload",
+            "/approved/apply/publish_overlap.payload.json",
+            "--output",
+            "/approved/apply/publish_overlap.signed.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-control-rollout-apply-receipt",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
+            "--phase",
+            "publish_overlap",
+            "--qualification-catalog-sha256",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--saved-plan-sha256",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--receipt",
+            "/approved/inbox/publish_overlap.signed.json",
+            "--output",
+            "/approved/verified/publish_overlap.receipt.json",
         ])
         .is_ok());
     }
