@@ -572,7 +572,12 @@ except (UnicodeDecodeError, json.JSONDecodeError, DuplicateKey):
 canonical = (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
 if raw != canonical or not isinstance(value, dict):
     raise SystemExit(1)
-if set(value) != {"cases", "framework_required_evidence", "version"} or value["version"] != 1:
+if set(value) != {
+    "cases",
+    "framework_required_evidence",
+    "post_block_path_cases",
+    "version",
+} or value["version"] != 1:
     raise SystemExit(1)
 
 filename_pattern = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
@@ -609,7 +614,7 @@ if value["framework_required_evidence"] != [
 cases = value["cases"]
 if not isinstance(cases, list) or not cases:
     raise SystemExit(1)
-expected_cases = {
+expected_cases = [
     "control-startup-schema",
     "node-registration-full-inventory",
     "cat-create-running",
@@ -618,10 +623,10 @@ expected_cases = {
     "route-v2-rotation-disable-live-delivery",
     "agent-restart-adoption",
     "volume-init-matrix",
-    "usage-final-terminal-receipt",
     "v3-aws-host-fence-authority",
     "delete-cleanup",
-}
+    "usage-source-terminal-receipts",
+]
 case_ids = []
 for case in cases:
     if not isinstance(case, dict) or set(case) != {
@@ -642,7 +647,32 @@ for case in cases:
     if validate_evidence(case["required_evidence"]) & framework_names:
         raise SystemExit(1)
     case_ids.append(case_id)
-if len(case_ids) != len(set(case_ids)) or set(case_ids) != expected_cases:
+if len(case_ids) != len(set(case_ids)) or case_ids != expected_cases:
+    raise SystemExit(1)
+
+post_cases = value["post_block_path_cases"]
+if not isinstance(post_cases, list) or len(post_cases) != 1:
+    raise SystemExit(1)
+post_case = post_cases[0]
+if not isinstance(post_case, dict) or set(post_case) != {
+    "case_id",
+    "deadline_seconds",
+    "expected_outcome",
+    "required_evidence",
+}:
+    raise SystemExit(1)
+if (
+    post_case["case_id"] != "usage-target-terminal-receipt"
+    or post_case["deadline_seconds"] != 600
+    or post_case["expected_outcome"] != {"kind": "passed"}
+    or validate_evidence(post_case["required_evidence"])
+    != {
+        "usage-target-terminal-request.json",
+        "usage-target-terminal-receipt.json",
+        "usage-target-terminal-verification.receipt.json",
+    }
+    or validate_evidence(post_case["required_evidence"]) & framework_names
+):
     raise SystemExit(1)
 PY
 

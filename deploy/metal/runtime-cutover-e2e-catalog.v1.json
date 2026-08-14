@@ -211,7 +211,7 @@
       ]
     },
     {
-      "case_id": "usage-final-terminal-receipt",
+      "case_id": "usage-source-terminal-receipts",
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
@@ -222,11 +222,7 @@
           "kind": "json"
         },
         {
-          "filename": "usage-source-terminal-receipt.json",
-          "kind": "json"
-        },
-        {
-          "filename": "usage-target-terminal-receipt.json",
+          "filename": "usage-source-terminal-receipts.json",
           "kind": "json"
         }
       ]
@@ -236,6 +232,29 @@
     {
       "filename": "cleanup-receipt.json",
       "kind": "json"
+    }
+  ],
+  "post_block_path_cases": [
+    {
+      "case_id": "usage-target-terminal-receipt",
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "usage-target-terminal-request.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-target-terminal-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-target-terminal-verification.receipt.json",
+          "kind": "json"
+        }
+      ]
     }
   ],
   "version": 1

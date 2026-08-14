@@ -14,8 +14,10 @@ const CASES: [&str; 11] = [
     "volume-init-matrix",
     "v3-aws-host-fence-authority",
     "delete-cleanup",
-    "usage-final-terminal-receipt",
+    "usage-source-terminal-receipts",
 ];
+
+const POST_BLOCK_PATH_CASES: [&str; 1] = ["usage-target-terminal-receipt"];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -857,7 +859,15 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
     let object = catalog.as_object().expect("catalog object");
     let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
     keys.sort_unstable();
-    assert_eq!(keys, ["cases", "framework_required_evidence", "version"]);
+    assert_eq!(
+        keys,
+        [
+            "cases",
+            "framework_required_evidence",
+            "post_block_path_cases",
+            "version"
+        ]
+    );
     assert_eq!(catalog["version"], 1);
     assert_eq!(
         catalog["framework_required_evidence"],
@@ -880,6 +890,26 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
             .expect("case evidence")
             .is_empty());
     }
+    let post_cases = catalog["post_block_path_cases"]
+        .as_array()
+        .expect("post-block-path cases");
+    assert_eq!(post_cases.len(), POST_BLOCK_PATH_CASES.len());
+    for (case, expected_id) in post_cases.iter().zip(POST_BLOCK_PATH_CASES) {
+        assert_eq!(case["case_id"], expected_id);
+        assert_eq!(
+            case["expected_outcome"],
+            serde_json::json!({"kind":"passed"})
+        );
+        assert_eq!(case["deadline_seconds"], 600);
+    }
+    assert_eq!(
+        post_cases[0]["required_evidence"],
+        serde_json::json!([
+            {"filename":"usage-target-terminal-request.json","kind":"json"},
+            {"filename":"usage-target-terminal-receipt.json","kind":"json"},
+            {"filename":"usage-target-terminal-verification.receipt.json","kind":"json"}
+        ])
+    );
 
     let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     let builder = include_str!("../../../deploy/aws/tools/build-manual-release.sh");
@@ -1017,9 +1047,9 @@ fn runtime_cutover_runner_rejects_evidence_outside_the_catalog_union() {
 }
 
 #[test]
-fn production_v2_driver_places_usage_terminal_after_delete_and_preserves_typed_blocks() {
+fn production_v2_driver_places_source_terminal_after_delete_and_preserves_typed_blocks() {
     let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("ten-plus-one");
+    let output_dir = fixture.output_dir("per-path-source-terminal");
     let output = fixture.run_post_preflight(&output_dir, |command| {
         command.env("CATS_E3_FIXTURE_BLOCK_CASES", "volume-init-matrix");
     });
@@ -1060,7 +1090,7 @@ fn production_v2_driver_places_usage_terminal_after_delete_and_preserves_typed_b
         .unwrap();
     let terminal_index = rows
         .iter()
-        .position(|row| row["case_id"] == "usage-final-terminal-receipt")
+        .position(|row| row["case_id"] == "usage-source-terminal-receipts")
         .unwrap();
     assert!(deletion_index < terminal_index);
     assert_eq!(rows[terminal_index]["status"], "passed");
@@ -1072,19 +1102,15 @@ fn production_v2_driver_places_usage_terminal_after_delete_and_preserves_typed_b
         assert!(runner.contains(case_id));
         assert!(catalog.contains(case_id));
     }
-    assert!(driver.contains("DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)"));
+    assert!(catalog.contains("post_block_path_cases"));
+    assert!(catalog.contains("usage-target-terminal-receipt"));
+    assert!(driver.contains("run_volume_init_matrix"));
+    assert!(driver.contains("/actions/attach"));
+    assert!(driver.contains("/actions/detach"));
+    assert!(driver.contains("persistent-disk-receipt.json"));
     assert!(driver.contains("/v1/admin/usage/source-terminal/discover"));
-    assert!(driver.contains("/v1/admin/usage/target-terminal/begin"));
-    assert!(driver.contains("/v1/admin/usage/target-terminal/complete"));
-    assert!(driver.contains("usage-source-terminal-receipt.json"));
-    assert!(driver.contains("usage-target-terminal-receipt.json"));
+    assert!(catalog.contains("usage-source-terminal-receipts.json"));
     assert!(driver.contains("CATS_E3_RUN_STARTED_AT_UNIX_MS"));
-    assert!(
-        driver.contains("target terminal begin remained ambiguous after one exact journal replay")
-    );
-    assert!(driver.contains("target terminal request journal does not match this exact run"));
-    assert!(driver.contains("ln \"$request_source\" \"$request_journal\""));
-    assert!(!driver.contains("atomic_json usage-target-terminal-request.json"));
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
     assert!(!driver.contains("before_agent_session:"));
