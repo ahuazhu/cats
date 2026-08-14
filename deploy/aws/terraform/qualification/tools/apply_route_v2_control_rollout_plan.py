@@ -453,7 +453,7 @@ def checked_https_url(value: Any, server_name: str, *, origin_only: bool) -> Spl
         or split.password is not None
         or split.query
         or split.fragment
-        or (origin_only and split.path not in ("", "/"))
+        or (origin_only and split.path != "")
         or (not origin_only and (not split.path.startswith("/") or split.path == "/"))
         or (port is not None and not 1 <= port <= 65535)
     ):
