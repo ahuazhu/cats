@@ -42,8 +42,8 @@ use cats_api::runtime_reconciliation::{
     GuestIpv4PoolKind, GuestTransportEvidence, HostPath, HttpProtocol, Id, InventorySource,
     Ipv4Address, KeyId, LifecycleAdmission, NodeBootId, NodeIdentity, NodeIdentityState,
     NodePlacementPolicy, NodeTransportTarget, ObservedRouteGate, ObservedRuntimeStatus,
-    ProgressingReason, RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding,
-    RouteGateState, RuntimeLaunch, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
+    RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
+    RuntimeLaunch, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
     RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
     RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
     RuntimeSchedulingState, RuntimeTarget, Sequence, Sha256Digest, StableState, UnixMillis,
@@ -305,60 +305,6 @@ struct ScanRecord {
 }
 
 #[derive(Default)]
-struct CompleteAssignedScanner {
-    records: Mutex<Vec<ScanRecord>>,
-}
-
-impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CompleteAssignedScanner {}
-
-impl RuntimeInventoryScanner for CompleteAssignedScanner {
-    fn scan_complete(
-        &self,
-        context: RuntimeInventoryScanContext,
-    ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
-        context.check_active()?;
-        let coordinates = context.coordinates().clone();
-        self.records.lock().unwrap().push(ScanRecord {
-            desired: coordinates.desired.clone(),
-            inventory_epoch: coordinates.inventory_epoch,
-        });
-
-        let mut coverage = InventoryCoverageAggregator::new();
-        for source in [
-            InventorySource::Checkpoint,
-            InventorySource::Systemd,
-            InventorySource::Process,
-            InventorySource::ControlSocket,
-            InventorySource::BlockFrontend,
-            InventorySource::Network,
-            InventorySource::DataDirectory,
-            InventorySource::PendingPack,
-            InventorySource::WarmSnapshot,
-            InventorySource::MetadataStore,
-            InventorySource::GuestMount,
-        ] {
-            coverage.record(source)?;
-        }
-        let runtimes = coordinates
-            .desired
-            .desired_specs
-            .iter()
-            .map(|desired| observed_missing_runtime(desired, coordinates.inventory_epoch))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
-            CompleteRuntimeInventory::from_validated_coverage(
-                coverage.finish()?,
-                UnixMillis::new(1_900_000_006_000).unwrap(),
-                RuntimeInventoryKeyRing::Unavailable,
-                runtimes,
-                Vec::new(),
-                Default::default(),
-            ),
-        )))
-    }
-}
-
-#[derive(Default)]
 struct RouteReadyScanner {
     records: Mutex<Vec<ScanRecord>>,
 }
@@ -503,44 +449,6 @@ fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> anyhow::Result<ObservedR
             reason: ReadyReason::PostconditionSatisfied {
                 target: RuntimeTarget::Running,
             },
-        }],
-    })
-}
-
-fn observed_missing_runtime(
-    desired: &DesiredRuntimeSpec,
-    inventory_epoch: Epoch,
-) -> anyhow::Result<ObservedRuntimeStatus> {
-    let step = ReconcileStep::InspectInventory { inventory_epoch };
-    Ok(ObservedRuntimeStatus {
-        cat_id: desired.cat_id.clone(),
-        applied_desired: Some(AppliedDesiredEvidence {
-            desired_revision: desired.desired_revision,
-            spec_digest: desired.spec_digest.clone(),
-            placement: desired.placement.clone(),
-            target: desired.target,
-        }),
-        runtime_incarnation: None,
-        stable_state: None,
-        step: step.clone(),
-        checkpoint: CheckpointEvidence::Missing {
-            checkpoint_path: HostPath::new(format!(
-                "/var/lib/cats/cross-component/{}.json",
-                desired.cat_id
-            ))
-            .context("cross-component checkpoint path is invalid")?,
-        },
-        processes: Vec::new(),
-        volumes: Vec::new(),
-        mounts: Vec::new(),
-        networks: Vec::new(),
-        guest_transport: GuestTransportEvidence::Unavailable,
-        warm_snapshot: WarmSnapshotEvidence::Absent,
-        lifecycle_admission: LifecycleAdmission::Closed,
-        routes: Vec::new(),
-        platform_guards: 0,
-        conditions: vec![Condition::Progressing {
-            reason: ProgressingReason::ReconcileStep { step },
         }],
     })
 }
@@ -5317,7 +5225,7 @@ async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effect() {
-    let context = ControlContext::spawn().await;
+    let context = ControlContext::spawn_route_v2().await;
     let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
     let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
         id("credential_cross_component_a"),
@@ -5362,7 +5270,7 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
     .unwrap();
     assert_eq!(session.node_id, identity.node_id);
 
-    let scanner = Arc::new(CompleteAssignedScanner::default());
+    let scanner = Arc::new(RouteReadyScanner::default());
     let effect = Arc::new(RecordingRefreshEffect::default());
     let client = RuntimeSpineHttpClient::for_loopback_test(
         &context.server.base_url(),
