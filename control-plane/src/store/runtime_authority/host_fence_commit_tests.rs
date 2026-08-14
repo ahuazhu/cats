@@ -499,6 +499,135 @@ fn recovery_fixture(slug: &str) -> RecoveryFixture {
     }
 }
 
+fn add_second_recovery_cat(fixture: &RecoveryFixture) -> TrustedHostFenceRecoveryCommitV1 {
+    let now = fixture.store.authority_transaction(database_now).unwrap();
+    let mut blank = fixture.current_volume.clone();
+    blank.volume_id = id("volume-root-second");
+    blank.head = blank_head();
+    blank.lease_owner = None;
+    blank.lease_epoch = fence_epoch(0);
+    blank.lease_expires_at = None;
+    blank.last_transition = None;
+
+    let transition_id = random_id(110);
+    let normal_request = NormalAcquireRequest {
+        volume_id: blank.volume_id.clone(),
+        transition_id: transition_id.clone(),
+        attachment_id: id("attachment-old-second"),
+        expected_unowned_epoch: blank.lease_epoch,
+        desired_revision: revision(1),
+        placement_epoch: epoch(1),
+        lease_duration_ms: 60_000,
+    };
+    let (current_volume, _) = normal_acquire(&blank, &normal_request, before(now, 1)).unwrap();
+
+    let mut current_desired = fixture.request.expected_current_desired.clone();
+    current_desired.cat_id = id("cat-host-recovery-second");
+    current_desired.volumes[0].volume_intent_id = id("intent-root-second");
+    current_desired.volumes[0].disk_id = id("disk-root-second");
+    current_desired.volumes[0].volume_id = current_volume.volume_id.clone();
+    current_desired.volumes[0].attachment_id = current_volume.lease_owner.clone().unwrap();
+    current_desired.volumes[0].guest_device.serial = id("root-device-second");
+    current_desired.volumes[0].acquire = VolumeAcquire::Normal {
+        transition_id,
+        expected_unowned_epoch: fence_epoch(0),
+    };
+    current_desired.spec_digest = spec_digest(&current_desired).unwrap();
+
+    let mut replacement_desired = current_desired.clone();
+    replacement_desired.desired_revision = revision(2);
+    replacement_desired.placement = fixture.request.replacement_desired.placement.clone();
+    replacement_desired.volumes[0].attachment_id = id("attachment-new-second");
+    replacement_desired.volumes[0].acquire = VolumeAcquire::Takeover {
+        authorization_id: id("takeover-authorization-second"),
+    };
+    replacement_desired.spec_digest = spec_digest(&replacement_desired).unwrap();
+
+    let authorization = AuthorizationRecord {
+        authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
+            authorization_id: id("takeover-authorization-second"),
+            authorized_node_id: replacement_desired.placement.node_id.clone(),
+            host_fence_event_id: fixture.request.terminal_event.event_id.clone(),
+            volume_id: current_volume.volume_id.clone(),
+            expected_attachment_id: current_volume.lease_owner.clone().unwrap(),
+            expected_epoch: current_volume.lease_epoch,
+            expected_head: current_volume.head.clone(),
+            new_attachment_id: replacement_desired.volumes[0].attachment_id.clone(),
+            desired_revision: replacement_desired.desired_revision,
+            new_placement_epoch: replacement_desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+            not_after: time(now.get().checked_add(60_000).unwrap()),
+        }),
+        state: AuthorizationState::Unconsumed,
+    };
+
+    let mut expected_old_operation = fixture.request.expected_old_operation.clone();
+    expected_old_operation.operation_id = id("operation-old-second");
+    expected_old_operation.cat_id = current_desired.cat_id.clone();
+    expected_old_operation.desired_spec_digest = current_desired.spec_digest.clone();
+
+    let mut settled_old_operation = expected_old_operation.clone();
+    settled_old_operation.phase = OperationPhase::Failed;
+    settled_old_operation.terminal = Some(OperationTerminal::Failed {
+        error: Box::new(OperationFailure::HostLost {
+            node_id: fixture.old_identity.node_id.clone(),
+            agent_session_epoch: fixture.old_session.agent_session_epoch,
+            host_fence_event_id: fixture.request.terminal_event.event_id.clone(),
+        }),
+        completed_at_unix_ms: now,
+    });
+    settled_old_operation.updated_at_unix_ms = now;
+
+    let mut recovery_operation = fixture.request.recovery_operation.clone();
+    recovery_operation.operation_id = id("operation-recovery-second");
+    recovery_operation.cat_id = replacement_desired.cat_id.clone();
+    recovery_operation.desired_spec_digest = replacement_desired.spec_digest.clone();
+
+    fixture
+        .store
+        .authority_transaction(|transaction| {
+            insert_volume(transaction, &blank)?;
+            update_volume_owner(
+                transaction,
+                &current_volume,
+                Some(&VolumeOwnerBinding {
+                    volume_id: current_volume.volume_id.clone(),
+                    owner_node_id: fixture.old_identity.node_id.clone(),
+                    attachment_id: current_volume.lease_owner.clone().unwrap(),
+                    attachment_epoch: current_volume.lease_epoch,
+                }),
+            )?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: current_desired.cat_id.clone(),
+                    workspace_id: current_desired.workspace_id.clone(),
+                    name: id("host-recovery-cat-second"),
+                    created_at: expected_old_operation.created_at_unix_ms,
+                },
+            )?;
+            insert_desired(transaction, &current_desired)?;
+            insert_operation(transaction, &expected_old_operation)
+        })
+        .unwrap();
+
+    TrustedHostFenceRecoveryCommitV1 {
+        terminal_event: fixture.request.terminal_event.clone(),
+        expected_old_node_id: fixture.request.expected_old_node_id.clone(),
+        expected_old_node_boot_id: fixture.request.expected_old_node_boot_id.clone(),
+        expected_old_agent_session_epoch: fixture.request.expected_old_agent_session_epoch,
+        expected_current_desired: current_desired,
+        takeover_authorizations: vec![TrustedTakeoverAuthorizationV1 {
+            expected_current_volume: current_volume,
+            authorization,
+        }],
+        replacement_desired,
+        expected_old_operation,
+        settled_old_operation,
+        recovery_operation,
+    }
+}
+
 fn output_counts(store: &Store) -> (i64, i64, i64) {
     store
         .with(|client| {
@@ -656,6 +785,47 @@ fn terminal_fence_recovery_commits_once_and_exact_replay_returns_the_receipt() {
         })
         .unwrap();
     assert_eq!(state, "terminal_v1");
+}
+
+#[test]
+fn singular_recovery_can_partially_recover_a_two_cat_node() {
+    let fixture = recovery_fixture("host-recovery-two-cat-characterization");
+    let second = add_second_recovery_cat(&fixture);
+
+    fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&fixture.request)
+        .unwrap();
+    let error = fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&second)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+
+    fixture
+        .store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                load_desired_for_update(transaction, &second.expected_current_desired.cat_id)?
+                    .unwrap(),
+                second.expected_current_desired
+            );
+            assert_eq!(
+                load_operation_for_update(
+                    transaction,
+                    &second.expected_old_operation.operation_id
+                )?
+                .unwrap(),
+                second.expected_old_operation
+            );
+            assert!(load_operation_for_update(
+                transaction,
+                &second.recovery_operation.operation_id,
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
