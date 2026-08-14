@@ -33,6 +33,7 @@ use super::cat_create_service::CatCreatePlacementMutation;
 use super::covered_commit::{
     CommitResolutionRegistry, CoveredCommitCancellation, CoveredCommitState,
 };
+use super::host_fence_recovery_batch::require_product_mutation_unblocked_in;
 use super::normal_delete::{begin_persistent_disk_delete_in, PersistentDiskDeleteContext};
 use super::placement_planner::{
     lock_cat_create_placement_for_desired_mutation,
@@ -2027,16 +2028,17 @@ fn commit_desired_publication_in(
     )?;
     checkpoint_covered_commit(transaction, commit_state)?;
 
+    let mut locked_node_ids = BTreeSet::new();
     match mutation_class {
         DesiredMutationClass::SourceOnly => {
             let nodes = BTreeSet::from([
                 publication.expected_current.placement.node_id.clone(),
                 publication.desired.placement.node_id.clone(),
             ]);
-            for node_id in nodes {
+            for node_id in &nodes {
                 checkpoint_covered_commit(transaction, commit_state)?;
-                let identity = load_identity_by_node_for_update(transaction, &node_id)?
-                    .ok_or_else(|| {
+                let identity =
+                    load_identity_by_node_for_update(transaction, node_id)?.ok_or_else(|| {
                         stored_corruption(
                             "assigned current Desired has no NodeIdentity coordination row",
                         )
@@ -2047,6 +2049,7 @@ fn commit_desired_publication_in(
                     ));
                 }
             }
+            locked_node_ids = nodes;
         }
         DesiredMutationClass::PlacementRequired => {
             for planned in publication.placement_snapshots {
@@ -2060,6 +2063,7 @@ fn commit_desired_publication_in(
                 if current.state != NodeIdentityState::Provisioned || current != *expected {
                     return Ok(DesiredPublicationOutcome::Stale);
                 }
+                locked_node_ids.insert(expected.node_id.clone());
             }
         }
     }
@@ -2080,6 +2084,11 @@ fn commit_desired_publication_in(
                 return Ok(DesiredPublicationOutcome::Replayed);
             }
         }
+    }
+
+    for node_id in &locked_node_ids {
+        checkpoint_covered_commit(transaction, commit_state)?;
+        require_product_mutation_unblocked_in(transaction, node_id)?;
     }
 
     if mutation_class == DesiredMutationClass::PlacementRequired {
@@ -2682,6 +2691,11 @@ fn create_cat_in(
             .into());
         }
     }
+    checkpoint_cat_create(transaction, commit_state)?;
+    require_product_mutation_unblocked_in(
+        transaction,
+        &request.candidate.desired.placement.node_id,
+    )?;
     checkpoint_cat_create(transaction, commit_state)?;
 
     // Network identities are globally non-reusable, including across target

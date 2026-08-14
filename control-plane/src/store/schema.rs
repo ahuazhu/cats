@@ -911,6 +911,8 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_operations",
     "trusted_host_fence_recovery_commits_v1",
     "host_fence_provider_queue_v1",
+    "trusted_host_fence_recovery_attempts_v1",
+    "trusted_host_fence_recovery_attempt_cats_v1",
     "api_idempotency_results",
     "node_identities",
     "agent_registration_attempts",
@@ -1297,6 +1299,16 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
     (
+        "trusted_host_fence_recovery_attempts_v1",
+        "trusted_host_fence_recovery_attempts_v1_pkey",
+        "fence_attempt_id",
+    ),
+    (
+        "trusted_host_fence_recovery_attempt_cats_v1",
+        "trusted_host_fence_recovery_attempt_cats_v1_pkey",
+        "fence_attempt_id,ordinal",
+    ),
+    (
         "host_fence_provider_queue_v1",
         "host_fence_provider_queue_v1_pkey",
         "fence_attempt_id",
@@ -1560,6 +1572,18 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 ];
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "trusted_host_fence_recovery_attempts_v1",
+        "host_recovery_one_active_source_session",
+        "provider,host_partition,host_account_id,host_region,immutable_host_id,node_id,expected_node_boot_id,expected_agent_session_epoch",
+        Some("(state = ANY (ARRAY['provider_pending'::text, 'provider_terminal'::text]))"),
+    ),
+    (
+        "trusted_host_fence_recovery_attempt_cats_v1",
+        "host_recovery_cat_attempt_cat_key",
+        "fence_attempt_id,cat_id",
+        None,
+    ),
     (
         "disk_records",
         "disk_records_initialization_token_unique",
@@ -2189,6 +2213,27 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         BEFORE_ROW_DELETE,
         "f9f88a4724e414eb226d429fdfb1dca313868b2ea5a9d69d467f63a85696d8aa",
     ),
+    (
+        "trusted_host_fence_recovery_attempts_v1",
+        "host_recovery_attempt_transition_v1",
+        "control_host_recovery_attempt_transition_v1",
+        BEFORE_ROW_UPDATE,
+        "966a5712f6f2e6680a6eb0d4d926312fbced1d94da8dfbdf34777f409ab13752",
+    ),
+    (
+        "trusted_host_fence_recovery_attempts_v1",
+        "host_recovery_attempt_cannot_delete_v1",
+        "control_host_recovery_attempt_cannot_delete_v1",
+        BEFORE_ROW_DELETE,
+        "6a545210255656923f6d1ea198a49c1a95b0ac62173f7b7978b0f081f64ec247",
+    ),
+    (
+        "trusted_host_fence_recovery_attempt_cats_v1",
+        "host_recovery_cat_is_immutable_v1",
+        "control_host_recovery_cat_is_immutable_v1",
+        BEFORE_ROW_UPDATE_DELETE,
+        "0f8cd357d7a37b46f006f92d1a147d12f023767630cb3d1462054d35019c9584",
+    ),
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
@@ -2258,6 +2303,21 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             renewed_to_unix_ms, evidence_bytes, evidence_sha256,
             enqueued_at_unix_ms, completed_at_unix_ms
        FROM host_fence_provider_queue_v1 WHERE FALSE",
+    "SELECT fence_attempt_id, attempt_bytes, attempt_sha256,
+            provider, host_partition, host_account_id, host_region,
+            immutable_host_id, node_id, expected_node_boot_id,
+            agent_instance_id, expected_agent_session_epoch,
+            physical_snapshot_state, inventory_epoch, inventory_digest, inventory_read_position,
+            full_observation_id, assigned_set_sha256, assigned_cat_count,
+            state, provider_evidence_bytes, provider_evidence_sha256,
+            provider_completed_at_unix_ms, outcome_bytes, outcome_sha256,
+            enqueued_at_unix_ms, outcome_completed_at_unix_ms
+       FROM trusted_host_fence_recovery_attempts_v1 WHERE FALSE",
+    "SELECT fence_attempt_id, ordinal, cat_id, cat_snapshot_bytes,
+            cat_snapshot_sha256, workspace_id, expected_desired_revision,
+            expected_desired_spec_digest, expected_old_operation_id,
+            volume_count, volume_set_sha256
+       FROM trusted_host_fence_recovery_attempt_cats_v1 WHERE FALSE",
     "SELECT authenticated_workspace_id, canonical_route, idempotency_key,
             request_fingerprint, http_status, content_type, response_body,
             created_at
@@ -4718,6 +4778,228 @@ EXECUTE FUNCTION control_host_fence_provider_queue_transition_guard();
 CREATE TRIGGER host_fence_provider_queue_cannot_delete
 BEFORE DELETE ON host_fence_provider_queue_v1 FOR EACH ROW
 EXECUTE FUNCTION control_host_fence_provider_queue_cannot_delete();
+CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
+    fence_attempt_id TEXT
+        CONSTRAINT trusted_host_fence_recovery_attempts_v1_pkey PRIMARY KEY,
+    attempt_bytes BYTEA NOT NULL
+        CONSTRAINT host_recovery_attempt_bytes_check
+        CHECK (octet_length(attempt_bytes) BETWEEN 2 AND 67108864),
+    attempt_sha256 TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_digest_check
+        CHECK (attempt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    provider TEXT NOT NULL,
+    host_partition TEXT NOT NULL,
+    host_account_id TEXT NOT NULL,
+    host_region TEXT NOT NULL,
+    immutable_host_id TEXT NOT NULL,
+    node_id TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_node_id_fkey
+        REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    expected_node_boot_id TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_boot_id_check
+        CHECK (expected_node_boot_id ~ '^[0-9a-f]{32}$'),
+    agent_instance_id TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_agent_id_check
+        CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
+    expected_agent_session_epoch BIGINT NOT NULL
+        CONSTRAINT host_recovery_attempt_session_epoch_check
+        CHECK (expected_agent_session_epoch > 0),
+    physical_snapshot_state TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_physical_state_check
+        CHECK (physical_snapshot_state IN ('accepted_full', 'unavailable')),
+    inventory_epoch BIGINT
+        CONSTRAINT host_recovery_attempt_inventory_epoch_check
+        CHECK (inventory_epoch > 0),
+    inventory_digest TEXT
+        CONSTRAINT host_recovery_attempt_inventory_digest_check
+        CHECK (inventory_digest ~ '^sha256:[0-9a-f]{64}$'),
+    inventory_read_position BIGINT
+        CONSTRAINT host_recovery_attempt_inventory_position_check
+        CHECK (inventory_read_position > 0),
+    full_observation_id TEXT
+        CONSTRAINT host_recovery_attempt_observation_id_check
+        CHECK (full_observation_id ~ '^[0-9a-f]{32}$'),
+    assigned_set_sha256 TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_assigned_digest_check
+        CHECK (assigned_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    assigned_cat_count BIGINT NOT NULL
+        CONSTRAINT host_recovery_attempt_cat_count_check
+        CHECK (assigned_cat_count BETWEEN 1 AND 1024),
+    state TEXT NOT NULL
+        CONSTRAINT host_recovery_attempt_state_check
+        CHECK (state IN (
+            'provider_pending', 'provider_terminal', 'blocked', 'committed'
+        )),
+    provider_evidence_bytes BYTEA
+        CONSTRAINT host_recovery_attempt_evidence_bytes_check
+        CHECK (provider_evidence_bytes IS NULL OR
+               octet_length(provider_evidence_bytes) BETWEEN 2 AND 4194304),
+    provider_evidence_sha256 TEXT
+        CONSTRAINT host_recovery_attempt_evidence_digest_check
+        CHECK (provider_evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    provider_completed_at_unix_ms BIGINT
+        CONSTRAINT host_recovery_attempt_provider_time_check
+        CHECK (provider_completed_at_unix_ms >= 0),
+    outcome_bytes BYTEA
+        CONSTRAINT host_recovery_attempt_outcome_bytes_check
+        CHECK (outcome_bytes IS NULL OR
+               octet_length(outcome_bytes) BETWEEN 2 AND 67108864),
+    outcome_sha256 TEXT
+        CONSTRAINT host_recovery_attempt_outcome_digest_check
+        CHECK (outcome_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    enqueued_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT host_recovery_attempt_enqueued_time_check
+        CHECK (enqueued_at_unix_ms >= 0),
+    outcome_completed_at_unix_ms BIGINT
+        CONSTRAINT host_recovery_attempt_outcome_time_check
+        CHECK (outcome_completed_at_unix_ms >= provider_completed_at_unix_ms),
+    CONSTRAINT host_recovery_attempt_provider_queue_fkey
+        FOREIGN KEY (fence_attempt_id)
+        REFERENCES host_fence_provider_queue_v1(fence_attempt_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT host_recovery_attempt_physical_shape_check CHECK (
+        (physical_snapshot_state = 'accepted_full'
+            AND inventory_epoch IS NOT NULL AND inventory_digest IS NOT NULL
+            AND inventory_read_position IS NOT NULL
+            AND full_observation_id IS NOT NULL) OR
+        (physical_snapshot_state = 'unavailable'
+            AND inventory_epoch IS NULL AND inventory_digest IS NULL
+            AND inventory_read_position IS NULL
+            AND full_observation_id IS NULL)
+    ),
+    CONSTRAINT host_recovery_attempt_state_shape_check CHECK (
+        (state = 'provider_pending' AND provider_evidence_bytes IS NULL
+            AND provider_evidence_sha256 IS NULL
+            AND provider_completed_at_unix_ms IS NULL
+            AND outcome_bytes IS NULL AND outcome_sha256 IS NULL
+            AND outcome_completed_at_unix_ms IS NULL) OR
+        (state = 'provider_terminal' AND provider_evidence_bytes IS NOT NULL
+            AND provider_evidence_sha256 IS NOT NULL
+            AND provider_completed_at_unix_ms IS NOT NULL
+            AND outcome_bytes IS NULL AND outcome_sha256 IS NULL
+            AND outcome_completed_at_unix_ms IS NULL) OR
+        (state IN ('blocked', 'committed')
+            AND provider_evidence_bytes IS NOT NULL
+            AND provider_evidence_sha256 IS NOT NULL
+            AND provider_completed_at_unix_ms IS NOT NULL
+            AND outcome_bytes IS NOT NULL AND outcome_sha256 IS NOT NULL
+            AND outcome_completed_at_unix_ms IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS host_recovery_one_active_source_session
+    ON trusted_host_fence_recovery_attempts_v1(
+        provider, host_partition, host_account_id, host_region,
+        immutable_host_id, node_id, expected_node_boot_id,
+        expected_agent_session_epoch
+    ) WHERE state IN ('provider_pending', 'provider_terminal');
+CREATE INDEX IF NOT EXISTS host_recovery_active_node_barrier
+    ON trusted_host_fence_recovery_attempts_v1(
+        node_id, state, fence_attempt_id COLLATE \"C\"
+    ) WHERE state IN ('provider_pending', 'provider_terminal');
+CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
+    fence_attempt_id TEXT NOT NULL,
+    ordinal BIGINT NOT NULL
+        CONSTRAINT host_recovery_cat_ordinal_check
+        CHECK (ordinal BETWEEN 0 AND 1023),
+    cat_id TEXT NOT NULL
+        CONSTRAINT host_recovery_cat_id_fkey
+        REFERENCES cat_records(cat_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    cat_snapshot_bytes BYTEA NOT NULL
+        CONSTRAINT host_recovery_cat_snapshot_bytes_check
+        CHECK (octet_length(cat_snapshot_bytes) BETWEEN 2 AND 8388608),
+    cat_snapshot_sha256 TEXT NOT NULL
+        CONSTRAINT host_recovery_cat_snapshot_digest_check
+        CHECK (cat_snapshot_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    workspace_id TEXT NOT NULL,
+    expected_desired_revision BIGINT NOT NULL
+        CONSTRAINT host_recovery_cat_desired_revision_check
+        CHECK (expected_desired_revision > 0),
+    expected_desired_spec_digest TEXT NOT NULL
+        CONSTRAINT host_recovery_cat_desired_digest_check
+        CHECK (expected_desired_spec_digest ~ '^sha256:[0-9a-f]{64}$'),
+    expected_old_operation_id TEXT NOT NULL
+        CONSTRAINT host_recovery_cat_old_operation_fkey
+        REFERENCES runtime_operations(operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    volume_count BIGINT NOT NULL
+        CONSTRAINT host_recovery_cat_volume_count_check
+        CHECK (volume_count BETWEEN 1 AND 1024),
+    volume_set_sha256 TEXT NOT NULL
+        CONSTRAINT host_recovery_cat_volume_digest_check
+        CHECK (volume_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT trusted_host_fence_recovery_attempt_cats_v1_pkey
+        PRIMARY KEY (fence_attempt_id, ordinal),
+    CONSTRAINT host_recovery_cat_attempt_fkey
+        FOREIGN KEY (fence_attempt_id)
+        REFERENCES trusted_host_fence_recovery_attempts_v1(fence_attempt_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT host_recovery_cat_attempt_cat_key
+        UNIQUE (fence_attempt_id, cat_id)
+);
+CREATE OR REPLACE FUNCTION control_host_recovery_attempt_transition_v1()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.fence_attempt_id, OLD.attempt_bytes, OLD.attempt_sha256,
+        OLD.provider, OLD.host_partition, OLD.host_account_id, OLD.host_region,
+        OLD.immutable_host_id, OLD.node_id, OLD.expected_node_boot_id,
+        OLD.agent_instance_id, OLD.expected_agent_session_epoch,
+        OLD.physical_snapshot_state, OLD.inventory_epoch, OLD.inventory_digest,
+        OLD.inventory_read_position, OLD.full_observation_id, OLD.assigned_set_sha256,
+        OLD.assigned_cat_count, OLD.enqueued_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.fence_attempt_id, NEW.attempt_bytes, NEW.attempt_sha256,
+        NEW.provider, NEW.host_partition, NEW.host_account_id, NEW.host_region,
+        NEW.immutable_host_id, NEW.node_id, NEW.expected_node_boot_id,
+        NEW.agent_instance_id, NEW.expected_agent_session_epoch,
+        NEW.physical_snapshot_state, NEW.inventory_epoch, NEW.inventory_digest,
+        NEW.inventory_read_position, NEW.full_observation_id, NEW.assigned_set_sha256,
+        NEW.assigned_cat_count, NEW.enqueued_at_unix_ms)
+       OR NOT (
+            (OLD.state = 'provider_pending' AND NEW.state = 'provider_terminal'
+                AND OLD.provider_evidence_bytes IS NULL
+                AND OLD.provider_evidence_sha256 IS NULL
+                AND OLD.provider_completed_at_unix_ms IS NULL
+                AND OLD.outcome_bytes IS NULL AND OLD.outcome_sha256 IS NULL
+                AND OLD.outcome_completed_at_unix_ms IS NULL)
+            OR (OLD.state = 'provider_terminal'
+                AND NEW.state IN ('blocked', 'committed')
+                AND (OLD.provider_evidence_bytes,
+                     OLD.provider_evidence_sha256,
+                     OLD.provider_completed_at_unix_ms)
+                    IS NOT DISTINCT FROM
+                    (NEW.provider_evidence_bytes,
+                     NEW.provider_evidence_sha256,
+                     NEW.provider_completed_at_unix_ms)
+                AND OLD.outcome_bytes IS NULL AND OLD.outcome_sha256 IS NULL
+                AND OLD.outcome_completed_at_unix_ms IS NULL)
+       )
+    THEN
+        RAISE EXCEPTION 'invalid trusted Host recovery attempt transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_host_recovery_attempt_cannot_delete_v1()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'trusted Host recovery attempts cannot be deleted';
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_host_recovery_cat_is_immutable_v1()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'trusted Host recovery assigned snapshots are immutable';
+END;
+$$;
+CREATE TRIGGER host_recovery_attempt_transition_v1
+BEFORE UPDATE ON trusted_host_fence_recovery_attempts_v1 FOR EACH ROW
+EXECUTE FUNCTION control_host_recovery_attempt_transition_v1();
+CREATE TRIGGER host_recovery_attempt_cannot_delete_v1
+BEFORE DELETE ON trusted_host_fence_recovery_attempts_v1 FOR EACH ROW
+EXECUTE FUNCTION control_host_recovery_attempt_cannot_delete_v1();
+CREATE TRIGGER host_recovery_cat_is_immutable_v1
+BEFORE UPDATE OR DELETE ON trusted_host_fence_recovery_attempt_cats_v1 FOR EACH ROW
+EXECUTE FUNCTION control_host_recovery_cat_is_immutable_v1();
 CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
