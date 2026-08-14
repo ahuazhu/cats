@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import importlib.util
 import os
@@ -311,6 +312,10 @@ def validate_inventory_is_observation_only() -> None:
 
 
 def validate_release_bound_usage_subprocess() -> None:
+    if not Path("/proc/self/fd").is_dir():
+        # The production adapter is Linux-only. The native Linux gate executes
+        # the held-descriptor race below; non-Linux static gates still parse it.
+        return
     (
         manifest,
         targets,
@@ -324,11 +329,14 @@ def validate_release_bound_usage_subprocess() -> None:
     original_binary = PROOF.USAGE_TERMINAL_VERIFIER
     original_private_directory = PROOF._require_root_private_directory
     original_open_executable = PROOF._open_release_bound_executable
+    original_open_child = PROOF._open_child_executable
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         state = root / "state"
         state.mkdir(mode=0o700)
         executable = root / "cats-usage-terminal-receipt-verifier"
+        original_marker = root / "original-executed"
+        foreign_marker = root / "foreign-executed"
         executable.write_text(
             f"""#!{sys.executable}
 import argparse
@@ -357,14 +365,24 @@ if (
 output = Path(args.receipt_out)
 output.write_bytes(bytes.fromhex({verification_file.data.hex()!r}))
 os.chmod(output, 0o600)
+Path({str(original_marker)!r}).write_text("original", encoding="utf-8")
 sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
 """,
             encoding="utf-8",
         )
         executable.chmod(0o500)
+        context = dataclasses.replace(
+            context,
+            usage_terminal_verifier_binary_sha256=(
+                "sha256:" + hashlib.sha256(executable.read_bytes()).hexdigest()
+            ),
+        )
         opened: list[str] = []
+        held_descriptor = -1
+        swap_path = False
 
         def open_fixture_executable(path: Path, expected_sha256: str) -> Any:
+            nonlocal held_descriptor
             if (
                 path != executable
                 or expected_sha256
@@ -372,13 +390,41 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             ):
                 raise AssertionError("subprocess adapter did not use the release verifier")
             descriptor = os.open(path, os.O_RDONLY)
+            held_descriptor = descriptor
+            if swap_path:
+                foreign = root / "foreign-verifier"
+                foreign.write_text(
+                    f"#!{sys.executable}\n"
+                    f"from pathlib import Path\n"
+                    f"Path({str(foreign_marker)!r}).write_text('foreign')\n",
+                    encoding="utf-8",
+                )
+                foreign.chmod(0o500)
+                os.replace(foreign, executable)
             opened.append(expected_sha256)
             return descriptor, PROOF._FileIdentity.from_stat(os.fstat(descriptor))
+
+        def open_fixture_child(
+            _process: Any,
+            expected_identity: Any,
+            expected_sha256: str,
+        ) -> int:
+            if (
+                held_descriptor < 0
+                or expected_sha256
+                != context.usage_terminal_verifier_binary_sha256
+            ):
+                raise AssertionError("subprocess adapter did not hold its executable")
+            descriptor = os.dup(held_descriptor)
+            if PROOF._FileIdentity.from_stat(os.fstat(descriptor)) != expected_identity:
+                raise AssertionError("subprocess adapter child inode drifted")
+            return descriptor
 
         try:
             PROOF.USAGE_TERMINAL_VERIFIER = executable
             PROOF._require_root_private_directory = lambda _path, _label: None
             PROOF._open_release_bound_executable = open_fixture_executable
+            PROOF._open_child_executable = open_fixture_child
             verifier = PROOF.SubprocessUsageTargetTerminalVerifier(state)
             verifier.verify(
                 manifest,
@@ -406,10 +452,29 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
                 pass
             else:
                 raise AssertionError("subprocess adapter accepted foreign verifier bytes")
+            original_marker.unlink()
+            swap_path = True
+            try:
+                verifier.verify(
+                    manifest,
+                    targets,
+                    receipt,
+                    request,
+                    verification_file,
+                    runs,
+                    context,
+                )
+            except PROOF.ProofSetError:
+                pass
+            else:
+                raise AssertionError("subprocess adapter ignored verifier path replacement")
+            if not original_marker.exists() or foreign_marker.exists():
+                raise AssertionError("verifier pathname replacement executed foreign bytes")
         finally:
             PROOF.USAGE_TERMINAL_VERIFIER = original_binary
             PROOF._require_root_private_directory = original_private_directory
             PROOF._open_release_bound_executable = original_open_executable
+            PROOF._open_child_executable = original_open_child
 
 
 def main() -> int:
