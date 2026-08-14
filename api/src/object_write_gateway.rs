@@ -37,6 +37,8 @@ pub const OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES: usize = 32 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AUTHORIZATION_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_RESPONSE_LOSS_MAX_BYTES: usize = 32 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES: usize = 16 * 1024;
+pub const OBJECT_WRITE_QUALIFICATION_SEALED_REQUEST_MAX_BYTES: usize = 32 * 1024;
+pub const OBJECT_WRITE_QUALIFICATION_UNPROVEN_RECEIPT_MAX_BYTES: usize = 48 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AMBIGUITY_RECEIPT_MAX_BYTES: usize = 48 * 1024;
 pub const OBJECT_WRITE_GATEWAY_RECEIPT_MAX_BYTES: usize = 64 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION: u64 = 16;
@@ -240,6 +242,40 @@ pub enum ObjectWriteQualificationUnprovenReasonV1 {
     ResponseLossReceiptAbsent,
 }
 
+/// Full accepted request context sealed by the qualification resolution.
+///
+/// The signed ingress descriptor retains the structured immutable key and
+/// fault marker. The server-derived authorization request independently binds
+/// writer, credential and provider/store scope. Validation recomputes their
+/// shared request identity instead of trusting either projection in isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteQualificationSealedRequestV1 {
+    pub version: ContractVersion,
+    pub accepted_sequence: WireU64,
+    pub ingress_descriptor: ObjectWriteIngressDescriptor,
+    pub authorization_request: ObjectWriteQualificationAuthorizationRequestV1,
+    pub accepted_at_unix_ms: UnixMillis,
+    pub issued_at_unix_ms: UnixMillis,
+}
+
+/// Durable fail-closed resolution for an exact-visible fault request which
+/// has no committed successful-PUT response-loss receipt.
+///
+/// `resolved_at_unix_ms` and `resolution_receipt_id` are minted only by the
+/// qualification authority while its per-request exclusive transaction is
+/// still held. This is not an ambiguity qualification receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteQualificationUnprovenVisibleReceiptV1 {
+    pub version: ContractVersion,
+    pub sealed_request: ObjectWriteQualificationSealedRequestV1,
+    pub reason: ObjectWriteQualificationUnprovenReasonV1,
+    pub head_evidence: ObjectWriteQualificationHeadEvidenceV1,
+    pub resolution_receipt_id: AsciiText,
+    pub resolved_at_unix_ms: UnixMillis,
+}
+
 /// Closed proof for one deliberately lost successful PUT response followed by
 /// exact HEAD discovery. It cannot be synthesized from an ordinary timeout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,8 +377,7 @@ pub enum ObjectWriteGatewayTerminalReceipt {
         failed_at_unix_ms: UnixMillis,
     },
     QualificationUnprovenVisible {
-        reason: ObjectWriteQualificationUnprovenReasonV1,
-        head_evidence: Box<ObjectWriteQualificationHeadEvidenceV1>,
+        receipt: Box<ObjectWriteQualificationUnprovenVisibleReceiptV1>,
     },
 }
 
@@ -530,6 +565,43 @@ pub fn decode_object_write_qualification_head_evidence(
     )
 }
 
+pub fn encode_object_write_qualification_sealed_request(
+    request: &ObjectWriteQualificationSealedRequestV1,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_qualification_sealed_request(request)?;
+    encode_bounded_receipt(request, OBJECT_WRITE_QUALIFICATION_SEALED_REQUEST_MAX_BYTES)
+}
+
+pub fn decode_object_write_qualification_sealed_request(
+    bytes: &[u8],
+) -> Result<ObjectWriteQualificationSealedRequestV1, ObjectWriteGatewayContractError> {
+    decode_bounded_receipt(
+        bytes,
+        OBJECT_WRITE_QUALIFICATION_SEALED_REQUEST_MAX_BYTES,
+        validate_qualification_sealed_request,
+    )
+}
+
+pub fn encode_object_write_qualification_unproven_visible_receipt(
+    receipt: &ObjectWriteQualificationUnprovenVisibleReceiptV1,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_qualification_unproven_visible_receipt(receipt)?;
+    encode_bounded_receipt(
+        receipt,
+        OBJECT_WRITE_QUALIFICATION_UNPROVEN_RECEIPT_MAX_BYTES,
+    )
+}
+
+pub fn decode_object_write_qualification_unproven_visible_receipt(
+    bytes: &[u8],
+) -> Result<ObjectWriteQualificationUnprovenVisibleReceiptV1, ObjectWriteGatewayContractError> {
+    decode_bounded_receipt(
+        bytes,
+        OBJECT_WRITE_QUALIFICATION_UNPROVEN_RECEIPT_MAX_BYTES,
+        validate_qualification_unproven_visible_receipt,
+    )
+}
+
 pub fn encode_object_write_qualification_ambiguity_receipt(
     receipt: &ObjectWriteQualificationAmbiguityReceiptV1,
 ) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
@@ -593,6 +665,41 @@ pub fn object_write_qualification_injection_receipt_id(
     hash_evidence_frame(&mut hasher, &put_bytes);
     hash_evidence_frame(&mut hasher, &injected_at_unix_ms.get().to_be_bytes());
     AsciiText::new(format!("owqinj1_{}", digest_hex(hasher)))
+        .ok_or(ObjectWriteGatewayContractError::InvalidReceipt)
+}
+
+/// Content-addressed ID for the exclusive fail-closed visibility resolution.
+/// The complete accepted descriptor projection, credential/scope projection,
+/// HEAD evidence and PostgreSQL resolution time are all covered.
+pub fn object_write_qualification_unproven_resolution_receipt_id(
+    sealed_request: &ObjectWriteQualificationSealedRequestV1,
+    reason: ObjectWriteQualificationUnprovenReasonV1,
+    head_evidence: &ObjectWriteQualificationHeadEvidenceV1,
+    resolved_at_unix_ms: UnixMillis,
+) -> Result<AsciiText, ObjectWriteGatewayContractError> {
+    validate_qualification_sealed_request(sealed_request)?;
+    validate_qualification_unproven_head(sealed_request, reason, head_evidence)?;
+    if resolved_at_unix_ms < head_evidence.observed_at_unix_ms {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    let sealed_bytes = encode_bounded_receipt(
+        sealed_request,
+        OBJECT_WRITE_QUALIFICATION_SEALED_REQUEST_MAX_BYTES,
+    )?;
+    let head_bytes = encode_bounded_receipt(
+        head_evidence,
+        OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES,
+    )?;
+    let mut hasher = sha2::Sha256::new();
+    hash_evidence_frame(
+        &mut hasher,
+        b"cats.object-write-qualification-unproven-visible.v1",
+    );
+    hash_evidence_frame(&mut hasher, &sealed_bytes);
+    hash_evidence_frame(&mut hasher, b"response-loss-receipt-absent");
+    hash_evidence_frame(&mut hasher, &head_bytes);
+    hash_evidence_frame(&mut hasher, &resolved_at_unix_ms.get().to_be_bytes());
+    AsciiText::new(format!("owqunp1_{}", digest_hex(hasher)))
         .ok_or(ObjectWriteGatewayContractError::InvalidReceipt)
 }
 
@@ -1022,18 +1129,13 @@ fn validate_receipt(
             }
             Ok(())
         }
-        ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
-            reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
-            head_evidence,
-        } => {
-            validate_qualification_head_evidence(head_evidence)?;
-            let expected_provider_attempt = receipt
-                .request_id
-                .as_str()
-                .strip_prefix("sha256:")
-                .and_then(|value| AsciiText::new(format!("owpa1_{value}")))
-                .ok_or(ObjectWriteGatewayContractError::InvalidReceipt)?;
-            if head_evidence.provider_attempt_id != expected_provider_attempt {
+        ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible { receipt: unproven } => {
+            validate_qualification_unproven_visible_receipt(unproven)?;
+            let sealed = &unproven.sealed_request;
+            if sealed.authorization_request.request_id != receipt.request_id
+                || sealed.authorization_request.writer_authority_id != receipt.writer_authority_id
+                || sealed.accepted_sequence != receipt.accepted_sequence
+            {
                 return Err(ObjectWriteGatewayContractError::InvalidReceipt);
             }
             Ok(())
@@ -1072,6 +1174,102 @@ fn validate_qualification_authorization_request(
         return Err(ObjectWriteGatewayContractError::InvalidReceipt);
     }
     Ok(())
+}
+
+fn validate_qualification_sealed_request(
+    sealed: &ObjectWriteQualificationSealedRequestV1,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    validate_descriptor(&sealed.ingress_descriptor)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidReceipt)?;
+    validate_qualification_authorization_request(&sealed.authorization_request)?;
+    let ingress = &sealed.ingress_descriptor;
+    let request = &sealed.authorization_request;
+    let Some(fault) = ingress.qualification_fault.as_ref() else {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    };
+    let canonical_logical_key =
+        object_write_key(&ingress.volume_id, &ingress.key, &ingress.content_sha256)
+            .map_err(|_| ObjectWriteGatewayContractError::InvalidReceipt)?;
+    if sealed.version != ContractVersion::V1
+        || sealed.accepted_sequence.get() == 0
+        || sealed.issued_at_unix_ms < sealed.accepted_at_unix_ms
+        || request.fault != *fault
+        || request.canonical_logical_key != canonical_logical_key
+        || request.content_sha256 != ingress.content_sha256
+        || request.content_length != ingress.content_length
+        || request.request_id != qualification_sealed_request_id(sealed)?
+    {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+fn qualification_sealed_request_id(
+    sealed: &ObjectWriteQualificationSealedRequestV1,
+) -> Result<Sha256Digest, ObjectWriteGatewayContractError> {
+    let ingress = &sealed.ingress_descriptor;
+    let request = &sealed.authorization_request;
+    let canonical_logical_key =
+        object_write_key(&ingress.volume_id, &ingress.key, &ingress.content_sha256)?;
+    if request.canonical_logical_key != canonical_logical_key {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    let mut hasher = sha2::Sha256::new();
+    hash_evidence_frame(&mut hasher, b"cats.object-write-request.v1");
+    hash_evidence_frame(&mut hasher, request.writer_authority_id.as_str().as_bytes());
+    hash_evidence_frame(
+        &mut hasher,
+        request.object_provider_scope.provider.as_str().as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        request.object_provider_scope.partition.as_str().as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        request.object_provider_scope.account_id.as_str().as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        request.object_provider_scope.region.as_str().as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        request.object_store_scope_id.as_str().as_bytes(),
+    );
+    hash_evidence_frame(&mut hasher, ingress.volume_id.as_str().as_bytes());
+    hash_evidence_frame(&mut hasher, canonical_logical_key.as_bytes());
+    hash_evidence_frame(&mut hasher, ingress.content_sha256.as_str().as_bytes());
+    hash_evidence_frame(&mut hasher, &ingress.content_length.get().to_be_bytes());
+    let ObjectWriteQualificationFaultV1::SuccessfulPutResponseLoss {
+        qualification_id,
+        fault_id,
+        qualification_catalog_sha256,
+    } = &request.fault;
+    hash_evidence_frame(&mut hasher, b"qualification-credential");
+    hash_evidence_frame(
+        &mut hasher,
+        request.credential.credential_id.as_str().as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        request
+            .credential
+            .public_key_spki_sha256
+            .as_str()
+            .as_bytes(),
+    );
+    hash_evidence_frame(
+        &mut hasher,
+        b"qualification-fault:successful-put-response-loss",
+    );
+    hash_evidence_frame(&mut hasher, qualification_id.as_str().as_bytes());
+    hash_evidence_frame(&mut hasher, fault_id.as_str().as_bytes());
+    hash_evidence_frame(
+        &mut hasher,
+        qualification_catalog_sha256.as_str().as_bytes(),
+    );
+    Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
 fn validate_qualification_authorization(
@@ -1138,6 +1336,56 @@ fn validate_qualification_head_evidence(
         {
             return Err(ObjectWriteGatewayContractError::InvalidReceipt);
         }
+    }
+    Ok(())
+}
+
+fn validate_qualification_unproven_head(
+    sealed_request: &ObjectWriteQualificationSealedRequestV1,
+    reason: ObjectWriteQualificationUnprovenReasonV1,
+    head_evidence: &ObjectWriteQualificationHeadEvidenceV1,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    validate_qualification_sealed_request(sealed_request)?;
+    validate_qualification_head_evidence(head_evidence)?;
+    let request = &sealed_request.authorization_request;
+    if reason != ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent
+        || head_evidence.provider_attempt_id != request.provider_attempt_id
+        || head_evidence.provider_request.content_sha256 != request.content_sha256
+        || head_evidence.provider_request.content_length != Some(request.content_length)
+        || head_evidence.observed_at_unix_ms < sealed_request.issued_at_unix_ms
+        || head_evidence
+            .preceding_conditional_request
+            .as_ref()
+            .is_some_and(|conditional| {
+                conditional.observed_at_unix_ms < sealed_request.issued_at_unix_ms
+            })
+    {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+fn validate_qualification_unproven_visible_receipt(
+    receipt: &ObjectWriteQualificationUnprovenVisibleReceiptV1,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    if receipt.version != ContractVersion::V1 {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    validate_qualification_unproven_head(
+        &receipt.sealed_request,
+        receipt.reason,
+        &receipt.head_evidence,
+    )?;
+    if receipt.resolved_at_unix_ms < receipt.head_evidence.observed_at_unix_ms
+        || receipt.resolution_receipt_id
+            != object_write_qualification_unproven_resolution_receipt_id(
+                &receipt.sealed_request,
+                receipt.reason,
+                &receipt.head_evidence,
+                receipt.resolved_at_unix_ms,
+            )?
+    {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
     }
     Ok(())
 }
@@ -1439,6 +1687,117 @@ mod tests {
         }
     }
 
+    fn qualification_unproven_receipt() -> ObjectWriteQualificationUnprovenVisibleReceiptV1 {
+        let content_sha256 = Sha256Digest::from_bytes([5; 32]);
+        let fault = ObjectWriteQualificationFaultV1::SuccessfulPutResponseLoss {
+            qualification_id: id("qualification-a"),
+            fault_id: RandomId128::new("6".repeat(32)).unwrap(),
+            qualification_catalog_sha256: Sha256Digest::from_bytes([7; 32]),
+        };
+        let ingress_descriptor = ObjectWriteIngressDescriptor {
+            version: ContractVersion::V1,
+            volume_id: id("volume-a"),
+            key: ObjectWriteImmutableKey::VolumeMap,
+            content_sha256: content_sha256.clone(),
+            content_length: WireU64::new(64).unwrap(),
+            qualification_fault: Some(fault.clone()),
+        };
+        let placeholder_request_id = Sha256Digest::from_bytes([0; 32]);
+        let authorization_request = ObjectWriteQualificationAuthorizationRequestV1 {
+            version: ContractVersion::V1,
+            mutation_class: ObjectWriteQualificationMutationClassV1::ObjectWriteAmbiguity,
+            request_id: placeholder_request_id.clone(),
+            writer_authority_id: id("writer-a"),
+            credential: ObjectWriteCredentialReference {
+                credential_id: id("credential-a"),
+                public_key_spki_sha256: Sha256Digest::from_bytes([8; 32]),
+            },
+            provider_attempt_id: ascii(&format!(
+                "owpa1_{}",
+                placeholder_request_id
+                    .as_str()
+                    .strip_prefix("sha256:")
+                    .unwrap()
+            )),
+            fault,
+            object_provider_scope: provider_scope(),
+            object_store_scope_id: ascii("object-store-scope-a"),
+            canonical_logical_key: object_write_key(
+                &ingress_descriptor.volume_id,
+                &ingress_descriptor.key,
+                &ingress_descriptor.content_sha256,
+            )
+            .unwrap(),
+            content_sha256: content_sha256.clone(),
+            content_length: ingress_descriptor.content_length,
+        };
+        let mut sealed_request = ObjectWriteQualificationSealedRequestV1 {
+            version: ContractVersion::V1,
+            accepted_sequence: WireU64::new(1).unwrap(),
+            ingress_descriptor,
+            authorization_request,
+            accepted_at_unix_ms: millis(12),
+            issued_at_unix_ms: millis(13),
+        };
+        let request_id = qualification_sealed_request_id(&sealed_request).unwrap();
+        sealed_request.authorization_request.request_id = request_id.clone();
+        sealed_request.authorization_request.provider_attempt_id = ascii(&format!(
+            "owpa1_{}",
+            request_id.as_str().strip_prefix("sha256:").unwrap()
+        ));
+        let head_evidence = ObjectWriteQualificationHeadEvidenceV1 {
+            provider_attempt_id: sealed_request
+                .authorization_request
+                .provider_attempt_id
+                .clone(),
+            visibility_receipt_id: ascii("visibility-unproven-a"),
+            preceding_conditional_request: Some(Box::new(
+                ObjectWriteConditionalRequestEvidenceV1 {
+                    provider_attempt_id: sealed_request
+                        .authorization_request
+                        .provider_attempt_id
+                        .clone(),
+                    outcome: ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed,
+                    provider_request: ObjectWriteProviderRequestObservationV1 {
+                        request_id: ascii("provider-conditional-request-a"),
+                        extended_request_id: Some(ascii("provider-conditional-extended-a")),
+                        content_sha256: content_sha256.clone(),
+                        content_length: Some(WireU64::new(64).unwrap()),
+                        entity_tag: None,
+                        version_id: None,
+                    },
+                    observed_at_unix_ms: millis(29),
+                },
+            )),
+            provider_request: ObjectWriteProviderRequestObservationV1 {
+                request_id: ascii("provider-head-unproven-a"),
+                extended_request_id: Some(ascii("provider-head-unproven-extended-a")),
+                content_sha256,
+                content_length: Some(WireU64::new(64).unwrap()),
+                entity_tag: Some(ascii("entity-tag-unproven-a")),
+                version_id: Some(ascii("version-unproven-a")),
+            },
+            observed_at_unix_ms: millis(30),
+        };
+        let reason = ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent;
+        let resolved_at_unix_ms = millis(31);
+        let resolution_receipt_id = object_write_qualification_unproven_resolution_receipt_id(
+            &sealed_request,
+            reason,
+            &head_evidence,
+            resolved_at_unix_ms,
+        )
+        .unwrap();
+        ObjectWriteQualificationUnprovenVisibleReceiptV1 {
+            version: ContractVersion::V1,
+            sealed_request,
+            reason,
+            head_evidence,
+            resolution_receipt_id,
+            resolved_at_unix_ms,
+        }
+    }
+
     #[test]
     fn attachment_key_registration_requires_a19_and_exact_proof_of_possession() {
         let node = signer("node_credential_a", 1);
@@ -1600,35 +1959,40 @@ mod tests {
             ]),
             Err(ObjectWriteGatewayContractError::InvalidReceipt)
         );
+        let unproven = qualification_unproven_receipt();
+        let sealed_bytes =
+            encode_object_write_qualification_sealed_request(&unproven.sealed_request).unwrap();
+        assert_eq!(
+            decode_object_write_qualification_sealed_request(&sealed_bytes).unwrap(),
+            unproven.sealed_request
+        );
+        let unproven_bytes =
+            encode_object_write_qualification_unproven_visible_receipt(&unproven).unwrap();
+        assert_eq!(
+            decode_object_write_qualification_unproven_visible_receipt(&unproven_bytes).unwrap(),
+            unproven
+        );
+        assert_eq!(
+            decode_object_write_qualification_unproven_visible_receipt(&vec![
+                b'x';
+                OBJECT_WRITE_QUALIFICATION_UNPROVEN_RECEIPT_MAX_BYTES
+                    + 1
+            ]),
+            Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
     }
 
     #[test]
     fn unproven_visible_is_a_distinct_bounded_terminal_without_ambiguity_proof() {
-        let ambiguity = qualification_ambiguity_receipt();
-        let request = &ambiguity.response_loss.authorization.request;
-        let mut head = ambiguity.head.clone();
-        head.preceding_conditional_request =
-            Some(Box::new(ObjectWriteConditionalRequestEvidenceV1 {
-                provider_attempt_id: head.provider_attempt_id.clone(),
-                outcome: ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed,
-                provider_request: ObjectWriteProviderRequestObservationV1 {
-                    request_id: ascii("provider-conditional-request-a"),
-                    extended_request_id: Some(ascii("provider-conditional-extended-a")),
-                    content_sha256: request.content_sha256.clone(),
-                    content_length: Some(request.content_length),
-                    entity_tag: None,
-                    version_id: None,
-                },
-                observed_at_unix_ms: millis(29),
-            }));
+        let unproven = qualification_unproven_receipt();
+        let request = &unproven.sealed_request.authorization_request;
         let receipt = ObjectWriteGatewayReceipt {
             version: ContractVersion::V1,
             writer_authority_id: request.writer_authority_id.clone(),
             request_id: request.request_id.clone(),
-            accepted_sequence: WireU64::new(1).unwrap(),
+            accepted_sequence: unproven.sealed_request.accepted_sequence,
             terminal: ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
-                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
-                head_evidence: Box::new(head.clone()),
+                receipt: Box::new(unproven.clone()),
             },
         };
         let bytes = encode_object_write_gateway_receipt(&receipt).unwrap();
@@ -1642,19 +2006,18 @@ mod tests {
         assert!(!wire.contains("qualification_ambiguity"));
 
         let mut wrong_attempt = receipt.clone();
-        let ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
-            head_evidence, ..
-        } = &mut wrong_attempt.terminal
+        let ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible { receipt: unproven } =
+            &mut wrong_attempt.terminal
         else {
             unreachable!("fixture is the unproven terminal")
         };
-        head_evidence.provider_attempt_id = ascii("owpa1_wrong");
+        unproven.head_evidence.provider_attempt_id = ascii("owpa1_wrong");
         assert_eq!(
             encode_object_write_gateway_receipt(&wrong_attempt),
             Err(ObjectWriteGatewayContractError::InvalidReceipt)
         );
 
-        let mut wrong_conditional = head;
+        let mut wrong_conditional = qualification_unproven_receipt().head_evidence;
         wrong_conditional
             .preceding_conditional_request
             .as_mut()
@@ -1663,6 +2026,130 @@ mod tests {
             .request_id = wrong_conditional.provider_request.request_id.clone();
         assert_eq!(
             encode_object_write_qualification_head_evidence(&wrong_conditional),
+            Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
+    }
+
+    #[test]
+    fn unproven_receipt_rejects_every_sealed_request_binding_drift() {
+        fn assert_invalid(receipt: ObjectWriteQualificationUnprovenVisibleReceiptV1) {
+            assert_eq!(
+                encode_object_write_qualification_unproven_visible_receipt(&receipt),
+                Err(ObjectWriteGatewayContractError::InvalidReceipt)
+            );
+        }
+
+        let valid = qualification_unproven_receipt();
+
+        let mut wrong_sha = valid.clone();
+        wrong_sha.sealed_request.ingress_descriptor.content_sha256 =
+            Sha256Digest::from_bytes([10; 32]);
+        assert_invalid(wrong_sha);
+
+        let mut wrong_length = valid.clone();
+        wrong_length
+            .sealed_request
+            .authorization_request
+            .content_length = WireU64::new(65).unwrap();
+        assert_invalid(wrong_length);
+
+        let mut wrong_credential = valid.clone();
+        wrong_credential
+            .sealed_request
+            .authorization_request
+            .credential
+            .credential_id = id("credential-b");
+        assert_invalid(wrong_credential);
+
+        let mut wrong_fault = valid.clone();
+        let ObjectWriteQualificationFaultV1::SuccessfulPutResponseLoss { fault_id, .. } =
+            &mut wrong_fault.sealed_request.authorization_request.fault;
+        *fault_id = RandomId128::new("a".repeat(32)).unwrap();
+        assert_invalid(wrong_fault);
+
+        let mut wrong_provider_scope = valid.clone();
+        wrong_provider_scope
+            .sealed_request
+            .authorization_request
+            .object_provider_scope
+            .region = id("region-b");
+        assert_invalid(wrong_provider_scope);
+
+        let mut wrong_store_scope = valid.clone();
+        wrong_store_scope
+            .sealed_request
+            .authorization_request
+            .object_store_scope_id = ascii("object-store-scope-b");
+        assert_invalid(wrong_store_scope);
+
+        let mut wrong_key = valid;
+        wrong_key.sealed_request.ingress_descriptor.key = ObjectWriteImmutableKey::VolumeCommit {
+            generation: Generation::new(1).unwrap(),
+            transaction_id: RandomId128::new("b".repeat(32)).unwrap(),
+        };
+        assert_invalid(wrong_key);
+    }
+
+    #[test]
+    fn credential_drift_with_coordinated_inner_rehash_still_fails_accepted_request_anchor() {
+        let original = qualification_unproven_receipt();
+        let mut gateway = ObjectWriteGatewayReceipt {
+            version: ContractVersion::V1,
+            writer_authority_id: original
+                .sealed_request
+                .authorization_request
+                .writer_authority_id
+                .clone(),
+            request_id: original
+                .sealed_request
+                .authorization_request
+                .request_id
+                .clone(),
+            accepted_sequence: original.sealed_request.accepted_sequence,
+            terminal: ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
+                receipt: Box::new(original),
+            },
+        };
+        let ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible { receipt } =
+            &mut gateway.terminal
+        else {
+            unreachable!("fixture is unproven");
+        };
+        receipt
+            .sealed_request
+            .authorization_request
+            .credential
+            .credential_id = id("credential-b");
+        let rehashed_request_id = qualification_sealed_request_id(&receipt.sealed_request).unwrap();
+        let rehashed_attempt = ascii(&format!(
+            "owpa1_{}",
+            rehashed_request_id
+                .as_str()
+                .strip_prefix("sha256:")
+                .unwrap()
+        ));
+        receipt.sealed_request.authorization_request.request_id = rehashed_request_id;
+        receipt
+            .sealed_request
+            .authorization_request
+            .provider_attempt_id = rehashed_attempt.clone();
+        receipt.head_evidence.provider_attempt_id = rehashed_attempt.clone();
+        receipt
+            .head_evidence
+            .preceding_conditional_request
+            .as_mut()
+            .unwrap()
+            .provider_attempt_id = rehashed_attempt;
+        receipt.resolution_receipt_id = object_write_qualification_unproven_resolution_receipt_id(
+            &receipt.sealed_request,
+            receipt.reason,
+            &receipt.head_evidence,
+            receipt.resolved_at_unix_ms,
+        )
+        .unwrap();
+
+        assert_eq!(
+            encode_object_write_gateway_receipt(&gateway),
             Err(ObjectWriteGatewayContractError::InvalidReceipt)
         );
     }
