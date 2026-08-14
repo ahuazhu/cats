@@ -441,13 +441,13 @@ impl AwsHostFenceProvider {
             .map_err(map_observation_error)?;
         validate_interface_set(request, target, &observations)?;
 
-        for index in 0..observations.len() {
+        for observation in &mut observations {
             let expected_groups =
                 BTreeSet::from([self.config.quarantine_security_group_id.clone()]);
-            if observations[index].security_group_ids == expected_groups {
+            if observation.security_group_ids == expected_groups {
                 continue;
             }
-            let interface_id = observations[index].interface_id.clone();
+            let interface_id = observation.interface_id.clone();
             match self
                 .ec2
                 .quarantine_network_interface(
@@ -484,7 +484,7 @@ impl AwsHostFenceProvider {
             ) {
                 return Err(HostFenceProviderError::ServingCutoffObservationAmbiguous);
             }
-            observations[index] = rediscovered;
+            *observation = rediscovered;
         }
         observations.sort_by(|left, right| left.interface_id.cmp(&right.interface_id));
         validate_interface_set(request, target, &observations)?;

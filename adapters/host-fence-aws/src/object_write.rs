@@ -521,7 +521,7 @@ impl ExactS3Api for SdkExactS3Api {
             for (key, value) in &request.metadata {
                 put = put.metadata(key, value);
             }
-            let output = mutate_with_deadline(put.send(), deadline).await?;
+            let output = Box::pin(mutate_with_deadline(put.send(), deadline)).await?;
             let checksum_sha256 = output
                 .checksum_sha256()
                 .ok_or(S3CallError::InvalidResponse)?
