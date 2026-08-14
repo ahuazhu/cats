@@ -791,6 +791,12 @@ fn node_identity_value() -> serde_json::Value {
     serde_json::json!({
         "version": 1,
         "node_id": "node_a",
+        "provider_scope": {
+            "provider": "aws",
+            "partition": "aws",
+            "account_id": "acct_a",
+            "region": "region_a",
+        },
         "immutable_host_id": "host_a",
         "credential_id": "cred_a",
         "credential_binding": {
@@ -2531,7 +2537,7 @@ fn transport_schema_and_number_errors_are_typed() {
 
     let duplicate = decode_node_identity(
         format!(
-            r#"{{"version":1,"node_id":"node_a","node_id":"node_b","immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned"}}"#
+            r#"{{"version":1,"node_id":"node_a","node_id":"node_b","provider_scope":{{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"}},"immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned"}}"#
         )
         .as_bytes(),
     )
@@ -2686,10 +2692,10 @@ fn transport_and_schema_scan_the_tail_after_an_array_limit() {
 #[test]
 fn candidate_selection_is_independent_of_object_member_order() {
     let first = format!(
-        r#"{{"version":1,"node_id":"node_a","node_id":"node_b","immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned","state":"retired"}}"#
+        r#"{{"version":1,"node_id":"node_a","node_id":"node_b","provider_scope":{{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"}},"immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned","state":"retired"}}"#
     );
     let second = format!(
-        r#"{{"state":"provisioned","state":"retired","state_path_id":"state","credential_binding":{{"public_key_spki_sha256":"{ZERO_DIGEST}","kind":"public_key"}},"credential_id":"cred","immutable_host_id":"host","node_id":"node_a","node_id":"node_b","version":1}}"#
+        r#"{{"state":"provisioned","state":"retired","state_path_id":"state","credential_binding":{{"public_key_spki_sha256":"{ZERO_DIGEST}","kind":"public_key"}},"credential_id":"cred","immutable_host_id":"host","provider_scope":{{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"}},"node_id":"node_a","node_id":"node_b","version":1}}"#
     );
     for input in [first, second] {
         let error = decode_node_identity(input.as_bytes()).unwrap_err();
@@ -2707,6 +2713,12 @@ fn candidate_selection_is_independent_of_object_member_order() {
     let schema_candidates = serde_json::json!({
         "version": 1,
         "node_id": "node_a",
+        "provider_scope": {
+            "provider": "aws",
+            "partition": "aws",
+            "account_id": "acct_a",
+            "region": "region_a",
+        },
         "immutable_host_id": "host",
         "credential_binding": {
             "kind": "public_key",
@@ -2733,7 +2745,7 @@ fn digest_claim_and_union_stages_are_deterministic() {
     assert_eq!(malformed(&mismatch).1, MalformedProblem::InvalidValue);
 
     let unknown_tag_and_missing = decode_node_identity(
-        br#"{"version":1,"node_id":"node","immutable_host_id":"host","credential_id":"cred","credential_binding":{"kind":"future"},"state_path_id":"state"}"#,
+        br#"{"version":1,"node_id":"node","provider_scope":{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"},"immutable_host_id":"host","credential_id":"cred","credential_binding":{"kind":"future"},"state_path_id":"state"}"#,
     )
     .unwrap_err();
     assert_eq!(malformed(&unknown_tag_and_missing).0.as_str(), "/state");
@@ -2743,7 +2755,7 @@ fn digest_claim_and_union_stages_are_deterministic() {
     );
 
     let unknown_tag_does_not_guess_a_variant = decode_node_identity(
-        br#"{"version":1,"node_id":"node","immutable_host_id":"host","credential_id":"cred","credential_binding":{"kind":"future","public_key_spki_sha256":1},"state_path_id":"state","state":"provisioned"}"#,
+        br#"{"version":1,"node_id":"node","provider_scope":{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"},"immutable_host_id":"host","credential_id":"cred","credential_binding":{"kind":"future","public_key_spki_sha256":1},"state_path_id":"state","state":"provisioned"}"#,
     )
     .unwrap_err();
     assert_eq!(
@@ -6557,6 +6569,12 @@ fn every_top_level_contract_uses_the_same_version_rules() {
             serde_json::json!({
                 "version": 1,
                 "node_id": "node_a",
+                "provider_scope": {
+                    "provider": "aws",
+                    "partition": "aws",
+                    "account_id": "acct_a",
+                    "region": "region_a",
+                },
                 "immutable_host_id": "host_a",
                 "credential_id": "cred_a",
                 "credential_binding": {"kind": "public_key", "public_key_spki_sha256": ZERO_DIGEST},
@@ -7190,7 +7208,7 @@ fn complete_inventory_collision_pointers_use_the_lowest_common_object() {
 #[test]
 fn pointers_escape_then_fallback_without_affecting_selection() {
     let base = format!(
-        r#""version":1,"node_id":"node_a","immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned""#
+        r#""version":1,"node_id":"node_a","provider_scope":{{"provider":"aws","partition":"aws","account_id":"acct_a","region":"region_a"}},"immutable_host_id":"host","credential_id":"cred","credential_binding":{{"kind":"public_key","public_key_spki_sha256":"{ZERO_DIGEST}"}},"state_path_id":"state","state":"provisioned""#
     );
     let escaped = format!(r#"{{{base},"a~/b":1}}"#);
     let error = decode_node_identity(escaped.as_bytes()).unwrap_err();
