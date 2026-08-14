@@ -1,0 +1,825 @@
+//! Provider-neutral Host-loss recovery snapshots and atomic batch commit.
+//!
+//! A Host fence is Host-scoped, so recovery cannot consume one Cat and retire
+//! the source identity before the other Cats assigned to that Node are dealt
+//! with.  These closed records freeze the complete assigned set and let the
+//! PostgreSQL owner apply either every safe takeover or none of them.
+
+use cats_api::runtime_reconciliation::{
+    AcquireOrigin, AdmissionInventoryAttestation, AuthorizationRecord, ContractVersion,
+    DesiredRuntimeSpec, Epoch, FleetPolicyPrincipal, Id, LastVolumeTransition, LocalLineageState,
+    NodeBootId, ObservedRuntimeStatus, ObservedVolume, Operation, OperationFailure, OperationPhase,
+    OperationTerminal, RandomId128, SessionBinding, Sha256Digest, UnixMillis, VolumeAuthorization,
+    VolumeDurability, VolumeRecord, WireU64,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::authority::{
+    validate_authorization_record, validate_volume_record, VolumeOwnerBinding,
+    MAX_NODE_OWNED_VOLUMES,
+};
+use crate::host_fence::{HostFenceAttemptRequest, HostFenceBinding};
+use crate::trusted_host_fence::{validate_trusted_host_fence_event_v1, TrustedHostFenceEventV1};
+
+pub const MAX_TRUSTED_HOST_FENCE_ASSIGNED_CATS: usize = 1_024;
+pub const MAX_TRUSTED_HOST_FENCE_TOTAL_VOLUME_PROOFS: usize = MAX_NODE_OWNED_VOLUMES;
+pub const TRUSTED_HOST_FENCE_RECOVERY_ATTEMPT_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub const TRUSTED_HOST_FENCE_BATCH_RECOVERY_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+const ASSIGNED_VOLUME_DIGEST_DOMAIN: &[u8] = b"cats.trusted-host-fence.assigned-volume.v1";
+const ASSIGNED_CAT_DIGEST_DOMAIN: &[u8] = b"cats.trusted-host-fence.assigned-cat.v1";
+const ASSIGNED_SET_DIGEST_DOMAIN: &[u8] = b"cats.trusted-host-fence.assigned-set.v1";
+const RECOVERY_ATTEMPT_DIGEST_DOMAIN: &[u8] = b"cats.trusted-host-fence.recovery-attempt.v1";
+const RECOVERY_ATTEMPT_ID_DOMAIN: &[u8] = b"cats.trusted-host-fence.recovery-attempt-id.v1";
+const BATCH_RECOVERY_DIGEST_DOMAIN: &[u8] = b"cats.trusted-host-fence.batch-recovery.v1";
+const RECOVERY_ATTEMPT_ID_PREFIX: &str = "host_recovery_v1_";
+
+/// Reference to exact canonical bytes retained in the immutable recovery row.
+/// The mutable current-inventory projection is never a replay dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceCanonicalArtifactV1 {
+    pub content_sha256: Sha256Digest,
+    pub length_bytes: WireU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedHostFenceInventoryUnavailableReasonV1 {
+    NoAcceptedFullInventory,
+    AcceptedFullInventoryNotCurrent,
+}
+
+/// Immutable source-inventory proof captured when the Host-level barrier is
+/// created. Accepted bytes are stored alongside this record under the two
+/// content-addressed references and retain their existing 8/16 MiB caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedHostFenceSourceInventoryV1 {
+    AcceptedFull {
+        session: SessionBinding,
+        attestation: Box<AdmissionInventoryAttestation>,
+        full_observation: TrustedHostFenceCanonicalArtifactV1,
+        assigned_snapshot: TrustedHostFenceCanonicalArtifactV1,
+    },
+    Unavailable {
+        session: SessionBinding,
+        reason: TrustedHostFenceInventoryUnavailableReasonV1,
+        recorded_at_unix_ms: UnixMillis,
+    },
+}
+
+impl TrustedHostFenceSourceInventoryV1 {
+    pub fn session(&self) -> &SessionBinding {
+        match self {
+            Self::AcceptedFull { session, .. } | Self::Unavailable { session, .. } => session,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedHostFenceAssignedCatInventoryV1 {
+    AcceptedFull {
+        observed_runtime: Box<ObservedRuntimeStatus>,
+    },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedHostFenceAssignedVolumeInventoryV1 {
+    AcceptedFull {
+        observed_volume: Box<ObservedVolume>,
+    },
+    Unavailable,
+}
+
+/// Whole PostgreSQL authority plus the exact relevant member of the accepted
+/// full inventory. No `R == L` boolean can replace these fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceExpectedVolumeAuthorityV1 {
+    pub volume_intent_id: Id,
+    pub expected_current_volume: VolumeRecord,
+    pub expected_owner: VolumeOwnerBinding,
+    pub inventory: TrustedHostFenceAssignedVolumeInventoryV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceAssignedCatV1 {
+    pub expected_current_desired: DesiredRuntimeSpec,
+    pub expected_old_operation: Operation,
+    pub inventory: TrustedHostFenceAssignedCatInventoryV1,
+    pub volumes: Vec<TrustedHostFenceExpectedVolumeAuthorityV1>,
+}
+
+/// The immutable Host-level barrier. `assigned_cats` is the exact complete
+/// current set for `binding.node_id`, sorted by Cat ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceRecoveryAttemptV1 {
+    pub version: ContractVersion,
+    pub apply_id: RandomId128,
+    pub principal: FleetPolicyPrincipal,
+    pub binding: HostFenceBinding,
+    pub provider_request: HostFenceAttemptRequest,
+    pub source_inventory: TrustedHostFenceSourceInventoryV1,
+    pub assigned_cats: Vec<TrustedHostFenceAssignedCatV1>,
+    pub assigned_set_sha256: Sha256Digest,
+    pub requested_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedHostFenceStrictVolumeProblemV1 {
+    InventoryUnavailable,
+    DesiredOrAuthorityBindingMismatch,
+    ObservedVolumeBindingMismatch,
+    ObservedAuthorityNotExactOwner,
+    LocalLineagesNotCanonical,
+    CurrentLineageMissing,
+    CurrentLineageDuplicated,
+    CurrentLineageBindingMismatch,
+    CurrentLineageNotActive,
+    LocalGenerationAheadOfRemote,
+    RemoteGenerationDoesNotMatchHead,
+    PendingPacksRemain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedHostFenceRecoveryBlockedReasonV1 {
+    SourceInventoryUnavailable {
+        reason: TrustedHostFenceInventoryUnavailableReasonV1,
+    },
+    RelaxedDurabilityUnprovableAfterInventory {
+        cat_id: Id,
+        volume_id: Id,
+    },
+    StrictVolumeNotSafelyRecoverable {
+        cat_id: Id,
+        volume_id: Id,
+        problem: TrustedHostFenceStrictVolumeProblemV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceBlockedReceiptV1 {
+    pub terminal_event: TrustedHostFenceEventV1,
+    pub reasons: Vec<TrustedHostFenceRecoveryBlockedReasonV1>,
+    pub blocked_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrustedHostFenceRecoveryAttemptStateV1 {
+    ProviderPending,
+    ProviderTerminal {
+        terminal_event: TrustedHostFenceEventV1,
+    },
+    Blocked {
+        receipt: TrustedHostFenceBlockedReceiptV1,
+    },
+    Committed {
+        terminal_event_id: Id,
+        batch_request_sha256: Sha256Digest,
+        committed_at_unix_ms: UnixMillis,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceRecoveryAttemptRecordV1 {
+    pub attempt: TrustedHostFenceRecoveryAttemptV1,
+    pub attempt_sha256: Sha256Digest,
+    pub state: TrustedHostFenceRecoveryAttemptStateV1,
+    pub updated_at_unix_ms: UnixMillis,
+}
+
+/// One authorization and the digest of the immutable expected Volume proof it
+/// consumes. The PostgreSQL transaction reloads that proof from the attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceVolumeRecoveryV1 {
+    pub volume_id: Id,
+    pub expected_volume_sha256: Sha256Digest,
+    pub takeover_authorization: AuthorizationRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceCatRecoveryV1 {
+    pub cat_id: Id,
+    pub assigned_cat_sha256: Sha256Digest,
+    pub replacement_desired: DesiredRuntimeSpec,
+    pub settled_old_operation: Operation,
+    pub recovery_operation: Operation,
+    pub volumes: Vec<TrustedHostFenceVolumeRecoveryV1>,
+}
+
+/// One all-or-nothing commit over the complete immutable attempt. It refers to
+/// the attempt by digest instead of copying its potentially large proof set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceBatchRecoveryCommitV1 {
+    pub version: ContractVersion,
+    pub fence_attempt_id: Id,
+    pub recovery_attempt_sha256: Sha256Digest,
+    pub terminal_event: TrustedHostFenceEventV1,
+    pub recoveries: Vec<TrustedHostFenceCatRecoveryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedHostFenceBatchRecoveryCommitReceiptV1 {
+    pub request_sha256: Sha256Digest,
+    pub commit: Box<TrustedHostFenceBatchRecoveryCommitV1>,
+    pub committed_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TrustedHostFenceRecoveryError {
+    #[error("trusted Host recovery JSON is malformed or non-canonical")]
+    NonCanonicalJson,
+    #[error("trusted Host recovery record exceeds its byte bound")]
+    WireLimit,
+    #[error("trusted Host recovery source binding is inconsistent")]
+    SourceBinding,
+    #[error("trusted Host recovery assigned set is incomplete or unordered")]
+    AssignedSet,
+    #[error("trusted Host recovery assigned-set digest does not match")]
+    AssignedSetDigest,
+    #[error("trusted Host recovery attempt ID does not match")]
+    AttemptId,
+    #[error("trusted Host recovery Cat or Volume proof is invalid")]
+    AssignedProof,
+    #[error("trusted Host recovery attempt digest does not match")]
+    AttemptDigest,
+    #[error("trusted Host recovery batch does not match the immutable attempt")]
+    BatchBinding,
+    #[error("trusted Host recovery batch contains an unsafe takeover")]
+    UnsafeTakeover,
+    #[error("trusted Host recovery terminal event is invalid")]
+    TerminalEvent,
+}
+
+#[derive(Serialize)]
+struct AssignedSetIdentity<'a> {
+    cats: Vec<AssignedCatIdentity<'a>>,
+}
+
+#[derive(Serialize)]
+struct AssignedCatIdentity<'a> {
+    cat_id: &'a Id,
+    assigned_cat_sha256: Sha256Digest,
+}
+
+#[derive(Serialize)]
+struct RecoveryAttemptIdentity<'a> {
+    apply_id: &'a RandomId128,
+    provider_scope: &'a cats_api::runtime_reconciliation::ProviderScope,
+    immutable_host_id: &'a Id,
+    node_id: &'a Id,
+    expected_node_boot_id: &'a NodeBootId,
+    expected_agent_session_epoch: Epoch,
+    assigned_set_sha256: &'a Sha256Digest,
+}
+
+pub fn trusted_host_fence_assigned_volume_sha256(
+    volume: &TrustedHostFenceExpectedVolumeAuthorityV1,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    digest_canonical(ASSIGNED_VOLUME_DIGEST_DOMAIN, volume)
+}
+
+pub fn trusted_host_fence_assigned_cat_sha256(
+    cat: &TrustedHostFenceAssignedCatV1,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    digest_canonical(ASSIGNED_CAT_DIGEST_DOMAIN, cat)
+}
+
+pub fn trusted_host_fence_assigned_set_sha256(
+    cats: &[TrustedHostFenceAssignedCatV1],
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    let identities = cats
+        .iter()
+        .map(|cat| {
+            Ok(AssignedCatIdentity {
+                cat_id: &cat.expected_current_desired.cat_id,
+                assigned_cat_sha256: trusted_host_fence_assigned_cat_sha256(cat)?,
+            })
+        })
+        .collect::<Result<Vec<_>, TrustedHostFenceRecoveryError>>()?;
+    digest_canonical(
+        ASSIGNED_SET_DIGEST_DOMAIN,
+        &AssignedSetIdentity { cats: identities },
+    )
+}
+
+pub fn trusted_host_fence_recovery_attempt_id(
+    apply_id: &RandomId128,
+    binding: &HostFenceBinding,
+    assigned_set_sha256: &Sha256Digest,
+) -> Result<Id, TrustedHostFenceRecoveryError> {
+    let digest = digest_canonical(
+        RECOVERY_ATTEMPT_ID_DOMAIN,
+        &RecoveryAttemptIdentity {
+            apply_id,
+            provider_scope: &binding.provider_scope,
+            immutable_host_id: &binding.immutable_host_id,
+            node_id: &binding.node_id,
+            expected_node_boot_id: &binding.expected_node_boot_id,
+            expected_agent_session_epoch: binding.expected_agent_session_epoch,
+            assigned_set_sha256,
+        },
+    )?;
+    let hex = digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or(TrustedHostFenceRecoveryError::AttemptId)?;
+    Id::new(format!("{RECOVERY_ATTEMPT_ID_PREFIX}{hex}"))
+        .ok_or(TrustedHostFenceRecoveryError::AttemptId)
+}
+
+pub fn trusted_host_fence_recovery_attempt_sha256(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    digest_canonical(RECOVERY_ATTEMPT_DIGEST_DOMAIN, attempt)
+}
+
+pub fn trusted_host_fence_batch_recovery_sha256(
+    commit: &TrustedHostFenceBatchRecoveryCommitV1,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    digest_canonical(BATCH_RECOVERY_DIGEST_DOMAIN, commit)
+}
+
+pub fn encode_trusted_host_fence_recovery_attempt_v1(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+) -> Result<Vec<u8>, TrustedHostFenceRecoveryError> {
+    validate_trusted_host_fence_recovery_attempt_v1(attempt)?;
+    encode_bounded(attempt, TRUSTED_HOST_FENCE_RECOVERY_ATTEMPT_MAX_BYTES)
+}
+
+pub fn decode_trusted_host_fence_recovery_attempt_v1(
+    bytes: &[u8],
+) -> Result<TrustedHostFenceRecoveryAttemptV1, TrustedHostFenceRecoveryError> {
+    let attempt = decode_bounded(bytes, TRUSTED_HOST_FENCE_RECOVERY_ATTEMPT_MAX_BYTES)?;
+    validate_trusted_host_fence_recovery_attempt_v1(&attempt)?;
+    Ok(attempt)
+}
+
+pub fn encode_trusted_host_fence_batch_recovery_commit_v1(
+    commit: &TrustedHostFenceBatchRecoveryCommitV1,
+) -> Result<Vec<u8>, TrustedHostFenceRecoveryError> {
+    encode_bounded(commit, TRUSTED_HOST_FENCE_BATCH_RECOVERY_MAX_BYTES)
+}
+
+pub fn decode_trusted_host_fence_batch_recovery_commit_v1(
+    bytes: &[u8],
+) -> Result<TrustedHostFenceBatchRecoveryCommitV1, TrustedHostFenceRecoveryError> {
+    decode_bounded(bytes, TRUSTED_HOST_FENCE_BATCH_RECOVERY_MAX_BYTES)
+}
+
+pub fn validate_trusted_host_fence_recovery_attempt_v1(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    if attempt.version != ContractVersion::V1
+        || attempt.provider_request.binding != attempt.binding
+        || attempt.source_inventory.session().node_id != attempt.binding.node_id
+        || attempt.source_inventory.session().node_boot_id != attempt.binding.expected_node_boot_id
+        || attempt.source_inventory.session().agent_session_epoch
+            != attempt.binding.expected_agent_session_epoch
+    {
+        return Err(TrustedHostFenceRecoveryError::SourceBinding);
+    }
+    if let TrustedHostFenceSourceInventoryV1::AcceptedFull {
+        session,
+        attestation,
+        full_observation,
+        assigned_snapshot,
+    } = &attempt.source_inventory
+    {
+        if attestation.version != ContractVersion::V1
+            || attestation.node_id != session.node_id
+            || attestation.agent_session_epoch != session.agent_session_epoch
+            || full_observation.length_bytes.get() == 0
+            || full_observation.length_bytes.get()
+                > cats_api::runtime_reconciliation::NODE_OBSERVATION_MAX_WIRE_BYTES as u64
+            || assigned_snapshot.length_bytes.get() == 0
+            || assigned_snapshot.length_bytes.get()
+                > cats_api::runtime_reconciliation::DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES as u64
+        {
+            return Err(TrustedHostFenceRecoveryError::SourceBinding);
+        }
+    }
+    if attempt.assigned_cats.is_empty()
+        || attempt.assigned_cats.len() > MAX_TRUSTED_HOST_FENCE_ASSIGNED_CATS
+    {
+        return Err(TrustedHostFenceRecoveryError::AssignedSet);
+    }
+    let mut prior_cat: Option<&Id> = None;
+    let mut total_volumes = 0_usize;
+    for cat in &attempt.assigned_cats {
+        let cat_id = &cat.expected_current_desired.cat_id;
+        if prior_cat.is_some_and(|prior| prior.as_str() >= cat_id.as_str()) {
+            return Err(TrustedHostFenceRecoveryError::AssignedSet);
+        }
+        prior_cat = Some(cat_id);
+        total_volumes = total_volumes
+            .checked_add(cat.volumes.len())
+            .ok_or(TrustedHostFenceRecoveryError::AssignedSet)?;
+        validate_assigned_cat(attempt, cat)?;
+    }
+    if total_volumes > MAX_TRUSTED_HOST_FENCE_TOTAL_VOLUME_PROOFS {
+        return Err(TrustedHostFenceRecoveryError::AssignedSet);
+    }
+    let assigned_set_sha256 = trusted_host_fence_assigned_set_sha256(&attempt.assigned_cats)?;
+    if attempt.assigned_set_sha256 != assigned_set_sha256 {
+        return Err(TrustedHostFenceRecoveryError::AssignedSetDigest);
+    }
+    if attempt.binding.fence_attempt_id
+        != trusted_host_fence_recovery_attempt_id(
+            &attempt.apply_id,
+            &attempt.binding,
+            &assigned_set_sha256,
+        )?
+    {
+        return Err(TrustedHostFenceRecoveryError::AttemptId);
+    }
+    let bytes =
+        serde_json::to_vec(attempt).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
+    if bytes.len() > TRUSTED_HOST_FENCE_RECOVERY_ATTEMPT_MAX_BYTES {
+        return Err(TrustedHostFenceRecoveryError::WireLimit);
+    }
+    Ok(())
+}
+
+pub fn trusted_host_fence_recovery_blockers(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+) -> Result<Vec<TrustedHostFenceRecoveryBlockedReasonV1>, TrustedHostFenceRecoveryError> {
+    validate_trusted_host_fence_recovery_attempt_v1(attempt)?;
+    let mut reasons = Vec::new();
+    if let TrustedHostFenceSourceInventoryV1::Unavailable { reason, .. } = &attempt.source_inventory
+    {
+        reasons.push(
+            TrustedHostFenceRecoveryBlockedReasonV1::SourceInventoryUnavailable { reason: *reason },
+        );
+    }
+    for cat in &attempt.assigned_cats {
+        for volume in &cat.volumes {
+            if volume.expected_current_volume.durability != VolumeDurability::Strict {
+                reasons.push(
+                    TrustedHostFenceRecoveryBlockedReasonV1::RelaxedDurabilityUnprovableAfterInventory {
+                        cat_id: cat.expected_current_desired.cat_id.clone(),
+                        volume_id: volume.expected_current_volume.volume_id.clone(),
+                    },
+                );
+                continue;
+            }
+            if let Err(problem) = validate_strict_volume(cat, volume) {
+                reasons.push(
+                    TrustedHostFenceRecoveryBlockedReasonV1::StrictVolumeNotSafelyRecoverable {
+                        cat_id: cat.expected_current_desired.cat_id.clone(),
+                        volume_id: volume.expected_current_volume.volume_id.clone(),
+                        problem,
+                    },
+                );
+            }
+        }
+    }
+    Ok(reasons)
+}
+
+pub fn validate_trusted_host_fence_batch_recovery_commit_v1(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+    commit: &TrustedHostFenceBatchRecoveryCommitV1,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    validate_trusted_host_fence_recovery_attempt_v1(attempt)?;
+    if !trusted_host_fence_recovery_blockers(attempt)?.is_empty() {
+        return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+    }
+    validate_trusted_host_fence_event_v1(&commit.terminal_event)
+        .map_err(|_| TrustedHostFenceRecoveryError::TerminalEvent)?;
+    let attempt_sha256 = trusted_host_fence_recovery_attempt_sha256(attempt)?;
+    if commit.version != ContractVersion::V1
+        || commit.fence_attempt_id != attempt.binding.fence_attempt_id
+        || commit.recovery_attempt_sha256 != attempt_sha256
+        || commit.terminal_event.binding != attempt.binding
+        || commit.recoveries.len() != attempt.assigned_cats.len()
+    {
+        return Err(TrustedHostFenceRecoveryError::BatchBinding);
+    }
+    for (assigned, recovery) in attempt.assigned_cats.iter().zip(&commit.recoveries) {
+        validate_cat_recovery(assigned, recovery, &commit.terminal_event)?;
+    }
+    let bytes =
+        serde_json::to_vec(commit).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
+    if bytes.len() > TRUSTED_HOST_FENCE_BATCH_RECOVERY_MAX_BYTES {
+        return Err(TrustedHostFenceRecoveryError::WireLimit);
+    }
+    trusted_host_fence_batch_recovery_sha256(commit)
+}
+
+fn validate_assigned_cat(
+    attempt: &TrustedHostFenceRecoveryAttemptV1,
+    cat: &TrustedHostFenceAssignedCatV1,
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    let desired = &cat.expected_current_desired;
+    let operation = &cat.expected_old_operation;
+    if desired.version != ContractVersion::V1
+        || desired.placement.node_id != attempt.binding.node_id
+        || operation.version != ContractVersion::V1
+        || operation.workspace_id != desired.workspace_id
+        || operation.cat_id != desired.cat_id
+        || operation.desired_revision != desired.desired_revision
+        || operation.desired_spec_digest != desired.spec_digest
+        || operation.placement != desired.placement
+        || operation.target != desired.target
+        || operation.phase != OperationPhase::Pending
+        || operation.terminal.is_some()
+        || cat.volumes.len() != desired.volumes.len()
+        || cat.volumes.len() > 64
+    {
+        return Err(TrustedHostFenceRecoveryError::AssignedProof);
+    }
+    match (&attempt.source_inventory, &cat.inventory) {
+        (
+            TrustedHostFenceSourceInventoryV1::AcceptedFull { .. },
+            TrustedHostFenceAssignedCatInventoryV1::AcceptedFull { observed_runtime },
+        ) if observed_runtime.cat_id == desired.cat_id => {}
+        (
+            TrustedHostFenceSourceInventoryV1::Unavailable { .. },
+            TrustedHostFenceAssignedCatInventoryV1::Unavailable,
+        ) => {}
+        _ => return Err(TrustedHostFenceRecoveryError::AssignedProof),
+    }
+    let mut prior_volume: Option<&Id> = None;
+    for (intent, volume) in desired.volumes.iter().zip(&cat.volumes) {
+        if prior_volume.is_some_and(|prior| prior.as_str() >= intent.volume_intent_id.as_str())
+            || volume.volume_intent_id != intent.volume_intent_id
+            || volume.expected_current_volume.volume_id != intent.volume_id
+            || volume.expected_owner.volume_id != intent.volume_id
+            || volume.expected_owner.owner_node_id != attempt.binding.node_id
+            || volume.expected_owner.attachment_id != intent.attachment_id
+            || volume.expected_owner.attachment_epoch != volume.expected_current_volume.lease_epoch
+            || volume.expected_current_volume.lease_owner.as_ref() != Some(&intent.attachment_id)
+        {
+            return Err(TrustedHostFenceRecoveryError::AssignedProof);
+        }
+        validate_volume_record(&volume.expected_current_volume)
+            .map_err(|_| TrustedHostFenceRecoveryError::AssignedProof)?;
+        match (&attempt.source_inventory, &volume.inventory) {
+            (
+                TrustedHostFenceSourceInventoryV1::AcceptedFull { .. },
+                TrustedHostFenceAssignedVolumeInventoryV1::AcceptedFull { .. },
+            ) => {}
+            (
+                TrustedHostFenceSourceInventoryV1::Unavailable { .. },
+                TrustedHostFenceAssignedVolumeInventoryV1::Unavailable,
+            ) => {}
+            _ => return Err(TrustedHostFenceRecoveryError::AssignedProof),
+        }
+        prior_volume = Some(&intent.volume_intent_id);
+    }
+    Ok(())
+}
+
+fn validate_strict_volume(
+    cat: &TrustedHostFenceAssignedCatV1,
+    volume: &TrustedHostFenceExpectedVolumeAuthorityV1,
+) -> Result<(), TrustedHostFenceStrictVolumeProblemV1> {
+    let desired = &cat.expected_current_desired;
+    let intent = desired
+        .volumes
+        .iter()
+        .find(|intent| intent.volume_intent_id == volume.volume_intent_id)
+        .ok_or(TrustedHostFenceStrictVolumeProblemV1::DesiredOrAuthorityBindingMismatch)?;
+    let TrustedHostFenceAssignedVolumeInventoryV1::AcceptedFull { observed_volume } =
+        &volume.inventory
+    else {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::InventoryUnavailable);
+    };
+    if observed_volume.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
+        || observed_volume.disk_id.as_ref() != Some(&intent.disk_id)
+        || observed_volume.volume_id != intent.volume_id
+        || observed_volume.size_bytes != Some(volume.expected_current_volume.size_bytes)
+    {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::ObservedVolumeBindingMismatch);
+    }
+    let cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &observed_volume.authority
+    else {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::ObservedAuthorityNotExactOwner);
+    };
+    if attachment_id != &volume.expected_owner.attachment_id
+        || *attachment_epoch != volume.expected_owner.attachment_epoch
+        || head != &volume.expected_current_volume.head
+    {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::ObservedAuthorityNotExactOwner);
+    }
+    let mut prior_key: Option<(String, u64, String, u64, String)> = None;
+    for lineage in &observed_volume.local_lineages {
+        let key = (
+            lineage.attachment_id.as_str().to_owned(),
+            lineage.attachment_epoch.get(),
+            lineage.node_id.as_str().to_owned(),
+            lineage.placement_epoch.get(),
+            lineage.data_directory.as_str().to_owned(),
+        );
+        if prior_key.as_ref().is_some_and(|prior| prior >= &key) {
+            return Err(TrustedHostFenceStrictVolumeProblemV1::LocalLineagesNotCanonical);
+        }
+        prior_key = Some(key);
+    }
+    let matching = observed_volume
+        .local_lineages
+        .iter()
+        .filter(|lineage| {
+            lineage.attachment_id == volume.expected_owner.attachment_id
+                && lineage.attachment_epoch == volume.expected_owner.attachment_epoch
+                && lineage.node_id == volume.expected_owner.owner_node_id
+                && lineage.placement_epoch == desired.placement.placement_epoch
+        })
+        .collect::<Vec<_>>();
+    let [lineage] = matching.as_slice() else {
+        return Err(if matching.is_empty() {
+            TrustedHostFenceStrictVolumeProblemV1::CurrentLineageMissing
+        } else {
+            TrustedHostFenceStrictVolumeProblemV1::CurrentLineageDuplicated
+        });
+    };
+    if !lineage_origin_matches(
+        intent,
+        &volume.expected_current_volume,
+        &lineage.acquire_origin,
+    ) {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::CurrentLineageBindingMismatch);
+    }
+    if lineage.state != LocalLineageState::Active {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::CurrentLineageNotActive);
+    }
+    if lineage.local_durable_generation > lineage.remote_durable_generation {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::LocalGenerationAheadOfRemote);
+    }
+    if lineage.remote_durable_generation != volume.expected_current_volume.head.generation
+        || lineage.local_durable_generation != volume.expected_current_volume.head.generation
+    {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::RemoteGenerationDoesNotMatchHead);
+    }
+    if lineage.pending_pack_count.get() != 0 {
+        return Err(TrustedHostFenceStrictVolumeProblemV1::PendingPacksRemain);
+    }
+    Ok(())
+}
+
+fn lineage_origin_matches(
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    record: &VolumeRecord,
+    origin: &AcquireOrigin,
+) -> bool {
+    match (&intent.acquire, &record.last_transition, origin) {
+        (
+            cats_api::runtime_reconciliation::VolumeAcquire::Normal { transition_id, .. },
+            Some(LastVolumeTransition::NormalAcquire { request, result }),
+            AcquireOrigin::Normal {
+                transition_id: lineage_transition,
+            },
+        ) => {
+            transition_id == lineage_transition
+                && request.transition_id == *transition_id
+                && result.transition_id == *transition_id
+                && result.attachment_id == intent.attachment_id
+                && result.resulting_epoch == record.lease_epoch
+                && result.resulting_head == record.head
+        }
+        (
+            cats_api::runtime_reconciliation::VolumeAcquire::Takeover { authorization_id },
+            Some(LastVolumeTransition::Takeover {
+                authorization_id: marker,
+            }),
+            AcquireOrigin::Takeover {
+                authorization_id: lineage_authorization,
+            },
+        ) => authorization_id == marker && authorization_id == lineage_authorization,
+        _ => false,
+    }
+}
+
+fn validate_cat_recovery(
+    assigned: &TrustedHostFenceAssignedCatV1,
+    recovery: &TrustedHostFenceCatRecoveryV1,
+    terminal_event: &TrustedHostFenceEventV1,
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    let current = &assigned.expected_current_desired;
+    if recovery.cat_id != current.cat_id
+        || recovery.assigned_cat_sha256 != trusted_host_fence_assigned_cat_sha256(assigned)?
+        || recovery.replacement_desired.workspace_id != current.workspace_id
+        || recovery.replacement_desired.cat_id != current.cat_id
+        || recovery.replacement_desired.placement.node_id == terminal_event.binding.node_id
+        || recovery.replacement_desired.desired_revision.get()
+            != current
+                .desired_revision
+                .get()
+                .checked_add(1)
+                .ok_or(TrustedHostFenceRecoveryError::BatchBinding)?
+        || recovery.settled_old_operation.operation_id
+            != assigned.expected_old_operation.operation_id
+        || recovery.settled_old_operation.phase != OperationPhase::Failed
+        || recovery.recovery_operation.phase != OperationPhase::Pending
+        || recovery.recovery_operation.terminal.is_some()
+        || recovery.volumes.len() != assigned.volumes.len()
+    {
+        return Err(TrustedHostFenceRecoveryError::BatchBinding);
+    }
+    let Some(OperationTerminal::Failed { error, .. }) = &recovery.settled_old_operation.terminal
+    else {
+        return Err(TrustedHostFenceRecoveryError::BatchBinding);
+    };
+    if !matches!(
+        error.as_ref(),
+        OperationFailure::HostLost {
+            node_id,
+            agent_session_epoch,
+            host_fence_event_id,
+        } if node_id == &terminal_event.binding.node_id
+            && *agent_session_epoch == terminal_event.binding.expected_agent_session_epoch
+            && host_fence_event_id == &terminal_event.event_id
+    ) {
+        return Err(TrustedHostFenceRecoveryError::BatchBinding);
+    }
+    for (expected, volume) in assigned.volumes.iter().zip(&recovery.volumes) {
+        if volume.volume_id != expected.expected_current_volume.volume_id
+            || volume.expected_volume_sha256 != trusted_host_fence_assigned_volume_sha256(expected)?
+        {
+            return Err(TrustedHostFenceRecoveryError::BatchBinding);
+        }
+        validate_authorization_record(&volume.takeover_authorization)
+            .map_err(|_| TrustedHostFenceRecoveryError::UnsafeTakeover)?;
+        let VolumeAuthorization::Takeover(authorization) =
+            &volume.takeover_authorization.authorization
+        else {
+            return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+        };
+        if authorization.host_fence_event_id != terminal_event.event_id
+            || authorization.volume_id != expected.expected_current_volume.volume_id
+            || authorization.expected_attachment_id != expected.expected_owner.attachment_id
+            || authorization.expected_epoch != expected.expected_owner.attachment_epoch
+            || authorization.expected_head != expected.expected_current_volume.head
+            || authorization.authorized_node_id != recovery.replacement_desired.placement.node_id
+            || authorization.desired_revision != recovery.replacement_desired.desired_revision
+            || authorization.new_placement_epoch
+                != recovery.replacement_desired.placement.placement_epoch
+        {
+            return Err(TrustedHostFenceRecoveryError::UnsafeTakeover);
+        }
+    }
+    Ok(())
+}
+
+fn encode_bounded<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<Vec<u8>, TrustedHostFenceRecoveryError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
+    if bytes.len() > limit {
+        return Err(TrustedHostFenceRecoveryError::WireLimit);
+    }
+    Ok(bytes)
+}
+
+fn decode_bounded<T: for<'de> Deserialize<'de> + Serialize>(
+    bytes: &[u8],
+    limit: usize,
+) -> Result<T, TrustedHostFenceRecoveryError> {
+    if bytes.len() > limit {
+        return Err(TrustedHostFenceRecoveryError::WireLimit);
+    }
+    let value = serde_json::from_slice(bytes)
+        .map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
+    if serde_json::to_vec(&value).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?
+        != bytes
+    {
+        return Err(TrustedHostFenceRecoveryError::NonCanonicalJson);
+    }
+    Ok(value)
+}
+
+fn digest_canonical<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<Sha256Digest, TrustedHostFenceRecoveryError> {
+    let canonical =
+        serde_json::to_vec(value).map_err(|_| TrustedHostFenceRecoveryError::NonCanonicalJson)?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(canonical);
+    Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
+}
