@@ -139,8 +139,8 @@ struct LockedTakeoverMutation<'transaction, 'connection> {
 }
 
 enum TakeoverFenceEvent {
-    Legacy(HostFenceEvent),
-    TrustedTerminalV1(TrustedHostFenceEventV1),
+    Legacy(Box<HostFenceEvent>),
+    TrustedTerminalV1(Box<TrustedHostFenceEventV1>),
 }
 
 impl TakeoverFenceEvent {
@@ -189,10 +189,12 @@ fn load_takeover_fence_event_for_update(
     };
     match row.try_get::<_, String>("state")?.as_str() {
         "active" | "rejoined" => load_event_for_update(transaction, event_id)?
+            .map(Box::new)
             .map(TakeoverFenceEvent::Legacy)
             .map(Some)
             .ok_or_else(|| AuthorityError::BackendUnknown.into()),
         "terminal_v1" => load_terminal_event_for_update(transaction, event_id)?
+            .map(Box::new)
             .map(TakeoverFenceEvent::TrustedTerminalV1)
             .map(Some)
             .ok_or_else(|| AuthorityError::BackendUnknown.into()),
