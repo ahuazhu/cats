@@ -113,6 +113,8 @@ pub struct RouteGrantV2RingInstaller {
     #[cfg(test)]
     crash_after_rename: AtomicBool,
     #[cfg(test)]
+    post_ownership_filesystem_failure: AtomicBool,
+    #[cfg(test)]
     pre_publication_gate: Mutex<Option<Arc<PrePublicationGate>>>,
 }
 
@@ -139,6 +141,8 @@ impl RouteGrantV2RingInstaller {
             emergency_close,
             #[cfg(test)]
             crash_after_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            post_ownership_filesystem_failure: AtomicBool::new(false),
             #[cfg(test)]
             pre_publication_gate: Mutex::new(None),
         }
@@ -205,12 +209,21 @@ impl RouteGrantV2RingInstaller {
         context.check_active()?;
         #[cfg(test)]
         self.wait_at_pre_publication_gate();
-        opened.publish(&current_file, &candidate, candidate_bytes, context)?;
+        opened.publish(&current_file, &candidate, candidate_bytes, context, || {
+            self.fail_close_if_empty(&candidate);
+            #[cfg(test)]
+            if self
+                .post_ownership_filesystem_failure
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(RouteGrantV2DurableInstallError::Filesystem);
+            }
+            Ok(())
+        })?;
         #[cfg(test)]
         if self.crash_after_rename.swap(false, Ordering::AcqRel) {
             return Err(RouteGrantV2DurableInstallError::InjectedCrashAfterRename);
         }
-        self.fail_close_if_empty(&candidate);
         self.verifier
             .replace_artifact(&candidate)
             .map_err(map_verifier_error)?;
@@ -269,6 +282,7 @@ impl RouteGrantV2RingInstaller {
             serialized,
             emergency_close,
             crash_after_rename: AtomicBool::new(false),
+            post_ownership_filesystem_failure: AtomicBool::new(false),
             pre_publication_gate: Mutex::new(None),
         }
     }
@@ -276,6 +290,12 @@ impl RouteGrantV2RingInstaller {
     #[cfg(test)]
     fn inject_crash_after_rename_once(&self) {
         self.crash_after_rename.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn inject_post_ownership_filesystem_failure_once(&self) {
+        self.post_ownership_filesystem_failure
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -490,13 +510,17 @@ impl OpenedRingDirectory {
         })
     }
 
-    fn publish(
+    fn publish<F>(
         &self,
         current: &PinnedRingFile,
         candidate: &RouteGrantV2PublicKeyRingArtifact,
         candidate_bytes: &[u8],
         context: &RouteGrantV2RingInstallContext,
-    ) -> Result<(), RouteGrantV2DurableInstallError> {
+        after_publication_owned: F,
+    ) -> Result<(), RouteGrantV2DurableInstallError>
+    where
+        F: FnOnce() -> Result<(), RouteGrantV2DurableInstallError>,
+    {
         context.check_active()?;
         self.revalidate_current(current, false)?;
         let parent_metadata =
@@ -562,6 +586,7 @@ impl OpenedRingDirectory {
         // publication wins, cancellation cannot interrupt rename, directory
         // fsync, verification, or the caller-visible ACK.
         context.begin_publication()?;
+        after_publication_owned()?;
         rename_at(
             fresh.parent_descriptor(),
             &temp_name,
@@ -1081,6 +1106,44 @@ mod tests {
     }
 
     #[test]
+    fn post_ownership_filesystem_failure_closes_empty_successor_without_ack() {
+        let (first, _) = rings();
+        let empty = empty_successor(&first);
+        let (root, verifier) = fixture(&first);
+        let ring_path = root.path().join("route-v2").join(RING_BASENAME);
+        let before = std::fs::read(&ring_path).unwrap();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&closes);
+        let installer = RouteGrantV2RingInstaller::for_test_with_emergency_close(
+            root.path(),
+            Arc::clone(&verifier),
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let context = RouteGrantV2RingInstallContext::default();
+        installer.inject_post_ownership_filesystem_failure_once();
+
+        assert!(matches!(
+            installer.install(
+                &encode_route_grant_v2_public_key_ring(&empty).unwrap(),
+                &context,
+            ),
+            Err(RouteGrantV2DurableInstallError::Filesystem)
+        ));
+        assert_eq!(
+            context.publication.load(Ordering::Acquire),
+            PUBLICATION_OWNED
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(ring_path).unwrap(), before);
+        assert_eq!(
+            verifier.current_ring().unwrap().version(),
+            first.ring_version
+        );
+    }
+
+    #[test]
     fn empty_successor_recovery_closes_before_verifier_swap() {
         let (first, _) = rings();
         let empty = empty_successor(&first);
@@ -1108,7 +1171,8 @@ mod tests {
             installer.install(&bytes, &RouteGrantV2RingInstallContext::default()),
             Err(RouteGrantV2DurableInstallError::InjectedCrashAfterRename)
         ));
-        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(*observed.lock().unwrap(), vec![(1, false)]);
         assert_eq!(
             verifier.current_ring().unwrap().version(),
             first.ring_version
@@ -1120,8 +1184,8 @@ mod tests {
                 .unwrap(),
             RouteGrantV2DurableInstallOutcome::RecoveredAfterDurableRename
         );
-        assert_eq!(closes.load(Ordering::SeqCst), 1);
-        assert_eq!(*observed.lock().unwrap(), vec![(1, false)]);
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
+        assert_eq!(*observed.lock().unwrap(), vec![(1, false), (1, false)]);
         assert!(verifier.current_ring().unwrap().loaded_kids().is_empty());
     }
 
