@@ -42,6 +42,39 @@ SHA_D = "sha256:" + "d" * 64
 COMMIT = "1" * 40
 
 
+def usage_target(name: str) -> dict[str, Any]:
+    resource_name = name.replace("_", "-")
+    return {
+        "archive_bucket_arn": f"arn:aws:s3:::usage-{resource_name}-archive",
+        "archive_bucket_name": f"usage-{resource_name}-archive",
+        "aws_account_id": "123456789012",
+        "aws_region": "us-east-1",
+        "checkpoint_table_arn": (
+            "arn:aws:dynamodb:us-east-1:123456789012:"
+            f"table/usage-{resource_name}-checkpoints"
+        ),
+        "checkpoint_table_name": f"usage-{resource_name}-checkpoints",
+        "stream_arn": (
+            "arn:aws:kinesis:us-east-1:123456789012:"
+            f"stream/usage-{resource_name}"
+        ),
+        "stream_name": f"usage-{resource_name}",
+        "usage_schema": f"cats_usage_{name}",
+    }
+
+
+def reset_target(name: str) -> dict[str, Any]:
+    return {
+        "chunkstore_bucket": f"chunks-{name}",
+        "chunkstore_object_prefix": f"chunks-{name}/",
+        "control_schema": f"cats_control_{name}",
+        "usage_archive_bucket": f"usage-{name}-archive",
+        "usage_checkpoint_table": f"usage-{name}-checkpoints",
+        "usage_kinesis_stream": f"usage-{name}",
+        "usage_schema": f"cats_usage_{name}",
+    }
+
+
 def verified(name: str, value: Any) -> Any:
     data = PROOF.canonical_json(value, newline=True)
     return PROOF.VerifiedFile(
@@ -59,7 +92,12 @@ def opaque(name: str, marker: str) -> Any:
 def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, Any]]:
     targets = verified(
         PROOF.USAGE_TERMINAL_TARGETS_FILE,
-        {"fresh_target": {}, "old_target": {}, "shards": [], "version": 1},
+        {
+            "fresh_target": usage_target("fresh"),
+            "old_target": usage_target("old"),
+            "shards": [],
+            "version": 1,
+        },
     )
     runs = (
         PROOF.QualifiedRun(
@@ -94,8 +132,8 @@ def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, 
         "artifact_sha256": "2" * 64,
         "contract_version": 1,
         "created_at_unix_ms": 250,
-        "fresh_target": {},
-        "old_target": {},
+        "fresh_target": usage_target("fresh"),
+        "old_target": usage_target("old"),
         "release_commit": COMMIT,
         "shards": [],
         "source_set_sha256": source_set,
@@ -106,7 +144,16 @@ def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, 
     receipt = opaque(PROOF.USAGE_TERMINAL_RECEIPT_FILE, "receipt")
     verification_file = opaque(PROOF.USAGE_TERMINAL_VERIFICATION_FILE, "verified")
     verification = {
-        "target_binding_sha256": SHA_C,
+        "target_binding_sha256": "sha256:"
+        + hashlib.sha256(
+            PROOF.canonical_json(
+                PROOF.decode_json(
+                    targets.data,
+                    "fixture Usage targets",
+                    canonical_lf=True,
+                )
+            )
+        ).hexdigest(),
         "target_request_sha256": SHA_D,
     }
     context = PROOF.ProducerContext(
@@ -118,8 +165,10 @@ def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, 
         usage_terminal_verifier_binary_sha256=SHA_B,
         qualification_manifest_sha256=SHA_C,
         qualification_catalog_sha256=SHA_D,
-        old_targets={},
-        fresh_targets={},
+        aws_account_id="123456789012",
+        aws_region="us-east-1",
+        old_targets=reset_target("old"),
+        fresh_targets=reset_target("fresh"),
     )
     manifest_value = {
         "block_runs": [
@@ -160,6 +209,104 @@ def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, 
         runs,
         verification,
     )
+
+
+def usage_verification_projection(
+    targets: Any,
+    request: Any,
+    receipt: Any,
+    context: Any,
+) -> dict[str, Any]:
+    targets_value = PROOF.decode_json(
+        targets.data,
+        "fixture Usage targets",
+        canonical_lf=True,
+    )
+    return {
+        "binary_sha256": context.usage_terminal_verifier_binary_sha256,
+        "expected_request_file_sha256": request.sha256,
+        "expected_targets_file_sha256": targets.sha256,
+        "kind": PROOF.USAGE_TERMINAL_VERIFICATION_KIND,
+        "release_commit": context.release_commit,
+        "target_binding_sha256": "sha256:"
+        + hashlib.sha256(PROOF.canonical_json(targets_value)).hexdigest(),
+        "target_receipt_file_sha256": receipt.sha256,
+        "target_request_sha256": SHA_D,
+        "validated": True,
+        "version": 1,
+        "worker_bundle_sha256": context.worker_bundle_sha256,
+    }
+
+
+def validate_usage_targets_match_reset_targets() -> None:
+    (
+        _manifest,
+        targets,
+        request,
+        receipt,
+        _verification_file,
+        context,
+        _runs,
+        _verification,
+    ) = fixture()
+    PROOF._validate_usage_verification_projection(
+        usage_verification_projection(targets, request, receipt, context),
+        receipt=receipt,
+        expected_request=request,
+        expected_targets=targets,
+        context=context,
+    )
+
+    foreign_targets_value = {
+        "fresh_target": usage_target("foreign_fresh"),
+        "old_target": usage_target("foreign_old"),
+        "shards": [],
+        "version": 1,
+    }
+    foreign_targets = verified(
+        PROOF.USAGE_TERMINAL_TARGETS_FILE,
+        foreign_targets_value,
+    )
+    foreign_request_value = PROOF.decode_json(
+        request.data,
+        "fixture Usage request",
+        canonical_lf=True,
+    )
+    foreign_request_value["old_target"] = foreign_targets_value["old_target"]
+    foreign_request_value["fresh_target"] = foreign_targets_value["fresh_target"]
+    foreign_request = verified(
+        PROOF.USAGE_TERMINAL_REQUEST_FILE,
+        foreign_request_value,
+    )
+    foreign_receipt = verified(
+        PROOF.USAGE_TERMINAL_RECEIPT_FILE,
+        {
+            "barriers": [],
+            "contract_version": 1,
+            "request": foreign_request_value,
+            "request_sha256": SHA_D,
+            "source_receipts": [],
+        },
+    )
+    try:
+        PROOF._validate_usage_verification_projection(
+            usage_verification_projection(
+                foreign_targets,
+                foreign_request,
+                foreign_receipt,
+                context,
+            ),
+            receipt=foreign_receipt,
+            expected_request=foreign_request,
+            expected_targets=foreign_targets,
+            context=context,
+        )
+    except PROOF.ProofSetError:
+        pass
+    else:
+        raise AssertionError(
+            "coherent foreign Usage terminal targets escaped the reset binding"
+        )
 
 
 def validate_with_request(request_value: dict[str, Any]) -> None:
@@ -700,6 +847,7 @@ def main() -> int:
         except PROOF.ProofSetError:
             continue
         raise AssertionError("non-closed per-run SHA256SUMS was accepted")
+    validate_usage_targets_match_reset_targets()
     validate_inventory_is_observation_only()
     validate_release_bound_usage_subprocess()
     validate_release_bound_usage_schema_subprocess()

@@ -432,6 +432,8 @@ class ProducerContext:
     usage_terminal_verifier_binary_sha256: str
     qualification_manifest_sha256: str
     qualification_catalog_sha256: str
+    aws_account_id: str
+    aws_region: str
     old_targets: dict[str, Any]
     fresh_targets: dict[str, Any]
 
@@ -1063,6 +1065,8 @@ class VerifiedProofSet:
             ),
             qualification_manifest_sha256=self.qualification_manifest_sha256,
             qualification_catalog_sha256=self.qualification_catalog_sha256,
+            aws_account_id=self.value["fresh"]["aws_account_id"],
+            aws_region=self.value["fresh"]["aws_region"],
             old_targets=self.value["old"],
             fresh_targets=self.value["fresh"]["targets"],
         )
@@ -1333,6 +1337,45 @@ def _validate_usage_verification_projection(
     )
     if not version_one(targets["version"]):
         raise ProofSetError("E9 expected-targets version drifted")
+    usage_target_fields = {
+        "aws_account_id",
+        "aws_region",
+        "usage_schema",
+        "stream_name",
+        "stream_arn",
+        "checkpoint_table_name",
+        "checkpoint_table_arn",
+        "archive_bucket_name",
+        "archive_bucket_arn",
+    }
+    old_usage_target = fields(
+        targets["old_target"],
+        usage_target_fields,
+        "E9 old Usage target",
+    )
+    fresh_usage_target = fields(
+        targets["fresh_target"],
+        usage_target_fields,
+        "E9 fresh Usage target",
+    )
+    for label, usage_target, reset_target in (
+        ("old", old_usage_target, context.old_targets),
+        ("fresh", fresh_usage_target, context.fresh_targets),
+    ):
+        if (
+            usage_target["aws_account_id"] != context.aws_account_id
+            or usage_target["aws_region"] != context.aws_region
+            or usage_target["usage_schema"] != reset_target["usage_schema"]
+            or usage_target["stream_name"]
+            != reset_target["usage_kinesis_stream"]
+            or usage_target["checkpoint_table_name"]
+            != reset_target["usage_checkpoint_table"]
+            or usage_target["archive_bucket_name"]
+            != reset_target["usage_archive_bucket"]
+        ):
+            raise ProofSetError(
+                f"E9 {label} Usage target differs from the reset target"
+            )
     expected_binding_sha256 = "sha256:" + hashlib.sha256(
         canonical_json(targets)
     ).hexdigest()
@@ -3149,6 +3192,8 @@ def verify(
             qualification_catalog_sha256=release[
                 "qualification_catalog_sha256"
             ],
+            aws_account_id=fresh["aws_account_id"],
+            aws_region=fresh["aws_region"],
             old_targets=old_targets,
             fresh_targets=fresh_targets,
         )
