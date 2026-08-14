@@ -7,7 +7,7 @@ use cats_api::runtime_reconciliation::{AsciiText, Id, ProviderScope};
 use cats_control_plane::object_write_gateway::{
     run_object_write_gateway, ObjectWriteGatewayConfig,
 };
-use cats_control_plane::store::{DsnSource, Store};
+use cats_control_plane::store::{DsnSource, ObjectWriteGatewayClient};
 use cats_host_fence_aws::{
     AwsObjectWriteConfig, AwsObjectWriteGatewayDownstream, VerifiedAwsProviderBinding,
 };
@@ -36,6 +36,8 @@ struct Args {
     control_store_url_file: PathBuf,
     #[arg(long, env = "CATS_CONTROL_POSTGRES_CA_FILE")]
     control_store_ca_file: PathBuf,
+    #[arg(long, env = "CATS_CONTROL_POSTGRES_SCHEMA")]
+    control_store_schema: String,
     #[arg(
         long,
         env = "CATS_OBJECT_WRITE_GATEWAY_SERVER_CERTIFICATE_FILE",
@@ -95,11 +97,13 @@ async fn main() -> anyhow::Result<()> {
         .to_str()
         .context("control-store CA path is not UTF-8")?
         .to_owned();
-    let store = Arc::new(
-        Store::connect_from_async(DsnSource::File(args.control_store_url_file), Some(ca_file))
-            .await
-            .context("connect object-write authority store")?,
-    );
+    let authority = ObjectWriteGatewayClient::connect_from_async(
+        DsnSource::File(args.control_store_url_file),
+        Some(ca_file),
+        args.control_store_schema,
+    )
+    .await
+    .context("connect dedicated object-write gateway PostgreSQL lane")?;
     let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(args.region))
         .load()
@@ -138,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     });
     Box::pin(run_object_write_gateway(
         config,
-        store,
+        authority,
         downstream,
         shutdown_rx,
     ))

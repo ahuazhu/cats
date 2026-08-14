@@ -839,6 +839,8 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
             "/run/cats/object-write-gateway/postgres/url",
             "--control-store-ca-file",
             "/etc/cats/rds-ca.pem",
+            "--control-store-schema",
+            var.control_postgres_schema,
             "--server-certificate-file",
             "/etc/cats/object-write-tls/object-write-server-certificate.pem",
             "--server-private-key-file",
