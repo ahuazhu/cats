@@ -15,7 +15,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use cats_api::object_write_gateway::object_write_key;
 use cats_api::object_write_gateway::{
-    ObjectWriteProviderRequestObservationV1, ObjectWriteSuccessfulPutV1,
+    ObjectWriteConditionalRequestEvidenceV1, ObjectWriteConditionalRequestOutcomeV1,
+    ObjectWriteProviderRequestObservationV1, ObjectWriteQualificationHeadEvidenceV1,
+    ObjectWriteQualificationUnprovenReasonV1, ObjectWriteSuccessfulPutV1,
 };
 #[cfg(test)]
 use cats_api::runtime_reconciliation::Id;
@@ -254,7 +256,7 @@ impl AwsObjectWriteGatewayDownstream {
                     })
                 }
             }
-            Err(S3CallError::PreconditionFailed) => match self
+            Err(S3CallError::PreconditionFailed(conditional)) => match self
                 .s3
                 .head_exact(&self.config.bucket, &provider_key, absolute_deadline)
                 .await
@@ -262,14 +264,40 @@ impl AwsObjectWriteGatewayDownstream {
                 Ok(observation) if head_matches(&request.descriptor, &observation) => {
                     let visibility_receipt_id =
                         visibility_receipt_id(&request.descriptor, &observation)?;
-                    Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
-                        provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                        put_receipt_id: replay_put_receipt_id(
-                            &request.descriptor,
-                            &visibility_receipt_id,
-                        )?,
-                        completed_at_unix_ms: observation.observed_at_unix_ms,
-                    })
+                    if request.descriptor.qualification_fault.is_some() {
+                        Ok(
+                            ObjectWriteDownstreamPutOutcome::QualificationUnprovenVisible {
+                                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
+                                head_evidence: Box::new(ObjectWriteQualificationHeadEvidenceV1 {
+                                    provider_attempt_id: request
+                                        .descriptor
+                                        .provider_attempt_id
+                                        .clone(),
+                                    visibility_receipt_id,
+                                    preceding_conditional_request: Some(Box::new(
+                                        conditional_request_evidence(
+                                            &request.descriptor,
+                                            &conditional,
+                                        ),
+                                    )),
+                                    provider_request: head_provider_request_observation(
+                                        &request.descriptor,
+                                        &observation,
+                                    )?,
+                                    observed_at_unix_ms: observation.observed_at_unix_ms,
+                                }),
+                            },
+                        )
+                    } else {
+                        Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
+                            provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
+                            put_receipt_id: replay_put_receipt_id(
+                                &request.descriptor,
+                                &visibility_receipt_id,
+                            )?,
+                            completed_at_unix_ms: observation.observed_at_unix_ms,
+                        })
+                    }
                 }
                 Ok(observation) => Ok(ObjectWriteDownstreamPutOutcome::PermanentlyFailed {
                     provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
@@ -309,11 +337,12 @@ impl AwsObjectWriteGatewayDownstream {
                         descriptor,
                         &observation,
                     )?),
+                    preceding_conditional_request: None,
                     observed_at_unix_ms: observation.observed_at_unix_ms,
                 })
             }
             Err(S3CallError::NotFound) => Ok(ObjectWriteVisibilityOutcome::NotVisible),
-            Err(S3CallError::PreconditionFailed) => Err(ObjectWriteDownstreamError::Ambiguous),
+            Err(S3CallError::PreconditionFailed(_)) => Err(ObjectWriteDownstreamError::Ambiguous),
             Err(error) => Err(map_read_error(error)),
         }
     }
@@ -391,6 +420,25 @@ fn head_provider_request_observation(
         entity_tag: observation.e_tag.clone(),
         version_id: observation.version_id.clone(),
     })
+}
+
+fn conditional_request_evidence(
+    descriptor: &ObjectPutDescriptor,
+    observation: &ConditionalObservation,
+) -> ObjectWriteConditionalRequestEvidenceV1 {
+    ObjectWriteConditionalRequestEvidenceV1 {
+        provider_attempt_id: descriptor.provider_attempt_id.clone(),
+        outcome: ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed,
+        provider_request: ObjectWriteProviderRequestObservationV1 {
+            request_id: observation.request_id.clone(),
+            extended_request_id: observation.extended_request_id.clone(),
+            content_sha256: descriptor.content_sha256.clone(),
+            content_length: Some(descriptor.content_length),
+            entity_tag: None,
+            version_id: None,
+        },
+        observed_at_unix_ms: observation.observed_at_unix_ms,
+    }
 }
 
 fn valid_bucket_name(bucket: &str) -> bool {
@@ -568,13 +616,20 @@ struct HeadObservation {
     observed_at_unix_ms: UnixMillis,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConditionalObservation {
+    request_id: AsciiText,
+    extended_request_id: Option<AsciiText>,
+    observed_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum S3CallError {
     Deadline,
     Ambiguous,
     Unavailable,
     InvalidResponse,
-    PreconditionFailed,
+    PreconditionFailed(ConditionalObservation),
     NotFound,
 }
 
@@ -743,7 +798,11 @@ where
         )) => Err(S3CallError::Ambiguous),
         Ok(Err(SdkError::ServiceError(error))) => match error.err().code().unwrap_or_default() {
             "PreconditionFailed" | "ConditionalRequestConflict" | "412" => {
-                Err(S3CallError::PreconditionFailed)
+                Err(S3CallError::PreconditionFailed(ConditionalObservation {
+                    request_id: required_ascii(error.raw().request_id())?,
+                    extended_request_id: optional_ascii(error.raw().extended_request_id())?,
+                    observed_at_unix_ms: now_unix_millis()?,
+                }))
             }
             "InternalError" | "ServiceUnavailable" | "SlowDown" | "503" => {
                 Err(S3CallError::Ambiguous)
@@ -761,7 +820,7 @@ fn map_put_error(error: S3CallError) -> ObjectWriteDownstreamError {
             ObjectWriteDownstreamError::Ambiguous
         }
         S3CallError::Unavailable => ObjectWriteDownstreamError::Unavailable,
-        S3CallError::PreconditionFailed | S3CallError::NotFound => {
+        S3CallError::PreconditionFailed(_) | S3CallError::NotFound => {
             ObjectWriteDownstreamError::Ambiguous
         }
     }
@@ -774,7 +833,7 @@ fn map_read_error(error: S3CallError) -> ObjectWriteDownstreamError {
             ObjectWriteDownstreamError::Ambiguous
         }
         S3CallError::Unavailable => ObjectWriteDownstreamError::Unavailable,
-        S3CallError::PreconditionFailed | S3CallError::NotFound => {
+        S3CallError::PreconditionFailed(_) | S3CallError::NotFound => {
             ObjectWriteDownstreamError::Ambiguous
         }
     }
@@ -1201,6 +1260,14 @@ mod tests {
         }
     }
 
+    fn precondition_observation() -> ConditionalObservation {
+        ConditionalObservation {
+            request_id: ascii("aws-request-precondition-1"),
+            extended_request_id: Some(ascii("aws-extended-precondition-1")),
+            observed_at_unix_ms: millis(30),
+        }
+    }
+
     #[test]
     fn configuration_binds_bucket_prefix_and_private_spool_root() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1403,7 +1470,9 @@ mod tests {
         let downstream = AwsObjectWriteGatewayDownstream::with_api(
             config(temporary.path()),
             Arc::new(FakeS3::new(
-                vec![Err(S3CallError::PreconditionFailed)],
+                vec![Err(S3CallError::PreconditionFailed(
+                    precondition_observation(),
+                ))],
                 vec![Ok(head_observation(&descriptor))],
             )),
         );
@@ -1421,6 +1490,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qualification_precondition_and_exact_head_is_unproven_not_success() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"committed before response-loss receipt";
+        let descriptor = qualification_descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let conditional = precondition_observation();
+        let head = head_observation(&descriptor);
+        let s3 = Arc::new(FakeS3::new(
+            vec![Err(S3CallError::PreconditionFailed(conditional.clone()))],
+            vec![Ok(head.clone())],
+        ));
+        let downstream =
+            AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
+
+        let outcome = downstream
+            .put_exact(
+                ObjectWriteDownstreamPut {
+                    descriptor: descriptor.clone(),
+                    spool,
+                },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ObjectWriteDownstreamPutOutcome::QualificationUnprovenVisible {
+                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
+                head_evidence,
+            } if head_evidence.provider_attempt_id == descriptor.provider_attempt_id
+                && head_evidence.provider_request.request_id == head.request_id
+                && head_evidence
+                    .preceding_conditional_request
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        evidence.provider_request.request_id == conditional.request_id
+                            && evidence.outcome
+                                == ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed
+                    })
+        ));
+        assert_eq!(s3.puts.lock().unwrap().len(), 1);
+        assert!(s3.head_results.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn exact_key_with_different_bytes_is_a_permanent_provider_failure() {
         let temporary = tempfile::tempdir().unwrap();
         let body = b"new bytes";
@@ -1431,7 +1545,9 @@ mod tests {
         let downstream = AwsObjectWriteGatewayDownstream::with_api(
             config(temporary.path()),
             Arc::new(FakeS3::new(
-                vec![Err(S3CallError::PreconditionFailed)],
+                vec![Err(S3CallError::PreconditionFailed(
+                    precondition_observation(),
+                ))],
                 vec![Ok(conflicting)],
             )),
         );
@@ -1465,7 +1581,9 @@ mod tests {
         let downstream = AwsObjectWriteGatewayDownstream::with_api(
             config(temporary.path()),
             Arc::new(FakeS3::new(
-                vec![Err(S3CallError::PreconditionFailed)],
+                vec![Err(S3CallError::PreconditionFailed(
+                    precondition_observation(),
+                ))],
                 vec![Ok(existing)],
             )),
         );
