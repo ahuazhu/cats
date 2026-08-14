@@ -104,7 +104,14 @@ impl RouteV2MachineConfig {
         &self,
         admission_registry: Arc<AdmissionCellRegistry>,
     ) -> RouteGrantV2RingInstaller {
-        let emergency_close = Arc::new(move || admission_registry.fail_close_all());
+        if self
+            .verifier
+            .current_ring()
+            .map_or(true, |ring| ring.loaded_kids().is_empty())
+        {
+            admission_registry.latch_emergency_route_disable();
+        }
+        let emergency_close = Arc::new(move || admission_registry.latch_emergency_route_disable());
         RouteGrantV2RingInstaller::for_production(
             Arc::clone(&self.verifier),
             Arc::clone(&self.ring_install_serialized),
@@ -506,24 +513,38 @@ async fn handle_tunnel_request(
         canonical_hostname: frame.hostname,
         protocol: HttpProtocol::Http,
     };
-    let verified =
-        match service
-            .verifier
-            .verify_request(&principal, &frame.opaque_grant, &binding, now)
-        {
-            Ok(verified) => verified,
-            Err(failure) => return Ok(failure_response(failure)),
-        };
-    let Some(cell) = service.registry.get(verified.cat_id()) else {
+    let Some(publication) = service
+        .registry
+        .begin_route_admission_publication()
+        .ok()
+        .flatten()
+    else {
         return Ok(failure_response(
             RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
                 .expect("RuntimeNotReady is pre-admission"),
         ));
     };
-    let admitted = match verified.admit(&cell) {
-        Ok(admitted) => admitted,
-        Err(failure) => return Ok(failure_response(failure)),
+    let admitted = {
+        let verified =
+            match service
+                .verifier
+                .verify_request(&principal, &frame.opaque_grant, &binding, now)
+            {
+                Ok(verified) => verified,
+                Err(failure) => return Ok(failure_response(failure)),
+            };
+        let Some(cell) = publication.cell(verified.cat_id()) else {
+            return Ok(failure_response(
+                RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
+                    .expect("RuntimeNotReady is pre-admission"),
+            ));
+        };
+        match verified.admit(&cell) {
+            Ok(admitted) => admitted,
+            Err(failure) => return Ok(failure_response(failure)),
+        }
     };
+    drop(publication);
     let upstream_target = format!(
         "{}:{}",
         admitted.guest_ipv4(),
@@ -1029,6 +1050,31 @@ mod tests {
         let first = config.ring_installer(Arc::clone(&registry));
         let second = config.ring_installer(registry);
         assert!(first.shares_process_lock_with(&second));
+    }
+
+    #[test]
+    fn initial_empty_ring_latches_route_admission_before_installer_replay() {
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let config = RouteV2MachineConfig::for_test(
+            "127.0.0.1:0".to_owned(),
+            Id::new("node-a").unwrap(),
+            CA_CERTIFICATE,
+            SERVER_CERTIFICATE,
+            SERVER_PRIVATE_KEY,
+            verifier,
+        )
+        .unwrap();
+        let registry_root = tempfile::tempdir().unwrap();
+        let registry = AdmissionCellRegistry::new(registry_root.path().join("checkpoints"));
+
+        let _installer = config.ring_installer(Arc::clone(&registry));
+
+        assert!(registry
+            .begin_route_admission_publication()
+            .unwrap()
+            .is_none());
     }
 
     fn client_tls(client_certificate: &[u8], client_private_key: &[u8]) -> Arc<ClientConfig> {

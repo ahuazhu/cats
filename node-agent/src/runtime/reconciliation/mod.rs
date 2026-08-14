@@ -150,6 +150,7 @@ pub use admission_port::{
 };
 pub(crate) use admission_registry::{
     AdmissionCellRegistry, AdmissionCellSession, AdmissionCellSessionLookup,
+    RouteAdmissionPublicationGuard,
 };
 pub use authorized_blockd::{
     authorized_blockd_command, authorized_blockd_status_is_bound, AuthorizedBlockFrontend,

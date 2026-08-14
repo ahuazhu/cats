@@ -1274,6 +1274,10 @@ impl RunningAdmissionEffect {
         let result = match action {
             RunningTailAction::OpenLifecycle => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1325,6 +1329,10 @@ impl RunningAdmissionEffect {
             }
             RunningTailAction::InstallGate(endpoint_id) => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1535,6 +1543,10 @@ impl RunningAdmissionEffect {
             }
             RouteRetirementAction::InstallGate(endpoint_id) => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 sequencer.install_gate_with_barrier(
                     &stored,
                     desired,
@@ -3860,6 +3872,29 @@ mod tests {
                 .snapshot()
                 .lifecycle_admission(),
             LifecycleAdmission::Open
+        );
+    }
+
+    #[test]
+    fn emergency_disabled_zero_endpoint_effect_remains_fail_closed() {
+        let fixture = Fixture::new(0);
+        let registry = fixture.registry();
+        registry.latch_emergency_route_disable();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+
+        assert_eq!(
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .expect("disabled zero-Endpoint Running tail stays bounded"),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            registry
+                .get(&fixture.desired.cat_id)
+                .expect("registered fail-closed cell")
+                .snapshot()
+                .lifecycle_admission(),
+            LifecycleAdmission::Closed
         );
     }
 
