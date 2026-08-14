@@ -63,7 +63,13 @@ read_token() {
 }
 AUTHORIZATION_TEMP=
 CURL_JSON_STATUS=
+QUALIFICATION_WATCHER_PID=
 cleanup_authorization_temp() {
+  if [[ -n $QUALIFICATION_WATCHER_PID ]]; then
+    kill "$QUALIFICATION_WATCHER_PID" 2>/dev/null || true
+    wait "$QUALIFICATION_WATCHER_PID" 2>/dev/null || true
+    QUALIFICATION_WATCHER_PID=
+  fi
   if [[ -n $AUTHORIZATION_TEMP ]]; then
     rm -f "$AUTHORIZATION_TEMP"
     AUTHORIZATION_TEMP=
@@ -677,26 +683,383 @@ run_restart() {
   rm -f "$CASE_DIR/restart-adoption-receipt.source.json"
 }
 
+qualification_operation_wait() {
+  local operation_id=$1 expected_target=$2 output=$3 workspace
+  workspace=$(required CATS_E3_WORKSPACE_ID)
+  canonical_id qualification_operation_id "$operation_id"
+  run_cats --api-url "$(control_origin)" --workspace "$workspace" --json \
+    operation wait "$operation_id" >"$output"
+  jq -e --arg operation "$operation_id" --arg workspace "$workspace" \
+    --arg target "$expected_target" '
+    .operation_id == $operation and .workspace_id == $workspace
+    and .phase == "succeeded" and .target == $target
+    and .terminal.kind == "succeeded"
+    and .terminal.result.observed_target == $target' "$output" >/dev/null || \
+    fail "qualification Operation lacks exact $expected_target settlement"
+}
+
+qualification_mutation_begin() {
+  local method=$1 path=$2 key=$3 body=$4 response=$5 replay=$6
+  local origin status attempt operation replay_operation revision replay_revision
+  origin=$(control_origin)
+  status=75
+  for attempt in 1 2; do
+    set +e
+    if [[ -n $body ]]; then
+      curl_json "$method" "$origin$path" "$response" 202 \
+        --header "idempotency-key: $key" \
+        --header 'content-type: application/json' --data-binary "@$body"
+    else
+      curl_json "$method" "$origin$path" "$response" 202 \
+        --header "idempotency-key: $key"
+    fi
+    status=$?
+    set -e
+    [[ $status -eq 75 ]] || break
+  done
+  [[ $status -eq 0 ]] || fail "qualification mutation remained ambiguous after exact replay"
+  operation=$(jq -er '.operation_id' "$response")
+  revision=$(jq -er '.desired_revision' "$response")
+  canonical_id qualification_operation_id "$operation"
+  [[ $revision =~ ^[1-9][0-9]*$ ]] || fail "qualification mutation revision is invalid"
+  if [[ -n $body ]]; then
+    curl_json "$method" "$origin$path" "$replay" 202 \
+      --header "idempotency-key: $key" \
+      --header 'content-type: application/json' --data-binary "@$body" || \
+      fail "qualification mutation replay was ambiguous"
+  else
+    curl_json "$method" "$origin$path" "$replay" 202 \
+      --header "idempotency-key: $key" || \
+      fail "qualification mutation replay was ambiguous"
+  fi
+  replay_operation=$(jq -er '.operation_id' "$replay")
+  replay_revision=$(jq -er '.desired_revision' "$replay")
+  [[ $replay_operation == "$operation" && $replay_revision == "$revision" ]] || \
+    fail "qualification mutation replay changed Operation or Desired revision"
+  printf '%s' "$operation"
+}
+
+qualification_mutation_wait() {
+  local method=$1 path=$2 key=$3 target=$4 body=$5 prefix=$6
+  local response replay operation result
+  response=$CASE_DIR/$prefix-response.json
+  replay=$CASE_DIR/$prefix-replay.json
+  result=$CASE_DIR/$prefix-operation.json
+  operation=$(qualification_mutation_begin \
+    "$method" "$path" "$key" "$body" "$response" "$replay")
+  qualification_operation_wait "$operation" "$target" "$result"
+  rm -f "$response" "$replay" "$result"
+}
+
 run_volume_init_matrix() {
-  local cat snapshot source expected_node
+  local workspace cat expected_node root_snapshot disk_create disk_name disk_id volume_id
+  local mount_path attach_body watcher watcher_pid start_response start_replay start_operation
+  local start_result initialization before_fleet after_fleet before_snapshot after_snapshot
+  local systemctl_bin service before_epoch after_epoch attempt ready raw_status
+  local strict_sync cold_absence final_fleet receipt_source delete_response delete_replay
+  workspace=$(required CATS_E3_WORKSPACE_ID)
   cat=$(cat_id)
   expected_node=$(qualification_node_id)
-  snapshot=$CASE_DIR/volume-frontend-snapshot.json
-  run_probe snapshot --cat-id "$cat" >"$snapshot"
-  jq -e --arg cat "$cat" --arg node "$expected_node" --arg block_path "$BLOCK_PATH" \
-    '.version == 1 and .cat_id == $cat and .node_id == $node
-      and .root_block_frontend == $block_path
-      and .strict_remote_durable == true' "$snapshot" >/dev/null || \
+  mount_path=${CATS_E3_PERSISTENT_MOUNT_PATH:-/mnt/cats-e3-persistent}
+  [[ $mount_path == /* && $mount_path != / && $mount_path != *$'\n'* ]] || \
+    fail "Persistent qualification mount path is not absolute non-root"
+
+  root_snapshot=$CASE_DIR/persistent-root-frontend.json
+  run_probe snapshot --cat-id "$cat" >"$root_snapshot"
+  jq -e --arg cat "$cat" --arg node "$expected_node" --arg block_path "$BLOCK_PATH" '
+    .version == 1 and .cat_id == $cat and .node_id == $node
+    and .root_block_frontend == $block_path and .strict_remote_durable == true' \
+    "$root_snapshot" >/dev/null || \
     fail "installed Running checkpoint does not use the selected block frontend"
-  source=$CASE_DIR/volume-frontend-receipt.source.json
-  jq -S -c --arg block_path "$BLOCK_PATH" \
-    '{version:1,cat_id,node_id,block_path:$block_path,
-      actual_root_block_frontend:.root_block_frontend,
-      runtime_incarnation,guest_boot_id,strict_remote_durable,
-      persistent_disk_live_matrix_proved:false}' "$snapshot" >"$source"
-  atomic_json volume-frontend-receipt.json "$source"
-  rm -f "$source"
-  blocked 'DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION): production v2 exposes PersistentDisk create/read/delete but no attach mutation; add the separately reviewed product attach entry before live first-mkfs-response-loss, exact filesystem UUID, mounted-set, Agent-restart remount and Strict-write qualification'
+  rm -f "$root_snapshot"
+
+  qualification_mutation_wait POST \
+    "/v1/workspaces/$workspace/cats/$cat/actions/stop" \
+    "e3-$CATS_E3_RUN_ID-persistent-pre-stop-$BLOCK_PATH" cold '' persistent-pre-stop
+
+  disk_name="e3-persistent-$CATS_E3_RUN_ID"
+  disk_create=$CASE_DIR/persistent-disk-create.json
+  run_cats --api-url "$(control_origin)" --workspace "$workspace" --json \
+    disk create "$disk_name" --size "${CATS_E3_PERSISTENT_SIZE:-1GiB}" \
+    --durability strict >"$disk_create"
+  jq -e --arg workspace "$workspace" --arg name "$disk_name" '
+    .workspace_id == $workspace and .name == $name and .kind == "persistent"
+    and .state == "available" and .durability == "strict"
+    and (.id | type == "string" and startswith("disk_"))
+    and (.volume_id | type == "string" and startswith("vol_"))' \
+    "$disk_create" >/dev/null || fail "PersistentDisk create response is not exact"
+  disk_id=$(json_field "$disk_create" '.id')
+  volume_id=$(json_field "$disk_create" '.volume_id')
+  canonical_id persistent_disk_id "$disk_id"
+  canonical_id persistent_volume_id "$volume_id"
+
+  attach_body=$CASE_DIR/persistent-attach-body.json
+  jq -S -c -n --arg cat_id "$cat" --arg mount_path "$mount_path" \
+    '{cat_id:$cat_id,mount_path:$mount_path}' >"$attach_body"
+  qualification_mutation_wait POST \
+    "/v1/workspaces/$workspace/disks/$disk_id/actions/attach" \
+    "e3-$CATS_E3_RUN_ID-persistent-attach-$BLOCK_PATH" cold "$attach_body" persistent-attach
+
+  watcher=$CASE_DIR/persistent-initialization-watch.json
+  run_probe watch-persistent-initialization --cat-id "$cat" --disk-id "$disk_id" \
+    --volume-id "$volume_id" --mount-path "$mount_path" --run-id "$CATS_E3_RUN_ID" \
+    --timeout-seconds 300 >"$watcher" &
+  watcher_pid=$!
+  QUALIFICATION_WATCHER_PID=$watcher_pid
+  start_response=$CASE_DIR/persistent-start-response.json
+  start_replay=$CASE_DIR/persistent-start-replay.json
+  start_result=$CASE_DIR/persistent-start-operation.json
+  start_operation=$(qualification_mutation_begin POST \
+    "/v1/workspaces/$workspace/cats/$cat/actions/start" \
+    "e3-$CATS_E3_RUN_ID-persistent-start-$BLOCK_PATH" '' \
+    "$start_response" "$start_replay")
+  qualification_operation_wait "$start_operation" running "$start_result"
+  if ! wait "$watcher_pid"; then
+    QUALIFICATION_WATCHER_PID=
+    fail "Persistent initialization watcher did not prove first-format recovery"
+  fi
+  QUALIFICATION_WATCHER_PID=
+  rm -f "$start_response" "$start_replay" "$start_result"
+  initialization=$watcher
+  jq -e --arg cat "$cat" --arg disk "$disk_id" --arg volume "$volume_id" \
+    --arg node "$expected_node" --arg mount "$mount_path" --arg block_path "$BLOCK_PATH" '
+    .version == 1 and .cat_id == $cat and .disk_id == $disk and .volume_id == $volume
+    and (.volume_intent_id | type == "string" and length > 0)
+    and (.attachment_id | type == "string" and length > 0)
+    and (.attachment_epoch | type == "number" and . > 0)
+    and (.guest_device.serial | type == "string" and length > 0)
+    and (.guest_device.slot | type == "string" and length > 0)
+    and (.filesystem_uuid | type == "string" and length > 0)
+    and .mount_path == $mount
+    and (.expected_blank_head | type == "string" and length > 0)
+    and (.initialized_head | type == "string" and length > 0)
+    and .initialized_head != .expected_blank_head
+    and .first_format.ambiguous_response_discovered == true
+    and .first_format.mkfs_invocations == 1
+    and .first_format.fault_action == "drop_validated_format_response_once"
+    and .first_format.consumed == true
+    and (.first_format.artifact_sha256 | test("^[0-9a-f]{64}$"))
+    and .ready.node_id == $node and .ready.block_frontend == $block_path
+    and .ready.filesystem_uuid == .filesystem_uuid and .ready.mount_path == $mount
+    and .ready.mounted_set_complete == true and .ready.strict_remote_durable == true' \
+    "$initialization" >/dev/null || fail "Persistent first-format/A22/Ready proof is not exact"
+
+  before_fleet=$CASE_DIR/persistent-restart-fleet-before.json
+  after_fleet=$CASE_DIR/persistent-restart-fleet-after.json
+  before_snapshot=$CASE_DIR/persistent-restart-before.json
+  after_snapshot=$CASE_DIR/persistent-restart-after.json
+  raw_fleet_snapshot_to "$before_fleet" || fail "pre-restart Persistent fleet snapshot unavailable"
+  run_probe persistent-snapshot --cat-id "$cat" --disk-id "$disk_id" \
+    --volume-id "$volume_id" --mount-path "$mount_path" >"$before_snapshot"
+  jq -e --arg node "$expected_node" '
+    ([.nodes[] | select(.node_id == $node)] | length == 1)
+    and ([.nodes[] | select(.node_id == $node)][0] as $n
+      | $n.inventory.complete_inventory == true
+      and $n.inventory.source_session.agent_session_epoch == $n.session.agent_session_epoch
+      and $n.inventory.attestation.agent_session_epoch == $n.session.agent_session_epoch
+      and $n.inventory.residue_count == 0 and $n.inventory.active_guard_count == 0)' \
+    "$before_fleet" >/dev/null || fail "pre-restart full inventory is not exact"
+  before_epoch=$(json_field "$before_fleet" ".nodes[] | select(.node_id == \"$expected_node\") | .session.agent_session_epoch")
+  [[ $before_epoch =~ ^[1-9][0-9]*$ ]] || fail "pre-restart AgentSession epoch is invalid"
+  systemctl_bin=$(binary systemctl)
+  service=$(required CATS_E3_WORKER_SERVICE)
+  [[ $service == cats-worker.service ]] || fail "Persistent restart service is not cats-worker.service"
+  "$systemctl_bin" restart "$service"
+  attempt=0
+  ready=false
+  while [[ $attempt -lt 240 ]]; do
+    attempt=$((attempt + 1))
+    set +e
+    raw_fleet_snapshot_to "$after_fleet"
+    raw_status=$?
+    set -e
+    if [[ $raw_status -eq 0 ]] && jq -e --arg node "$expected_node" \
+      --argjson before "$before_epoch" '
+      ([.nodes[] | select(.node_id == $node)] | length == 1)
+      and ([.nodes[] | select(.node_id == $node)][0] as $n
+        | $n.session.agent_session_epoch > $before
+        and $n.inventory.complete_inventory == true
+        and $n.inventory.source_session.agent_session_epoch == $n.session.agent_session_epoch
+        and $n.inventory.attestation.agent_session_epoch == $n.session.agent_session_epoch
+        and $n.inventory.residue_count == 0 and $n.inventory.active_guard_count == 0)' \
+      "$after_fleet" >/dev/null; then
+      set +e
+      run_probe persistent-snapshot --cat-id "$cat" --disk-id "$disk_id" \
+        --volume-id "$volume_id" --mount-path "$mount_path" >"$after_snapshot"
+      raw_status=$?
+      set -e
+      if [[ $raw_status -eq 0 ]]; then
+        ready=true
+        break
+      fi
+    fi
+    sleep 0.5
+  done
+  [[ $ready == true ]] || fail "Agent restart did not adopt exact Persistent runtime"
+  after_epoch=$(json_field "$after_fleet" ".nodes[] | select(.node_id == \"$expected_node\") | .session.agent_session_epoch")
+  jq -e -n --slurpfile initial "$initialization" --slurpfile before "$before_snapshot" \
+    --slurpfile after "$after_snapshot" '
+    $before[0].runtime_incarnation == $initial[0].ready.runtime_incarnation
+    and $after[0].runtime_incarnation == $before[0].runtime_incarnation
+    and $before[0].guest_boot_id == $initial[0].ready.guest_boot_id
+    and $after[0].guest_boot_id == $before[0].guest_boot_id
+    and $after[0].attachment_id == $before[0].attachment_id
+    and $after[0].attachment_epoch == $before[0].attachment_epoch
+    and $after[0].filesystem_uuid == $before[0].filesystem_uuid
+    and $after[0].mount_path == $before[0].mount_path
+    and $after[0].mounted_set_complete == true
+    and $after[0].strict_remote_durable == true' >/dev/null || \
+    fail "restart changed Persistent runtime/boot/attachment/filesystem/mount identity"
+
+  strict_sync=$CASE_DIR/persistent-strict-sync.json
+  run_probe persistent-sync --cat-id "$cat" --disk-id "$disk_id" \
+    --volume-id "$volume_id" --mount-path "$mount_path" --run-id "$CATS_E3_RUN_ID" \
+    >"$strict_sync"
+  jq -e --arg disk "$disk_id" --arg volume "$volume_id" '
+    .version == 1 and .disk_id == $disk and .volume_id == $volume
+    and .remote_durable == true and .after_remote_generation > .before_remote_generation
+    and (.before_head | type == "string" and length > 0)
+    and (.after_head | type == "string" and length > 0)
+    and .after_head != .before_head' \
+    "$strict_sync" >/dev/null || fail "Persistent Strict FLUSH did not advance remote head"
+
+  qualification_mutation_wait POST \
+    "/v1/workspaces/$workspace/cats/$cat/actions/stop" \
+    "e3-$CATS_E3_RUN_ID-persistent-stop-$BLOCK_PATH" cold '' persistent-stop
+  qualification_mutation_wait POST \
+    "/v1/workspaces/$workspace/disks/$disk_id/actions/detach" \
+    "e3-$CATS_E3_RUN_ID-persistent-detach-$BLOCK_PATH" cold "$attach_body" persistent-detach
+
+  cold_absence=$CASE_DIR/persistent-cold-absence.json
+  run_probe persistent-cold-absence --cat-id "$cat" --disk-id "$disk_id" \
+    --volume-id "$volume_id" --mount-path "$mount_path" >"$cold_absence"
+  jq -e --arg cat "$cat" --arg node "$expected_node" --arg disk "$disk_id" \
+    --arg volume "$volume_id" '
+    .version == 1 and .cat_id == $cat and .node_id == $node
+    and .disk_id == $disk and .volume_id == $volume and .stable_cold == true
+    and .desired_volume_absent == true and .device_absent == true and .mount_absent == true' \
+    "$cold_absence" >/dev/null || fail "detached Persistent resources remain in Cold checkpoint"
+  final_fleet=$CASE_DIR/persistent-final-fleet.json
+  raw_fleet_snapshot_to "$final_fleet" || fail "post-detach fleet snapshot unavailable"
+  jq -e --arg node "$expected_node" --argjson restart_epoch "$after_epoch" '
+    ([.nodes[] | select(.node_id == $node)] | length == 1)
+    and ([.nodes[] | select(.node_id == $node)][0] as $n
+      | $n.session.agent_session_epoch >= $restart_epoch
+      and $n.inventory.complete_inventory == true
+      and $n.inventory.lifecycle_open_count == 0
+      and $n.inventory.route_active_count == 0
+      and $n.inventory.active_guard_count == 0
+      and $n.inventory.residue_count == 0)' "$final_fleet" >/dev/null || \
+    fail "post-detach full inventory is not complete, closed and residue-free"
+
+  receipt_source=$CASE_DIR/persistent-disk-receipt.source.json
+  jq -S -c -n --arg workspace "$workspace" --arg cat "$cat" --arg node "$expected_node" \
+    --arg disk "$disk_id" --arg volume "$volume_id" --arg block_path "$BLOCK_PATH" \
+    --argjson before_epoch "$before_epoch" --argjson after_epoch "$after_epoch" \
+    --slurpfile init "$initialization" --slurpfile before "$before_snapshot" \
+    --slurpfile after "$after_snapshot" --slurpfile flush "$strict_sync" \
+    --slurpfile absent "$cold_absence" --slurpfile fleet "$final_fleet" '
+    ([$fleet[0].nodes[] | select(.node_id == $node)][0]) as $final
+    | {version:1,proof:"persistent_disk_attach_initialize_restart_detach",
+       block_path:$block_path,workspace_id:$workspace,cat_id:$cat,node_id:$node,
+       disk_id:$disk,volume_id:$volume,
+       volume_intent_id:$init[0].volume_intent_id,
+       attachment_id:$init[0].attachment_id,
+       attachment_epoch:$init[0].attachment_epoch,
+       guest_device:$init[0].guest_device,
+       filesystem_uuid:$init[0].filesystem_uuid,mount_path:$init[0].mount_path,
+       expected_blank_head:$init[0].expected_blank_head,
+       initialized_head:$init[0].initialized_head,
+       first_format:$init[0].first_format,
+       ready:{runtime_incarnation:$init[0].ready.runtime_incarnation,
+         guest_boot_id:$init[0].ready.guest_boot_id,
+         device_path:$init[0].ready.device_path,mounted_set_complete:true},
+       restart:{before_agent_session_epoch:$before_epoch,
+         after_agent_session_epoch:$after_epoch,
+         retained_runtime_incarnation:$after[0].runtime_incarnation,
+         retained_guest_boot_id:$after[0].guest_boot_id,
+         filesystem_uuid:$after[0].filesystem_uuid,mount_path:$after[0].mount_path},
+       strict_flush:{before_head:$flush[0].before_head,after_head:$flush[0].after_head,
+         remote_durable:$flush[0].remote_durable},
+       detach:{desired_volume_absent:$absent[0].desired_volume_absent,
+         authority_unowned:true,device_absent:$absent[0].device_absent,
+         mount_absent:$absent[0].mount_absent},
+       final_inventory:{node_id:$node,agent_session_epoch:$final.session.agent_session_epoch,
+         complete:$final.inventory.complete_inventory,gates_closed:true,
+         active_guard_count:$final.inventory.active_guard_count,
+         residue_count:$final.inventory.residue_count}}' >"$receipt_source"
+  jq -e --arg block_path "$BLOCK_PATH" --arg workspace "$workspace" --arg cat "$cat" \
+    --arg node "$expected_node" --arg disk "$disk_id" --arg volume "$volume_id" '
+    keys == ["attachment_epoch","attachment_id","block_path","cat_id","detach","disk_id",
+      "expected_blank_head","filesystem_uuid","final_inventory","first_format","guest_device",
+      "initialized_head","mount_path","node_id","proof","ready","restart","strict_flush",
+      "version","volume_id","volume_intent_id","workspace_id"]
+    and .version == 1 and .proof == "persistent_disk_attach_initialize_restart_detach"
+    and .block_path == $block_path and .workspace_id == $workspace and .cat_id == $cat
+    and .node_id == $node and .disk_id == $disk and .volume_id == $volume
+    and (.volume_intent_id | type == "string" and length > 0)
+    and (.attachment_id | type == "string" and length > 0)
+    and (.attachment_epoch | type == "number" and . > 0 and floor == .)
+    and (.guest_device | keys == ["serial","slot"])
+    and (.guest_device.serial | type == "string" and length > 0)
+    and (.guest_device.slot | type == "string" and length > 0)
+    and (.filesystem_uuid | type == "string" and length > 0)
+    and (.mount_path | type == "string" and startswith("/") and . != "/")
+    and (.expected_blank_head | type == "string" and length > 0)
+    and (.initialized_head | type == "string" and length > 0)
+    and .initialized_head != .expected_blank_head
+    and (.first_format | keys == ["ambiguous_response_discovered","artifact_sha256",
+      "consumed","fault_action","mkfs_invocations"])
+    and .first_format == {ambiguous_response_discovered:true,
+      artifact_sha256:.first_format.artifact_sha256,consumed:true,
+      fault_action:"drop_validated_format_response_once",mkfs_invocations:1}
+    and (.first_format.artifact_sha256 | test("^[0-9a-f]{64}$"))
+    and (.ready | keys == ["device_path","guest_boot_id","mounted_set_complete",
+      "runtime_incarnation"])
+    and (.ready.runtime_incarnation | type == "string" and length > 0)
+    and (.ready.guest_boot_id | type == "string" and length > 0)
+    and (.ready.device_path | type == "string" and startswith("/"))
+    and .ready.mounted_set_complete == true
+    and (.restart | keys == ["after_agent_session_epoch","before_agent_session_epoch",
+      "filesystem_uuid","mount_path","retained_guest_boot_id","retained_runtime_incarnation"])
+    and .restart.after_agent_session_epoch > .restart.before_agent_session_epoch
+    and .restart.retained_runtime_incarnation == .ready.runtime_incarnation
+    and .restart.retained_guest_boot_id == .ready.guest_boot_id
+    and .restart.filesystem_uuid == .filesystem_uuid and .restart.mount_path == .mount_path
+    and (.strict_flush | keys == ["after_head","before_head","remote_durable"])
+    and (.strict_flush.before_head | type == "string" and length > 0)
+    and (.strict_flush.after_head | type == "string" and length > 0)
+    and .strict_flush.after_head != .strict_flush.before_head
+    and .strict_flush.remote_durable == true
+    and .detach == {authority_unowned:true,desired_volume_absent:true,
+      device_absent:true,mount_absent:true}
+    and (.final_inventory | keys == ["active_guard_count","agent_session_epoch","complete",
+      "gates_closed","node_id","residue_count"])
+    and .final_inventory.node_id == $node and .final_inventory.complete == true
+    and .final_inventory.gates_closed == true and .final_inventory.active_guard_count == 0
+    and .final_inventory.residue_count == 0
+    and .final_inventory.agent_session_epoch >= .restart.after_agent_session_epoch' \
+    "$receipt_source" >/dev/null || fail "Persistent receipt is outside its frozen closed schema"
+  atomic_json persistent-disk-receipt.json "$receipt_source"
+
+  delete_response=$CASE_DIR/persistent-delete-response.json
+  delete_replay=$CASE_DIR/persistent-delete-replay.json
+  curl_json DELETE "$(control_origin)/v1/workspaces/$workspace/disks/$disk_id" \
+    "$delete_response" 202 --header "idempotency-key: e3-$CATS_E3_RUN_ID-persistent-delete-$BLOCK_PATH" || \
+    fail "detached qualification Disk delete was ambiguous"
+  curl_json DELETE "$(control_origin)/v1/workspaces/$workspace/disks/$disk_id" \
+    "$delete_replay" 202 --header "idempotency-key: e3-$CATS_E3_RUN_ID-persistent-delete-$BLOCK_PATH" || \
+    fail "detached qualification Disk delete replay was ambiguous"
+  cmp -s "$delete_response" "$delete_replay" || fail "Disk delete replay changed result"
+
+  # Restore the numbered suite's Cat to Running only after the exact detached
+  # Cold receipt has been sealed; later usage and delete cases retain ownership.
+  qualification_mutation_wait POST \
+    "/v1/workspaces/$workspace/cats/$cat/actions/start" \
+    "e3-$CATS_E3_RUN_ID-persistent-restore-$BLOCK_PATH" running '' persistent-restore
+  rm -f "$disk_create" "$attach_body" "$initialization" "$before_fleet" "$after_fleet" \
+    "$before_snapshot" "$after_snapshot" "$strict_sync" "$cold_absence" "$final_fleet" \
+    "$receipt_source" "$delete_response" "$delete_replay"
 }
 
 usage_report_to() {

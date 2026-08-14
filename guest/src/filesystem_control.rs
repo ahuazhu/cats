@@ -113,7 +113,21 @@ impl FilesystemController {
                 match classify_unmounted_expected_or_blank(&request, &initial) {
                     FormatAdmission::Adopt => FilesystemControlOutcomeV1::Exact,
                     FormatAdmission::Blank => {
+                        if let Err(error) =
+                            super::qualification_fault::record_format_invocation(&request)
+                        {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "qualification mkfs invocation marker was not recorded"
+                            );
+                        }
                         self.format_ext4(&retained, &request.filesystem.filesystem_uuid, guard)?;
+                        ensure_active(guard)?;
+                        retained
+                            .file
+                            .sync_all()
+                            .context("sync formatted Persistent block device")?;
+                        ensure_active(guard)?;
                         FilesystemControlOutcomeV1::Exact
                     }
                     FormatAdmission::Conflict => FilesystemControlOutcomeV1::Conflict,

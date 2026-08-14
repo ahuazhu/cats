@@ -36,6 +36,7 @@ use cats_block_client::NbdClient;
 
 mod filesystem_control;
 mod oci;
+mod qualification_fault;
 mod runtime_ready;
 
 // ---------------------------------------------------------------------------
@@ -998,6 +999,21 @@ impl GuestAgent {
                                 Some(std::os::fd::AsRawFd::as_raw_fd(&stream)),
                             ),
                         };
+                        if is_filesystem_control {
+                            if let GuestResponseBody::FilesystemControl { filesystem } = &resp.body
+                            {
+                                match qualification_fault::consume_validated_format_response_once(
+                                    filesystem,
+                                ) {
+                                    Ok(true) => break,
+                                    Ok(false) => {}
+                                    Err(error) => tracing::warn!(
+                                        error = %format!("{error:#}"),
+                                        "qualification filesystem fault was rejected"
+                                    ),
+                                }
+                            }
+                        }
                         let written = if is_runtime_ready {
                             write_runtime_ready_response_frame(&mut stream, &resp)
                         } else if is_filesystem_control {

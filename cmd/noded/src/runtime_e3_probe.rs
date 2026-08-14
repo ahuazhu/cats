@@ -10,10 +10,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
+use cats_api::guest::{
+    RuntimeReadyRequestV1, RuntimeReadyResponseV1, GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
+    GUEST_HOST_CONTROL_VSOCK_PORT_V1,
+};
 use cats_api::runtime_reconciliation::{
     decode_node_identity, decode_runtime_checkpoint, encode_node_identity,
-    encode_runtime_checkpoint, GuestTransportEvidence, Id, NodeIdentity, NodeIdentityState,
-    ObservedDiskKind, PrepareDeviceFrontend, ProcessRole, RuntimeCheckpoint, RuntimeLaunch,
+    encode_runtime_checkpoint, FilesystemInitialization, GuestDeviceIdentity,
+    GuestTransportEvidence, HostPath, Id, MountAccess, NodeIdentity, NodeIdentityState,
+    ObservedDiskKind, ObservedMount, PersistentFilesystemBinding, PrepareDeviceFrontend,
+    ProcessRole, RandomId128, ReconcileStep, RemoteHead, RuntimeCheckpoint, RuntimeLaunch,
     StableState, VolumeAuthorityEvidence, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_node_agent::agent_registration::{NODE_IDENTITY_PATH, NODE_STATE_ROOT};
@@ -45,6 +51,56 @@ enum Command {
     Snapshot {
         #[arg(long)]
         cat_id: String,
+    },
+    /// Watch the exact first-format/A22/mount sequence for one PersistentDisk.
+    WatchPersistentInitialization {
+        #[arg(long)]
+        cat_id: String,
+        #[arg(long)]
+        disk_id: String,
+        #[arg(long)]
+        volume_id: String,
+        #[arg(long)]
+        mount_path: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 240)]
+        timeout_seconds: u64,
+    },
+    /// Emit a fresh RuntimeReady + blockd proof for one mounted PersistentDisk.
+    PersistentSnapshot {
+        #[arg(long)]
+        cat_id: String,
+        #[arg(long)]
+        disk_id: String,
+        #[arg(long)]
+        volume_id: String,
+        #[arg(long)]
+        mount_path: String,
+    },
+    /// Write on one exact PersistentDisk and prove its Strict head advances.
+    PersistentSync {
+        #[arg(long)]
+        cat_id: String,
+        #[arg(long)]
+        disk_id: String,
+        #[arg(long)]
+        volume_id: String,
+        #[arg(long)]
+        mount_path: String,
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Prove a detached PersistentDisk is absent from the exact Cold checkpoint.
+    PersistentColdAbsence {
+        #[arg(long)]
+        cat_id: String,
+        #[arg(long)]
+        disk_id: String,
+        #[arg(long)]
+        volume_id: String,
+        #[arg(long)]
+        mount_path: String,
     },
     /// Copy and start the exact E3 HTTP/WebSocket workload inside the Guest.
     InstallWorkload {
@@ -79,6 +135,40 @@ fn main() -> Result<()> {
     match Args::parse().command {
         Command::GuestSync { cat_id, run_id } => guest_sync(&cat_id, &run_id),
         Command::Snapshot { cat_id } => snapshot(&cat_id),
+        Command::WatchPersistentInitialization {
+            cat_id,
+            disk_id,
+            volume_id,
+            mount_path,
+            run_id,
+            timeout_seconds,
+        } => watch_persistent_initialization(
+            &cat_id,
+            &disk_id,
+            &volume_id,
+            &mount_path,
+            &run_id,
+            timeout_seconds,
+        ),
+        Command::PersistentSnapshot {
+            cat_id,
+            disk_id,
+            volume_id,
+            mount_path,
+        } => persistent_snapshot(&cat_id, &disk_id, &volume_id, &mount_path),
+        Command::PersistentSync {
+            cat_id,
+            disk_id,
+            volume_id,
+            mount_path,
+            run_id,
+        } => persistent_sync(&cat_id, &disk_id, &volume_id, &mount_path, &run_id),
+        Command::PersistentColdAbsence {
+            cat_id,
+            disk_id,
+            volume_id,
+            mount_path,
+        } => persistent_cold_absence(&cat_id, &disk_id, &volume_id, &mount_path),
         Command::InstallWorkload {
             cat_id,
             run_id,
@@ -110,7 +200,7 @@ fn installed_state_directory(identity: &NodeIdentity) -> PathBuf {
     Path::new(NODE_STATE_ROOT).join(identity.state_path_id.as_str())
 }
 
-fn installed_checkpoint(raw_cat_id: &str) -> Result<RuntimeCheckpoint> {
+fn load_installed_checkpoint(raw_cat_id: &str) -> Result<RuntimeCheckpoint> {
     let cat_id = Id::new(raw_cat_id.to_owned()).context("invalid --cat-id")?;
     let identity = installed_identity()?;
     let path = installed_state_directory(&identity)
@@ -130,6 +220,11 @@ fn installed_checkpoint(raw_cat_id: &str) -> Result<RuntimeCheckpoint> {
         checkpoint.node_id == identity.node_id,
         "RuntimeCheckpoint belongs to another Node"
     );
+    Ok(checkpoint)
+}
+
+fn installed_checkpoint(raw_cat_id: &str) -> Result<RuntimeCheckpoint> {
+    let checkpoint = load_installed_checkpoint(raw_cat_id)?;
     anyhow::ensure!(
         checkpoint.stable_state == Some(StableState::Running),
         "Cat is not stable Running"
@@ -264,12 +359,22 @@ fn root_facts(checkpoint: &RuntimeCheckpoint) -> Result<RootFacts<'_>> {
 }
 
 fn blockd_status(facts: &RootFacts<'_>) -> Result<DurabilityStatus> {
-    let mut stream = UnixStream::connect(facts.control_socket).with_context(|| {
-        format!(
-            "connect blockd control at {}",
-            facts.control_socket.display()
-        )
-    })?;
+    exact_blockd_status(
+        facts.control_socket,
+        facts.volume_id,
+        facts.attachment_id,
+        facts.attachment_epoch,
+    )
+}
+
+fn exact_blockd_status(
+    control_socket: &Path,
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+) -> Result<DurabilityStatus> {
+    let mut stream = UnixStream::connect(control_socket)
+        .with_context(|| format!("connect blockd control at {}", control_socket.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(BlockdControlCommand::Status.as_wire().as_bytes())?;
@@ -290,15 +395,242 @@ fn blockd_status(facts: &RootFacts<'_>) -> Result<DurabilityStatus> {
     let status: DurabilityStatus =
         serde_json::from_str(&payload).context("decode blockd status")?;
     anyhow::ensure!(
-        status.volume_id == facts.volume_id.as_str()
-            && status.attachment_id == facts.attachment_id.as_str()
-            && status.attachment_epoch == Some(facts.attachment_epoch)
+        status.volume_id == volume_id.as_str()
+            && status.attachment_id == attachment_id.as_str()
+            && status.attachment_epoch == Some(attachment_epoch)
             && status.mode == "strict"
             && status.guest_io_enabled == Some(true)
             && !status.fenced,
         "blockd status does not bind the exact live Strict attachment"
     );
     Ok(status)
+}
+
+struct PersistentFacts<'a> {
+    volume_intent_id: &'a Id,
+    disk_id: &'a Id,
+    volume_id: &'a Id,
+    attachment_id: &'a Id,
+    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &'a RemoteHead,
+    guest_device: &'a GuestDeviceIdentity,
+    mount: &'a ObservedMount,
+    control_socket: &'a Path,
+    block_frontend: &'static str,
+}
+
+fn persistent_facts<'a>(
+    checkpoint: &'a RuntimeCheckpoint,
+    raw_disk_id: &str,
+    raw_volume_id: &str,
+    raw_mount_path: &str,
+) -> Result<PersistentFacts<'a>> {
+    let disk_id = Id::new(raw_disk_id.to_owned()).context("invalid --disk-id")?;
+    let volume_id = Id::new(raw_volume_id.to_owned()).context("invalid --volume-id")?;
+    let mount_path = HostPath::new(raw_mount_path.to_owned()).context("invalid --mount-path")?;
+    anyhow::ensure!(mount_path.as_str() != "/", "Persistent mount path is Root");
+    let volumes = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| {
+            volume.disk_kind == ObservedDiskKind::Persistent
+                && volume.disk_id.as_ref() == Some(&disk_id)
+                && volume.volume_id == volume_id
+        })
+        .collect::<Vec<_>>();
+    let [volume] = volumes.as_slice() else {
+        bail!("Running checkpoint lacks one exact PersistentDisk")
+    };
+    anyhow::ensure!(
+        volume.durability == Some(cats_api::runtime_reconciliation::Durability::Strict),
+        "PersistentDisk is not Strict"
+    );
+    let volume_intent_id = volume
+        .volume_intent_id
+        .as_ref()
+        .context("PersistentDisk lacks volume_intent_id")?;
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &volume.authority
+    else {
+        bail!("PersistentDisk is not exact Owned authority")
+    };
+    let processes = checkpoint
+        .processes
+        .iter()
+        .filter(|process| {
+            matches!(
+                &process.role,
+                ProcessRole::Blockd { volume_id: observed_volume, attachment_id: observed_attachment, attachment_epoch: observed_epoch }
+                    if observed_volume == &volume.volume_id
+                        && observed_attachment == attachment_id
+                        && observed_epoch == attachment_epoch
+            )
+        })
+        .collect::<Vec<_>>();
+    let [process] = processes.as_slice() else {
+        bail!("PersistentDisk lacks one exact blockd process")
+    };
+    let RuntimeLaunch::Present(launch) = &checkpoint.runtime_launch else {
+        bail!("Running checkpoint lacks retained launch")
+    };
+    let prepared = launch
+        .devices
+        .iter()
+        .filter(|device| {
+            device.volume_intent_id == *volume_intent_id
+                && device.disk_id == disk_id
+                && device.volume_id == volume_id
+                && device.attachment_id == *attachment_id
+                && device.attachment_epoch == *attachment_epoch
+        })
+        .collect::<Vec<_>>();
+    let [prepared] = prepared.as_slice() else {
+        bail!("PersistentDisk lacks one exact retained launch device")
+    };
+    let mounts = checkpoint
+        .mounts
+        .iter()
+        .filter(|mount| mount.volume_id == volume_id)
+        .collect::<Vec<_>>();
+    let [mount] = mounts.as_slice() else {
+        bail!("PersistentDisk lacks one exact mounted-set member")
+    };
+    anyhow::ensure!(
+        mount.guest_device == prepared.guest_device
+            && mount.mount_path == mount_path
+            && mount.access == MountAccess::ReadWrite
+            && mount.instance_count == 1,
+        "PersistentDisk mount is not exact read-write readiness"
+    );
+    let block_frontend = match &prepared.frontend {
+        PrepareDeviceFrontend::KernelNbd { .. } => "kernel-nbd",
+        PrepareDeviceFrontend::VhostUserBlk { .. } => "vhost-user",
+    };
+    Ok(PersistentFacts {
+        volume_intent_id,
+        disk_id: volume.disk_id.as_ref().unwrap(),
+        volume_id: &volume.volume_id,
+        attachment_id,
+        attachment_epoch: *attachment_epoch,
+        head,
+        guest_device: &prepared.guest_device,
+        mount,
+        control_socket: Path::new(process.control_socket_path.as_str()),
+        block_frontend,
+    })
+}
+
+fn canonical_head(head: &RemoteHead) -> Result<String> {
+    serde_json::to_string(head).context("encode canonical remote head")
+}
+
+fn fresh_challenge() -> Result<RandomId128> {
+    let mut bytes = [0_u8; 16];
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    options
+        .open("/dev/urandom")
+        .context("open kernel entropy source")?
+        .read_exact(&mut bytes)
+        .context("read fresh RuntimeReady challenge")?;
+    anyhow::ensure!(
+        bytes.iter().any(|byte| *byte != 0),
+        "entropy returned zero ID"
+    );
+    RandomId128::new(hex::encode(bytes)).context("generated invalid challenge")
+}
+
+fn exact_runtime_ready(checkpoint: &RuntimeCheckpoint) -> Result<RuntimeReadyResponseV1> {
+    let RuntimeLaunch::Present(launch) = &checkpoint.runtime_launch else {
+        bail!("Running checkpoint lacks launch for RuntimeReady")
+    };
+    let GuestTransportEvidence::VsockReady {
+        runtime_incarnation,
+        guest_cid,
+        guest_port,
+        guest_agent_protocol_version,
+        guest_boot_id,
+    } = &checkpoint.guest_transport
+    else {
+        bail!("Running checkpoint lacks exact Guest transport")
+    };
+    anyhow::ensure!(
+        runtime_incarnation == &launch.runtime_incarnation
+            && *guest_cid == launch.guest_cid
+            && u32::from(*guest_port) == GUEST_HOST_CONTROL_VSOCK_PORT_V1
+            && *guest_agent_protocol_version
+                == cats_api::runtime_reconciliation::ContractVersion::V1,
+        "Guest transport does not bind launch and frozen protocol"
+    );
+    let request = RuntimeReadyRequestV1 {
+        version: GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
+        challenge: fresh_challenge()?,
+        runtime_incarnation: launch.runtime_incarnation.clone(),
+        expected_guest_cid: launch.guest_cid,
+        expected_guest_port: GUEST_HOST_CONTROL_VSOCK_PORT_V1,
+        expected_guest_agent_protocol_version: GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
+    };
+    let mut guest = guest_client(checkpoint)?;
+    let response = guest.runtime_ready(request)?;
+    anyhow::ensure!(
+        response.guest_boot_id == *guest_boot_id
+            && response.devices.len() == launch.devices.len()
+            && response.mounts.len() == checkpoint.mounts.len(),
+        "fresh RuntimeReady set differs from exact checkpoint set"
+    );
+    for prepared in &launch.devices {
+        let devices = response
+            .devices
+            .iter()
+            .filter(|device| device.guest_device == prepared.guest_device)
+            .collect::<Vec<_>>();
+        let [device] = devices.as_slice() else {
+            bail!("RuntimeReady lacks one exact retained device")
+        };
+        anyhow::ensure!(
+            device.size_bytes == prepared.size_bytes,
+            "RuntimeReady device size differs from launch"
+        );
+        let checkpoint_mounts = checkpoint
+            .mounts
+            .iter()
+            .filter(|mount| {
+                mount.volume_id == prepared.volume_id && mount.guest_device == prepared.guest_device
+            })
+            .collect::<Vec<_>>();
+        let [checkpoint_mount] = checkpoint_mounts.as_slice() else {
+            bail!("checkpoint lacks one exact mount for retained device")
+        };
+        let ready_mounts = response
+            .mounts
+            .iter()
+            .filter(|mount| {
+                mount.device_major == device.device_major
+                    && mount.device_minor == device.device_minor
+                    && mount.source_path == device.device_path
+            })
+            .collect::<Vec<_>>();
+        let [ready_mount] = ready_mounts.as_slice() else {
+            bail!("RuntimeReady lacks one exact mount for retained device")
+        };
+        anyhow::ensure!(
+            device.filesystem_uuid == checkpoint_mount.filesystem_uuid
+                && ready_mount.filesystem_uuid == checkpoint_mount.filesystem_uuid
+                && ready_mount.source_path == checkpoint_mount.source_path
+                && ready_mount.mount_root.as_str() == "/"
+                && ready_mount.mount_path == checkpoint_mount.mount_path
+                && ready_mount.filesystem_type.as_str() == "ext4"
+                && ready_mount.access == checkpoint_mount.access
+                && checkpoint_mount.instance_count == 1,
+            "RuntimeReady mount differs from checkpoint mounted-set"
+        );
+    }
+    Ok(response)
 }
 
 fn prove_remote(status: &DurabilityStatus) -> Result<()> {
@@ -408,6 +740,526 @@ fn snapshot(cat_id: &str) -> Result<()> {
             "route_gate_count": checkpoint.route_gates.len(),
             "active_route_gate_count": checkpoint.route_gates.iter().filter(|gate| matches!(gate.gate, cats_api::runtime_reconciliation::RouteGateState::Active)).count(),
             "strict_remote_durable": true
+        })
+    );
+    Ok(())
+}
+
+fn persistent_snapshot_value(
+    cat_id: &str,
+    disk_id: &str,
+    volume_id: &str,
+    mount_path: &str,
+) -> Result<serde_json::Value> {
+    let checkpoint = installed_checkpoint(cat_id)?;
+    let facts = persistent_facts(&checkpoint, disk_id, volume_id, mount_path)?;
+    let status = exact_blockd_status(
+        facts.control_socket,
+        facts.volume_id,
+        facts.attachment_id,
+        facts.attachment_epoch,
+    )?;
+    prove_remote(&status)?;
+    anyhow::ensure!(
+        status.remote_head.as_ref() == Some(facts.head),
+        "Persistent checkpoint and blockd disagree on current head"
+    );
+    let ready = exact_runtime_ready(&checkpoint)?;
+    let ready_devices = ready
+        .devices
+        .iter()
+        .filter(|device| device.guest_device == *facts.guest_device)
+        .collect::<Vec<_>>();
+    let [ready_device] = ready_devices.as_slice() else {
+        bail!("fresh RuntimeReady lacks exact Persistent device")
+    };
+    let RuntimeLaunch::Present(launch) = &checkpoint.runtime_launch else {
+        unreachable!()
+    };
+    let guest_boot_id = match &checkpoint.guest_transport {
+        GuestTransportEvidence::VsockReady { guest_boot_id, .. } => guest_boot_id,
+        _ => unreachable!(),
+    };
+    Ok(serde_json::json!({
+        "version": 1,
+        "cat_id": checkpoint.cat_id,
+        "node_id": checkpoint.node_id,
+        "disk_id": facts.disk_id,
+        "volume_id": facts.volume_id,
+        "volume_intent_id": facts.volume_intent_id,
+        "attachment_id": facts.attachment_id,
+        "attachment_epoch": facts.attachment_epoch,
+        "guest_device": {
+            "serial": facts.guest_device.serial,
+            "slot": facts.guest_device.slot.to_string()
+        },
+        "filesystem_uuid": facts.mount.filesystem_uuid,
+        "mount_path": facts.mount.mount_path,
+        "runtime_incarnation": launch.runtime_incarnation,
+        "guest_boot_id": guest_boot_id,
+        "device_path": ready_device.device_path,
+        "block_frontend": facts.block_frontend,
+        "remote_head": canonical_head(facts.head)?,
+        "remote_generation": status.remote_durable_generation,
+        "mounted_set_complete": true,
+        "strict_remote_durable": true
+    }))
+}
+
+fn persistent_snapshot(
+    cat_id: &str,
+    disk_id: &str,
+    volume_id: &str,
+    mount_path: &str,
+) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&persistent_snapshot_value(
+            cat_id, disk_id, volume_id, mount_path,
+        )?)?
+    );
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationFaultV1 {
+    version: u8,
+    run_id: String,
+    attachment_id: Id,
+    initialization_token: RandomId128,
+    filesystem_uuid: RandomId128,
+    action: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationInvocationV1 {
+    version: u8,
+    challenge: RandomId128,
+    attachment_id: Id,
+    initialization_token: RandomId128,
+    filesystem_uuid: RandomId128,
+    mkfs_invocations: u8,
+}
+
+fn arm_format_response_fault(
+    checkpoint: &RuntimeCheckpoint,
+    filesystem: &PersistentFilesystemBinding,
+    run_id: &str,
+) -> Result<()> {
+    canonical_run_id(run_id)?;
+    let FilesystemInitialization::Initialize {
+        initialization_token,
+        ..
+    } = &filesystem.initialization
+    else {
+        bail!("first-format checkpoint is not Initialize")
+    };
+    let artifact = QualificationFaultV1 {
+        version: 1,
+        run_id: run_id.to_owned(),
+        attachment_id: filesystem.attachment_id.clone(),
+        initialization_token: initialization_token.clone(),
+        filesystem_uuid: filesystem.filesystem_uuid.clone(),
+        action: "drop_validated_format_response_once".to_owned(),
+    };
+    let bytes = serde_json::to_vec(&artifact)?;
+    let mut guest = guest_client(checkpoint)?;
+    let script = r#"set -eu
+umask 077
+directory=/run/cats/qualification
+artifact=$directory/filesystem-fault.v1.json
+consumed=$directory/filesystem-fault-consumed.v1.json
+mkdir -p -m 0700 "$directory"
+test ! -L "$directory"
+test "$(stat -c '%u:%g:%a' "$directory")" = '0:0:700'
+test ! -e "$artifact" && test ! -L "$artifact"
+test ! -e "$consumed" && test ! -L "$consumed"
+set -C
+cat > "$artifact"
+chmod 0600 "$artifact"
+test "$(stat -c '%u:%g:%a:%h' "$artifact")" = '0:0:600:1'
+sync -f "$artifact"
+sync -f "$directory"
+printf 'armed\n'"#;
+    let (code, stdout, stderr) = guest.exec_with_input(
+        vec!["sh".into(), "-c".into(), script.into(), "cats-e3".into()],
+        Default::default(),
+        bytes,
+    )?;
+    anyhow::ensure!(
+        code == 0 && stdout == "armed\n",
+        "arm format-response fault failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+struct QualificationFaultEvidence {
+    artifact_sha256: String,
+    mkfs_invocations: u8,
+}
+
+fn qualification_fault_evidence(
+    checkpoint: &RuntimeCheckpoint,
+    filesystem: &PersistentFilesystemBinding,
+    run_id: &str,
+) -> Result<QualificationFaultEvidence> {
+    let FilesystemInitialization::Initialize {
+        initialization_token,
+        ..
+    } = &filesystem.initialization
+    else {
+        bail!("first-format checkpoint is not Initialize")
+    };
+    let marker = format!(
+        "/run/cats/qualification/filesystem-format-invocation-{}.v1.json",
+        filesystem.filesystem_uuid.as_str()
+    );
+    let mut guest = guest_client(checkpoint)?;
+    let script = r#"set -eu
+directory=/run/cats/qualification
+active=$directory/filesystem-fault.v1.json
+consumed=$directory/filesystem-fault-consumed.v1.json
+test ! -e "$active"
+test ! -L "$consumed" && test -f "$consumed"
+test ! -L "$1" && test -f "$1"
+test "$(stat -c '%u:%g:%a:%h' "$consumed")" = '0:0:600:1'
+test "$(stat -c '%u:%g:%a:%h' "$1")" = '0:0:600:1'
+cat "$consumed"
+printf '\n'
+cat "$1"
+printf '\n'
+sha256sum "$consumed" | awk '{print $1}'"#;
+    let (code, stdout, stderr) = guest.exec(vec![
+        "sh".into(),
+        "-c".into(),
+        script.into(),
+        "cats-e3".into(),
+        marker,
+    ])?;
+    anyhow::ensure!(
+        code == 0,
+        "read format-response fault evidence failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let [fault_line, invocation_line, digest] = lines.as_slice() else {
+        bail!("format-response fault evidence is not exactly three lines")
+    };
+    let fault: QualificationFaultV1 = serde_json::from_str(fault_line)?;
+    let invocation: QualificationInvocationV1 = serde_json::from_str(invocation_line)?;
+    anyhow::ensure!(
+        serde_json::to_string(&fault)? == *fault_line
+            && serde_json::to_string(&invocation)? == *invocation_line
+            && fault.version == 1
+            && fault.run_id == run_id
+            && fault.attachment_id == filesystem.attachment_id
+            && fault.initialization_token == *initialization_token
+            && fault.filesystem_uuid == filesystem.filesystem_uuid
+            && fault.action == "drop_validated_format_response_once"
+            && invocation.version == 1
+            && invocation.challenge.as_str().len() == 32
+            && invocation.attachment_id == filesystem.attachment_id
+            && invocation.initialization_token == *initialization_token
+            && invocation.filesystem_uuid == filesystem.filesystem_uuid
+            && invocation.mkfs_invocations == 1,
+        "format-response fault evidence does not bind initialization"
+    );
+    let calculated = hex::encode(Sha256::digest(fault_line.as_bytes()));
+    anyhow::ensure!(
+        digest.len() == 64 && *digest == calculated,
+        "consumed fault digest differs from exact artifact"
+    );
+    Ok(QualificationFaultEvidence {
+        artifact_sha256: calculated,
+        mkfs_invocations: invocation.mkfs_invocations,
+    })
+}
+
+fn filesystem_step(
+    checkpoint: &RuntimeCheckpoint,
+) -> Option<(&PersistentFilesystemBinding, Option<&RemoteHead>)> {
+    match &checkpoint.step {
+        ReconcileStep::FormatFilesystem { filesystem }
+        | ReconcileStep::DrainInitialization { filesystem, .. } => Some((filesystem, None)),
+        ReconcileStep::CommitInitialized {
+            filesystem,
+            new_remote_head,
+        } => Some((filesystem, Some(new_remote_head))),
+        ReconcileStep::MountFilesystem {
+            filesystem,
+            expected_head,
+        } => Some((filesystem, Some(expected_head))),
+        _ => None,
+    }
+}
+
+fn watch_persistent_initialization(
+    cat_id: &str,
+    disk_id: &str,
+    volume_id: &str,
+    mount_path: &str,
+    run_id: &str,
+    timeout_seconds: u64,
+) -> Result<()> {
+    canonical_run_id(run_id)?;
+    let disk_id = Id::new(disk_id.to_owned()).context("invalid --disk-id")?;
+    let volume_id = Id::new(volume_id.to_owned()).context("invalid --volume-id")?;
+    let mount_path = HostPath::new(mount_path.to_owned()).context("invalid --mount-path")?;
+    anyhow::ensure!(mount_path.as_str() != "/", "Persistent mount path is Root");
+    anyhow::ensure!(
+        (1..=900).contains(&timeout_seconds),
+        "--timeout-seconds is outside 1..=900"
+    );
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut format: Option<PersistentFilesystemBinding> = None;
+    let mut initialized_head: Option<RemoteHead> = None;
+    let mut fault_armed = false;
+    loop {
+        let checkpoint = load_installed_checkpoint(cat_id)?;
+        if let Some((filesystem, step_head)) = filesystem_step(&checkpoint) {
+            if filesystem.disk_id == disk_id && filesystem.volume_id == volume_id {
+                anyhow::ensure!(
+                    filesystem.mount_path == mount_path,
+                    "filesystem phase uses another mount path"
+                );
+                if let Some(existing) = &format {
+                    anyhow::ensure!(
+                        existing == filesystem,
+                        "filesystem identity changed between initialization phases"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        matches!(checkpoint.step, ReconcileStep::FormatFilesystem { .. }),
+                        "initialization watcher missed the first Format checkpoint"
+                    );
+                    format = Some(filesystem.clone());
+                }
+                if !fault_armed && matches!(checkpoint.step, ReconcileStep::FormatFilesystem { .. })
+                {
+                    arm_format_response_fault(&checkpoint, filesystem, run_id)?;
+                    fault_armed = true;
+                }
+                if let Some(head) = step_head {
+                    anyhow::ensure!(head.generation.get() > 0, "A22 initialized head is blank");
+                    if let Some(existing) = &initialized_head {
+                        anyhow::ensure!(
+                            existing == head,
+                            "A22 initialized head changed between commit and mount"
+                        );
+                    } else {
+                        initialized_head = Some(head.clone());
+                    }
+                }
+            }
+        }
+        if checkpoint.stable_state == Some(StableState::Running) {
+            let filesystem = format
+                .as_ref()
+                .context("Running became stable without observed first Format checkpoint")?;
+            let snapshot = persistent_snapshot_value(
+                cat_id,
+                disk_id.as_str(),
+                volume_id.as_str(),
+                mount_path.as_str(),
+            )?;
+            let stable_head: RemoteHead = serde_json::from_str(
+                snapshot
+                    .get("remote_head")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Persistent snapshot lacks remote head")?,
+            )?;
+            let initialized_head = initialized_head
+                .clone()
+                .context("Running became stable without observed A22 initialized head")?;
+            let FilesystemInitialization::Initialize {
+                expected_blank_head,
+                ..
+            } = &filesystem.initialization
+            else {
+                bail!("observed first format is not Initialize")
+            };
+            anyhow::ensure!(
+                initialized_head.generation.get() > expected_blank_head.generation.get()
+                    && stable_head.generation.get() >= initialized_head.generation.get(),
+                "initialized/stable head did not advance from exact blank head"
+            );
+            let fault = qualification_fault_evidence(&checkpoint, filesystem, run_id)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": 1,
+                    "cat_id": cat_id,
+                    "disk_id": disk_id,
+                    "volume_id": volume_id,
+                    "volume_intent_id": filesystem.volume_intent_id,
+                    "attachment_id": filesystem.attachment_id,
+                    "attachment_epoch": filesystem.attachment_epoch,
+                    "guest_device": {
+                        "serial": filesystem.guest_device.serial,
+                        "slot": filesystem.guest_device.slot.to_string()
+                    },
+                    "filesystem_uuid": filesystem.filesystem_uuid,
+                    "mount_path": filesystem.mount_path,
+                    "expected_blank_head": canonical_head(expected_blank_head)?,
+                    "initialized_head": canonical_head(&initialized_head)?,
+                    "first_format": {
+                        "ambiguous_response_discovered": true,
+                        "mkfs_invocations": fault.mkfs_invocations,
+                        "fault_action": "drop_validated_format_response_once",
+                        "consumed": true,
+                        "artifact_sha256": fault.artifact_sha256
+                    },
+                    "ready": snapshot
+                })
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Persistent initialization watcher timed out"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn persistent_sync(
+    cat_id: &str,
+    disk_id: &str,
+    volume_id: &str,
+    mount_path: &str,
+    run_id: &str,
+) -> Result<()> {
+    canonical_run_id(run_id)?;
+    let before_snapshot = persistent_snapshot_value(cat_id, disk_id, volume_id, mount_path)?;
+    let before_generation = before_snapshot
+        .get("remote_generation")
+        .and_then(serde_json::Value::as_u64)
+        .context("Persistent snapshot lacks remote generation")?;
+    let before_head = before_snapshot
+        .get("remote_head")
+        .and_then(serde_json::Value::as_str)
+        .context("Persistent snapshot lacks remote head")?
+        .to_owned();
+    let checkpoint = installed_checkpoint(cat_id)?;
+    let mut guest = guest_client(&checkpoint)?;
+    let marker_path = format!(
+        "{}/.cats-e3-{}.strict-flush",
+        mount_path.trim_end_matches('/'),
+        run_id
+    );
+    let script = "set -eu; umask 077; printf '%s\\n' \"$1\" > \"$2\"; sync -f \"$2\"";
+    let (code, stdout, stderr) = guest.exec(vec![
+        "sh".into(),
+        "-c".into(),
+        script.into(),
+        "cats-e3".into(),
+        run_id.into(),
+        marker_path.clone(),
+    ])?;
+    anyhow::ensure!(
+        code == 0,
+        "Persistent marker write failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    guest
+        .syncfs()
+        .context("Guest Syncfs after Persistent write")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let after_snapshot = loop {
+        let snapshot = persistent_snapshot_value(cat_id, disk_id, volume_id, mount_path)?;
+        let after_generation = snapshot
+            .get("remote_generation")
+            .and_then(serde_json::Value::as_u64)
+            .context("Persistent snapshot lacks remote generation")?;
+        if after_generation > before_generation {
+            break snapshot;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Persistent Strict remote head did not advance"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let after_head = after_snapshot
+        .get("remote_head")
+        .and_then(serde_json::Value::as_str)
+        .context("post-write Persistent snapshot lacks remote head")?;
+    for key in [
+        "attachment_id",
+        "attachment_epoch",
+        "filesystem_uuid",
+        "mount_path",
+        "runtime_incarnation",
+        "guest_boot_id",
+    ] {
+        anyhow::ensure!(
+            after_snapshot.get(key) == before_snapshot.get(key),
+            "Persistent identity changed while proving Strict head advance: {key}"
+        );
+    }
+    anyhow::ensure!(after_head != before_head, "Persistent head did not change");
+    println!(
+        "{}",
+        serde_json::json!({
+            "version": 1,
+            "cat_id": cat_id,
+            "disk_id": disk_id,
+            "volume_id": volume_id,
+            "attachment_id": before_snapshot["attachment_id"],
+            "attachment_epoch": before_snapshot["attachment_epoch"],
+            "filesystem_uuid": before_snapshot["filesystem_uuid"],
+            "mount_path": mount_path,
+            "marker_path": marker_path,
+            "before_head": before_head,
+            "after_head": after_head,
+            "before_remote_generation": before_generation,
+            "after_remote_generation": after_snapshot["remote_generation"],
+            "remote_durable": true
+        })
+    );
+    Ok(())
+}
+
+fn persistent_cold_absence(
+    cat_id: &str,
+    disk_id: &str,
+    volume_id: &str,
+    mount_path: &str,
+) -> Result<()> {
+    let disk_id = Id::new(disk_id.to_owned()).context("invalid --disk-id")?;
+    let volume_id = Id::new(volume_id.to_owned()).context("invalid --volume-id")?;
+    let mount_path = HostPath::new(mount_path.to_owned()).context("invalid --mount-path")?;
+    let checkpoint = load_installed_checkpoint(cat_id)?;
+    anyhow::ensure!(
+        checkpoint.stable_state == Some(StableState::Cold)
+            && matches!(checkpoint.runtime_launch, RuntimeLaunch::Absent)
+            && checkpoint.runtime_incarnation.is_none()
+            && checkpoint.processes.is_empty()
+            && checkpoint.mounts.is_empty()
+            && checkpoint.volumes.iter().all(|volume| {
+                volume.disk_id.as_ref() != Some(&disk_id)
+                    && volume.volume_id != volume_id
+                    && volume.devices.is_empty()
+            })
+            && !checkpoint
+                .mounts
+                .iter()
+                .any(|mount| mount.mount_path == mount_path),
+        "Cold checkpoint still contains detached Persistent resources"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "version": 1,
+            "cat_id": checkpoint.cat_id,
+            "node_id": checkpoint.node_id,
+            "disk_id": disk_id,
+            "volume_id": volume_id,
+            "mount_path": mount_path,
+            "desired_volume_absent": true,
+            "device_absent": true,
+            "mount_absent": true,
+            "stable_cold": true
         })
     );
     Ok(())
