@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    effective_uid, generate_pkcs8_v2_pem, list_directory_names, open_directory_nofollow,
-    open_file_at, publish_user_file_idempotent, read_regular_at, read_stable_file, read_user_file,
-    report, set_file_mode, sync_directory, validate_directory, validate_regular_metadata,
+    generate_pkcs8_v2_pem, list_directory_names, open_directory_nofollow, open_file_at,
+    publish_user_file_idempotent, read_regular_at, read_stable_file, read_user_file, report,
+    set_file_mode, sync_directory, validate_directory, validate_regular_metadata,
     write_new_file_at, Cli, RuntimeProvisionerRouteV2R1Command,
 };
 use crate::stable_unix_fs::{c_os_name, mkdir_at};
@@ -67,6 +67,8 @@ const MAX_PRIVATE_KEY_BYTES: usize = 16_384;
 const MAX_JSON_BYTES: usize = 262_144;
 const MAX_ROTATION_RECOVERY_BUNDLE_BYTES: usize = 1_048_576;
 const ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS: u64 = 5 * 60 * 1_000;
+const INSTALLED_ROTATION_OPERATOR_TRUST_PATH: &str =
+    "/etc/cats/route-v2/rotation-operator-trust.v1.json";
 const ROOT_DIRECTORIES: [&str; 5] = ["authority", "control", "gateway", "node", "provider"];
 const AUTHORITY_FILES: [(&str, u32); 3] = [
     ("route-v2-ca-certificate.pem", 0o644),
@@ -1927,9 +1929,8 @@ fn load_staged_rotation_contract(
 fn load_staged_rotation_trust(
     trust_path: &Path,
 ) -> Result<(RouteV2RotationOperatorTrust, Vec<u8>)> {
-    // The release artifact is public 0644, while the qualification runner
-    // stages every config below its root-only 0700 directory as 0600. No
-    // other mode is an admitted representation of this trust root.
+    // Only the fixed release artifact is public 0644. Every runner copy is a
+    // root-only 0600 staged input; arbitrary public copies are not authority.
     let trust_bytes = read_staged_rotation_trust_file(trust_path)?;
     let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
         .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
@@ -1937,6 +1938,38 @@ fn load_staged_rotation_trust(
 }
 
 fn read_staged_rotation_trust_file(path: &Path) -> Result<Vec<u8>> {
+    read_rotation_trust_file_as(path, rotation_trust_representation(path), 0, 0)
+}
+
+fn rotation_trust_representation(path: &Path) -> RotationTrustRepresentation {
+    if path == Path::new(INSTALLED_ROTATION_OPERATOR_TRUST_PATH) {
+        RotationTrustRepresentation::InstalledRelease
+    } else {
+        RotationTrustRepresentation::RunnerStaged
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RotationTrustRepresentation {
+    InstalledRelease,
+    RunnerStaged,
+}
+
+impl RotationTrustRepresentation {
+    fn exact_mode(self) -> u32 {
+        match self {
+            Self::InstalledRelease => 0o644,
+            Self::RunnerStaged => 0o600,
+        }
+    }
+}
+
+fn read_rotation_trust_file_as(
+    path: &Path,
+    representation: RotationTrustRepresentation,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Vec<u8>> {
     anyhow::ensure!(
         path.is_absolute(),
         "staged Route rotation trust path must be absolute"
@@ -1945,25 +1978,40 @@ fn read_staged_rotation_trust_file(path: &Path) -> Result<Vec<u8>> {
         path.parent()
             .context("staged Route rotation trust path has no parent")?,
     )?;
-    validate_directory(
-        &parent,
-        effective_uid(),
-        None,
-        "staged Route rotation trust parent",
-    )?;
+    let parent_metadata = parent.metadata()?;
+    anyhow::ensure!(
+        parent_metadata.file_type().is_dir()
+            && parent_metadata.uid() == expected_uid
+            && parent_metadata.gid() == expected_gid
+            && parent_metadata.mode() & 0o022 == 0,
+        "staged Route rotation trust parent is not owner-controlled"
+    );
     let name = c_os_name(
         path.file_name()
             .context("staged Route rotation trust path has no basename")?,
     )?;
     let file = open_file_at(&parent, &name, libc::O_RDONLY, 0)
         .with_context(|| format!("open staged Route rotation trust {}", path.display()))?;
-    let mode = file.metadata()?.mode() & 0o7777;
-    anyhow::ensure!(
-        matches!(mode, 0o600 | 0o644),
-        "staged Route rotation trust must have exact mode 0600 or 0644"
-    );
-    validate_regular_metadata(&file, effective_uid(), mode, "staged Route rotation trust")?;
+    let metadata = file.metadata()?;
+    validate_rotation_trust_metadata(&metadata, representation, expected_uid, expected_gid)?;
     read_stable_file(&file, MAX_JSON_BYTES)
+}
+
+fn validate_rotation_trust_metadata(
+    metadata: &std::fs::Metadata,
+    representation: RotationTrustRepresentation,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.uid() == expected_uid
+            && metadata.gid() == expected_gid
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o7777 == representation.exact_mode(),
+        "staged Route rotation trust has the wrong type, owner, link count, or mode"
+    );
+    Ok(())
 }
 
 fn validate_staged_rotation_lineage(bundle: &RotationRecoveryCommandBundle) -> Result<()> {
@@ -4096,7 +4144,127 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
     use tempfile::TempDir;
+
+    fn write_test_trust(path: &Path, mode: u32) {
+        std::fs::write(path, b"canonical-trust").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn test_owner(path: &Path) -> (u32, u32) {
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.uid(), metadata.gid())
+    }
+
+    #[test]
+    fn staged_and_fixed_rotation_trust_admit_only_their_exact_modes() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("rotation-operator-trust.v1.json");
+        let (uid, gid) = test_owner(root.path());
+
+        assert_eq!(
+            rotation_trust_representation(Path::new(INSTALLED_ROTATION_OPERATOR_TRUST_PATH)),
+            RotationTrustRepresentation::InstalledRelease
+        );
+        assert_eq!(
+            rotation_trust_representation(&path),
+            RotationTrustRepresentation::RunnerStaged
+        );
+
+        write_test_trust(&path, 0o600);
+        assert_eq!(
+            read_rotation_trust_file_as(
+                &path,
+                RotationTrustRepresentation::RunnerStaged,
+                uid,
+                gid,
+            )
+            .unwrap(),
+            b"canonical-trust"
+        );
+        assert!(read_rotation_trust_file_as(
+            &path,
+            RotationTrustRepresentation::InstalledRelease,
+            uid,
+            gid,
+        )
+        .is_err());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_rotation_trust_file_as(
+                &path,
+                RotationTrustRepresentation::InstalledRelease,
+                uid,
+                gid,
+            )
+            .unwrap(),
+            b"canonical-trust"
+        );
+        assert!(read_rotation_trust_file_as(
+            &path,
+            RotationTrustRepresentation::RunnerStaged,
+            uid,
+            gid,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn staged_rotation_trust_rejects_loose_modes_links_and_wrong_owner() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("rotation-operator-trust.v1.json");
+        let (uid, gid) = test_owner(root.path());
+
+        for mode in [0o640, 0o660, 0o664, 0o604] {
+            if path.exists() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            write_test_trust(&path, mode);
+            assert!(read_rotation_trust_file_as(
+                &path,
+                RotationTrustRepresentation::RunnerStaged,
+                uid,
+                gid,
+            )
+            .is_err());
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let target = root.path().join("trust-target.json");
+        write_test_trust(&target, 0o600);
+        symlink(&target, &path).unwrap();
+        assert!(read_rotation_trust_file_as(
+            &path,
+            RotationTrustRepresentation::RunnerStaged,
+            uid,
+            gid,
+        )
+        .is_err());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(read_rotation_trust_file_as(
+            &path,
+            RotationTrustRepresentation::RunnerStaged,
+            uid,
+            gid,
+        )
+        .is_err());
+
+        let wrong_owner_path = root.path().join("wrong-owner.json");
+        write_test_trust(&wrong_owner_path, 0o600);
+        let metadata = std::fs::metadata(&wrong_owner_path).unwrap();
+        let wrong_uid = if uid == 0 { 1 } else { 0 };
+        assert!(validate_rotation_trust_metadata(
+            &metadata,
+            RotationTrustRepresentation::RunnerStaged,
+            wrong_uid,
+            gid,
+        )
+        .is_err());
+    }
 
     #[test]
     fn provider_inputs_preserve_the_exact_closed_role_bytes() {
