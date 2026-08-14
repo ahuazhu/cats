@@ -39,6 +39,7 @@ pub struct AwsObjectWriteConfig {
     object_store_prefix: String,
     object_store_scope_id: AsciiText,
     durable_spool_root: PathBuf,
+    durable_spool_root_uid: u32,
 }
 
 impl AwsObjectWriteConfig {
@@ -69,14 +70,18 @@ impl AwsObjectWriteConfig {
         {
             return Err(ObjectWriteDownstreamError::InvalidRequest);
         }
-        let durable_spool_root = std::fs::canonicalize(durable_spool_root)
+        let canonical_spool_root = std::fs::canonicalize(&durable_spool_root)
             .map_err(|_| ObjectWriteDownstreamError::Unavailable)?;
+        if canonical_spool_root != durable_spool_root {
+            return Err(ObjectWriteDownstreamError::InvalidRequest);
+        }
         Ok(Self {
             provider_scope,
             bucket,
             object_store_prefix,
             object_store_scope_id,
-            durable_spool_root,
+            durable_spool_root: canonical_spool_root,
+            durable_spool_root_uid: metadata.uid(),
         })
     }
 
@@ -179,7 +184,13 @@ impl AwsObjectWriteGatewayDownstream {
             .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?;
         let provider_key = self.config.provider_key(&request.descriptor)?;
         let spool_path = self.config.spool_path(&request.spool.spool_id)?;
-        validate_spool_file(&spool_path, &request.descriptor, absolute_deadline).await?;
+        validate_spool_file(
+            &spool_path,
+            &request.descriptor,
+            self.config.durable_spool_root_uid,
+            absolute_deadline,
+        )
+        .await?;
 
         let checksum_sha256 = STANDARD.encode(request.descriptor.content_sha256.as_bytes());
         let metadata = BTreeMap::from([
@@ -354,8 +365,13 @@ struct FileIdentity {
     device: u64,
     inode: u64,
     length: u64,
+    links: u64,
+    owner_uid: u32,
+    mode: u32,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
@@ -363,28 +379,49 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
         length: metadata.len(),
+        links: metadata.nlink(),
+        owner_uid: metadata.uid(),
+        mode: metadata.mode(),
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
     }
+}
+
+fn valid_spool_metadata(
+    metadata: &std::fs::Metadata,
+    expected_length: u64,
+    expected_owner_uid: u32,
+) -> bool {
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.mode() & 0o7777 == 0o600
+        && metadata.nlink() == 1
+        && metadata.uid() == expected_owner_uid
+        && metadata.len() == expected_length
 }
 
 async fn validate_spool_file(
     path: &Path,
     descriptor: &ObjectPutDescriptor,
+    expected_owner_uid: u32,
     deadline: Instant,
 ) -> Result<(), ObjectWriteDownstreamError> {
     let metadata = timeout_read(tokio::fs::symlink_metadata(path), deadline).await?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.len() != descriptor.content_length.get()
-    {
+    if !valid_spool_metadata(
+        &metadata,
+        descriptor.content_length.get(),
+        expected_owner_uid,
+    ) {
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
     let before = file_identity(&metadata);
     let mut file = timeout_read(tokio::fs::File::open(path), deadline).await?;
     let opened = timeout_read(file.metadata(), deadline).await?;
-    if file_identity(&opened) != before {
+    if file_identity(&opened) != before
+        || !valid_spool_metadata(&opened, descriptor.content_length.get(), expected_owner_uid)
+    {
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
 
@@ -412,7 +449,9 @@ async fn validate_spool_file(
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
     let after = timeout_read(tokio::fs::symlink_metadata(path), deadline).await?;
-    if file_identity(&after) != before || after.permissions().mode() & 0o777 != 0o600 {
+    if file_identity(&after) != before
+        || !valid_spool_metadata(&after, descriptor.content_length.get(), expected_owner_uid)
+    {
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
     Ok(())
@@ -1011,12 +1050,13 @@ mod tests {
 
     fn config(root: &Path) -> AwsObjectWriteConfig {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical_root = std::fs::canonicalize(root).unwrap();
         AwsObjectWriteConfig::new(
             provider_scope(),
             "cats-chunks-test".to_owned(),
             "production/chunks".to_owned(),
             ascii("arn:aws:s3:::cats-chunks-test/production/chunks"),
-            root.to_owned(),
+            canonical_root,
         )
         .unwrap()
     }
@@ -1074,6 +1114,34 @@ mod tests {
                 "production/chunks".to_owned(),
                 ascii("arn:aws:s3:::cats-chunks-test/production/chunks"),
                 temporary.path().to_owned(),
+            ),
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn configuration_rejects_a_spool_root_reached_through_an_aliased_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let real_parent = temporary.path().join("real-parent");
+        let real_spool_root = real_parent.join("spool");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::fs::create_dir(&real_spool_root).unwrap();
+        std::fs::set_permissions(&real_spool_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let aliased_parent = temporary.path().join("aliased-parent");
+        std::os::unix::fs::symlink(&real_parent, &aliased_parent).unwrap();
+        let configured_spool_root = aliased_parent.join("spool");
+        assert_ne!(
+            std::fs::canonicalize(&configured_spool_root).unwrap(),
+            configured_spool_root
+        );
+
+        assert_eq!(
+            AwsObjectWriteConfig::new(
+                provider_scope(),
+                "cats-chunks-test".to_owned(),
+                "production/chunks".to_owned(),
+                ascii("arn:aws:s3:::cats-chunks-test/production/chunks"),
+                configured_spool_root,
             ),
             Err(ObjectWriteDownstreamError::InvalidRequest)
         );
@@ -1257,6 +1325,60 @@ mod tests {
             Err(ObjectWriteDownstreamError::InvalidRequest)
         );
         assert!(s3.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spool_with_an_extra_hard_link_is_rejected_before_s3() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"linked spool";
+        let descriptor = descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let spool_path = temporary
+            .path()
+            .join(format!("{}{SPOOL_FILE_SUFFIX}", spool.spool_id.as_str()));
+        std::fs::hard_link(&spool_path, temporary.path().join("unexpected-link")).unwrap();
+        let s3 = Arc::new(FakeS3::new(vec![], vec![]));
+        let downstream =
+            AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
+
+        assert_eq!(
+            downstream
+                .put_exact(
+                    ObjectWriteDownstreamPut { descriptor, spool },
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await,
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
+        assert!(s3.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spool_with_the_wrong_owner_uid_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"owner-bound spool";
+        let descriptor = descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let spool_path = temporary
+            .path()
+            .join(format!("{}{SPOOL_FILE_SUFFIX}", spool.spool_id.as_str()));
+        let actual_uid = std::fs::symlink_metadata(&spool_path).unwrap().uid();
+        let different_uid = if actual_uid == u32::MAX {
+            actual_uid - 1
+        } else {
+            actual_uid + 1
+        };
+
+        assert_eq!(
+            validate_spool_file(
+                &spool_path,
+                &descriptor,
+                different_uid,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await,
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
     }
 
     #[tokio::test]
