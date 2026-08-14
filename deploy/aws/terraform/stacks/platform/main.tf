@@ -366,8 +366,8 @@ resource "aws_vpc_security_group_ingress_rule" "object_write_gateway_nlb_from_wo
 resource "aws_vpc_security_group_egress_rule" "object_write_gateway_nlb_to_cluster" {
   security_group_id            = aws_security_group.object_write_gateway_nlb.id
   referenced_security_group_id = module.cluster.cluster_security_group_id
-  from_port                    = 7444
-  to_port                      = 7444
+  from_port                    = 7443
+  to_port                      = 7443
   ip_protocol                  = "tcp"
   description                  = "TLS pass-through to ObjectWrite Gateway Pods"
 }

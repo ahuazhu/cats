@@ -840,37 +840,36 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
           command           = ["/usr/local/bin/cats-object-write-gatewayd"]
           args = [
             "--listen",
-            "0.0.0.0:7444",
+            "0.0.0.0:7443",
+            "--control-store-url-file",
+            "/etc/cats/object-write-database/CATS_CONTROL_POSTGRES_URL",
+            "--control-store-ca-file",
+            "/etc/cats/rds-ca.pem",
             "--server-certificate-file",
             "/etc/cats/object-write-tls/object-write-server-certificate.pem",
             "--server-private-key-file",
             "/etc/cats/object-write-tls/object-write-server-private-key.pem",
-            "--control-store-url-file",
-            "/etc/cats/object-write-database/CATS_CONTROL_POSTGRES_URL",
             "--durable-spool-root",
-            "/var/lib/cats/object-write-spools",
-            "--object-store-adapter",
-            "aws-s3",
-            "--object-store-option",
-            "bucket=${var.chunkstore_bucket_name}",
-            "--object-store-option",
-            "region=${var.chunkstore_region}",
-            "--object-store-option",
-            "prefix=${var.chunkstore_prefix}",
-            "--object-provider-partition",
+            "/var/lib/cats/object-write-spool",
+            "--provider",
+            "aws",
+            "--partition",
             var.object_write_provider_partition,
-            "--object-provider-account-id",
+            "--account-id",
             var.object_write_provider_account_id,
+            "--region",
+            var.chunkstore_region,
+            "--bucket",
+            var.chunkstore_bucket_name,
+            "--prefix",
+            var.chunkstore_prefix,
+            "--object-store-scope-id",
+            "arn:${var.object_write_provider_partition}:s3:::${var.chunkstore_bucket_name}/${var.chunkstore_prefix}",
           ]
-
-          env {
-            name  = "CATS_CONTROL_POSTGRES_CA_FILE"
-            value = "/etc/cats/rds-ca.pem"
-          }
 
           port {
             name           = "https"
-            container_port = 7444
+            container_port = 7443
             protocol       = "TCP"
           }
 
@@ -945,7 +944,7 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
 
           volume_mount {
             name       = "object-write-spool"
-            mount_path = "/var/lib/cats/object-write-spools"
+            mount_path = "/var/lib/cats/object-write-spool"
           }
         }
 

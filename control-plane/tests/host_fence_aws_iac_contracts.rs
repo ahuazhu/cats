@@ -269,7 +269,7 @@ fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
         "resource \"kubernetes_deployment_v1\" \"object_write_gateway\"",
         "resource \"kubernetes_pod_disruption_budget_v1\" \"object_write_gateway\"",
     );
-    assert!(deployment.contains("mount_path = \"/var/lib/cats/object-write-spools\""));
+    assert!(deployment.contains("mount_path = \"/var/lib/cats/object-write-spool\""));
     assert!(deployment.contains("cats-object-write-gatewayd"));
     assert!(deployment.contains("max_unavailable = \"0\""));
 }
@@ -329,12 +329,46 @@ fn object_write_gateway_is_private_tls_passthrough_from_exact_workers() {
     for contract in [
         "object-write-server-certificate.pem object-write-server-private-key.pem",
         "test \"$actual_count\" = 2",
+        "\"0.0.0.0:7443\"",
+        "--control-store-url-file",
+        "--control-store-ca-file",
         "--server-certificate-file",
         "--server-private-key-file",
+        "--durable-spool-root",
+        "\"/var/lib/cats/object-write-spool\"",
+        "\"--provider\"",
+        "\"--partition\"",
+        "\"--account-id\"",
+        "\"--region\"",
+        "\"--bucket\"",
+        "\"--prefix\"",
+        "\"--object-store-scope-id\"",
+        "arn:${var.object_write_provider_partition}:s3:::${var.chunkstore_bucket_name}/${var.chunkstore_prefix}",
+        "container_port = 7443",
         "scheme = \"HTTPS\"",
     ] {
         assert!(deployment.contains(contract), "missing Pod TLS: {contract}");
     }
+    for stale in [
+        "0.0.0.0:7444",
+        "--object-store-adapter",
+        "--object-store-option",
+        "--object-provider-partition",
+        "--object-provider-account-id",
+    ] {
+        assert!(
+            !deployment.contains(stale),
+            "stale pre-freeze gateway argument remains: {stale}"
+        );
+    }
+
+    let nlb_egress = between(
+        &platform,
+        "resource \"aws_vpc_security_group_egress_rule\" \"object_write_gateway_nlb_to_cluster\"",
+        "# A stable private name is required",
+    );
+    assert!(nlb_egress.contains("from_port                    = 7443"));
+    assert!(nlb_egress.contains("to_port                      = 7443"));
 
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
