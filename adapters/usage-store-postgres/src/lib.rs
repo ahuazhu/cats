@@ -35,6 +35,26 @@ use postgres_native_tls::MakeTlsConnector;
 
 pub const DEFAULT_SCHEMA: &str = "cats_usage";
 pub const DEFAULT_WORKERS: usize = 4;
+pub const USAGE_SCHEMA_VERSION: i32 = 16;
+/// SHA-256 of the PostgreSQL-16 normalized catalog rows selected by
+/// `USAGE_SCHEMA_V16_CATALOG_SQL`. This is a release protocol constant, not a
+/// migration hint: any mismatch is refused without repair.
+pub const USAGE_SCHEMA_V16_CATALOG_SHA256: &str =
+    "sha256:ec10b4afe112dba411466e9b2d67d1cef5d8d232da4ec52c11ced993d771f157";
+pub const USAGE_SCHEMA_V16_FUNCTION_PROSRC_SHA256: &[(&str, &str)] = &[
+    (
+        "reject_credit_ledger_mutation",
+        "sha256:cdb5c3f99782490aaab6986cffe264cbcae9dcecf5b50f2143390ed120183b11",
+    ),
+    (
+        "reject_usage_checkpoint_mutation",
+        "sha256:3f7dac6e76c38bd26adce3f6353d452244aeaa8f0476b66e3dc1366cea70872d",
+    ),
+    (
+        "reject_usage_terminal_mutation",
+        "sha256:cf292f5255d98ef61ca15dc3d801863fcf63b63675d86902ddf67b32d278c9e0",
+    ),
+];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,6 +64,172 @@ const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 // even if all of them select the same worker. Other callers then backpressure
 // instead of growing synchronous database work without a bound.
 const JOBS_PER_WORKER: usize = 64;
+
+/// PostgreSQL 16 canonicalizes DDL before returning it from `pg_get_*def`.
+/// Hashing this complete, schema-name-neutral row set detects extra, missing or
+/// altered relations, columns, constraints, indexes, user triggers, functions,
+/// policies, rules and schema-owned scalar types. Internal FK triggers are
+/// deliberately represented by their constraints instead of unstable OIDs.
+const USAGE_SCHEMA_V16_CATALOG_SQL: &str = r#"
+WITH catalog(kind, key1, key2, definition) AS (
+    SELECT 'relation', class_row.relname, '',
+           jsonb_build_array(
+               class_row.relkind::text,
+               class_row.relpersistence::text,
+               COALESCE(access_method_row.amname, ''),
+               class_row.relrowsecurity,
+               class_row.relforcerowsecurity,
+               class_row.relreplident::text,
+               COALESCE(array_to_string(class_row.reloptions, E'\x1f'), '')
+           )::text
+      FROM pg_catalog.pg_class class_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      LEFT JOIN pg_catalog.pg_am access_method_row ON access_method_row.oid=class_row.relam
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'column', class_row.relname, attribute_row.attname,
+           jsonb_build_array(
+               attribute_row.attnum,
+               pg_catalog.format_type(attribute_row.atttypid, attribute_row.atttypmod),
+               attribute_row.attnotnull,
+               attribute_row.attidentity::text,
+               attribute_row.attgenerated::text,
+               attribute_row.attstorage::text,
+               attribute_row.attcompression::text,
+               attribute_row.attstattarget,
+               COALESCE(collation_row.collname, ''),
+               COALESCE(replace(
+                   pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid, true),
+                   $1 || '.', '<schema>.'
+               ), '')
+           )::text
+      FROM pg_catalog.pg_attribute attribute_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=attribute_row.attrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      LEFT JOIN pg_catalog.pg_attrdef default_row
+        ON default_row.adrelid=attribute_row.attrelid
+       AND default_row.adnum=attribute_row.attnum
+      LEFT JOIN pg_catalog.pg_collation collation_row ON collation_row.oid=attribute_row.attcollation
+     WHERE namespace_row.nspname=$1
+       AND class_row.relkind IN ('r','p')
+       AND attribute_row.attnum > 0
+       AND NOT attribute_row.attisdropped
+    UNION ALL
+    SELECT 'constraint', class_row.relname, constraint_row.conname,
+           jsonb_build_array(
+               constraint_row.contype::text,
+               constraint_row.condeferrable,
+               constraint_row.condeferred,
+               constraint_row.convalidated,
+               constraint_row.connoinherit,
+               replace(
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_constraint constraint_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=constraint_row.conrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'index', table_class.relname, index_class.relname,
+           jsonb_build_array(
+               index_row.indisunique,
+               index_row.indisprimary,
+               index_row.indisvalid,
+               index_row.indisready,
+               index_row.indisclustered,
+               index_row.indnullsnotdistinct,
+               replace(
+                   pg_catalog.pg_get_indexdef(index_row.indexrelid, 0, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_index index_row
+      JOIN pg_catalog.pg_class index_class ON index_class.oid=index_row.indexrelid
+      JOIN pg_catalog.pg_class table_class ON table_class.oid=index_row.indrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=table_class.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'trigger', class_row.relname, trigger_row.tgname,
+           jsonb_build_array(
+               trigger_row.tgenabled::text,
+               CASE WHEN function_namespace.nspname=$1
+                    THEN '<schema>' ELSE function_namespace.nspname END,
+               function_row.proname,
+               replace(
+                   pg_catalog.pg_get_triggerdef(trigger_row.oid, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_trigger trigger_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=trigger_row.tgrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      JOIN pg_catalog.pg_proc function_row ON function_row.oid=trigger_row.tgfoid
+      JOIN pg_catalog.pg_namespace function_namespace
+        ON function_namespace.oid=function_row.pronamespace
+     WHERE namespace_row.nspname=$1 AND NOT trigger_row.tgisinternal
+    UNION ALL
+    SELECT 'function', function_row.proname,
+           pg_catalog.pg_get_function_identity_arguments(function_row.oid),
+           jsonb_build_array(
+               function_row.prokind::text,
+               language_row.lanname,
+               function_row.provolatile::text,
+               function_row.proisstrict,
+               function_row.prosecdef,
+               function_row.proleakproof,
+               function_row.proparallel::text,
+               COALESCE(array_to_string(function_row.proconfig, E'\x1f'), ''),
+               pg_catalog.pg_get_function_result(function_row.oid),
+               replace(
+                   pg_catalog.pg_get_functiondef(function_row.oid),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_proc function_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=function_row.pronamespace
+      JOIN pg_catalog.pg_language language_row ON language_row.oid=function_row.prolang
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'policy', class_row.relname, policy_row.polname,
+           jsonb_build_array(
+               policy_row.polcmd::text,
+               policy_row.polpermissive,
+               COALESCE(pg_catalog.pg_get_expr(policy_row.polqual, policy_row.polrelid, true), ''),
+               COALESCE(pg_catalog.pg_get_expr(policy_row.polwithcheck, policy_row.polrelid, true), '')
+           )::text
+      FROM pg_catalog.pg_policy policy_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=policy_row.polrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'rule', class_row.relname, rewrite_row.rulename,
+           replace(
+               pg_catalog.pg_get_ruledef(rewrite_row.oid, true),
+               $1 || '.', '<schema>.'
+           )
+      FROM pg_catalog.pg_rewrite rewrite_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=rewrite_row.ev_class
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1 AND rewrite_row.rulename <> '_RETURN'
+    UNION ALL
+    SELECT 'type', type_row.typname, '',
+           jsonb_build_array(
+               type_row.typtype::text,
+               type_row.typcategory::text,
+               type_row.typnotnull,
+               COALESCE(type_row.typdefault, ''),
+               COALESCE(pg_catalog.format_type(NULLIF(type_row.typbasetype, 0), type_row.typtypmod), '')
+           )::text
+      FROM pg_catalog.pg_type type_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=type_row.typnamespace
+     WHERE namespace_row.nspname=$1 AND type_row.typrelid=0 AND type_row.typelem=0
+)
+SELECT kind, key1, key2, definition
+  FROM catalog
+ ORDER BY kind COLLATE "C", key1 COLLATE "C", key2 COLLATE "C", definition COLLATE "C"
+"#;
 
 /// A job receives the connection or the reason there is not one. Dropping it
 /// unrun would reach the caller as "operation was canceled", which is the kind
@@ -124,6 +310,34 @@ impl PostgresUsageStore {
             WORKER_STARTUP_TIMEOUT,
             DISPATCH_TIMEOUT,
         )
+    }
+
+    /// Read-only reset/preflight hook. Unlike normal startup this never
+    /// installs an empty schema: absence, partial state and every catalog
+    /// mismatch are returned as failure without making a database change.
+    pub fn verify_existing_schema_v16(
+        url: &str,
+        ca_file: Option<&str>,
+        schema: &str,
+    ) -> Result<()> {
+        validate_schema_name(schema)?;
+        let mut client = connect_uninitialized_client(url, ca_file)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| pg_error("start read-only Usage v16 verification", error))?;
+        transaction
+            .batch_execute("SET TRANSACTION READ ONLY")
+            .map_err(|error| pg_error("make Usage v16 verification read-only", error))?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v16', 0))",
+                &[],
+            )
+            .map_err(|error| pg_error("lock read-only Usage v16 verification", error))?;
+        verify_exact_usage_schema_v16(&mut transaction, schema)?;
+        transaction
+            .commit()
+            .map_err(|error| pg_error("commit read-only Usage v16 verification", error))
     }
 
     fn connect_from_with_timeouts(
@@ -1575,13 +1789,18 @@ fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>, schema: &str) -> Res
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>, schema: &str) -> Result<Client> {
+    let mut client = connect_uninitialized_client(url, ca_file)?;
+    migrate(&mut client, schema)?;
+    Ok(client)
+}
+
+fn connect_uninitialized_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
     let connector = tls_connector(ca_file)?;
     let config = client_config(url)?;
     let mut client = config
         .connect(MakeTlsConnector::new(connector))
         .map_err(|error| pg_error("connect PostgreSQL", error))?;
     configure_session(&mut client)?;
-    migrate(&mut client, schema)?;
     Ok(client)
 }
 
@@ -1671,40 +1890,153 @@ fn validate_schema_name(schema: &str) -> Result<()> {
 }
 
 fn migrate(client: &mut Client, schema: &str) -> Result<()> {
-    let sql = migration_sql(schema);
     let mut transaction = client
         .transaction()
-        .map_err(|error| pg_error("start usage migration", error))?;
+        .map_err(|error| pg_error("start Usage v16 schema verification", error))?;
     transaction
         .query_one(
-            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v1', 0))",
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v16', 0))",
             &[],
         )
-        .map_err(|error| pg_error("lock usage migration", error))?;
-    transaction
-        .batch_execute(&sql)
-        .map_err(|error| pg_error("migrate usage schema", error))?;
+        .map_err(|error| pg_error("lock Usage v16 schema verification", error))?;
+    let schema_exists = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)",
+            &[&schema],
+        )
+        .map_err(|error| pg_error("discover Usage schema", error))?
+        .get::<_, bool>(0);
+    let install = if schema_exists {
+        usage_schema_is_empty(&mut transaction, schema)?
+    } else {
+        transaction
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .map_err(|error| pg_error("create empty Usage v16 schema", error))?;
+        true
+    };
+    if install {
+        transaction
+            .batch_execute(&fresh_schema_sql(schema))
+            .map_err(|error| pg_error("install exact fresh Usage v16 schema", error))?;
+    }
+    verify_exact_usage_schema_v16(&mut transaction, schema)?;
     transaction
         .commit()
-        .map_err(|error| pg_error("commit usage migration", error))
+        .map_err(|error| pg_error("commit Usage v16 schema verification", error))
 }
 
-fn migration_sql(schema: &str) -> String {
+fn usage_schema_is_empty(transaction: &mut Transaction<'_>, schema: &str) -> Result<bool> {
+    transaction
+        .query_one(
+            r#"SELECT NOT EXISTS (
+                   SELECT 1 FROM pg_catalog.pg_class class_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=class_row.relnamespace
+                   WHERE namespace_row.nspname=$1
+                   UNION ALL
+                   SELECT 1 FROM pg_catalog.pg_proc function_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=function_row.pronamespace
+                   WHERE namespace_row.nspname=$1
+                   UNION ALL
+                   SELECT 1 FROM pg_catalog.pg_type type_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=type_row.typnamespace
+                   WHERE namespace_row.nspname=$1
+                     AND type_row.typrelid=0 AND type_row.typelem=0
+               )"#,
+            &[&schema],
+        )
+        .map(|row| row.get(0))
+        .map_err(|error| pg_error("inspect empty Usage schema", error))
+}
+
+fn verify_exact_usage_schema_v16(transaction: &mut Transaction<'_>, schema: &str) -> Result<()> {
+    let stamp_sql = format!("SELECT version FROM {schema}.schema_migrations ORDER BY version");
+    let versions = transaction
+        .query(&stamp_sql, &[])
+        .map_err(|_| {
+            MeteringError::Conflict(
+                "nonempty Usage schema has no readable exact v16 stamp; refusing repair".into(),
+            )
+        })?
+        .into_iter()
+        .map(|row| row.get::<_, i32>(0))
+        .collect::<Vec<_>>();
+    if versions != [USAGE_SCHEMA_VERSION] {
+        return Err(MeteringError::Conflict(format!(
+            "Usage schema version rows {versions:?} are not the one exact v16 stamp"
+        )));
+    }
+    let functions = transaction
+        .query(
+            "SELECT function_row.proname, function_row.prosrc
+               FROM pg_catalog.pg_proc function_row
+               JOIN pg_catalog.pg_namespace namespace_row
+                 ON namespace_row.oid=function_row.pronamespace
+              WHERE namespace_row.nspname=$1
+              ORDER BY function_row.proname COLLATE \"C\"",
+            &[&schema],
+        )
+        .map_err(|error| pg_error("read Usage v16 function bodies", error))?
+        .into_iter()
+        .map(|row| {
+            let name = row.get::<_, String>(0);
+            let body = row.get::<_, String>(1);
+            (name, sha256_prefixed(body.as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    let expected_functions = USAGE_SCHEMA_V16_FUNCTION_PROSRC_SHA256
+        .iter()
+        .map(|(name, digest)| ((*name).to_string(), (*digest).to_string()))
+        .collect::<Vec<_>>();
+    if functions != expected_functions {
+        return Err(MeteringError::Conflict(
+            "Usage schema v16 function prosrc digest set differs from the release; refusing repair"
+                .into(),
+        ));
+    }
+    let actual = usage_schema_catalog_sha256(transaction, schema)?;
+    if actual != USAGE_SCHEMA_V16_CATALOG_SHA256 {
+        return Err(MeteringError::Conflict(format!(
+            "Usage schema v16 catalog digest {actual} does not match release digest {USAGE_SCHEMA_V16_CATALOG_SHA256}; refusing repair"
+        )));
+    }
+    Ok(())
+}
+
+fn usage_schema_catalog_sha256(transaction: &mut Transaction<'_>, schema: &str) -> Result<String> {
+    let rows = transaction
+        .query(USAGE_SCHEMA_V16_CATALOG_SQL, &[&schema])
+        .map_err(|error| pg_error("read normalized Usage v16 catalog", error))?;
+    let mut bytes = Vec::new();
+    for row in rows {
+        for column in 0..4 {
+            let value = row.get::<_, String>(column);
+            bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+    Ok(sha256_prefixed(&bytes))
+}
+
+fn fresh_schema_sql(schema: &str) -> String {
     format!(
         r#"
-CREATE SCHEMA IF NOT EXISTS {schema};
-CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
-    version INTEGER PRIMARY KEY,
+CREATE TABLE {schema}.schema_migrations (
+    version INTEGER NOT NULL,
+    CONSTRAINT schema_migrations_pk PRIMARY KEY (version),
+    CONSTRAINT schema_migrations_version_exact CHECK (version = 16),
     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
-CREATE TABLE IF NOT EXISTS {schema}.usage_checkpoints (
-    event_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.usage_checkpoints (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     source_epoch TEXT NOT NULL,
-    sequence BIGINT NOT NULL CHECK (sequence >= 0),
-    observed_at_ms BIGINT NOT NULL CHECK (observed_at_ms >= 0),
+    sequence BIGINT NOT NULL,
+    observed_at_ms BIGINT NOT NULL,
     metric TEXT NOT NULL,
-    cumulative_quantity NUMERIC(39, 0) NOT NULL CHECK (cumulative_quantity >= 0),
+    cumulative_quantity NUMERIC(39, 0) NOT NULL,
     billing_account_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
@@ -1715,11 +2047,16 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_checkpoints (
         CONSTRAINT usage_checkpoints_source_binding_nonempty
         CHECK (source_binding_json <> ''),
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    UNIQUE (source_id, source_epoch, metric, sequence)
+    CONSTRAINT usage_checkpoints_pk PRIMARY KEY (event_id),
+    CONSTRAINT usage_checkpoints_sequence_nonnegative CHECK (sequence >= 0),
+    CONSTRAINT usage_checkpoints_observed_nonnegative CHECK (observed_at_ms >= 0),
+    CONSTRAINT usage_checkpoints_quantity_nonnegative CHECK (cumulative_quantity >= 0),
+    CONSTRAINT usage_checkpoints_source_metric_sequence_unique
+        UNIQUE (source_id, source_epoch, metric, sequence)
 );
-CREATE INDEX IF NOT EXISTS usage_checkpoints_account_time_idx
+CREATE INDEX usage_checkpoints_account_time_idx
     ON {schema}.usage_checkpoints (billing_account_id, observed_at_ms);
-CREATE TABLE IF NOT EXISTS {schema}.usage_archive_projections (
+CREATE TABLE {schema}.usage_archive_projections (
     event_id TEXT NOT NULL,
     stream_name TEXT NOT NULL,
     archive_bucket TEXT NOT NULL,
@@ -1746,7 +2083,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_archive_projections (
     CONSTRAINT usage_archive_projections_stream_position_unique
         UNIQUE (stream_name, shard_id, sequence_number)
 );
-CREATE TABLE IF NOT EXISTS {schema}.usage_source_terminal_receipts (
+CREATE TABLE {schema}.usage_source_terminal_receipts (
     source_id TEXT NOT NULL,
     source_epoch TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
@@ -1757,7 +2094,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_source_terminal_receipts (
     CONSTRAINT usage_source_terminal_receipts_sha256_canonical
         CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
 );
-CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_operations (
+CREATE TABLE {schema}.usage_terminal_operations (
     terminal_epoch_id TEXT NOT NULL,
     singleton_key BOOLEAN NOT NULL DEFAULT TRUE,
     request_json TEXT NOT NULL,
@@ -1774,7 +2111,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_operations (
         CHECK (request_sha256 ~ '^sha256:[0-9a-f]{{64}}$'),
     CONSTRAINT usage_terminal_operations_created_nonnegative CHECK (created_at_ms >= 0)
 );
-CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_barrier_projections (
+CREATE TABLE {schema}.usage_terminal_barrier_projections (
     marker_id TEXT NOT NULL,
     sequence_number NUMERIC(78, 0) NOT NULL,
     sequence_number_text TEXT NOT NULL,
@@ -1801,10 +2138,10 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_barrier_projections (
     CONSTRAINT usage_terminal_barrier_projections_position_unique
         UNIQUE (terminal_epoch_id, shard_id, sequence_number)
 );
-CREATE INDEX IF NOT EXISTS usage_terminal_barrier_operation_idx
+CREATE INDEX usage_terminal_barrier_operation_idx
     ON {schema}.usage_terminal_barrier_projections
        (terminal_epoch_id, shard_id, sequence_number);
-CREATE TABLE IF NOT EXISTS {schema}.usage_target_terminal_receipts (
+CREATE TABLE {schema}.usage_target_terminal_receipts (
     terminal_epoch_id TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
     receipt_sha256 TEXT NOT NULL,
@@ -1816,7 +2153,7 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_target_terminal_receipts (
     CONSTRAINT usage_target_terminal_receipts_sha256_canonical
         CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
 );
-CREATE OR REPLACE FUNCTION {schema}.reject_usage_terminal_mutation()
+CREATE FUNCTION {schema}.reject_usage_terminal_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
@@ -1824,57 +2161,52 @@ BEGIN
     RAISE EXCEPTION 'usage terminal evidence is insert-only';
 END
 $function$;
-DROP TRIGGER IF EXISTS usage_archive_projections_insert_only
-    ON {schema}.usage_archive_projections;
 CREATE TRIGGER usage_archive_projections_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_archive_projections
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
-DROP TRIGGER IF EXISTS usage_source_terminal_receipts_insert_only
-    ON {schema}.usage_source_terminal_receipts;
 CREATE TRIGGER usage_source_terminal_receipts_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_source_terminal_receipts
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
-DROP TRIGGER IF EXISTS usage_terminal_operations_insert_only
-    ON {schema}.usage_terminal_operations;
 CREATE TRIGGER usage_terminal_operations_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_operations
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
-DROP TRIGGER IF EXISTS usage_terminal_barrier_projections_insert_only
-    ON {schema}.usage_terminal_barrier_projections;
 CREATE TRIGGER usage_terminal_barrier_projections_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_barrier_projections
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
-DROP TRIGGER IF EXISTS usage_target_terminal_receipts_insert_only
-    ON {schema}.usage_target_terminal_receipts;
 CREATE TRIGGER usage_target_terminal_receipts_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_target_terminal_receipts
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
-CREATE TABLE IF NOT EXISTS {schema}.usage_intervals (
-    end_event_id TEXT PRIMARY KEY
-        REFERENCES {schema}.usage_checkpoints(event_id),
-    start_event_id TEXT NOT NULL
-        REFERENCES {schema}.usage_checkpoints(event_id),
+CREATE TABLE {schema}.usage_intervals (
+    end_event_id TEXT NOT NULL,
+    start_event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     source_epoch TEXT NOT NULL,
-    end_sequence BIGINT NOT NULL CHECK (end_sequence >= 0),
+    end_sequence BIGINT NOT NULL,
     interval_start_ms BIGINT NOT NULL,
     interval_end_ms BIGINT NOT NULL,
     metric TEXT NOT NULL,
-    quantity NUMERIC(39, 0) NOT NULL CHECK (quantity >= 0),
+    quantity NUMERIC(39, 0) NOT NULL,
     billing_account_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
-    CHECK (interval_end_ms > interval_start_ms)
+    CONSTRAINT usage_intervals_pk PRIMARY KEY (end_event_id),
+    CONSTRAINT usage_intervals_end_event_fk FOREIGN KEY (end_event_id)
+        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_intervals_start_event_fk FOREIGN KEY (start_event_id)
+        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_intervals_end_sequence_nonnegative CHECK (end_sequence >= 0),
+    CONSTRAINT usage_intervals_quantity_nonnegative CHECK (quantity >= 0),
+    CONSTRAINT usage_intervals_time_order CHECK (interval_end_ms > interval_start_ms)
 );
-CREATE INDEX IF NOT EXISTS usage_intervals_account_time_idx
+CREATE INDEX usage_intervals_account_time_idx
     ON {schema}.usage_intervals
         (billing_account_id, interval_start_ms, interval_end_ms);
-CREATE INDEX IF NOT EXISTS usage_intervals_cat_time_idx
+CREATE INDEX usage_intervals_cat_time_idx
     ON {schema}.usage_intervals
         (attributed_cat_id, interval_start_ms, interval_end_ms);
-CREATE OR REPLACE FUNCTION {schema}.reject_usage_checkpoint_mutation()
+CREATE FUNCTION {schema}.reject_usage_checkpoint_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
@@ -1882,48 +2214,37 @@ BEGIN
     RAISE EXCEPTION 'usage checkpoints are insert-only';
 END
 $function$;
-DROP TRIGGER IF EXISTS usage_checkpoints_insert_only
-    ON {schema}.usage_checkpoints;
 CREATE TRIGGER usage_checkpoints_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_checkpoints
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_checkpoint_mutation();
-INSERT INTO {schema}.schema_migrations (version)
-VALUES (1) ON CONFLICT (version) DO NOTHING;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 2
-    ) THEN
-        ALTER TABLE {schema}.usage_checkpoints
-            ALTER COLUMN cumulative_quantity TYPE NUMERIC(39, 0)
-            USING cumulative_quantity::numeric;
-        ALTER TABLE {schema}.usage_intervals
-            ALTER COLUMN quantity TYPE NUMERIC(39, 0)
-            USING quantity::numeric;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (2);
-    END IF;
-END
-$migration$;
-CREATE TABLE IF NOT EXISTS {schema}.billing_accounts (
-    billing_account_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.billing_accounts (
+    billing_account_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
+    currency TEXT NOT NULL,
     stripe_customer_id TEXT,
-    created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0)
+    created_at_ms BIGINT NOT NULL,
+    CONSTRAINT billing_accounts_pk PRIMARY KEY (billing_account_id),
+    CONSTRAINT billing_accounts_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT billing_accounts_created_nonnegative CHECK (created_at_ms >= 0)
 );
-CREATE TABLE IF NOT EXISTS {schema}.credit_ledger_entries (
-    entry_id TEXT PRIMARY KEY,
-    billing_account_id TEXT NOT NULL
-        REFERENCES {schema}.billing_accounts(billing_account_id),
+CREATE TABLE {schema}.credit_ledger_entries (
+    entry_id TEXT NOT NULL,
+    billing_account_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     amount_nanos NUMERIC(39, 0) NOT NULL,
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
-    external_reference TEXT NOT NULL UNIQUE,
-    effective_at_ms BIGINT NOT NULL CHECK (effective_at_ms >= 0)
+    currency TEXT NOT NULL,
+    external_reference TEXT NOT NULL,
+    effective_at_ms BIGINT NOT NULL,
+    CONSTRAINT credit_ledger_entries_pk PRIMARY KEY (entry_id),
+    CONSTRAINT credit_ledger_entries_account_fk FOREIGN KEY (billing_account_id)
+        REFERENCES {schema}.billing_accounts(billing_account_id),
+    CONSTRAINT credit_ledger_entries_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT credit_ledger_entries_external_reference_unique UNIQUE (external_reference),
+    CONSTRAINT credit_ledger_entries_effective_nonnegative CHECK (effective_at_ms >= 0)
 );
-CREATE INDEX IF NOT EXISTS credit_ledger_account_time_idx
+CREATE INDEX credit_ledger_account_time_idx
     ON {schema}.credit_ledger_entries (billing_account_id, effective_at_ms);
-CREATE OR REPLACE FUNCTION {schema}.reject_credit_ledger_mutation()
+CREATE FUNCTION {schema}.reject_credit_ledger_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
@@ -1931,91 +2252,40 @@ BEGIN
     RAISE EXCEPTION 'credit ledger entries are insert-only';
 END
 $function$;
-DROP TRIGGER IF EXISTS credit_ledger_insert_only
-    ON {schema}.credit_ledger_entries;
 CREATE TRIGGER credit_ledger_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.credit_ledger_entries
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_credit_ledger_mutation();
-CREATE TABLE IF NOT EXISTS {schema}.checkout_intents (
-    intent_id TEXT PRIMARY KEY,
-    billing_account_id TEXT NOT NULL
-        REFERENCES {schema}.billing_accounts(billing_account_id),
+CREATE TABLE {schema}.checkout_intents (
+    intent_id TEXT NOT NULL,
+    billing_account_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
-    created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0),
-    stripe_session_id TEXT UNIQUE,
+    amount_cents BIGINT NOT NULL,
+    currency TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    stripe_session_id TEXT,
     checkout_url TEXT,
-    stripe_payment_intent_id TEXT UNIQUE,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'paid'))
+    stripe_payment_intent_id TEXT,
+    status TEXT NOT NULL,
+    CONSTRAINT checkout_intents_pk PRIMARY KEY (intent_id),
+    CONSTRAINT checkout_intents_account_fk FOREIGN KEY (billing_account_id)
+        REFERENCES {schema}.billing_accounts(billing_account_id),
+    CONSTRAINT checkout_intents_amount_positive CHECK (amount_cents > 0),
+    CONSTRAINT checkout_intents_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT checkout_intents_created_nonnegative CHECK (created_at_ms >= 0),
+    CONSTRAINT checkout_intents_stripe_session_unique UNIQUE (stripe_session_id),
+    CONSTRAINT checkout_intents_stripe_payment_unique UNIQUE (stripe_payment_intent_id),
+    CONSTRAINT checkout_intents_status_valid CHECK (status IN ('pending', 'paid'))
 );
-CREATE TABLE IF NOT EXISTS {schema}.stripe_events (
-    event_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.stripe_events (
+    event_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     payload_sha256 TEXT NOT NULL,
     livemode BOOLEAN NOT NULL,
-    processed_at_ms BIGINT NOT NULL CHECK (processed_at_ms >= 0)
+    processed_at_ms BIGINT NOT NULL,
+    CONSTRAINT stripe_events_pk PRIMARY KEY (event_id),
+    CONSTRAINT stripe_events_processed_nonnegative CHECK (processed_at_ms >= 0)
 );
-INSERT INTO {schema}.schema_migrations (version)
-VALUES (3) ON CONFLICT (version) DO NOTHING;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 4
-    ) THEN
-        -- The Project -> Account rename (ADR-0018) changed this column in the
-        -- CREATE DDL without migrating databases that already had the table.
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'billing_accounts'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.billing_accounts
-                RENAME COLUMN project_id TO account_id;
-        END IF;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (4);
-    END IF;
-END
-$migration$;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 5
-    ) THEN
-        -- Remaining legacy project_id columns from the same pre-rename shape:
-        -- the usage tables track the Workspace, checkout intents the Account.
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'usage_checkpoints'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.usage_checkpoints
-                RENAME COLUMN project_id TO workspace_id;
-        END IF;
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'usage_intervals'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.usage_intervals
-                RENAME COLUMN project_id TO workspace_id;
-        END IF;
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'checkout_intents'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.checkout_intents
-                RENAME COLUMN project_id TO account_id;
-        END IF;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (5);
-    END IF;
-END
-$migration$;
+INSERT INTO {schema}.schema_migrations (version) VALUES (16);
 "#
     )
 }
@@ -2683,24 +2953,37 @@ mod tests {
     }
 
     #[test]
-    fn migration_makes_raw_checkpoints_insert_only() {
-        let sql = migration_sql("cats_usage");
+    fn fresh_v16_schema_has_one_stamp_and_no_upgrade_or_repair_path() {
+        let sql = fresh_schema_sql("cats_usage");
         assert!(sql.contains("BEFORE UPDATE OR DELETE"));
         assert!(sql.contains("usage_intervals"));
         assert!(sql.contains("schema_migrations"));
         assert!(sql.contains("NUMERIC(39, 0)"));
-        assert!(sql.contains("version = 2"));
-        assert!(sql.contains("VALUES (3) ON CONFLICT"));
-        // Rungs 4 and 5 heal databases created before the Project -> Account/
-        // Workspace rename, where the tables still carry project_id.
-        assert!(sql.contains("version = 4"));
-        assert!(sql.contains("RENAME COLUMN project_id TO account_id"));
-        assert!(sql.contains("version = 5"));
-        assert!(sql.contains("RENAME COLUMN project_id TO workspace_id"));
+        assert!(sql.contains("schema_migrations_version_exact CHECK (version = 16)"));
+        assert!(sql.contains("schema_migrations (version) VALUES (16)"));
+        assert_eq!(sql.matches("schema_migrations (version) VALUES").count(), 1);
+        assert!(!sql.contains("IF NOT EXISTS"));
+        assert!(!sql.contains("ON CONFLICT"));
+        assert!(!sql.contains("ALTER TABLE"));
+        assert!(!sql.contains("RENAME COLUMN"));
+        assert!(!sql.contains("CREATE OR REPLACE"));
+        assert!(!sql.contains("DROP TRIGGER"));
         assert!(sql.contains("credit_ledger_entries"));
         assert!(sql.contains("checkout_intents"));
         assert!(sql.contains("stripe_events"));
         assert!(sql.contains("reject_credit_ledger_mutation"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_constraintdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_indexdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_triggerdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_functiondef"));
+        assert_eq!(USAGE_SCHEMA_V16_CATALOG_SHA256.len(), 71);
+        assert!(USAGE_SCHEMA_V16_CATALOG_SHA256
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }));
     }
 
     #[test]
@@ -3048,6 +3331,156 @@ mod tests {
                     .map_err(|error| pg_error("drop failure-bounds test schema", error))
             })
             .await
+            .unwrap();
+    }
+
+    #[test]
+    fn live_postgres_v16_refuses_old_partial_and_drifted_catalogs_without_repair() {
+        let Ok(url) = std::env::var("CATS_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let short_suffix = suffix % 1_000_000_000;
+        let mut admin = connect_uninitialized_client(&url, None).unwrap();
+        let old_schema = format!("cats_usage_old_{}_{}", std::process::id(), short_suffix);
+        admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA {old_schema};
+                 CREATE TABLE {old_schema}.schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO {old_schema}.schema_migrations VALUES (5);"
+            ))
+            .unwrap();
+        let old_error = connect_client(&url, None, &old_schema)
+            .err()
+            .expect("old Usage schema unexpectedly started");
+        assert!(old_error
+            .to_string()
+            .contains("not the one exact v16 stamp"));
+        assert_eq!(
+            admin
+                .query_one(
+                    &format!("SELECT version FROM {old_schema}.schema_migrations"),
+                    &[],
+                )
+                .unwrap()
+                .get::<_, i32>(0),
+            5
+        );
+
+        let partial_schema = format!("cats_usage_partial_{}_{}", std::process::id(), short_suffix);
+        admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA {partial_schema};
+                 CREATE TABLE {partial_schema}.schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO {partial_schema}.schema_migrations VALUES (16);"
+            ))
+            .unwrap();
+        let partial_error = connect_client(&url, None, &partial_schema)
+            .err()
+            .expect("partial Usage schema unexpectedly started");
+        assert!(partial_error.to_string().contains("prosrc digest"));
+        assert_eq!(
+            admin
+                .query_one(
+                    "SELECT count(*)::BIGINT FROM pg_catalog.pg_class class_row
+                     JOIN pg_catalog.pg_namespace namespace_row
+                       ON namespace_row.oid=class_row.relnamespace
+                     WHERE namespace_row.nspname=$1",
+                    &[&partial_schema],
+                )
+                .unwrap()
+                .get::<_, i64>(0),
+            2,
+            "failed startup must not create or repair any partial relation"
+        );
+
+        fn catalog_digest(client: &mut Client, schema: &str) -> String {
+            let mut transaction = client.transaction().unwrap();
+            let digest = usage_schema_catalog_sha256(&mut transaction, schema).unwrap();
+            transaction.rollback().unwrap();
+            digest
+        }
+
+        for drift in [
+            "extra_relation",
+            "missing_relation",
+            "missing_column",
+            "constraint_definition",
+            "index_definition",
+            "trigger_definition",
+            "function_body",
+        ] {
+            let schema = format!(
+                "cats_usage_drift_{}_{}_{}",
+                drift,
+                std::process::id(),
+                short_suffix
+            );
+            drop(connect_client(&url, None, &schema).unwrap());
+            PostgresUsageStore::verify_existing_schema_v16(&url, None, &schema).unwrap();
+            let mutation = match drift {
+                "extra_relation" => format!("CREATE TABLE {schema}.foreign_table (id INTEGER)"),
+                "missing_relation" => format!("DROP TABLE {schema}.stripe_events"),
+                "missing_column" => {
+                    format!("ALTER TABLE {schema}.stripe_events DROP COLUMN event_type")
+                }
+                "constraint_definition" => format!(
+                    "ALTER TABLE {schema}.usage_checkpoints
+                       DROP CONSTRAINT usage_checkpoints_sequence_nonnegative;
+                     ALTER TABLE {schema}.usage_checkpoints
+                       ADD CONSTRAINT usage_checkpoints_sequence_nonnegative CHECK (sequence >= -1)"
+                ),
+                "index_definition" => format!(
+                    "DROP INDEX {schema}.usage_checkpoints_account_time_idx;
+                     CREATE INDEX usage_checkpoints_account_time_idx
+                       ON {schema}.usage_checkpoints (workspace_id, observed_at_ms)"
+                ),
+                "trigger_definition" => format!(
+                    "DROP TRIGGER usage_checkpoints_insert_only ON {schema}.usage_checkpoints;
+                     CREATE TRIGGER usage_checkpoints_insert_only
+                       BEFORE DELETE ON {schema}.usage_checkpoints
+                       FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_checkpoint_mutation()"
+                ),
+                "function_body" => format!(
+                    "CREATE OR REPLACE FUNCTION {schema}.reject_usage_checkpoint_mutation()
+                     RETURNS trigger LANGUAGE plpgsql AS $body$
+                     BEGIN RAISE EXCEPTION 'changed insert-only authority'; END
+                     $body$"
+                ),
+                _ => unreachable!(),
+            };
+            admin.batch_execute(&mutation).unwrap();
+            let before = catalog_digest(&mut admin, &schema);
+            let error =
+                PostgresUsageStore::verify_existing_schema_v16(&url, None, &schema).unwrap_err();
+            assert!(
+                error.to_string().contains("catalog digest")
+                    || error.to_string().contains("prosrc digest"),
+                "{drift} returned {error}"
+            );
+            assert_eq!(before, catalog_digest(&mut admin, &schema));
+            assert_eq!(
+                admin
+                    .query_one(
+                        &format!("SELECT version FROM {schema}.schema_migrations"),
+                        &[],
+                    )
+                    .unwrap()
+                    .get::<_, i32>(0),
+                USAGE_SCHEMA_VERSION
+            );
+            admin
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .unwrap();
+        }
+        admin
+            .batch_execute(&format!(
+                "DROP SCHEMA {old_schema} CASCADE;
+                 DROP SCHEMA {partial_schema} CASCADE;"
+            ))
             .unwrap();
     }
 
