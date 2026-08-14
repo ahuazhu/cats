@@ -3219,54 +3219,6 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
 }
 
 #[tokio::test]
-async fn frozen_usage_epoch_accepts_the_old_node_tail_after_placement_moves() {
-    let ctx = Ctx::new().await;
-    let _old_node = start_stub_node(&ctx.cp, "node_a").await;
-    let usage_node = ctx.register_usage_node("node_a").await;
-    ctx.create_cat("migrating-meter", None).await;
-    let cat = ctx
-        .wait_observed("migrating-meter", ObservedState::Running)
-        .await;
-
-    let checkpoint = |sequence, observed_at_unix_ms, cumulative_quantity| {
-        let mut checkpoint = CatUsageCheckpoint {
-            event_id: String::new(),
-            source_id: format!("node/node_a/cat/{}", cat.id),
-            source_epoch: "runtime-before-move".to_string(),
-            sequence,
-            observed_at_unix_ms,
-            cat_id: cat.id.clone(),
-            cat_generation: cat.generation,
-            metric: UsageMetric::CpuUsec,
-            cumulative_quantity,
-        };
-        checkpoint.event_id = deterministic_event_id(&checkpoint);
-        checkpoint
-    };
-    let first = IngestUsageCheckpointsRequest {
-        session: usage_node.session.clone(),
-        node_id: "node_a".to_string(),
-        checkpoints: vec![checkpoint(0, 1_000, 0)],
-    };
-    let accepted = ctx.post_signed_usage_json(&usage_node, &first).await;
-    assert_eq!(accepted.accepted, 1);
-
-    let _new_node = start_stub_node(&ctx.cp, "node_b").await;
-    ctx.cp
-        .state
-        .store
-        .set_placement(&cat.id, Some("node_b"))
-        .unwrap();
-    let tail = IngestUsageCheckpointsRequest {
-        session: usage_node.session.clone(),
-        node_id: "node_a".to_string(),
-        checkpoints: vec![checkpoint(1, 2_000, 1)],
-    };
-    let accepted_tail = ctx.post_signed_usage_json(&usage_node, &tail).await;
-    assert_eq!(accepted_tail.accepted, 1);
-}
-
-#[tokio::test]
 async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
@@ -4894,12 +4846,36 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     // checkpoint of its epoch was attributed: nothing will ever make it
     // ingestible. It sits at the head, where it used to block the rest.
     let poison = checkpoint("cat_vanished", 0, 1_000, 0);
+    let billable_first = checkpoint(&cat.id, 0, 1_000, 0);
+    assert_eq!(
+        ctx.cp
+            .state
+            .usage
+            .ingest(&AttributedCheckpoint {
+                attribution: UsageAttribution {
+                    billing_account_id: ctx
+                        .cp
+                        .state
+                        .store
+                        .billing_account_id_for_workspace(&ctx.workspace_id)
+                        .unwrap(),
+                    workspace_id: ctx.workspace_id.clone(),
+                    resource_type: "cat".to_string(),
+                    resource_id: cat.id.clone(),
+                    attributed_cat_id: Some(cat.id.clone()),
+                },
+                checkpoint: billable_first.clone(),
+            })
+            .await
+            .unwrap(),
+        IngestOutcome::Accepted
+    );
     let request = IngestUsageCheckpointsRequest {
         session: usage_node.session.clone(),
         node_id: "node_a".to_string(),
         checkpoints: vec![
             poison.clone(),
-            checkpoint(&cat.id, 0, 1_000, 0),
+            billable_first,
             checkpoint(&cat.id, 1, 61_000, 60_000_000),
         ],
     };

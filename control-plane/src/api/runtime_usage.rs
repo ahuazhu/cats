@@ -22,6 +22,7 @@ use cats_api::runtime_reconciliation::Id;
 use cats_metering::{AttributedCheckpoint, IngestOutcome, UsageAttribution};
 
 use crate::server::AppState;
+use crate::store::runtime_authority::product_reads::RuntimeUsageCatRead;
 use crate::store::runtime_authority::volume_transition_auth::{
     VolumeTransitionStoreOutcome, VolumeTransitionStoreRejection,
 };
@@ -260,48 +261,54 @@ async fn ingest_authenticated(
                 ));
             }
         }
-        let attribution = if let Some(attribution) = frozen_attribution {
-            let workspace_id = cat.as_ref().map(|cat| cat.workspace_id.as_str());
-            if !cat_attribution_matches(&attribution, &checkpoint.cat_id, workspace_id) {
-                return conflict("stored source-epoch attribution does not match checkpoint Cat");
+        let attribution = match select_checkpoint_attribution(
+            frozen_attribution,
+            cat,
+            &checkpoint.cat_id,
+            &request.node_id,
+        ) {
+            Ok(AttributionSelection::Frozen(attribution)) => attribution,
+            Ok(AttributionSelection::Current(cat)) => {
+                let workspace_id = cat.workspace_id.to_string();
+                let billing_account_id =
+                    match super::billing_account_id_for_workspace(state, &workspace_id).await {
+                        Ok(account) => account,
+                        Err(error) => return api_error(error),
+                    };
+                UsageAttribution {
+                    billing_account_id,
+                    workspace_id,
+                    resource_type: "cat".to_owned(),
+                    resource_id: checkpoint.cat_id.clone(),
+                    attributed_cat_id: Some(checkpoint.cat_id.clone()),
+                }
             }
-            attribution
-        } else if let Some(cat) = cat {
-            if cat.node_id.as_str() != request.node_id {
+            Ok(AttributionSelection::DeletedWithoutFrozen) => {
+                let reason = format!(
+                    "no frozen attribution exists for deleted Cat {} source epoch",
+                    checkpoint.cat_id
+                );
+                tracing::warn!(
+                    event = %checkpoint.event_id,
+                    cat = %checkpoint.cat_id,
+                    source_epoch = %checkpoint.source_epoch,
+                    "rejecting an unattributable usage checkpoint; its usage is not billed"
+                );
+                rejected.push(RejectedCheckpoint {
+                    event_id: checkpoint.event_id,
+                    reason,
+                });
+                continue;
+            }
+            Err(AttributionSelectionError::StoredAttributionMismatch) => {
+                return conflict("stored source-epoch attribution does not match checkpoint Cat")
+            }
+            Err(AttributionSelectionError::CurrentNodeMismatch) => {
                 return conflict(format!(
                     "node {} does not own Cat {}",
                     request.node_id, checkpoint.cat_id
-                ));
+                ))
             }
-            let workspace_id = cat.workspace_id.to_string();
-            let billing_account_id =
-                match super::billing_account_id_for_workspace(state, &workspace_id).await {
-                    Ok(account) => account,
-                    Err(error) => return api_error(error),
-                };
-            UsageAttribution {
-                billing_account_id,
-                workspace_id,
-                resource_type: "cat".to_owned(),
-                resource_id: checkpoint.cat_id.clone(),
-                attributed_cat_id: Some(checkpoint.cat_id.clone()),
-            }
-        } else {
-            let reason = format!(
-                "no frozen attribution exists for deleted Cat {} source epoch",
-                checkpoint.cat_id
-            );
-            tracing::warn!(
-                event = %checkpoint.event_id,
-                cat = %checkpoint.cat_id,
-                source_epoch = %checkpoint.source_epoch,
-                "rejecting an unattributable usage checkpoint; its usage is not billed"
-            );
-            rejected.push(RejectedCheckpoint {
-                event_id: checkpoint.event_id,
-                reason,
-            });
-            continue;
         };
         let value = AttributedCheckpoint {
             attribution,
@@ -319,6 +326,44 @@ async fn ingest_authenticated(
         rejected,
     })
     .into_response()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttributionSelection {
+    Frozen(UsageAttribution),
+    Current(RuntimeUsageCatRead),
+    DeletedWithoutFrozen,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttributionSelectionError {
+    StoredAttributionMismatch,
+    CurrentNodeMismatch,
+}
+
+/// Frozen source-epoch attribution remains authoritative after placement changes or deletion.
+/// Current placement is consulted only while establishing attribution for a new source epoch.
+fn select_checkpoint_attribution(
+    frozen_attribution: Option<UsageAttribution>,
+    current_cat: Option<RuntimeUsageCatRead>,
+    checkpoint_cat_id: &str,
+    request_node_id: &str,
+) -> Result<AttributionSelection, AttributionSelectionError> {
+    if let Some(attribution) = frozen_attribution {
+        let workspace_id = current_cat.as_ref().map(|cat| cat.workspace_id.as_str());
+        if !cat_attribution_matches(&attribution, checkpoint_cat_id, workspace_id) {
+            return Err(AttributionSelectionError::StoredAttributionMismatch);
+        }
+        return Ok(AttributionSelection::Frozen(attribution));
+    }
+
+    let Some(cat) = current_cat else {
+        return Ok(AttributionSelection::DeletedWithoutFrozen);
+    };
+    if cat.node_id.as_str() != request_node_id {
+        return Err(AttributionSelectionError::CurrentNodeMismatch);
+    }
+    Ok(AttributionSelection::Current(cat))
 }
 
 fn cat_attribution_matches(
@@ -448,4 +493,79 @@ fn error_response(
         response.headers_mut().insert(name, value.clone());
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use cats_api::runtime_reconciliation::Revision;
+
+    use super::*;
+
+    fn current_cat(node_id: &str) -> RuntimeUsageCatRead {
+        RuntimeUsageCatRead {
+            workspace_id: Id::new("workspace_a").unwrap(),
+            desired_revision: Revision::new(2).unwrap(),
+            node_id: Id::new(node_id).unwrap(),
+        }
+    }
+
+    fn frozen_attribution() -> UsageAttribution {
+        UsageAttribution {
+            billing_account_id: "billing_a".to_owned(),
+            workspace_id: "workspace_a".to_owned(),
+            resource_type: "cat".to_owned(),
+            resource_id: "cat_a".to_owned(),
+            attributed_cat_id: Some("cat_a".to_owned()),
+        }
+    }
+
+    #[test]
+    fn frozen_attribution_precedes_current_node_ownership() {
+        let frozen = frozen_attribution();
+
+        let selected = select_checkpoint_attribution(
+            Some(frozen.clone()),
+            Some(current_cat("node_b")),
+            "cat_a",
+            "node_a",
+        );
+
+        assert_eq!(selected, Ok(AttributionSelection::Frozen(frozen)));
+    }
+
+    #[test]
+    fn current_cat_without_frozen_attribution_requires_request_node() {
+        let selected =
+            select_checkpoint_attribution(None, Some(current_cat("node_b")), "cat_a", "node_a");
+
+        assert_eq!(
+            selected,
+            Err(AttributionSelectionError::CurrentNodeMismatch)
+        );
+    }
+
+    #[test]
+    fn deleted_cat_without_frozen_attribution_is_rejected() {
+        let selected = select_checkpoint_attribution(None, None, "cat_a", "node_a");
+
+        assert_eq!(selected, Ok(AttributionSelection::DeletedWithoutFrozen));
+    }
+
+    #[test]
+    fn frozen_attribution_must_match_the_current_workspace() {
+        let mut frozen = frozen_attribution();
+        frozen.workspace_id = "workspace_b".to_owned();
+
+        let selected = select_checkpoint_attribution(
+            Some(frozen),
+            Some(current_cat("node_a")),
+            "cat_a",
+            "node_a",
+        );
+
+        assert_eq!(
+            selected,
+            Err(AttributionSelectionError::StoredAttributionMismatch)
+        );
+    }
 }
