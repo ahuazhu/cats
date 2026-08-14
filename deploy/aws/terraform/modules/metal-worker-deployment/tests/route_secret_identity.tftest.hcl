@@ -13,6 +13,7 @@ variables {
   aws_region                               = "us-east-1"
   artifact_bucket_name                     = "cats-production-worker-fixture"
   chunkstore_prefix                        = "cats-fresh"
+  control_postgres_schema                  = "cats_fresh"
   worker_bundle_path                       = "/dev/null"
   worker_bundle_sha256                     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   instances                                = { metal-1 = "i-0123456789abcdef0" }

@@ -616,11 +616,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         );
     }
 
-    let early_idle_guard = deployment
-        .find(
-            "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
-        )
-        .expect("worker deployment rejects active Cat processes and live runtime binaries");
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
@@ -636,9 +631,13 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let deployment_lock = deployment
         .find("cats_acquire_worker_deployment_lock")
         .expect("worker deployment acquires its Host-global lock");
-    let locked_metering = deployment[deployment_lock..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let exact_classification = deployment[deployment_lock..]
+        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
+        .expect("worker deployment classifies exact Route v2 state under the lock");
+    let locked_metering = deployment[exact_classification..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+        .map(|offset| exact_classification + offset)
         .expect("worker deployment recomputes its metering cgroup under the lock");
     let locked_idle_guard = deployment[locked_metering..]
         .find(
@@ -660,10 +659,21 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let authorize = deployment
         .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
         .expect("post-mutation worker start authorization and watchdog");
+    let idle_guard =
+        "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"";
+    assert_eq!(
+        deployment.matches(idle_guard).count(),
+        1,
+        "physical idle must have one authoritative check under the Host lock"
+    );
     assert!(
-        release_verify < early_idle_guard
-            && early_idle_guard < deployment_lock
-            && deployment_lock < locked_metering
+        !deployment[..deployment_lock].contains(idle_guard),
+        "Route v2 state must be classified under the Host lock before the idle guard queries systemd"
+    );
+    assert!(
+        release_verify < deployment_lock
+            && deployment_lock < exact_classification
+            && exact_classification < locked_metering
             && locked_metering < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
