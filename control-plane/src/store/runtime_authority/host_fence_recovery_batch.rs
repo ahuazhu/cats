@@ -1333,16 +1333,24 @@ fn begin_attempt_in(
 
     // Route signing and Node authority apply take the shared form before
     // locking NodeIdentity. Recovery takes the exclusive form first, then the
-    // same identity row, so no route/credential snapshot can cross the seal.
+    // Host-global advisory before the identity row, so no route/credential
+    // snapshot or fresh same-Host Provision can cross the seal.
     lock_route_v2_machine_authority_exclusive(transaction)?;
+    let source_host = authority_bindings
+        .hosts
+        .iter()
+        .find(|host| host.node_id == apply.source_node_id)
+        .ok_or_else(|| {
+            conflict("Host recovery authority artifact does not bind the requested source Node")
+        })?;
+    require_host_recovery_unblocked_in(
+        transaction,
+        &authority_bindings.provider_scope,
+        &source_host.immutable_host_id,
+    )?;
     let identity = load_identity_by_node_for_update(transaction, &apply.source_node_id)?
         .ok_or_else(|| conflict("Host recovery source NodeIdentity is absent"))?;
     validate_source_identity(&identity, apply, authority_bindings)?;
-    require_host_recovery_unblocked_in(
-        transaction,
-        &identity.provider_scope,
-        &identity.immutable_host_id,
-    )?;
     require_active_credential_lineage(transaction, &identity)?;
     let session = load_current_session_for_update(transaction, &identity.node_id)?
         .ok_or_else(|| conflict("Host recovery source has no current AgentSession"))?;

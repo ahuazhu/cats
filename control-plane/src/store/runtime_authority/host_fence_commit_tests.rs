@@ -182,6 +182,7 @@ fn desired(
 }
 
 pub(super) struct RecoveryFixture {
+    pub(super) url: String,
     pub(super) store: Store,
     pub(super) current_desired: DesiredRuntimeSpec,
     pub(super) expected_old_operation: Operation,
@@ -278,6 +279,7 @@ pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
         .unwrap();
 
     RecoveryFixture {
+        url,
         store,
         current_desired,
         expected_old_operation,

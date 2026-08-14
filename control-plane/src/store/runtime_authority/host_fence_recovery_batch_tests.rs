@@ -1,3 +1,6 @@
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
 use cats_api::error::ErrorCode;
 use cats_api::runtime_host_loss_recovery::{
     HostLossRecoveryApplyV1, HostLossRecoveryDiscoveryOutcomeV1, HostLossRecoveryDiscoveryV1,
@@ -22,9 +25,12 @@ use cats_storage::trusted_host_recovery::{
 use super::host_fence_commit_tests::{add_second_recovery_cat, recovery_fixture, RecoveryFixture};
 use super::host_fence_provider_queue::{evidence_sha256, HostFenceProviderQueueStateV1};
 use super::host_fence_provider_queue_tests::terminal_evidence;
-use super::host_fence_recovery_batch::require_product_mutation_unblocked_in;
+use super::host_fence_recovery_batch::{
+    require_host_recovery_unblocked_in, require_product_mutation_unblocked_in,
+};
 use super::product_rows::{load_desired_for_update, load_operation_for_update};
 use super::rows::database_now;
+use crate::store::Store;
 
 fn id(value: impl Into<String>) -> Id {
     Id::new(value).unwrap()
@@ -36,6 +42,40 @@ fn text(value: impl Into<String>) -> AsciiText {
 
 fn random(value: u128) -> RandomId128 {
     RandomId128::new(format!("{value:032x}")).unwrap()
+}
+
+fn backend_pid(store: &Store) -> i32 {
+    store
+        .with(|client| Ok(client.query_one("SELECT pg_backend_pid()", &[])?.get(0)))
+        .unwrap()
+}
+
+fn wait_for_lock_wait(store: &Store, backend_pid: i32, advisory_only: bool) {
+    let started = Instant::now();
+    loop {
+        let waiting = store
+            .with(|client| {
+                Ok(client
+                    .query_one(
+                        "SELECT EXISTS (
+                           SELECT 1 FROM pg_locks
+                            WHERE pid=$1 AND NOT granted
+                              AND (NOT $2 OR locktype='advisory')
+                         )",
+                        &[&backend_pid, &advisory_only],
+                    )?
+                    .get::<_, bool>(0))
+            })
+            .unwrap();
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "backend {backend_pid} did not reach its expected lock wait"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn principal() -> FleetPolicyPrincipal {
@@ -281,6 +321,82 @@ fn seal_provider_terminal(fixture: &BatchFixture, binding: &HostFenceBinding) {
     {
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn begin_holds_host_barrier_before_waiting_for_source_identity() {
+    let fixture = batch_fixture("host-recovery-lock-order");
+    let url = fixture.fixture.url.clone();
+    let source_node_id = fixture.fixture.old_identity.node_id.clone();
+    let provider_scope = fixture.fixture.old_identity.provider_scope.clone();
+    let immutable_host_id = fixture.fixture.old_identity.immutable_host_id.clone();
+
+    // Hold only the source identity row. A correctly ordered begin acquires
+    // the Host advisory first and then waits here. The second transaction
+    // must therefore wait for that same Host advisory; the retired ordering
+    // (identity row first) would let the probe pass before this row releases.
+    let mut identity_barrier = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    identity_barrier.batch_execute("BEGIN").unwrap();
+    assert_eq!(
+        identity_barrier
+            .query_one(
+                "SELECT node_id FROM node_identities WHERE node_id=$1 FOR UPDATE",
+                &[&source_node_id.as_str()],
+            )
+            .unwrap()
+            .get::<_, String>(0),
+        source_node_id.as_str()
+    );
+
+    let begin_store = Store::connect(&url, None).unwrap();
+    let begin_pid = backend_pid(&begin_store);
+    let begin_apply = fixture.apply.clone();
+    let begin_bindings = fixture.bindings.clone();
+    let (begin_tx, begin_rx) = mpsc::channel();
+    let begin_thread = std::thread::spawn(move || {
+        begin_tx
+            .send(begin_store.begin_trusted_host_fence_recovery_attempt_v1(
+                &principal(),
+                &begin_apply,
+                &begin_bindings,
+            ))
+            .unwrap();
+    });
+    let monitor = Store::connect(&url, None).unwrap();
+    wait_for_lock_wait(&monitor, begin_pid, false);
+
+    let probe_store = Store::connect(&url, None).unwrap();
+    let probe_pid = backend_pid(&probe_store);
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe_thread = std::thread::spawn(move || {
+        probe_tx
+            .send(probe_store.authority_transaction(|transaction| {
+                require_host_recovery_unblocked_in(transaction, &provider_scope, &immutable_host_id)
+            }))
+            .unwrap();
+    });
+    wait_for_lock_wait(&monitor, probe_pid, true);
+    assert!(matches!(
+        begin_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        probe_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    identity_barrier.batch_execute("COMMIT").unwrap();
+    begin_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let probe_error = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(probe_error.code, ErrorCode::Conflict);
+    begin_thread.join().unwrap();
+    probe_thread.join().unwrap();
 }
 
 #[test]
