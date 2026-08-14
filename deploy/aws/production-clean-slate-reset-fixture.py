@@ -78,7 +78,7 @@ class FakeRunner(reset.CommandRunner):
             "cats_control_old": "13",
             "cats_usage_old": "5",
             "cats_control_fresh": reset.EXPECTED_FRESH_CONTROL_SCHEMA_VERSION,
-            "cats_usage_fresh": "5",
+            "cats_usage_fresh": reset.EXPECTED_FRESH_USAGE_SCHEMA_VERSION,
         }
         self.streams = {"cats-usage-old", "cats-usage-fresh"}
         self.tables = {"cats-usage-checkpoints-old", "cats-usage-checkpoints-fresh"}
@@ -1385,6 +1385,75 @@ def assert_binding_failures(parent: Path) -> None:
         raise AssertionError("aged-out pre-start evidence executed a physical effect")
 
 
+def assert_post_open_verifiers_accept_only_target_drift(parent: Path) -> None:
+    config, runner, executor, plan_path, plan_digest = build_scenario(
+        parent,
+        "cutover-post-open-0001",
+    )
+    executor.apply(plan_path, plan_digest, config.reset_id, execute=True)
+    frozen_projection = fixture_cutover_authority(config, FIXTURE_NOW)
+    executor._production_cutover_authority = lambda _reference_time: (  # type: ignore[method-assign]
+        reset.VerifiedCutoverAuthority(
+            proof_set=None,
+            operator=frozen_projection["operator"],
+            projection=frozen_projection,
+        )
+    )
+
+    # Calibrate the old verifier against the known pre-open state, then prove
+    # that the same probe rejects the expected post-boundary Ingress change.
+    executor.verify_complete(plan_path, plan_digest)
+    runner.ingress_closed = False
+    runner.objects[config.new_chunkstore_bucket].append(
+        {
+            "key": f"{config.new_object_prefix}data/new-product-object",
+            "version_id": "fresh-version-after-open",
+            "kind": "version",
+        }
+    )
+    try:
+        executor.verify_complete(plan_path, plan_digest)
+    except reset.ResetError as error:
+        if "ingress is not explicitly Closed" not in str(error):
+            raise
+    else:
+        raise AssertionError("pristine reset verifier accepted post-open Ingress")
+
+    # Isolate the live trust call from this offline fixture while retaining the
+    # real target-identity, fresh-resource and retired-target probes.
+    executor._post_open_boundary_trust = lambda _stable: {  # type: ignore[method-assign]
+        "fixture": "exact-offline-trust"
+    }
+    forward = executor.verify_complete_after_open_started(plan_path, plan_digest)
+    if forward.reset_complete_sha256 != "sha256:" + reset.read_json_file(
+        forward.reset_complete_path,
+        "fixture reset-complete",
+        canonical=True,
+    )[1]:
+        raise AssertionError("post-open verifier lost reset-complete identity")
+
+    # Cleanup authority must not require any old/fresh database credential.
+    # Construct a new executor after removing every DSN so lazy caches cannot
+    # accidentally make this pass.
+    for path in (
+        config.control_postgres_url_file,
+        config.usage_postgres_url_file,
+        config.new_control_postgres_url_file,
+        config.new_usage_postgres_url_file,
+    ):
+        path.unlink()
+    cleanup_executor = fixture_executor(config, runner)
+    cleanup_executor._post_open_boundary_trust = lambda _stable: {  # type: ignore[method-assign]
+        "fixture": "exact-offline-trust"
+    }
+    before = len(runner.calls)
+    cleanup = cleanup_executor.verify_complete_for_cleanup(plan_path, plan_digest)
+    if cleanup.reset_complete_sha256 != forward.reset_complete_sha256:
+        raise AssertionError("cleanup verifier changed immutable reset authority")
+    if any(call[0][0] == "psql" for call in runner.calls[before:]):
+        raise AssertionError("cleanup verifier read a PostgreSQL credential")
+
+
 def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="cats-clean-slate-fixture-") as directory:
@@ -1689,13 +1758,15 @@ def main() -> int:
             assert_binding_failures(root)
             assert_unaccepted_proofs_block_execute(root)
             assert_cutover_authority_ordering_and_replay(root)
+            assert_post_open_verifiers_accept_only_target_drift(root)
 
             print(
                 "clean-slate fixture: paginated versions+markers, multipart abort, "
                 "fresh namespace preserved, exact old retire, dry-run, receipts, "
                 "post-green blocker passed, closed forward-resume, crash replay, binding failures, "
                 "mechanical prerequisite blocks, recoverable receipt publication, and S3 "
-                "expected-owner gates passed; fresh DB read-only and ingress Closed passed"
+                "expected-owner gates passed; fresh DB read-only, ingress Closed, and post-open "
+                "forward/credential-independent cleanup verification passed"
             )
             return 0
     except (AssertionError, OSError, reset.ResetError) as error:

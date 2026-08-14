@@ -76,6 +76,7 @@ MAX_JSON_BYTES = 64 * 1024
 MAX_LIST_PAGES = 100_000
 MAX_S3_ENTRIES = 5_000_000
 EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "16"
+EXPECTED_FRESH_USAGE_SCHEMA_VERSION = "16"
 POST_GREEN_MAX_AGE_SECONDS = 15 * 60
 POSTGRES_QUERY_PARAMETERS = {
     "channel_binding",
@@ -245,6 +246,19 @@ class VerifiedCutoverAuthority:
 @dataclasses.dataclass(frozen=True)
 class VerifiedResetCompletion:
     authority: VerifiedCutoverAuthority
+    plan_sha256: str
+    stable_preflight_sha256: str
+    reset_complete_path: Path
+    reset_complete_sha256: str
+    reset_complete: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifiedPostOpenResetCompletion:
+    """Immutable reset authority and retirement proof after Open crossed its marker."""
+
+    cutover_authority: dict[str, Any]
+    operator_trust: dict[str, Any]
     plan_sha256: str
     stable_preflight_sha256: str
     reset_complete_path: Path
@@ -703,21 +717,52 @@ class ResetExecutor:
         self._fixed_now = now is not None
         self._cutover_authority_verifier = cutover_authority_verifier
         self._receipt_publication_hook = receipt_publication_hook
-        self.control_dsn = read_secret_file(
-            config.control_postgres_url_file, "control PostgreSQL URL file"
-        )
-        self.usage_dsn = read_secret_file(
-            config.usage_postgres_url_file, "usage PostgreSQL URL file"
-        )
-        self.new_control_dsn = read_secret_file(
-            config.new_control_postgres_url_file, "fresh control PostgreSQL URL file"
-        )
-        self.new_usage_dsn = read_secret_file(
-            config.new_usage_postgres_url_file, "fresh usage PostgreSQL URL file"
-        )
+        # DSN secrets are loaded only by stages that actually query PostgreSQL.
+        # Exact terminal replay and safety cleanup must survive retirement or
+        # rotation of unrelated old/fresh database credentials.
+        self._control_dsn: str | None = None
+        self._usage_dsn: str | None = None
+        self._new_control_dsn: str | None = None
+        self._new_usage_dsn: str | None = None
 
     def _current_time(self) -> dt.datetime:
         return self.now if self._fixed_now else utc_now()
+
+    @property
+    def control_dsn(self) -> str:
+        if self._control_dsn is None:
+            self._control_dsn = read_secret_file(
+                self.config.control_postgres_url_file,
+                "control PostgreSQL URL file",
+            )
+        return self._control_dsn
+
+    @property
+    def usage_dsn(self) -> str:
+        if self._usage_dsn is None:
+            self._usage_dsn = read_secret_file(
+                self.config.usage_postgres_url_file,
+                "usage PostgreSQL URL file",
+            )
+        return self._usage_dsn
+
+    @property
+    def new_control_dsn(self) -> str:
+        if self._new_control_dsn is None:
+            self._new_control_dsn = read_secret_file(
+                self.config.new_control_postgres_url_file,
+                "fresh control PostgreSQL URL file",
+            )
+        return self._new_control_dsn
+
+    @property
+    def new_usage_dsn(self) -> str:
+        if self._new_usage_dsn is None:
+            self._new_usage_dsn = read_secret_file(
+                self.config.new_usage_postgres_url_file,
+                "fresh usage PostgreSQL URL file",
+            )
+        return self._new_usage_dsn
 
     def _write_receipt(
         self, stage: str, value: dict[str, Any]
@@ -1167,6 +1212,42 @@ class ResetExecutor:
             "cats_ingress_classes": 0,
         }
 
+    def _kubernetes_target_identity(self, endpoint: str) -> dict[str, str]:
+        """Read immutable target identity without asserting the pre-open state."""
+
+        context_server = self._run(
+            [
+                "kubectl",
+                "--kubeconfig",
+                str(self.config.kubeconfig),
+                "--context",
+                self.config.kube_context,
+                "config",
+                "view",
+                "--minify",
+                "--output",
+                "jsonpath={.clusters[0].cluster.server}",
+            ]
+        ).strip()
+        if context_server != endpoint:
+            raise ResetError(
+                "kubeconfig context endpoint does not match the explicit EKS cluster"
+            )
+        namespace = self._kubectl_json(
+            "get", "namespace", self.config.kubernetes_namespace
+        )
+        metadata = namespace.get("metadata")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != self.config.kubernetes_namespace
+        ):
+            raise ResetError("Kubernetes namespace identity mismatch")
+        namespace_uid = metadata.get("uid")
+        if not isinstance(namespace_uid, str) or not namespace_uid:
+            raise ResetError("Kubernetes namespace has no UID")
+
+        return {"namespace_uid": namespace_uid}
+
     def _bucket_region(self, bucket: str) -> str:
         value = self._aws_json(
             "s3api",
@@ -1424,6 +1505,23 @@ class ResetExecutor:
         }
         return summary, objects, uploads
 
+    def _chunkstore_target_identity(self, bucket: str) -> dict[str, str]:
+        """Verify the fixed bucket without enumerating mutable production objects."""
+
+        if self._bucket_region(bucket) != self.config.aws_region:
+            raise ResetError("ChunkStore bucket region does not match the explicit region")
+        versioning = self._aws_json(
+            "s3api",
+            "get-bucket-versioning",
+            "--bucket",
+            bucket,
+            "--expected-bucket-owner",
+            self.config.aws_account_id,
+        )
+        if versioning.get("Status") != "Enabled" or versioning.get("MFADelete") == "Enabled":
+            raise ResetError("ChunkStore bucket must have versioning Enabled and MFA Delete off")
+        return {"bucket_versioning": "Enabled"}
+
     def _database_schema(
         self,
         dsn: str,
@@ -1581,6 +1679,10 @@ FROM outside;
             "schema_migrations",
             require_owner=False,
         )
+        if fresh_usage["schema_version"] != EXPECTED_FRESH_USAGE_SCHEMA_VERSION:
+            raise ResetError(
+                "fresh Usage schema is not the required terminal schema version 16"
+            )
         stable = {
             "targets": self.config.targets(),
             "release_commit": self.config.release_commit,
@@ -2234,6 +2336,9 @@ COMMIT;
                     "control_schema_version": stable["databases"]["fresh_control"][
                         "schema_version"
                     ],
+                    "usage_schema_version": stable["databases"]["fresh_usage"][
+                        "schema_version"
+                    ],
                     "usage_resources": stable["fresh_usage_resources"],
                 }
                 expected_empty_proof = {
@@ -2322,6 +2427,8 @@ COMMIT;
             fresh_control != databases.get("fresh_control")
             or fresh_usage_schema != databases.get("fresh_usage")
             or fresh_control.get("schema_version") != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION
+            or fresh_usage_schema.get("schema_version")
+            != EXPECTED_FRESH_USAGE_SCHEMA_VERSION
         ):
             raise ResetError("fresh PostgreSQL namespace drifted during forward-resume")
         return {
@@ -2333,6 +2440,7 @@ COMMIT;
                 "usage_schema_verification_receipt_sha256"
             ],
             "control_schema_version": fresh_control["schema_version"],
+            "usage_schema_version": fresh_usage_schema["schema_version"],
             "usage_resources": fresh_usage,
         }
 
@@ -2427,13 +2535,17 @@ COMMIT;
         }
         return self._write_receipt("plan", receipt)
 
-    def verify_complete(
+    def _completed_reset_context(
         self,
         plan_path: Path,
         supplied_plan_sha256: str,
-    ) -> VerifiedResetCompletion:
-        """Read-only proof that the exact reviewed reset reached its final receipt."""
-
+    ) -> tuple[
+        dict[str, Any],
+        str,
+        str,
+        str,
+        dict[str, tuple[Path, dict[str, Any], str]],
+    ]:
         if not HEX_SHA256.fullmatch(supplied_plan_sha256):
             raise ResetError("reset plan SHA-256 must be exact lowercase hex")
         plan, actual_plan_digest = read_json_file(
@@ -2473,6 +2585,133 @@ COMMIT;
         chain = self._load_receipt_chain(common, stable)
         if "reset-complete" not in chain:
             raise ResetError("the reviewed reset has no terminal reset-complete receipt")
+        return stable, actual_plan_digest, stable_digest, authority_digest, chain
+
+    def _assert_retired_reset_targets(self) -> None:
+        self._s3_empty_proof()
+        self._assert_old_usage_transport_absent()
+        self._assert_schema_absent(self.control_dsn, self.config.control_schema)
+        self._assert_schema_absent(self.usage_dsn, self.config.usage_schema)
+
+    def _post_open_boundary_trust(
+        self, stable: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Recheck the fixed offline scope without replaying terminal proofs."""
+
+        authority = stable["cutover_authority"]
+        admission = production_mutation_admission()
+        try:
+            trust_raw = admission.read_stable_file(
+                self.config.production_cutover_operator_trust_file,
+                "production cutover operator trust",
+                admission.MAX_TRUST_BYTES,
+                private=False,
+            )
+            trust, credential = admission.validate_trust(
+                admission.decode_json(trust_raw, "production cutover operator trust")
+            )
+            # A refreshed STS session is expected during recovery. The offline
+            # trust fixes the account and role; it never fixes one session ARN.
+            admission.discover_sts(Path("/usr/local/bin/aws"), credential["scope"])
+        except admission.AdmissionError as error:
+            raise ResetError("production cutover trust failed closed") from error
+        scope = credential["scope"]
+        frozen_operator = authority["operator"]
+        if (
+            admission.sha256(trust_raw) != authority["operator_trust_sha256"]
+            or trust["release_id"] != authority["release_id"]
+            or trust["source_commit_sha"] != stable["release_commit"]
+            or scope["aws_partition"] != frozen_operator["aws_partition"]
+            or scope["account_id"] != frozen_operator["account_id"]
+            or scope["role_arn"] != frozen_operator["role_arn"]
+        ):
+            raise ResetError("production cutover trust differs from reset-complete")
+        return trust
+
+    def _post_open_boundary_trust_and_target(
+        self, stable: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Recheck trust scope and target identity without pre-open state claims."""
+
+        trust = self._post_open_boundary_trust(stable)
+
+        cloud = self._cloud_identity()
+        endpoint = cloud.pop("eks_endpoint")
+        if cloud != stable["cloud"]:
+            raise ResetError("fresh cloud identity drifted after final-open boundary")
+        kubernetes_identity = self._kubernetes_target_identity(endpoint)
+        if kubernetes_identity != {
+            "namespace_uid": stable["kubernetes"]["namespace_uid"]
+        }:
+            raise ResetError("fresh Kubernetes namespace identity drifted after final-open boundary")
+        return trust
+
+    def _post_open_boundary_forward_preflight(
+        self, stable: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Recheck forward authority while permitting ingress and fresh data."""
+
+        trust = self._post_open_boundary_trust_and_target(stable)
+
+        old_archive = self._usage_archive(self.config.usage_archive_bucket)
+        if any(
+            old_archive.get(field) != stable["old_usage_resources"].get(field)
+            for field in old_archive
+        ):
+            raise ResetError("retained old usage archive identity drifted")
+        fresh_usage = self._usage_resources(
+            self.config.new_usage_kinesis_stream,
+            self.config.new_usage_checkpoint_table,
+            self.config.new_usage_archive_bucket,
+        )
+        if fresh_usage != stable["fresh_usage_resources"]:
+            raise ResetError("fresh usage authority drifted after final-open boundary")
+        chunkstore_identity = self._chunkstore_target_identity(
+            self.config.new_chunkstore_bucket
+        )
+        if chunkstore_identity != {
+            "bucket_versioning": stable["chunkstore"]["fresh"]["bucket_versioning"]
+        }:
+            raise ResetError("fresh ChunkStore identity drifted after final-open boundary")
+
+        databases = stable["databases"]
+        fresh_control = self._database_schema(
+            self.new_control_dsn,
+            self.config.new_control_schema,
+            "control_schema_version",
+            require_owner=False,
+        )
+        fresh_usage_schema = self._database_schema(
+            self.new_usage_dsn,
+            self.config.new_usage_schema,
+            "schema_migrations",
+            require_owner=False,
+        )
+        if (
+            fresh_control != databases["fresh_control"]
+            or fresh_usage_schema != databases["fresh_usage"]
+            or fresh_control["schema_version"]
+            != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION
+            or fresh_usage_schema["schema_version"]
+            != EXPECTED_FRESH_USAGE_SCHEMA_VERSION
+        ):
+            raise ResetError("fresh PostgreSQL namespace drifted after final-open boundary")
+        return trust
+
+    def verify_complete(
+        self,
+        plan_path: Path,
+        supplied_plan_sha256: str,
+    ) -> VerifiedResetCompletion:
+        """Read-only proof that the exact reviewed reset reached its final receipt."""
+
+        (
+            stable,
+            actual_plan_digest,
+            stable_digest,
+            authority_digest,
+            chain,
+        ) = self._completed_reset_context(plan_path, supplied_plan_sha256)
         _started_path, started, _started_digest = chain["reset-started"]
         self._resume_preflight(stable, authority_digest, started)
         live = self._production_cutover_authority(self._current_time())
@@ -2482,10 +2721,7 @@ COMMIT;
             != authority_digest
         ):
             raise ResetError("live cutover authority differs from reset-complete")
-        self._s3_empty_proof()
-        self._assert_old_usage_transport_absent()
-        self._assert_schema_absent(self.control_dsn, self.config.control_schema)
-        self._assert_schema_absent(self.usage_dsn, self.config.usage_schema)
+        self._assert_retired_reset_targets()
         complete_path, complete, complete_digest = chain["reset-complete"]
         return VerifiedResetCompletion(
             authority=live,
@@ -2494,6 +2730,72 @@ COMMIT;
             reset_complete_path=complete_path,
             reset_complete_sha256="sha256:" + complete_digest,
             reset_complete=complete,
+        )
+
+    def _verify_post_open_reset_completion(
+        self,
+        plan_path: Path,
+        supplied_plan_sha256: str,
+        *,
+        continue_forward: bool,
+    ) -> VerifiedPostOpenResetCompletion:
+        """Verify frozen reset authority after Open crossed its marker.
+
+        The exact reset plan and receipt chain already freeze the proof set and
+        original STS session. Replaying cleanup must not reapply their freshness
+        windows or require that session to remain current. Forward recovery also
+        checks stable Usage/schema identity and live old-resource retirement;
+        safety cleanup deliberately does not let those unrelated dependencies
+        prevent ingress close, cordon, or admission close.
+        """
+
+        (
+            stable,
+            actual_plan_digest,
+            stable_digest,
+            _authority_digest,
+            chain,
+        ) = self._completed_reset_context(plan_path, supplied_plan_sha256)
+        if continue_forward:
+            trust = self._post_open_boundary_forward_preflight(stable)
+            self._assert_retired_reset_targets()
+        else:
+            trust = self._post_open_boundary_trust_and_target(stable)
+        complete_path, complete, complete_digest = chain["reset-complete"]
+        return VerifiedPostOpenResetCompletion(
+            cutover_authority=stable["cutover_authority"],
+            operator_trust=trust,
+            plan_sha256=actual_plan_digest,
+            stable_preflight_sha256=stable_digest,
+            reset_complete_path=complete_path,
+            reset_complete_sha256="sha256:" + complete_digest,
+            reset_complete=complete,
+        )
+
+    def verify_complete_after_open_started(
+        self,
+        plan_path: Path,
+        supplied_plan_sha256: str,
+    ) -> VerifiedPostOpenResetCompletion:
+        """Read-only authority for continuing forward after ``open-started``."""
+
+        return self._verify_post_open_reset_completion(
+            plan_path,
+            supplied_plan_sha256,
+            continue_forward=True,
+        )
+
+    def verify_complete_for_cleanup(
+        self,
+        plan_path: Path,
+        supplied_plan_sha256: str,
+    ) -> VerifiedPostOpenResetCompletion:
+        """Minimal immutable authority that cannot strand safety cleanup."""
+
+        return self._verify_post_open_reset_completion(
+            plan_path,
+            supplied_plan_sha256,
+            continue_forward=False,
         )
 
     def apply(
@@ -2578,6 +2880,9 @@ COMMIT;
                     "cutover_authority"
                 ]["usage_schema_verification_receipt_sha256"],
                 "control_schema_version": stable["databases"]["fresh_control"][
+                    "schema_version"
+                ],
+                "usage_schema_version": stable["databases"]["fresh_usage"][
                     "schema_version"
                 ],
                 "usage_resources": stable["fresh_usage_resources"],
