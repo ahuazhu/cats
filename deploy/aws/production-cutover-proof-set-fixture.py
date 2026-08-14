@@ -493,6 +493,22 @@ def validate_release_bound_usage_schema_subprocess() -> None:
         dsn.write_text("postgresql://fixture\n", encoding="utf-8")
         ca.write_text("fixture-ca\n", encoding="utf-8")
 
+        expected_receipt = PROOF.canonical_json(
+            {
+                "binary_sha256": executable_sha256,
+                "catalog_sha256": SHA_C,
+                "kind": PROOF.USAGE_SCHEMA_VERIFICATION_KIND,
+                "release_commit": context.release_commit,
+                "schema": "cats_usage_fresh",
+                "schema_version": 16,
+                "verified": True,
+                "version": 1,
+                "worker_bundle_sha256": context.worker_bundle_sha256,
+            },
+            newline=True,
+        )
+        invocations = 0
+
         def open_fixture_executable(path: Path, expected_sha256: str) -> Any:
             if path != executable or expected_sha256 != executable_sha256:
                 raise AssertionError("schema adapter did not select the release binary")
@@ -506,6 +522,8 @@ def validate_release_bound_usage_schema_subprocess() -> None:
             cwd: Path,
             timeout_seconds: int,
         ) -> tuple[int, bytes, bytes]:
+            nonlocal invocations
+            invocations += 1
             expected = [
                 str(executable),
                 "--dsn-file",
@@ -524,22 +542,9 @@ def validate_release_bound_usage_schema_subprocess() -> None:
             if argv != expected or cwd != state or timeout_seconds != 120:
                 raise AssertionError("schema adapter invocation drifted")
             output = state / PROOF.USAGE_SCHEMA_VERIFICATION_FILE
-            output.write_bytes(
-                PROOF.canonical_json(
-                    {
-                        "binary_sha256": executable_sha256,
-                        "catalog_sha256": SHA_C,
-                        "kind": PROOF.USAGE_SCHEMA_VERIFICATION_KIND,
-                        "release_commit": context.release_commit,
-                        "schema": "cats_usage_fresh",
-                        "schema_version": 16,
-                        "verified": True,
-                        "version": 1,
-                        "worker_bundle_sha256": context.worker_bundle_sha256,
-                    },
-                    newline=True,
-                )
-            )
+            if output.exists() and output.read_bytes() != expected_receipt:
+                return 1, b"", b"Usage schema v16 verification failed closed\n"
+            output.write_bytes(expected_receipt)
             output.chmod(0o600)
             return 0, PROOF.USAGE_SCHEMA_SUCCESS_STDOUT.encode("ascii"), b""
 
@@ -556,6 +561,40 @@ def validate_release_bound_usage_schema_subprocess() -> None:
             )
             if actual.name != PROOF.USAGE_SCHEMA_VERIFICATION_FILE:
                 raise AssertionError("schema adapter receipt name drifted")
+            replay = PROOF.SubprocessUsageSchemaV16Verifier(state).verify(
+                dsn_file=dsn,
+                ca_file=ca,
+                schema="cats_usage_fresh",
+                context=context,
+            )
+            if replay != actual or invocations != 2:
+                raise AssertionError("schema adapter exact replay drifted")
+            (state / PROOF.USAGE_SCHEMA_VERIFICATION_FILE).write_bytes(
+                PROOF.canonical_json(
+                    {
+                        **PROOF.decode_json(
+                            expected_receipt,
+                            "schema receipt fixture",
+                            canonical_lf=True,
+                        ),
+                        "catalog_sha256": SHA_D,
+                    },
+                    newline=True,
+                )
+            )
+            try:
+                PROOF.SubprocessUsageSchemaV16Verifier(state).verify(
+                    dsn_file=dsn,
+                    ca_file=ca,
+                    schema="cats_usage_fresh",
+                    context=context,
+                )
+            except PROOF.ProofSetError:
+                pass
+            else:
+                raise AssertionError(
+                    "schema adapter accepted a foreign existing receipt"
+                )
         finally:
             PROOF.USAGE_SCHEMA_VERIFIER = original_binary
             PROOF._require_root_private_directory = original_private_directory

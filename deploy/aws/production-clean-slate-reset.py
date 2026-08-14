@@ -6,11 +6,10 @@ account, region, cluster, namespace, PostgreSQL schema, bucket, and prefix is
 an explicit input.  ``plan`` is read-only.  ``apply`` is also read-only unless
 ``--execute`` and two independent plan confirmations are present.
 
-Production execution is mechanically blocked in this revision because the
-canonical E13 positive-stop, E9 signed final usage barrier, and cross-component
-Closed-admission proof formats have not yet been accepted.  The destructive
-path remains executable only through constructor flags used by this module's
-offline fake fixture; no CLI option exposes them.
+Production execution consumes the exact closed E13 proof directory and invokes
+the release-bound Rust Usage terminal/schema verifiers before it can publish
+``reset-started``. Unavailable V3/G3/local-stop or admission-discovery adapters
+fail closed; no CLI option can bypass them.
 
 The reset is a post-cutover retirement tool.  It proves that a disjoint fresh
 schema/object/stream/checkpoint/archive namespace is already qualified and
@@ -24,6 +23,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -34,6 +34,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qsl, unquote, urlsplit
+
+import production_cutover_proof_set as cutover_proof
 
 
 KIND_PLAN = "cats.production-clean-slate-plan.v1"
@@ -48,10 +50,32 @@ HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 RESET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 COMPONENTS = ("gateway", "controller", "node_agent", "vmm", "blockd")
+CUTOVER_AUTHORITY_FIELDS = {
+    "cutover_id",
+    "proof_set_sha256",
+    "operator",
+    "operator_trust_sha256",
+    "release_id",
+    "release_manifest_sha256",
+    "worker_bundle_sha256",
+    "qualification_manifest_sha256",
+    "qualification_catalog_sha256",
+    "fresh_targets_sha256",
+    "fleet_closed_receipt_sha256",
+    "route_v2_rotation_qualification_receipt_sha256",
+    "route_v2_rotation_qualification_node_ack_sets_sha256",
+    "route_v2_rotation_qualification_transcript_sha256",
+    "usage_terminal_receipt_sha256",
+    "old_host_coverage_sha256",
+    "kernel_nbd_qualification_bundle_sha256",
+    "vhost_user_qualification_bundle_sha256",
+    "usage_schema_verification_receipt_sha256",
+    "usage_schema_catalog_sha256",
+}
 MAX_JSON_BYTES = 64 * 1024
 MAX_LIST_PAGES = 100_000
 MAX_S3_ENTRIES = 5_000_000
-EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "15"
+EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "16"
 POST_GREEN_MAX_AGE_SECONDS = 15 * 60
 POSTGRES_QUERY_PARAMETERS = {
     "channel_binding",
@@ -81,6 +105,30 @@ POSTGRES_QUERY_PARAMETERS = {
 
 class ResetError(RuntimeError):
     """A safe, non-secret explanation for a refused reset."""
+
+
+_ADMISSION_MODULE: Any | None = None
+
+
+def production_mutation_admission() -> Any:
+    global _ADMISSION_MODULE
+    if _ADMISSION_MODULE is not None:
+        return _ADMISSION_MODULE
+    path = Path(__file__).resolve().with_name("production-mutation-admission.py")
+    spec = importlib.util.spec_from_file_location(
+        "cats_production_mutation_admission_for_reset",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise ResetError("production mutation admission operator is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        raise ResetError("production mutation admission operator cannot load") from error
+    _ADMISSION_MODULE = module
+    return module
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,8 +191,11 @@ class Config:
     new_usage_kinesis_stream: str
     new_usage_checkpoint_table: str
     new_usage_archive_bucket: str
-    post_green_evidence_file: Path
     receipt_directory: Path
+    cutover_proof_directory: Path
+    production_cutover_operator_trust_file: Path
+    fresh_usage_postgres_ca_file: Path
+    legacy_fixture_post_green_evidence_file: Path | None = None
 
     @property
     def object_prefix(self) -> str:
@@ -182,6 +233,13 @@ class Config:
             "usage_checkpoint_table": self.new_usage_checkpoint_table,
             "usage_archive_bucket": self.new_usage_archive_bucket,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifiedCutoverAuthority:
+    proof_set: cutover_proof.VerifiedProofSet
+    operator: dict[str, Any]
+    projection: dict[str, Any]
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -482,11 +540,21 @@ def validate_config(config: Config) -> None:
         (config.usage_postgres_url_file, "usage_postgres_url_file"),
         (config.new_control_postgres_url_file, "new_control_postgres_url_file"),
         (config.new_usage_postgres_url_file, "new_usage_postgres_url_file"),
-        (config.post_green_evidence_file, "post_green_evidence_file"),
         (config.receipt_directory, "receipt_directory"),
+        (config.cutover_proof_directory, "cutover_proof_directory"),
+        (
+            config.production_cutover_operator_trust_file,
+            "production_cutover_operator_trust_file",
+        ),
+        (config.fresh_usage_postgres_ca_file, "fresh_usage_postgres_ca_file"),
     ]:
         if not path.is_absolute():
             raise ResetError(f"{field} must be an absolute path")
+    if (
+        config.legacy_fixture_post_green_evidence_file is not None
+        and not config.legacy_fixture_post_green_evidence_file.is_absolute()
+    ):
+        raise ResetError("legacy fixture evidence path must be absolute")
     try:
         receipt_stat = config.receipt_directory.stat(follow_symlinks=False)
     except OSError as error:
@@ -614,9 +682,8 @@ class ResetExecutor:
         runner: CommandRunner,
         *,
         now: dt.datetime | None = None,
-        allow_unaccepted_e13_proof_for_fixture: bool = False,
-        allow_unaccepted_e9_barrier_for_fixture: bool = False,
-        allow_unaccepted_closed_admission_for_fixture: bool = False,
+        cutover_authority_verifier: Callable[[dt.datetime], dict[str, Any]]
+        | None = None,
         receipt_publication_hook: Callable[[str, Path], None] | None = None,
     ) -> None:
         validate_config(config)
@@ -624,15 +691,7 @@ class ResetExecutor:
         self.runner = runner
         self.now = (now or utc_now()).astimezone(dt.timezone.utc)
         self._fixed_now = now is not None
-        self._allow_unaccepted_e13_proof_for_fixture = (
-            allow_unaccepted_e13_proof_for_fixture
-        )
-        self._allow_unaccepted_e9_barrier_for_fixture = (
-            allow_unaccepted_e9_barrier_for_fixture
-        )
-        self._allow_unaccepted_closed_admission_for_fixture = (
-            allow_unaccepted_closed_admission_for_fixture
-        )
+        self._cutover_authority_verifier = cutover_authority_verifier
         self._receipt_publication_hook = receipt_publication_hook
         self.control_dsn = read_secret_file(
             config.control_postgres_url_file, "control PostgreSQL URL file"
@@ -665,22 +724,160 @@ class ResetExecutor:
             publication_hook=self._receipt_publication_hook,
         )
 
-    def _require_accepted_execute_prerequisites(self) -> None:
-        if not self._allow_unaccepted_e13_proof_for_fixture:
-            raise ResetError(
-                "production --execute is mechanically blocked until the canonical E13 "
-                "positive-stop/isolation proof format is accepted and verified"
+    def _production_cutover_authority(
+        self,
+        reference_time: dt.datetime,
+    ) -> VerifiedCutoverAuthority:
+        admission = production_mutation_admission()
+        try:
+            trust_raw = admission.read_stable_file(
+                self.config.production_cutover_operator_trust_file,
+                "production cutover operator trust",
+                admission.MAX_TRUST_BYTES,
+                private=False,
             )
-        if not self._allow_unaccepted_e9_barrier_for_fixture:
-            raise ResetError(
-                "production --execute is mechanically blocked until the canonical E9 "
-                "signed final usage epoch/barrier receipt is accepted and verified"
+            trust, credential = admission.validate_trust(
+                admission.decode_json(trust_raw, "production cutover operator trust")
             )
-        if not self._allow_unaccepted_closed_admission_for_fixture:
-            raise ResetError(
-                "production --execute is mechanically blocked until the canonical "
-                "Closed route/mutation admission proof is accepted and verified"
+            if (
+                trust["source_commit_sha"] != self.config.release_commit
+                or credential["scope"]["account_id"] != self.config.aws_account_id
+            ):
+                raise ResetError(
+                    "production cutover trust differs from the reset release/account"
+                )
+            operator = admission.discover_sts(
+                Path("/usr/local/bin/aws"),
+                credential["scope"],
             )
+            usage_terminal_verifier = (
+                cutover_proof.SubprocessUsageTargetTerminalVerifier(
+                    self.config.receipt_directory
+                )
+            )
+            proof = cutover_proof.verify(
+                self.config.cutover_proof_directory,
+                expected_reset_id=self.config.reset_id,
+                expected_release_commit=self.config.release_commit,
+                expected_operator=operator,
+                expected_old_targets=self.config.targets()["old"],
+                expected_fresh_targets=self.config.fresh_targets(),
+                usage_verifier=usage_terminal_verifier,
+                now=reference_time,
+            )
+            if (
+                proof.release_manifest_sha256
+                != "sha256:" + self.config.artifact_sha256
+                or proof.value["release"]["release_id"] != trust["release_id"]
+                or proof.value["fresh"]["deployment_id"]
+                != trust["deployment_id"]
+            ):
+                raise ResetError(
+                    "production cutover proof differs from the fixed release trust"
+                )
+            schema_receipt = cutover_proof.SubprocessUsageSchemaV16Verifier(
+                self.config.receipt_directory
+            ).verify(
+                dsn_file=self.config.new_usage_postgres_url_file,
+                ca_file=self.config.fresh_usage_postgres_ca_file,
+                schema=self.config.new_usage_schema,
+                context=proof.producer_context(),
+            )
+            schema_value = cutover_proof.fields(
+                cutover_proof.decode_json(
+                    schema_receipt.data,
+                    "Usage schema verification receipt",
+                    canonical_lf=True,
+                ),
+                {
+                    "binary_sha256",
+                    "catalog_sha256",
+                    "kind",
+                    "release_commit",
+                    "schema",
+                    "schema_version",
+                    "verified",
+                    "version",
+                    "worker_bundle_sha256",
+                },
+                "Usage schema verification receipt",
+            )
+        except (admission.AdmissionError, cutover_proof.ProofSetError) as error:
+            raise ResetError(
+                "production cutover proof or Usage verifier failed closed"
+            ) from error
+        projection = {
+            "cutover_id": proof.value["cutover_id"],
+            "proof_set_sha256": proof.sha256,
+            "operator": operator,
+            "operator_trust_sha256": admission.sha256(trust_raw),
+            "release_id": proof.value["release"]["release_id"],
+            "release_manifest_sha256": proof.release_manifest_sha256,
+            "worker_bundle_sha256": proof.worker_bundle_sha256,
+            "qualification_manifest_sha256": proof.qualification_manifest_sha256,
+            "qualification_catalog_sha256": proof.qualification_catalog_sha256,
+            "fresh_targets_sha256": proof.fresh_targets_sha256,
+            "fleet_closed_receipt_sha256": proof.fleet_closed_sha256,
+            "route_v2_rotation_qualification_receipt_sha256": (
+                proof.route_v2_rotation_qualification_receipt_sha256
+            ),
+            "route_v2_rotation_qualification_node_ack_sets_sha256": (
+                proof.route_v2_rotation_qualification_node_ack_sets_sha256
+            ),
+            "route_v2_rotation_qualification_transcript_sha256": (
+                proof.route_v2_rotation_qualification_transcript_sha256
+            ),
+            "usage_terminal_receipt_sha256": proof.usage_terminal_sha256,
+            "old_host_coverage_sha256": proof.old_host_coverage_sha256,
+            "kernel_nbd_qualification_bundle_sha256": (
+                proof.kernel_nbd_qualification_bundle_sha256
+            ),
+            "vhost_user_qualification_bundle_sha256": (
+                proof.vhost_user_qualification_bundle_sha256
+            ),
+            "usage_schema_verification_receipt_sha256": schema_receipt.sha256,
+            "usage_schema_catalog_sha256": schema_value["catalog_sha256"],
+        }
+        return VerifiedCutoverAuthority(proof, operator, projection)
+
+    def _cutover_authority_projection(
+        self,
+        reference_time: dt.datetime,
+    ) -> dict[str, Any]:
+        if self._cutover_authority_verifier is None:
+            value = self._production_cutover_authority(reference_time).projection
+        else:
+            value = self._cutover_authority_verifier(reference_time)
+        value = require_keys(
+            value,
+            CUTOVER_AUTHORITY_FIELDS,
+            "cutover authority projection",
+        )
+        for field in ("cutover_id", "release_id"):
+            if (
+                not isinstance(value[field], str)
+                or not value[field]
+                or len(value[field]) > 128
+            ):
+                raise ResetError(f"cutover authority {field} is invalid")
+        operator = require_keys(
+            value["operator"],
+            {"aws_partition", "account_id", "role_arn", "principal_arn"},
+            "cutover authority operator",
+        )
+        if operator["account_id"] != self.config.aws_account_id:
+            raise ResetError("cutover authority operator account drifted")
+        for field in CUTOVER_AUTHORITY_FIELDS - {"cutover_id", "operator", "release_id"}:
+            digest = value[field]
+            if (
+                not isinstance(digest, str)
+                or not digest.startswith("sha256:")
+                or HEX_SHA256.fullmatch(digest.removeprefix("sha256:")) is None
+            ):
+                raise ResetError(f"cutover authority {field} is malformed")
+        if value["release_manifest_sha256"] != "sha256:" + self.config.artifact_sha256:
+            raise ResetError("cutover authority release manifest drifted")
+        return value
 
     def _run(self, argv: Sequence[str], *, env: Mapping[str, str] | None = None) -> str:
         result = self.runner.run(argv, env=env)
@@ -829,66 +1026,6 @@ class ResetExecutor:
                 service_path.unlink()
             except FileNotFoundError:
                 pass
-
-    def _post_green_evidence(
-        self, *, freshness_at: dt.datetime | None = None
-    ) -> tuple[dict[str, Any], str]:
-        value, digest = read_json_file(
-            self.config.post_green_evidence_file, "post-green evidence"
-        )
-        require_keys(
-            value,
-            {
-                "kind",
-                "version",
-                "reset_id",
-                "observed_at",
-                "qualified_release_commit",
-                "qualified_artifact_sha256",
-                "aws_account_id",
-                "aws_region",
-                "eks_cluster_name",
-                "kubernetes_namespace",
-                "fresh_targets",
-                "qualification",
-                "qualification_manifest_sha256",
-                "old_writers",
-            },
-            "post-green evidence",
-        )
-        if value["kind"] != KIND_GREEN or value["version"] != 1:
-            raise ResetError("unsupported post-green evidence kind/version")
-        expected = {
-            "reset_id": self.config.reset_id,
-            "qualified_release_commit": self.config.release_commit,
-            "qualified_artifact_sha256": self.config.artifact_sha256,
-            "aws_account_id": self.config.aws_account_id,
-            "aws_region": self.config.aws_region,
-            "eks_cluster_name": self.config.eks_cluster_name,
-            "kubernetes_namespace": self.config.kubernetes_namespace,
-        }
-        for field, target in expected.items():
-            if value[field] != target:
-                raise ResetError(f"post-green evidence {field} does not match the target")
-        if value["fresh_targets"] != self.config.fresh_targets():
-            raise ResetError("post-green evidence fresh targets do not match this invocation")
-        if value["qualification"] != "passed":
-            raise ResetError("fresh namespace qualification is not passed")
-        old_writers = require_keys(value["old_writers"], set(COMPONENTS), "old_writers")
-        if any(old_writers[name] != "stopped_or_isolated" for name in COMPONENTS):
-            raise ResetError("every old-writer declaration must bind the qualification manifest")
-        manifest_digest = value["qualification_manifest_sha256"]
-        if not isinstance(manifest_digest, str) or not HEX_SHA256.fullmatch(
-            manifest_digest
-        ):
-            raise ResetError("invalid qualification evidence manifest digest")
-        reference = (freshness_at or self.now).astimezone(dt.timezone.utc)
-        observed = parse_time(value["observed_at"], "post-green observed_at")
-        if observed > reference:
-            raise ResetError("post-green evidence timestamp is in the future")
-        if (reference - observed).total_seconds() > POST_GREEN_MAX_AGE_SECONDS:
-            raise ResetError("post-green evidence is older than the closed 15-minute window")
-        return value, digest
 
     def _cloud_identity(self) -> dict[str, Any]:
         identity = self._aws_json("sts", "get-caller-identity")
@@ -1387,7 +1524,7 @@ FROM outside;
         }
 
     def preflight(self) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, str]]]:
-        green, green_digest = self._post_green_evidence()
+        cutover_authority = self._cutover_authority_projection(self._current_time())
         cloud = self._cloud_identity()
         kubernetes = self._kubernetes_green(cloud.pop("eks_endpoint"))
         old_usage_resources = self._usage_resources(
@@ -1426,7 +1563,7 @@ FROM outside;
         )
         if fresh_control["schema_version"] != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION:
             raise ResetError(
-                "fresh control schema is not the required terminal schema version 15"
+                "fresh control schema is not the required terminal schema version 16"
             )
         fresh_usage = self._database_schema(
             self.new_usage_dsn,
@@ -1438,8 +1575,9 @@ FROM outside;
             "targets": self.config.targets(),
             "release_commit": self.config.release_commit,
             "artifact_sha256": self.config.artifact_sha256,
-            "post_green_evidence_sha256": green_digest,
-            "qualification_manifest_sha256": green["qualification_manifest_sha256"],
+            "cutover_authority": cutover_authority,
+            "cutover_authority_sha256": "sha256:"
+            + sha256_bytes(canonical_bytes(cutover_authority)),
             "cloud": cloud,
             "kubernetes": kubernetes,
             "old_usage_resources": old_usage_resources,
@@ -1751,7 +1889,7 @@ COMMIT;
                 "mode",
                 "reset_id",
                 "created_at",
-                "post_green_evidence_sha256",
+                "cutover_authority_sha256",
                 "stable_preflight",
                 "stable_preflight_sha256",
                 "destructive_actions",
@@ -1762,6 +1900,7 @@ COMMIT;
         )
         if (
             plan["kind"] != KIND_PLAN
+            or type(plan["version"]) is not int
             or plan["version"] != 1
             or plan["mode"] != "read_only_plan"
             or plan["reset_id"] != self.config.reset_id
@@ -1777,8 +1916,8 @@ COMMIT;
                 "targets",
                 "release_commit",
                 "artifact_sha256",
-                "post_green_evidence_sha256",
-                "qualification_manifest_sha256",
+                "cutover_authority",
+                "cutover_authority_sha256",
                 "cloud",
                 "kubernetes",
                 "old_usage_resources",
@@ -1800,18 +1939,39 @@ COMMIT;
             raise ResetError("plan receipt stable preflight digest is malformed")
         if sha256_bytes(canonical_bytes(stable)) != stable_digest:
             raise ResetError("plan receipt internal preflight digest is invalid")
-        evidence_digest = plan["post_green_evidence_sha256"]
+        authority = require_keys(
+            stable["cutover_authority"],
+            CUTOVER_AUTHORITY_FIELDS,
+            "plan cutover authority",
+        )
+        operator = require_keys(
+            authority["operator"],
+            {"aws_partition", "account_id", "role_arn", "principal_arn"},
+            "plan cutover operator",
+        )
+        if operator["account_id"] != self.config.aws_account_id:
+            raise ResetError("plan cutover operator account drifted")
+        for field in CUTOVER_AUTHORITY_FIELDS - {"cutover_id", "operator", "release_id"}:
+            value = authority[field]
+            if (
+                not isinstance(value, str)
+                or not value.startswith("sha256:")
+                or HEX_SHA256.fullmatch(value.removeprefix("sha256:")) is None
+            ):
+                raise ResetError(f"plan cutover authority {field} is malformed")
+        if authority["release_manifest_sha256"] != "sha256:" + self.config.artifact_sha256:
+            raise ResetError("plan cutover authority release manifest drifted")
+        evidence_digest = plan["cutover_authority_sha256"]
         if (
             not isinstance(evidence_digest, str)
-            or not HEX_SHA256.fullmatch(evidence_digest)
-            or stable.get("post_green_evidence_sha256") != evidence_digest
+            or not evidence_digest.startswith("sha256:")
+            or not HEX_SHA256.fullmatch(evidence_digest.removeprefix("sha256:"))
+            or stable.get("cutover_authority_sha256") != evidence_digest
+            or "sha256:"
+            + sha256_bytes(canonical_bytes(stable.get("cutover_authority")))
+            != evidence_digest
         ):
-            raise ResetError("plan receipt post-green evidence binding is invalid")
-        qualification_digest = stable["qualification_manifest_sha256"]
-        if not isinstance(qualification_digest, str) or not HEX_SHA256.fullmatch(
-            qualification_digest
-        ):
-            raise ResetError("plan receipt qualification manifest binding is invalid")
+            raise ResetError("plan receipt cutover authority binding is invalid")
         chunkstore = require_keys(
             stable["chunkstore"], {"old", "fresh"}, "plan ChunkStore boundary"
         )
@@ -1849,7 +2009,11 @@ COMMIT;
         return stable
 
     def _receipt_common(
-        self, plan_digest: str, stable_digest: str, evidence_digest: str
+        self,
+        plan_digest: str,
+        stable_digest: str,
+        evidence_digest: str,
+        authority: Mapping[str, Any],
     ) -> dict[str, Any]:
         return {
             "kind": KIND_RECEIPT,
@@ -1860,14 +2024,34 @@ COMMIT;
             "targets": self.config.targets(),
             "plan_receipt_sha256": plan_digest,
             "stable_preflight_sha256": stable_digest,
-            "post_green_evidence_sha256": evidence_digest,
+            "cutover_authority_sha256": evidence_digest,
+            "proof_set_sha256": authority["proof_set_sha256"],
+            "qualification_manifest_sha256": authority[
+                "qualification_manifest_sha256"
+            ],
+            "qualification_catalog_sha256": authority[
+                "qualification_catalog_sha256"
+            ],
+            "fleet_closed_receipt_sha256": authority[
+                "fleet_closed_receipt_sha256"
+            ],
+            "usage_terminal_receipt_sha256": authority[
+                "usage_terminal_receipt_sha256"
+            ],
+            "usage_schema_verification_receipt_sha256": authority[
+                "usage_schema_verification_receipt_sha256"
+            ],
+            "operator_principal_arn": authority["operator"]["principal_arn"],
         }
 
     def _validate_receipt_common(
         self, value: dict[str, Any], common: Mapping[str, Any], stage: str
     ) -> None:
         for field, expected in common.items():
-            if value.get(field) != expected:
+            if (
+                field == "version"
+                and type(value.get(field)) is not int
+            ) or value.get(field) != expected:
                 raise ResetError(f"{stage} receipt {field} binding drifted")
         parse_time(value.get("created_at"), f"{stage} receipt created_at")
 
@@ -2028,9 +2212,15 @@ COMMIT;
                 if any(value.get(field) != digest for field, digest in expected_digests.items()):
                     raise ResetError("complete receipt chain digest drifted")
                 expected_fresh_proof = {
-                    "qualification_manifest_sha256": stable[
-                        "qualification_manifest_sha256"
+                    "proof_set_sha256": stable["cutover_authority"][
+                        "proof_set_sha256"
                     ],
+                    "qualification_manifest_sha256": stable[
+                        "cutover_authority"
+                    ]["qualification_manifest_sha256"],
+                    "usage_schema_verification_receipt_sha256": stable[
+                        "cutover_authority"
+                    ]["usage_schema_verification_receipt_sha256"],
                     "control_schema_version": stable["databases"]["fresh_control"][
                         "schema_version"
                     ],
@@ -2071,9 +2261,13 @@ COMMIT;
         started: Mapping[str, Any],
     ) -> dict[str, Any]:
         started_at = parse_time(started.get("created_at"), "reset-started created_at")
-        green, live_evidence_digest = self._post_green_evidence(freshness_at=started_at)
-        if live_evidence_digest != evidence_digest:
-            raise ResetError("post-green evidence changed after reset-started")
+        live_authority = self._cutover_authority_projection(started_at)
+        if (
+            live_authority != stable.get("cutover_authority")
+            or "sha256:" + sha256_bytes(canonical_bytes(live_authority))
+            != evidence_digest
+        ):
+            raise ResetError("cutover authority changed after reset-started")
         cloud = self._cloud_identity()
         kubernetes = self._kubernetes_green(cloud.pop("eks_endpoint"))
         if cloud != stable.get("cloud") or kubernetes != stable.get("kubernetes"):
@@ -2121,7 +2315,13 @@ COMMIT;
         ):
             raise ResetError("fresh PostgreSQL namespace drifted during forward-resume")
         return {
-            "qualification_manifest_sha256": green["qualification_manifest_sha256"],
+            "proof_set_sha256": live_authority["proof_set_sha256"],
+            "qualification_manifest_sha256": live_authority[
+                "qualification_manifest_sha256"
+            ],
+            "usage_schema_verification_receipt_sha256": live_authority[
+                "usage_schema_verification_receipt_sha256"
+            ],
             "control_schema_version": fresh_control["schema_version"],
             "usage_resources": fresh_usage,
         }
@@ -2197,7 +2397,7 @@ COMMIT;
             "mode": "read_only_plan",
             "reset_id": self.config.reset_id,
             "created_at": format_time(self.now),
-            "post_green_evidence_sha256": stable["post_green_evidence_sha256"],
+            "cutover_authority_sha256": stable["cutover_authority_sha256"],
             "stable_preflight": stable,
             "stable_preflight_sha256": sha256_bytes(canonical_bytes(stable)),
             "destructive_actions": [
@@ -2247,11 +2447,14 @@ COMMIT;
         if confirmation != self.config.reset_id:
             raise ResetError("--confirm-reset-id does not match the explicit reset target")
         planned_stable = self._validate_plan_receipt(plan)
-        if execute:
-            self._require_accepted_execute_prerequisites()
         stable_digest = plan["stable_preflight_sha256"]
-        evidence_digest = plan["post_green_evidence_sha256"]
-        common = self._receipt_common(actual_plan_digest, stable_digest, evidence_digest)
+        evidence_digest = plan["cutover_authority_sha256"]
+        common = self._receipt_common(
+            actual_plan_digest,
+            stable_digest,
+            evidence_digest,
+            planned_stable["cutover_authority"],
+        )
         existing = self._load_receipt_chain(common, planned_stable)
         if existing and "reset-started" not in existing:
             raise ResetError("receipt chain exists without reset-started")
@@ -2261,17 +2464,15 @@ COMMIT;
             started_path, started, started_digest = existing["reset-started"]
             if "reset-complete" in existing:
                 complete_path, _complete, complete_digest = existing["reset-complete"]
-                green, live_evidence_digest = self._post_green_evidence(
-                    freshness_at=parse_time(
-                        started["created_at"], "reset-started created_at"
-                    )
+                live_authority = self._cutover_authority_projection(
+                    parse_time(started["created_at"], "reset-started created_at")
                 )
                 if (
-                    live_evidence_digest != evidence_digest
-                    or green["qualification_manifest_sha256"]
-                    != planned_stable["qualification_manifest_sha256"]
+                    live_authority != planned_stable["cutover_authority"]
+                    or "sha256:" + sha256_bytes(canonical_bytes(live_authority))
+                    != evidence_digest
                 ):
-                    raise ResetError("post-green evidence changed after reset-started")
+                    raise ResetError("cutover authority changed after reset-started")
                 self._s3_empty_proof()
                 self._assert_old_usage_transport_absent()
                 self._assert_schema_absent(self.control_dsn, self.config.control_schema)
@@ -2285,12 +2486,18 @@ COMMIT;
             stable, objects, uploads = self.preflight()
             if sha256_bytes(canonical_bytes(stable)) != stable_digest:
                 raise ResetError("live preflight changed since plan; create and review a new plan")
-            if stable["post_green_evidence_sha256"] != evidence_digest:
-                raise ResetError("live post-green evidence changed since plan")
+            if stable["cutover_authority_sha256"] != evidence_digest:
+                raise ResetError("live cutover authority changed since plan")
             fresh_namespace_proof = {
-                "qualification_manifest_sha256": stable[
+                "proof_set_sha256": stable["cutover_authority"][
+                    "proof_set_sha256"
+                ],
+                "qualification_manifest_sha256": stable["cutover_authority"][
                     "qualification_manifest_sha256"
                 ],
+                "usage_schema_verification_receipt_sha256": stable[
+                    "cutover_authority"
+                ]["usage_schema_verification_receipt_sha256"],
                 "control_schema_version": stable["databases"]["fresh_control"][
                     "schema_version"
                 ],
@@ -2307,11 +2514,15 @@ COMMIT;
             return self._write_receipt("dry-run", dry_run)
         if "reset-started" not in existing:
             started_at = self._current_time()
-            _green, start_evidence_digest = self._post_green_evidence(
-                freshness_at=started_at
-            )
-            if start_evidence_digest != evidence_digest:
-                raise ResetError("post-green evidence changed immediately before reset-started")
+            start_authority = self._cutover_authority_projection(started_at)
+            if (
+                start_authority != planned_stable["cutover_authority"]
+                or "sha256:" + sha256_bytes(canonical_bytes(start_authority))
+                != evidence_digest
+            ):
+                raise ResetError(
+                    "cutover authority changed immediately before reset-started"
+                )
             started = {
                 **common,
                 "stage": "destructive_execution_started",
@@ -2469,8 +2680,18 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fresh-usage-kinesis-stream", required=True)
     parser.add_argument("--fresh-usage-checkpoint-table", required=True)
     parser.add_argument("--fresh-usage-archive-bucket", required=True)
-    parser.add_argument("--post-green-evidence-file", required=True, type=Path)
     parser.add_argument("--receipt-directory", required=True, type=Path)
+    parser.add_argument("--cutover-proof-directory", required=True, type=Path)
+    parser.add_argument(
+        "--production-cutover-operator-trust-file",
+        required=True,
+        type=Path,
+    )
+    parser.add_argument(
+        "--fresh-usage-postgres-ca-file",
+        required=True,
+        type=Path,
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -2502,8 +2723,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
         new_usage_kinesis_stream=args.fresh_usage_kinesis_stream,
         new_usage_checkpoint_table=args.fresh_usage_checkpoint_table,
         new_usage_archive_bucket=args.fresh_usage_archive_bucket,
-        post_green_evidence_file=args.post_green_evidence_file,
         receipt_directory=args.receipt_directory,
+        cutover_proof_directory=args.cutover_proof_directory,
+        production_cutover_operator_trust_file=(
+            args.production_cutover_operator_trust_file
+        ),
+        fresh_usage_postgres_ca_file=args.fresh_usage_postgres_ca_file,
     )
 
 

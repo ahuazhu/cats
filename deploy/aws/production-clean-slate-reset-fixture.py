@@ -520,6 +520,99 @@ def write_private(path: Path, value: str) -> None:
 FIXTURE_NOW = dt.datetime(2026, 8, 13, 0, 0, tzinfo=dt.timezone.utc)
 
 
+def fixture_cutover_authority(
+    config: reset.Config,
+    reference_time: dt.datetime,
+) -> dict[str, object]:
+    if config.legacy_fixture_post_green_evidence_file is None:
+        raise reset.ResetError("fixture cutover evidence is unavailable")
+    value, raw_digest = reset.read_json_file(
+        config.legacy_fixture_post_green_evidence_file,
+        "fixture cutover evidence",
+    )
+    reset.require_keys(
+        value,
+        {
+            "kind",
+            "version",
+            "reset_id",
+            "observed_at",
+            "qualified_release_commit",
+            "qualified_artifact_sha256",
+            "aws_account_id",
+            "aws_region",
+            "eks_cluster_name",
+            "kubernetes_namespace",
+            "fresh_targets",
+            "qualification",
+            "qualification_manifest_sha256",
+            "old_writers",
+        },
+        "fixture cutover evidence",
+    )
+    if (
+        value["kind"] != reset.KIND_GREEN
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["reset_id"] != config.reset_id
+        or value["qualified_release_commit"] != config.release_commit
+        or value["qualified_artifact_sha256"] != config.artifact_sha256
+        or value["aws_account_id"] != config.aws_account_id
+        or value["aws_region"] != config.aws_region
+        or value["eks_cluster_name"] != config.eks_cluster_name
+        or value["kubernetes_namespace"] != config.kubernetes_namespace
+        or value["fresh_targets"] != config.fresh_targets()
+        or value["qualification"] != "passed"
+    ):
+        raise reset.ResetError("fixture cutover evidence binding drifted")
+    old_writers = reset.require_keys(
+        value["old_writers"], set(reset.COMPONENTS), "fixture old writers"
+    )
+    if any(old_writers[name] != "stopped_or_isolated" for name in reset.COMPONENTS):
+        raise reset.ResetError("fixture old writer is not terminal")
+    qualification = value["qualification_manifest_sha256"]
+    if not isinstance(qualification, str) or reset.HEX_SHA256.fullmatch(qualification) is None:
+        raise reset.ResetError("fixture qualification digest is malformed")
+    observed = reset.parse_time(value["observed_at"], "fixture observed_at")
+    if (
+        observed > reference_time
+        or (reference_time - observed).total_seconds()
+        > reset.POST_GREEN_MAX_AGE_SECONDS
+    ):
+        raise reset.ResetError("fixture cutover evidence is stale")
+    proof_digest = "sha256:" + raw_digest
+    return {
+        "cutover_id": "legacy_fixture_cutover",
+        "proof_set_sha256": proof_digest,
+        "operator": {
+            "aws_partition": "aws",
+            "account_id": config.aws_account_id,
+            "role_arn": f"arn:aws:iam::{config.aws_account_id}:role/fixture-cutover",
+            "principal_arn": (
+                f"arn:aws:sts::{config.aws_account_id}:"
+                "assumed-role/fixture-cutover/session"
+            ),
+        },
+        "operator_trust_sha256": proof_digest,
+        "release_id": "legacy_fixture_release",
+        "release_manifest_sha256": "sha256:" + config.artifact_sha256,
+        "worker_bundle_sha256": proof_digest,
+        "qualification_manifest_sha256": "sha256:" + qualification,
+        "qualification_catalog_sha256": proof_digest,
+        "fresh_targets_sha256": proof_digest,
+        "fleet_closed_receipt_sha256": proof_digest,
+        "route_v2_rotation_qualification_receipt_sha256": proof_digest,
+        "route_v2_rotation_qualification_node_ack_sets_sha256": proof_digest,
+        "route_v2_rotation_qualification_transcript_sha256": proof_digest,
+        "usage_terminal_receipt_sha256": proof_digest,
+        "old_host_coverage_sha256": proof_digest,
+        "kernel_nbd_qualification_bundle_sha256": proof_digest,
+        "vhost_user_qualification_bundle_sha256": proof_digest,
+        "usage_schema_verification_receipt_sha256": proof_digest,
+        "usage_schema_catalog_sha256": proof_digest,
+    }
+
+
 def fixture_executor(
     config: reset.Config,
     runner: FakeRunner,
@@ -531,9 +624,10 @@ def fixture_executor(
         config,
         runner,
         now=now,
-        allow_unaccepted_e13_proof_for_fixture=True,
-        allow_unaccepted_e9_barrier_for_fixture=True,
-        allow_unaccepted_closed_admission_for_fixture=True,
+        cutover_authority_verifier=lambda reference: fixture_cutover_authority(
+            config,
+            reference,
+        ),
         receipt_publication_hook=receipt_publication_hook,
     )
 
@@ -628,8 +722,11 @@ def build_scenario(
         new_usage_kinesis_stream="cats-usage-fresh",
         new_usage_checkpoint_table="cats-usage-checkpoints-fresh",
         new_usage_archive_bucket="cats-usage-archive-fresh-fixture",
-        post_green_evidence_file=evidence,
         receipt_directory=receipts,
+        cutover_proof_directory=root / "unused-proof-directory",
+        production_cutover_operator_trust_file=root / "unused-cutover-trust.json",
+        fresh_usage_postgres_ca_file=root / "unused-usage-ca.pem",
+        legacy_fixture_post_green_evidence_file=evidence,
     )
     if lost_effect is None:
         runner: FakeRunner = FakeRunner(
@@ -885,37 +982,120 @@ def assert_unaccepted_proofs_block_execute(parent: Path) -> None:
     )
     cases = [
         (
-            "E13",
-            {},
+            "production cutover proof",
+            None,
         ),
         (
-            "E9",
-            {"allow_unaccepted_e13_proof_for_fixture": True},
-        ),
-        (
-            "Closed route/mutation",
-            {
-                "allow_unaccepted_e13_proof_for_fixture": True,
-                "allow_unaccepted_e9_barrier_for_fixture": True,
-            },
+            "cutover authority projection",
+            lambda _reference: {},
         ),
     ]
-    for label, overrides in cases:
+    for label, verifier in cases:
         runner = FakeRunner(
             config.aws_account_id, config.aws_region, config.eks_cluster_name
         )
-        executor = reset.ResetExecutor(config, runner, now=FIXTURE_NOW, **overrides)
+        executor = reset.ResetExecutor(
+            config,
+            runner,
+            now=FIXTURE_NOW,
+            cutover_authority_verifier=verifier,
+        )
         try:
             executor.apply(plan_path, plan_digest, config.reset_id, execute=True)
         except reset.ResetError as error:
             if label not in str(error):
                 raise
         else:
-            raise AssertionError(f"unaccepted {label} proof did not mechanically block")
+            raise AssertionError(f"unaccepted {label} did not mechanically block")
         if runner.calls or mutation_counts(runner) != (0, 0, 0, 0, ()):
             raise AssertionError(
                 f"random digest crossed AWS/PostgreSQL boundary before {label} block"
             )
+
+
+def assert_cutover_authority_ordering_and_replay(parent: Path) -> None:
+    config, runner, _executor, plan_path, plan_digest = build_scenario(
+        parent,
+        "cutover-authority-order-0001",
+    )
+    projection = fixture_cutover_authority(config, FIXTURE_NOW)
+    verification_calls: list[dt.datetime] = []
+
+    def exact_verifier(reference: dt.datetime) -> dict[str, object]:
+        verification_calls.append(reference)
+        # Model a deterministic Rust verification receipt replay, rather than
+        # returning shared mutable fixture state.
+        return json.loads(json.dumps(projection))
+
+    original_write_receipt = reset.write_receipt
+
+    def crash_before_reset_started(
+        directory: Path,
+        reset_id: str,
+        stage: str,
+        value: dict[str, object],
+    ) -> tuple[Path, str]:
+        if stage == "reset-started":
+            raise reset.ResetError(
+                "simulated crash after schema verification before reset-started"
+            )
+        return original_write_receipt(directory, reset_id, stage, value)
+
+    runner.calls.clear()
+    reset.write_receipt = crash_before_reset_started
+    try:
+        try:
+            reset.ResetExecutor(
+                config,
+                runner,
+                now=FIXTURE_NOW,
+                cutover_authority_verifier=exact_verifier,
+            ).apply(plan_path, plan_digest, config.reset_id, execute=True)
+        except reset.ResetError as error:
+            if "after schema verification before reset-started" not in str(error):
+                raise
+        else:
+            raise AssertionError("pre-reset-started verification crash did not stop")
+    finally:
+        reset.write_receipt = original_write_receipt
+    if mutation_counts(runner) != (0, 0, 0, 0, ()):
+        raise AssertionError("schema verification crash crossed the mutation boundary")
+    if reset.read_stage_receipt(
+        config.receipt_directory,
+        config.reset_id,
+        "reset-started",
+    ) is not None:
+        raise AssertionError("pre-publication crash manufactured reset-started authority")
+    if len(verification_calls) != 2:
+        raise AssertionError(
+            "proof/schema authority was not checked in preflight and at the boundary"
+        )
+
+    verification_calls.clear()
+    final_path, final_digest = reset.ResetExecutor(
+        config,
+        runner,
+        now=FIXTURE_NOW,
+        cutover_authority_verifier=exact_verifier,
+    ).apply(plan_path, plan_digest, config.reset_id, execute=True)
+    if len(verification_calls) != 2:
+        raise AssertionError("exact proof/schema receipt replay was not revalidated")
+    before = mutation_counts(runner)
+    verification_calls.clear()
+    replay_path, replay_digest = reset.ResetExecutor(
+        config,
+        runner,
+        now=FIXTURE_NOW + dt.timedelta(days=2),
+        cutover_authority_verifier=exact_verifier,
+    ).apply(plan_path, plan_digest, config.reset_id, execute=True)
+    if (replay_path, replay_digest) != (final_path, final_digest):
+        raise AssertionError("completed reset exact replay changed its receipt")
+    if mutation_counts(runner) != before:
+        raise AssertionError("completed reset exact replay repeated a mutation")
+    if verification_calls != [FIXTURE_NOW]:
+        raise AssertionError(
+            "forward replay did not bind proof verification to reset-started time"
+        )
 
 
 def assert_binding_failures(parent: Path) -> None:
@@ -934,6 +1114,24 @@ def assert_binding_failures(parent: Path) -> None:
             raise AssertionError(f"wrong {label} binding was accepted")
     if mutation_counts(runner) != (0, 0, 0, 0, ()):
         raise AssertionError("a wrong plan/reset binding crossed the mutation boundary")
+
+    boolean_version_plan = plan_path.with_name("boolean-version-plan.json")
+    boolean_version = json.loads(plan_path.read_text())
+    boolean_version["version"] = True
+    boolean_version_plan.write_bytes(reset.canonical_bytes(boolean_version))
+    try:
+        executor.apply(
+            boolean_version_plan,
+            reset.sha256_bytes(boolean_version_plan.read_bytes()),
+            config.reset_id,
+            execute=True,
+        )
+    except reset.ResetError:
+        pass
+    else:
+        raise AssertionError("JSON boolean was accepted as reset plan version 1")
+    if mutation_counts(runner) != (0, 0, 0, 0, ()):
+        raise AssertionError("boolean plan version crossed the mutation boundary")
 
     original_write_receipt = reset.write_receipt
     crashed = False
@@ -962,9 +1160,13 @@ def assert_binding_failures(parent: Path) -> None:
     finally:
         reset.write_receipt = original_write_receipt
     before = mutation_counts(runner)
-    evidence_value = json.loads(config.post_green_evidence_file.read_text())
+    evidence_value = json.loads(
+        config.legacy_fixture_post_green_evidence_file.read_text()
+    )
     evidence_value["qualification_manifest_sha256"] = "c" * 64
-    config.post_green_evidence_file.write_text(json.dumps(evidence_value) + "\n")
+    config.legacy_fixture_post_green_evidence_file.write_text(
+        json.dumps(evidence_value) + "\n"
+    )
     try:
         fixture_executor(config, runner).apply(
             plan_path, plan_digest, config.reset_id, execute=True
@@ -1129,9 +1331,13 @@ def assert_binding_failures(parent: Path) -> None:
     stale_config, stale_runner, _executor, _plan, _digest = build_scenario(
         parent, "cutover-stale-0001"
     )
-    stale_value = json.loads(stale_config.post_green_evidence_file.read_text())
+    stale_value = json.loads(
+        stale_config.legacy_fixture_post_green_evidence_file.read_text()
+    )
     stale_value["observed_at"] = "2026-08-12T23:44:59Z"
-    stale_config.post_green_evidence_file.write_text(json.dumps(stale_value) + "\n")
+    stale_config.legacy_fixture_post_green_evidence_file.write_text(
+        json.dumps(stale_value) + "\n"
+    )
     try:
         fixture_executor(stale_config, stale_runner).plan()
     except reset.ResetError as error:
@@ -1143,9 +1349,13 @@ def assert_binding_failures(parent: Path) -> None:
     wrong_id_config, wrong_id_runner, _executor, _plan, _digest = build_scenario(
         parent, "cutover-evidence-id-0001"
     )
-    wrong_id_value = json.loads(wrong_id_config.post_green_evidence_file.read_text())
+    wrong_id_value = json.loads(
+        wrong_id_config.legacy_fixture_post_green_evidence_file.read_text()
+    )
     wrong_id_value["reset_id"] = "cutover-evidence-id-wrong"
-    wrong_id_config.post_green_evidence_file.write_text(json.dumps(wrong_id_value) + "\n")
+    wrong_id_config.legacy_fixture_post_green_evidence_file.write_text(
+        json.dumps(wrong_id_value) + "\n"
+    )
     try:
         fixture_executor(wrong_id_config, wrong_id_runner).plan()
     except reset.ResetError as error:
@@ -1265,8 +1475,13 @@ def main() -> int:
                 new_usage_kinesis_stream="cats-usage-fresh",
                 new_usage_checkpoint_table="cats-usage-checkpoints-fresh",
                 new_usage_archive_bucket="cats-usage-archive-fresh-fixture",
-                post_green_evidence_file=evidence,
                 receipt_directory=receipts,
+                cutover_proof_directory=root / "unused-proof-directory",
+                production_cutover_operator_trust_file=(
+                    root / "unused-cutover-trust.json"
+                ),
+                fresh_usage_postgres_ca_file=root / "unused-usage-ca.pem",
+                legacy_fixture_post_green_evidence_file=evidence,
             )
             runner = FakeRunner(
                 config.aws_account_id, config.aws_region, config.eks_cluster_name
@@ -1342,10 +1557,10 @@ def main() -> int:
                 ):
                     raise AssertionError("a read/list/delete/abort S3 call lost expected owner")
             plan_value = json.loads(plan_path.read_text())
-            evidence_digest = plan_value["post_green_evidence_sha256"]
+            evidence_digest = plan_value["cutover_authority_sha256"]
             for receipt_path in receipts.glob(f"{config.reset_id}.*.json"):
                 receipt_value = json.loads(receipt_path.read_text())
-                if receipt_value.get("post_green_evidence_sha256") != evidence_digest:
+                if receipt_value.get("cutover_authority_sha256") != evidence_digest:
                     raise AssertionError(
                         f"receipt lost the exact post-green digest: {receipt_path.name}"
                     )
@@ -1395,7 +1610,7 @@ def main() -> int:
                     dataclasses.replace(
                         config,
                         reset_id=public_reset_id,
-                        post_green_evidence_file=public_evidence,
+                        legacy_fixture_post_green_evidence_file=public_evidence,
                     ),
                     public_runner,
                 ).plan()
@@ -1416,11 +1631,11 @@ def main() -> int:
             blocked_runner = FakeRunner(
                 config.aws_account_id, config.aws_region, config.eks_cluster_name
             )
-            blocked_executor = reset.ResetExecutor(
+            blocked_executor = fixture_executor(
                 dataclasses.replace(
                     config,
                     reset_id="cutover-fixture-0002",
-                    post_green_evidence_file=blocked_evidence,
+                    legacy_fixture_post_green_evidence_file=blocked_evidence,
                 ),
                 blocked_runner,
                 now=dt.datetime(2026, 8, 13, 0, 0, tzinfo=dt.timezone.utc),
@@ -1428,7 +1643,7 @@ def main() -> int:
             try:
                 blocked_executor.plan()
             except reset.ResetError as error:
-                if "qualification is not passed" not in str(error):
+                if "fixture cutover evidence binding drifted" not in str(error):
                     raise
             else:
                 raise AssertionError("failed fresh qualification did not block retirement")
@@ -1450,11 +1665,11 @@ def main() -> int:
                     config.eks_cluster_name,
                     replacement,
                 )
-                owner_executor = reset.ResetExecutor(
+                owner_executor = fixture_executor(
                     dataclasses.replace(
                         config,
                         reset_id=owner_reset_id,
-                        post_green_evidence_file=owner_evidence,
+                        legacy_fixture_post_green_evidence_file=owner_evidence,
                     ),
                     owner_runner,
                     now=dt.datetime(2026, 8, 13, 0, 0, tzinfo=dt.timezone.utc),
@@ -1472,6 +1687,7 @@ def main() -> int:
             assert_receipt_publication_recovery(root)
             assert_binding_failures(root)
             assert_unaccepted_proofs_block_execute(root)
+            assert_cutover_authority_ordering_and_replay(root)
 
             print(
                 "clean-slate fixture: paginated versions+markers, multipart abort, "

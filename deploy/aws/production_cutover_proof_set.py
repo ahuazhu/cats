@@ -1049,6 +1049,24 @@ class VerifiedProofSet:
     kernel_nbd_qualification_bundle_sha256: str
     vhost_user_qualification_bundle_sha256: str
 
+    def producer_context(self) -> ProducerContext:
+        return ProducerContext(
+            release_id=self.value["release"]["release_id"],
+            release_commit=self.value["release"]["source_commit_sha"],
+            release_manifest_sha256=self.release_manifest_sha256,
+            worker_bundle_sha256=self.worker_bundle_sha256,
+            usage_schema_verifier_binary_sha256=(
+                self.usage_schema_verifier_binary_sha256
+            ),
+            usage_terminal_verifier_binary_sha256=(
+                self.usage_terminal_verifier_binary_sha256
+            ),
+            qualification_manifest_sha256=self.qualification_manifest_sha256,
+            qualification_catalog_sha256=self.qualification_catalog_sha256,
+            old_targets=self.value["old"],
+            fresh_targets=self.value["fresh"]["targets"],
+        )
+
     def admission_binding(self, reset_complete_receipt_sha256: str) -> dict[str, Any]:
         release = self.value["release"]
         fresh = self.value["fresh"]
