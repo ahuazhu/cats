@@ -14672,13 +14672,7 @@ mod tests {
                             ..
                         }])
                 )),
-                Residue::Symlink | Residue::Hardlink => {
-                    #[cfg(feature = "proposed-node-residue-reclamation")]
-                    assert_eq!(result.unwrap(), InventoryAbsence::Unavailable);
-                    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
-                    result.expect_err("unsafe lineage must remain fail-closed");
-                }
-                Residue::DuplicateEpoch => {
+                Residue::DuplicateEpoch | Residue::Symlink | Residue::Hardlink => {
                     result.expect_err("unsafe or duplicate lineage must remain fail-closed");
                 }
             }
