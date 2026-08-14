@@ -100,10 +100,15 @@ impl RouteV2MachineConfig {
 
     /// Construct the fixed-path successor installer over the exact verifier
     /// used by this listener and by full-inventory ACK observation.
-    pub fn ring_installer(&self) -> RouteGrantV2RingInstaller {
+    pub(crate) fn ring_installer(
+        &self,
+        admission_registry: Arc<AdmissionCellRegistry>,
+    ) -> RouteGrantV2RingInstaller {
+        let emergency_close = Arc::new(move || admission_registry.fail_close_all());
         RouteGrantV2RingInstaller::for_production(
             Arc::clone(&self.verifier),
             Arc::clone(&self.ring_install_serialized),
+            emergency_close,
         )
     }
 
@@ -164,6 +169,9 @@ pub(crate) struct RouteV2MachineListener {
     service: Arc<RouteV2MachineService>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
+    // Composed now so any future accepted delivery transport can only use the
+    // installer that closes this listener's exact admission registry.
+    ring_installer: RouteGrantV2RingInstaller,
 }
 
 impl RouteV2MachineListener {
@@ -171,6 +179,7 @@ impl RouteV2MachineListener {
         config: RouteV2MachineConfig,
         registry: Arc<AdmissionCellRegistry>,
     ) -> anyhow::Result<Self> {
+        let ring_installer = config.ring_installer(Arc::clone(&registry));
         let listener = TcpListener::bind(&config.listen)
             .await
             .with_context(|| format!("bind Node Route v2 machine listener {}", config.listen))?;
@@ -188,11 +197,20 @@ impl RouteV2MachineListener {
             service,
             stop,
             task: Some(task),
+            ring_installer,
         })
     }
 
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    #[allow(
+        dead_code,
+        reason = "G3 core is composed but its accepted delivery transport is still absent"
+    )]
+    pub(crate) fn ring_installer(&self) -> &RouteGrantV2RingInstaller {
+        &self.ring_installer
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -1006,8 +1024,10 @@ mod tests {
             Arc::new(RouteGrantV2Verifier::new(ring)),
         )
         .unwrap();
-        let first = config.ring_installer();
-        let second = config.ring_installer();
+        let registry_root = tempfile::tempdir().unwrap();
+        let registry = AdmissionCellRegistry::new(registry_root.path().join("checkpoints"));
+        let first = config.ring_installer(Arc::clone(&registry));
+        let second = config.ring_installer(registry);
         assert!(first.shares_process_lock_with(&second));
     }
 

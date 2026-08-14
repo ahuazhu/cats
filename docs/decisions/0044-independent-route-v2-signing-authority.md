@@ -33,9 +33,10 @@ provisioner key。这三者都拥有不同 principal、签名 domain、轮换和
 5. rotation 固定为：发布 overlap ring、全部 schedulable Node ACK exact version/digest、切换 active
    signer 并持久化 `last_old_issue_at`、等待最大 TTL 加 clock skew、发布移除 old key 的 ring 并再次
    等 ACK，最后永久 retire old lineage 并删除 old secret。成为 schedulable 也必须 ACK 当前发布 ring。
-6. key 泄漏或 authority 不自洽时先持久 disable signer并停止新签发；reachable Node 关闭 admission，
-   unreachable Host 外部隔离。只有 fresh ring 已安装并 ACK 后才能恢复。删除 public key 本身不终止
-   已存在 stream。
+6. key 泄漏或 authority 不自洽时以一个empty exact-successor ring持久 disable signer并停止新签发；
+   reachable Node durable安装该empty ring时关闭全部admission，unreachable Host外部隔离。只有fresh ring
+   已安装并ACK后才能恢复。单独删除public key本身不终止已存在stream；闭门来自同一installer在ACK前
+   调用既有AdmissionCell registry的fail-close边界。
 
 ## 当前实现边界
 
@@ -45,8 +46,9 @@ production full-inventory 对已安装 public ring 的只读 exact observation�
 不接受该轮 full inventory。PostgreSQL保存immutable exact descriptor/ring revision、current exact projection、
 permanent key/secret-reference lineage与retirement；startup只允许initial install或
 exact replay，不把合法本地successor自动当作rotation authority。Node successor installer在durable rename与
-verifier swap后才ACK；typed writer在singleton lock内完成两轮schedulable full ACK、strict retention、uncordon
-current ACK与emergency disable/fresh activation。该G3 catalog是候选schema 14的唯一delta，并将exact
+verifier swap后才ACK，empty emergency ring还必须先关闭同进程全部gate；typed writer在singleton lock内完成
+两轮schedulable full ACK、strict retention、uncordon current ACK与emergency disable/fresh activation。
+该G3 catalog是候选schema 14的唯一delta，并将exact
 clean-slate authority schema推进为15；它不依赖或预留E9/V3 schema。
 Control现已用固定CA/server artifact组成独立TLS 1.3/HTTP/1.1 machine listener；每次签发在同一shared-lock
 snapshot内同时重验Gateway principal、hostname-derived Workspace、Route/Desired/ring ACK与本进程signer的PG

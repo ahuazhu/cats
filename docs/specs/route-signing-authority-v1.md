@@ -85,7 +85,8 @@ Ed25519 SPKI DER（`302a300506032b6570032100 || raw-32-byte-key`），普通 SHA
 
 revision 1必须`expected_previous=null`；revision N>1必须携带N-1的exact version/digest。gap、rollback、
 same version different digest、错previous、超八把、非严格排序、重复SPKI/kid或kid/SPKI不等都拒绝，旧
-ring继续有效。空ring是合法加载结果但不接受任何Grant；它与artifact unavailable不同。
+ring继续有效。空ring是合法加载结果但不接受任何Grant；它与artifact unavailable不同。revision 1可为空；
+successor空ring只用于§5的持久emergency disable/close步骤。
 
 Node installer必须先在同filesystem temporary file完整验证candidate和expected-previous，再fsync file、
 atomic rename到fixed path并fsync parent，最后才原子swap进程内整环。crash在rename前保留old；rename后restart
@@ -95,6 +96,9 @@ atomic rename到fixed path并fsync parent，最后才原子swap进程内整环�
 unavailable，存在但partial/corrupt/unsafe/读取不稳定时
 整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。successor installer使用同一
 cancellation/publication CAS；只有fixed file完成temp fsync、rename、parent fsync且in-process verifier原子swap后才返回ACK。
+安装或replay空ring还必须在返回ACK前调用同一production composition的`AdmissionCellRegistry::fail_close_all`；
+它关闭新admission并取消现有guard，restart仍按既有规则从Closed开始。后续full inventory以gate Closed、guard归零
+和exact empty-ring observation证明该reachable Node已闭门。
 
 ## 4. Control signer descriptor
 
@@ -176,9 +180,12 @@ resolve只为其同一fresh observation ring中含current active kid的Node签�
 Node可继续接old token；switch后任何回退到old-only artifact的Node立即不可签发。ring version/digest主要是
 rotation/uncordon ACK CAS，不是第二份Endpoint authority。
 
-泄漏或不明状态使用新descriptor revision把`signer.state=disabled`持久化；从该linearization point起所有
-replica停止签发。reachable Node先关闭全部Route admission并drain/fence streams；不可达Host必须provider/BMC
-隔离，不能以TTL或删public key替代。部署fresh key/ring、取得全量ACK并以新revision activate后才重开。
+泄漏或不明状态使用新descriptor revision与一个empty exact-successor ring在同一事务把
+`signer.state=disabled`持久化；从该linearization point起所有replica停止签发。reachable Node通过durable
+installer逐个安装该empty ring，并在ACK前关闭全部Route admission及取消/排空streams；不可达Host必须
+provider/BMC隔离，不能以TTL或仅删public key替代。fresh ring必须是该empty ring的exact successor；每个
+未fence的provisioned Node取得fresh全量ACK且accepted inventory证明全部gate Closed、guard归零后，才允许
+以新revision activate，之后另由既有Desired route-epoch规则重开。
 
 ## 6. Deployment shape
 
@@ -202,5 +209,5 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | separation | A19/A23/V1 keys、shared bearer、header identity均不能构造descriptor、signer或ring ACK |
 | persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
 | rotation | overlap ACK -> switch -> strict >305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK；并发replica只提交一个exact successor，stale retry零写 |
-| revocation | persisted disable先于新签发停止；reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK后才activate；retired lineage是secret删除前提 |
+| revocation | persisted disable+empty successor先于新签发停止；empty-ring installer在ACK前reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK且Closed/guard=0后才activate；retired lineage是secret删除前提 |
 | deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |

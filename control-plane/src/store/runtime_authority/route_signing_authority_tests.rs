@@ -654,21 +654,39 @@ fn emergency_disable_is_immediate_and_reactivation_retires_only_after_fresh_ring
         },
     ));
 
+    let disabled_ring = successor_ring(&overlap_ring, Vec::new());
     let disabled_reference = successor_reference(
         &overlap_reference,
         RouteGrantV2SignerSelection::Disabled,
-        &overlap_ring,
+        &disabled_ring,
     );
     let disable = RouteGrantV2SigningAuthorityCommand {
         successor: disabled_reference.clone(),
-        kind: RouteGrantV2SigningAuthorityCommandKind::Disable,
+        kind: RouteGrantV2SigningAuthorityCommandKind::Disable {
+            successor_ring: disabled_ring.clone(),
+        },
     };
     assert_applied(apply(&store, &disable));
     assert!(!store
         .route_grant_v2_signer_is_current_for_test(initial.binding())
         .unwrap());
+    store
+        .with(|client| {
+            let disabled = client.query_one(
+                "SELECT signer_state, public_key_ring_version,
+                        (SELECT count(*) FROM route_v2_signer_retirements
+                          WHERE state='ring_removed' AND ring_removed_version=3)
+                   FROM route_v2_signing_authority WHERE singleton",
+                &[],
+            )?;
+            assert_eq!(disabled.get::<_, String>(0), "disabled");
+            assert_eq!(disabled.get::<_, i64>(1), 3);
+            assert_eq!(disabled.get::<_, i64>(2), 2);
+            Ok(())
+        })
+        .unwrap();
 
-    let fresh_ring = successor_ring(&overlap_ring, vec![third_entry()]);
+    let fresh_ring = successor_ring(&disabled_ring, vec![third_entry()]);
     let fresh_disabled = successor_reference(
         &disabled_reference,
         RouteGrantV2SignerSelection::Disabled,
@@ -731,7 +749,7 @@ fn emergency_disable_is_immediate_and_reactivation_retires_only_after_fresh_ring
             )?;
             assert_eq!(pointer.get::<_, String>(0), "active");
             assert_eq!(pointer.get::<_, String>(1), third_entry().kid.as_str());
-            assert_eq!(pointer.get::<_, i64>(2), 3);
+            assert_eq!(pointer.get::<_, i64>(2), 4);
             let retired = client
                 .query(
                     "SELECT kid, secret_reference_id

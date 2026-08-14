@@ -55,7 +55,9 @@ pub(crate) enum RouteGrantV2SigningAuthorityCommandKind {
         successor_ring: RouteGrantV2PublicKeyRingArtifact,
     },
     Retire,
-    Disable,
+    Disable {
+        successor_ring: RouteGrantV2PublicKeyRingArtifact,
+    },
     Activate,
 }
 
@@ -218,7 +220,8 @@ fn validate_command(command: &RouteGrantV2SigningAuthorityCommand) -> Result<()>
         .ok_or_else(|| ApiError::invalid("Route v2 signing authority command is invalid"))?;
     match &command.kind {
         RouteGrantV2SigningAuthorityCommandKind::PublishOverlap { successor_ring, .. }
-        | RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { successor_ring } => {
+        | RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { successor_ring }
+        | RouteGrantV2SigningAuthorityCommandKind::Disable { successor_ring } => {
             command
                 .successor
                 .validate_ring(successor_ring)
@@ -442,12 +445,13 @@ fn apply_command_in(
             &command.successor,
             committed_at,
         )?,
-        RouteGrantV2SigningAuthorityCommandKind::Disable => disable_in(
+        RouteGrantV2SigningAuthorityCommandKind::Disable { successor_ring } => disable_in(
             transaction,
             &pointer,
             &current,
             current_ring,
             &command.successor,
+            successor_ring,
             committed_at,
         )?,
         RouteGrantV2SigningAuthorityCommandKind::Activate => activate_in(
@@ -719,14 +723,15 @@ fn disable_in(
     current: &RouteGrantV2SignerBinding,
     current_ring: &RouteGrantV2PublicKeyRingArtifact,
     successor: &RouteGrantV2SignerReference,
+    successor_ring: &RouteGrantV2PublicKeyRingArtifact,
     committed_at: UnixMillis,
 ) -> AuthorityTxResult<Option<RouteGrantV2SigningAuthorityCommandResult>> {
     let RouteGrantV2SignerSelection::Active { .. } = &current.reference.signer else {
         return Ok(None);
     };
     if successor.signer != RouteGrantV2SignerSelection::Disabled
-        || successor.public_key_ring_version != current_ring.ring_version
-        || successor.public_key_ring_digest != current_ring.digest().map_err(corrupt)?
+        || !successor_ring.keys.is_empty()
+        || !ring_is_exact_successor(current_ring, successor_ring)
     {
         return Ok(None);
     }
@@ -750,6 +755,12 @@ fn disable_in(
         }
     }
     insert_signer_revision(transaction, successor, committed_at)?;
+    insert_ring_revision(
+        transaction,
+        &pointer.deployment_id,
+        successor_ring,
+        committed_at,
+    )?;
     update_pointer(transaction, successor)?;
     for (kid, secret_reference_id) in new_retirements {
         insert_retirement(
@@ -762,6 +773,11 @@ fn disable_in(
             "emergency",
         )?;
     }
+    mark_all_pending_retirements_ring_removed(
+        transaction,
+        &pointer.deployment_id,
+        successor_ring.ring_version,
+    )?;
     Ok(Some(applied(successor)))
 }
 

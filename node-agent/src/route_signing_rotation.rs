@@ -109,6 +109,7 @@ pub struct RouteGrantV2RingInstaller {
     verifier: Arc<RouteGrantV2Verifier>,
     filesystem: RingFilesystem,
     serialized: Arc<Mutex<()>>,
+    emergency_close: Arc<dyn Fn() + Send + Sync>,
     #[cfg(test)]
     crash_after_rename: AtomicBool,
     #[cfg(test)]
@@ -129,11 +130,13 @@ impl RouteGrantV2RingInstaller {
     pub(crate) fn for_production(
         verifier: Arc<RouteGrantV2Verifier>,
         serialized: Arc<Mutex<()>>,
+        emergency_close: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         Self {
             verifier,
             filesystem: RingFilesystem::production(),
             serialized,
+            emergency_close,
             #[cfg(test)]
             crash_after_rename: AtomicBool::new(false),
             #[cfg(test)]
@@ -172,14 +175,19 @@ impl RouteGrantV2RingInstaller {
         if current_file.exact_bytes == candidate_bytes {
             if same_ring(&verifier, &candidate_ring) {
                 context.begin_publication()?;
-                return Ok(RouteGrantV2DurableInstallOutcome::Replay);
+                return Ok(
+                    self.finish_install(&candidate, RouteGrantV2DurableInstallOutcome::Replay)
+                );
             }
             if !same_ring(&verifier, &current_ring) && exact_predecessor(&candidate, &verifier) {
                 context.begin_publication()?;
                 self.verifier
                     .replace_artifact(&candidate)
                     .map_err(map_verifier_error)?;
-                return Ok(RouteGrantV2DurableInstallOutcome::RecoveredAfterDurableRename);
+                return Ok(self.finish_install(
+                    &candidate,
+                    RouteGrantV2DurableInstallOutcome::RecoveredAfterDurableRename,
+                ));
             }
             return Err(RouteGrantV2DurableInstallError::VerifierDiverged);
         }
@@ -208,12 +216,27 @@ impl RouteGrantV2RingInstaller {
         self.verifier
             .replace_artifact(&candidate)
             .map_err(map_verifier_error)?;
-        Ok(RouteGrantV2DurableInstallOutcome::Installed)
+        Ok(self.finish_install(&candidate, RouteGrantV2DurableInstallOutcome::Installed))
+    }
+
+    /// Empty rings are the accepted emergency-disable verifier artifact. The
+    /// installer cannot ACK one until every process-local Route gate has been
+    /// fail-closed; active guards then drain through their existing
+    /// cancellation edge and are proven by the next full inventory.
+    fn finish_install(
+        &self,
+        candidate: &RouteGrantV2PublicKeyRingArtifact,
+        outcome: RouteGrantV2DurableInstallOutcome,
+    ) -> RouteGrantV2DurableInstallOutcome {
+        if candidate.keys.is_empty() {
+            (self.emergency_close)();
+        }
+        outcome
     }
 
     #[cfg(test)]
     fn for_test(root: &Path, verifier: Arc<RouteGrantV2Verifier>) -> Self {
-        Self::for_test_with_serialized(root, verifier, Arc::new(Mutex::new(())))
+        Self::for_test_with_parts(root, verifier, Arc::new(Mutex::new(())), Arc::new(|| {}))
     }
 
     #[cfg(test)]
@@ -221,6 +244,25 @@ impl RouteGrantV2RingInstaller {
         root: &Path,
         verifier: Arc<RouteGrantV2Verifier>,
         serialized: Arc<Mutex<()>>,
+    ) -> Self {
+        Self::for_test_with_parts(root, verifier, serialized, Arc::new(|| {}))
+    }
+
+    #[cfg(test)]
+    fn for_test_with_emergency_close(
+        root: &Path,
+        verifier: Arc<RouteGrantV2Verifier>,
+        emergency_close: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self::for_test_with_parts(root, verifier, Arc::new(Mutex::new(())), emergency_close)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_parts(
+        root: &Path,
+        verifier: Arc<RouteGrantV2Verifier>,
+        serialized: Arc<Mutex<()>>,
+        emergency_close: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         // SAFETY: geteuid/getegid have no pointer arguments or failure mode.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -232,6 +274,7 @@ impl RouteGrantV2RingInstaller {
                 owner: Owner { uid, gid },
             },
             serialized,
+            emergency_close,
             crash_after_rename: AtomicBool::new(false),
             pre_publication_gate: Mutex::new(None),
         }
@@ -818,6 +861,7 @@ impl PrePublicationGate {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::AtomicUsize;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
@@ -954,6 +998,47 @@ mod tests {
             verifier.current_ring().unwrap().version(),
             second.ring_version
         );
+    }
+
+    #[test]
+    fn empty_successor_closes_admission_before_ack_and_on_replay() {
+        let (first, _) = rings();
+        let empty = RouteGrantV2PublicKeyRingArtifact {
+            version: ContractVersion::V1,
+            ring_version: Epoch::new(2).unwrap(),
+            expected_previous: Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+                ring_version: first.ring_version,
+                key_ring_digest: first.digest().unwrap(),
+            }),
+            keys: Vec::new(),
+        };
+        let (root, verifier) = fixture(&first);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&closes);
+        let installer = RouteGrantV2RingInstaller::for_test_with_emergency_close(
+            root.path(),
+            Arc::clone(&verifier),
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let bytes = encode_route_grant_v2_public_key_ring(&empty).unwrap();
+        assert_eq!(
+            installer
+                .install(&bytes, &RouteGrantV2RingInstallContext::default())
+                .unwrap(),
+            RouteGrantV2DurableInstallOutcome::Installed
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert!(verifier.current_ring().unwrap().loaded_kids().is_empty());
+
+        assert_eq!(
+            installer
+                .install(&bytes, &RouteGrantV2RingInstallContext::default())
+                .unwrap(),
+            RouteGrantV2DurableInstallOutcome::Replay
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
     }
 
     #[test]
