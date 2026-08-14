@@ -6707,9 +6707,9 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
         expected: &ServingBlockdExpectation,
         context: &crate::runtime_spine::RuntimeDesiredEffectContext,
     ) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
-        let absence = self
-            .retain_start_socket_absence(expected, context)?
-            .context("fresh full scan did not seal serving socket-owner absence")?;
+        let absence =
+            ServingBlockdProcessGlobalPort::retain_start_socket_absence(self, expected, context)?
+                .context("fresh full scan did not seal serving socket-owner absence")?;
         let current_boot = CurrentBlockdSocketBoot::read()?;
         let root = RetainedManagedBlockdSocketRoot::open_installed()?;
         let intents = BlockdSocketIntentStore::open_existing(context.state_directory().clone())?;

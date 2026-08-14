@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context as _};
+use anyhow::Context as _;
 use cats_api::agent_registration::Ed25519RequestSigner;
 use cats_api::metering::{CatUsageCheckpoint, USAGE_CHECKPOINTS_PATH};
 use cats_api::runtime_reconciliation::{
