@@ -3,13 +3,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const CASES: [&str; 8] = [
+const CASES: [&str; 9] = [
     "control-startup-schema",
     "node-registration-full-inventory",
     "cat-create-running",
     "durable-write-flush",
     "route-http-ws",
     "agent-restart-adoption",
+    "volume-init-matrix",
     "usage-final-terminal-receipt",
     "delete-cleanup",
 ];
@@ -170,12 +171,16 @@ set -euo pipefail
 role=$(basename "$0")
 case "$role" in
   cats)
+    [[ -n ${CATS_TOKEN:-} ]] || exit 65
     case " $* " in
       *" admin fleet-verify "*)
         printf '{"version":1,"release_commit_sha":"%s","snapshot":{"desired_runtime_count":0,"current_runtime_observation_count":0,"nodes":[{"node_id":"node_fixture","inventory":{"complete_inventory":true,"assigned_desired_count":0,"runtime_count":0,"residue_count":0,"lifecycle_open_count":0,"route_active_count":0,"route_closed_count":0,"active_guard_count":0,"cancellation_pending_count":0,"quarantined_condition_count":0}}]}}\n' "$CATS_E3_EXACT_COMMIT"
         ;;
       *" create "*) printf '%s\n' '{"cat_id":"cat_fixture","operation_id":"op_create"}' ;;
       *" get "*) printf '%s\n' '{"id":"cat_fixture","desired":{"target":"running"},"observed":{"stable_state":"running","conditions":["ready"]}}' ;;
+      *" operation wait op_create "*) printf '%s\n' '{"version":1,"operation_id":"op_create","workspace_id":"ws_fixture","target":"running","phase":"succeeded","terminal":{"kind":"succeeded","result":{"observed_target":"running"}}}' ;;
+      *" operation wait op_endpoint "*) printf '%s\n' '{"version":1,"operation_id":"op_endpoint","workspace_id":"ws_fixture","target":"running","phase":"succeeded","terminal":{"kind":"succeeded","result":{"observed_target":"running"}}}' ;;
+      *" operation wait op_delete "*) printf '%s\n' '{"version":1,"operation_id":"op_delete","workspace_id":"ws_fixture","target":"deleted","phase":"succeeded","terminal":{"kind":"succeeded","result":{"observed_target":"deleted"}}}' ;;
       *) exit 64 ;;
     esac
     ;;
@@ -183,14 +188,14 @@ case "$role" in
     output=/dev/null headers= method=GET url= write_out=false
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --output|--dump-header|--request|--header|--proto|--max-time|--write-out|--data-binary)
+        --output|--dump-header|--request|--header|--proto|--max-time|--max-filesize|--write-out|--data-binary)
           [[ $1 == --output ]] && output=$2
           [[ $1 == --dump-header ]] && headers=$2
           [[ $1 == --request ]] && method=$2
           [[ $1 == --write-out ]] && write_out=true
           shift 2
           ;;
-        --fail|--fail-with-body|--silent|--show-error|--tlsv1.2) shift ;;
+        --fail|--silent|--show-error|--tlsv1.2) shift ;;
         https://*) url=$1; shift ;;
         *) exit 64 ;;
       esac
@@ -198,8 +203,15 @@ case "$role" in
     status=200 body='{}'
     case "$url|$method" in
       */healthz*) ;;
-      */operations/op_create*|*/operations/op_endpoint*) body='{"phase":"succeeded","terminal":{"result":{"observed_target":"running"}}}' ;;
-      */operations/op_delete*) body='{"phase":"succeeded","terminal":{"result":{"observed_target":"deleted"}}}' ;;
+      */billing/usage*'|GET')
+        if [[ -f "$CATS_E3_FIXTURE_USAGE_STATE" ]]; then
+          usage_sequence=2
+        else
+          usage_sequence=1
+          : >"$CATS_E3_FIXTURE_USAGE_STATE"
+        fi
+        body=$(printf '{"workspace_id":"ws_fixture","status":"provisional","latest_interval_end_unix_ms":2000,"details":[{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"cpu_usec","quantity":"1","unit":"microsecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"33333333333333333333333333333333","end_sequence":%s},{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"memory_byte_millis","quantity":"1024","unit":"byte_millisecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"33333333333333333333333333333333","end_sequence":%s}]}' "$usage_sequence" "$usage_sequence")
+        ;;
       */endpoints*'|POST') status=202; body='{"desired_revision":2,"operation_id":"op_endpoint"}' ;;
       */cats/cat_fixture*'|DELETE') status=202; body='{"desired_revision":3,"operation_id":"op_delete"}' ;;
       *) exit 64 ;;
@@ -209,7 +221,74 @@ case "$role" in
     [[ $write_out == false ]] || printf '%s' "$status"
     ;;
   journalctl) printf '%s\n' 'fixture journal is bounded and nonsecret' ;;
-  route-g5-http|route-g5-ws|node-agent-tests) exit 0 ;;
+  systemctl)
+    [[ -z ${CATS_TOKEN:-} ]] || exit 65
+    case "$1" in
+      show)
+        if [[ -f "$CATS_E3_FIXTURE_SYSTEMCTL_STATE" ]]; then
+          printf '%032d\n' 2
+        else
+          printf '%032d\n' 1
+        fi
+        ;;
+      restart) : >"$CATS_E3_FIXTURE_SYSTEMCTL_STATE" ;;
+      is-active) exit 0 ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  runtime-e3-probe)
+    [[ -z ${CATS_TOKEN:-} ]] || exit 65
+    case "$1" in
+      guest-sync)
+        run_id=
+        while [[ $# -gt 0 ]]; do
+          [[ $1 == --run-id ]] && { run_id=$2; break; }
+          shift
+        done
+        printf '{"version":1,"cat_id":"cat_fixture","run_id":"%s","marker_path":"/var/lib/cats-e3/%s","before_remote_generation":1,"after_remote_generation":2,"after_remote_head":{"generation":2},"strict_flush_remote_durable":true}\n' "$run_id" "$run_id"
+        ;;
+      snapshot)
+        printf '%s\n' '{"version":1,"cat_id":"cat_fixture","runtime_incarnation":"11111111111111111111111111111111","guest_boot_id":"22222222222222222222222222222222","vmm_scope_id":"cats-fixture.scope","root_volume_id":"vol_fixture","root_attachment_id":"att_fixture","root_attachment_epoch":1,"root_remote_head":{"generation":2},"root_remote_generation":2,"strict_remote_durable":true}'
+        ;;
+      install-workload)
+        workload_sha256=
+        while [[ $# -gt 0 ]]; do
+          [[ $1 == --workload-sha256 ]] && { workload_sha256=$2; break; }
+          shift
+        done
+        printf '{"version":1,"cat_id":"cat_fixture","run_id":"v2-fixture-run","unit":"cats-e3-v2-fixture-run","path":"/run/cats/cats-e3-v2-fixture-run","port":8080,"workload_sha256":"%s","installed":true}\n' "$workload_sha256"
+        ;;
+      remove-workload)
+        printf '%s\n' '{"version":1,"cat_id":"cat_fixture","run_id":"v2-fixture-run","removed":true}'
+        ;;
+      public-route)
+        printf '%s\n' '{"version":1,"origin":"https://e3.fixture.test","run_id":"v2-fixture-run","http_guest_body":true,"websocket_guest_echo":true}'
+        ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  route-g5-http)
+    [[ -z ${CATS_TOKEN:-} ]] || exit 65
+    if [[ " $* " == *" --list "* ]]; then
+      printf '%s\n' 'public_http_bytes_cross_one_route_lookup_and_one_node_tunnel: test'
+    fi
+    ;;
+  route-g5-ws)
+    [[ -z ${CATS_TOKEN:-} ]] || exit 65
+    if [[ " $* " == *" --list "* ]]; then
+      printf '%s\n' 'websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel: test'
+    fi
+    ;;
+  node-agent-tests)
+    [[ -z ${CATS_TOKEN:-} ]] || exit 65
+    if [[ " $* " == *" --list "* ]]; then
+      printf '%s\n' \
+        'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test' \
+        'runtime::reconciliation::clean_slate_probes::tests::full_scanner_seals_exact_root_and_persistent_kernel_nbd_mount_set: test' \
+        'runtime::reconciliation::clean_slate_probes::tests::full_scanner_seals_exact_root_and_persistent_vhost_mount_set: test'
+    fi
+    ;;
+  e3-guest-workload) exit 0 ;;
   *) exit 64 ;;
 esac
 "#;
@@ -220,6 +299,9 @@ esac
             "route-g5-http",
             "route-g5-ws",
             "node-agent-tests",
+            "runtime-e3-probe",
+            "e3-guest-workload",
+            "systemctl",
         ];
         let mut binaries = Vec::new();
         for label in labels {
@@ -275,6 +357,14 @@ esac
             .env("CATS_E3_ENDPOINT_NAME", "e3-web")
             .env("CATS_E3_ENDPOINT_HOSTNAME", "e3.fixture.test")
             .env("CATS_E3_NODE_SERVICE", "cats-noded.service")
+            .env(
+                "CATS_E3_FIXTURE_SYSTEMCTL_STATE",
+                self._temp.path().join("systemctl-restarted"),
+            )
+            .env(
+                "CATS_E3_FIXTURE_USAGE_STATE",
+                self._temp.path().join("usage-progressed"),
+            )
             .current_dir(&self.root);
         command.output().expect("run production v2 driver fixture")
     }
@@ -372,6 +462,7 @@ fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
         "manifest.json",
         "scenario-results.jsonl",
         "component-journal-summary.txt",
+        "case-receipts.jsonl",
         "final-inventory.json",
         "exit-code",
         "SHA256SUMS",
@@ -437,7 +528,7 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
     let output = fixture.run_v2_driver(&output_dir);
     assert!(
         !output.status.success(),
-        "E9 and live Guest/route must stay blocked"
+        "E9 must remain explicitly blocked"
     );
 
     let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
@@ -448,7 +539,10 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
         "control-startup-schema",
         "node-registration-full-inventory",
         "cat-create-running",
+        "durable-write-flush",
+        "route-http-ws",
         "agent-restart-adoption",
+        "volume-init-matrix",
         "delete-cleanup",
     ] {
         assert!(results.lines().any(|line| {
@@ -456,11 +550,7 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
                 && line.contains("\"status\":\"passed\"")
         }));
     }
-    for blocked in [
-        "durable-write-flush",
-        "route-http-ws",
-        "usage-final-terminal-receipt",
-    ] {
+    for blocked in ["usage-final-terminal-receipt"] {
         assert!(results.lines().any(|line| {
             line.contains(&format!("\"case_id\":\"{blocked}\""))
                 && line.contains("\"status\":\"blocked\"")
@@ -472,4 +562,10 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
     assert!(journal.contains("BLOCKED_RECEIPT"));
     assert!(journal.contains("FOCUSED_RECEIPT"));
     assert!(!journal.contains("fixture-token"));
+    let receipts = fs::read_to_string(output_dir.join("case-receipts.jsonl")).unwrap();
+    assert!(receipts.contains("\"receipt_name\":\"public-route-receipt.json\""));
+    assert!(receipts.contains("\"receipt_name\":\"volume-init-matrix-receipt.json\""));
+    assert!(receipts.contains("\"receipt_name\":\"usage-live-delivery-receipt.json\""));
+    assert!(receipts.contains("\"receipt_name\":\"blocked-receipt.json\""));
+    assert!(!receipts.contains("fixture-token"));
 }

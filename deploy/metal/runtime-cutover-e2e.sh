@@ -84,6 +84,15 @@ for command_name in git jq python3 sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
 
+# The scenario driver may execute only binaries/configs named by this exact
+# invocation.  Do not let a caller's ambient environment smuggle an unrecorded
+# executable or config past the manifest-backed --binary/--config boundary.
+while IFS='=' read -r environment_name _; do
+  case "$environment_name" in
+    CATS_E3_BINARY_*|CATS_E3_CONFIG_*) unset "$environment_name" ;;
+  esac
+done < <(env)
+
 script_dir=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$script_dir/../.." && pwd -P)
 filter=$script_dir/runtime-cutover-evidence-filter.py
@@ -141,7 +150,8 @@ jq -e --arg commit "$exact_commit" \
   '.version == 1 and .source.commit == $commit' \
   "$release_manifest" >/dev/null || fail "release manifest does not bind the exact commit"
 
-schema_version=$(sed -nE 's/^pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' "$repo/storage/src/authority.rs")
+schema_version=$(git -C "$repo" show "${exact_commit}:storage/src/authority.rs" |
+  sed -nE 's/^pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p')
 [[ $schema_version =~ ^[1-9][0-9]*$ ]] || fail "exact source does not expose one authority schema version"
 
 timeout_bin=${CATS_E3_TIMEOUT_BIN:-}
@@ -151,6 +161,7 @@ fi
 [[ -n $timeout_bin ]] || fail "GNU timeout is required on the qualification host"
 timeout_bin=$(canonical_existing "$timeout_bin") || fail "timeout command must be an absolute non-symlink executable"
 [[ -x $timeout_bin && -f $timeout_bin ]] || fail "timeout command is not executable"
+timeout_bin_sha256=$(sha256sum "$timeout_bin" | awk '{print $1}')
 
 mkdir -m 0700 "$output_dir"
 scratch=$output_dir/.scratch
@@ -161,12 +172,14 @@ catalog_work=$scratch/scenario-catalog.jsonl
 binaries_work=$scratch/binaries.jsonl
 configs_work=$scratch/configs.jsonl
 fingerprints_work=$scratch/key-fingerprints.jsonl
+receipts_work=$scratch/case-receipts.jsonl
 : >"$results_work"
 : >"$journal_work"
 : >"$catalog_work"
 : >"$binaries_work"
 : >"$configs_work"
 : >"$fingerprints_work"
+: >"$receipts_work"
 
 atomic_copy() {
   local source=$1 destination=$2 temporary
@@ -213,6 +226,8 @@ record_hashed_entries() {
     if [[ $kind == binary ]]; then
       printf -v "CATS_E3_BINARY_${environment_label}" '%s' "$canonical"
       export "CATS_E3_BINARY_${environment_label}"
+      printf -v "CATS_E3_BINARY_${environment_label}_SHA256" '%s' "$digest"
+      export "CATS_E3_BINARY_${environment_label}_SHA256"
     else
       printf -v "CATS_E3_CONFIG_${environment_label}" '%s' "$canonical"
       export "CATS_E3_CONFIG_${environment_label}"
@@ -238,10 +253,11 @@ case_ids=(
   durable-write-flush
   route-http-ws
   agent-restart-adoption
+  volume-init-matrix
   usage-final-terminal-receipt
   delete-cleanup
 )
-case_deadlines=(120 180 600 300 300 600 300 600)
+case_deadlines=(120 180 600 300 300 600 900 300 600)
 case_postconditions=(
   'exact schema starts and rejects every other schema'
   'current AgentSession owns one complete full-inventory attestation with gates Closed'
@@ -249,7 +265,8 @@ case_postconditions=(
   'Guest write and successful FLUSH reach the selected durability postcondition'
   'HTTP and WebSocket traverse Gateway, Control resolve, Node guard and Guest'
   'Agent restart adopts exact runtime and retained pending data without gate resurrection'
-  'Final usage is durably archived, projected and acknowledged before teardown'
+  'selected block path proves first initialization, crash recovery, exact ext4 identity, remount readiness and Strict FLUSH'
+  'live sampler, durable spool and signed ingest ACK are proven; terminal archive/projector receipt remains explicit Blocked'
   'delete reaches exact physical cleanup with no residue or writer'
 )
 
@@ -287,6 +304,8 @@ write_manifest() {
     --arg release_manifest_sha256 "$release_manifest_sha256" \
     --arg scenario_driver "$scenario_driver" \
     --arg scenario_driver_sha256 "$scenario_driver_sha256" \
+    --arg timeout_binary "$timeout_bin" \
+    --arg timeout_binary_sha256 "$timeout_bin_sha256" \
     --arg scenario_catalog_sha256 "$scenario_catalog_sha256" \
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
     --argjson ended_at_unix_seconds "$ended" \
@@ -295,7 +314,7 @@ write_manifest() {
     --slurpfile configs "$configs_work" \
     --slurpfile key_fingerprints "$fingerprints_work" \
     --slurpfile scenarios "$catalog_work" \
-    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
+    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
     >"$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$output_dir/manifest.json"
@@ -304,6 +323,7 @@ write_manifest() {
 write_manifest running -1 0
 atomic_copy "$results_work" scenario-results.jsonl
 atomic_copy "$journal_work" component-journal-summary.txt
+atomic_copy "$receipts_work" case-receipts.jsonl
 
 export CATS_E3_EXACT_COMMIT=$exact_commit
 export CATS_E3_BLOCK_PATH=$block_path
@@ -347,6 +367,32 @@ append_summary() {
   atomic_copy "$journal_work" component-journal-summary.txt
 }
 
+persist_case_receipts() {
+  local case_id=$1 case_dir=$2 receipt filename filtered entry
+  local receipts=()
+  shopt -s nullglob
+  receipts=("$case_dir"/*-receipt.json)
+  shopt -u nullglob
+  for receipt in "${receipts[@]}"; do
+    filename=${receipt##*/}
+    filtered=$(mktemp "$scratch/.case-receipt.XXXXXX")
+    if ! "$filter" --mode inventory --max-bytes 1048576 <"$receipt" >"$filtered"; then
+      rm -f "$filtered"
+      return 125
+    fi
+    entry=$(mktemp "$scratch/.case-receipt-entry.XXXXXX")
+    if ! jq -S -c -n --arg case_id "$case_id" --arg receipt_name "$filename" \
+      --slurpfile receipt "$filtered" \
+      '{case_id:$case_id,receipt_name:$receipt_name,receipt:$receipt[0]}' >"$entry"; then
+      rm -f "$filtered" "$entry"
+      return 125
+    fi
+    cat "$entry" >>"$receipts_work"
+    rm -f "$filtered" "$entry"
+  done
+  atomic_copy "$receipts_work" case-receipts.jsonl
+}
+
 failed_cases=0
 for index in "${!case_ids[@]}"; do
   case_id=${case_ids[$index]}
@@ -382,13 +428,21 @@ for index in "${!case_ids[@]}"; do
   fi
   append_summary "$case_id" cleanup "$cleanup_summary"
 
+  if persist_case_receipts "$case_id" "$case_dir"; then
+    evidence_code=0
+  else
+    evidence_code=$?
+  fi
+
   case_ended=$(date +%s)
   status=passed
-  if [[ $run_code -ne 0 || $cleanup_code -ne 0 ]]; then
+  if [[ $run_code -ne 0 || $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
     status=failed
     failed_cases=$((failed_cases + 1))
   fi
-  if [[ $run_code -eq 124 ]]; then
+  if [[ $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
+    status=failed
+  elif [[ $run_code -eq 124 ]]; then
     status=timed_out
   elif [[ $run_code -eq 78 ]]; then
     status=blocked
@@ -403,14 +457,15 @@ for index in "${!case_ids[@]}"; do
     --argjson run_exit_code "$run_code" \
     --argjson diagnostic_exit_code "$diagnostic_code" \
     --argjson cleanup_exit_code "$cleanup_code" \
-    '{case_id:$case_id,status:$status,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code}' \
+    --argjson evidence_exit_code "$evidence_code" \
+    '{case_id:$case_id,status:$status,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,evidence_exit_code:$evidence_exit_code}' \
     >>"$results_work"
   atomic_copy "$results_work" scenario-results.jsonl
 done
 
 inventory_work=$scratch/final-inventory.json
 set +e
-"$timeout_bin" --signal=TERM --kill-after=5 60 \
+"$timeout_bin" --signal=TERM --kill-after=5 180 \
   "$scenario_driver" inventory final "$block_path" "$scratch" 2>/dev/null \
   | "$filter" --mode inventory --max-bytes 1048576 >"$inventory_work"
 inventory_statuses=("${PIPESTATUS[@]}")
@@ -441,6 +496,7 @@ checksums_tmp=$(mktemp "$output_dir/.SHA256SUMS.XXXXXX")
   cd "$output_dir"
   LC_ALL=C sha256sum \
     component-journal-summary.txt \
+    case-receipts.jsonl \
     exit-code \
     final-inventory.json \
     manifest.json \
