@@ -4,7 +4,9 @@
 //! process that owns object-store write credentials.  Closing an authority
 //! snapshots the maximum accepted sequence and prevents any later acceptance.
 
+use std::fs::File;
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom};
 use std::pin::Pin;
 use std::time::Instant;
 
@@ -15,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::blob::validate_key;
+use crate::image_manifest::IMAGE_MANIFEST_MAX_BYTES;
+
+pub const OBJECT_WRITE_REQUEST_MAX_BYTES: usize = IMAGE_MANIFEST_MAX_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,10 +115,43 @@ pub struct ObjectPutAttempt {
     pub state: ObjectPutState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+pub struct ValidatedObjectWriteSpool {
+    file: File,
+}
+
+impl ValidatedObjectWriteSpool {
+    /// Accept an already descriptor-stable private spool. The gateway streams
+    /// the HTTP body into a mode-0600 temporary file; no whole-object buffer
+    /// crosses this boundary.
+    pub fn from_mode_0600_file(file: File) -> Result<Self, ObjectWriteAuthorityError> {
+        let metadata = file
+            .metadata()
+            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+        let maximum = u64::try_from(OBJECT_WRITE_REQUEST_MAX_BYTES)
+            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+        if !metadata.is_file() || metadata.len() > maximum {
+            return Err(ObjectWriteAuthorityError::InvalidRequest);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o777 != 0o600 {
+                return Err(ObjectWriteAuthorityError::InvalidRequest);
+            }
+        }
+        Ok(Self { file })
+    }
+
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
+#[derive(Debug)]
 pub struct ObjectWriteDownstreamPut {
     pub descriptor: ObjectPutDescriptor,
-    pub body: Vec<u8>,
+    pub spool: ValidatedObjectWriteSpool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,13 +301,41 @@ pub fn object_put_provider_attempt_id(
 }
 
 pub fn validate_downstream_put(
-    request: &ObjectWriteDownstreamPut,
+    request: &mut ObjectWriteDownstreamPut,
+    absolute_deadline: Instant,
 ) -> Result<(), ObjectWriteAuthorityError> {
-    let length =
-        u64::try_from(request.body.len()).map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
-    if request.descriptor.content_length.get() != length
-        || request.descriptor.content_sha256
-            != Sha256Digest::from_bytes(Sha256::digest(&request.body).into())
+    let maximum = u64::try_from(OBJECT_WRITE_REQUEST_MAX_BYTES)
+        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+    let file = &mut request.spool.file;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+    let mut hasher = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if Instant::now() >= absolute_deadline {
+            return Err(ObjectWriteAuthorityError::InvalidRequest);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(
+                u64::try_from(read).map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?,
+            )
+            .ok_or(ObjectWriteAuthorityError::InvalidRequest)?;
+        if observed > maximum {
+            return Err(ObjectWriteAuthorityError::InvalidRequest);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ObjectWriteAuthorityError::InvalidRequest)?;
+    if request.descriptor.content_length.get() != observed
+        || request.descriptor.content_sha256 != Sha256Digest::from_bytes(hasher.finalize().into())
     {
         return Err(ObjectWriteAuthorityError::StaleAttempt);
     }
@@ -445,7 +511,7 @@ pub enum ObjectWriteDownstreamError {
 pub trait ObjectWriteGatewayDownstream: Send + Sync {
     fn put_exact<'a>(
         &'a self,
-        request: &'a ObjectWriteDownstreamPut,
+        request: ObjectWriteDownstreamPut,
         absolute_deadline: Instant,
     ) -> ObjectWriteDownstreamFuture<'a, ObjectWriteDownstreamPutOutcome>;
 
