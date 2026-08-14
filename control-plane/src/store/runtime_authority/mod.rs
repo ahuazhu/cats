@@ -5,6 +5,7 @@ mod covered_commit;
 pub(crate) mod delete_sweeper;
 pub(crate) mod fleet_verification;
 pub(crate) mod gateway_identity;
+pub(crate) mod host_fence_commit;
 pub(crate) mod image_manifest_resolver;
 pub(crate) mod normal_delete;
 pub(crate) mod object_write;
@@ -53,6 +54,9 @@ pub(crate) mod product_tests;
 
 #[cfg(test)]
 mod placement_policy_tests;
+
+#[cfg(test)]
+mod host_fence_commit_tests;
 
 #[cfg(test)]
 mod gateway_identity_tests;

@@ -27,13 +27,15 @@ use cats_api::runtime_reconciliation::{
     VolumeLeaseGrant,
 };
 use cats_storage::authority::{
-    consume_disposable_root_delete, consume_takeover, normal_acquire, release,
-    replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
+    consume_disposable_root_delete, consume_takeover, consume_trusted_takeover_v1, normal_acquire,
+    release, replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
     HostFenceEvent, LastVolumeTransition, NormalAcquireRequest, ReleaseRequest, TakeoverResult,
     VolumeAuthorization, VolumeOwnerBinding, VolumeRecord,
 };
+use cats_storage::trusted_host_fence::TrustedHostFenceEventV1;
 use postgres::Transaction;
 
+use super::host_fence_commit::load_terminal_event_for_update;
 use super::product::{
     persistent_initialization_matches_mount, DiskAdminState, DiskRecord, DiskRole,
     PersistentDiskInitialization,
@@ -130,10 +132,72 @@ struct LockedMutationContext<'transaction, 'connection> {
 struct LockedTakeoverMutation<'transaction, 'connection> {
     transaction: &'transaction mut Transaction<'connection>,
     db_now: UnixMillis,
-    event: HostFenceEvent,
+    event: TakeoverFenceEvent,
     authorization: AuthorizationRecord,
     volume: VolumeRecord,
     owner_binding: VolumeOwnerBinding,
+}
+
+enum TakeoverFenceEvent {
+    Legacy(HostFenceEvent),
+    TrustedTerminalV1(TrustedHostFenceEventV1),
+}
+
+impl TakeoverFenceEvent {
+    fn event_id(&self) -> &Id {
+        match self {
+            Self::Legacy(event) => &event.event_id,
+            Self::TrustedTerminalV1(event) => &event.event_id,
+        }
+    }
+
+    fn node_id(&self) -> &Id {
+        match self {
+            Self::Legacy(event) => &event.node_id,
+            Self::TrustedTerminalV1(event) => &event.binding.node_id,
+        }
+    }
+
+    fn consume(
+        &self,
+        volume: &VolumeRecord,
+        authorization: &AuthorizationRecord,
+        authorization_id: &Id,
+        db_now: UnixMillis,
+    ) -> cats_storage::authority::Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+        match self {
+            Self::Legacy(event) => {
+                consume_takeover(volume, event, authorization, authorization_id, db_now)
+            }
+            Self::TrustedTerminalV1(event) => {
+                consume_trusted_takeover_v1(volume, event, authorization, authorization_id, db_now)
+            }
+        }
+    }
+}
+
+fn load_takeover_fence_event_for_update(
+    transaction: &mut Transaction<'_>,
+    event_id: &Id,
+) -> AuthorityTxResult<Option<TakeoverFenceEvent>> {
+    let Some(row) = transaction.query_opt(
+        "SELECT state FROM host_fence_events WHERE event_id=$1 FOR UPDATE",
+        &[&event_id.as_str()],
+    )?
+    else {
+        return Ok(None);
+    };
+    match row.try_get::<_, String>("state")?.as_str() {
+        "active" | "rejoined" => load_event_for_update(transaction, event_id)?
+            .map(TakeoverFenceEvent::Legacy)
+            .map(Some)
+            .ok_or_else(|| AuthorityError::BackendUnknown.into()),
+        "terminal_v1" => load_terminal_event_for_update(transaction, event_id)?
+            .map(TakeoverFenceEvent::TrustedTerminalV1)
+            .map(Some)
+            .ok_or_else(|| AuthorityError::BackendUnknown.into()),
+        _ => Err(AuthorityError::BackendUnknown.into()),
+    }
 }
 
 struct AuthenticatedNodeTransaction {
@@ -810,7 +874,7 @@ fn execute_takeover(
         }
         return Err(AuthorityError::BackendUnknown.into());
     };
-    let event = load_event_for_update(context.transaction, &event_id)?
+    let event = load_takeover_fence_event_for_update(context.transaction, &event_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
     let authorization = load_takeover_authorization_for_intent_update(
         context.transaction,
@@ -824,7 +888,7 @@ fn execute_takeover(
     let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
         return Err(AuthorityError::BackendUnknown.into());
     };
-    if payload.host_fence_event_id != event.event_id
+    if &payload.host_fence_event_id != event.event_id()
         || !takeover_payload_matches_desired(payload, &context.node_id, &context.desired, &intent)
     {
         return Err(AuthorityError::BackendUnknown.into());
@@ -836,7 +900,7 @@ fn execute_takeover(
         .owner_binding
         .ok_or(AuthorityError::BackendUnknown)?;
     if matches!(authorization.state, AuthorizationState::Unconsumed)
-        && owner_binding.owner_node_id != event.node_id
+        && &owner_binding.owner_node_id != event.node_id()
     {
         return Ok(authorization_rejected(
             authorization_id.clone(),
@@ -861,16 +925,11 @@ fn execute_takeover(
             result
         }
         Ok(None) => {
-            let (updated_volume, updated_authorization, result) = match consume_takeover(
-                &volume,
-                &event,
-                &authorization,
-                authorization_id,
-                context.db_now,
-            ) {
-                Ok(value) => value,
-                Err(error) => return takeover_authority_error(authorization_id, error),
-            };
+            let (updated_volume, updated_authorization, result) =
+                match event.consume(&volume, &authorization, authorization_id, context.db_now) {
+                    Ok(value) => value,
+                    Err(error) => return takeover_authority_error(authorization_id, error),
+                };
             let owner_binding = VolumeOwnerBinding {
                 volume_id: updated_volume.volume_id.clone(),
                 owner_node_id: context.node_id.clone(),
@@ -2065,8 +2124,8 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     // VolumeRecord -> DiskRecord/current Desired.  The Desired was read above
     // only as a NodeIdentity-protected routing fact and is locked/revalidated
     // here after Volume as required by the global DAG.
-    let event =
-        load_event_for_update(transaction, &event_id)?.ok_or(AuthorityError::BackendUnknown)?;
+    let event = load_takeover_fence_event_for_update(transaction, &event_id)?
+        .ok_or(AuthorityError::BackendUnknown)?;
     let authorization = load_takeover_authorization_for_intent_update(
         transaction,
         &request.authorization_id,
@@ -2079,7 +2138,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
         return Err(AuthorityError::BackendUnknown.into());
     };
-    if payload.host_fence_event_id != event.event_id {
+    if &payload.host_fence_event_id != event.event_id() {
         return Err(AuthorityError::BackendUnknown.into());
     }
     if !takeover_payload_matches_current_intent(payload, &node_id, &desired, &intent, request) {
@@ -2093,7 +2152,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         .owner_binding
         .ok_or(AuthorityError::BackendUnknown)?;
     if matches!(authorization.state, AuthorizationState::Unconsumed)
-        && owner_binding.owner_node_id != event.node_id
+        && &owner_binding.owner_node_id != event.node_id()
     {
         return Ok(authorization_rejected(
             request.authorization_id.clone(),
@@ -2158,7 +2217,7 @@ fn consume_locked_takeover(
     };
     let owner_node_id = payload.authorized_node_id.clone();
     let (updated_volume, updated_authorization, result) =
-        match consume_takeover(&volume, &event, &authorization, authorization_id, db_now) {
+        match event.consume(&volume, &authorization, authorization_id, db_now) {
             Ok(result) => result,
             Err(error) => return takeover_authority_error(authorization_id, error),
         };

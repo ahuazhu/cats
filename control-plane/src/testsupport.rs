@@ -1172,6 +1172,12 @@ pub async fn set_runtime_product_read_states_for_test(
                     i64::try_from(desired.desired_revision.get()).expect("test revision fits PG");
                 let placement_epoch = i64::try_from(desired.placement.placement_epoch.get())
                     .expect("test placement epoch fits PG");
+                let expected_head_generation = i64::try_from(owned.head.generation.get())
+                    .expect("test expected head generation fits PG");
+                let expected_head_root_hash =
+                    owned.head.root_hash.as_ref().map(ToString::to_string);
+                let expected_head_root_object_id =
+                    owned.head.root_object_id.as_ref().map(ToString::to_string);
                 let consumed_at = i64::try_from(consumed_receipt.consumed_at.get())
                     .expect("test consumed time fits PG");
                 assert_eq!(
@@ -1180,10 +1186,12 @@ pub async fn set_runtime_product_read_states_for_test(
                             authorization_id, record, kind, authorized_node_id,
                             host_fence_event_id, volume_id, state,
                             desired_revision, placement_epoch, lease_duration_ms,
-                            not_after, consumed_at
+                            expected_head_generation, expected_head_root_hash,
+                            expected_head_root_object_id, not_after, consumed_at
                          ) VALUES (
                             $1, $2::TEXT::jsonb, 'disposable_root_delete', $3,
-                            NULL, $4, 'consumed', $5, $6, NULL, $7, $8
+                            NULL, $4, 'consumed', $5, $6, NULL, $7, $8, $9,
+                            $10, $11
                          )",
                         &[
                             &authorization_id.as_str(),
@@ -1192,6 +1200,9 @@ pub async fn set_runtime_product_read_states_for_test(
                             &root.volume_id.as_str(),
                             &desired_revision,
                             &placement_epoch,
+                            &expected_head_generation,
+                            &expected_head_root_hash,
+                            &expected_head_root_object_id,
                             &50_000_i64,
                             &consumed_at,
                         ],

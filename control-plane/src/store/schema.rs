@@ -689,6 +689,7 @@ const CONTROL_TABLES: &[&str] = &[
     "desired_runtime_specs",
     "hostname_desired_lookups",
     "runtime_operations",
+    "trusted_host_fence_recovery_commits_v1",
     "api_idempotency_results",
     "node_identities",
     "agent_registration_attempts",
@@ -1406,6 +1407,12 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         Some("(state = 'active'::text)"),
     ),
     (
+        "host_fence_events",
+        "runtime_one_terminal_host_fence_event_v1",
+        "provider,host_partition,host_account_id,host_region,immutable_host_id,node_id,expected_node_boot_id,expected_agent_session_epoch",
+        Some("(state = 'terminal_v1'::text)"),
+    ),
+    (
         "runtime_node_credential_lineage",
         "runtime_node_one_active_credential",
         "node_id",
@@ -1940,14 +1947,17 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             transition_placement_epoch, transition_lease_duration_ms,
             owner_binding, owner_node_id
        FROM volume_records WHERE FALSE",
-    "SELECT event_id, record, provider, immutable_host_id, node_id,
+    "SELECT event_id, record, canonical_record, provider, host_partition, host_account_id,
+            host_region, immutable_host_id, node_id,
             expected_node_boot_id, expected_agent_session_epoch,
             fence_attempt_id, isolation_state, observed_at, state,
-            destroyed_at
+            destroyed_at, provider_evidence_sha256, committed_at
        FROM host_fence_events WHERE FALSE",
     "SELECT authorization_id, record, kind, authorized_node_id,
             host_fence_event_id, volume_id,
             state, desired_revision, placement_epoch, lease_duration_ms,
+            expected_head_generation, expected_head_root_hash,
+            expected_head_root_object_id,
             not_after, consumed_at
        FROM volume_authorizations WHERE FALSE",
     "SELECT delete_id, record, kind, disk_id, volume_id, authorization_id,
@@ -1979,6 +1989,11 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             desired_spec_digest, node_id, placement_epoch, target, phase,
             terminal_kind, created_at, updated_at
        FROM runtime_operations WHERE FALSE",
+    "SELECT event_id, event_state, record, canonical_record, request_sha256, old_node_id,
+            old_node_boot_id, old_agent_session_epoch, cat_id,
+            expected_desired_revision, replacement_desired_revision,
+            old_operation_id, recovery_operation_id, committed_at
+       FROM trusted_host_fence_recovery_commits_v1 WHERE FALSE",
     "SELECT authenticated_workspace_id, canonical_route, idempotency_key,
             request_fingerprint, http_status, content_type, response_body,
             created_at
@@ -2392,24 +2407,61 @@ ON volume_records((record->'admin_state'->>'delete_id'));
 CREATE TABLE IF NOT EXISTS host_fence_events (
     event_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    canonical_record BYTEA CHECK (
+        canonical_record IS NULL OR octet_length(canonical_record) BETWEEN 2 AND 4194304
+    ),
     provider TEXT NOT NULL,
+    host_partition TEXT,
+    host_account_id TEXT,
+    host_region TEXT,
     immutable_host_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
     expected_node_boot_id TEXT NOT NULL,
     expected_agent_session_epoch BIGINT NOT NULL CHECK (expected_agent_session_epoch > 0),
     fence_attempt_id TEXT NOT NULL,
-    isolation_state TEXT NOT NULL CHECK (isolation_state IN ('isolated', 'host_destroyed')),
+    isolation_state TEXT NOT NULL CHECK (isolation_state IN (
+        'isolated', 'host_destroyed', 'trusted_provider_evidence_v1'
+    )),
     observed_at BIGINT NOT NULL CHECK (observed_at >= 0),
-    state TEXT NOT NULL CHECK (state IN ('active', 'rejoined')),
+    state TEXT NOT NULL CHECK (state IN ('active', 'rejoined', 'terminal_v1')),
     destroyed_at BIGINT,
+    provider_evidence_sha256 TEXT
+        CHECK (provider_evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    committed_at BIGINT CHECK (committed_at >= 0),
+    UNIQUE (event_id, state),
     CHECK (
-        (isolation_state = 'isolated' AND destroyed_at IS NULL) OR
-        (isolation_state = 'host_destroyed' AND destroyed_at IS NOT NULL)
+        (state IN ('active', 'rejoined')
+            AND host_partition IS NULL
+            AND host_account_id IS NULL
+            AND host_region IS NULL
+            AND provider_evidence_sha256 IS NULL
+            AND committed_at IS NULL
+            AND canonical_record IS NULL
+            AND (
+                (isolation_state = 'isolated' AND destroyed_at IS NULL) OR
+                (isolation_state = 'host_destroyed' AND destroyed_at IS NOT NULL)
+            )) OR
+        (state = 'terminal_v1'
+            AND isolation_state = 'trusted_provider_evidence_v1'
+            AND host_partition IS NOT NULL
+            AND host_account_id IS NOT NULL
+            AND host_region IS NOT NULL
+            AND provider_evidence_sha256 IS NOT NULL
+            AND committed_at IS NOT NULL
+            AND canonical_record IS NOT NULL
+            AND destroyed_at IS NULL)
     ),
-    CHECK (isolation_state <> 'host_destroyed' OR state = 'active')
+    CHECK (isolation_state <> 'host_destroyed' OR state = 'active'),
+    CHECK (state <> 'terminal_v1' OR committed_at >= observed_at)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS runtime_node_one_active_host_fence_event
     ON host_fence_events(node_id) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_one_terminal_host_fence_event_v1
+    ON host_fence_events(
+        provider, host_partition, host_account_id, host_region,
+        immutable_host_id, node_id, expected_node_boot_id,
+        expected_agent_session_epoch
+    ) WHERE state = 'terminal_v1';
 CREATE TABLE IF NOT EXISTS volume_authorizations (
     authorization_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -2421,11 +2473,22 @@ CREATE TABLE IF NOT EXISTS volume_authorizations (
     desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
     placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
     lease_duration_ms BIGINT,
+    expected_head_generation BIGINT NOT NULL CHECK (expected_head_generation >= 0),
+    expected_head_root_hash TEXT,
+    expected_head_root_object_id TEXT,
     not_after BIGINT NOT NULL CHECK (not_after >= 0),
     consumed_at BIGINT,
     CHECK (
         (kind = 'takeover' AND host_fence_event_id IS NOT NULL AND lease_duration_ms > 0) OR
         (kind = 'disposable_root_delete' AND lease_duration_ms IS NULL)
+    ),
+    CHECK (
+        (expected_head_generation = 0
+            AND expected_head_root_hash IS NULL
+            AND expected_head_root_object_id IS NULL) OR
+        (expected_head_generation > 0
+            AND expected_head_root_hash ~ '^sha256:[0-9a-f]{64}$'
+            AND expected_head_root_object_id IS NOT NULL)
     ),
     CHECK ((state = 'consumed') = (consumed_at IS NOT NULL))
 );
@@ -2696,6 +2759,40 @@ ON runtime_operations(
         (record->>'workspace_id') COLLATE \"C\"
     AND operation_id COLLATE \"C\" IS DISTINCT FROM
         (record->>'operation_id') COLLATE \"C\";
+CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_commits_v1 (
+    event_id TEXT PRIMARY KEY,
+    event_state TEXT NOT NULL DEFAULT 'terminal_v1'
+        CHECK (event_state = 'terminal_v1'),
+    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    canonical_record BYTEA NOT NULL
+        CHECK (octet_length(canonical_record) BETWEEN 2 AND 8388608),
+    request_sha256 TEXT NOT NULL
+        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    old_node_id TEXT NOT NULL,
+    old_node_boot_id TEXT NOT NULL,
+    old_agent_session_epoch BIGINT NOT NULL CHECK (old_agent_session_epoch > 0),
+    cat_id TEXT NOT NULL,
+    expected_desired_revision BIGINT NOT NULL CHECK (expected_desired_revision > 0),
+    replacement_desired_revision BIGINT NOT NULL
+        CHECK (replacement_desired_revision > expected_desired_revision),
+    old_operation_id TEXT NOT NULL UNIQUE,
+    recovery_operation_id TEXT NOT NULL UNIQUE,
+    committed_at BIGINT NOT NULL CHECK (committed_at >= 0),
+    UNIQUE (cat_id, expected_desired_revision),
+    UNIQUE (cat_id, replacement_desired_revision),
+    FOREIGN KEY (event_id, event_state)
+        REFERENCES host_fence_events(event_id, state)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (cat_id)
+        REFERENCES desired_runtime_specs(cat_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (old_operation_id)
+        REFERENCES runtime_operations(operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (recovery_operation_id)
+        REFERENCES runtime_operations(operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
 CREATE TABLE IF NOT EXISTS api_idempotency_results (
     authenticated_workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     canonical_route TEXT NOT NULL CHECK (
