@@ -838,16 +838,26 @@ where
             let code = error.err().code().unwrap_or_default();
             if matches!(
                 code,
-                "InternalError"
-                    | "RequestLimitExceeded"
-                    | "ServiceUnavailable"
-                    | "Unavailable"
-                    | "Throttling"
-                    | "ThrottlingException"
+                "AccessDenied"
+                    | "AccessDeniedException"
+                    | "AuthFailure"
+                    | "InvalidClientTokenId"
+                    | "InvalidGroupId.Malformed"
+                    | "InvalidInstanceID.Malformed"
+                    | "InvalidNetworkInterfaceId.Malformed"
+                    | "InvalidParameter"
+                    | "InvalidParameterValue"
+                    | "MissingParameter"
+                    | "RequestExpired"
+                    | "SignatureDoesNotMatch"
+                    | "UnauthorizedOperation"
             ) {
-                Err(Ec2CallError::Ambiguous)
-            } else {
                 Err(Ec2CallError::Unavailable)
+            } else {
+                // Even an explicit service error can race another actor or a
+                // partially applied provider workflow. Only closed auth/input
+                // rejections above bypass exact postcondition discovery.
+                Err(Ec2CallError::Ambiguous)
             }
         }
         Ok(Err(_)) => Err(Ec2CallError::Ambiguous),
