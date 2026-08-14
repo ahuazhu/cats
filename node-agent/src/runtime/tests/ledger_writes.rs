@@ -57,7 +57,7 @@ fn grant(cat_id: &str, disk_id: &str, mount_path: &str) -> VolumeGrant {
         disk_id: disk_id.to_string(),
         volume_id: format!("vol_{cat_id}_{disk_id}"),
         attachment_id: format!("att_{cat_id}_{disk_id}"),
-        epoch: 0,
+        epoch: 1,
         size_bytes: VOLUME_SIZE,
         mount_path: mount_path.to_string(),
         durability: Default::default(),

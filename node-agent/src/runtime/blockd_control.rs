@@ -233,6 +233,12 @@ impl NodeRuntime {
             vhost_user_queues,
             seed_image_id,
         });
+        #[cfg(test)]
+        cmd.env(
+            "CATS_TEST_BLOCKD_VOLUME_SIZE_BYTES",
+            grant.size_bytes.to_string(),
+        )
+        .env("CATS_TEST_BLOCKD_ATTACHMENT_EPOCH", grant.epoch.to_string());
         let log_path = blockd_log_path(cat_dir, &grant.disk_id);
         let log = std::fs::File::create(&log_path).context("create blockd log")?;
         let child = cmd

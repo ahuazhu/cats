@@ -118,10 +118,16 @@ pub struct NodeConfig {
 #[cfg(test)]
 pub(crate) fn real_child_node_config(root: &Path, node_id: &str) -> NodeConfig {
     let parts = cats_test_support::NodeConfigBuilder::new(root, node_id).into_parts();
+    static TEST_BLOCKD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let blockd_bin = TEST_BLOCKD
+        .get_or_init(|| {
+            cats_test_support::workspace_example("cats-blockd", "sqlite_node_runtime_test_server")
+        })
+        .clone();
     NodeConfig {
         node_id: parts.node_id,
         state_dir: parts.state_dir.into(),
-        blockd_bin: parts.blockd_bin,
+        blockd_bin,
         guest_agent_bin: parts.guest_agent_bin,
         metadata_store: parts.metadata_store,
         object_store: parts.object_store,
