@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 use cats_api::runtime_reconciliation::{
     AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
     RandomId128, RemoteHead, Revision, Sha256Digest,
@@ -145,6 +146,11 @@ impl SqliteTestVolumeAuthority {
                 },
                 node_id: self.grant.node_id.clone(),
                 placement_epoch: self.grant.placement_epoch,
+            },
+            object_write_credential: ObjectWriteCredentialReference {
+                credential_id: Id::new(format!("test-object-write-{}", self.grant.attachment_id))
+                    .expect("attachment ID composes a valid test credential ID"),
+                public_key_spki_sha256: Sha256Digest::from_bytes([0x0b; 32]),
             },
             size_bytes: self
                 .load_volume(&self.grant.volume_id)
