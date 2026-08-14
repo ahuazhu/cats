@@ -333,6 +333,7 @@ pub enum ObjectWriteDownstreamPutOutcome {
 /// cannot mint this capability or any qualified terminal outcome.
 pub struct ObjectWriteQualificationPut {
     downstream: ObjectWriteDownstreamPut,
+    absolute_deadline: Instant,
 }
 
 impl ObjectWriteQualificationPut {
@@ -342,6 +343,10 @@ impl ObjectWriteQualificationPut {
 
     pub fn spool(&self) -> &DurableObjectWriteSpoolReceipt {
         &self.downstream.spool
+    }
+
+    pub fn absolute_deadline(&self) -> Instant {
+        self.absolute_deadline
     }
 }
 
@@ -1016,9 +1021,15 @@ pub enum ObjectWriteQualificationDurableResolution {
 /// Opaque per-request transaction guard. Production implementations acquire
 /// one exclusive row/advisory lock keyed by the exact authorization request,
 /// load its immutable resolution in that same transaction, and retain the
-/// lock through HEAD and one resolution commit. Dropping it rolls back.
+/// lock through HEAD and one resolution commit. Every async method enforces
+/// the sealed deadline with transaction-local database timeouts; dropping the
+/// guard rolls back.
 pub trait QualificationFaultRequestGuard: Send {
     fn request(&self) -> &ObjectWriteQualificationAuthorizationRequestV1;
+
+    /// The original monotonic handler deadline supplied to `lock_request`.
+    /// No later stage may replace or extend it.
+    fn absolute_deadline(&self) -> Instant;
 
     fn durable_resolution(&self) -> Option<&ObjectWriteQualificationDurableResolution>;
 
@@ -1029,7 +1040,6 @@ pub trait QualificationFaultRequestGuard: Send {
         self: Box<Self>,
         sealed_request: ObjectWriteQualificationSealedRequestV1,
         head_evidence: ObjectWriteQualificationHeadEvidenceV1,
-        absolute_deadline: Instant,
     ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationUnprovenVisibleReceiptV1>
     where
         Self: 'a;
@@ -1038,7 +1048,6 @@ pub trait QualificationFaultRequestGuard: Send {
     /// The returned guard continues to own both locks.
     fn authorize_put<'a>(
         self: Box<Self>,
-        absolute_deadline: Instant,
     ) -> QualificationFaultAuthorityFuture<'a, Box<dyn QualificationFaultAuthorizationGuard + 'a>>
     where
         Self: 'a;
@@ -1050,10 +1059,17 @@ pub trait QualificationFaultRequestGuard: Send {
 pub trait QualificationFaultAuthorizationGuard: Send {
     fn authorization(&self) -> &ObjectWriteQualificationAuthorizationV1;
 
+    /// Monotonic effect deadline clamped to both the original handler
+    /// deadline and remaining qualification lifetime measured from the
+    /// PostgreSQL clock used to mint `authorization`. Production guards must
+    /// also recheck the binding's database-clock expiry in every resolution
+    /// write and configure transaction-local lock/statement timeouts so a
+    /// commit cannot complete after this deadline.
+    fn absolute_deadline(&self) -> Instant;
+
     fn commit_response_loss<'a>(
         self: Box<Self>,
         successful_put: ObjectWriteSuccessfulPutV1,
-        absolute_deadline: Instant,
     ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationResponseLossV1>
     where
         Self: 'a;
@@ -1064,7 +1080,6 @@ pub trait QualificationFaultAuthorizationGuard: Send {
         self: Box<Self>,
         sealed_request: ObjectWriteQualificationSealedRequestV1,
         head_evidence: ObjectWriteQualificationHeadEvidenceV1,
-        absolute_deadline: Instant,
     ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationUnprovenVisibleReceiptV1>
     where
         Self: 'a;
@@ -1126,6 +1141,10 @@ impl ObjectWriteQualificationAuthorizationCapability<'_> {
     pub fn authorization(&self) -> &ObjectWriteQualificationAuthorizationV1 {
         self.guard.authorization()
     }
+
+    pub fn absolute_deadline(&self) -> Instant {
+        self.guard.absolute_deadline()
+    }
 }
 
 pub struct ObjectWriteQualificationPutDispatch<'a> {
@@ -1147,6 +1166,12 @@ impl ObjectWriteQualificationPutDispatch<'_> {
 pub struct ObjectWriteQualificationHeadProbe<'a> {
     sealed_request: ObjectWriteQualificationSealedRequestV1,
     guard: Box<dyn QualificationFaultRequestGuard + 'a>,
+}
+
+impl ObjectWriteQualificationHeadProbe<'_> {
+    pub fn absolute_deadline(&self) -> Instant {
+        self.guard.absolute_deadline()
+    }
 }
 
 pub enum ObjectWriteQualificationHeadResolution<'a> {
@@ -1194,7 +1219,7 @@ pub async fn prepare_object_write_qualification<'a>(
     let guard = authority
         .lock_request(request.clone(), absolute_deadline)
         .await?;
-    if guard.request() != &request {
+    if guard.request() != &request || guard.absolute_deadline() != absolute_deadline {
         return Err(QualificationFaultAuthorityError::InvalidEvidence);
     }
     if let Some(stored) = guard.durable_resolution() {
@@ -1238,7 +1263,14 @@ pub async fn prepare_object_write_qualification<'a>(
             )),
         );
     }
-    let guard = guard.authorize_put(absolute_deadline).await?;
+    let request_deadline = guard.absolute_deadline();
+    let guard = guard.authorize_put().await?;
+    if guard.absolute_deadline() > request_deadline {
+        return Err(QualificationFaultAuthorityError::InvalidEvidence);
+    }
+    if Instant::now() >= guard.absolute_deadline() {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+    }
     validate_qualification_authorization_for_descriptor(descriptor, guard.authorization())
         .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
     if guard.authorization().request != request {
@@ -1274,8 +1306,15 @@ pub fn seal_object_write_qualification_put<'a>(
         spool: spool.clone(),
     };
     validate_qualification_downstream_put_binding(&downstream)?;
+    let absolute_deadline = capability.guard.absolute_deadline();
+    if Instant::now() >= absolute_deadline {
+        return Err(ObjectWriteAuthorityError::InvalidRequest);
+    }
     Ok(ObjectWriteQualificationPutDispatch {
-        request: ObjectWriteQualificationPut { downstream },
+        request: ObjectWriteQualificationPut {
+            downstream,
+            absolute_deadline,
+        },
         sealed_request,
         guard: capability.guard,
     })
@@ -1289,7 +1328,6 @@ pub async fn resolve_object_write_qualification_after_head<'a>(
     attempt: &ObjectPutAttempt,
     probe: Box<ObjectWriteQualificationHeadProbe<'a>>,
     visibility: ObjectWriteVisibilityOutcome,
-    absolute_deadline: Instant,
 ) -> Result<ObjectWriteQualificationHeadResolution<'a>, QualificationFaultAuthorityError> {
     let ObjectPutState::ProviderIssued {
         issued_at_unix_ms, ..
@@ -1314,6 +1352,9 @@ pub async fn resolve_object_write_qualification_after_head<'a>(
             preceding_conditional_request,
             observed_at_unix_ms,
         } => {
+            if Instant::now() >= probe.guard.absolute_deadline() {
+                return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+            }
             let head_evidence = ObjectWriteQualificationHeadEvidenceV1 {
                 provider_attempt_id,
                 visibility_receipt_id,
@@ -1323,7 +1364,7 @@ pub async fn resolve_object_write_qualification_after_head<'a>(
             };
             let receipt = probe
                 .guard
-                .commit_unproven_visible(probe.sealed_request, head_evidence, absolute_deadline)
+                .commit_unproven_visible(probe.sealed_request, head_evidence)
                 .await?;
             validate_qualification_unproven_visible(
                 &attempt.descriptor,
@@ -1338,7 +1379,14 @@ pub async fn resolve_object_write_qualification_after_head<'a>(
             )
         }
         ObjectWriteVisibilityOutcome::NotVisible => {
-            let guard = probe.guard.authorize_put(absolute_deadline).await?;
+            let request_deadline = probe.guard.absolute_deadline();
+            let guard = probe.guard.authorize_put().await?;
+            if guard.absolute_deadline() > request_deadline {
+                return Err(QualificationFaultAuthorityError::InvalidEvidence);
+            }
+            if Instant::now() >= guard.absolute_deadline() {
+                return Err(QualificationFaultAuthorityError::DeadlineExceeded);
+            }
             validate_qualification_authorization_for_descriptor(
                 &attempt.descriptor,
                 guard.authorization(),
@@ -1358,7 +1406,10 @@ pub async fn resolve_object_write_qualification_after_head<'a>(
                 .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
             Ok(ObjectWriteQualificationHeadResolution::Authorized(
                 Box::new(ObjectWriteQualificationPutDispatch {
-                    request: ObjectWriteQualificationPut { downstream },
+                    request: ObjectWriteQualificationPut {
+                        downstream,
+                        absolute_deadline: guard.absolute_deadline(),
+                    },
                     sealed_request: probe.sealed_request,
                     guard,
                 }),
@@ -1657,7 +1708,6 @@ pub async fn commit_object_write_qualification_put_outcome(
     attempt: &ObjectPutAttempt,
     dispatch: ObjectWriteQualificationPutDispatch<'_>,
     outcome: ObjectWriteQualificationPutOutcome,
-    absolute_deadline: Instant,
 ) -> Result<ObjectPutAttempt, QualificationFaultAuthorityError> {
     validate_object_put_attempt(authority, attempt)
         .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
@@ -1674,8 +1724,12 @@ pub async fn commit_object_write_qualification_put_outcome(
     if dispatch.request.downstream.descriptor != attempt.descriptor
         || dispatch.request.downstream.spool != *spool
         || dispatch.sealed_request != expected_sealed
+        || dispatch.request.absolute_deadline != dispatch.guard.absolute_deadline()
     {
         return Err(QualificationFaultAuthorityError::Conflict);
+    }
+    if Instant::now() >= dispatch.request.absolute_deadline {
+        return Err(QualificationFaultAuthorityError::DeadlineExceeded);
     }
     validate_qualification_authorization_for_descriptor(
         &attempt.descriptor,
@@ -1684,10 +1738,7 @@ pub async fn commit_object_write_qualification_put_outcome(
     .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
     match outcome {
         ObjectWriteQualificationPutOutcome::SuccessfulPut(successful_put) => {
-            let response_loss = dispatch
-                .guard
-                .commit_response_loss(*successful_put, absolute_deadline)
-                .await?;
+            let response_loss = dispatch.guard.commit_response_loss(*successful_put).await?;
             validate_qualification_response_loss(
                 &attempt.descriptor,
                 *issued_at_unix_ms,
@@ -1703,7 +1754,7 @@ pub async fn commit_object_write_qualification_put_outcome(
             }
             let receipt = dispatch
                 .guard
-                .commit_unproven_visible(dispatch.sealed_request, *head_evidence, absolute_deadline)
+                .commit_unproven_visible(dispatch.sealed_request, *head_evidence)
                 .await?;
             validate_qualification_unproven_visible(
                 &attempt.descriptor,
@@ -1967,9 +2018,8 @@ pub fn validate_downstream_put(
 
 pub fn validate_qualification_downstream_put(
     request: &ObjectWriteQualificationPut,
-    absolute_deadline: Instant,
 ) -> Result<(), ObjectWriteAuthorityError> {
-    if Instant::now() >= absolute_deadline {
+    if Instant::now() >= request.absolute_deadline {
         return Err(ObjectWriteAuthorityError::InvalidRequest);
     }
     validate_qualification_downstream_put_binding(&request.downstream)
@@ -2318,10 +2368,12 @@ pub trait ObjectWriteGatewayDownstream: Send + Sync {
         absolute_deadline: Instant,
     ) -> ObjectWriteDownstreamFuture<'a, ObjectWriteDownstreamPutOutcome>;
 
+    /// Execute only the core-sealed qualification request. The adapter must
+    /// validate the capability and use `request.absolute_deadline()` as the
+    /// hard provider deadline; no caller-supplied replacement is authoritative.
     fn put_qualification_exact<'a>(
         &'a self,
         request: &'a ObjectWriteQualificationPut,
-        absolute_deadline: Instant,
     ) -> ObjectWriteDownstreamFuture<'a, ObjectWriteQualificationPutOutcome>;
 
     fn discover_visibility<'a>(
@@ -2672,6 +2724,8 @@ mod tests {
 
     struct TestRequestGuard {
         request: ObjectWriteQualificationAuthorizationRequestV1,
+        absolute_deadline: Instant,
+        authorization_deadline_extension: Duration,
         resolution: Option<ObjectWriteQualificationDurableResolution>,
         lease: Option<TestLease>,
     }
@@ -2679,6 +2733,10 @@ mod tests {
     impl QualificationFaultRequestGuard for TestRequestGuard {
         fn request(&self) -> &ObjectWriteQualificationAuthorizationRequestV1 {
             &self.request
+        }
+
+        fn absolute_deadline(&self) -> Instant {
+            self.absolute_deadline
         }
 
         fn durable_resolution(&self) -> Option<&ObjectWriteQualificationDurableResolution> {
@@ -2689,13 +2747,12 @@ mod tests {
             mut self: Box<Self>,
             sealed_request: ObjectWriteQualificationSealedRequestV1,
             head_evidence: ObjectWriteQualificationHeadEvidenceV1,
-            absolute_deadline: Instant,
         ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationUnprovenVisibleReceiptV1>
         where
             Self: 'a,
         {
             Box::pin(async move {
-                if Instant::now() >= absolute_deadline || self.resolution.is_some() {
+                if Instant::now() >= self.absolute_deadline || self.resolution.is_some() {
                     return Err(QualificationFaultAuthorityError::DeadlineExceeded);
                 }
                 let receipt = unproven_receipt(
@@ -2749,13 +2806,12 @@ mod tests {
 
         fn authorize_put<'a>(
             mut self: Box<Self>,
-            absolute_deadline: Instant,
         ) -> QualificationFaultAuthorityFuture<'a, Box<dyn QualificationFaultAuthorizationGuard + 'a>>
         where
             Self: 'a,
         {
             Box::pin(async move {
-                if Instant::now() >= absolute_deadline {
+                if Instant::now() >= self.absolute_deadline {
                     return Err(QualificationFaultAuthorityError::DeadlineExceeded);
                 }
                 if self.resolution.is_some() {
@@ -2763,8 +2819,13 @@ mod tests {
                 }
                 let lease = self.lease.take().unwrap();
                 lease.shared.lock().unwrap().events.push("authorize");
+                let authorization_deadline = self
+                    .absolute_deadline
+                    .checked_add(self.authorization_deadline_extension)
+                    .ok_or(QualificationFaultAuthorityError::InvalidEvidence)?;
                 Ok(Box::new(TestAuthorizationGuard {
                     authorization: authorization(self.request.clone()),
+                    absolute_deadline: authorization_deadline,
                     lease: Some(lease),
                 })
                     as Box<dyn QualificationFaultAuthorizationGuard>)
@@ -2774,6 +2835,7 @@ mod tests {
 
     struct TestAuthorizationGuard {
         authorization: ObjectWriteQualificationAuthorizationV1,
+        absolute_deadline: Instant,
         lease: Option<TestLease>,
     }
 
@@ -2782,16 +2844,19 @@ mod tests {
             &self.authorization
         }
 
+        fn absolute_deadline(&self) -> Instant {
+            self.absolute_deadline
+        }
+
         fn commit_response_loss<'a>(
             mut self: Box<Self>,
             successful_put: ObjectWriteSuccessfulPutV1,
-            absolute_deadline: Instant,
         ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationResponseLossV1>
         where
             Self: 'a,
         {
             Box::pin(async move {
-                if Instant::now() >= absolute_deadline {
+                if Instant::now() >= self.absolute_deadline {
                     return Err(QualificationFaultAuthorityError::DeadlineExceeded);
                 }
                 let injected_at_unix_ms = millis(21);
@@ -2821,13 +2886,12 @@ mod tests {
             mut self: Box<Self>,
             sealed_request: ObjectWriteQualificationSealedRequestV1,
             head_evidence: ObjectWriteQualificationHeadEvidenceV1,
-            absolute_deadline: Instant,
         ) -> QualificationFaultAuthorityFuture<'a, ObjectWriteQualificationUnprovenVisibleReceiptV1>
         where
             Self: 'a,
         {
             Box::pin(async move {
-                if Instant::now() >= absolute_deadline {
+                if Instant::now() >= self.absolute_deadline {
                     return Err(QualificationFaultAuthorityError::DeadlineExceeded);
                 }
                 if self.authorization.request != sealed_request.authorization_request {
@@ -2861,10 +2925,18 @@ mod tests {
     struct TestAuthority {
         lock_calls: AtomicUsize,
         shared: Arc<Mutex<TestAuthorityState>>,
+        authorization_deadline_extension: Duration,
     }
 
     impl TestAuthority {
         fn new(stored: Option<ObjectWriteQualificationDurableResolution>) -> Self {
+            Self::with_authorization_deadline_extension(stored, Duration::ZERO)
+        }
+
+        fn with_authorization_deadline_extension(
+            stored: Option<ObjectWriteQualificationDurableResolution>,
+            authorization_deadline_extension: Duration,
+        ) -> Self {
             Self {
                 lock_calls: AtomicUsize::new(0),
                 shared: Arc::new(Mutex::new(TestAuthorityState {
@@ -2874,6 +2946,7 @@ mod tests {
                     events: Vec::new(),
                     rollback_drops: 0,
                 })),
+                authorization_deadline_extension,
             }
         }
 
@@ -2894,6 +2967,7 @@ mod tests {
         shared: Arc<Mutex<TestAuthorityState>>,
         request: Option<ObjectWriteQualificationAuthorizationRequestV1>,
         absolute_deadline: Instant,
+        authorization_deadline_extension: Duration,
     }
 
     impl Future for TestLockFuture {
@@ -2925,6 +2999,8 @@ mod tests {
             let request = self.request.take().unwrap();
             Poll::Ready(Ok(Box::new(TestRequestGuard {
                 request,
+                absolute_deadline: self.absolute_deadline,
+                authorization_deadline_extension: self.authorization_deadline_extension,
                 resolution: resolution.clone(),
                 lease: Some(TestLease {
                     shared: self.shared.clone(),
@@ -2948,6 +3024,7 @@ mod tests {
                     shared: self.shared.clone(),
                     request: Some(request),
                     absolute_deadline,
+                    authorization_deadline_extension: self.authorization_deadline_extension,
                 }
                 .await?;
                 Ok(guard as Box<dyn QualificationFaultRequestGuard + 'a>)
@@ -2990,10 +3067,11 @@ mod tests {
         let accepted = accepted_attempt(descriptor.clone());
         validate_object_put_attempt(&authority, &accepted).unwrap();
         let fault_authority = TestAuthority::new(None);
+        let absolute_deadline = Instant::now() + Duration::from_secs(1);
         let preparation = poll_ready(prepare_object_write_qualification(
             &fault_authority,
             &accepted,
-            Instant::now() + Duration::from_secs(1),
+            absolute_deadline,
         ))
         .unwrap();
         let ObjectWriteQualificationPreparation::Authorized(capability) = preparation else {
@@ -3003,6 +3081,7 @@ mod tests {
             capability.authorization().mutation_class,
             ObjectWriteQualificationMutationClassV1::ObjectWriteAmbiguity
         );
+        assert_eq!(capability.absolute_deadline(), absolute_deadline);
         let issued = mark_object_write_provider_issued(&authority, &accepted, millis(12)).unwrap();
         let synthetic_ordinary = ObjectWriteDownstreamPut {
             descriptor: descriptor.clone(),
@@ -3013,11 +3092,8 @@ mod tests {
             Err(ObjectWriteAuthorityError::InvalidRequest)
         );
         let dispatch = seal_object_write_qualification_put(&issued, capability).unwrap();
-        validate_qualification_downstream_put(
-            dispatch.request(),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap();
+        assert_eq!(dispatch.request().absolute_deadline(), absolute_deadline);
+        validate_qualification_downstream_put(dispatch.request()).unwrap();
         let lost = poll_ready(commit_object_write_qualification_put_outcome(
             &authority,
             &issued,
@@ -3026,7 +3102,6 @@ mod tests {
                 &descriptor,
                 "provider-put-request-a",
             ))),
-            Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
         let ObjectPutState::QualificationResponseLost { response_loss, .. } = &lost.state else {
@@ -3089,7 +3164,6 @@ mod tests {
                 ObjectWriteQualificationPutOutcome::PreconditionFailedExactVisible(Box::new(
                     head_evidence(&descriptor),
                 )),
-                Instant::now() + Duration::from_secs(1),
             )),
             Err(QualificationFaultAuthorityError::InvalidEvidence)
         );
@@ -3113,7 +3187,6 @@ mod tests {
             ObjectWriteQualificationPutOutcome::PreconditionFailedExactVisible(Box::new(
                 precondition_head_evidence(&descriptor),
             )),
-            Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
         assert!(matches!(
@@ -3178,24 +3251,25 @@ mod tests {
         let descriptor = descriptor(&authority, Some(fault()));
         let issued = issued_attempt(descriptor.clone());
         let fault_authority = TestAuthority::new(None);
+        let absolute_deadline = Instant::now() + Duration::from_secs(1);
 
         let preparation = poll_ready(prepare_object_write_qualification(
             &fault_authority,
             &issued,
-            Instant::now() + Duration::from_secs(1),
+            absolute_deadline,
         ))
         .unwrap();
         let ObjectWriteQualificationPreparation::DiscoverIssuedVisibility(probe) = preparation
         else {
             panic!("an issued fault must discover durable response loss before HEAD");
         };
+        assert_eq!(probe.absolute_deadline(), absolute_deadline);
         assert_eq!(fault_authority.events(), vec!["lock"]);
 
         let resolution = poll_ready(resolve_object_write_qualification_after_head(
             &issued,
             probe,
             exact_visibility(&descriptor),
-            Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
         let ObjectWriteQualificationHeadResolution::QualificationUnprovenVisible(committed) =
@@ -3270,7 +3344,6 @@ mod tests {
             &issued,
             probe,
             ObjectWriteVisibilityOutcome::NotVisible,
-            Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
         assert!(matches!(
@@ -3312,11 +3385,7 @@ mod tests {
         assert_pending(replica_b.as_mut());
 
         let lost = poll_ready(commit_object_write_qualification_put_outcome(
-            &authority,
-            &issued,
-            dispatch_a,
-            successful,
-            Instant::now() + Duration::from_secs(1),
+            &authority, &issued, dispatch_a, successful,
         ))
         .unwrap();
         assert!(matches!(
@@ -3374,7 +3443,6 @@ mod tests {
             &issued,
             probe_b,
             exact_visibility(&descriptor),
-            Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
         assert!(matches!(
@@ -3466,5 +3534,27 @@ mod tests {
             )),
             Ok(ObjectWriteQualificationPreparation::Authorized(_))
         ));
+    }
+
+    #[test]
+    fn authorization_guard_cannot_extend_the_locked_request_deadline() {
+        let authority = authority();
+        let descriptor = descriptor(&authority, Some(fault()));
+        let accepted = accepted_attempt(descriptor);
+        let fault_authority =
+            TestAuthority::with_authorization_deadline_extension(None, Duration::from_secs(1));
+        let absolute_deadline = Instant::now() + Duration::from_secs(1);
+
+        assert!(matches!(
+            poll_ready(prepare_object_write_qualification(
+                &fault_authority,
+                &accepted,
+                absolute_deadline,
+            )),
+            Err(QualificationFaultAuthorityError::InvalidEvidence)
+        ));
+        assert_eq!(fault_authority.events(), vec!["lock", "authorize"]);
+        assert_eq!(fault_authority.rollback_drops(), 1);
+        assert!(fault_authority.resolution().is_none());
     }
 }

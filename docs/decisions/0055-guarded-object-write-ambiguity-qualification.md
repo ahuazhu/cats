@@ -83,9 +83,12 @@ provider dispatch之前短暂检查Qualification，锁释放之后provider仍可
 ## 后果
 
 Qualification close可能等待一个有界provider call与receipt commit；这正是对“close之后没有晚effect”的必要
-代价。gateway必须把同一个monotonic absolute deadline传过request lock、HEAD/E13/provider和resolution commit；
-production authority把PostgreSQL lock/statement timeout截到剩余预算，在每次commit前重验deadline，并且只用
-该持锁事务的PostgreSQL clock铸造authorized/injected/resolved wall-clock字段。caller/provider不能提交这些时间。
+代价。gateway只在取得request lock时提交一次monotonic absolute deadline；request guard封印该deadline，HEAD
+token继承它，E13 authorization guard再把它收紧到PostgreSQL clock所见的qualification剩余寿命，qualified PUT
+capability把最终deadline只读地交给provider。后续provider与resolution API都不再接收caller可替换的deadline。
+production authority把PostgreSQL lock/statement timeout截到这份封印后的剩余预算，在每次commit前同时重验
+monotonic deadline和database-clock expiry，并且只用该持锁事务的PostgreSQL clock铸造
+authorized/injected/resolved wall-clock字段。caller/provider不能延长deadline或提交这些时间。
 drop任一guard会rollback/归还连接。`QualificationUnprovenVisible`证明对象安全可见，但不证明规定的response-loss注入；runner
 必须报告资格失败并以新fault/新immutable key重跑，不能对同一request重发PUT。cleanup仍遵守writer cutoff与
 terminal prefix。
