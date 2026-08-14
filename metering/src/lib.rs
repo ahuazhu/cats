@@ -11,8 +11,11 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use cats_api::metering::{CatUsageCheckpoint, UsageEpochMarker, UsageMetric};
+use cats_api::runtime_reconciliation::{
+    Epoch, Id, NodeBootId, RandomId128, Revision, SessionBinding,
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 const GIB: u128 = 1_073_741_824;
@@ -42,6 +45,7 @@ impl From<rusqlite::Error> for MeteringError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsageAttribution {
     pub billing_account_id: String,
     pub workspace_id: String,
@@ -51,9 +55,228 @@ pub struct UsageAttribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttributedCheckpoint {
     pub checkpoint: CatUsageCheckpoint,
     pub attribution: UsageAttribution,
+    /// Immutable runtime authority captured by the signed Control ingestion
+    /// boundary. Producers cannot choose billing attribution or this binding.
+    pub source_binding: RuntimeUsageSourceBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeUsageSourceBinding {
+    pub session: SessionBinding,
+    pub desired_revision: Revision,
+    pub runtime_incarnation: RandomId128,
+}
+
+/// The receipt/archive wire shape intentionally avoids any field named
+/// `session`: release evidence scanners reserve that word for possible session
+/// credentials. These six fields are the complete, lossless expansion of the
+/// non-secret AgentSession identity plus the runtime authority binding.
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeUsageSourceBindingRef<'a> {
+    node_id: &'a Id,
+    node_boot_id: &'a NodeBootId,
+    agent_instance_id: &'a RandomId128,
+    agent_epoch: Epoch,
+    desired_revision: Revision,
+    runtime_incarnation: &'a RandomId128,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeUsageSourceBindingWire {
+    node_id: Id,
+    node_boot_id: NodeBootId,
+    agent_instance_id: RandomId128,
+    agent_epoch: Epoch,
+    desired_revision: Revision,
+    runtime_incarnation: RandomId128,
+}
+
+impl serde::Serialize for RuntimeUsageSourceBinding {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &RuntimeUsageSourceBindingRef {
+                node_id: &self.session.node_id,
+                node_boot_id: &self.session.node_boot_id,
+                agent_instance_id: &self.session.agent_instance_id,
+                agent_epoch: self.session.agent_session_epoch,
+                desired_revision: self.desired_revision,
+                runtime_incarnation: &self.runtime_incarnation,
+            },
+            serializer,
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RuntimeUsageSourceBinding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire =
+            <RuntimeUsageSourceBindingWire as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self {
+            session: SessionBinding {
+                node_id: wire.node_id,
+                node_boot_id: wire.node_boot_id,
+                agent_instance_id: wire.agent_instance_id,
+                agent_session_epoch: wire.agent_epoch,
+            },
+            desired_revision: wire.desired_revision,
+            runtime_incarnation: wire.runtime_incarnation,
+        })
+    }
+}
+
+/// Exact immutable archive location for one projected stream record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageArchiveEvidence {
+    pub stream_name: String,
+    pub archive_bucket: String,
+    pub shard_id: String,
+    /// Canonical unsigned decimal Kinesis sequence number.
+    pub sequence_number: String,
+    pub archive_key: String,
+    pub archive_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedUsageCheckpoint {
+    pub value: AttributedCheckpoint,
+    pub archive: UsageArchiveEvidence,
+}
+
+/// Closed proof that the two compute meters for one runtime source epoch have
+/// reached their explicit final sample in both the immutable archive and the
+/// insert-only ledger projection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageSourceTerminalReceipt {
+    pub contract_version: u16,
+    pub source_id: String,
+    pub source_epoch: String,
+    pub cat_id: String,
+    pub source_binding: RuntimeUsageSourceBinding,
+    pub final_sequence: u64,
+    pub final_observed_at_unix_ms: i64,
+    /// Sorted by canonical metric slug; V1 contains exactly CPU then memory.
+    pub final_events: Vec<UsageTerminalEventEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTerminalEventEvidence {
+    pub event_id: String,
+    pub metric: UsageMetric,
+    pub cumulative_quantity: u128,
+    pub archive: UsageArchiveEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum UsageStreamRecord {
+    Checkpoint(AttributedCheckpoint),
+    TerminalBarrier(UsageTerminalShardMarker),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTargetBinding {
+    pub aws_account_id: String,
+    pub aws_region: String,
+    pub usage_schema: String,
+    pub stream_name: String,
+    pub stream_arn: String,
+    pub checkpoint_table_name: String,
+    pub checkpoint_table_arn: String,
+    pub archive_bucket_name: String,
+    pub archive_bucket_arn: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTerminalSourceExpectation {
+    pub source_id: String,
+    pub source_epoch: String,
+    pub receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTerminalShardTarget {
+    pub shard_id: String,
+    pub explicit_hash_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTargetTerminalRequest {
+    pub contract_version: u16,
+    pub terminal_epoch_id: RandomId128,
+    pub release_commit: String,
+    pub artifact_sha256: String,
+    pub created_at_unix_ms: i64,
+    pub old_target: UsageTargetBinding,
+    pub fresh_target: UsageTargetBinding,
+    pub sources: Vec<UsageTerminalSourceExpectation>,
+    pub source_set_sha256: String,
+    pub shards: Vec<UsageTerminalShardTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTerminalShardMarker {
+    pub contract_version: u16,
+    pub terminal_epoch_id: RandomId128,
+    pub request_sha256: String,
+    pub marker_id: String,
+    pub shard_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedUsageTerminalBarrier {
+    pub marker: UsageTerminalShardMarker,
+    pub archive: UsageArchiveEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTerminalBarrierProjection {
+    pub marker: UsageTerminalShardMarker,
+    pub archive: UsageArchiveEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageTargetTerminalReceipt {
+    pub contract_version: u16,
+    pub request: UsageTargetTerminalRequest,
+    pub request_sha256: String,
+    pub source_receipts: Vec<UsageSourceTerminalReceipt>,
+    pub barriers: Vec<UsageTerminalBarrierProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTerminalPrepareOutcome {
+    Prepared,
+    ExactReplay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTargetTerminalState {
+    pub request: UsageTargetTerminalRequest,
+    pub request_sha256: String,
+    pub barriers: Vec<UsageTerminalBarrierProjection>,
+    pub receipt: Option<UsageTargetTerminalReceipt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +377,102 @@ pub trait UsageStore: Send + Sync {
         source_id: &'a str,
         source_epoch: &'a str,
     ) -> UsageStoreFuture<'a, Option<UsageAttribution>>;
+
+    /// Atomically project an already immutable archived event and bind that
+    /// event to its exact stream/archive position. Implementations must never
+    /// manufacture archive evidence for ordinary `ingest` calls.
+    fn project_archived<'a>(
+        &'a self,
+        value: &'a ArchivedUsageCheckpoint,
+    ) -> UsageStoreFuture<'a, IngestOutcome>;
+
+    /// Discover the immutable terminal receipt for one exact source epoch.
+    /// Absence means "not proven terminal", never "there was no usage".
+    fn source_terminal_receipt<'a>(
+        &'a self,
+        source_id: &'a str,
+        source_epoch: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>>;
+
+    /// Discover the single target-terminal operation, if this projection has
+    /// been frozen. Delivery adapters use this during startup so a process
+    /// restart cannot accidentally reopen producer ingress after preparation.
+    fn active_target_terminal<'a>(
+        &'a self,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Close producer ingress and place the exact per-shard terminal markers.
+    /// Only a delivery adapter that owns the live stream may implement this;
+    /// projection stores expose the lower-level preparation methods below.
+    fn begin_target_terminal<'a>(
+        &'a self,
+        _request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not own target terminal delivery".to_string(),
+            ))
+        })
+    }
+
+    /// Convergently discover projector catch-up and create or exact-replay the
+    /// immutable S3 + projection receipt. `None` is pending, never success.
+    fn complete_target_terminal<'a>(
+        &'a self,
+        _request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalReceipt>> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not own target terminal delivery".to_string(),
+            ))
+        })
+    }
+
+    fn prepare_target_terminal<'a>(
+        &'a self,
+        _request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not implement target terminal authority".to_string(),
+            ))
+        })
+    }
+
+    fn project_terminal_barrier<'a>(
+        &'a self,
+        _barrier: &'a ArchivedUsageTerminalBarrier,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not implement target terminal barriers".to_string(),
+            ))
+        })
+    }
+
+    fn target_terminal_state<'a>(
+        &'a self,
+        _terminal_epoch_id: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not implement target terminal discovery".to_string(),
+            ))
+        })
+    }
+
+    fn commit_target_terminal<'a>(
+        &'a self,
+        _receipt: &'a UsageTargetTerminalReceipt,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        Box::pin(async {
+            Err(MeteringError::Invalid(
+                "usage store does not implement target terminal commit".to_string(),
+            ))
+        })
+    }
 }
 
 /// One billing account's append-only credit projection.
@@ -322,6 +641,10 @@ pub fn deterministic_event_id(checkpoint: &CatUsageCheckpoint) -> String {
         checkpoint.source_id.as_str(),
         checkpoint.source_epoch.as_str(),
         checkpoint.metric.slug(),
+        match checkpoint.epoch_marker {
+            UsageEpochMarker::Open => "open",
+            UsageEpochMarker::Final => "final",
+        },
         &checkpoint.sequence.to_string(),
     ] {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -346,6 +669,24 @@ pub struct RuntimeMeterAccumulator {
     last_cpu_usage_usec: Option<u64>,
     last_memory_current_bytes: Option<u64>,
     memory_byte_millis: u128,
+}
+
+/// Durable Node-local continuation state captured before a physical runtime
+/// effect. It is not a billing event and never leaves the Node spool. Keeping
+/// the previous memory sample is necessary to resume the left-continuous
+/// memory integral without either a gap or double counting after a crash.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMeterAccumulatorSnapshot {
+    pub source_id: String,
+    pub source_epoch: String,
+    pub cat_id: String,
+    pub cat_generation: i64,
+    pub sequence: u64,
+    pub last_observed_at_unix_ms: Option<i64>,
+    pub last_cpu_usage_usec: Option<u64>,
+    pub last_memory_current_bytes: Option<u64>,
+    pub memory_byte_millis: u128,
 }
 
 impl RuntimeMeterAccumulator {
@@ -421,16 +762,87 @@ impl RuntimeMeterAccumulator {
         self.last_observed_at_ms
     }
 
+    pub fn snapshot(&self) -> RuntimeMeterAccumulatorSnapshot {
+        RuntimeMeterAccumulatorSnapshot {
+            source_id: self.source_id.clone(),
+            source_epoch: self.source_epoch.clone(),
+            cat_id: self.cat_id.clone(),
+            cat_generation: self.cat_generation,
+            sequence: self.sequence,
+            last_observed_at_unix_ms: self.last_observed_at_ms,
+            last_cpu_usage_usec: self.last_cpu_usage_usec,
+            last_memory_current_bytes: self.last_memory_current_bytes,
+            memory_byte_millis: self.memory_byte_millis,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: RuntimeMeterAccumulatorSnapshot) -> Result<Self> {
+        if snapshot.source_id.is_empty()
+            || snapshot.source_epoch.is_empty()
+            || snapshot.cat_id.is_empty()
+            || snapshot.cat_generation < 0
+            || snapshot
+                .last_observed_at_unix_ms
+                .is_some_and(|value| value < 0)
+            || snapshot.last_observed_at_unix_ms.is_some() != snapshot.last_cpu_usage_usec.is_some()
+            || snapshot.last_observed_at_unix_ms.is_some()
+                != snapshot.last_memory_current_bytes.is_some()
+            || snapshot.last_observed_at_unix_ms.is_none() && snapshot.memory_byte_millis != 0
+        {
+            return Err(MeteringError::Invalid(
+                "runtime meter accumulator snapshot is inconsistent".into(),
+            ));
+        }
+        Ok(Self {
+            source_id: snapshot.source_id,
+            source_epoch: snapshot.source_epoch,
+            cat_id: snapshot.cat_id,
+            cat_generation: snapshot.cat_generation,
+            sequence: snapshot.sequence,
+            last_observed_at_ms: snapshot.last_observed_at_unix_ms,
+            last_cpu_usage_usec: snapshot.last_cpu_usage_usec,
+            last_memory_current_bytes: snapshot.last_memory_current_bytes,
+            memory_byte_millis: snapshot.memory_byte_millis,
+        })
+    }
+
     /// Emit CPU and memory checkpoints at the most recent observation.
     pub fn checkpoint(&mut self) -> Result<[CatUsageCheckpoint; 2]> {
-        let observed_at_unix_ms = self.last_observed_at_ms.ok_or_else(|| {
-            MeteringError::Invalid("cannot checkpoint before the first observation".to_string())
-        })?;
-        let sequence = self.sequence;
+        self.checkpoint_with_marker(UsageEpochMarker::Open)
+    }
+
+    /// Emit the last CPU and memory samples for this source epoch.
+    pub fn final_checkpoint(&mut self) -> Result<[CatUsageCheckpoint; 2]> {
+        self.checkpoint_with_marker(UsageEpochMarker::Final)
+    }
+
+    /// Build the exact final pair without advancing the accumulator. The Node
+    /// stages this candidate durably before a physical effect and publishes it
+    /// only after an accepted inventory proves that the source cannot reopen.
+    pub fn final_checkpoint_candidate(&self) -> Result<[CatUsageCheckpoint; 2]> {
+        self.checkpoints_for_marker(UsageEpochMarker::Final)
+    }
+
+    fn checkpoint_with_marker(
+        &mut self,
+        epoch_marker: UsageEpochMarker,
+    ) -> Result<[CatUsageCheckpoint; 2]> {
+        let checkpoints = self.checkpoints_for_marker(epoch_marker)?;
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or(MeteringError::Overflow)?;
+        Ok(checkpoints)
+    }
+
+    fn checkpoints_for_marker(
+        &self,
+        epoch_marker: UsageEpochMarker,
+    ) -> Result<[CatUsageCheckpoint; 2]> {
+        let observed_at_unix_ms = self.last_observed_at_ms.ok_or_else(|| {
+            MeteringError::Invalid("cannot checkpoint before the first observation".to_string())
+        })?;
+        let sequence = self.sequence;
         let make = |metric, cumulative_quantity| {
             let mut checkpoint = CatUsageCheckpoint {
                 event_id: String::new(),
@@ -441,6 +853,7 @@ impl RuntimeMeterAccumulator {
                 cat_id: self.cat_id.clone(),
                 cat_generation: self.cat_generation,
                 metric,
+                epoch_marker,
                 cumulative_quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
@@ -481,31 +894,36 @@ impl SqliteUsageStore {
     pub fn ingest(&self, value: &AttributedCheckpoint) -> Result<IngestOutcome> {
         validate_checkpoint(value)?;
         let payload = serde_json::to_string(&value.checkpoint)?;
+        let source_binding_json = serde_json::to_string(&value.source_binding)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         if let Some(existing) = tx
             .query_row(
-                "SELECT payload_json, billing_account_id, workspace_id,
-                        resource_type, resource_id, attributed_cat_id
+                "SELECT payload_json, source_binding_json, billing_account_id,
+                        workspace_id, resource_type, resource_id, attributed_cat_id
                    FROM usage_checkpoints WHERE event_id=?1",
                 params![value.checkpoint.event_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
                         UsageAttribution {
-                            billing_account_id: row.get(1)?,
-                            workspace_id: row.get(2)?,
-                            resource_type: row.get(3)?,
-                            resource_id: row.get(4)?,
-                            attributed_cat_id: row.get(5)?,
+                            billing_account_id: row.get(2)?,
+                            workspace_id: row.get(3)?,
+                            resource_type: row.get(4)?,
+                            resource_id: row.get(5)?,
+                            attributed_cat_id: row.get(6)?,
                         },
                     ))
                 },
             )
             .optional()?
         {
-            if existing.0 == payload && existing.1 == value.attribution {
+            if existing.0 == payload
+                && existing.1 == source_binding_json
+                && existing.2 == value.attribution
+            {
                 tx.commit()?;
                 return Ok(IngestOutcome::Duplicate);
             }
@@ -513,6 +931,20 @@ impl SqliteUsageStore {
                 "event {} was replayed with a different payload",
                 value.checkpoint.event_id
             )));
+        }
+
+        let terminal_exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM usage_source_terminal_receipts
+                  WHERE source_id=?1 AND source_epoch=?2
+             )",
+            params![value.checkpoint.source_id, value.checkpoint.source_epoch],
+            |row| row.get(0),
+        )?;
+        if terminal_exists {
+            return Err(MeteringError::Conflict(
+                "source epoch is already terminal".to_string(),
+            ));
         }
 
         if let Some(existing_attribution) = tx
@@ -541,6 +973,23 @@ impl SqliteUsageStore {
                 ));
             }
         }
+        if let Some(existing_binding) = tx
+            .query_row(
+                "SELECT source_binding_json
+                   FROM usage_checkpoints
+                  WHERE source_id=?1 AND source_epoch=?2
+                  LIMIT 1",
+                params![value.checkpoint.source_id, value.checkpoint.source_epoch],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing_binding != source_binding_json {
+                return Err(MeteringError::Conflict(
+                    "runtime authority changed inside one source epoch".to_string(),
+                ));
+            }
+        }
         let previous = adjacent_checkpoint(&tx, value, Adjacent::Previous)?;
         let next = adjacent_checkpoint(&tx, value, Adjacent::Next)?;
         validate_adjacent(value, previous.as_ref(), next.as_ref())?;
@@ -551,8 +1000,9 @@ impl SqliteUsageStore {
             "INSERT INTO usage_checkpoints (
                 event_id, source_id, source_epoch, sequence, observed_at_ms,
                 metric, cumulative_quantity, billing_account_id, workspace_id,
-                resource_type, resource_id, attributed_cat_id, payload_json
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                resource_type, resource_id, attributed_cat_id, payload_json,
+                source_binding_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 value.checkpoint.event_id,
                 value.checkpoint.source_id,
@@ -567,6 +1017,7 @@ impl SqliteUsageStore {
                 value.attribution.resource_id,
                 value.attribution.attributed_cat_id,
                 payload,
+                source_binding_json,
             ],
         )?;
 
@@ -654,6 +1105,68 @@ impl SqliteUsageStore {
         .optional()
         .map_err(Into::into)
     }
+
+    pub fn project_archived(&self, value: &ArchivedUsageCheckpoint) -> Result<IngestOutcome> {
+        validate_archive_evidence(&value.archive)?;
+        let outcome = self.ingest(&value.value)?;
+        let evidence_json = serde_json::to_string(&value.archive)?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO usage_archive_projections (
+                 event_id, stream_name, archive_bucket, shard_id,
+                 sequence_number, archive_key, archive_sha256, evidence_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                value.value.checkpoint.event_id,
+                value.archive.stream_name,
+                value.archive.archive_bucket,
+                value.archive.shard_id,
+                value.archive.sequence_number,
+                value.archive.archive_key,
+                value.archive.archive_sha256,
+                evidence_json,
+            ],
+        )?;
+        if inserted == 0 {
+            let existing: String = transaction.query_row(
+                "SELECT evidence_json FROM usage_archive_projections WHERE event_id=?1",
+                params![value.value.checkpoint.event_id],
+                |row| row.get(0),
+            )?;
+            if existing != evidence_json {
+                return Err(MeteringError::Conflict(format!(
+                    "event {} was projected from conflicting archive evidence",
+                    value.value.checkpoint.event_id
+                )));
+            }
+        }
+        maybe_insert_sqlite_source_terminal_receipt(
+            &transaction,
+            &value.value.checkpoint.source_id,
+            &value.value.checkpoint.source_epoch,
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn source_terminal_receipt(
+        &self,
+        source_id: &str,
+        source_epoch: &str,
+    ) -> Result<Option<UsageSourceTerminalReceipt>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT receipt_json, receipt_sha256
+               FROM usage_source_terminal_receipts
+              WHERE source_id=?1 AND source_epoch=?2",
+            params![source_id, source_epoch],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .map(|(json, expected_sha256)| decode_terminal_receipt(&json, &expected_sha256))
+        .transpose()
+    }
 }
 
 impl UsageStore for SqliteUsageStore {
@@ -676,6 +1189,23 @@ impl UsageStore for SqliteUsageStore {
         Box::pin(async move {
             SqliteUsageStore::source_epoch_attribution(self, source_id, source_epoch)
         })
+    }
+
+    fn project_archived<'a>(
+        &'a self,
+        value: &'a ArchivedUsageCheckpoint,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        Box::pin(async move { SqliteUsageStore::project_archived(self, value) })
+    }
+
+    fn source_terminal_receipt<'a>(
+        &'a self,
+        source_id: &'a str,
+        source_epoch: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>> {
+        Box::pin(
+            async move { SqliteUsageStore::source_terminal_receipt(self, source_id, source_epoch) },
+        )
     }
 }
 
@@ -1244,6 +1774,25 @@ pub fn validate_checkpoint(value: &AttributedCheckpoint) -> Result<()> {
             "cat_generation must be non-negative".to_string(),
         ));
     }
+    if value.source_binding.session.node_id.as_str().is_empty()
+        || checkpoint.source_id
+            != format!(
+                "node/{}/cat/{}",
+                value.source_binding.session.node_id, checkpoint.cat_id
+            )
+    {
+        return Err(MeteringError::Invalid(
+            "runtime source binding does not match source_id and cat_id".to_string(),
+        ));
+    }
+    let desired_revision = u64::try_from(checkpoint.cat_generation).map_err(|_| {
+        MeteringError::Invalid("cat_generation must fit the Desired revision".to_string())
+    })?;
+    if value.source_binding.desired_revision.get() != desired_revision {
+        return Err(MeteringError::Invalid(
+            "runtime source binding Desired revision does not match cat_generation".to_string(),
+        ));
+    }
     if value.attribution.resource_type == "cat"
         && (value.attribution.resource_id != checkpoint.cat_id
             || value.attribution.attributed_cat_id.as_deref() != Some(checkpoint.cat_id.as_str()))
@@ -1538,6 +2087,458 @@ fn row_u128(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u128> {
     }
 }
 
+pub fn validate_archive_evidence(evidence: &UsageArchiveEvidence) -> Result<()> {
+    for (name, value, maximum) in [
+        ("stream_name", evidence.stream_name.as_str(), 256_usize),
+        ("archive_bucket", evidence.archive_bucket.as_str(), 256),
+        ("shard_id", evidence.shard_id.as_str(), 256),
+        ("archive_key", evidence.archive_key.as_str(), 1_024),
+    ] {
+        if value.is_empty() || value.len() > maximum {
+            return Err(MeteringError::Invalid(format!(
+                "archive evidence {name} must contain 1..={maximum} bytes"
+            )));
+        }
+    }
+    if evidence.sequence_number.is_empty()
+        || (evidence.sequence_number.len() > 1 && evidence.sequence_number.starts_with('0'))
+        || evidence.sequence_number.len() > 78
+        || !evidence
+            .sequence_number
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(MeteringError::Invalid(
+            "archive evidence sequence_number must be a canonical unsigned decimal".to_string(),
+        ));
+    }
+    let digest = evidence
+        .archive_sha256
+        .strip_prefix("sha256:")
+        .filter(|digest| digest.len() == 64)
+        .filter(|digest| {
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if digest.is_none() {
+        return Err(MeteringError::Invalid(
+            "archive evidence archive_sha256 is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn maybe_insert_sqlite_source_terminal_receipt(
+    transaction: &Transaction<'_>,
+    source_id: &str,
+    source_epoch: &str,
+) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT checkpoint.payload_json, checkpoint.source_binding_json,
+                archive.evidence_json
+           FROM usage_checkpoints checkpoint
+           JOIN usage_archive_projections archive
+             ON archive.event_id=checkpoint.event_id
+          WHERE checkpoint.source_id=?1 AND checkpoint.source_epoch=?2
+          ORDER BY checkpoint.sequence, checkpoint.metric, checkpoint.event_id",
+    )?;
+    let mut rows = statement.query(params![source_id, source_epoch])?;
+    let mut all = Vec::<(
+        CatUsageCheckpoint,
+        RuntimeUsageSourceBinding,
+        UsageArchiveEvidence,
+    )>::new();
+    while let Some(row) = rows.next()? {
+        let checkpoint = serde_json::from_str::<CatUsageCheckpoint>(&row.get::<_, String>(0)?)?;
+        let binding = serde_json::from_str::<RuntimeUsageSourceBinding>(&row.get::<_, String>(1)?)?;
+        let archive = serde_json::from_str::<UsageArchiveEvidence>(&row.get::<_, String>(2)?)?;
+        all.push((checkpoint, binding, archive));
+    }
+    drop(rows);
+    drop(statement);
+    let Some(receipt) = build_source_terminal_receipt(source_id, source_epoch, &all)? else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(&receipt)?;
+    let receipt_sha256 = sha256_prefixed(receipt_json.as_bytes());
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO usage_source_terminal_receipts (
+             source_id, source_epoch, receipt_json, receipt_sha256
+         ) VALUES (?1,?2,?3,?4)",
+        params![source_id, source_epoch, receipt_json, receipt_sha256],
+    )?;
+    if inserted == 0 {
+        let existing: (String, String) = transaction.query_row(
+            "SELECT receipt_json, receipt_sha256
+               FROM usage_source_terminal_receipts
+              WHERE source_id=?1 AND source_epoch=?2",
+            params![source_id, source_epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if existing != (receipt_json, receipt_sha256) {
+            return Err(MeteringError::Conflict(
+                "source terminal receipt conflicts with its immutable replay".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn build_source_terminal_receipt(
+    source_id: &str,
+    source_epoch: &str,
+    projected: &[(
+        CatUsageCheckpoint,
+        RuntimeUsageSourceBinding,
+        UsageArchiveEvidence,
+    )],
+) -> Result<Option<UsageSourceTerminalReceipt>> {
+    let mut finals = projected
+        .iter()
+        .filter(|(checkpoint, _, _)| checkpoint.epoch_marker == UsageEpochMarker::Final)
+        .collect::<Vec<_>>();
+    if finals.len() < 2 {
+        return Ok(None);
+    }
+    if finals.len() != 2 {
+        return Err(MeteringError::Conflict(
+            "source epoch contains more than one final metric pair".to_string(),
+        ));
+    }
+    finals.sort_by_key(|(checkpoint, _, _)| checkpoint.metric.slug());
+    let expected_metrics = [UsageMetric::CpuUsec, UsageMetric::MemoryByteMillis];
+    if finals
+        .iter()
+        .map(|(checkpoint, _, _)| checkpoint.metric)
+        .ne(expected_metrics)
+    {
+        return Err(MeteringError::Conflict(
+            "source epoch final marker does not contain the exact compute meter set".to_string(),
+        ));
+    }
+    let (first, binding, _) = finals[0];
+    let (second, second_binding, _) = finals[1];
+    if first.sequence != second.sequence
+        || first.observed_at_unix_ms != second.observed_at_unix_ms
+        || first.cat_id != second.cat_id
+        || binding != second_binding
+        || projected.iter().any(|(checkpoint, candidate_binding, _)| {
+            checkpoint.sequence > first.sequence || candidate_binding != binding
+        })
+    {
+        return Err(MeteringError::Conflict(
+            "source epoch final metrics do not share one terminal runtime binding".to_string(),
+        ));
+    }
+    Ok(Some(UsageSourceTerminalReceipt {
+        contract_version: 1,
+        source_id: source_id.to_string(),
+        source_epoch: source_epoch.to_string(),
+        cat_id: first.cat_id.clone(),
+        source_binding: binding.clone(),
+        final_sequence: first.sequence,
+        final_observed_at_unix_ms: first.observed_at_unix_ms,
+        final_events: finals
+            .into_iter()
+            .map(|(checkpoint, _, archive)| UsageTerminalEventEvidence {
+                event_id: checkpoint.event_id.clone(),
+                metric: checkpoint.metric,
+                cumulative_quantity: checkpoint.cumulative_quantity,
+                archive: archive.clone(),
+            })
+            .collect(),
+    }))
+}
+
+pub fn decode_terminal_receipt(
+    receipt_json: &str,
+    expected_sha256: &str,
+) -> Result<UsageSourceTerminalReceipt> {
+    if sha256_prefixed(receipt_json.as_bytes()) != expected_sha256 {
+        return Err(MeteringError::Store(
+            "source terminal receipt digest does not match its immutable JSON".to_string(),
+        ));
+    }
+    serde_json::from_str(receipt_json).map_err(Into::into)
+}
+
+pub fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+pub fn target_terminal_request_sha256(request: &UsageTargetTerminalRequest) -> Result<String> {
+    validate_target_terminal_request(request)?;
+    Ok(sha256_prefixed(&serde_json::to_vec(request)?))
+}
+
+pub fn target_terminal_marker(
+    request: &UsageTargetTerminalRequest,
+    shard_id: &str,
+) -> Result<UsageTerminalShardMarker> {
+    let request_sha256 = target_terminal_request_sha256(request)?;
+    let shard = request
+        .shards
+        .iter()
+        .find(|shard| shard.shard_id == shard_id)
+        .ok_or_else(|| MeteringError::Invalid("terminal marker shard is not requested".into()))?;
+    let mut hasher = Sha256::new();
+    for value in [request_sha256.as_str(), shard.shard_id.as_str()] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Ok(UsageTerminalShardMarker {
+        contract_version: 1,
+        terminal_epoch_id: request.terminal_epoch_id.clone(),
+        request_sha256,
+        marker_id: format!("usage_terminal_marker_{}", hex::encode(hasher.finalize())),
+        shard_id: shard.shard_id.clone(),
+    })
+}
+
+pub fn validate_target_terminal_request(request: &UsageTargetTerminalRequest) -> Result<()> {
+    if request.contract_version != 1 || request.created_at_unix_ms < 0 {
+        return Err(MeteringError::Invalid(
+            "target terminal request version or creation time is invalid".into(),
+        ));
+    }
+    if request.release_commit.len() != 40
+        || !lower_hex(&request.release_commit)
+        || request.artifact_sha256.len() != 64
+        || !lower_hex(&request.artifact_sha256)
+    {
+        return Err(MeteringError::Invalid(
+            "target terminal release binding is not canonical".into(),
+        ));
+    }
+    validate_usage_target(&request.old_target)?;
+    validate_usage_target(&request.fresh_target)?;
+    if request.old_target.aws_account_id != request.fresh_target.aws_account_id
+        || request.old_target.aws_region != request.fresh_target.aws_region
+    {
+        return Err(MeteringError::Invalid(
+            "old and fresh Usage targets are not in one AWS authority boundary".into(),
+        ));
+    }
+    for (old, fresh, name) in [
+        (
+            request.old_target.usage_schema.as_str(),
+            request.fresh_target.usage_schema.as_str(),
+            "usage schema",
+        ),
+        (
+            request.old_target.stream_arn.as_str(),
+            request.fresh_target.stream_arn.as_str(),
+            "Kinesis stream",
+        ),
+        (
+            request.old_target.checkpoint_table_arn.as_str(),
+            request.fresh_target.checkpoint_table_arn.as_str(),
+            "checkpoint table",
+        ),
+        (
+            request.old_target.archive_bucket_arn.as_str(),
+            request.fresh_target.archive_bucket_arn.as_str(),
+            "archive bucket",
+        ),
+    ] {
+        if old == fresh {
+            return Err(MeteringError::Invalid(format!(
+                "old and fresh {name} overlap"
+            )));
+        }
+    }
+    if request.sources.windows(2).any(|pair| {
+        (&pair[0].source_id, &pair[0].source_epoch) >= (&pair[1].source_id, &pair[1].source_epoch)
+    }) {
+        return Err(MeteringError::Invalid(
+            "terminal source expectations are not strictly sorted".into(),
+        ));
+    }
+    for source in &request.sources {
+        if source.source_id.is_empty()
+            || source.source_epoch.is_empty()
+            || !canonical_sha256(&source.receipt_sha256)
+        {
+            return Err(MeteringError::Invalid(
+                "terminal source expectation is not canonical".into(),
+            ));
+        }
+    }
+    let expected_source_set = sha256_prefixed(&serde_json::to_vec(&request.sources)?);
+    if request.source_set_sha256 != expected_source_set {
+        return Err(MeteringError::Invalid(format!(
+            "terminal source_set_sha256 must be {expected_source_set}"
+        )));
+    }
+    if request.shards.is_empty()
+        || request
+            .shards
+            .windows(2)
+            .any(|pair| pair[0].shard_id >= pair[1].shard_id)
+    {
+        return Err(MeteringError::Invalid(
+            "terminal shard targets must be nonempty and strictly sorted".into(),
+        ));
+    }
+    for shard in &request.shards {
+        let shard_suffix = shard.shard_id.strip_prefix("shardId-");
+        if shard_suffix.is_none_or(|suffix| {
+            suffix.len() != 12 || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }) || !canonical_unsigned_decimal(&shard.explicit_hash_key, 39)
+            || shard.explicit_hash_key.len() == 39
+                && shard.explicit_hash_key.as_str() > "340282366920938463463374607431768211455"
+        {
+            return Err(MeteringError::Invalid(
+                "terminal shard target is not canonical".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_target_terminal_receipt(receipt: &UsageTargetTerminalReceipt) -> Result<()> {
+    if receipt.contract_version != 1
+        || receipt.request_sha256 != target_terminal_request_sha256(&receipt.request)?
+    {
+        return Err(MeteringError::Invalid(
+            "target terminal receipt request binding is invalid".into(),
+        ));
+    }
+    if receipt.source_receipts.len() != receipt.request.sources.len()
+        || receipt.barriers.len() != receipt.request.shards.len()
+    {
+        return Err(MeteringError::Invalid(
+            "target terminal receipt does not close the exact source and shard sets".into(),
+        ));
+    }
+    for (expected, actual) in receipt.request.sources.iter().zip(&receipt.source_receipts) {
+        let actual_sha256 = sha256_prefixed(&serde_json::to_vec(actual)?);
+        if expected.source_id != actual.source_id
+            || expected.source_epoch != actual.source_epoch
+            || expected.receipt_sha256 != actual_sha256
+        {
+            return Err(MeteringError::Invalid(
+                "target terminal receipt contains a foreign source receipt".into(),
+            ));
+        }
+    }
+    for (expected, actual) in receipt.request.shards.iter().zip(&receipt.barriers) {
+        let marker = target_terminal_marker(&receipt.request, &expected.shard_id)?;
+        if actual.marker != marker
+            || actual.archive.shard_id != expected.shard_id
+            || actual.archive.stream_name != receipt.request.old_target.stream_name
+            || actual.archive.archive_bucket != receipt.request.old_target.archive_bucket_name
+        {
+            return Err(MeteringError::Invalid(
+                "target terminal receipt contains a foreign shard barrier".into(),
+            ));
+        }
+        validate_archive_evidence(&actual.archive)?;
+    }
+    Ok(())
+}
+
+fn validate_usage_target(target: &UsageTargetBinding) -> Result<()> {
+    if target.aws_account_id.len() != 12
+        || !target
+            .aws_account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        || target.aws_region.is_empty()
+        || target.usage_schema.is_empty()
+    {
+        return Err(MeteringError::Invalid(
+            "Usage target account, region or schema is invalid".into(),
+        ));
+    }
+    for value in [
+        target.stream_name.as_str(),
+        target.stream_arn.as_str(),
+        target.checkpoint_table_name.as_str(),
+        target.checkpoint_table_arn.as_str(),
+        target.archive_bucket_name.as_str(),
+        target.archive_bucket_arn.as_str(),
+    ] {
+        if value.is_empty() || value.len() > 2_048 {
+            return Err(MeteringError::Invalid(
+                "Usage target resource identity is invalid".into(),
+            ));
+        }
+    }
+    let stream_arn = parse_arn(&target.stream_arn).filter(|parts| {
+        parts.service == "kinesis"
+            && parts.region == target.aws_region
+            && parts.account == target.aws_account_id
+            && parts.resource == format!("stream/{}", target.stream_name)
+    });
+    let table_arn = parse_arn(&target.checkpoint_table_arn).filter(|parts| {
+        parts.service == "dynamodb"
+            && parts.region == target.aws_region
+            && parts.account == target.aws_account_id
+            && parts.resource == format!("table/{}", target.checkpoint_table_name)
+    });
+    let bucket_arn = parse_arn(&target.archive_bucket_arn).filter(|parts| {
+        parts.service == "s3"
+            && parts.region.is_empty()
+            && parts.account.is_empty()
+            && parts.resource == target.archive_bucket_name
+    });
+    let partitions_match =
+        stream_arn
+            .zip(table_arn)
+            .zip(bucket_arn)
+            .is_some_and(|((stream, table), bucket)| {
+                !stream.partition.is_empty()
+                    && stream.partition == table.partition
+                    && stream.partition == bucket.partition
+            });
+    if !partitions_match {
+        return Err(MeteringError::Invalid(
+            "Usage target ARNs do not exactly bind their account, region and resource names".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct ArnParts<'a> {
+    partition: &'a str,
+    service: &'a str,
+    region: &'a str,
+    account: &'a str,
+    resource: &'a str,
+}
+
+fn parse_arn(value: &str) -> Option<ArnParts<'_>> {
+    let mut parts = value.splitn(6, ':');
+    (parts.next()? == "arn").then_some(ArnParts {
+        partition: parts.next()?,
+        service: parts.next()?,
+        region: parts.next()?,
+        account: parts.next()?,
+        resource: parts.next()?,
+    })
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && lower_hex(digest))
+}
+
+fn lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_unsigned_decimal(value: &str, maximum_digits: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_digits
+        && (value.len() == 1 || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn migrate_sqlite_u128(conn: &mut Connection) -> Result<()> {
     let quantity_type: String = conn.query_row(
         "SELECT type FROM pragma_table_info('usage_checkpoints')
@@ -1605,10 +2606,52 @@ CREATE TABLE IF NOT EXISTS usage_checkpoints (
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
     payload_json TEXT NOT NULL,
+    source_binding_json TEXT NOT NULL,
     UNIQUE (source_id, source_epoch, metric, sequence)
 );
 CREATE INDEX IF NOT EXISTS usage_checkpoints_account_time
 ON usage_checkpoints(billing_account_id, observed_at_ms);
+
+CREATE TABLE IF NOT EXISTS usage_archive_projections (
+    event_id TEXT PRIMARY KEY REFERENCES usage_checkpoints(event_id),
+    stream_name TEXT NOT NULL,
+    archive_bucket TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
+    sequence_number TEXT NOT NULL,
+    archive_key TEXT NOT NULL,
+    archive_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS usage_archive_projection_position
+ON usage_archive_projections(stream_name, shard_id, sequence_number);
+CREATE TRIGGER IF NOT EXISTS usage_archive_projections_insert_only_update
+BEFORE UPDATE ON usage_archive_projections
+BEGIN
+    SELECT RAISE(ABORT, 'usage archive projections are insert-only');
+END;
+CREATE TRIGGER IF NOT EXISTS usage_archive_projections_insert_only_delete
+BEFORE DELETE ON usage_archive_projections
+BEGIN
+    SELECT RAISE(ABORT, 'usage archive projections are insert-only');
+END;
+
+CREATE TABLE IF NOT EXISTS usage_source_terminal_receipts (
+    source_id TEXT NOT NULL,
+    source_epoch TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    PRIMARY KEY(source_id, source_epoch)
+);
+CREATE TRIGGER IF NOT EXISTS usage_source_terminal_receipts_insert_only_update
+BEFORE UPDATE ON usage_source_terminal_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'usage source terminal receipts are insert-only');
+END;
+CREATE TRIGGER IF NOT EXISTS usage_source_terminal_receipts_insert_only_delete
+BEFORE DELETE ON usage_source_terminal_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'usage source terminal receipts are insert-only');
+END;
 
 CREATE TABLE IF NOT EXISTS usage_intervals (
     end_event_id TEXT PRIMARY KEY,
@@ -1706,11 +2749,26 @@ mod tests {
             cat_id: "cat-a".to_string(),
             cat_generation: 7,
             metric,
+            epoch_marker: UsageEpochMarker::Open,
             cumulative_quantity,
         };
         checkpoint.event_id = deterministic_event_id(&checkpoint);
         AttributedCheckpoint {
             checkpoint,
+            source_binding: RuntimeUsageSourceBinding {
+                session: SessionBinding {
+                    node_id: cats_api::runtime_reconciliation::Id::new("node-a").unwrap(),
+                    node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                        "11111111111111111111111111111111",
+                    )
+                    .unwrap(),
+                    agent_instance_id: RandomId128::new("22222222222222222222222222222222")
+                        .unwrap(),
+                    agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+                },
+                desired_revision: Revision::new(7).unwrap(),
+                runtime_incarnation: RandomId128::new("33333333333333333333333333333333").unwrap(),
+            },
             attribution: UsageAttribution {
                 billing_account_id: "ba-org-a".to_string(),
                 workspace_id: "workspace-a".to_string(),
@@ -2066,5 +3124,109 @@ mod tests {
         meter.observe(1_000, 500, 1_000).unwrap();
         let error = meter.observe(2_000, 100, 1_000).unwrap_err();
         assert!(matches!(error, MeteringError::Conflict(_)));
+    }
+
+    fn archived(value: AttributedCheckpoint, sequence_number: &str) -> ArchivedUsageCheckpoint {
+        ArchivedUsageCheckpoint {
+            value,
+            archive: UsageArchiveEvidence {
+                stream_name: "usage-old".to_owned(),
+                archive_bucket: "usage-old-archive".to_owned(),
+                shard_id: "shardId-000000000000".to_owned(),
+                sequence_number: sequence_number.to_owned(),
+                archive_key: format!(
+                    "raw/day=1/shard=shardId-000000000000/{sequence_number}-{sequence_number}.ndjson"
+                ),
+                archive_sha256: format!("sha256:{}", "a".repeat(64)),
+            },
+        }
+    }
+
+    fn final_checkpoint(
+        sequence: u64,
+        observed_at_unix_ms: i64,
+        quantity: u128,
+        metric: UsageMetric,
+    ) -> AttributedCheckpoint {
+        let mut value = checkpoint(sequence, observed_at_unix_ms, quantity, metric);
+        value.checkpoint.epoch_marker = UsageEpochMarker::Final;
+        value.checkpoint.event_id = deterministic_event_id(&value.checkpoint);
+        value
+    }
+
+    #[test]
+    fn source_receipt_appears_only_after_both_final_events_are_archived() {
+        let ledger = ledger();
+        let cpu = final_checkpoint(9, 11_000, 900, UsageMetric::CpuUsec);
+        let memory = final_checkpoint(9, 11_000, 4_096, UsageMetric::MemoryByteMillis);
+        ledger.project_archived(&archived(cpu, "41")).unwrap();
+        assert!(ledger
+            .source_terminal_receipt("node/node-a/cat/cat-a", "runtime-7")
+            .unwrap()
+            .is_none());
+
+        ledger.project_archived(&archived(memory, "42")).unwrap();
+        let receipt = ledger
+            .source_terminal_receipt("node/node-a/cat/cat-a", "runtime-7")
+            .unwrap()
+            .expect("the exact final meter pair must close the source");
+        assert_eq!(receipt.final_sequence, 9);
+        assert_eq!(receipt.final_events.len(), 2);
+        assert_eq!(receipt.final_events[0].metric, UsageMetric::CpuUsec);
+        assert_eq!(
+            receipt.final_events[1].metric,
+            UsageMetric::MemoryByteMillis
+        );
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert!(!json.contains("session"));
+        assert!(json.contains("\"agent_epoch\":1"));
+    }
+
+    #[test]
+    fn terminal_source_rejects_a_brand_new_open_event_but_exact_final_replays() {
+        let ledger = ledger();
+        let cpu = final_checkpoint(9, 11_000, 900, UsageMetric::CpuUsec);
+        let memory = final_checkpoint(9, 11_000, 4_096, UsageMetric::MemoryByteMillis);
+        ledger
+            .project_archived(&archived(cpu.clone(), "41"))
+            .unwrap();
+        ledger
+            .project_archived(&archived(memory.clone(), "42"))
+            .unwrap();
+        assert_eq!(
+            ledger.project_archived(&archived(memory, "42")).unwrap(),
+            IngestOutcome::Duplicate
+        );
+        let later = checkpoint(10, 12_000, 1_000, UsageMetric::CpuUsec);
+        assert!(matches!(
+            ledger.project_archived(&archived(later, "43")),
+            Err(MeteringError::Conflict(_))
+        ));
+        assert!(ledger
+            .source_terminal_receipt("node/node-a/cat/cat-a", "runtime-7")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn pending_final_candidate_does_not_advance_and_snapshot_resumes_exactly() {
+        let mut meter = RuntimeMeterAccumulator::new(
+            "node/node-a/cat/cat-a".to_owned(),
+            "runtime-a".to_owned(),
+            "cat-a".to_owned(),
+            1,
+        )
+        .unwrap();
+        meter.observe(1_000, 100, 4_096).unwrap();
+        let candidate = meter.final_checkpoint_candidate().unwrap();
+        assert_eq!(candidate[0].sequence, 0);
+        let snapshot = meter.snapshot();
+        let mut resumed = RuntimeMeterAccumulator::from_snapshot(snapshot).unwrap();
+        assert_eq!(resumed.final_checkpoint_candidate().unwrap(), candidate);
+        resumed.observe(2_000, 200, 8_192).unwrap();
+        let open = resumed.checkpoint().unwrap();
+        assert_eq!(open[0].sequence, 0);
+        assert_eq!(open[0].epoch_marker, UsageEpochMarker::Open);
+        assert_eq!(open[1].cumulative_quantity, 4_096_000);
     }
 }

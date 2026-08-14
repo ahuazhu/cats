@@ -80,6 +80,17 @@ async fn mock_usage_ok(State(cp): State<MockControlPlane>, body: Bytes) -> Respo
             accepted: u64::try_from(request.checkpoints.len()).unwrap(),
             duplicates: 0,
             rejected: Vec::new(),
+            results: request
+                .checkpoints
+                .into_iter()
+                .map(
+                    |checkpoint| cats_api::metering::UsageCheckpointIngestResult {
+                        event_id: checkpoint.event_id,
+                        outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                        reason: None,
+                    },
+                )
+                .collect(),
         })
         .unwrap(),
     )
@@ -189,6 +200,7 @@ fn seed_spool(state_dir: &std::path::Path) {
             cat_id: "cat_seed".into(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: 1_000,
         }])
         .unwrap();

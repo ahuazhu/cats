@@ -30,7 +30,7 @@ use cats_api::runtime_reconciliation::{
     encode_agent_registration_attempt, encode_desired_read_request, encode_node_observation,
     guest_config_digest, inventory_digest, AgentRegistrationAttempt, ContractVersion,
     CredentialBinding, DesiredReadRequest, Epoch, Id, NodeBootId, NodeIdentity, NodeIdentityState,
-    NodeObservation, RandomId128, Sequence, SessionBinding, UnixMillis,
+    NodeObservation, RandomId128, Revision, Sequence, SessionBinding, UnixMillis,
 };
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{
@@ -39,7 +39,8 @@ use cats_control_plane::server::{
 use cats_control_plane::store::{DsnSource, OciDeploymentClaim, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
-    deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
+    deterministic_event_id, AttributedCheckpoint, IngestOutcome, RuntimeUsageSourceBinding,
+    SqliteUsageStore, UsageAttribution,
 };
 use cats_storage::MetadataStore;
 
@@ -3001,18 +3002,25 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("metered", None).await;
     let cat = ctx.wait_observed("metered", ObservedState::Running).await;
+    let source_epoch = format!(
+        "session:{}:{}:desired:{}:runtime:33333333333333333333333333333333:processes:test-scope:1:1:runtime",
+        usage_node.session.agent_instance_id,
+        usage_node.session.agent_session_epoch.get(),
+        cat.generation,
+    );
 
     let make_checkpoint =
         |metric: UsageMetric, sequence: u64, observed_at_unix_ms: i64, quantity: u128| {
             let mut checkpoint = CatUsageCheckpoint {
                 event_id: String::new(),
                 source_id: format!("node/node_a/cat/{}", cat.id),
-                source_epoch: "runtime-1".to_string(),
+                source_epoch: source_epoch.clone(),
                 sequence,
                 observed_at_unix_ms,
                 cat_id: cat.id.clone(),
                 cat_generation: cat.generation,
                 metric,
+                epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                 cumulative_quantity: quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
@@ -3040,6 +3048,15 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             .state
             .usage
             .ingest(&AttributedCheckpoint {
+                source_binding: RuntimeUsageSourceBinding {
+                    session: usage_node.session.clone(),
+                    desired_revision: Revision::new(
+                        u64::try_from(request.checkpoints[0].cat_generation).unwrap(),
+                    )
+                    .unwrap(),
+                    runtime_incarnation: RandomId128::new("33333333333333333333333333333333",)
+                        .unwrap(),
+                },
                 attribution: UsageAttribution {
                     billing_account_id: ctx
                         .cp
@@ -4858,17 +4875,23 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("billable", None).await;
     let cat = ctx.wait_observed("billable", ObservedState::Running).await;
+    let source_epoch = format!(
+        "session:{}:{}:desired:1:runtime:33333333333333333333333333333333:processes:test-scope:1:1:runtime",
+        usage_node.session.agent_instance_id,
+        usage_node.session.agent_session_epoch.get(),
+    );
 
     let checkpoint = |cat_id: &str, sequence, observed_at_unix_ms, quantity| {
         let mut checkpoint = CatUsageCheckpoint {
             event_id: String::new(),
             source_id: format!("node/node_a/cat/{cat_id}"),
-            source_epoch: "epoch-a".to_string(),
+            source_epoch: source_epoch.clone(),
             sequence,
             observed_at_unix_ms,
             cat_id: cat_id.to_string(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: quantity,
         };
         checkpoint.event_id = deterministic_event_id(&checkpoint);
@@ -4885,6 +4908,12 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
             .state
             .usage
             .ingest(&AttributedCheckpoint {
+                source_binding: RuntimeUsageSourceBinding {
+                    session: usage_node.session.clone(),
+                    desired_revision: Revision::new(1).unwrap(),
+                    runtime_incarnation: RandomId128::new("33333333333333333333333333333333",)
+                        .unwrap(),
+                },
                 attribution: UsageAttribution {
                     billing_account_id: ctx
                         .cp

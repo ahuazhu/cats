@@ -11,24 +11,32 @@ use cats_api::metering::{CatUsageCheckpoint, USAGE_CHECKPOINTS_PATH};
 use cats_api::runtime_reconciliation::{
     AgentSession, DesiredRuntimeSpec, NodeObservation, ProcessRole, SessionBinding, StableState,
 };
-use cats_metering::RuntimeMeterAccumulator;
+use cats_metering::{RuntimeMeterAccumulator, RuntimeMeterAccumulatorSnapshot};
 
 use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
 };
 use crate::usage_delivery::{deliver_usage_batches, session_binding, UsageDeliveryState};
-use crate::usage_spool::UsageSpool;
+use crate::usage_spool::{PendingUsageFinal, UsageSpool};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignedMeterTarget {
     cat_id: String,
     generation: i64,
     source_epoch: String,
     cgroups: Vec<PathBuf>,
+}
+
+struct PendingFinalCandidate {
+    cat_id: String,
+    target_json: String,
+    accumulator: RuntimeMeterAccumulatorSnapshot,
+    checkpoints: Vec<CatUsageCheckpoint>,
 }
 
 struct SignedMeterState {
@@ -58,7 +66,8 @@ impl SignedUsageSampler {
     fn update_observation(
         &mut self,
         observation: &NodeObservation,
-    ) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+        spool: &UsageSpool,
+    ) -> anyhow::Result<(Vec<CatUsageCheckpoint>, bool)> {
         anyhow::ensure!(
             observation.complete_inventory
                 && observation.node_id == self.session.node_id
@@ -77,10 +86,10 @@ impl SignedUsageSampler {
                 "accepted observation contains duplicate usage targets"
             );
         }
-
         let now = Instant::now();
         let observed_at_unix_ms = now_unix_ms()?;
         let mut checkpoints = Vec::new();
+        let promoted_pending = self.resolve_pending(&next, spool)?;
         for (cat_id, meter) in &mut self.meters {
             let remains_same = next
                 .get(cat_id)
@@ -102,7 +111,68 @@ impl SignedUsageSampler {
                 }
             }
         }
-        Ok(checkpoints)
+        Ok((checkpoints, promoted_pending))
+    }
+
+    fn resolve_pending(
+        &mut self,
+        next: &BTreeMap<String, SignedMeterTarget>,
+        spool: &UsageSpool,
+    ) -> anyhow::Result<bool> {
+        for target in next.values() {
+            let source_id = format!("node/{}/cat/{}", self.node_id, target.cat_id);
+            anyhow::ensure!(
+                !spool.source_was_promoted(&source_id, &target.source_epoch)?,
+                "accepted observation attempted to reopen promoted Usage source epoch {}",
+                target.source_epoch
+            );
+        }
+        let mut promoted_pending = false;
+        for pending in spool.pending_finals()? {
+            let target: SignedMeterTarget = serde_json::from_str(&pending.target_json)
+                .context("decode pending signed Usage target")?;
+            anyhow::ensure!(
+                target.cat_id == pending.cat_id,
+                "pending signed Usage target Cat does not match its key"
+            );
+            let remains_same = next
+                .get(&pending.cat_id)
+                .is_some_and(|candidate| candidate == &target);
+            if remains_same {
+                match self.meters.get_mut(&pending.cat_id) {
+                    Some(meter) => {
+                        anyhow::ensure!(
+                            meter.target == target
+                                && meter.accumulator.snapshot() == pending.accumulator,
+                            "pending signed Usage resume conflicts with the live accumulator"
+                        );
+                    }
+                    None => {
+                        self.meters.insert(
+                            pending.cat_id.clone(),
+                            restored_meter(&self.node_id, target, &pending)?,
+                        );
+                    }
+                }
+                spool.cancel_pending_final(&pending.cat_id, &pending.target_json)?;
+                self.meters
+                    .get_mut(&pending.cat_id)
+                    .context("resumed signed Usage meter vanished")?
+                    .active = true;
+            } else {
+                anyhow::ensure!(
+                    spool.promote_pending_final(&pending.cat_id, &pending.target_json)?,
+                    "pending signed Usage final vanished before accepted postcondition"
+                );
+                promoted_pending = true;
+                if let Some(meter) = self.meters.get_mut(&pending.cat_id) {
+                    if meter.target == target {
+                        meter.active = false;
+                    }
+                }
+            }
+        }
+        Ok(promoted_pending)
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
@@ -125,19 +195,27 @@ impl SignedUsageSampler {
         Ok(checkpoints)
     }
 
-    fn finalize_before_effect(
+    fn stage_cat_before_effect(
         &mut self,
-        desired: &DesiredRuntimeSpec,
-    ) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
-        let Some(meter) = self.meters.get_mut(desired.cat_id.as_str()) else {
-            return Ok(Vec::new());
+        cat_id: &str,
+    ) -> anyhow::Result<Option<PendingFinalCandidate>> {
+        let Some(meter) = self.meters.get_mut(cat_id) else {
+            return Ok(None);
         };
         if !meter.active {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let checkpoints = sample_meter(meter, Instant::now(), now_unix_ms()?, true)?;
+        observe_meter(meter, now_unix_ms()?)?;
+        let accumulator = meter.accumulator.snapshot();
+        let checkpoints = meter.accumulator.final_checkpoint_candidate()?.into();
+        let target_json = serde_json::to_string(&meter.target)?;
         meter.active = false;
-        Ok(checkpoints)
+        Ok(Some(PendingFinalCandidate {
+            cat_id: meter.target.cat_id.clone(),
+            target_json,
+            accumulator,
+            checkpoints,
+        }))
     }
 
     fn target_for_runtime(
@@ -232,12 +310,30 @@ fn new_meter(node_id: &str, target: SignedMeterTarget) -> anyhow::Result<SignedM
     })
 }
 
-fn sample_meter(
-    meter: &mut SignedMeterState,
-    now: Instant,
-    observed_at_unix_ms: i64,
-    force_checkpoint: bool,
-) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+fn restored_meter(
+    node_id: &str,
+    target: SignedMeterTarget,
+    pending: &PendingUsageFinal,
+) -> anyhow::Result<SignedMeterState> {
+    anyhow::ensure!(
+        pending.accumulator.source_id == format!("node/{node_id}/cat/{}", target.cat_id)
+            && pending.accumulator.source_epoch == target.source_epoch
+            && pending.accumulator.cat_id == target.cat_id
+            && pending.accumulator.cat_generation == target.generation,
+        "pending signed Usage accumulator does not bind its runtime target"
+    );
+    Ok(SignedMeterState {
+        target,
+        accumulator: RuntimeMeterAccumulator::from_snapshot(pending.accumulator.clone())?,
+        // Force a fresh open checkpoint quickly after recovery. If the process
+        // crashes before then, the still-durable pending row can be evaluated
+        // again by the next accepted inventory.
+        last_checkpoint_at: None,
+        active: false,
+    })
+}
+
+fn observe_meter(meter: &mut SignedMeterState, observed_at_unix_ms: i64) -> anyhow::Result<()> {
     let (cpu_usage_usec, memory_current_bytes) = read_cgroup_usage(&meter.target.cgroups)?;
     if meter
         .accumulator
@@ -248,6 +344,16 @@ fn sample_meter(
             .accumulator
             .observe(observed_at_unix_ms, cpu_usage_usec, memory_current_bytes)?;
     }
+    Ok(())
+}
+
+fn sample_meter(
+    meter: &mut SignedMeterState,
+    now: Instant,
+    observed_at_unix_ms: i64,
+    force_checkpoint: bool,
+) -> anyhow::Result<Vec<CatUsageCheckpoint>> {
+    observe_meter(meter, observed_at_unix_ms)?;
     let due = force_checkpoint
         || meter
             .last_checkpoint_at
@@ -255,7 +361,11 @@ fn sample_meter(
     if !due {
         return Ok(Vec::new());
     }
-    let checkpoints = meter.accumulator.checkpoint()?;
+    let checkpoints = if force_checkpoint {
+        meter.accumulator.final_checkpoint()?
+    } else {
+        meter.accumulator.checkpoint()?
+    };
     meter.last_checkpoint_at = Some(now);
     Ok(checkpoints.into())
 }
@@ -361,12 +471,16 @@ impl SignedUsagePipeline {
     }
 
     pub(crate) fn update_observation(&self, observation: &NodeObservation) -> anyhow::Result<()> {
-        let checkpoints = self
+        let (checkpoints, promoted_pending) = self
             .sampler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .update_observation(observation)?;
-        self.persist(checkpoints)
+            .update_observation(observation, &self.spool)?;
+        self.persist(checkpoints)?;
+        if promoted_pending {
+            self.delivery_wake.notify_one();
+        }
+        Ok(())
     }
 
     pub(crate) fn sample(&self) -> anyhow::Result<()> {
@@ -387,16 +501,82 @@ impl SignedUsagePipeline {
         self.persist(checkpoints)
     }
 
-    pub(crate) fn finalize_before_effect(
-        &self,
-        desired: &DesiredRuntimeSpec,
-    ) -> anyhow::Result<()> {
-        let checkpoints = self
+    pub(crate) fn stage_before_effect(&self, desired: &DesiredRuntimeSpec) -> anyhow::Result<()> {
+        self.stage_cat_before_effect(desired.cat_id.as_str())
+    }
+
+    fn stage_cat_before_effect(&self, cat_id: &str) -> anyhow::Result<()> {
+        let existing = self
+            .spool
+            .pending_finals()?
+            .into_iter()
+            .find(|pending| pending.cat_id == cat_id);
+        let mut sampler = self
             .sampler
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .finalize_before_effect(desired)?;
-        self.persist(checkpoints)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = existing {
+            let target: SignedMeterTarget = serde_json::from_str(&existing.target_json)
+                .context("decode retried pending signed Usage target")?;
+            let meter = sampler
+                .meters
+                .get_mut(cat_id)
+                .context("pending signed Usage effect has no live meter")?;
+            anyhow::ensure!(
+                meter.target == target && meter.accumulator.snapshot() == existing.accumulator,
+                "retried signed Usage effect conflicts with its pending final candidate"
+            );
+            meter.active = false;
+            return Ok(());
+        }
+        let Some(candidate) = sampler.stage_cat_before_effect(cat_id)? else {
+            return Ok(());
+        };
+        if let Err(error) = self.spool.stage_pending_final(
+            &candidate.cat_id,
+            &candidate.target_json,
+            &candidate.accumulator,
+            &candidate.checkpoints,
+        ) {
+            if let Some(meter) = sampler.meters.get_mut(&candidate.cat_id) {
+                meter.active = true;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_pending_effect(&self, desired: &DesiredRuntimeSpec) -> anyhow::Result<()> {
+        self.cancel_pending_cat(desired.cat_id.as_str())
+    }
+
+    fn cancel_pending_cat(&self, cat_id: &str) -> anyhow::Result<()> {
+        let Some(pending) = self
+            .spool
+            .pending_finals()?
+            .into_iter()
+            .find(|pending| pending.cat_id == cat_id)
+        else {
+            return Ok(());
+        };
+        let target: SignedMeterTarget = serde_json::from_str(&pending.target_json)
+            .context("decode cancelled pending signed Usage target")?;
+        let mut sampler = self
+            .sampler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let meter = sampler
+            .meters
+            .get_mut(cat_id)
+            .context("cancelled pending signed Usage effect has no live meter")?;
+        anyhow::ensure!(
+            meter.target == target && meter.accumulator.snapshot() == pending.accumulator,
+            "cancelled signed Usage effect conflicts with its pending final candidate"
+        );
+        self.spool
+            .cancel_pending_final(&pending.cat_id, &pending.target_json)?;
+        meter.active = true;
+        Ok(())
     }
 
     fn persist(&self, checkpoints: Vec<CatUsageCheckpoint>) -> anyhow::Result<()> {
@@ -448,8 +628,23 @@ impl RuntimeDesiredEffect for MeteredRuntimeDesiredEffect {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
-        self.usage.finalize_before_effect(desired)?;
-        self.inner.apply(context, desired)
+        self.usage.stage_before_effect(desired)?;
+        match self.inner.apply(context, desired) {
+            Ok(outcome) => {
+                if !matches!(
+                    outcome,
+                    RuntimeDesiredEffectOutcome::RetryExact
+                        | RuntimeDesiredEffectOutcome::RefreshInventory
+                ) {
+                    self.usage.cancel_pending_effect(desired)?;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.usage.cancel_pending_effect(desired)?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -521,7 +716,7 @@ async fn wait_for_usage_shutdown(shutdown: &mut tokio::sync::watch::Receiver<boo
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -533,7 +728,7 @@ mod tests {
     use cats_api::agent_registration::Ed25519RequestSigner;
     use cats_api::metering::{
         CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
-        UsageMetric, MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+        UsageEpochMarker, UsageMetric, MAX_USAGE_CHECKPOINTS_PER_REQUEST,
     };
     use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
     use ring::rand::SystemRandom;
@@ -546,6 +741,58 @@ mod tests {
     };
     use crate::usage_delivery::UsageDeliveryState;
     use crate::usage_spool::UsageSpool;
+
+    fn test_session() -> SessionBinding {
+        SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(3).unwrap(),
+        }
+    }
+
+    fn test_pipeline_with_meter(directory: &Path) -> (SignedUsagePipeline, SignedMeterTarget) {
+        let cgroup = directory.join("cat-a.service");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 41\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "4096\n").unwrap();
+        let session = test_session();
+        let target = SignedMeterTarget {
+            cat_id: "cat-a".to_owned(),
+            generation: 7,
+            source_epoch: signed_source_epoch(
+                &session,
+                7,
+                "33333333333333333333333333333333",
+                "vmm:cat-a.service:41:99",
+            ),
+            cgroups: vec![cgroup],
+        };
+        let mut sampler = SignedUsageSampler::new(session.clone(), PathBuf::new());
+        sampler.meters.insert(
+            target.cat_id.clone(),
+            new_meter("node-a", target.clone()).unwrap(),
+        );
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519RequestSigner::from_pkcs8_der(
+            Id::new("credential-a").unwrap(),
+            document.as_ref(),
+        )
+        .unwrap();
+        (
+            SignedUsagePipeline {
+                sampler: Mutex::new(sampler),
+                spool: UsageSpool::open(&directory.join("usage-spool.sqlite3")).unwrap(),
+                delivery: tokio::sync::Mutex::new(UsageDeliveryState::default()),
+                delivery_wake: tokio::sync::Notify::new(),
+                client: reqwest::Client::new(),
+                endpoint: "http://127.0.0.1/unused".to_owned(),
+                signer,
+                session,
+            },
+            target,
+        )
+    }
 
     #[test]
     fn desired_revision_separates_accumulator_epochs_after_counter_reset() {
@@ -561,6 +808,108 @@ mod tests {
         assert_ne!(first, next);
         assert!(first.contains(":desired:7:"));
         assert!(next.contains(":desired:8:"));
+    }
+
+    #[test]
+    fn effect_failure_cancels_pending_final_without_publishing_terminal_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline_with_meter(directory.path());
+
+        pipeline.stage_cat_before_effect("cat-a").unwrap();
+        assert_eq!(pipeline.spool.pending_final_len().unwrap(), 1);
+        assert_eq!(pipeline.spool.len().unwrap(), 0);
+        pipeline.cancel_pending_cat("cat-a").unwrap();
+
+        assert_eq!(pipeline.spool.pending_final_len().unwrap(), 0);
+        assert_eq!(pipeline.spool.len().unwrap(), 0);
+        assert!(
+            pipeline
+                .sampler
+                .lock()
+                .unwrap()
+                .meters
+                .get("cat-a")
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
+    fn same_target_observation_resumes_pending_accumulator_without_a_final_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, target) = test_pipeline_with_meter(directory.path());
+        pipeline.stage_cat_before_effect("cat-a").unwrap();
+        let next = BTreeMap::from([("cat-a".to_owned(), target)]);
+
+        let promoted = pipeline
+            .sampler
+            .lock()
+            .unwrap()
+            .resolve_pending(&next, &pipeline.spool)
+            .unwrap();
+
+        assert!(!promoted);
+        assert_eq!(pipeline.spool.pending_final_len().unwrap(), 0);
+        assert_eq!(pipeline.spool.len().unwrap(), 0);
+        assert!(
+            pipeline
+                .sampler
+                .lock()
+                .unwrap()
+                .meters
+                .get("cat-a")
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
+    fn crash_pending_candidate_resumes_or_promotes_only_from_accepted_inventory() {
+        let resume_directory = tempfile::tempdir().unwrap();
+        let (resume_pipeline, resume_target) = test_pipeline_with_meter(resume_directory.path());
+        resume_pipeline.stage_cat_before_effect("cat-a").unwrap();
+        let mut recovered = SignedUsageSampler::new(test_session(), PathBuf::new());
+        assert!(!recovered
+            .resolve_pending(
+                &BTreeMap::from([("cat-a".to_owned(), resume_target)]),
+                &resume_pipeline.spool,
+            )
+            .unwrap());
+        assert!(recovered.meters.get("cat-a").unwrap().active);
+        assert_eq!(resume_pipeline.spool.len().unwrap(), 0);
+
+        let promote_directory = tempfile::tempdir().unwrap();
+        let (promote_pipeline, _) = test_pipeline_with_meter(promote_directory.path());
+        promote_pipeline.stage_cat_before_effect("cat-a").unwrap();
+        let mut recovered = SignedUsageSampler::new(test_session(), PathBuf::new());
+        assert!(recovered
+            .resolve_pending(&BTreeMap::new(), &promote_pipeline.spool)
+            .unwrap());
+        let final_events = promote_pipeline.spool.peek(10).unwrap();
+        assert_eq!(final_events.len(), 2);
+        assert!(final_events
+            .iter()
+            .all(|checkpoint| checkpoint.epoch_marker == UsageEpochMarker::Final));
+    }
+
+    #[test]
+    fn promoted_final_source_epoch_cannot_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, target) = test_pipeline_with_meter(directory.path());
+        pipeline.stage_cat_before_effect("cat-a").unwrap();
+        let mut recovered = SignedUsageSampler::new(test_session(), PathBuf::new());
+        assert!(recovered
+            .resolve_pending(&BTreeMap::new(), &pipeline.spool)
+            .unwrap());
+
+        let error = recovered
+            .resolve_pending(
+                &BTreeMap::from([("cat-a".to_owned(), target)]),
+                &pipeline.spool,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("attempted to reopen promoted"));
+        assert_eq!(pipeline.spool.len().unwrap(), 2);
     }
 
     #[derive(Clone)]
@@ -591,6 +940,17 @@ mod tests {
             accepted: request.checkpoints.len() as u64,
             duplicates: 0,
             rejected: Vec::new(),
+            results: request
+                .checkpoints
+                .into_iter()
+                .map(
+                    |checkpoint| cats_api::metering::UsageCheckpointIngestResult {
+                        event_id: checkpoint.event_id,
+                        outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                        reason: None,
+                    },
+                )
+                .collect(),
         })
     }
 
@@ -604,6 +964,7 @@ mod tests {
             cat_id: "cat-a".to_owned(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: u128::from(sequence),
         }
     }

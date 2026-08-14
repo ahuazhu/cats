@@ -1,6 +1,5 @@
 //! One ordered, signed delivery lane for every Node usage producer.
 
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -10,8 +9,8 @@ use cats_api::agent_registration::{
 };
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
-    MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_METHOD,
-    USAGE_CHECKPOINTS_PATH,
+    UsageCheckpointIngestOutcome, MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
+    USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH,
 };
 use cats_api::runtime_reconciliation::{AgentSession, SessionBinding};
 use reqwest::StatusCode;
@@ -276,26 +275,23 @@ pub(crate) async fn deliver_usage_batches(
                     ));
             }
         };
-        let rejected_ids = acknowledgement
-            .rejected
+        if let Err(reason) = validate_exact_ack(&pending_checkpoints, &acknowledgement) {
+            let delay = delivery.record_failure(Instant::now());
+            anyhow::bail!(
+                "usage ingestion returned an invalid ACK ({reason}); retaining the exact queue prefix for replay after {} ms",
+                delay.as_millis()
+            );
+        }
+        if let Some(first) = acknowledgement
+            .results
             .iter()
-            .map(|rejected| rejected.event_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let pending_ids = pending_checkpoints
-            .iter()
-            .map(|checkpoint| checkpoint.event_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let accounted = acknowledgement
-            .accepted
-            .checked_add(acknowledgement.duplicates)
-            .and_then(|count| count.checked_add(acknowledgement.rejected.len() as u64));
-        if accounted != Some(pending_checkpoints.len() as u64)
-            || rejected_ids.len() != acknowledgement.rejected.len()
-            || !rejected_ids.is_subset(&pending_ids)
+            .find(|result| result.outcome == UsageCheckpointIngestOutcome::Rejected)
         {
             let delay = delivery.record_failure(Instant::now());
             anyhow::bail!(
-                "usage ingestion returned an ACK that does not account for the exact request prefix; retaining it for replay after {} ms",
+                "usage ingestion permanently rejected event {}: {}; retaining the exact queue prefix for operator recovery after {} ms",
+                first.event_id,
+                first.reason.as_deref().unwrap_or("no closed reason"),
                 delay.as_millis()
             );
         }
@@ -306,5 +302,143 @@ pub(crate) async fn deliver_usage_batches(
             .collect::<Vec<_>>();
         spool.acknowledge(&event_ids)?;
         delivery.record_success();
+    }
+}
+
+fn validate_exact_ack(
+    pending: &[CatUsageCheckpoint],
+    acknowledgement: &IngestUsageCheckpointsResponse,
+) -> Result<(), &'static str> {
+    let exact_order = acknowledgement.results.len() == pending.len()
+        && acknowledgement
+            .results
+            .iter()
+            .zip(pending)
+            .all(|(result, checkpoint)| result.event_id == checkpoint.event_id);
+    if !exact_order {
+        return Err("results do not match the exact request order");
+    }
+    if acknowledgement
+        .results
+        .iter()
+        .any(|result| match result.outcome {
+            UsageCheckpointIngestOutcome::Accepted | UsageCheckpointIngestOutcome::ExactReplay => {
+                result.reason.is_some()
+            }
+            UsageCheckpointIngestOutcome::Rejected => {
+                result.reason.as_deref().is_none_or(str::is_empty)
+            }
+        })
+    {
+        return Err("result reason does not match its outcome");
+    }
+    let accepted = acknowledgement
+        .results
+        .iter()
+        .filter(|result| result.outcome == UsageCheckpointIngestOutcome::Accepted)
+        .count() as u64;
+    let exact_replays = acknowledgement
+        .results
+        .iter()
+        .filter(|result| result.outcome == UsageCheckpointIngestOutcome::ExactReplay)
+        .count() as u64;
+    let rejected = acknowledgement
+        .results
+        .iter()
+        .filter(|result| result.outcome == UsageCheckpointIngestOutcome::Rejected)
+        .collect::<Vec<_>>();
+    let rejected_match = rejected.len() == acknowledgement.rejected.len()
+        && rejected
+            .iter()
+            .zip(&acknowledgement.rejected)
+            .all(|(result, legacy)| {
+                result.event_id == legacy.event_id
+                    && result.reason.as_deref() == Some(legacy.reason.as_str())
+            });
+    if acknowledgement.accepted != accepted
+        || acknowledgement.duplicates != exact_replays
+        || !rejected_match
+    {
+        return Err("aggregate diagnostics do not mirror exact results");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use cats_api::metering::{
+        RejectedCheckpoint, UsageCheckpointIngestResult, UsageEpochMarker, UsageMetric,
+    };
+
+    use super::*;
+
+    fn checkpoint(event_id: &str) -> CatUsageCheckpoint {
+        CatUsageCheckpoint {
+            event_id: event_id.to_owned(),
+            source_id: "node/node-a/cat/cat-a".to_owned(),
+            source_epoch: "epoch-a".to_owned(),
+            sequence: 1,
+            observed_at_unix_ms: 1_000,
+            cat_id: "cat-a".to_owned(),
+            cat_generation: 1,
+            metric: UsageMetric::CpuUsec,
+            epoch_marker: UsageEpochMarker::Open,
+            cumulative_quantity: 1,
+        }
+    }
+
+    #[test]
+    fn exact_ack_rejects_missing_foreign_or_reordered_results() {
+        let pending = vec![checkpoint("one"), checkpoint("two")];
+        for event_ids in [vec!["one"], vec!["one", "foreign"], vec!["two", "one"]] {
+            let acknowledgement = IngestUsageCheckpointsResponse {
+                accepted: event_ids.len() as u64,
+                duplicates: 0,
+                rejected: Vec::new(),
+                results: event_ids
+                    .into_iter()
+                    .map(|event_id| UsageCheckpointIngestResult {
+                        event_id: event_id.to_owned(),
+                        outcome: UsageCheckpointIngestOutcome::Accepted,
+                        reason: None,
+                    })
+                    .collect(),
+            };
+            assert!(validate_exact_ack(&pending, &acknowledgement).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_ack_retains_the_whole_prefix_on_any_rejection_or_count_drift() {
+        let pending = vec![checkpoint("one"), checkpoint("two")];
+        let rejected = IngestUsageCheckpointsResponse {
+            accepted: 1,
+            duplicates: 0,
+            rejected: vec![RejectedCheckpoint {
+                event_id: "two".to_owned(),
+                reason: "closed".to_owned(),
+            }],
+            results: vec![
+                UsageCheckpointIngestResult {
+                    event_id: "one".to_owned(),
+                    outcome: UsageCheckpointIngestOutcome::Accepted,
+                    reason: None,
+                },
+                UsageCheckpointIngestResult {
+                    event_id: "two".to_owned(),
+                    outcome: UsageCheckpointIngestOutcome::Rejected,
+                    reason: Some("closed".to_owned()),
+                },
+            ],
+        };
+        assert!(validate_exact_ack(&pending, &rejected).is_ok());
+        assert!(rejected
+            .results
+            .iter()
+            .any(|result| result.outcome == UsageCheckpointIngestOutcome::Rejected));
+
+        let mut drift = rejected;
+        drift.accepted = 2;
+        assert!(validate_exact_ack(&pending, &drift).is_err());
     }
 }

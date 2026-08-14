@@ -714,11 +714,19 @@ mod usage_delivery_tests {
         accepted: Arc<Mutex<Vec<String>>>,
     }
 
-    fn accepted_response(status: StatusCode, checkpoint_count: usize) -> Response {
+    fn accepted_response(status: StatusCode, event_ids: Vec<String>) -> Response {
         let response = IngestUsageCheckpointsResponse {
-            accepted: u64::try_from(checkpoint_count).unwrap(),
+            accepted: u64::try_from(event_ids.len()).unwrap(),
             duplicates: 0,
             rejected: Vec::new(),
+            results: event_ids
+                .into_iter()
+                .map(|event_id| cats_api::metering::UsageCheckpointIngestResult {
+                    event_id,
+                    outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                    reason: None,
+                })
+                .collect(),
         };
         (
             status,
@@ -730,14 +738,12 @@ mod usage_delivery_tests {
 
     async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> Response {
         let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
-        let checkpoint_count = request.checkpoints.len();
-        state.requests.lock().unwrap().push(
-            request
-                .checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.event_id.clone())
-                .collect(),
-        );
+        let event_ids = request
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.event_id.clone())
+            .collect::<Vec<_>>();
+        state.requests.lock().unwrap().push(event_ids.clone());
         let status = state
             .responses
             .lock()
@@ -745,7 +751,7 @@ mod usage_delivery_tests {
             .pop_front()
             .unwrap_or(StatusCode::OK);
         if status.is_success() {
-            accepted_response(status, checkpoint_count)
+            accepted_response(status, event_ids)
         } else {
             status.into_response()
         }
@@ -767,7 +773,14 @@ mod usage_delivery_tests {
         } else {
             state.accepted.lock().unwrap().extend(event_ids);
         }
-        accepted_response(StatusCode::OK, request.checkpoints.len())
+        accepted_response(
+            StatusCode::OK,
+            request
+                .checkpoints
+                .into_iter()
+                .map(|checkpoint| checkpoint.event_id)
+                .collect(),
+        )
     }
 
     /// Answers every request with one status and one body, for asserting what
@@ -828,6 +841,7 @@ mod usage_delivery_tests {
             cat_id: "cat-a".to_string(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: u128::from(sequence),
         }
     }
@@ -1480,7 +1494,12 @@ impl HostTelemetrySampler {
         if !due {
             return Ok(Vec::new());
         }
-        match sample.accumulator.checkpoint() {
+        let checkpoints = if force_checkpoint {
+            sample.accumulator.final_checkpoint()
+        } else {
+            sample.accumulator.checkpoint()
+        };
+        match checkpoints {
             Ok(checkpoints) => {
                 sample.last_checkpoint_at = Some(now);
                 Ok(checkpoints.into())
@@ -1888,6 +1907,7 @@ mod telemetry_tests {
                     cat_id: "cat-a".to_string(),
                     cat_generation: 1,
                     metric: UsageMetric::CpuUsec,
+                    epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                     cumulative_quantity: u128::from(sequence) * 100,
                 };
                 checkpoint.event_id = deterministic_event_id(&checkpoint);

@@ -16,11 +16,17 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use cats_api::metering::UsageMetric;
 use cats_metering::{
-    metric_from_slug, usage_view_from_intervals, validate_checkout_intent,
-    validate_checkout_payment, validate_checkout_refund, validate_checkpoint, validate_usage_query,
-    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
-    CreditStore, CreditStoreFuture, CreditSummary, IngestOutcome, MeteringError, Result,
-    UsageAggregate, UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture,
+    build_source_terminal_receipt, decode_terminal_receipt, metric_from_slug, sha256_prefixed,
+    target_terminal_marker, target_terminal_request_sha256, usage_view_from_intervals,
+    validate_archive_evidence, validate_checkout_intent, validate_checkout_payment,
+    validate_checkout_refund, validate_checkpoint, validate_target_terminal_receipt,
+    validate_target_terminal_request, validate_usage_query, ArchivedUsageCheckpoint,
+    ArchivedUsageTerminalBarrier, AttributedCheckpoint, CheckoutIntent, CheckoutPayment,
+    CheckoutRefund, CreditApplyOutcome, CreditStore, CreditStoreFuture, CreditSummary,
+    IngestOutcome, MeteringError, Result, RuntimeUsageSourceBinding, UsageAggregate,
+    UsageArchiveEvidence, UsageAttribution, UsageInterval, UsageQuery, UsageSourceTerminalReceipt,
+    UsageStore, UsageStoreFuture, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
+    UsageTargetTerminalState, UsageTerminalBarrierProjection, UsageTerminalPrepareOutcome,
     UsageTotals, UsageView,
 };
 use native_tls::{Certificate, TlsConnector};
@@ -277,6 +283,94 @@ impl UsageStore for PostgresUsageStore {
                 source_epoch_attribution(client, &schema, &source_id, &source_epoch)
             })
             .await
+        })
+    }
+
+    fn project_archived<'a>(
+        &'a self,
+        value: &'a ArchivedUsageCheckpoint,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        let value = value.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_project_archived(client, &schema, &value))
+                .await
+        })
+    }
+
+    fn source_terminal_receipt<'a>(
+        &'a self,
+        source_id: &'a str,
+        source_epoch: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>> {
+        let source_id = source_id.to_string();
+        let source_epoch = source_epoch.to_string();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| {
+                pg_source_terminal_receipt(client, &schema, &source_id, &source_epoch)
+            })
+            .await
+        })
+    }
+
+    fn active_target_terminal<'a>(
+        &'a self,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_active_target_terminal(client, &schema))
+                .await
+        })
+    }
+
+    fn prepare_target_terminal<'a>(
+        &'a self,
+        request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        let request = request.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_prepare_target_terminal(client, &schema, &request))
+                .await
+        })
+    }
+
+    fn project_terminal_barrier<'a>(
+        &'a self,
+        barrier: &'a ArchivedUsageTerminalBarrier,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        let barrier = barrier.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_project_terminal_barrier(client, &schema, &barrier))
+                .await
+        })
+    }
+
+    fn target_terminal_state<'a>(
+        &'a self,
+        terminal_epoch_id: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        let terminal_epoch_id = terminal_epoch_id.to_string();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| {
+                pg_target_terminal_state(client, &schema, &terminal_epoch_id)
+            })
+            .await
+        })
+    }
+
+    fn commit_target_terminal<'a>(
+        &'a self,
+        receipt: &'a UsageTargetTerminalReceipt,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        let receipt = receipt.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_commit_target_terminal(client, &schema, &receipt))
+                .await
         })
     }
 }
@@ -862,6 +956,558 @@ fn source_epoch_attribution(
         .map_err(|error| pg_error("look up usage source epoch attribution", error))
 }
 
+fn pg_project_archived(
+    client: &mut Client,
+    schema: &str,
+    archived: &ArchivedUsageCheckpoint,
+) -> Result<IngestOutcome> {
+    validate_archive_evidence(&archived.archive)?;
+    let outcome = ingest_checkpoint(client, schema, &archived.value)?;
+    let evidence_json = serde_json::to_string(&archived.archive)?;
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start usage archive projection", error))?;
+    let epoch_lock = format!(
+        "{}:{}{}",
+        archived.value.checkpoint.source_id.len(),
+        archived.value.checkpoint.source_id,
+        archived.value.checkpoint.source_epoch
+    );
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&epoch_lock],
+        )
+        .map_err(|error| pg_error("lock archived usage source epoch", error))?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_archive_projections (
+             event_id, stream_name, archive_bucket, shard_id, sequence_number,
+             sequence_number_text, archive_key, archive_sha256, evidence_json
+         ) VALUES ($1,$2,$3,$4,$5::text::numeric,$5,$6,$7,$8)
+         ON CONFLICT (event_id) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[
+                &archived.value.checkpoint.event_id,
+                &archived.archive.stream_name,
+                &archived.archive.archive_bucket,
+                &archived.archive.shard_id,
+                &archived.archive.sequence_number,
+                &archived.archive.archive_key,
+                &archived.archive.archive_sha256,
+                &evidence_json,
+            ],
+        )
+        .map_err(|error| pg_error("insert usage archive projection", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT evidence_json FROM {schema}.usage_archive_projections WHERE event_id=$1"
+        );
+        let existing: String = transaction
+            .query_one(&existing_sql, &[&archived.value.checkpoint.event_id])
+            .map_err(|error| pg_error("read usage archive projection replay", error))?
+            .get(0);
+        if existing != evidence_json {
+            return Err(MeteringError::Conflict(format!(
+                "event {} was projected from conflicting archive evidence",
+                archived.value.checkpoint.event_id
+            )));
+        }
+    }
+    pg_maybe_insert_source_terminal_receipt(
+        &mut transaction,
+        schema,
+        &archived.value.checkpoint.source_id,
+        &archived.value.checkpoint.source_epoch,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit usage archive projection", error))?;
+    Ok(outcome)
+}
+
+fn pg_maybe_insert_source_terminal_receipt(
+    transaction: &mut Transaction<'_>,
+    schema: &str,
+    source_id: &str,
+    source_epoch: &str,
+) -> Result<()> {
+    let sql = format!(
+        "SELECT checkpoint.payload_json, checkpoint.source_binding_json,
+                archive.evidence_json
+           FROM {schema}.usage_checkpoints checkpoint
+           JOIN {schema}.usage_archive_projections archive
+             ON archive.event_id=checkpoint.event_id
+          WHERE checkpoint.source_id=$1 AND checkpoint.source_epoch=$2
+          ORDER BY checkpoint.sequence, checkpoint.metric, checkpoint.event_id"
+    );
+    let rows = transaction
+        .query(&sql, &[&source_id, &source_epoch])
+        .map_err(|error| pg_error("read projected source epoch", error))?;
+    let mut projected = Vec::<(
+        cats_api::metering::CatUsageCheckpoint,
+        RuntimeUsageSourceBinding,
+        UsageArchiveEvidence,
+    )>::with_capacity(rows.len());
+    for row in rows {
+        projected.push((
+            serde_json::from_str(&row.get::<_, String>(0))?,
+            serde_json::from_str(&row.get::<_, String>(1))?,
+            serde_json::from_str(&row.get::<_, String>(2))?,
+        ));
+    }
+    let Some(receipt) = build_source_terminal_receipt(source_id, source_epoch, &projected)? else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(&receipt)?;
+    let receipt_sha256 = sha256_prefixed(receipt_json.as_bytes());
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_source_terminal_receipts (
+             source_id, source_epoch, receipt_json, receipt_sha256
+         ) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (source_id, source_epoch) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[&source_id, &source_epoch, &receipt_json, &receipt_sha256],
+        )
+        .map_err(|error| pg_error("insert usage source terminal receipt", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT receipt_json, receipt_sha256
+               FROM {schema}.usage_source_terminal_receipts
+              WHERE source_id=$1 AND source_epoch=$2"
+        );
+        let row = transaction
+            .query_one(&existing_sql, &[&source_id, &source_epoch])
+            .map_err(|error| pg_error("read usage terminal receipt replay", error))?;
+        let existing = (row.get::<_, String>(0), row.get::<_, String>(1));
+        if existing != (receipt_json, receipt_sha256) {
+            return Err(MeteringError::Conflict(
+                "source terminal receipt conflicts with its immutable replay".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pg_source_terminal_receipt(
+    client: &mut Client,
+    schema: &str,
+    source_id: &str,
+    source_epoch: &str,
+) -> Result<Option<UsageSourceTerminalReceipt>> {
+    let sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    client
+        .query_opt(&sql, &[&source_id, &source_epoch])
+        .map_err(|error| pg_error("read usage source terminal receipt", error))?
+        .map(|row| decode_terminal_receipt(&row.get::<_, String>(0), &row.get::<_, String>(1)))
+        .transpose()
+}
+
+fn pg_prepare_target_terminal(
+    client: &mut Client,
+    schema: &str,
+    request: &UsageTargetTerminalRequest,
+) -> Result<UsageTerminalPrepareOutcome> {
+    validate_target_terminal_request(request)?;
+    if request.old_target.usage_schema != schema {
+        return Err(MeteringError::Invalid(format!(
+            "terminal old usage schema {} does not match opened projection {schema}",
+            request.old_target.usage_schema
+        )));
+    }
+    let request_json = serde_json::to_string(request)?;
+    let request_sha256 = target_terminal_request_sha256(request)?;
+    let terminal_epoch_id = request.terminal_epoch_id.to_string();
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage target terminal preparation", error))?;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-target-terminal-v1', 0))",
+            &[],
+        )
+        .map_err(|error| pg_error("lock Usage target terminal preparation", error))?;
+    let existing_sql = format!(
+        "SELECT terminal_epoch_id, request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          ORDER BY terminal_epoch_id
+          LIMIT 2"
+    );
+    let existing = transaction
+        .query(&existing_sql, &[])
+        .map_err(|error| pg_error("read Usage target terminal operation", error))?;
+    if let Some(row) = existing.first() {
+        if existing.len() == 1
+            && row.get::<_, String>(0) == terminal_epoch_id
+            && row.get::<_, String>(1) == request_json
+            && row.get::<_, String>(2) == request_sha256
+        {
+            transaction
+                .commit()
+                .map_err(|error| pg_error("commit Usage target terminal replay", error))?;
+            return Ok(UsageTerminalPrepareOutcome::ExactReplay);
+        }
+        return Err(MeteringError::Conflict(
+            "Usage target already has a different terminal operation".to_string(),
+        ));
+    }
+    pg_verify_terminal_source_set(&mut transaction, schema, request)?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_terminal_operations (
+             terminal_epoch_id, request_json, request_sha256, created_at_ms
+         ) VALUES ($1,$2,$3,$4)"
+    );
+    transaction
+        .execute(
+            &insert_sql,
+            &[
+                &terminal_epoch_id,
+                &request_json,
+                &request_sha256,
+                &request.created_at_unix_ms,
+            ],
+        )
+        .map_err(|error| pg_error("insert Usage target terminal operation", error))?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage target terminal preparation", error))?;
+    Ok(UsageTerminalPrepareOutcome::Prepared)
+}
+
+fn pg_verify_terminal_source_set(
+    transaction: &mut Transaction<'_>,
+    schema: &str,
+    request: &UsageTargetTerminalRequest,
+) -> Result<Vec<UsageSourceTerminalReceipt>> {
+    let source_sql = format!(
+        "SELECT DISTINCT source_id, source_epoch
+           FROM {schema}.usage_checkpoints
+          ORDER BY source_id COLLATE \"C\", source_epoch COLLATE \"C\""
+    );
+    let actual_keys = transaction
+        .query(&source_sql, &[])
+        .map_err(|error| pg_error("enumerate Usage terminal source set", error))?
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let expected_keys = request
+        .sources
+        .iter()
+        .map(|source| (source.source_id.clone(), source.source_epoch.clone()))
+        .collect::<Vec<_>>();
+    if actual_keys != expected_keys {
+        return Err(MeteringError::Conflict(
+            "Usage target source closed set is incomplete or contains a foreign epoch".to_string(),
+        ));
+    }
+    let receipt_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    let mut receipts = Vec::with_capacity(request.sources.len());
+    for expected in &request.sources {
+        let row = transaction
+            .query_opt(&receipt_sql, &[&expected.source_id, &expected.source_epoch])
+            .map_err(|error| pg_error("read required source terminal receipt", error))?
+            .ok_or_else(|| {
+                MeteringError::Conflict(format!(
+                    "source {}/{} has no terminal receipt",
+                    expected.source_id, expected.source_epoch
+                ))
+            })?;
+        let receipt_json: String = row.get(0);
+        let receipt_sha256: String = row.get(1);
+        if receipt_sha256 != expected.receipt_sha256 {
+            return Err(MeteringError::Conflict(format!(
+                "source {}/{} terminal receipt digest changed",
+                expected.source_id, expected.source_epoch
+            )));
+        }
+        receipts.push(decode_terminal_receipt(&receipt_json, &receipt_sha256)?);
+    }
+    Ok(receipts)
+}
+
+fn pg_project_terminal_barrier(
+    client: &mut Client,
+    schema: &str,
+    barrier: &ArchivedUsageTerminalBarrier,
+) -> Result<IngestOutcome> {
+    validate_archive_evidence(&barrier.archive)?;
+    let terminal_epoch_id = barrier.marker.terminal_epoch_id.to_string();
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage terminal barrier projection", error))?;
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let operation = transaction
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read Usage terminal barrier operation", error))?
+        .ok_or_else(|| {
+            MeteringError::Conflict("terminal barrier has no prepared operation".into())
+        })?;
+    let request_json: String = operation.get(0);
+    let request: UsageTargetTerminalRequest = serde_json::from_str(&request_json)?;
+    if operation.get::<_, String>(1) != target_terminal_request_sha256(&request)?
+        || barrier.marker != target_terminal_marker(&request, &barrier.marker.shard_id)?
+        || barrier.archive.shard_id != barrier.marker.shard_id
+        || barrier.archive.stream_name != request.old_target.stream_name
+        || barrier.archive.archive_bucket != request.old_target.archive_bucket_name
+    {
+        return Err(MeteringError::Conflict(
+            "terminal barrier does not match its prepared old Usage target".into(),
+        ));
+    }
+    let marker_json = serde_json::to_string(&barrier.marker)?;
+    let evidence_json = serde_json::to_string(&barrier.archive)?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_terminal_barrier_projections (
+             marker_id, sequence_number, sequence_number_text, terminal_epoch_id,
+             shard_id, marker_json, evidence_json
+         ) VALUES ($1,$2::text::numeric,$2,$3,$4,$5,$6)
+         ON CONFLICT (marker_id, sequence_number) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[
+                &barrier.marker.marker_id,
+                &barrier.archive.sequence_number,
+                &terminal_epoch_id,
+                &barrier.marker.shard_id,
+                &marker_json,
+                &evidence_json,
+            ],
+        )
+        .map_err(|error| pg_error("insert Usage terminal barrier projection", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT marker_json, evidence_json
+               FROM {schema}.usage_terminal_barrier_projections
+              WHERE marker_id=$1 AND sequence_number=$2::text::numeric"
+        );
+        let row = transaction
+            .query_one(
+                &existing_sql,
+                &[&barrier.marker.marker_id, &barrier.archive.sequence_number],
+            )
+            .map_err(|error| pg_error("read Usage terminal barrier replay", error))?;
+        if (row.get::<_, String>(0), row.get::<_, String>(1)) != (marker_json, evidence_json) {
+            return Err(MeteringError::Conflict(
+                "terminal barrier position was replayed with conflicting evidence".into(),
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage terminal barrier projection", error))?;
+    Ok(if inserted == 0 {
+        IngestOutcome::Duplicate
+    } else {
+        IngestOutcome::Accepted
+    })
+}
+
+fn pg_target_terminal_state(
+    client: &mut Client,
+    schema: &str,
+    terminal_epoch_id: &str,
+) -> Result<Option<UsageTargetTerminalState>> {
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let Some(operation) = client
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("discover Usage target terminal operation", error))?
+    else {
+        return Ok(None);
+    };
+    let request_json: String = operation.get(0);
+    let request: UsageTargetTerminalRequest = serde_json::from_str(&request_json)?;
+    let request_sha256: String = operation.get(1);
+    if request_sha256 != target_terminal_request_sha256(&request)? {
+        return Err(MeteringError::Store(
+            "stored Usage terminal request digest is corrupt".into(),
+        ));
+    }
+    let barriers = pg_load_canonical_barriers(client, schema, terminal_epoch_id)?;
+    let receipt_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_target_terminal_receipts
+          WHERE terminal_epoch_id=$1"
+    );
+    let receipt = client
+        .query_opt(&receipt_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("discover Usage target terminal receipt", error))?
+        .map(|row| {
+            let json: String = row.get(0);
+            let expected_sha256: String = row.get(1);
+            if sha256_prefixed(json.as_bytes()) != expected_sha256 {
+                return Err(MeteringError::Store(
+                    "stored Usage target terminal receipt digest is corrupt".into(),
+                ));
+            }
+            let receipt: UsageTargetTerminalReceipt = serde_json::from_str(&json)?;
+            validate_target_terminal_receipt(&receipt)?;
+            Ok(receipt)
+        })
+        .transpose()?;
+    Ok(Some(UsageTargetTerminalState {
+        request,
+        request_sha256,
+        barriers,
+        receipt,
+    }))
+}
+
+fn pg_active_target_terminal(
+    client: &mut Client,
+    schema: &str,
+) -> Result<Option<UsageTargetTerminalState>> {
+    let sql = format!(
+        "SELECT terminal_epoch_id
+           FROM {schema}.usage_terminal_operations
+          ORDER BY terminal_epoch_id
+          LIMIT 2"
+    );
+    let operations = client
+        .query(&sql, &[])
+        .map_err(|error| pg_error("discover active Usage target terminal operation", error))?;
+    if operations.len() > 1 {
+        return Err(MeteringError::Store(
+            "multiple Usage target terminal operations violate the singleton authority".into(),
+        ));
+    }
+    let Some(operation) = operations.first() else {
+        return Ok(None);
+    };
+    pg_target_terminal_state(client, schema, &operation.get::<_, String>(0))
+}
+
+fn pg_load_canonical_barriers(
+    client: &mut impl postgres::GenericClient,
+    schema: &str,
+    terminal_epoch_id: &str,
+) -> Result<Vec<UsageTerminalBarrierProjection>> {
+    let sql = format!(
+        "SELECT DISTINCT ON (shard_id) marker_json, evidence_json
+           FROM {schema}.usage_terminal_barrier_projections
+          WHERE terminal_epoch_id=$1
+          ORDER BY shard_id, sequence_number"
+    );
+    client
+        .query(&sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read canonical Usage terminal barriers", error))?
+        .into_iter()
+        .map(|row| {
+            Ok(UsageTerminalBarrierProjection {
+                marker: serde_json::from_str(&row.get::<_, String>(0))?,
+                archive: serde_json::from_str(&row.get::<_, String>(1))?,
+            })
+        })
+        .collect()
+}
+
+fn pg_commit_target_terminal(
+    client: &mut Client,
+    schema: &str,
+    receipt: &UsageTargetTerminalReceipt,
+) -> Result<UsageTerminalPrepareOutcome> {
+    validate_target_terminal_receipt(receipt)?;
+    if receipt.request.old_target.usage_schema != schema {
+        return Err(MeteringError::Invalid(
+            "target receipt old schema does not match opened projection".into(),
+        ));
+    }
+    let terminal_epoch_id = receipt.request.terminal_epoch_id.to_string();
+    let receipt_json = serde_json::to_string(receipt)?;
+    let receipt_sha256 = sha256_prefixed(receipt_json.as_bytes());
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage target terminal commit", error))?;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-target-terminal-v1', 0))",
+            &[],
+        )
+        .map_err(|error| pg_error("lock Usage target terminal commit", error))?;
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let operation = transaction
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read prepared Usage terminal operation", error))?
+        .ok_or_else(|| {
+            MeteringError::Conflict("target receipt has no prepared operation".into())
+        })?;
+    if operation.get::<_, String>(0) != serde_json::to_string(&receipt.request)?
+        || operation.get::<_, String>(1) != receipt.request_sha256
+    {
+        return Err(MeteringError::Conflict(
+            "target receipt does not match prepared operation".into(),
+        ));
+    }
+    let source_receipts =
+        pg_verify_terminal_source_set(&mut transaction, schema, &receipt.request)?;
+    let barriers = pg_load_canonical_barriers(&mut transaction, schema, &terminal_epoch_id)?;
+    if source_receipts != receipt.source_receipts || barriers != receipt.barriers {
+        return Err(MeteringError::Conflict(
+            "target receipt source or barrier evidence changed before commit".into(),
+        ));
+    }
+    let existing_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_target_terminal_receipts
+          WHERE terminal_epoch_id=$1"
+    );
+    if let Some(row) = transaction
+        .query_opt(&existing_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read Usage target terminal receipt replay", error))?
+    {
+        if (row.get::<_, String>(0), row.get::<_, String>(1)) != (receipt_json, receipt_sha256) {
+            return Err(MeteringError::Conflict(
+                "target terminal receipt conflicts with immutable replay".into(),
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| pg_error("commit Usage target terminal receipt replay", error))?;
+        return Ok(UsageTerminalPrepareOutcome::ExactReplay);
+    }
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_target_terminal_receipts (
+             terminal_epoch_id, receipt_json, receipt_sha256
+         ) VALUES ($1,$2,$3)"
+    );
+    transaction
+        .execute(
+            &insert_sql,
+            &[&terminal_epoch_id, &receipt_json, &receipt_sha256],
+        )
+        .map_err(|error| pg_error("insert Usage target terminal receipt", error))?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage target terminal receipt", error))?;
+    Ok(UsageTerminalPrepareOutcome::Prepared)
+}
+
 fn spawn_worker(
     dsn: DsnSource,
     ca_file: Option<String>,
@@ -1065,11 +1711,144 @@ CREATE TABLE IF NOT EXISTS {schema}.usage_checkpoints (
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
     payload_json TEXT NOT NULL,
+    source_binding_json TEXT NOT NULL
+        CONSTRAINT usage_checkpoints_source_binding_nonempty
+        CHECK (source_binding_json <> ''),
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (source_id, source_epoch, metric, sequence)
 );
 CREATE INDEX IF NOT EXISTS usage_checkpoints_account_time_idx
     ON {schema}.usage_checkpoints (billing_account_id, observed_at_ms);
+CREATE TABLE IF NOT EXISTS {schema}.usage_archive_projections (
+    event_id TEXT NOT NULL,
+    stream_name TEXT NOT NULL,
+    archive_bucket TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
+    sequence_number NUMERIC(78, 0) NOT NULL,
+    sequence_number_text TEXT NOT NULL,
+    archive_key TEXT NOT NULL,
+    archive_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    projected_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_archive_projections_pk PRIMARY KEY (event_id),
+    CONSTRAINT usage_archive_projections_event_fk FOREIGN KEY (event_id)
+        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_archive_projections_sequence_nonnegative
+        CHECK (sequence_number >= 0),
+    CONSTRAINT usage_archive_projections_sequence_text_canonical
+        CHECK (sequence_number_text ~ '^(0|[1-9][0-9]{{0,77}})$'),
+    CONSTRAINT usage_archive_projections_sequence_exact
+        CHECK (sequence_number = sequence_number_text::numeric),
+    CONSTRAINT usage_archive_projections_sha256_canonical
+        CHECK (archive_sha256 ~ '^sha256:[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_archive_projections_evidence_nonempty
+        CHECK (evidence_json <> ''),
+    CONSTRAINT usage_archive_projections_stream_position_unique
+        UNIQUE (stream_name, shard_id, sequence_number)
+);
+CREATE TABLE IF NOT EXISTS {schema}.usage_source_terminal_receipts (
+    source_id TEXT NOT NULL,
+    source_epoch TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_source_terminal_receipts_pk PRIMARY KEY (source_id, source_epoch),
+    CONSTRAINT usage_source_terminal_receipts_json_nonempty CHECK (receipt_json <> ''),
+    CONSTRAINT usage_source_terminal_receipts_sha256_canonical
+        CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
+);
+CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_operations (
+    terminal_epoch_id TEXT NOT NULL,
+    singleton_key BOOLEAN NOT NULL DEFAULT TRUE,
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    CONSTRAINT usage_terminal_operations_pk PRIMARY KEY (terminal_epoch_id),
+    CONSTRAINT usage_terminal_operations_epoch_canonical
+        CHECK (terminal_epoch_id ~ '^[0-9a-f]{{32}}$'
+               AND terminal_epoch_id <> repeat('0', 32)),
+    CONSTRAINT usage_terminal_operations_singleton_unique UNIQUE (singleton_key),
+    CONSTRAINT usage_terminal_operations_singleton_true CHECK (singleton_key),
+    CONSTRAINT usage_terminal_operations_request_nonempty CHECK (request_json <> ''),
+    CONSTRAINT usage_terminal_operations_sha256_canonical
+        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_terminal_operations_created_nonnegative CHECK (created_at_ms >= 0)
+);
+CREATE TABLE IF NOT EXISTS {schema}.usage_terminal_barrier_projections (
+    marker_id TEXT NOT NULL,
+    sequence_number NUMERIC(78, 0) NOT NULL,
+    sequence_number_text TEXT NOT NULL,
+    terminal_epoch_id TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
+    marker_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    projected_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_terminal_barrier_projections_pk
+        PRIMARY KEY (marker_id, sequence_number),
+    CONSTRAINT usage_terminal_barrier_projections_operation_fk
+        FOREIGN KEY (terminal_epoch_id)
+        REFERENCES {schema}.usage_terminal_operations(terminal_epoch_id),
+    CONSTRAINT usage_terminal_barrier_projections_marker_canonical
+        CHECK (marker_id ~ '^usage_terminal_marker_[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_nonnegative
+        CHECK (sequence_number >= 0),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_text_canonical
+        CHECK (sequence_number_text ~ '^(0|[1-9][0-9]{{0,77}})$'),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_exact
+        CHECK (sequence_number = sequence_number_text::numeric),
+    CONSTRAINT usage_terminal_barrier_projections_marker_nonempty CHECK (marker_json <> ''),
+    CONSTRAINT usage_terminal_barrier_projections_evidence_nonempty CHECK (evidence_json <> ''),
+    CONSTRAINT usage_terminal_barrier_projections_position_unique
+        UNIQUE (terminal_epoch_id, shard_id, sequence_number)
+);
+CREATE INDEX IF NOT EXISTS usage_terminal_barrier_operation_idx
+    ON {schema}.usage_terminal_barrier_projections
+       (terminal_epoch_id, shard_id, sequence_number);
+CREATE TABLE IF NOT EXISTS {schema}.usage_target_terminal_receipts (
+    terminal_epoch_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_target_terminal_receipts_pk PRIMARY KEY (terminal_epoch_id),
+    CONSTRAINT usage_target_terminal_receipts_operation_fk FOREIGN KEY (terminal_epoch_id)
+        REFERENCES {schema}.usage_terminal_operations(terminal_epoch_id),
+    CONSTRAINT usage_target_terminal_receipts_json_nonempty CHECK (receipt_json <> ''),
+    CONSTRAINT usage_target_terminal_receipts_sha256_canonical
+        CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
+);
+CREATE OR REPLACE FUNCTION {schema}.reject_usage_terminal_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION 'usage terminal evidence is insert-only';
+END
+$function$;
+DROP TRIGGER IF EXISTS usage_archive_projections_insert_only
+    ON {schema}.usage_archive_projections;
+CREATE TRIGGER usage_archive_projections_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_archive_projections
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+DROP TRIGGER IF EXISTS usage_source_terminal_receipts_insert_only
+    ON {schema}.usage_source_terminal_receipts;
+CREATE TRIGGER usage_source_terminal_receipts_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_source_terminal_receipts
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+DROP TRIGGER IF EXISTS usage_terminal_operations_insert_only
+    ON {schema}.usage_terminal_operations;
+CREATE TRIGGER usage_terminal_operations_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_operations
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+DROP TRIGGER IF EXISTS usage_terminal_barrier_projections_insert_only
+    ON {schema}.usage_terminal_barrier_projections;
+CREATE TRIGGER usage_terminal_barrier_projections_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_barrier_projections
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+DROP TRIGGER IF EXISTS usage_target_terminal_receipts_insert_only
+    ON {schema}.usage_target_terminal_receipts;
+CREATE TRIGGER usage_target_terminal_receipts_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_target_terminal_receipts
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
 CREATE TABLE IF NOT EXISTS {schema}.usage_intervals (
     end_event_id TEXT PRIMARY KEY
         REFERENCES {schema}.usage_checkpoints(event_id),
@@ -1277,6 +2056,7 @@ fn ingest_checkpoint(
     let sequence = signed(value.checkpoint.sequence, "sequence")?;
     let cumulative_quantity = value.checkpoint.cumulative_quantity.to_string();
     let payload = serde_json::to_string(&value.checkpoint)?;
+    let source_binding_json = serde_json::to_string(&value.source_binding)?;
     let mut transaction = client
         .transaction()
         .map_err(|error| pg_error("start usage ingestion", error))?;
@@ -1294,7 +2074,7 @@ fn ingest_checkpoint(
         .map_err(|error| pg_error("lock usage source epoch", error))?;
 
     let existing_sql = format!(
-        "SELECT payload_json, billing_account_id, workspace_id,
+        "SELECT payload_json, source_binding_json, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints WHERE event_id=$1"
     );
@@ -1303,8 +2083,12 @@ fn ingest_checkpoint(
         .map_err(|error| pg_error("look up usage event", error))?
     {
         let existing_payload: String = row.get(0);
-        let existing_attribution = attribution_from_row(&row, 1);
-        if existing_payload == payload && existing_attribution == value.attribution {
+        let existing_source_binding: String = row.get(1);
+        let existing_attribution = attribution_from_row(&row, 2);
+        if existing_payload == payload
+            && existing_source_binding == source_binding_json
+            && existing_attribution == value.attribution
+        {
             transaction
                 .commit()
                 .map_err(|error| pg_error("commit duplicate usage event", error))?;
@@ -1314,6 +2098,34 @@ fn ingest_checkpoint(
             "event {} was replayed with a different payload",
             value.checkpoint.event_id
         )));
+    }
+
+    let target_terminal_sql = format!("SELECT 1 FROM {schema}.usage_terminal_operations LIMIT 1");
+    if transaction
+        .query_opt(&target_terminal_sql, &[])
+        .map_err(|error| pg_error("look up Usage target terminal operation", error))?
+        .is_some()
+    {
+        return Err(MeteringError::Conflict(
+            "Usage target is terminal and accepts no brand-new event".to_string(),
+        ));
+    }
+
+    let terminal_sql = format!(
+        "SELECT 1 FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    if transaction
+        .query_opt(
+            &terminal_sql,
+            &[&value.checkpoint.source_id, &value.checkpoint.source_epoch],
+        )
+        .map_err(|error| pg_error("look up usage source terminal receipt", error))?
+        .is_some()
+    {
+        return Err(MeteringError::Conflict(
+            "source epoch is already terminal".to_string(),
+        ));
     }
 
     let attribution_sql = format!(
@@ -1337,6 +2149,26 @@ fn ingest_checkpoint(
         }
     }
 
+    let binding_sql = format!(
+        "SELECT source_binding_json
+           FROM {schema}.usage_checkpoints
+          WHERE source_id=$1 AND source_epoch=$2
+          LIMIT 1"
+    );
+    if let Some(row) = transaction
+        .query_opt(
+            &binding_sql,
+            &[&value.checkpoint.source_id, &value.checkpoint.source_epoch],
+        )
+        .map_err(|error| pg_error("look up usage runtime binding", error))?
+    {
+        if row.get::<_, String>(0) != source_binding_json {
+            return Err(MeteringError::Conflict(
+                "runtime authority changed inside one source epoch".to_string(),
+            ));
+        }
+    }
+
     let previous = adjacent_checkpoint(&mut transaction, schema, value, sequence, true)?;
     let next = adjacent_checkpoint(&mut transaction, schema, value, sequence, false)?;
     validate_adjacent(value, previous.as_ref(), next.as_ref())?;
@@ -1345,9 +2177,10 @@ fn ingest_checkpoint(
         "INSERT INTO {schema}.usage_checkpoints (
             event_id, source_id, source_epoch, sequence, observed_at_ms,
             metric, cumulative_quantity, billing_account_id, workspace_id,
-            resource_type, resource_id, attributed_cat_id, payload_json
+            resource_type, resource_id, attributed_cat_id, payload_json,
+            source_binding_json
          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13
+            $1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13,$14
          )"
     );
     transaction
@@ -1367,6 +2200,7 @@ fn ingest_checkpoint(
                 &value.attribution.resource_id,
                 &value.attribution.attributed_cat_id,
                 &payload,
+                &source_binding_json,
             ],
         )
         .map_err(|error| pg_error("insert usage checkpoint", error))?;
@@ -2239,11 +3073,32 @@ mod tests {
                 cat_id: "cat-a".to_string(),
                 cat_generation: 7,
                 metric,
+                epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                 cumulative_quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
             AttributedCheckpoint {
                 checkpoint,
+                source_binding: cats_metering::RuntimeUsageSourceBinding {
+                    session: cats_api::runtime_reconciliation::SessionBinding {
+                        node_id: cats_api::runtime_reconciliation::Id::new("node-a").unwrap(),
+                        node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                            "11111111111111111111111111111111",
+                        )
+                        .unwrap(),
+                        agent_instance_id: cats_api::runtime_reconciliation::RandomId128::new(
+                            "22222222222222222222222222222222",
+                        )
+                        .unwrap(),
+                        agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1)
+                            .unwrap(),
+                    },
+                    desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
+                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                        "33333333333333333333333333333333",
+                    )
+                    .unwrap(),
+                },
                 attribution: UsageAttribution {
                     billing_account_id: "ba-org-a".to_string(),
                     workspace_id: "workspace-a".to_string(),

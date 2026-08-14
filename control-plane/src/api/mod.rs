@@ -902,6 +902,18 @@ pub fn router(state: AppState) -> Router {
             post(runtime_usage::ingest).fallback(runtime_usage::ingest),
         )
         .route(
+            "/v1/admin/usage/source-terminal/discover",
+            post(runtime_usage::discover_source_terminal),
+        )
+        .route(
+            "/v1/admin/usage/target-terminal/begin",
+            post(runtime_usage::begin_target_terminal),
+        )
+        .route(
+            "/v1/admin/usage/target-terminal/complete",
+            post(runtime_usage::complete_target_terminal),
+        )
+        .route(
             "/v1/admin/runtime/node-authority-applies",
             post(runtime_node_authority::apply_runtime_node_authority)
                 .fallback(runtime_node_authority::apply_runtime_node_authority),
@@ -1144,6 +1156,9 @@ POST /v1/admin/production/mutation-admission-command-discoveries
 POST /v1/admin/production/mutation-admission-commands
 POST /v1/admin/production/mutation-admission-state-discoveries
 POST /v1/admin/runtime/node-authority-applies
+POST /v1/admin/usage/source-terminal/discover
+POST /v1/admin/usage/target-terminal/begin
+POST /v1/admin/usage/target-terminal/complete
 POST /v1/auth/logout
 POST /v1/billing/stripe/webhook
 POST /v1/internal/route-v2/signing-authority-commands

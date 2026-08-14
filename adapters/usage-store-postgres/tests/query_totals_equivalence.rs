@@ -21,8 +21,12 @@
 //! passes vacuously, so a green run without that variable is not evidence.
 
 use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+use cats_api::runtime_reconciliation::{
+    Epoch, Id, NodeBootId, RandomId128, Revision, SessionBinding,
+};
 use cats_metering::{
-    deterministic_event_id, AttributedCheckpoint, UsageAttribution, UsageQuery, UsageStore,
+    deterministic_event_id, AttributedCheckpoint, RuntimeUsageSourceBinding, UsageAttribution,
+    UsageQuery, UsageStore,
 };
 use cats_usage_store_postgres::PostgresUsageStore;
 
@@ -52,10 +56,21 @@ fn checkpoint(
         cat_id: "cat-a".to_string(),
         cat_generation: 1,
         metric,
+        epoch_marker: cats_api::metering::UsageEpochMarker::Open,
         cumulative_quantity,
     };
     checkpoint.event_id = deterministic_event_id(&checkpoint);
     AttributedCheckpoint {
+        source_binding: RuntimeUsageSourceBinding {
+            session: SessionBinding {
+                node_id: Id::new("node-a").unwrap(),
+                node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+                agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                agent_session_epoch: Epoch::new(1).unwrap(),
+            },
+            desired_revision: Revision::new(1).unwrap(),
+            runtime_incarnation: RandomId128::new("33333333333333333333333333333333").unwrap(),
+        },
         attribution: UsageAttribution {
             billing_account_id: ACCOUNT.to_string(),
             workspace_id: "workspace-a".to_string(),

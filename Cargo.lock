@@ -1375,7 +1375,9 @@ dependencies = [
  "aws-sdk-s3",
  "cats-metering",
  "futures-util",
+ "hex",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]

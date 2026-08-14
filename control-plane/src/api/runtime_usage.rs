@@ -1,5 +1,6 @@
 //! Signed, session-fenced ingestion into the existing UsageStore.
 
+use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::time::{Duration, Instant};
 
@@ -14,12 +15,18 @@ use cats_api::agent_registration::{
 };
 use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::metering::{
-    IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, RejectedCheckpoint,
-    MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_METHOD,
-    USAGE_CHECKPOINTS_PATH,
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
+    RejectedCheckpoint, UsageCheckpointIngestOutcome, UsageCheckpointIngestResult,
+    UsageEpochMarker, MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
+    USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH,
 };
-use cats_api::runtime_reconciliation::Id;
-use cats_metering::{AttributedCheckpoint, IngestOutcome, UsageAttribution};
+use cats_api::runtime_reconciliation::{Id, RandomId128, Revision, SessionBinding};
+use cats_metering::{
+    target_terminal_request_sha256, AttributedCheckpoint, IngestOutcome, RuntimeUsageSourceBinding,
+    UsageAttribution, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
+    UsageTerminalPrepareOutcome,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::server::AppState;
 use crate::store::runtime_authority::product_reads::RuntimeUsageCatRead;
@@ -31,11 +38,115 @@ use crate::store::AuthorityRequestContext;
 const HANDLER_DEADLINE: Duration = Duration::from_secs(10);
 const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-internal\"";
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DiscoverSourceTerminalRequest {
+    source_id: String,
+    source_epoch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BeginTargetTerminalResponse {
+    state: &'static str,
+    request_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompleteTargetTerminalResponse {
+    state: &'static str,
+    request_sha256: String,
+    receipt: Option<UsageTargetTerminalReceipt>,
+}
+
 struct CancelRequestOnDrop(AuthorityRequestContext);
 
 impl Drop for CancelRequestOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+pub(super) async fn discover_source_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DiscoverSourceTerminalRequest>,
+) -> Response {
+    if let Err(error) = super::check_admin_auth(&state, &headers).await {
+        return error.into_response();
+    }
+    if request.source_id.is_empty() || request.source_epoch.is_empty() {
+        return invalid("source_id and source_epoch are required");
+    }
+    match state
+        .usage
+        .source_terminal_receipt(&request.source_id, &request.source_epoch)
+        .await
+    {
+        Ok(Some(receipt)) => Json(receipt).into_response(),
+        Ok(None) => api_error(ApiError::not_found("usage source terminal receipt")),
+        Err(error) => metering_error(error),
+    }
+}
+
+pub(super) async fn begin_target_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UsageTargetTerminalRequest>,
+) -> Response {
+    if let Err(error) = super::check_admin_auth(&state, &headers).await {
+        return error.into_response();
+    }
+    let request_sha256 = match target_terminal_request_sha256(&request) {
+        Ok(digest) => digest,
+        Err(error) => return metering_error(error),
+    };
+    match state.usage.begin_target_terminal(&request).await {
+        Ok(outcome) => Json(BeginTargetTerminalResponse {
+            state: match outcome {
+                UsageTerminalPrepareOutcome::Prepared => "prepared",
+                UsageTerminalPrepareOutcome::ExactReplay => "exact_replay",
+            },
+            request_sha256,
+        })
+        .into_response(),
+        Err(error) => metering_error(error),
+    }
+}
+
+pub(super) async fn complete_target_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UsageTargetTerminalRequest>,
+) -> Response {
+    if let Err(error) = super::check_admin_auth(&state, &headers).await {
+        return error.into_response();
+    }
+    let request_sha256 = match target_terminal_request_sha256(&request) {
+        Ok(digest) => digest,
+        Err(error) => return metering_error(error),
+    };
+    match state.usage.complete_target_terminal(&request).await {
+        Ok(receipt) => {
+            let status = if receipt.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (
+                status,
+                Json(CompleteTargetTerminalResponse {
+                    state: if receipt.is_some() {
+                        "terminal"
+                    } else {
+                        "pending"
+                    },
+                    request_sha256,
+                    receipt,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => metering_error(error),
     }
 }
 
@@ -150,6 +261,9 @@ pub(super) async fn ingest(State(state): State<AppState>, request: Request<Body>
     if request.node_id != request.session.node_id.as_str() {
         return conflict("usage checkpoint node_id does not match its AgentSession");
     }
+    if let Err(message) = validate_request_terminal_order(&request.checkpoints) {
+        return invalid(message);
+    }
 
     let active_guest_digest = state
         .agent_session_registration_policy
@@ -219,10 +333,45 @@ async fn ingest_authenticated(
     let mut accepted = 0_u64;
     let mut duplicates = 0_u64;
     let mut rejected = Vec::new();
+    let mut results = Vec::new();
     for checkpoint in request.checkpoints {
         let expected_source = format!("node/{}/cat/{}", request.node_id, checkpoint.cat_id);
         if checkpoint.source_id != expected_source {
             return invalid(format!("checkpoint source_id must be {expected_source}"));
+        }
+        let source_binding = match runtime_source_binding(&request.session, &checkpoint) {
+            Ok(binding) => binding,
+            Err(message) => return invalid(message),
+        };
+        let source_terminal = match state
+            .usage
+            .source_terminal_receipt(&checkpoint.source_id, &checkpoint.source_epoch)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => return metering_error(error),
+        };
+        if let Some(receipt) = source_terminal {
+            if terminal_receipt_matches_checkpoint(&receipt, &source_binding, &checkpoint) {
+                duplicates += 1;
+                results.push(UsageCheckpointIngestResult {
+                    event_id: checkpoint.event_id,
+                    outcome: UsageCheckpointIngestOutcome::ExactReplay,
+                    reason: None,
+                });
+            } else {
+                let reason = "source epoch already has an immutable terminal receipt".to_owned();
+                rejected.push(RejectedCheckpoint {
+                    event_id: checkpoint.event_id.clone(),
+                    reason: reason.clone(),
+                });
+                results.push(UsageCheckpointIngestResult {
+                    event_id: checkpoint.event_id,
+                    outcome: UsageCheckpointIngestOutcome::Rejected,
+                    reason: Some(reason),
+                });
+            }
+            continue;
         }
         let frozen_attribution = match state
             .usage
@@ -295,8 +444,13 @@ async fn ingest_authenticated(
                     "rejecting an unattributable usage checkpoint; its usage is not billed"
                 );
                 rejected.push(RejectedCheckpoint {
+                    event_id: checkpoint.event_id.clone(),
+                    reason: reason.clone(),
+                });
+                results.push(UsageCheckpointIngestResult {
                     event_id: checkpoint.event_id,
-                    reason,
+                    outcome: UsageCheckpointIngestOutcome::Rejected,
+                    reason: Some(reason),
                 });
                 continue;
             }
@@ -312,11 +466,26 @@ async fn ingest_authenticated(
         };
         let value = AttributedCheckpoint {
             attribution,
+            source_binding,
             checkpoint,
         };
         match state.usage.ingest(&value).await {
-            Ok(IngestOutcome::Accepted) => accepted += 1,
-            Ok(IngestOutcome::Duplicate) => duplicates += 1,
+            Ok(IngestOutcome::Accepted) => {
+                accepted += 1;
+                results.push(UsageCheckpointIngestResult {
+                    event_id: value.checkpoint.event_id.clone(),
+                    outcome: UsageCheckpointIngestOutcome::Accepted,
+                    reason: None,
+                });
+            }
+            Ok(IngestOutcome::Duplicate) => {
+                duplicates += 1;
+                results.push(UsageCheckpointIngestResult {
+                    event_id: value.checkpoint.event_id.clone(),
+                    outcome: UsageCheckpointIngestOutcome::ExactReplay,
+                    reason: None,
+                });
+            }
             Err(error) => return metering_error(error),
         }
     }
@@ -324,8 +493,112 @@ async fn ingest_authenticated(
         accepted,
         duplicates,
         rejected,
+        results,
     })
     .into_response()
+}
+
+fn terminal_receipt_matches_checkpoint(
+    receipt: &cats_metering::UsageSourceTerminalReceipt,
+    source_binding: &RuntimeUsageSourceBinding,
+    checkpoint: &CatUsageCheckpoint,
+) -> bool {
+    receipt.contract_version == 1
+        && receipt.source_id == checkpoint.source_id
+        && receipt.source_epoch == checkpoint.source_epoch
+        && receipt.cat_id == checkpoint.cat_id
+        && receipt.source_binding == *source_binding
+        && receipt.final_sequence == checkpoint.sequence
+        && receipt.final_observed_at_unix_ms == checkpoint.observed_at_unix_ms
+        && checkpoint.epoch_marker == UsageEpochMarker::Final
+        && receipt.final_events.iter().any(|event| {
+            event.event_id == checkpoint.event_id
+                && event.metric == checkpoint.metric
+                && event.cumulative_quantity == checkpoint.cumulative_quantity
+        })
+}
+
+fn validate_request_terminal_order(checkpoints: &[CatUsageCheckpoint]) -> Result<(), String> {
+    let mut terminals = BTreeMap::<(&str, &str), (u64, i64, &str, i64, Vec<_>)>::new();
+    for checkpoint in checkpoints {
+        let key = (
+            checkpoint.source_id.as_str(),
+            checkpoint.source_epoch.as_str(),
+        );
+        match checkpoint.epoch_marker {
+            UsageEpochMarker::Open => {
+                if terminals.contains_key(&key) {
+                    return Err(format!(
+                        "source {}/{} has an open checkpoint after its final marker",
+                        checkpoint.source_id, checkpoint.source_epoch
+                    ));
+                }
+            }
+            UsageEpochMarker::Final => {
+                let terminal = terminals.entry(key).or_insert_with(|| {
+                    (
+                        checkpoint.sequence,
+                        checkpoint.observed_at_unix_ms,
+                        checkpoint.cat_id.as_str(),
+                        checkpoint.cat_generation,
+                        Vec::new(),
+                    )
+                });
+                if terminal.0 != checkpoint.sequence
+                    || terminal.1 != checkpoint.observed_at_unix_ms
+                    || terminal.2 != checkpoint.cat_id
+                    || terminal.3 != checkpoint.cat_generation
+                    || terminal.4.contains(&checkpoint.metric)
+                    || terminal.4.len() == 2
+                {
+                    return Err(format!(
+                        "source {}/{} final checkpoint set is not one exact CPU/memory sample",
+                        checkpoint.source_id, checkpoint.source_epoch
+                    ));
+                }
+                terminal.4.push(checkpoint.metric);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_source_binding(
+    session: &SessionBinding,
+    checkpoint: &CatUsageCheckpoint,
+) -> Result<RuntimeUsageSourceBinding, String> {
+    let desired_revision = u64::try_from(checkpoint.cat_generation)
+        .ok()
+        .and_then(Revision::new)
+        .ok_or_else(|| "checkpoint Cat generation is not a Desired revision".to_string())?;
+    let prefix = format!(
+        "session:{}:{}:desired:{}:runtime:",
+        session.agent_instance_id,
+        session.agent_session_epoch.get(),
+        desired_revision.get()
+    );
+    let remainder = checkpoint
+        .source_epoch
+        .strip_prefix(&prefix)
+        .ok_or_else(|| {
+            "checkpoint source_epoch does not bind the current AgentSession and Desired revision"
+                .to_string()
+        })?;
+    let (runtime_incarnation, process_identity) = remainder
+        .split_once(":processes:")
+        .ok_or_else(|| "checkpoint source_epoch has no runtime process binding".to_string())?;
+    let runtime_incarnation =
+        RandomId128::new(runtime_incarnation.to_string()).ok_or_else(|| {
+            "checkpoint source_epoch runtime incarnation is not canonical".to_string()
+        })?;
+    if process_identity.is_empty() {
+        return Err("checkpoint source_epoch process binding is empty".to_string());
+    }
+    Ok(RuntimeUsageSourceBinding {
+        session: session.clone(),
+        desired_revision,
+        runtime_incarnation,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
