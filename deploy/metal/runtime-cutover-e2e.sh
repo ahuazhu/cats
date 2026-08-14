@@ -1050,12 +1050,12 @@ write_manifest() {
     --arg scenario_driver "$scenario_driver_original" \
     --arg scenario_driver_sha256 "$scenario_driver_sha256" \
     --arg qualification_catalog "$qualification_catalog_original" \
-    --arg qualification_catalog_sha256 "$qualification_catalog_authority_sha256" \
+    --arg qualification_catalog_sha256 "sha256:$qualification_catalog_authority_sha256" \
     --argjson qualification_catalog_size_bytes "$qualification_catalog_size" \
     --arg timeout_binary "$timeout_bin_original" \
     --arg timeout_binary_sha256 "$timeout_bin_sha256" \
     --arg scenario_catalog_sha256 "$scenario_catalog_sha256" \
-    --arg case_evidence_sha256 "$case_evidence_sha256" \
+    --arg case_evidence_sha256 "sha256:$case_evidence_sha256" \
     --argjson case_evidence_count "$case_evidence_count" \
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
     --argjson ended_at_unix_seconds "$ended" \
