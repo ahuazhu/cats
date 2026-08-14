@@ -648,6 +648,10 @@ fn runner_stages_the_route_rotation_key_without_manifesting_its_authority() {
         "not 1 <= before.st_size <= 65_536",
         "identity(os.fstat(source)) != identity(before)",
         "stat.S_IMODE(metadata.st_mode) != 0o700",
+        "readonly cats_e3_volatile_private_root=/run/cats-runtime-cutover-e2e",
+        "cats_e3_prepare_volatile_private_root",
+        "with open(\"/proc/self/mountinfo\"",
+        "cats_e3_prepare_private_stage \"$cats_e3_volatile_private_root\"",
         "CATS_E3_CONFIG_ROUTE_ROTATION_OPERATOR_KEY=$staged",
         "route_rotation_operator_key_seen=true",
     ] {
@@ -671,6 +675,7 @@ fn runner_stages_the_route_rotation_key_without_manifesting_its_authority() {
         "remember_original \"config:route-rotation-operator-key\"",
         "stage_input \"config:route-rotation-operator-key\"",
         "--arg route_rotation_operator_key",
+        "cats_e3_prepare_private_stage \"$state_directory\"",
     ] {
         assert!(
             !runner.contains(forbidden),
@@ -781,6 +786,44 @@ fn assert_tree_has_no_secret(path: &Path, secret: &[u8]) {
     }
 }
 
+fn assert_tree_has_no_private_input_artifacts(path: &Path, secrets: &[&str]) {
+    for entry in fs::read_dir(path).expect("read retained artifact directory") {
+        let entry = entry.expect("read retained artifact entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !matches!(
+                name.as_ref(),
+                "invocation-secrets"
+                    | "control-token"
+                    | "production-cutover-operator-key"
+                    | "route-rotation-operator-key"
+            ) && !name.starts_with("invocation-")
+                && !name.starts_with(".authorization."),
+            "retained private input artifact {}",
+            entry.path().display()
+        );
+        if entry
+            .file_type()
+            .expect("read retained artifact type")
+            .is_dir()
+        {
+            assert_tree_has_no_private_input_artifacts(&entry.path(), secrets);
+            continue;
+        }
+        let bytes = fs::read(entry.path()).expect("read retained artifact file");
+        for secret in secrets {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "retained private input bytes at {}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
 fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) {
     let stage =
         fs::read_to_string(output_dir.join("private-stage-path")).expect("read private stage path");
@@ -813,6 +856,7 @@ mkdir -m 0700 "$2"
 cats_e3_prepare_private_stage "$4"
 printf '%s\n' "$cats_e3_private_stage" >"$2/private-stage-path"
 printf '%s' "$3" >"$cats_e3_private_stage/control-token"
+chmod 0600 "$cats_e3_private_stage/control-token"
 exit 23
 "#;
     let output = Command::new("bash")
@@ -847,6 +891,7 @@ mkdir -m 0700 "$2"
 cats_e3_prepare_private_stage "$4"
 printf '%s\n' "$cats_e3_private_stage" >"$2/private-stage-path"
 printf '%s' "$3" >"$cats_e3_private_stage/control-token"
+chmod 0600 "$cats_e3_private_stage/control-token"
 : >"$2/ready"
 while :; do sleep 1; done
 "#;
@@ -878,6 +923,47 @@ while :; do sleep 1; done
     let status = child.wait().expect("wait for private stage TERM fixture");
     assert_eq!(status.code(), Some(143));
     assert_private_stage_removed_without_secret(&output_dir, secret);
+}
+
+#[test]
+fn runner_uses_only_the_fixed_root_private_tmpfs_stage_in_production() {
+    if !Path::new("/proc/self/mountinfo").is_file() {
+        return;
+    }
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("read fixture uid");
+    assert_success(&uid);
+    if uid.stdout != b"0\n" {
+        // The production runner itself requires root. The native/Linux root
+        // gate executes the fixed tmpfs and cleanup checks below.
+        return;
+    }
+    let stage_name = format!("invocation-{:064x}", std::process::id());
+    let script = r#"
+set -euo pipefail
+source "$1"
+cats_e3_prepare_volatile_private_root
+[[ $cats_e3_volatile_private_root == /run/cats-runtime-cutover-e2e ]]
+[[ $(stat -f -c '%T' "$cats_e3_volatile_private_root") == tmpfs ]]
+[[ $(stat -c '%u:%g:%a' "$cats_e3_volatile_private_root") == 0:0:700 ]]
+cats_e3_prepare_private_stage "$cats_e3_volatile_private_root" "$2"
+printf '%s' fixture-volatile-secret >"$cats_e3_private_stage/control-token"
+chmod 0600 "$cats_e3_private_stage/control-token"
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-private-tmpfs-stage"])
+        .arg(workspace_root().join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(&stage_name)
+        .output()
+        .expect("run fixed volatile stage fixture");
+    assert_success(&output);
+    assert!(!Path::new("/run/cats-runtime-cutover-e2e")
+        .join(stage_name)
+        .exists());
 }
 
 #[test]
@@ -2180,7 +2266,12 @@ exec /usr/bin/stat "$@"
 }
 
 #[test]
-fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
+fn runtime_cutover_runner_sigkill_reentry_has_no_persistent_secret_residue() {
+    const SECRET_CANARIES: [&str; 3] = [
+        "fixture-production-cutover-operator-key-must-not-survive",
+        "fixture-control-token-must-not-survive-sigkill",
+        "fixture-route-rotation-operator-key-must-not-survive",
+    ];
     let fixture = Fixture::new();
     let harness = fixture._temp.path().join("runner-reentry-harness.sh");
     let trace = fixture._temp.path().join("runner-reentry.trace");
@@ -2188,6 +2279,28 @@ fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
     fs::create_dir(&state).expect("create reentry state");
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("protect reentry state");
     let state = fs::canonicalize(state).expect("canonical reentry state");
+    let volatile_root = fixture._temp.path().join("runner-reentry-volatile");
+    let secret_sources = fixture._temp.path().join("runner-reentry-secret-sources");
+    for directory in [&volatile_root, &secret_sources] {
+        fs::create_dir(directory).expect("create private reentry fixture directory");
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("protect private reentry fixture directory");
+    }
+    let volatile_root = fs::canonicalize(volatile_root).expect("canonical volatile fixture root");
+    let secret_sources =
+        fs::canonicalize(secret_sources).expect("canonical secret source fixture root");
+    let operator_key = secret_sources.join("production-cutover-operator-key");
+    let control_token = secret_sources.join("control-token");
+    let route_key = secret_sources.join("route-rotation-operator-key");
+    for (path, canary) in [
+        (&operator_key, SECRET_CANARIES[0]),
+        (&control_token, SECRET_CANARIES[1]),
+        (&route_key, SECRET_CANARIES[2]),
+    ] {
+        fs::write(path, canary).expect("write original secret fixture input");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("protect original secret fixture input");
+    }
     fs::write(
         &harness,
         r#"#!/usr/bin/env bash
@@ -2195,21 +2308,50 @@ set -euo pipefail
 source "$1"
 output_dir=$2
 state_directory=$3
-trace=$4
-scenario_driver=$5
-filter=$6
-catalog=$7
-mode=$8
-timeout_bin=$9
+volatile_root=$4
+trace=$5
+scenario_driver=$6
+filter=$7
+catalog=$8
+mode=$9
+timeout_bin=${10}
+operator_key_source=${11}
+control_token_source=${12}
+route_key_source=${13}
 block_path=kernel-nbd
 run_id=fixture-reentry
 workspace_id=workspace-fixture
 exact_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-operator_secret=fixture-production-cutover-operator-key-must-not-survive
-cats_e3_prepare_private_stage "$state_directory"
-printf '%s' "$operator_secret" \
-  >"$cats_e3_private_stage/production-cutover-operator-key"
+python3 - "$operator_key_source" "$control_token_source" "$route_key_source" <<'PY' || exit 86
+import os
+import stat
+import sys
+for path in sys.argv[1:]:
+    value = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or value.st_nlink != 1
+        or stat.S_IMODE(value.st_mode) != 0o600
+    ):
+        raise SystemExit(1)
+PY
+private_stage_name=invocation-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+cats_e3_prepare_private_stage "$volatile_root" "$private_stage_name" || exit 87
+cp "$operator_key_source" "$cats_e3_private_stage/production-cutover-operator-key" || exit 88
 chmod 0600 "$cats_e3_private_stage/production-cutover-operator-key"
+cp "$control_token_source" "$cats_e3_private_stage/control-token" || exit 89
+chmod 0600 "$cats_e3_private_stage/control-token"
+cp "$route_key_source" "$cats_e3_private_stage/route-rotation-operator-key" || exit 90
+chmod 0600 "$cats_e3_private_stage/route-rotation-operator-key"
+if [[ $mode == kill ]]; then
+  : >"$cats_e3_private_stage/.authorization.ABC123"
+  printf 'authorization: Bearer fixture-control' \
+    >"$cats_e3_private_stage/.authorization.DEF456"
+  printf 'authorization: Bearer %s\n' "$(<"$control_token_source")" \
+    >"$cats_e3_private_stage/.authorization.GHI789"
+  chmod 0600 "$cats_e3_private_stage"/.authorization.*
+fi
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$output_dir" "$scratch"
 results_work=$scratch/scenario-results.jsonl
@@ -2285,6 +2427,7 @@ printf '%s\n' "$first_incomplete_case_index" >"$output_dir/first-incomplete"
             .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
             .arg(output)
             .arg(&state)
+            .arg(&volatile_root)
             .arg(&trace)
             .arg(
                 fixture
@@ -2303,6 +2446,9 @@ printf '%s\n' "$first_incomplete_case_index" >"$output_dir/first-incomplete"
             )
             .arg(mode)
             .arg(&fixture.timeout)
+            .arg(&operator_key)
+            .arg(&control_token)
+            .arg(&route_key)
             .output()
             .expect("run cross-process reentry fixture")
     };
@@ -2328,20 +2474,54 @@ printf '%s\n' "$first_incomplete_case_index" >"$output_dir/first-incomplete"
     let runtime_state: serde_json::Value =
         serde_json::from_slice(&fs::read(state.join("runtime-state.json")).unwrap()).unwrap();
     assert_eq!(runtime_state["cat_id"], "cat-fixture-reentry");
-    const OPERATOR_SECRET: &str = "fixture-production-cutover-operator-key-must-not-survive";
+    assert!(!state.join("invocation-secrets").exists());
+    assert_tree_has_no_private_input_artifacts(&state, &SECRET_CANARIES);
+    assert_tree_has_no_private_input_artifacts(&first_output, &SECRET_CANARIES);
+    let volatile_stage = volatile_root
+        .join("invocation-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    assert!(volatile_stage.is_dir());
+    for (name, canary) in [
+        ("production-cutover-operator-key", SECRET_CANARIES[0]),
+        ("control-token", SECRET_CANARIES[1]),
+        ("route-rotation-operator-key", SECRET_CANARIES[2]),
+    ] {
+        assert_eq!(
+            fs::read(volatile_stage.join(name)).unwrap(),
+            canary.as_bytes()
+        );
+    }
+    assert!(fs::read(volatile_stage.join(".authorization.ABC123"))
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        fs::read(state.join("invocation-secrets/production-cutover-operator-key")).unwrap(),
-        OPERATOR_SECRET.as_bytes()
+        fs::read(volatile_stage.join(".authorization.DEF456")).unwrap(),
+        b"authorization: Bearer fixture-control"
     );
-    assert_tree_has_no_secret(&first_output, OPERATOR_SECRET.as_bytes());
+    assert_eq!(
+        fs::read(volatile_stage.join(".authorization.GHI789")).unwrap(),
+        format!("authorization: Bearer {}\n", SECRET_CANARIES[1]).as_bytes()
+    );
+
+    fs::remove_file(&control_token).expect("remove one required original input before reentry");
+    let missing_input_output = fixture.output_dir("runner-reentry-missing-secret-input");
+    let missing_input = invoke("resume", &missing_input_output);
+    assert_eq!(missing_input.status.code(), Some(86));
+    assert!(!missing_input_output.exists());
+    assert!(volatile_stage.is_dir());
+    assert_tree_has_no_private_input_artifacts(&state, &SECRET_CANARIES);
+    assert_tree_has_no_private_input_artifacts(&first_output, &SECRET_CANARIES);
+    fs::write(&control_token, SECRET_CANARIES[1]).expect("restore required token input");
+    fs::set_permissions(&control_token, fs::Permissions::from_mode(0o600))
+        .expect("protect restored token input");
 
     let resumed_output = fixture.output_dir("runner-reentry-resumed");
     let resumed = invoke("resume", &resumed_output);
     assert_success(&resumed);
     assert!(!state.join("invocation-secrets").exists());
-    assert_tree_has_no_secret(&first_output, OPERATOR_SECRET.as_bytes());
-    assert_tree_has_no_secret(&resumed_output, OPERATOR_SECRET.as_bytes());
-    assert_tree_has_no_secret(&state, OPERATOR_SECRET.as_bytes());
+    assert_tree_has_no_private_input_artifacts(&first_output, &SECRET_CANARIES);
+    assert_tree_has_no_private_input_artifacts(&resumed_output, &SECRET_CANARIES);
+    assert_tree_has_no_private_input_artifacts(&state, &SECRET_CANARIES);
+    assert_eq!(fs::read_dir(&volatile_root).unwrap().count(), 0);
     assert_eq!(
         fs::read_to_string(resumed_output.join("first-incomplete")).unwrap(),
         "3\n"
@@ -2386,8 +2566,9 @@ printf '%s\n' "$first_incomplete_case_index" >"$output_dir/first-incomplete"
         String::from_utf8_lossy(&rejected.stdout)
     );
     assert!(!state.join("invocation-secrets").exists());
-    assert_tree_has_no_secret(&rejected_output, OPERATOR_SECRET.as_bytes());
-    assert_tree_has_no_secret(&state, OPERATOR_SECRET.as_bytes());
+    assert_tree_has_no_private_input_artifacts(&rejected_output, &SECRET_CANARIES);
+    assert_tree_has_no_private_input_artifacts(&state, &SECRET_CANARIES);
+    assert_eq!(fs::read_dir(&volatile_root).unwrap().count(), 0);
 }
 
 #[test]
@@ -2601,6 +2782,8 @@ fn production_v2_driver_places_source_terminal_after_delete_and_preserves_typed_
     assert!(!driver.contains("create-response.pending.json"));
     assert!(driver.contains(".create-response.json.XXXXXX"));
     assert!(driver.contains("--existing-pending-only"));
+    assert!(driver.contains("${TOKEN_FILE%/*}/.authorization.XXXXXX"));
+    assert!(!driver.contains("$CASE_DIR/.authorization.XXXXXX"));
     assert!(driver.contains("durable Cat identity has no adjacent create response"));
     assert!(driver.contains("os.fsync(directory_fd)"));
     assert!(

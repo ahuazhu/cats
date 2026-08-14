@@ -331,7 +331,7 @@ curl_json() {
   shift 4
   local curl_bin auth_header response_headers status content_types encodings curl_status size token
   curl_bin=$(binary curl)
-  auth_header=$(mktemp "$CASE_DIR/.authorization.XXXXXX")
+  auth_header=$(mktemp "${TOKEN_FILE%/*}/.authorization.XXXXXX")
   AUTHORIZATION_TEMP=$auth_header
   response_headers=$(mktemp "$CASE_DIR/.response-headers.XXXXXX")
   chmod 0600 "$auth_header" "$response_headers"

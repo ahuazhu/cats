@@ -2047,17 +2047,98 @@ PY
   exec {parent_fd}<&-
 }
 
-cats_e3_private_stage=
-cats_e3_remove_private_stage() {
-  local parent=$1
-  python3 - "$parent" <<'PY'
+readonly cats_e3_volatile_private_root=/run/cats-runtime-cutover-e2e
+
+cats_e3_prepare_volatile_private_root() {
+  [[ $EUID -eq 0 ]] || return 1
+  python3 <<'PY'
 import os
+import re
+import stat
+
+
+flags = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def mount_path(value):
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+root_fd = os.open("/", flags)
+try:
+    run_fd = os.open("run", flags, dir_fd=root_fd)
+finally:
+    os.close(root_fd)
+try:
+    run = os.fstat(run_fd)
+    if (
+        not stat.S_ISDIR(run.st_mode)
+        or (run.st_uid, run.st_gid) != (0, 0)
+        or stat.S_IMODE(run.st_mode) & 0o022
+    ):
+        raise SystemExit(1)
+    device = f"{os.major(run.st_dev)}:{os.minor(run.st_dev)}"
+    selected = None
+    with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+        for raw in mountinfo:
+            before, separator, after = raw.rstrip("\n").partition(" - ")
+            fields = before.split()
+            filesystem = after.split()
+            if not separator or len(fields) < 6 or not filesystem or fields[2] != device:
+                continue
+            candidate = mount_path(fields[4])
+            if "/run" != candidate and not "/run".startswith(candidate.rstrip("/") + "/"):
+                continue
+            if selected is None or len(candidate) > len(selected[0]):
+                selected = (candidate, filesystem[0])
+    if selected is None or selected[1] != "tmpfs":
+        raise SystemExit(1)
+    try:
+        os.mkdir("cats-runtime-cutover-e2e", 0o700, dir_fd=run_fd)
+        os.fsync(run_fd)
+    except FileExistsError:
+        pass
+    private_fd = os.open("cats-runtime-cutover-e2e", flags, dir_fd=run_fd)
+    try:
+        private = os.fstat(private_fd)
+        if (
+            not stat.S_ISDIR(private.st_mode)
+            or (private.st_uid, private.st_gid) != (0, 0)
+            or stat.S_IMODE(private.st_mode) != 0o700
+            or private.st_dev != run.st_dev
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(private_fd)
+finally:
+    os.close(run_fd)
+PY
+}
+
+cats_e3_private_stage=
+cats_e3_private_stage_parent=
+cats_e3_private_stage_name=
+cats_e3_remove_private_stage() {
+  local parent=$1 name=${2:-invocation-secrets}
+  python3 - "$parent" "$name" <<'PY'
+import os
+import re
 import stat
 import sys
 
 
-parent = sys.argv[1]
-name = "invocation-secrets"
+parent, name = sys.argv[1:]
+if name != "invocation-secrets" and re.fullmatch(r"invocation-[0-9a-f]{64}", name) is None:
+    raise SystemExit(1)
 effective_uid = os.geteuid()
 inherited = None
 for prefix in ("/proc/self/fd/", "/dev/fd/"):
@@ -2101,7 +2182,11 @@ try:
             "route-rotation-operator-key",
         }
         entries = os.listdir(directory_fd)
-        if not set(entries) <= allowed:
+        authorization = re.compile(r"\.authorization\.[A-Za-z0-9]{6}\Z")
+        if len(entries) > 16 or any(
+            entry not in allowed and authorization.fullmatch(entry) is None
+            for entry in entries
+        ):
             raise SystemExit(1)
         for entry in entries:
             metadata = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
@@ -2110,6 +2195,8 @@ try:
                 or metadata.st_uid != effective_uid
                 or (effective_uid == 0 and metadata.st_gid != 0)
                 or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or not 0 <= metadata.st_size <= 65_536
             ):
                 raise SystemExit(1)
             os.unlink(entry, dir_fd=directory_fd)
@@ -2130,20 +2217,31 @@ cats_e3_cleanup_private_stage() {
     [[ $status -ne 0 ]] || status=125
   fi
   if [[ -n $cats_e3_private_stage ]]; then
-    cats_e3_remove_private_stage "${cats_e3_private_stage%/*}" || status=125
+    cats_e3_remove_private_stage \
+      "$cats_e3_private_stage_parent" "$cats_e3_private_stage_name" || status=125
     cats_e3_private_stage=
+    cats_e3_private_stage_parent=
+    cats_e3_private_stage_name=
   fi
   exit "$status"
 }
 
 cats_e3_prepare_private_stage() {
-  local parent=$1
-  [[ -z $cats_e3_private_stage && $parent == /* && -d $parent && ! -L $parent ]] || return 1
-  cats_e3_remove_private_stage "$parent" || return 1
-  cats_e3_private_stage=$parent/invocation-secrets
-  mkdir -m 0700 "$cats_e3_private_stage" || return 1
-  cats_e3_private_state_subdirectory "$cats_e3_private_stage" || return 1
-  sync -f "$parent" || return 1
+  local parent=$1 name=${2:-invocation-secrets}
+  [[ -z $cats_e3_private_stage && $parent == /* && -d $parent && ! -L $parent && \
+    ($name == invocation-secrets || $name =~ ^invocation-[0-9a-f]{64}$) ]] || return 1
+  cats_e3_remove_private_stage "$parent" "$name" || return 1
+  cats_e3_private_stage_parent=$parent
+  cats_e3_private_stage_name=$name
+  cats_e3_private_stage=$parent/$name
+  if ! cats_e3_private_state_subdirectory "$cats_e3_private_stage" || \
+    ! sync -f "$parent"; then
+    cats_e3_remove_private_stage "$parent" "$name" || true
+    cats_e3_private_stage=
+    cats_e3_private_stage_parent=
+    cats_e3_private_stage_name=
+    return 1
+  fi
   trap cats_e3_cleanup_private_stage EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -2375,6 +2473,10 @@ raise SystemExit(1)
 PY
 case "$output_dir_display/" in "$state_directory_display/"*) fail "output directory must not be inside persistent state" ;; esac
 case "$state_directory_display/" in "$output_dir_display/"*) fail "persistent state must not be inside output evidence" ;; esac
+case "$state_directory_display/" in "$cats_e3_volatile_private_root/"*) fail "persistent state must not contain the volatile secret root" ;; esac
+case "$cats_e3_volatile_private_root/" in "$state_directory_display/"*) fail "volatile secret root must not be inside persistent state" ;; esac
+case "$output_dir_display/" in "$cats_e3_volatile_private_root/"*) fail "output evidence must not contain the volatile secret root" ;; esac
+case "$cats_e3_volatile_private_root/" in "$output_dir_display/"*) fail "volatile secret root must not be inside output evidence" ;; esac
 state_directory=$state_directory_fd_path
 cats_e3_open_pinned_state_lock "$state_directory_fd" "$state_directory_fd_path" \
   state_lock_fd || fail "persistent state lock is not protected descriptor-relative state"
@@ -2741,8 +2843,15 @@ stage_input qualification-catalog "$qualification_catalog" "$stage/qualification
 stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
 stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
 stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
-cats_e3_prepare_private_stage "$state_directory" || \
-  fail "create root-only invocation secret stage"
+private_stage_binding_sha256=$(printf '%s\0' "$state_directory_display" "$run_id" \
+  "$block_path" "$workspace_id" "$exact_commit" | sha256sum | awk '{print $1}')
+[[ $private_stage_binding_sha256 =~ ^[0-9a-f]{64}$ ]] || \
+  fail "derive volatile invocation secret stage binding"
+cats_e3_prepare_volatile_private_root || \
+  fail "create the fixed root-only tmpfs secret root"
+cats_e3_prepare_private_stage "$cats_e3_volatile_private_root" \
+  "invocation-$private_stage_binding_sha256" || \
+  fail "create the bound root-only volatile invocation secret stage"
 production_cutover_operator_private_key_file_original=$production_cutover_operator_private_key_file
 production_cutover_operator_private_key_file=$cats_e3_private_stage/production-cutover-operator-key
 cats_e3_stage_route_rotation_operator_key \
@@ -2751,11 +2860,12 @@ cats_e3_stage_route_rotation_operator_key \
   fail "stage the protected ProductionCutoverOperator private key"
 token_file=$cats_e3_private_stage/control-token
 token_before=$(sha256sum "$token_file_original" | awk '{print $1}')
-[[ $token_before == "$token_file_authority_sha256" ]] || fail "token changed before its private stable-stage copy"
+[[ $token_before == "$token_file_authority_sha256" ]] || \
+  fail "token changed before its volatile stable-stage copy"
 cp "$token_file_original" "$token_file"
 chmod 0600 "$token_file"
 [[ $(sha256sum "$token_file" | awk '{print $1}') == "$token_file_authority_sha256" ]] || \
-  fail "private stable-stage copy changed token"
+  fail "volatile stable-stage copy changed token"
 verify_staged_repo_file() {
   local original=$1 staged=$2 relative expected_blob actual_blob
   relative=${original#"$repo"/}
