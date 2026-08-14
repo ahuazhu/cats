@@ -51,6 +51,7 @@ struct Fixture {
     binary: PathBuf,
     config: PathBuf,
     timeout: PathBuf,
+    timeout_trace: PathBuf,
     trace: PathBuf,
 }
 
@@ -66,6 +67,7 @@ impl Fixture {
         let binary = temp.path().join("cats-noded");
         let config = temp.path().join("cats-public.conf");
         let timeout = temp.path().join("timeout");
+        let timeout_trace = temp.path().join("timeout-trace");
         let trace = temp.path().join("trace");
 
         fs::write(
@@ -89,6 +91,7 @@ impl Fixture {
             &timeout,
             r#"#!/usr/bin/env bash
 set -euo pipefail
+[[ -z ${CATS_E3_FIXTURE_TIMEOUT_TRACE:-} ]] || printf '%s\n' "$*" >>"$CATS_E3_FIXTURE_TIMEOUT_TRACE"
 while [[ $1 == --* ]]; do
   case "$1" in
     --signal=*|--kill-after=*) shift ;;
@@ -113,6 +116,7 @@ exec "$@"
             binary,
             config,
             timeout,
+            timeout_trace,
             trace,
         }
     }
@@ -172,6 +176,7 @@ exec "$@"
                     .join("deploy/metal/tests/runtime-cutover-e2e-scenario-fixture.sh"),
             )
             .env("CATS_E3_FIXTURE_MODE", "enabled")
+            .env("CATS_E3_FIXTURE_TIMEOUT_TRACE", &self.timeout_trace)
             .env("CATS_E3_FIXTURE_TRACE", &self.trace)
             .env(
                 "CATS_E3_FIXTURE_CATALOG",
@@ -423,11 +428,13 @@ evidence_work=$scratch/case-evidence.jsonl
 : >"$evidence_work"
 case_ids=()
 case_deadlines=()
+case_cleanup_deadlines=()
 case_expected_outcomes=()
 case_required_evidence=()
 while IFS= read -r case_record; do
   case_ids+=("$(jq -r '.case_id' <<<"$case_record")")
   case_deadlines+=("$(jq -r '.deadline_seconds' <<<"$case_record")")
+  case_cleanup_deadlines+=("$(jq -r '.cleanup_deadline_seconds' <<<"$case_record")")
   case_expected_outcomes+=("$(jq -c '.expected_outcome' <<<"$case_record")")
   case_required_evidence+=("$(jq -c '.required_evidence' <<<"$case_record")")
 done < <(jq -S -c '
@@ -893,6 +900,14 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
         assert!(case["deadline_seconds"]
             .as_u64()
             .is_some_and(|value| value > 0));
+        assert_eq!(
+            case["cleanup_deadline_seconds"],
+            if expected_id == "route-v2-rotation-disable-live-delivery" {
+                1800
+            } else {
+                60
+            }
+        );
         assert!(!case["required_evidence"]
             .as_array()
             .expect("case evidence")
@@ -932,6 +947,8 @@ fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
         "CATS_E3_QUALIFICATION_CATALOG_SHA256=sha256:$qualification_catalog_authority_sha256"
     ));
     assert!(runner.contains("qualification catalog digest changed"));
+    assert!(runner.contains("--kill-after=\"$kill_after\""));
+    assert!(runner.contains("cleanup_deadline=${case_cleanup_deadlines[$index]}"));
     assert!(builder.contains("--input-file \"qualification_catalog="));
 }
 
@@ -1052,6 +1069,31 @@ fn runtime_cutover_runner_rejects_evidence_outside_the_catalog_union() {
         .unwrap();
     assert_eq!(durable["status"], "failed");
     assert_eq!(durable["evidence_exit_code"], 125);
+}
+
+#[test]
+fn runtime_cutover_runner_gives_only_route_rotation_a_long_cleanup_window() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("route-rotation-cleanup-deadline");
+    let output = fixture.run_post_preflight(&output_dir, |_| {});
+    assert_success(&output);
+    let timeouts = fs::read_to_string(&fixture.timeout_trace).expect("read timeout trace");
+    let route_lines = timeouts
+        .lines()
+        .filter(|line| line.contains(" route-v2-rotation-disable-live-delivery "))
+        .collect::<Vec<_>>();
+    assert!(route_lines.iter().any(
+        |line| line.starts_with("--signal=TERM --kill-after=30 1800 ")
+            && line.contains(" run route-v2-rotation-disable-live-delivery ")
+    ));
+    assert!(route_lines.iter().any(
+        |line| line.starts_with("--signal=TERM --kill-after=30 1800 ")
+            && line.contains(" cleanup route-v2-rotation-disable-live-delivery ")
+    ));
+    assert!(timeouts.lines().any(|line| {
+        line.starts_with("--signal=TERM --kill-after=5 60 ")
+            && line.contains(" cleanup durable-write-flush ")
+    }));
 }
 
 #[test]

@@ -17,10 +17,10 @@ cats_e3_run_cases_post_preflight() {
   }
 
   run_filtered() {
-    local action=$1 case_id=$2 deadline=$3 destination=$4 case_dir=$5
+    local action=$1 case_id=$2 deadline=$3 destination=$4 case_dir=$5 kill_after=$6
     local statuses command_status filter_status
     set +e
-    "$timeout_bin" --signal=TERM --kill-after=5 "$deadline" \
+    "$timeout_bin" --signal=TERM --kill-after="$kill_after" "$deadline" \
       "$scenario_driver" "$action" "$case_id" "$block_path" "$case_dir" 2>&1 \
       | "$filter" --mode text --max-bytes 16384 >"$destination"
     statuses=("${PIPESTATUS[@]}")
@@ -146,8 +146,13 @@ cats_e3_run_cases_post_preflight() {
   for index in "${!case_ids[@]}"; do
     case_id=${case_ids[$index]}
     deadline=${case_deadlines[$index]}
+    cleanup_deadline=${case_cleanup_deadlines[$index]}
     expected_outcome=${case_expected_outcomes[$index]}
     required_evidence=${case_required_evidence[$index]}
+    kill_after=5
+    if [[ $case_id == route-v2-rotation-disable-live-delivery ]]; then
+      kill_after=30
+    fi
     case_dir=$scratch/case-$case_id
     mkdir -m 0700 "$case_dir"
     run_summary=$case_dir/run-summary.txt
@@ -155,7 +160,7 @@ cats_e3_run_cases_post_preflight() {
     diagnostic_summary=$case_dir/diagnostic-summary.txt
     case_started=$(date +%s)
 
-    if run_filtered run "$case_id" "$deadline" "$run_summary" "$case_dir"; then
+    if run_filtered run "$case_id" "$deadline" "$run_summary" "$case_dir" "$kill_after"; then
       run_code=0
     else
       run_code=$?
@@ -164,7 +169,7 @@ cats_e3_run_cases_post_preflight() {
 
     diagnostic_code=0
     if [[ $run_code -ne 0 ]]; then
-      if run_filtered diagnostics "$case_id" 30 "$diagnostic_summary" "$case_dir"; then
+      if run_filtered diagnostics "$case_id" 30 "$diagnostic_summary" "$case_dir" 5; then
         diagnostic_code=0
       else
         diagnostic_code=$?
@@ -172,7 +177,7 @@ cats_e3_run_cases_post_preflight() {
       append_summary "$case_id" diagnostics "$diagnostic_summary"
     fi
 
-    if run_filtered cleanup "$case_id" 60 "$cleanup_summary" "$case_dir"; then
+    if run_filtered cleanup "$case_id" "$cleanup_deadline" "$cleanup_summary" "$case_dir" "$kill_after"; then
       cleanup_code=0
     else
       cleanup_code=$?
@@ -227,6 +232,7 @@ cats_e3_run_cases_post_preflight() {
       --argjson expected_outcome "$expected_outcome" \
       --argjson outcome_matches "$outcome_matches" \
       --argjson deadline_seconds "$deadline" \
+      --argjson cleanup_deadline_seconds "$cleanup_deadline" \
       --argjson started_at_unix_seconds "$case_started" \
       --argjson ended_at_unix_seconds "$case_ended" \
       --argjson run_exit_code "$run_code" \
@@ -235,7 +241,8 @@ cats_e3_run_cases_post_preflight() {
       --argjson evidence_exit_code "$evidence_code" \
       '{case_id:$case_id,status:$status,observed_outcome:$observed_outcome,
         expected_outcome:$expected_outcome,outcome_matches:$outcome_matches,
-        deadline_seconds:$deadline_seconds,started_at_unix_seconds:$started_at_unix_seconds,
+        deadline_seconds:$deadline_seconds,cleanup_deadline_seconds:$cleanup_deadline_seconds,
+        started_at_unix_seconds:$started_at_unix_seconds,
         ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,
         diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,
         evidence_exit_code:$evidence_exit_code}' \
@@ -646,6 +653,7 @@ case_ids = []
 for case in cases:
     if not isinstance(case, dict) or set(case) != {
         "case_id",
+        "cleanup_deadline_seconds",
         "deadline_seconds",
         "expected_outcome",
         "required_evidence",
@@ -656,6 +664,15 @@ for case in cases:
         raise SystemExit(1)
     deadline = case["deadline_seconds"]
     if type(deadline) is not int or not 1 <= deadline <= 3600:
+        raise SystemExit(1)
+    cleanup_deadline = case["cleanup_deadline_seconds"]
+    expected_cleanup_deadline = (
+        1800 if case_id == "route-v2-rotation-disable-live-delivery" else 60
+    )
+    if (
+        type(cleanup_deadline) is not int
+        or cleanup_deadline != expected_cleanup_deadline
+    ):
         raise SystemExit(1)
     if case["expected_outcome"] != {"kind": "passed"}:
         raise SystemExit(1)
@@ -1199,11 +1216,13 @@ done
 
 case_ids=()
 case_deadlines=()
+case_cleanup_deadlines=()
 case_expected_outcomes=()
 case_required_evidence=()
 while IFS= read -r case_record; do
   case_ids+=("$(jq -r '.case_id' <<<"$case_record")")
   case_deadlines+=("$(jq -r '.deadline_seconds' <<<"$case_record")")
+  case_cleanup_deadlines+=("$(jq -r '.cleanup_deadline_seconds' <<<"$case_record")")
   case_expected_outcomes+=("$(jq -c '.expected_outcome' <<<"$case_record")")
   case_required_evidence+=("$(jq -c '.required_evidence' <<<"$case_record")")
   printf '%s\n' "$case_record" >>"$catalog_work"

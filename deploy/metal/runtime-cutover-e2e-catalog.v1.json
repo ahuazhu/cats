@@ -2,6 +2,7 @@
   "cases": [
     {
       "case_id": "control-startup-schema",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 120,
       "expected_outcome": {
         "kind": "passed"
@@ -19,6 +20,7 @@
     },
     {
       "case_id": "node-registration-full-inventory",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 180,
       "expected_outcome": {
         "kind": "passed"
@@ -32,6 +34,7 @@
     },
     {
       "case_id": "cat-create-running",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
@@ -53,6 +56,7 @@
     },
     {
       "case_id": "durable-write-flush",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 300,
       "expected_outcome": {
         "kind": "passed"
@@ -66,6 +70,7 @@
     },
     {
       "case_id": "route-http-ws",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 300,
       "expected_outcome": {
         "kind": "passed"
@@ -95,6 +100,7 @@
     },
     {
       "case_id": "route-v2-rotation-disable-live-delivery",
+      "cleanup_deadline_seconds": 1800,
       "deadline_seconds": 1800,
       "expected_outcome": {
         "kind": "passed"
@@ -116,6 +122,7 @@
     },
     {
       "case_id": "agent-restart-adoption",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
@@ -149,6 +156,7 @@
     },
     {
       "case_id": "volume-init-matrix",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 900,
       "expected_outcome": {
         "kind": "passed"
@@ -162,6 +170,7 @@
     },
     {
       "case_id": "v3-aws-host-fence-authority",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
@@ -187,6 +196,7 @@
     },
     {
       "case_id": "delete-cleanup",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
@@ -212,6 +222,7 @@
     },
     {
       "case_id": "usage-source-terminal-receipts",
+      "cleanup_deadline_seconds": 60,
       "deadline_seconds": 600,
       "expected_outcome": {
         "kind": "passed"
