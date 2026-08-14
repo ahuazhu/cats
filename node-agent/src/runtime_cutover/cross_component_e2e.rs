@@ -7,6 +7,7 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -413,6 +414,7 @@ impl RuntimeInventoryScanner for RouteReadyScanner {
                 },
                 runtimes,
                 Vec::new(),
+                BTreeSet::new(),
             ),
         ))
     }
