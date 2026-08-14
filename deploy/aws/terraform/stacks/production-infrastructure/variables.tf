@@ -223,7 +223,7 @@ variable "worker_runtime_secret_data" {
 }
 
 variable "route_v2_node_artifact_secret_arn" {
-  description = "Pre-created Secrets Manager ARN for the exact five-file Node Route v2 artifact set. Terraform receives no artifact bytes."
+  description = "Pre-created Secrets Manager ARN for the exact six-file Node Route v2 artifact set. Terraform receives no artifact bytes."
   type        = string
   default     = ""
 

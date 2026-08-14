@@ -282,6 +282,7 @@ jobs:
                   "gateway-client-ca-bundle.pem",
                   "gateway-workload-authority.v1.json",
                   "public-key-ring.v1.json",
+                  "rotation-operator-trust.v1.json",
                   "signer-private-key.pem",
                   "signer.v1.json"
                 ]

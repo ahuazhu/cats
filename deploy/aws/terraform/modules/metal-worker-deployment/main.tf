@@ -164,6 +164,7 @@ locals {
         "gateway_client_ca_bundle_pem_b64",
         "node_machine_server_certificate_pem_b64",
         "node_machine_server_private_key_pem_b64",
+        "node_server_ca_bundle_pem_b64",
         "public_key_ring_v1_json_b64",
         "rotation_operator_trust_v1_json_b64"
       ] and
@@ -184,6 +185,7 @@ locals {
     decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
     decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
     decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600
+    decode_route_v2_artifact node_server_ca_bundle_pem_b64 "$route_v2_stage/node-server-ca-bundle.pem" 0644
     "$stage_path/cats-route-v2-node-r1-validator" --directory "$route_v2_stage"
 
     # One Host-global open-file-description lock spans the entire mutation,

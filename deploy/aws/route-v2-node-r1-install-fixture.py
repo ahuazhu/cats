@@ -21,6 +21,7 @@ NAMES = {
     "gateway-client-ca-bundle.pem": 0o644,
     "node-machine-server-certificate.pem": 0o644,
     "node-machine-server-private-key.pem": 0o600,
+    "node-server-ca-bundle.pem": 0o644,
 }
 RING = b'{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}'
 JQ_SORTED_RING = b'{"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}],"ring_version":1,"version":1}'
@@ -39,6 +40,7 @@ def make_candidate(root: Path, suffix: bytes = b"") -> Path:
         "gateway-client-ca-bundle.pem": b"fixture-ca" + suffix,
         "node-machine-server-certificate.pem": b"fixture-certificate",
         "node-machine-server-private-key.pem": b"fixture-private-key",
+        "node-server-ca-bundle.pem": b"fixture-ca" + suffix,
     }
     for name, mode in NAMES.items():
         path = root / name

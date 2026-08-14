@@ -176,15 +176,17 @@ pub struct InstalledNodeRouteV2MachineArtifacts {
     ring: InstalledRouteGrantV2PublicKeyRing,
     rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
     gateway_client_ca_bundle_pem: Vec<u8>,
+    node_server_ca_bundle_pem: Vec<u8>,
     server_certificate_pem: Vec<u8>,
     server_private_key_pem: Vec<u8>,
 }
 
 #[cfg(unix)]
-const NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES: [&str; 5] = [
+const NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES: [&str; 6] = [
     "gateway-client-ca-bundle.pem",
     "node-machine-server-certificate.pem",
     "node-machine-server-private-key.pem",
+    "node-server-ca-bundle.pem",
     "public-key-ring.v1.json",
     "rotation-operator-trust.v1.json",
 ];
@@ -202,6 +204,7 @@ impl std::fmt::Debug for InstalledNodeRouteV2MachineArtifacts {
             .debug_struct("InstalledNodeRouteV2MachineArtifacts")
             .field("ring", &self.ring)
             .field("gateway_client_ca_bundle_pem", &"[redacted]")
+            .field("node_server_ca_bundle_pem", &"[redacted]")
             .field("server_certificate_pem", &"[redacted]")
             .field("server_private_key_pem", &"[redacted]")
             .finish()
@@ -230,6 +233,10 @@ impl InstalledNodeRouteV2MachineArtifacts {
 
     pub fn gateway_client_ca_bundle_pem(&self) -> &[u8] {
         &self.gateway_client_ca_bundle_pem
+    }
+
+    pub fn node_server_ca_bundle_pem(&self) -> &[u8] {
+        &self.node_server_ca_bundle_pem
     }
 
     pub fn server_certificate_pem(&self) -> &[u8] {
@@ -631,7 +638,7 @@ pub fn load_installed_node_route_v2_machine_artifacts(
 ///
 /// The caller may select only the staging directory. Every path component is
 /// opened descriptor-relative without following symlinks, and the directory
-/// must contain exactly the five Node artifacts with the same ownership,
+/// must contain exactly the six Node artifacts with the same ownership,
 /// mode, link-count, size and canonical-wire contracts used at daemon startup.
 /// TLS composition remains a Node concern and is validated by
 /// `cats-node-agent` before an installer may publish these bytes.
@@ -771,6 +778,13 @@ fn load_node_route_v2_machine_artifacts_from(
         GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
         public,
     )?;
+    let node_server_ca_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "node-server-ca-bundle.pem",
+        Path::new(NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH),
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public,
+    )?;
     let server_certificate_file = read_pinned_installed_file_at_with_contract(
         directory.final_descriptor(),
         "node-machine-server-certificate.pem",
@@ -803,6 +817,7 @@ fn load_node_route_v2_machine_artifacts_from(
         public,
     )?;
     client_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
+    node_server_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
     server_certificate_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
     server_private_key_file.revalidate_from(
         &fresh,
@@ -830,6 +845,11 @@ fn load_node_route_v2_machine_artifacts_from(
         public,
     )?;
     client_ca_file.revalidate_from(&closing, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
+    node_server_ca_file.revalidate_from(
+        &closing,
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public,
+    )?;
     server_certificate_file.revalidate_from(
         &closing,
         ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
@@ -846,6 +866,7 @@ fn load_node_route_v2_machine_artifacts_from(
         &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
     )?;
     if client_ca_file.exact_bytes().is_empty()
+        || node_server_ca_file.exact_bytes().is_empty()
         || server_certificate_file.exact_bytes().is_empty()
         || server_private_key_file.exact_bytes().is_empty()
     {
@@ -866,6 +887,7 @@ fn load_node_route_v2_machine_artifacts_from(
             exact_bytes: rotation_operator_file.into_exact_bytes(),
         },
         gateway_client_ca_bundle_pem: client_ca_file.into_exact_bytes(),
+        node_server_ca_bundle_pem: node_server_ca_file.into_exact_bytes(),
         server_certificate_pem: server_certificate_file.into_exact_bytes(),
         server_private_key_pem: server_private_key_file.into_exact_bytes(),
     })
@@ -2539,6 +2561,7 @@ mod tests {
                 0o644,
             ),
             ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
+            ("node-server-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
             (
                 "node-machine-server-certificate.pem",
                 TEST_SERVER_CERTIFICATE,
@@ -3427,6 +3450,7 @@ mod tests {
                 .unwrap();
         assert_eq!(installed.ring().exact_bytes(), ROUTE_RING);
         assert_eq!(installed.gateway_client_ca_bundle_pem(), TEST_CLIENT_CA);
+        assert_eq!(installed.node_server_ca_bundle_pem(), TEST_CLIENT_CA);
         assert_eq!(installed.server_certificate_pem(), TEST_SERVER_CERTIFICATE);
         assert_eq!(installed.server_private_key_pem(), TEST_SERVER_PRIVATE_KEY);
         let debug = format!("{installed:?}");

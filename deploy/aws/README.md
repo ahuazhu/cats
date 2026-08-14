@@ -75,16 +75,17 @@ keys are `0600`. Main containers run as uid 0 only because the frozen reader
 requires those exact owners/modes; both have a read-only root filesystem, no
 privilege escalation and all Linux capabilities dropped.
 
-The worker Secrets Manager `SecretString` is a JSON object with exactly five
+The worker Secrets Manager `SecretString` is a JSON object with exactly six
 non-empty base64 fields:
 `public_key_ring_v1_json_b64`, `rotation_operator_trust_v1_json_b64`,
 `gateway_client_ca_bundle_pem_b64`,
 `node_machine_server_certificate_pem_b64` and
-`node_machine_server_private_key_pem_b64`. The instance role can read only that
+`node_machine_server_private_key_pem_b64`, plus the public
+`node_server_ca_bundle_pem_b64`. The instance role can read only that
 ARN (plus its already-scoped runtime/database secrets). Terraform also pins
 the exact Secrets Manager version ID, so a later `AWSCURRENT` change cannot
 alter a fresh Host's revision-1 bytes. The SSM transaction decodes, validates
-and installs the five fixed Node files with the same owner,
+and installs the six fixed Node files with the same owner,
 directory and mode contract through the same Rust ring/rustls validator used
 at daemon startup before starting `cats-noded`. The fixed operator trust then
 authenticates adjacent public-ring delivery without giving Node a Control
@@ -136,7 +137,7 @@ sudo /approved/staged-worker/cats-route-v2-node-r1-validator \
 
 Generation creates no cloud resource. It writes five exact root-owned `0700`
 directories: retained CA and offline rotation private material, Control
-eight-file set, Gateway three-file set, Node five-file set, and three provider
+eight-file set, Gateway three-file set, Node six-file set, and three provider
 inputs. Before returning it
 reopens every file, checks the canonical signer/ring and Gateway policy, proves
 the CA/key pairs, passes the Node set through the production candidate reader,
@@ -211,7 +212,7 @@ does not qualify as rollback. `metal/install-worker.sh` remains a
 bootstrap/development helper. It requires
 `CATS_ROUTE_V2_NODE_ARTIFACT_DIR=/approved/root-only/node-route-v2` before it
 changes packages, installed files or services. The source must be one real
-directory containing exactly the fixed five Node artifacts documented above.
+directory containing exactly the fixed six Node artifacts documented above.
 The helper stages and validates the canonical ring, CA sequence and matching
 Node certificate/private key, then installs the closed set at
 `/etc/cats/route-v2` before enabling `cats-worker`. Cloud Hypervisor stays under

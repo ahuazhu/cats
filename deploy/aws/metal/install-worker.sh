@@ -49,13 +49,14 @@ route_v2_expected=(
   gateway-client-ca-bundle.pem
   node-machine-server-certificate.pem
   node-machine-server-private-key.pem
+  node-server-ca-bundle.pem
 )
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 5 ]] || {
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 6 ]] || {
   echo "Node Route v2 artifact source contains an unexpected entry" >&2
   exit 1
 }
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 5 ]] || {
-  echo "Node Route v2 artifact source must contain exactly five single-link regular files" >&2
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 6 ]] || {
+  echo "Node Route v2 artifact source must contain exactly six single-link regular files" >&2
   exit 1
 }
 for name in "${route_v2_expected[@]}"; do

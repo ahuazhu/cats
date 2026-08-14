@@ -573,6 +573,7 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
         "gateway-client-ca-bundle.pem",
         "node-machine-server-certificate.pem",
         "node-machine-server-private-key.pem",
+        "node-server-ca-bundle.pem",
         "CATS_ROUTE_V2_ROTATION_ORIGIN",
         "route_v2_rotation_origin",
     ] {
@@ -3659,7 +3660,7 @@ fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
         .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory")
         .expect("absolute real Node Route v2 artifact directory check");
     let closed_set = script
-        .find("Node Route v2 artifact source must contain exactly four")
+        .find("Node Route v2 artifact source must contain exactly six")
         .expect("closed Node Route v2 artifact set check");
     let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
     assert!(
@@ -3696,6 +3697,7 @@ fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
         "[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]",
         "after-install-route-v2-artifacts",
         "node-machine-server-private-key.pem",
+        "node-server-ca-bundle.pem",
     ] {
         assert!(
             script.contains(expected),

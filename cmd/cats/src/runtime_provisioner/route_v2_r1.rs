@@ -84,10 +84,11 @@ const GATEWAY_FILES: [(&str, u32); 3] = [
     ("gateway-machine-client-private-key.pem", 0o600),
     ("node-server-ca-bundle.pem", 0o644),
 ];
-const NODE_FILES: [(&str, u32); 5] = [
+const NODE_FILES: [(&str, u32); 6] = [
     ("gateway-client-ca-bundle.pem", 0o644),
     ("node-machine-server-certificate.pem", 0o644),
     ("node-machine-server-private-key.pem", 0o600),
+    ("node-server-ca-bundle.pem", 0o644),
     ("public-key-ring.v1.json", 0o644),
     ("rotation-operator-trust.v1.json", 0o644),
 ];
@@ -2777,6 +2778,12 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
     )?;
     publish(
         &candidate.node,
+        "node-server-ca-bundle.pem",
+        &ca_certificate_bytes,
+        0o644,
+    )?;
+    publish(
+        &candidate.node,
         "node-machine-server-certificate.pem",
         &node_certificate,
         0o644,
@@ -3051,6 +3058,10 @@ fn encode_node_secret(name: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<V
             STANDARD.encode(required(files, "node-machine-server-private-key.pem")?),
         ),
         (
+            "node_server_ca_bundle_pem_b64".to_owned(),
+            STANDARD.encode(required(files, "node-server-ca-bundle.pem")?),
+        ),
+        (
             "public_key_ring_v1_json_b64".to_owned(),
             STANDARD.encode(required(files, "public-key-ring.v1.json")?),
         ),
@@ -3131,6 +3142,8 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
             installed.ring().exact_bytes() == required(&node, "public-key-ring.v1.json")?
                 && installed.gateway_client_ca_bundle_pem()
                     == required(&node, "gateway-client-ca-bundle.pem")?
+                && installed.node_server_ca_bundle_pem()
+                    == required(&node, "node-server-ca-bundle.pem")?
                 && installed.server_certificate_pem()
                     == required(&node, "node-machine-server-certificate.pem")?
                 && installed.server_private_key_pem()
@@ -3146,6 +3159,7 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
         required(&control, "gateway-client-ca-bundle.pem")?,
         required(&gateway, "node-server-ca-bundle.pem")?,
         required(&node, "gateway-client-ca-bundle.pem")?,
+        required(&node, "node-server-ca-bundle.pem")?,
     ] {
         anyhow::ensure!(
             observed == ca_certificate,
@@ -3660,10 +3674,11 @@ fn verify_node_secret(
                     "gateway_client_ca_bundle_pem_b64",
                     "node_machine_server_certificate_pem_b64",
                     "node_machine_server_private_key_pem_b64",
+                    "node_server_ca_bundle_pem_b64",
                     "public_key_ring_v1_json_b64",
                     "rotation_operator_trust_v1_json_b64",
                 ],
-        "Node SecretString is not the exact five-field shape"
+        "Node SecretString is not the exact six-field shape"
     );
     let mapping = [
         (
@@ -3678,6 +3693,7 @@ fn verify_node_secret(
             "node_machine_server_private_key_pem_b64",
             "node-machine-server-private-key.pem",
         ),
+        ("node_server_ca_bundle_pem_b64", "node-server-ca-bundle.pem"),
         ("public_key_ring_v1_json_b64", "public-key-ring.v1.json"),
         (
             "rotation_operator_trust_v1_json_b64",
@@ -3728,6 +3744,7 @@ mod tests {
                 "node-machine-server-private-key.pem".to_owned(),
                 b"key".to_vec(),
             ),
+            ("node-server-ca-bundle.pem".to_owned(), b"ca".to_vec()),
             ("public-key-ring.v1.json".to_owned(), b"ring".to_vec()),
             (
                 "rotation-operator-trust.v1.json".to_owned(),
