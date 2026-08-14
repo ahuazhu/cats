@@ -1534,6 +1534,92 @@ cats_e3_close_on_exit
 }
 
 #[test]
+fn runner_does_not_close_until_forward_g3_cleanup_succeeds_on_reentry() {
+    let fixture = Fixture::new();
+    let trace = fixture._temp.path().join("runner-g3-failure-before-close.trace");
+    let state = fixture._temp.path().join("runner-g3-failure-before-close.state");
+    fs::create_dir(&state).expect("create G3 recovery state");
+    let script = r#"
+set -euo pipefail
+source "$1"
+trace=$2
+state_directory=$3
+mode=$4
+decision=$state_directory/qualification-close-decision.v1.json
+qualification_lifecycle_attempted=true
+qualification_begin_applied=true
+qualification_close_applied=false
+qualification_close_forbidden=false
+qualification_terminalized=false
+qualification_close_kind=
+if [[ -f $decision ]]; then
+  qualification_close_kind=$(cat "$decision")
+fi
+cats_e3_persist_close_decision() {
+  if [[ -f $decision ]]; then
+    test "$(cat "$decision")" = "$1"
+  else
+    (umask 077; printf '%s\n' "$1" >"$decision")
+    sync -f "$state_directory"
+  fi
+  printf 'decision:%s:%s\n' "$mode" "$1" >>"$trace"
+}
+cats_e3_forward_recover_g3_on_exit() {
+  printf 'g3:%s\n' "$mode" >>"$trace"
+  [[ $mode == resume ]]
+}
+cats_e3_qualification_close() {
+  printf 'close:%s:%s\n' "$mode" "$1" >>"$trace"
+  test "$mode" = resume
+  test "$1" = emergency_close
+  qualification_close_applied=true
+}
+cats_e3_qualification_product_inventory() { :; }
+cats_e3_collect_final_inventory() { :; }
+cats_e3_publish_qualification_zero_wrappers() { :; }
+cats_e3_qualification_terminalize() { qualification_terminalized=true; }
+cats_e3_close_on_exit
+"#;
+    let invoke = |mode: &str| {
+        Command::new("bash")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .args(["-c", script, "runtime-cutover-g3-failure-before-close"])
+            .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+            .arg(&trace)
+            .arg(&state)
+            .arg(mode)
+            .output()
+            .expect("run G3 failure before close fixture")
+    };
+
+    let first = invoke("fail");
+    assert!(!first.status.success(), "first G3 cleanup unexpectedly passed");
+    assert_eq!(
+        fs::read_to_string(&trace).unwrap(),
+        concat!("decision:fail:emergency_close\n", "g3:fail\n"),
+        "a failed forward cleanup must have zero Qualification Close effects"
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("qualification-close-decision.v1.json")).unwrap(),
+        "emergency_close\n"
+    );
+
+    let resumed = invoke("resume");
+    assert_success(&resumed);
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
+        concat!(
+            "decision:fail:emergency_close\n",
+            "g3:fail\n",
+            "decision:resume:emergency_close\n",
+            "g3:resume\n",
+            "close:resume:emergency_close\n"
+        )
+    );
+}
+
+#[test]
 fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
     let fixture = Fixture::new();
     let harness = fixture._temp.path().join("runner-reentry-harness.sh");

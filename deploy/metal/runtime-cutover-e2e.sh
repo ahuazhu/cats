@@ -549,6 +549,7 @@ cats_e3_close_on_exit() {
   else
     cleanup_status=$?
   fi
+  [[ $cleanup_status -eq 0 ]] || return "$cleanup_status"
   if [[ $close_status -eq 0 && ${qualification_close_applied:-false} != true ]]; then
     if cats_e3_qualification_close "$qualification_close_kind" >/dev/null 2>&1; then
       close_status=0
