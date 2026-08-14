@@ -11,7 +11,11 @@ exact bytes for submission, replay and typed discovery.
 Control authenticates the offline signature and verifies that the signed STS
 claim is inside the release-bound trust scope.  It does not contact STS; the
 online lookup and its signed binding are operator-tool evidence, not a second
-Control-side authentication factor.
+Control-side authentication factor.  The Qualification wrapper commands use
+the same path: they discover the current revision with a signed read-only
+request, durably journal each effect command, resolve ambiguous responses by
+exact discovery, close before post-run terminal evidence, and never issue a
+new effect from the terminalizer.
 """
 
 from __future__ import annotations
@@ -53,6 +57,46 @@ MAX_COMMAND_LIFETIME_MS = 5 * 60 * 1_000
 MAX_QUALIFICATION_LIFETIME_MS = 24 * 60 * 60 * 1_000
 DEFAULT_COMMAND_LIFETIME_MS = 4 * 60 * 1_000
 DEFAULT_RESOLUTION_SECONDS = 120
+QUALIFICATION_BEGIN_RECEIPT_FILE = (
+    "production-mutation-qualification-begin.receipt.json"
+)
+QUALIFICATION_TERMINAL_RECEIPT_FILE = (
+    "production-mutation-qualification-terminal.receipt.json"
+)
+QUALIFICATION_FINAL_STATE_FILE = (
+    "production-mutation-qualification-final-admission-state.json"
+)
+QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-begin.command-receipt.json"
+)
+QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE = (
+    "production-mutation-qualification-close.command-receipt.json"
+)
+QUALIFICATION_BEGIN_PENDING_FILE = (
+    "production-mutation-qualification-begin.pending.json"
+)
+QUALIFICATION_CLOSE_PENDING_FILE = (
+    "production-mutation-qualification-close.pending.json"
+)
+QUALIFICATION_FINAL_FLEET_FILE = (
+    "production-mutation-qualification-final-fleet-closed.receipt.json"
+)
+QUALIFICATION_CLEANUP_INVENTORY_FILE = (
+    "production-mutation-qualification-cleanup-inventory.receipt.json"
+)
+QUALIFICATION_BEGIN_RECEIPT_KIND = (
+    "cats.production-mutation-qualification-begin-receipt.v1"
+)
+QUALIFICATION_TERMINAL_RECEIPT_KIND = (
+    "cats.production-mutation-qualification-terminal-receipt.v1"
+)
+QUALIFICATION_CLEANUP_INVENTORY_KIND = (
+    "cats.production-mutation-qualification-cleanup-inventory.v1"
+)
+QUALIFICATION_FINAL_FLEET_KIND = (
+    "cats.production-mutation-qualification-final-fleet-closed.v1"
+)
+MAX_QUALIFICATION_EVIDENCE_BYTES = 1024 * 1024
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -1050,6 +1094,696 @@ def discover_state(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
+def read_canonical_evidence(
+    path: Path,
+    label: str,
+    *,
+    private: bool = False,
+) -> tuple[dict[str, Any], bytes]:
+    raw = read_stable_file(
+        path,
+        label,
+        MAX_QUALIFICATION_EVIDENCE_BYTES,
+        private=private,
+    )
+    value = decode_json(raw, label)
+    if not isinstance(value, dict) or raw not in {
+        canonical_json(value),
+        canonical_json(value, newline=True),
+    }:
+        raise AdmissionError(f"{label} is not canonical Cats JSON")
+    return value, raw
+
+
+def qualification_command_id(binding: dict[str, Any], phase: str) -> str:
+    frame = bytearray(b"cats.production-qualification-admission.v1\0")
+    phase_bytes = phase.encode("ascii")
+    binding_bytes = canonical_json(binding)
+    frame.extend(struct.pack(">Q", len(phase_bytes)))
+    frame.extend(phase_bytes)
+    frame.extend(struct.pack(">Q", len(binding_bytes)))
+    frame.extend(binding_bytes)
+    return hashlib.sha256(frame).hexdigest()[:32]
+
+
+def qualification_binding_sha256(binding: dict[str, Any]) -> str:
+    return sha256(canonical_json({"kind": "qualification", "binding": binding}))
+
+
+def qualification_pending_path(
+    state_directory: Path,
+    binding: dict[str, Any],
+    phase: str,
+) -> Path:
+    return state_directory / f"{qualification_command_id(binding, phase)}.pending.v1.json"
+
+
+def ensure_qualification_pending(
+    args: argparse.Namespace,
+    binding: dict[str, Any],
+    *,
+    phase: str,
+    mutation: str,
+    expected_revision: int,
+) -> Path:
+    command_id = qualification_command_id(binding, phase)
+    path = args.state_directory / f"{command_id}.pending.v1.json"
+    if path.exists() or path.is_symlink():
+        _pending, _body, command = load_pending(path, args.trust_file)
+        expected_wire_binding: Any = binding
+        if mutation == "emergency_close":
+            expected_wire_binding = {"kind": "qualification", "binding": binding}
+        if (
+            command["command_id"] != command_id
+            or command["expected_revision"] != expected_revision
+            or command["mutation"]
+            != {"kind": mutation, "binding": expected_wire_binding}
+        ):
+            raise AdmissionError("durable Qualification pending command conflicts")
+        return path
+    namespace = argparse.Namespace(
+        origin=args.origin,
+        trust_file=args.trust_file,
+        private_key_file=args.private_key_file,
+        binding_file=args.binding_file,
+        state_directory=args.state_directory,
+        expected_revision=expected_revision,
+        mutation=mutation,
+        binding_kind="qualification" if mutation == "emergency_close" else None,
+        command_id=command_id,
+        command_lifetime_seconds=args.command_lifetime_seconds,
+        aws=args.aws,
+        openssl=args.openssl,
+    )
+    created, _digest = prepare(namespace)
+    if created != path:
+        raise AdmissionError("Qualification pending path is not deterministic")
+    return path
+
+
+def settle_qualification_pending(
+    pending: Path,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], bytes, str]:
+    receipt_path, receipt_sha256 = settle(
+        argparse.Namespace(
+            pending=pending,
+            trust_file=args.trust_file,
+            resolution_timeout_seconds=args.resolution_timeout_seconds,
+        )
+    )
+    receipt, raw = read_canonical_evidence(
+        receipt_path,
+        "Qualification admission command receipt",
+        private=True,
+    )
+    if sha256(raw) != receipt_sha256:
+        raise AdmissionError("Qualification command receipt digest drifted")
+    return receipt, raw, receipt_sha256
+
+
+def validate_qualification_authority_inputs(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    validate_private_directory(args.state_directory)
+    validate_private_directory(args.evidence_directory)
+    binding_value, binding_raw = read_canonical_evidence(
+        args.binding_file,
+        "Qualification admission binding",
+    )
+    binding = validate_qualification_binding(binding_value)
+    if binding_raw != canonical_json(binding, newline=True):
+        raise AdmissionError("Qualification binding must have one terminal LF")
+    if (
+        binding["qualification_id"] != args.run_id
+        or binding["workspace_id"] != args.workspace_id
+        or binding["source_commit_sha"] != args.exact_commit
+    ):
+        raise AdmissionError("Qualification runner identity differs from its binding")
+    if args.block_path not in {"kernel-nbd", "vhost-user"}:
+        raise AdmissionError("Qualification block path is not canonical")
+
+    cell, cell_raw = read_canonical_evidence(
+        args.cell_manifest_file,
+        "Qualification cell manifest",
+    )
+    cell = require_fields(
+        cell,
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "deployment_id",
+            "release_id",
+            "source_commit_sha",
+            "aws_partition",
+            "aws_account_id",
+            "aws_region",
+            "cell_id",
+            "cell_namespace",
+            "cats_account_id",
+            "workspace_id",
+            "control_origin",
+            "control_schema_version",
+            "release_manifest_sha256",
+            "worker_bundle_sha256",
+            "qualification_catalog_sha256",
+            "created_at_unix_ms",
+        },
+        "Qualification cell manifest",
+    )
+    if cell["kind"] != "cats.production-qualification-cell-manifest.v1" or cell[
+        "version"
+    ] != 1:
+        raise AdmissionError("Qualification cell manifest kind/version drifted")
+    for field in (
+        "qualification_id",
+        "deployment_id",
+        "release_id",
+        "source_commit_sha",
+        "aws_partition",
+        "aws_account_id",
+        "aws_region",
+        "cell_id",
+        "cell_namespace",
+        "cats_account_id",
+        "workspace_id",
+        "control_schema_version",
+        "release_manifest_sha256",
+        "worker_bundle_sha256",
+        "qualification_catalog_sha256",
+    ):
+        if cell[field] != binding[field]:
+            raise AdmissionError(
+                "Qualification cell manifest differs from its admission binding"
+            )
+    if cell["control_origin"] != validate_origin(args.origin):
+        raise AdmissionError("Qualification cell Control origin drifted")
+    if (
+        not isinstance(cell["created_at_unix_ms"], int)
+        or isinstance(cell["created_at_unix_ms"], bool)
+        or cell["created_at_unix_ms"] <= 0
+        or binding["qualification_cell_manifest_sha256"] != sha256(cell_raw)
+    ):
+        raise AdmissionError("Qualification cell manifest identity is invalid")
+
+    release, release_raw = read_canonical_evidence(
+        args.release_manifest_file,
+        "manual release manifest",
+    )
+    try:
+        release_source = release["source"]
+        worker = release["artifacts"]["worker"]
+    except (KeyError, TypeError) as error:
+        raise AdmissionError("manual release manifest shape is unavailable") from error
+    if (
+        release.get("version") != 1
+        or not isinstance(release_source, dict)
+        or release_source.get("commit") != binding["source_commit_sha"]
+        or not isinstance(worker, dict)
+        or worker.get("bundle_sha256") != binding["worker_bundle_sha256"]
+        or binding["release_manifest_sha256"] != sha256(release_raw)
+    ):
+        raise AdmissionError("manual release manifest differs from Qualification binding")
+    _catalog, catalog_raw = read_canonical_evidence(
+        args.qualification_catalog_file,
+        "Qualification catalog",
+    )
+    if binding["qualification_catalog_sha256"] != sha256(catalog_raw):
+        raise AdmissionError("Qualification catalog differs from its binding")
+    return binding
+
+
+def validate_applied_qualification_receipt(
+    receipt: dict[str, Any],
+    binding: dict[str, Any],
+    mutation: str,
+) -> dict[str, Any]:
+    command = receipt["command"]
+    expected_wire_binding: Any = binding
+    if mutation == "emergency_close":
+        expected_wire_binding = {"kind": "qualification", "binding": binding}
+    if command["mutation"] != {"kind": mutation, "binding": expected_wire_binding}:
+        raise AdmissionError("Qualification command receipt mutation drifted")
+    outcome = receipt.get("outcome")
+    if not isinstance(outcome, dict) or outcome.get("kind") != "applied":
+        raise AdmissionError("Qualification command did not reach Applied")
+    state = validate_state(outcome.get("state"))
+    expected_mode = "qualification" if mutation == "begin_qualification" else "closed"
+    if (
+        state["mode"] != expected_mode
+        or state["binding"] != {"kind": "qualification", "binding": binding}
+    ):
+        raise AdmissionError("Qualification command installed the wrong state")
+    return state
+
+
+def qualification_begin_framework(
+    binding: dict[str, Any],
+    receipt: dict[str, Any],
+    receipt_sha256: str,
+) -> dict[str, Any]:
+    state = validate_applied_qualification_receipt(
+        receipt,
+        binding,
+        "begin_qualification",
+    )
+    command = receipt["command"]
+    return {
+        "kind": QUALIFICATION_BEGIN_RECEIPT_KIND,
+        "version": 1,
+        "qualification_id": binding["qualification_id"],
+        "workspace_id": binding["workspace_id"],
+        "release_id": binding["release_id"],
+        "source_commit_sha": binding["source_commit_sha"],
+        "qualification_catalog_sha256": binding[
+            "qualification_catalog_sha256"
+        ],
+        "allowed_mutation_classes": binding["allowed_mutation_classes"],
+        "binding_sha256": qualification_binding_sha256(binding),
+        "begin_command_id": command["command_id"],
+        "begin_request_sha256": receipt["request_sha256"],
+        "begin_command_receipt_sha256": receipt_sha256,
+        "resulting_revision": state["revision"],
+        "qualification_expires_at_unix_ms": binding[
+            "qualification_expires_at_unix_ms"
+        ],
+    }
+
+
+def qualification_begin(args: argparse.Namespace) -> tuple[Path, str]:
+    binding = validate_qualification_authority_inputs(args)
+    begin_pending = qualification_pending_path(
+        args.state_directory,
+        binding,
+        "begin",
+    )
+    if not begin_pending.exists() and not begin_pending.is_symlink():
+        probe = ensure_qualification_pending(
+            args,
+            binding,
+            phase="state-probe",
+            mutation="begin_qualification",
+            expected_revision=1,
+        )
+        current = discover_state(
+            argparse.Namespace(pending=probe, trust_file=args.trust_file)
+        )
+        if current["mode"] != "closed":
+            raise AdmissionError("Qualification Begin requires exact current Closed state")
+        begin_pending = ensure_qualification_pending(
+            args,
+            binding,
+            phase="begin",
+            mutation="begin_qualification",
+            expected_revision=current["revision"],
+        )
+    receipt, receipt_raw, receipt_sha256 = settle_qualification_pending(
+        begin_pending,
+        args,
+    )
+    begin_pending_raw = read_stable_file(
+        begin_pending,
+        "Qualification Begin pending command",
+        MAX_RESPONSE_BYTES,
+        private=True,
+    )
+    write_atomic(
+        args.evidence_directory / QUALIFICATION_BEGIN_PENDING_FILE,
+        begin_pending_raw,
+    )
+    write_atomic(
+        args.evidence_directory / QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE,
+        receipt_raw,
+    )
+    framework = qualification_begin_framework(binding, receipt, receipt_sha256)
+    path = args.evidence_directory / QUALIFICATION_BEGIN_RECEIPT_FILE
+    payload = canonical_json(framework)
+    write_atomic(path, payload)
+    return path, sha256(payload)
+
+
+def validate_cleanup_inventory(
+    value: Any,
+    binding: dict[str, Any],
+    block_path: str,
+) -> dict[str, Any]:
+    value = require_fields(
+        value,
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "source_commit_sha",
+            "block_path",
+            "evaluated_at_unix_ms",
+            "complete",
+            "product_resource_count",
+            "desired_runtime_count",
+            "current_runtime_observation_count",
+            "active_guard_count",
+            "residue_count",
+        },
+        "Qualification cleanup inventory",
+    )
+    if (
+        value["kind"] != QUALIFICATION_CLEANUP_INVENTORY_KIND
+        or value["version"] != 1
+        or value["qualification_id"] != binding["qualification_id"]
+        or value["workspace_id"] != binding["workspace_id"]
+        or value["source_commit_sha"] != binding["source_commit_sha"]
+        or value["block_path"] != block_path
+        or value["complete"] is not True
+    ):
+        raise AdmissionError("Qualification cleanup inventory binding drifted")
+    if (
+        not isinstance(value["evaluated_at_unix_ms"], int)
+        or isinstance(value["evaluated_at_unix_ms"], bool)
+        or value["evaluated_at_unix_ms"] <= 0
+    ):
+        raise AdmissionError("Qualification cleanup inventory time is invalid")
+    for field in (
+        "product_resource_count",
+        "desired_runtime_count",
+        "current_runtime_observation_count",
+        "active_guard_count",
+        "residue_count",
+    ):
+        if value[field] != 0 or isinstance(value[field], bool):
+            raise AdmissionError("Qualification cleanup inventory is not zero")
+    return value
+
+
+def validate_qualification_final_fleet(
+    value: Any,
+    binding: dict[str, Any],
+    block_path: str,
+) -> dict[str, Any]:
+    value = require_fields(
+        value,
+        {
+            "kind",
+            "version",
+            "qualification_id",
+            "workspace_id",
+            "source_commit_sha",
+            "block_path",
+            "evaluated_at_unix_ms",
+            "complete",
+            "expected_node_ids",
+            "desired_runtime_count",
+            "current_runtime_observation_count",
+            "active_guard_count",
+            "residue_count",
+            "fleet_verification_receipt_sha256",
+        },
+        "Qualification final Fleet Closed receipt",
+    )
+    if (
+        value["kind"] != QUALIFICATION_FINAL_FLEET_KIND
+        or value["version"] != 1
+        or value["qualification_id"] != binding["qualification_id"]
+        or value["workspace_id"] != binding["workspace_id"]
+        or value["source_commit_sha"] != binding["source_commit_sha"]
+        or value["block_path"] != block_path
+        or value["complete"] is not True
+    ):
+        raise AdmissionError("Qualification final Fleet binding drifted")
+    expected_nodes = value["expected_node_ids"]
+    if (
+        not isinstance(expected_nodes, list)
+        or not expected_nodes
+        or expected_nodes != sorted(set(expected_nodes))
+    ):
+        raise AdmissionError("Qualification final Fleet Node set is not closed")
+    for node_id in expected_nodes:
+        require_string(node_id, ID, "Qualification final Fleet Node ID")
+    if (
+        not isinstance(value["evaluated_at_unix_ms"], int)
+        or isinstance(value["evaluated_at_unix_ms"], bool)
+        or value["evaluated_at_unix_ms"] <= 0
+    ):
+        raise AdmissionError("Qualification final Fleet time is invalid")
+    require_string(
+        value["fleet_verification_receipt_sha256"],
+        SHA256,
+        "Qualification final Fleet authority digest",
+    )
+    for field in (
+        "desired_runtime_count",
+        "current_runtime_observation_count",
+        "active_guard_count",
+        "residue_count",
+    ):
+        if value[field] != 0 or isinstance(value[field], bool):
+            raise AdmissionError("Qualification final Fleet is not Closed and empty")
+    return value
+
+
+def load_qualification_begin_for_close(
+    args: argparse.Namespace,
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    begin_pending = qualification_pending_path(
+        args.state_directory,
+        binding,
+        "begin",
+    )
+    if not begin_pending.exists() or begin_pending.is_symlink():
+        raise AdmissionError("Qualification Begin pending authority is unavailable")
+    begin_command_receipt, _receipt_raw, begin_command_receipt_sha256 = (
+        settle_qualification_pending(begin_pending, args)
+    )
+    expected_begin = qualification_begin_framework(
+        binding,
+        begin_command_receipt,
+        begin_command_receipt_sha256,
+    )
+    begin_path = args.evidence_directory / QUALIFICATION_BEGIN_RECEIPT_FILE
+    begin, begin_raw = read_canonical_evidence(
+        begin_path,
+        "Qualification Begin framework receipt",
+        private=True,
+    )
+    if begin != expected_begin or begin_raw != canonical_json(expected_begin):
+        raise AdmissionError("Qualification Begin framework receipt drifted")
+    return begin
+
+
+def apply_qualification_close(
+    args: argparse.Namespace,
+    binding: dict[str, Any],
+    begin: dict[str, Any],
+    *,
+    allow_prepare: bool,
+) -> tuple[dict[str, Any], dict[str, Any], str, Path]:
+    mutation = (
+        "end_qualification"
+        if args.close_kind == "end_qualification"
+        else "emergency_close"
+    )
+    close_pending = qualification_pending_path(
+        args.state_directory,
+        binding,
+        args.close_kind,
+    )
+    if not close_pending.exists() and not close_pending.is_symlink():
+        if not allow_prepare:
+            raise AdmissionError("Qualification close pending authority is unavailable")
+        begin_pending = qualification_pending_path(
+            args.state_directory,
+            binding,
+            "begin",
+        )
+        current = discover_state(
+            argparse.Namespace(pending=begin_pending, trust_file=args.trust_file)
+        )
+        if (
+            current["mode"] != "qualification"
+            or current["binding"] != {"kind": "qualification", "binding": binding}
+        ):
+            raise AdmissionError("Qualification close requires its exact installed binding")
+        close_pending = ensure_qualification_pending(
+            args,
+            binding,
+            phase=args.close_kind,
+            mutation=mutation,
+            expected_revision=current["revision"],
+        )
+    receipt, receipt_raw, receipt_sha256 = settle_qualification_pending(
+        close_pending,
+        args,
+    )
+    close_pending_raw = read_stable_file(
+        close_pending,
+        "Qualification close pending command",
+        MAX_RESPONSE_BYTES,
+        private=True,
+    )
+    state = validate_applied_qualification_receipt(receipt, binding, mutation)
+    if state["revision"] != begin["resulting_revision"] + 1:
+        raise AdmissionError("Qualification close is not the exact Begin successor")
+    state_payload = canonical_json(state)
+    state_path = args.state_directory / QUALIFICATION_FINAL_STATE_FILE
+    write_atomic(state_path, state_payload)
+    write_atomic(
+        args.evidence_directory / QUALIFICATION_CLOSE_COMMAND_RECEIPT_FILE,
+        receipt_raw,
+    )
+    write_atomic(
+        args.evidence_directory / QUALIFICATION_CLOSE_PENDING_FILE,
+        close_pending_raw,
+    )
+    write_atomic(
+        args.evidence_directory / QUALIFICATION_FINAL_STATE_FILE,
+        state_payload,
+    )
+    return receipt, state, receipt_sha256, state_path
+
+
+def qualification_close(args: argparse.Namespace) -> tuple[Path, str]:
+    binding = validate_qualification_authority_inputs(args)
+    begin = load_qualification_begin_for_close(args, binding)
+    _receipt, _state, _receipt_sha256, state_path = apply_qualification_close(
+        args,
+        binding,
+        begin,
+        allow_prepare=True,
+    )
+    state_raw = read_stable_file(
+        state_path,
+        "Qualification final admission state",
+        MAX_RESPONSE_BYTES,
+        private=True,
+    )
+    return state_path, sha256(state_raw)
+
+
+def qualification_terminalize(args: argparse.Namespace) -> tuple[Path, str]:
+    binding = validate_qualification_authority_inputs(args)
+    if (
+        args.fleet_closed_receipt.parent != args.evidence_directory
+        or args.cleanup_inventory_receipt.parent != args.evidence_directory
+        or args.fleet_closed_receipt.name != QUALIFICATION_FINAL_FLEET_FILE
+        or args.cleanup_inventory_receipt.name
+        != QUALIFICATION_CLEANUP_INVENTORY_FILE
+    ):
+        raise AdmissionError("Qualification terminal support evidence names drifted")
+    begin = load_qualification_begin_for_close(args, binding)
+    receipt, state, receipt_sha256, _state_path = apply_qualification_close(
+        args,
+        binding,
+        begin,
+        allow_prepare=False,
+    )
+    state_payload = canonical_json(state)
+
+    fleet, fleet_raw = read_canonical_evidence(
+        args.fleet_closed_receipt,
+        "Qualification final Fleet Closed receipt",
+        private=True,
+    )
+    cleanup, cleanup_raw = read_canonical_evidence(
+        args.cleanup_inventory_receipt,
+        "Qualification cleanup inventory receipt",
+        private=True,
+    )
+    fleet = validate_qualification_final_fleet(fleet, binding, args.block_path)
+    cleanup = validate_cleanup_inventory(cleanup, binding, args.block_path)
+    if (
+        cleanup["evaluated_at_unix_ms"] < receipt["committed_at_unix_ms"]
+        or fleet["evaluated_at_unix_ms"] < receipt["committed_at_unix_ms"]
+    ):
+        raise AdmissionError("Qualification terminal evidence predates close linearization")
+    completed = max(
+        cleanup["evaluated_at_unix_ms"],
+        fleet["evaluated_at_unix_ms"],
+    )
+    framework = {
+        "kind": QUALIFICATION_TERMINAL_RECEIPT_KIND,
+        "version": 1,
+        "qualification_id": begin["qualification_id"],
+        "workspace_id": begin["workspace_id"],
+        "release_id": begin["release_id"],
+        "source_commit_sha": begin["source_commit_sha"],
+        "qualification_catalog_sha256": begin[
+            "qualification_catalog_sha256"
+        ],
+        "allowed_mutation_classes": begin["allowed_mutation_classes"],
+        "qualification_expires_at_unix_ms": begin[
+            "qualification_expires_at_unix_ms"
+        ],
+        "binding_sha256": begin["binding_sha256"],
+        "begin_command_id": begin["begin_command_id"],
+        "begin_request_sha256": begin["begin_request_sha256"],
+        "begin_command_receipt_sha256": begin[
+            "begin_command_receipt_sha256"
+        ],
+        "begin_resulting_revision": begin["resulting_revision"],
+        "close_kind": args.close_kind,
+        "terminal_outcome": (
+            "qualified_closed"
+            if args.close_kind == "end_qualification"
+            else "emergency_closed"
+        ),
+        "close_command_id": receipt["command"]["command_id"],
+        "close_request_sha256": receipt["request_sha256"],
+        "close_command_receipt_sha256": receipt_sha256,
+        "final_admission_state_sha256": sha256(state_payload),
+        "final_closed_revision": state["revision"],
+        "fleet_closed_receipt_sha256": sha256(fleet_raw),
+        "cleanup_inventory_receipt_sha256": sha256(cleanup_raw),
+        "active_guard_count": cleanup["active_guard_count"],
+        "product_resource_count": cleanup["product_resource_count"],
+        "residue_count": cleanup["residue_count"],
+        "completed_at_unix_ms": completed,
+    }
+    path = args.evidence_directory / QUALIFICATION_TERMINAL_RECEIPT_FILE
+    payload = canonical_json(framework)
+    write_atomic(path, payload)
+    return path, sha256(payload)
+
+
+def add_qualification_hook_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    signing: bool,
+) -> None:
+    parser.add_argument("--origin", required=True)
+    parser.add_argument("--trust-file", required=True, type=Path)
+    if signing:
+        parser.add_argument("--private-key-file", required=True, type=Path)
+    parser.add_argument("--binding-file", required=True, type=Path)
+    parser.add_argument("--cell-manifest-file", required=True, type=Path)
+    parser.add_argument("--release-manifest-file", required=True, type=Path)
+    parser.add_argument("--qualification-catalog-file", required=True, type=Path)
+    parser.add_argument("--state-directory", required=True, type=Path)
+    parser.add_argument("--evidence-directory", required=True, type=Path)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--workspace-id", required=True)
+    parser.add_argument("--exact-commit", required=True)
+    parser.add_argument(
+        "--block-path",
+        required=True,
+        choices=("kernel-nbd", "vhost-user"),
+    )
+    if signing:
+        parser.add_argument(
+            "--command-lifetime-seconds",
+            type=int,
+            default=DEFAULT_COMMAND_LIFETIME_MS // 1_000,
+        )
+    parser.add_argument(
+        "--resolution-timeout-seconds",
+        type=int,
+        default=DEFAULT_RESOLUTION_SECONDS,
+    )
+    if signing:
+        parser.add_argument("--aws", type=Path, default=Path("/usr/local/bin/aws"))
+        parser.add_argument("--openssl", type=Path, default=Path("/usr/bin/openssl"))
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -1094,6 +1828,41 @@ def parser() -> argparse.ArgumentParser:
     state_parser = commands.add_parser("state", help="typed read-only discovery using a pending command")
     state_parser.add_argument("--pending", required=True, type=Path)
     state_parser.add_argument("--trust-file", required=True, type=Path)
+    qualification_begin_parser = commands.add_parser(
+        "qualification-begin",
+        help="discover Closed, apply exact BeginQualification and publish its framework receipt",
+    )
+    add_qualification_hook_arguments(qualification_begin_parser, signing=True)
+    qualification_close_parser = commands.add_parser(
+        "qualification-close",
+        help="apply exact EndQualification/EmergencyClose and publish its final state",
+    )
+    add_qualification_hook_arguments(qualification_close_parser, signing=True)
+    qualification_close_parser.add_argument(
+        "--close-kind",
+        required=True,
+        choices=("end_qualification", "emergency_close"),
+    )
+    qualification_terminal_parser = commands.add_parser(
+        "qualification-terminalize",
+        help="bind post-close Fleet/cleanup evidence into the terminal framework receipt",
+    )
+    add_qualification_hook_arguments(qualification_terminal_parser, signing=False)
+    qualification_terminal_parser.add_argument(
+        "--close-kind",
+        required=True,
+        choices=("end_qualification", "emergency_close"),
+    )
+    qualification_terminal_parser.add_argument(
+        "--fleet-closed-receipt",
+        required=True,
+        type=Path,
+    )
+    qualification_terminal_parser.add_argument(
+        "--cleanup-inventory-receipt",
+        required=True,
+        type=Path,
+    )
     return result
 
 
@@ -1108,8 +1877,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
             path, digest = settle(args)
             value = {"receipt": str(path), "sha256": digest}
-        else:
+        elif args.command == "state":
             value = discover_state(args)
+        elif args.command == "qualification-begin":
+            if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:
+                raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
+            path, digest = qualification_begin(args)
+            value = {"receipt": str(path), "sha256": digest}
+        elif args.command == "qualification-close":
+            if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:
+                raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
+            path, digest = qualification_close(args)
+            value = {"receipt": str(path), "sha256": digest}
+        else:
+            if args.resolution_timeout_seconds <= 0 or args.resolution_timeout_seconds > 3600:
+                raise AdmissionError("resolution timeout must be from 1 through 3600 seconds")
+            path, digest = qualification_terminalize(args)
+            value = {"receipt": str(path), "sha256": digest}
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0
     except AdmissionError as error:

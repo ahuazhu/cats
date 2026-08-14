@@ -335,6 +335,58 @@ label. The final state/fleet/cleanup receipts are read afterward; E9 terminaliza
 The final qualification manifest hashes these receipts; neither receipt hashes that manifest,
 avoiding a recursive digest.
 
+### 4.2 Runner Qualification hook
+
+Each block-path runner invocation has its own unique `run_id`, binding, 0700 operator state
+directory and Begin/terminal pair. The exact source tool is
+`deploy/aws/production-mutation-admission.py`. Nonsecret staged configuration labels are:
+
+- `production-cutover-operator-trust` for the fixed
+  `/etc/cats/production-cutover-operator-trust.v1.json` public trust;
+- `production-mutation-qualification-binding` for the canonical run-specific
+  `QualificationAdmissionBinding`;
+- `production-qualification-cell-manifest` for the canonical Terraform/control identity artifact;
+- the existing `qualification-catalog` and approved manual release manifest.
+
+The offline private key is a root-only secret input to Begin/close. It is never a config label,
+manifest member, digest projection or evidence copy. The cell manifest kind is
+`cats.production-qualification-cell-manifest.v1` and closes exactly the run/deployment/release,
+source, AWS partition/account/region, ADR-0038 cell ID/namespace, Cats account/Workspace, Control
+origin/schema, release-manifest/worker/catalog digests and creation time. Its exact file digest is
+the binding's `qualification_cell_manifest_sha256`.
+
+The runner calls, with the common exact identity/file arguments shown by `--help`:
+
+```text
+production-mutation-admission.py qualification-begin COMMON-SIGNED-ARGS
+... run cases and exact cleanup ...
+production-mutation-admission.py qualification-close COMMON-SIGNED-ARGS \
+  --close-kind end_qualification
+... obtain only read-only post-close Fleet and cleanup evidence ...
+production-mutation-admission.py qualification-terminalize COMMON-VERIFY-ARGS \
+  --close-kind end_qualification \
+  --fleet-closed-receipt ABS/production-mutation-qualification-final-fleet-closed.receipt.json \
+  --cleanup-inventory-receipt ABS/production-mutation-qualification-cleanup-inventory.receipt.json
+```
+
+Begin first signs a deterministic read-only state probe, discovers the exact current revision, then
+durably creates the real pending command before submit. Close takes the conflicting Store lock and
+publishes the canonical final Closed state before the runner obtains post-close evidence.
+Terminalize has no private-key/AWS/OpenSSL argument and refuses to create a missing close command; it
+can only exact-replay/discover the durable close and assemble evidence. The final Fleet wrapper kind
+is `cats.production-mutation-qualification-final-fleet-closed.v1`; the cleanup wrapper kind is
+`cats.production-mutation-qualification-cleanup-inventory.v1`. Both bind run/Workspace/source/raw
+block path, are evaluated after the close commit, are complete, and carry exact zero runtime/guard/
+residue (plus product-resource zero for cleanup) projections.
+
+The runner's failure/cancellation trap never invents cleanup. It finishes only explicitly allowed
+run-bound cleanup, invokes `qualification-close --close-kind emergency_close`, then obtains the same
+read-only zero proofs and terminalizes as `emergency_closed` when possible. If zero cleanup cannot be
+proved, the close command receipt and final Closed state remain durable, no successful terminal
+receipt is published, and the ADR-0038 cell stays isolated for Terraform destruction. An ambiguous
+Begin/End/EmergencyClose is always resolved with the same pending bytes before any different command
+may be prepared.
+
 ## 5. Final-open transaction
 
 Final-open has separate canonical plan/receipt kinds and a new `open_id`. The read-only plan binds
