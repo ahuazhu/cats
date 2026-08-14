@@ -318,6 +318,107 @@ cats_e3_environment_labels_are_unique() {
   done
 }
 
+cats_e3_validate_private_key_input() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+
+def fail():
+    raise SystemExit(1)
+
+
+def open_checked(name, flags, *, dir_fd=None):
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError:
+        fail()
+
+
+path = sys.argv[1]
+if (
+    not path.startswith("/")
+    or path != os.path.normpath(path)
+    or path == "/"
+):
+    fail()
+
+components = path.split("/")[1:]
+directory_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+effective_owner = (os.geteuid(), os.getegid())
+if effective_owner[0] == 0 and effective_owner != (0, 0):
+    fail()
+allowed_directory_owners = {(0, 0), effective_owner}
+directory = open_checked("/", directory_flags)
+try:
+    for component in components[:-1]:
+        if component in {"", ".", ".."}:
+            fail()
+        child = open_checked(component, directory_flags, dir_fd=directory)
+        metadata = os.fstat(child)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) not in allowed_directory_owners
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            os.close(child)
+            fail()
+        os.close(directory)
+        directory = child
+
+    parent = os.fstat(directory)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or (parent.st_uid, parent.st_gid) != effective_owner
+        or stat.S_IMODE(parent.st_mode) & 0o022
+    ):
+        fail()
+    descriptor = open_checked(components[-1], file_flags, dir_fd=directory)
+    try:
+        before = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_uid, before.st_gid) != effective_owner
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or not 1 <= before.st_size <= 16_384
+        ):
+            fail()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 16_384))
+            if not chunk:
+                fail()
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            fail()
+        if identity(os.fstat(descriptor)) != identity(before):
+            fail()
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory)
+PY
+}
+
 cats_e3_private_stage=
 cats_e3_cleanup_private_stage() {
   local status=$?
@@ -356,6 +457,7 @@ usage: runtime-cutover-e2e.sh \
   --release-manifest-sha256 <sha256:64hex> \
   --installer-receipt </absolute/installer-receipt.json> \
   --token-file </absolute/root-only/control-token> \
+  --production-cutover-operator-private-key-file </absolute/root-only/private-key.pem> \
   --control-origin <canonical-https-origin> \
   --workspace-id <runtime-id> \
   --expected-node <runtime-id> [--expected-node ...] \
@@ -387,6 +489,8 @@ release_manifest=
 release_manifest_sha256=
 installer_receipt=
 token_file=
+production_cutover_operator_private_key_file=
+production_cutover_operator_private_key_file_count=0
 control_origin=
 workspace_id=
 qualification_node=
@@ -403,6 +507,12 @@ key_fingerprint_entries=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --production-cutover-operator-private-key-file)
+      [[ $# -ge 2 ]] || usage
+      production_cutover_operator_private_key_file=$2
+      production_cutover_operator_private_key_file_count=$((production_cutover_operator_private_key_file_count + 1))
+      shift 2
+      ;;
     --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--token-file|--control-origin|--workspace-id|--qualification-node|--cat-name|--boot-image-digest|--endpoint-name|--endpoint-hostname|--guest-kernel|--scenario-driver)
       [[ $# -ge 2 ]] || usage
       name=${1#--}
@@ -446,6 +556,10 @@ case "$block_path" in kernel-nbd|vhost-user) ;; *) fail "--block-path must be ke
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "--installer-receipt must be the canonical production installation receipt"
 [[ $token_file == /* ]] || fail "--token-file must be absolute"
+[[ $production_cutover_operator_private_key_file_count -eq 1 ]] || \
+  fail "--production-cutover-operator-private-key-file is required exactly once"
+[[ $production_cutover_operator_private_key_file == /* ]] || \
+  fail "--production-cutover-operator-private-key-file must be absolute"
 [[ $control_origin =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || \
   fail "--control-origin must be one canonical HTTPS origin"
 for coordinate in workspace_id qualification_node cat_name endpoint_name; do
@@ -477,6 +591,8 @@ cats_e3_environment_labels_are_unique true "${binary_entries[@]}" || \
 cats_e3_environment_labels_are_unique false "${config_entries[@]}" || \
   fail "config labels collide after environment normalization"
 [[ $EUID -eq 0 ]] || fail "production E3 qualification must run as root"
+cats_e3_validate_private_key_input "$production_cutover_operator_private_key_file" || \
+  fail "production cutover operator private key is not protected root-only input"
 
 for command_name in git jq python3 sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"

@@ -544,6 +544,80 @@ cats_e3_environment_labels_are_unique false route-key-ring=/one route-key-ring-s
     assert_success(&output);
 }
 
+#[test]
+fn runner_keeps_the_production_cutover_key_out_of_staged_authority() {
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    assert!(runner.contains("--production-cutover-operator-private-key-file"));
+    assert!(runner.contains("production_cutover_operator_private_key_file_count -eq 1"));
+    assert!(runner.contains("cats_e3_validate_private_key_input"));
+    for required in [
+        "getattr(os, \"O_NOFOLLOW\", 0)",
+        "getattr(os, \"O_DIRECTORY\", 0)",
+        "before.st_nlink != 1",
+        "effective_owner[0] == 0 and effective_owner != (0, 0)",
+        "stat.S_IMODE(before.st_mode) != 0o600",
+        "not 1 <= before.st_size <= 16_384",
+        "identity(os.fstat(descriptor)) != identity(before)",
+    ] {
+        assert!(
+            runner.contains(required),
+            "missing private-key guard {required}"
+        );
+    }
+    for forbidden in [
+        "export CATS_E3_PRODUCTION_CUTOVER_OPERATOR_PRIVATE_KEY_FILE",
+        "stage_input production-cutover-operator-private-key",
+        "remember_original production-cutover-operator-private-key",
+        "production_cutover_operator_private_key_sha256",
+    ] {
+        assert!(
+            !runner.contains(forbidden),
+            "private-key authority leaked through {forbidden}"
+        );
+    }
+
+    let temp = tempfile::tempdir_in(workspace_root()).expect("private-key validation fixture");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .expect("protect private-key fixture parent");
+    let script = r#"
+set -euo pipefail
+source "$1"
+parent=$2
+key=$parent/operator.pem
+printf '%s' private-key-fixture >"$key"
+chmod 0600 "$key"
+cats_e3_validate_private_key_input "$key"
+! cats_e3_validate_private_key_input relative.pem
+! cats_e3_validate_private_key_input "$parent/missing.pem"
+ln -s "$key" "$parent/symlink.pem"
+! cats_e3_validate_private_key_input "$parent/symlink.pem"
+rm "$parent/symlink.pem"
+ln "$key" "$parent/hardlink.pem"
+! cats_e3_validate_private_key_input "$key"
+rm "$parent/hardlink.pem"
+chmod 0644 "$key"
+! cats_e3_validate_private_key_input "$key"
+chmod 0600 "$key"
+chmod 0770 "$parent"
+! cats_e3_validate_private_key_input "$key"
+chmod 0700 "$parent"
+if [[ $(id -u) -eq 0 ]]; then
+  chown 1:1 "$key"
+  ! cats_e3_validate_private_key_input "$key"
+fi
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-private-key-fixture"])
+        .arg(workspace_root().join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(temp.path())
+        .output()
+        .expect("run private-key validation fixture");
+    assert_success(&output);
+    assert!(output.stdout.is_empty(), "private-key helper wrote stdout");
+}
+
 fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) {
     let stage =
         fs::read_to_string(output_dir.join("private-stage-path")).expect("read private stage path");
