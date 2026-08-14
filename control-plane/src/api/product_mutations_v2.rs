@@ -69,6 +69,15 @@ async fn cat_lifecycle_v2(
         return Err(ApiError::failed_precondition("Warm is unavailable in this release").into());
     }
     let workspace_id = authenticated_workspace_id(&scope.workspace.id)?;
+    if matches!(
+        action,
+        CatLifecycleAction::Suspend | CatLifecycleAction::Resume
+    ) {
+        return Err(ApiError::failed_precondition(
+            "Suspend and Resume are unavailable in this release",
+        )
+        .into());
+    }
     let ingress = authorized_after_auth(
         &workspace_id,
         Some(&cat),
@@ -529,6 +538,107 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(warm_rows, 0);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabled_suspend_and_resume_authenticate_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
+        let handle = crate::server::spawn(crate::server::Config {
+            listen: "127.0.0.1:0".into(),
+            control_store_dsn: crate::store::DsnSource::Literal(
+                crate::testsupport::isolated_control_store_url(),
+            ),
+            control_store_ca_file: None,
+            usage_store: usage.clone(),
+            credit_store: usage,
+            retired_storage_meta_for_tests: None,
+            image_blob: crate::testsupport::unavailable_image_blob(),
+            guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
+            runtime_provisioner_trust_bundle:
+                crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            auth_token: "service-token".into(),
+            route_grant_signer: crate::testsupport::route_grant_signer(),
+            admin_token: "admin-token".into(),
+            workos: None,
+            stripe: None,
+            billing_enforcement_enabled: false,
+            node_lease_timeout_ms: 30_000,
+            reconcile_interval_ms: 60_000,
+            auto_tier_policy: Default::default(),
+            oci_deploy_sync_wait_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let workspace = tokio::task::block_in_place(|| {
+            Id::new(
+                handle
+                    .state
+                    .store
+                    .list_all_workspace_views()
+                    .unwrap()
+                    .into_iter()
+                    .find(|workspace| workspace.is_default)
+                    .unwrap()
+                    .id,
+            )
+            .unwrap()
+        });
+        let cat_id = tokio::task::block_in_place(|| {
+            crate::store::runtime_authority::product_tests::seed_a2_http_cat(
+                handle.state.store.as_ref(),
+                &workspace,
+            )
+        });
+        let client = reqwest::Client::new();
+        let suspend_url = format!(
+            "{}/v1/workspaces/{workspace}/cats/{cat_id}/actions/suspend",
+            handle.base_url()
+        );
+        assert_eq!(
+            client.post(&suspend_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for (action, key) in [
+            ("suspend", "suspend-disabled-r1"),
+            ("resume", "resume-disabled-r1"),
+        ] {
+            let url = format!(
+                "{}/v1/workspaces/{workspace}/cats/{cat_id}/actions/{action}",
+                handle.base_url()
+            );
+            let response = client
+                .post(url)
+                .bearer_auth("admin-token")
+                .header("Idempotency-Key", key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            let body: cats_api::error::ErrorBody = response.json().await.unwrap();
+            assert_eq!(body.code, cats_api::error::ErrorCode::FailedPrecondition);
+        }
+
+        let persisted_rows: i64 = tokio::task::block_in_place(|| {
+            handle
+                .state
+                .store
+                .with(|client| {
+                    client
+                        .query_one(
+                            "SELECT count(*) FROM api_idempotency_results
+                              WHERE authenticated_workspace_id=$1
+                                AND idempotency_key IN (
+                                    'suspend-disabled-r1', 'resume-disabled-r1')",
+                            &[&workspace.as_str()],
+                        )
+                        .map(|row| row.get(0))
+                })
+                .unwrap()
+        });
+        assert_eq!(persisted_rows, 0);
         handle.shutdown().await.unwrap();
     }
 }

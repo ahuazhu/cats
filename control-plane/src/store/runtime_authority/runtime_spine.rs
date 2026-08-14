@@ -2278,6 +2278,13 @@ fn database_postcondition_satisfied(
     if runtime.lifecycle_admission != expected_admission {
         return Ok(false);
     }
+    // Suspended/Resume is intentionally unavailable in the first release:
+    // the frozen checkpoint protocol has PauseRuntime but no ResumeRuntime
+    // token. Never let a pre-existing or synthetic Ready observation complete a
+    // newly delivered Suspended Operation while the product ingress is off.
+    if desired.target == RuntimeTarget::Suspended {
+        return Ok(false);
+    }
     // Warm success requires a locked Control snapshot record. That authority
     // is not present in the current schema slice, so fail closed instead of
     // treating the Node's snapshot-shaped payload as a proof.
@@ -2542,9 +2549,9 @@ fn active_volume_evidence_matches(
     volume: &cats_storage::authority::VolumeRecord,
     desired: &DesiredRuntimeSpec,
 ) -> bool {
-    // Suspended retains the exact active writer and its local lineage. A
-    // Relaxed volume may therefore retain an unpublished local tail (L > R),
-    // unlike the released Cold/Deleted evidence checked separately below.
+    // Running retains the exact active writer and may have an unpublished
+    // Relaxed local tail (L > R), unlike the released Cold/Deleted evidence
+    // checked separately below. Suspended is rejected before this helper.
     let durable_generation_matches =
         |lineage: &cats_api::runtime_reconciliation::LocalVolumeLineage| {
             active_lineage_generations_match(

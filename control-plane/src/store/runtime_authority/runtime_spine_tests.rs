@@ -84,7 +84,7 @@ fn digest(byte: u8) -> Sha256Digest {
 }
 
 #[test]
-fn suspended_active_lineage_retains_a_relaxed_local_tail() {
+fn running_active_lineage_accepts_a_relaxed_local_tail() {
     let remote = Generation::new(4).unwrap();
     let local = Generation::new(5).unwrap();
     assert!(active_lineage_generations_match_for_test(local, remote));
@@ -690,6 +690,96 @@ fn settlement_runtime(
                 },
             },
         ],
+    }
+}
+
+fn suspended_settlement_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
+    let incarnation = random(778);
+    let launch = runtime_launch(&incarnation);
+    let RuntimeLaunch::Present(identity) = &launch else {
+        unreachable!("fixture launch is present")
+    };
+    let step = ReconcileStep::Stable {
+        state: StableState::Suspended,
+    };
+    ObservedRuntimeStatus {
+        cat_id: desired.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: RuntimeTarget::Suspended,
+        }),
+        runtime_incarnation: Some(incarnation.clone()),
+        stable_state: Some(StableState::Suspended),
+        step: step.clone(),
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/suspended-settlement.json").unwrap(),
+            content_digest: digest(7),
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            runtime_incarnation: Some(incarnation.clone()),
+            runtime_launch: Box::new(launch.clone()),
+            stable_state: Some(StableState::Suspended),
+            step: Box::new(step),
+            require_idle: Box::new(RequireIdleCheckpoint::NotApplicable),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+        },
+        processes: vec![ProcessEvidence {
+            role: ProcessRole::Vmm {
+                runtime_incarnation: incarnation.clone(),
+            },
+            process_id: 102,
+            process_start_time_ticks: WireU64::new(2).unwrap(),
+            executable_path: identity.boot.vmm_executable.path.clone(),
+            scope_id: identity.scope_id.clone(),
+            control_socket_path: identity.api_socket_path.clone(),
+            state: ProcessState::Paused,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: identity.process_identity_token.clone(),
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: Some(ObservedVmShape {
+                vcpus: desired.runtime.vcpus,
+                memory_bytes: desired.runtime.memory_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            }),
+        }],
+        volumes: Vec::new(),
+        mounts: Vec::new(),
+        networks: vec![ObservedNetwork {
+            kind: desired.runtime.network_config.kind,
+            network_id: desired.runtime.network_config.network_id.clone(),
+            guest_mac: desired.runtime.network_config.guest_mac.clone(),
+            guest_ipv4: desired.runtime.network_config.guest_ipv4.clone(),
+            prefix_length: desired.runtime.network_config.prefix_length,
+            gateway_ipv4: desired.runtime.network_config.gateway_ipv4.clone(),
+            tap_name: identity.network.tap_name.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: identity.network.ownership_token.clone(),
+            },
+        }],
+        guest_transport: GuestTransportEvidence::VsockReady {
+            runtime_incarnation: incarnation,
+            guest_cid: identity.guest_cid,
+            guest_port: cats_api::runtime_reconciliation::GUEST_AGENT_VSOCK_PORT_V1,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_boot_id: GuestBootId::new("52525252525252525252525252525252").unwrap(),
+        },
+        warm_snapshot: WarmSnapshotEvidence::Absent,
+        lifecycle_admission: LifecycleAdmission::Closed,
+        routes: Vec::new(),
+        platform_guards: 0,
+        conditions: vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Suspended,
+            },
+        }],
     }
 }
 
@@ -2249,6 +2339,52 @@ fn operation_settlement_validates_every_reason_then_selects_first_terminal_atomi
                 }
             )
     ));
+}
+
+#[test]
+fn suspended_ready_observation_cannot_settle_an_operation() {
+    let (store, identity, authenticated, _policy, session) = fixture();
+    let workspace = bootstrap_workspace(&store, "f3c-suspended-disabled");
+    let mut desired = current_desired(&workspace, &identity.node_id);
+    desired.target = RuntimeTarget::Suspended;
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    insert_pending_operation(&store, &desired);
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        vec![suspended_settlement_runtime(&desired)],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+
+    let phase: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT phase FROM runtime_operations WHERE operation_id='op_settlement'",
+                    &[],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(phase, "pending");
 }
 
 #[test]

@@ -1253,13 +1253,30 @@ impl LifecycleStepEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
         context.check_active()?;
-        if desired.target == RuntimeTarget::Warm {
+        if matches!(
+            desired.target,
+            RuntimeTarget::Suspended | RuntimeTarget::Warm
+        ) {
             return Ok(Some(stop_local()));
         }
         let accepted = context.accepted_full()?;
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
+        if runtime.stable_state == Some(StableState::Suspended)
+            || matches!(
+                runtime.step,
+                ReconcileStep::Stable {
+                    state: StableState::Suspended
+                }
+            )
+        {
+            // This release has no frozen ResumeRuntime checkpoint token. Keep
+            // an already-paused VMM and its possibly unique R<L journal
+            // untouched instead of letting a later Running/cleanup effect
+            // reinterpret Stable Suspended as a launch or teardown permit.
+            return Ok(Some(stop_local()));
+        }
 
         if !is_lifecycle_step(&runtime.step) {
             if let Some(outcome) = self.plan_first(context, desired, runtime)? {
@@ -4247,6 +4264,86 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             admission,
         )
+    }
+
+    #[test]
+    fn disabled_suspended_paths_stop_before_physical_effects() {
+        let (desired, _, _) = fixtures(RuntimeTarget::Suspended);
+        let volume = Arc::new(ScriptedLifecycleVolumePort {
+            recovery: Mutex::new(None),
+            evidence_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            delete_attempts: Mutex::new(VecDeque::new()),
+            delete_authorization_ids: Mutex::new(Vec::new()),
+        });
+        let effect = LifecycleStepEffect {
+            physical: Arc::new(NeverLifecyclePhysical),
+            volume_transition: Arc::clone(&volume) as Arc<dyn SignedLifecycleVolumePort>,
+            volume_authority: Arc::new(UnavailableVolumeAuthority),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
+        };
+        let directory = TempDir::new().unwrap();
+        let context = RuntimeDesiredEffectContext::for_test(
+            crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            effect.try_apply(&context, &desired).unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(volume.evidence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(volume.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
+
+        let (running, mut checkpoint, mut suspended) = fixtures(RuntimeTarget::Running);
+        checkpoint.stable_state = Some(StableState::Suspended);
+        checkpoint.step = ReconcileStep::Stable {
+            state: StableState::Suspended,
+        };
+        checkpoint.processes[0].state = ProcessState::Paused;
+        suspended.applied_desired = Some(AppliedDesiredEvidence {
+            desired_revision: running.desired_revision,
+            spec_digest: running.spec_digest.clone(),
+            placement: running.placement.clone(),
+            target: running.target,
+        });
+        suspended.stable_state = checkpoint.stable_state;
+        suspended.step = checkpoint.step.clone();
+        suspended.processes = checkpoint.processes.clone();
+        suspended.checkpoint = CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/suspended-disabled.json".to_owned())
+                .unwrap(),
+            content_digest: cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0x51; 32]),
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+            stable_state: checkpoint.stable_state,
+            step: Box::new(checkpoint.step.clone()),
+            require_idle: Box::new(checkpoint.require_idle.clone()),
+            updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+        };
+        let resume_directory = TempDir::new().unwrap();
+        let resume_context = deleting_effect_context(&resume_directory, &running, suspended);
+        assert_eq!(
+            effect.try_apply(&resume_context, &running).unwrap(),
+            Some(stop_local())
+        );
+        assert_eq!(volume.evidence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(volume.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(std::fs::read_dir(resume_directory.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]
