@@ -17,6 +17,20 @@ printf '%s|%s|%s\n' "$action" "$case_id" "$block_path" >>"$trace"
 case "$action" in
   run)
     printf 'fixture ran %s through %s\n' "$case_id" "$block_path"
+    case ",${CATS_E3_FIXTURE_BLOCK_CASES:-}," in
+      *",$case_id,"*)
+        jq -S -c -n --arg case_id "$case_id" --arg block_path "$block_path" \
+          '{version:1,status:"blocked",case_id:$case_id,block_path:$block_path,reason:"fixture typed block"}' \
+          >"$case_dir/blocked-receipt.json"
+        exit 78
+        ;;
+    esac
+    if [[ ${CATS_E3_FIXTURE_SENSITIVE_RECEIPT_CASE:-} == "$case_id" ]]; then
+      printf '%s\n' '{"agent_session":"must-be-rejected"}' >"$case_dir/sensitive-receipt.json"
+    else
+      jq -S -c -n --arg case_id "$case_id" \
+        '{version:1,case_id:$case_id,evidence:"fixture"}' >"$case_dir/fixture-receipt.json"
+    fi
     if [[ ${CATS_E3_FIXTURE_SECRETS:-false} == true ]]; then
       printf 'Authorization: Bearer fixture-token-must-not-survive\n'
       printf 'password=fixture-password-must-not-survive\n'

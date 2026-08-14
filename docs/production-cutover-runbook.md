@@ -76,8 +76,12 @@ this runbook.
 
 ## Stage A — closed candidate and internal qualification (executable)
 
-This stage ends after phase 8. Public ingress remains disabled, normal product mutation remains
-Closed and all Nodes remain cordoned throughout it.
+This stage ends after phase 8. Normal product mutation remains Closed. Public ingress remains
+disabled and all Nodes remain cordoned except for each explicitly approved, bounded E3
+qualification window in phase 7: that window makes exactly one qualification Node schedulable and
+opens ingress only long enough to exercise its run-bound Endpoint. The saved close plan and exact
+A23 re-cordon apply run after either success or failure; Stage A cannot finish in the temporary
+state.
 
 ## 0. Freeze and qualify the exact release before the window
 
@@ -617,8 +621,11 @@ Node from `--expected-node`.
 
 ## 7. E3: qualify create → Running → durable I/O → route → restart → usage → delete
 
-This is an isolated qualification on already-provisioned, cordoned metal; it is not a public
-production Cat and does not require uncordoning the production placement pool. The repo-owned E3
+This is an isolated qualification on already-provisioned metal; it is not a public production Cat.
+The placement planner has no cordoned bypass, so each invocation temporarily makes exactly its
+named qualification Node schedulable through an ordinary A23 policy revision. The public HTTP/WS
+case likewise uses one operator-approved qualification-ingress window; no private Gateway bypass
+or second route is introduced. The repo-owned E3
 scenario driver is an input to the orchestrator and must be tracked, executable and byte-identical
 to `<FINAL_RELEASE_SHA>`. If `<FINAL_RELEASE_SCENARIO_DRIVER>` is absent from the final release,
 record `DEFERRED(E3_SCENARIO_DRIVER)` and stop.
@@ -627,8 +634,122 @@ record `DEFERRED(E3_SCENARIO_DRIVER)` and stop.
 manifest digest was independently approved; and
 `/opt/cats/release/worker-installation-receipt.v1.json` is the root-owned, single-link receipt from
 the exact worker installation. Its worker bundle and member set must match the approved manifest.
-Every binary, config and non-secret key fingerprint below is explicit; each output directory is
-absolute and does not yet exist. Run both block paths against the same release and scenario oracle.
+Every binary, config, non-secret coordinate and key fingerprint below is explicit; each output
+directory is absolute and does not yet exist. The control token is one root-owned mode-0600 file
+passed by path, never argv content or manifest data. Before either invocation, while every Node is
+still cordoned, save and review only `qualification-ingress-open.tfplan`; it must change only
+`enable_public_ingress=false -> true`. Apply that open plan while the qualification Node is still
+cordoned. Immediately restore `enable_public_ingress=false` in the reviewed input, plan against the
+now-open live state, and save and review `qualification-ingress-close.tfplan`. It must only remove
+or close the qualification ingress. A close plan made against the earlier Closed state is invalid.
+Retain `terraform show -json` for both plans; pass those two JSON files as the required runner
+configs. Run both block paths against the same release and scenario oracle.
+
+Only after the saved close plan has been reviewed, install an EXIT/INT/TERM cleanup trap that uses
+that exact plan. Then apply the reviewed full A23 policy that changes only the exact qualification
+Node from `cordoned` to `schedulable`, using its exact current revision, and run E3. Capture the
+runner status without exiting the operator shell. Whether the runner returns 0, 78 or any failure,
+cleanup first exact-re-cordons the Node and then applies the saved ingress-close plan. Failure of
+the first cleanup action must not suppress the second; both must be attempted and both must succeed:
+
+```sh
+terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
+  -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-open.tfplan \
+  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-open-apply.txt
+
+terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
+  -input=false \
+  -var-file=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfvars \
+  -out=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan
+
+terraform -chdir=deploy/aws/terraform/stacks/production-application show \
+  -json /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
+  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-plan.json
+
+# Review the JSON now. It must only remove/close qualification ingress. Do not
+# continue until that assertion has an operator approval receipt.
+qualification_node_schedulable=0
+cleanup_e3_window() {
+  set +e
+  re_cordon_status=0
+  if [ "$qualification_node_schedulable" -eq 1 ]; then
+    /approved/staged-worker/cats \
+      --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+      admin runtime-node policy apply \
+      --node <QUALIFICATION_NODE_ID> \
+      --expected-revision <EXACT_SCHEDULABLE_POLICY_REVISION> \
+      --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json \
+      --deployment-id <FRESH_DEPLOYMENT_ID> \
+      --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
+      --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
+      > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json
+    re_cordon_status=$?
+  fi
+
+  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
+    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
+    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-apply.txt
+  ingress_close_status=$?
+  set -e
+  [ "$re_cordon_status" -eq 0 ] && [ "$ingress_close_status" -eq 0 ]
+}
+
+abort_e3_window() {
+  window_status=$1
+  trap - EXIT INT TERM
+  cleanup_status=0
+  cleanup_e3_window || cleanup_status=$?
+  if [ "$cleanup_status" -ne 0 ]; then
+    exit "$cleanup_status"
+  fi
+  exit "$window_status"
+}
+trap 'abort_e3_window $?' EXIT
+trap 'abort_e3_window 130' INT
+trap 'abort_e3_window 143' TERM
+
+/approved/staged-worker/cats \
+  --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
+  admin runtime-node policy apply \
+  --node <QUALIFICATION_NODE_ID> \
+  --expected-revision <EXACT_CURRENT_CORDONED_POLICY_REVISION> \
+  --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-schedulable-policy.v1.json \
+  --deployment-id <FRESH_DEPLOYMENT_ID> \
+  --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
+  --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
+  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-result.v1.json
+qualification_node_schedulable=1
+
+set +e
+deploy/metal/runtime-cutover-e2e.sh <THE_MATCHING_FULL_INVOCATION_BELOW>
+e3_status=$?
+cleanup_status=0
+cleanup_e3_window || cleanup_status=$?
+set -e
+trap - EXIT INT TERM
+
+[ "$cleanup_status" -eq 0 ]
+
+jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
+  '.version == 1 and .node_id == $node and .outcome == "policy_updated"
+   and .identity_state == "provisioned" and .policy_revision == $revision' \
+  /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json
+jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
+  '.version == 1 and .node_id == $node and .policy_revision == $revision
+   and .scheduling_state == "cordoned"' \
+  /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
+
+# Rerun phase 6's exact fleet-verify command after re-cordon. E12 proves
+# empty/session/full-inventory/ring; the signed A23 result+policy above prove cordon.
+case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
+```
+
+The open plan is applied before the cleanup trap only while every Node remains cordoned; install
+the trap immediately after the live-state close plan is saved and approved, before the A23
+schedulable transition. Clear it only after both cleanup receipts exist. Rerun E12 before accepting
+the block path; E12 proves empty/session/full-inventory/ring, while the latest A23 result and full
+policy above independently prove exact re-cordon.
+Do not continue to the other block path if ingress-close, A23 re-cordon or E12 fails.
 
 **Command — kernel NBD:**
 
@@ -642,9 +763,20 @@ deploy/metal/runtime-cutover-e2e.sh \
   --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
   --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
   --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
+  --token-file /approved/secrets/<CUTOVER_ID>/e3-control-token \
+  --control-origin <FRESH_PRIVATE_CONTROL_ORIGIN> \
+  --workspace-id <QUALIFICATION_WORKSPACE_ID> \
+  --expected-node <KERNEL_NBD_QUALIFICATION_NODE_ID> \
+  --qualification-node <KERNEL_NBD_QUALIFICATION_NODE_ID> \
+  --cat-name <KERNEL_NBD_QUALIFICATION_CAT_NAME> \
+  --boot-image-digest sha256:<QUALIFIED_BOOT_IMAGE_DIGEST> \
+  --endpoint-name <QUALIFICATION_ENDPOINT_NAME> \
+  --endpoint-hostname <QUALIFICATION_ENDPOINT_HOSTNAME> \
   --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
   --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
-  --config <LABEL>=<ABSOLUTE_CONFIG_PATH> \
+  --config route-key-ring=<ABSOLUTE_ROUTE_KEY_RING_PATH> \
+  --config qualification-ingress-open-plan=/approved/evidence/<CUTOVER_ID>/70-kernel-nbd-qualification-ingress-open-plan.json \
+  --config qualification-ingress-close-plan=/approved/evidence/<CUTOVER_ID>/70-kernel-nbd-qualification-ingress-close-plan.json \
   --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
   --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
 ```
@@ -661,14 +793,27 @@ deploy/metal/runtime-cutover-e2e.sh \
   --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
   --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
   --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
+  --token-file /approved/secrets/<CUTOVER_ID>/e3-control-token \
+  --control-origin <FRESH_PRIVATE_CONTROL_ORIGIN> \
+  --workspace-id <QUALIFICATION_WORKSPACE_ID> \
+  --expected-node <VHOST_USER_QUALIFICATION_NODE_ID> \
+  --qualification-node <VHOST_USER_QUALIFICATION_NODE_ID> \
+  --cat-name <VHOST_USER_QUALIFICATION_CAT_NAME> \
+  --boot-image-digest sha256:<QUALIFIED_BOOT_IMAGE_DIGEST> \
+  --endpoint-name <QUALIFICATION_ENDPOINT_NAME> \
+  --endpoint-hostname <QUALIFICATION_ENDPOINT_HOSTNAME> \
   --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
   --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
-  --config <LABEL>=<ABSOLUTE_CONFIG_PATH> \
+  --config route-key-ring=<ABSOLUTE_ROUTE_KEY_RING_PATH> \
+  --config qualification-ingress-open-plan=/approved/evidence/<CUTOVER_ID>/70-vhost-user-qualification-ingress-open-plan.json \
+  --config qualification-ingress-close-plan=/approved/evidence/<CUTOVER_ID>/70-vhost-user-qualification-ingress-close-plan.json \
   --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
   --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
 ```
 
-Repeat `--binary`, `--config` and `--key-fingerprint` for the complete reviewed input set. Binary
+Repeat `--expected-node`, `--binary`, additional `--config` and `--key-fingerprint` for the complete
+reviewed fleet/input set. No `CATS_TOKEN` or `CATS_E3_*` ambient value is an input: the runner clears
+them and reconstructs the scenario environment from these arguments. Binary
 digests and installed paths are not caller assertions: the runner derives them from
 `.artifacts.worker.members` and the installer receipt, copies every input to a private stable stage,
 and re-hashes the original inputs at the end. The explicit binaries include the installed
@@ -705,8 +850,9 @@ durable usage delivery, and exact delete cleanup.
 `final-inventory.json`, `exit-code` and `SHA256SUMS` through the append-only evidence boundary.
 
 **Cancel point.** A failed case still runs bounded diagnostics and cleanup, then exits nonzero.
-Keep the fleet cordoned and preserve the entire output directory; do not skip a case, edit JSONL or
-reuse an existing output directory.
+The operator trap must restore ingress Closed, exact-re-cordon the qualification Node and rerun E12
+before diagnosis. Preserve the entire output directory; do not skip a case, edit JSONL or reuse an
+existing output directory.
 
 <!-- cutover-stage: 70-final-gates -->
 
@@ -930,11 +1076,14 @@ with ad hoc ingress or Node commands.
 ## Operator sign-off checklist
 
 - One final SHA and release manifest bind all binaries, configs, Guest payload and receipts.
-- Maintenance is a reviewed Terraform transition; ingress remains disabled through reset.
+- Maintenance is a reviewed Terraform transition; the only pre-reset ingress exception is each
+  bounded E3 window, whose Node is exact-re-cordoned before its saved close plan is applied and E12
+  is repeated.
 - Stage A uses a fresh Control schema and ChunkStore prefix but the reviewed current Usage target;
   Stage B requires a disjoint final fresh Usage target.
-- A23 initial policies are cordoned; E12 proves the exact empty fleet and key-ring ACK.
-- Both E3 block paths pass all nine cases with checksum-valid evidence.
+- A23 initial policies are cordoned; E12 proves the exact empty/session/full-inventory/ring facts,
+  while each latest signed A23 result plus its exact full policy proves the Node is re-cordoned.
+- Both E3 block paths report all nine cases with checksum-valid seven-pass/two-typed-block evidence.
 - Local/full, compatibility Linux, native x86_64 Linux and real metal evidence are retained.
 - Reset planning begins only in Stage B and repeats every exact target; production execute remains
   blocked today.

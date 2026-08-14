@@ -1,8 +1,221 @@
 #!/usr/bin/env bash
-# Deterministic evidence orchestrator for an already-provisioned, cordoned
-# runtime-cutover qualification host. It never provisions infrastructure,
-# applies Terraform, or installs a long-lived service.
+# Deterministic evidence orchestrator for an already-provisioned qualification
+# host inside the runbook's bounded schedulable/ingress window. It never
+# provisions infrastructure, applies Terraform, or installs a long-lived service.
 set -euo pipefail
+
+# Testable boundary after all production authority checks and stable staging.
+# Executing this file always enters the root-only main path below; sourcing it
+# only exposes this deterministic case/evidence loop to repository tests.
+cats_e3_run_cases_post_preflight() {
+  atomic_copy() {
+    local source=$1 destination=$2 temporary
+    temporary=$(mktemp "$output_dir/.${destination}.XXXXXX")
+    cp "$source" "$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$output_dir/$destination"
+  }
+
+  run_filtered() {
+    local action=$1 case_id=$2 deadline=$3 destination=$4 case_dir=$5
+    local statuses command_status filter_status
+    set +e
+    "$timeout_bin" --signal=TERM --kill-after=5 "$deadline" \
+      "$scenario_driver" "$action" "$case_id" "$block_path" "$case_dir" 2>&1 \
+      | "$filter" --mode text --max-bytes 16384 >"$destination"
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    command_status=${statuses[0]:-125}
+    filter_status=${statuses[1]:-125}
+    if [[ $filter_status -ne 0 ]]; then
+      printf '%s\n' '[evidence filter failed closed]' >"$destination"
+      return 125
+    fi
+    return "$command_status"
+  }
+
+  append_summary() {
+    local case_id=$1 phase=$2 source=$3 bounded
+    printf '=== %s %s ===\n' "$case_id" "$phase" >>"$journal_work"
+    cat "$source" >>"$journal_work"
+    printf '\n' >>"$journal_work"
+    bounded=$scratch/component-journal-summary.bounded
+    "$filter" --mode text --max-bytes 131072 <"$journal_work" >"$bounded" || \
+      printf '%s\n' '[evidence filter failed closed]' >"$bounded"
+    mv -f "$bounded" "$journal_work"
+    atomic_copy "$journal_work" component-journal-summary.txt
+  }
+
+  persist_case_receipts() {
+    local case_id=$1 case_dir=$2 receipt filename filtered entry
+    local receipts=()
+    shopt -s nullglob
+    receipts=("$case_dir"/*-receipt.json)
+    shopt -u nullglob
+    for receipt in "${receipts[@]}"; do
+      filename=${receipt##*/}
+      filtered=$(mktemp "$scratch/.case-receipt.XXXXXX")
+      if ! "$filter" --mode inventory --max-bytes 1048576 <"$receipt" >"$filtered"; then
+        rm -f "$filtered"
+        return 125
+      fi
+      entry=$(mktemp "$scratch/.case-receipt-entry.XXXXXX")
+      if ! jq -S -c -n --arg case_id "$case_id" --arg receipt_name "$filename" \
+        --slurpfile receipt "$filtered" \
+        '{case_id:$case_id,receipt_name:$receipt_name,receipt:$receipt[0]}' >"$entry"; then
+        rm -f "$filtered" "$entry"
+        return 125
+      fi
+      cat "$entry" >>"$receipts_work"
+      rm -f "$filtered" "$entry"
+    done
+    atomic_copy "$receipts_work" case-receipts.jsonl
+  }
+
+  failed_cases=0
+  blocked_cases=0
+  passed_cases=0
+  for index in "${!case_ids[@]}"; do
+    case_id=${case_ids[$index]}
+    deadline=${case_deadlines[$index]}
+    case_dir=$scratch/case-$case_id
+    mkdir -m 0700 "$case_dir"
+    run_summary=$case_dir/run-summary.txt
+    cleanup_summary=$case_dir/cleanup-summary.txt
+    diagnostic_summary=$case_dir/diagnostic-summary.txt
+    case_started=$(date +%s)
+
+    if run_filtered run "$case_id" "$deadline" "$run_summary" "$case_dir"; then
+      run_code=0
+    else
+      run_code=$?
+    fi
+    append_summary "$case_id" run "$run_summary"
+
+    diagnostic_code=0
+    if [[ $run_code -ne 0 ]]; then
+      if run_filtered diagnostics "$case_id" 30 "$diagnostic_summary" "$case_dir"; then
+        diagnostic_code=0
+      else
+        diagnostic_code=$?
+      fi
+      append_summary "$case_id" diagnostics "$diagnostic_summary"
+    fi
+
+    if run_filtered cleanup "$case_id" 60 "$cleanup_summary" "$case_dir"; then
+      cleanup_code=0
+    else
+      cleanup_code=$?
+    fi
+    append_summary "$case_id" cleanup "$cleanup_summary"
+
+    if persist_case_receipts "$case_id" "$case_dir"; then
+      evidence_code=0
+    else
+      evidence_code=$?
+    fi
+
+    case_ended=$(date +%s)
+    status=passed
+    if [[ $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
+      status=failed
+    elif [[ $run_code -eq 124 ]]; then
+      status=timed_out
+    elif [[ $run_code -eq 78 ]]; then
+      if [[ -f $case_dir/blocked-receipt.json ]] && jq -e \
+        --arg case_id "$case_id" --arg block_path "$block_path" \
+        '.version == 1 and .status == "blocked" and .case_id == $case_id
+          and .block_path == $block_path and (.reason | type == "string" and length > 0)' \
+        "$case_dir/blocked-receipt.json" >/dev/null; then
+        status=blocked
+      else
+        status=failed
+        evidence_code=125
+      fi
+    elif [[ $run_code -ne 0 ]]; then
+      status=failed
+    fi
+    case "$status" in
+      passed) passed_cases=$((passed_cases + 1)) ;;
+      blocked) blocked_cases=$((blocked_cases + 1)) ;;
+      failed|timed_out) failed_cases=$((failed_cases + 1)) ;;
+      *) return 125 ;;
+    esac
+    jq -S -c -n \
+      --arg case_id "$case_id" \
+      --arg status "$status" \
+      --arg expected_postcondition "${case_postconditions[$index]}" \
+      --argjson deadline_seconds "$deadline" \
+      --argjson started_at_unix_seconds "$case_started" \
+      --argjson ended_at_unix_seconds "$case_ended" \
+      --argjson run_exit_code "$run_code" \
+      --argjson diagnostic_exit_code "$diagnostic_code" \
+      --argjson cleanup_exit_code "$cleanup_code" \
+      --argjson evidence_exit_code "$evidence_code" \
+      '{case_id:$case_id,status:$status,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,evidence_exit_code:$evidence_exit_code}' \
+      >>"$results_work"
+    atomic_copy "$results_work" scenario-results.jsonl
+  done
+
+  inventory_work=$scratch/final-inventory.json
+  set +e
+  "$timeout_bin" --signal=TERM --kill-after=5 180 \
+    "$scenario_driver" inventory final "$block_path" "$scratch" 2>/dev/null \
+    | "$filter" --mode inventory --max-bytes 1048576 >"$inventory_work"
+  inventory_statuses=("${PIPESTATUS[@]}")
+  set -e
+  inventory_command_status=${inventory_statuses[0]:-125}
+  inventory_filter_status=${inventory_statuses[1]:-125}
+  if [[ $inventory_command_status -ne 0 || $inventory_filter_status -ne 0 ]]; then
+    failed_cases=$((failed_cases + 1))
+    printf '%s\n' '{"status":"unavailable"}' >"$inventory_work"
+    printf '%s\n' '[final inventory command or evidence filter failed closed]' >"$scratch/inventory-diagnostic.txt"
+    append_summary final-inventory diagnostics "$scratch/inventory-diagnostic.txt"
+  fi
+  atomic_copy "$inventory_work" final-inventory.json
+}
+
+cats_e3_clear_ambient() {
+  local environment_name
+  while IFS='=' read -r environment_name _; do
+    case "$environment_name" in
+      CATS_TOKEN|CATS_E3_*) unset "$environment_name" ;;
+    esac
+  done < <(env)
+}
+
+cats_e3_export_qualification_environment() {
+  export CATS_E3_WORKER_SERVICE=cats-worker.service
+  export CATS_E3_INSTALLED_NODED_PATH=$installed_noded_path
+  export CATS_E3_TOKEN_FILE=$token_file
+  export CATS_E3_CONTROL_ORIGIN=$control_origin
+  export CATS_E3_WORKSPACE_ID=$workspace_id
+  export CATS_E3_QUALIFICATION_NODE_ID=$qualification_node
+  export CATS_E3_CAT_NAME=$cat_name
+  export CATS_E3_BOOT_IMAGE_DIGEST=$boot_image_digest
+  export CATS_E3_ENDPOINT_NAME=$endpoint_name
+  export CATS_E3_ENDPOINT_HOSTNAME=$endpoint_hostname
+  export CATS_E3_PUBLIC_ORIGIN=https://$endpoint_hostname
+  printf -v CATS_E3_EXPECTED_NODES '%s,' "${expected_nodes[@]}"
+  CATS_E3_EXPECTED_NODES=${CATS_E3_EXPECTED_NODES%,}
+  export CATS_E3_EXPECTED_NODES
+}
+
+cats_e3_environment_labels_are_unique() {
+  local entry label environment_label seen
+  seen='|'
+  for entry in "$@"; do
+    label=${entry%%=*}
+    [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+    environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+    case "$seen" in *"|$environment_label|"*) return 1 ;; esac
+    seen+="$environment_label|"
+  done
+}
+
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  return 0
+fi
 
 usage() {
   cat >&2 <<'EOF'
@@ -15,6 +228,15 @@ usage: runtime-cutover-e2e.sh \
   --release-manifest </absolute/release-manifest.json> \
   --release-manifest-sha256 <sha256:64hex> \
   --installer-receipt </absolute/installer-receipt.json> \
+  --token-file </absolute/root-only/control-token> \
+  --control-origin <canonical-https-origin> \
+  --workspace-id <runtime-id> \
+  --expected-node <runtime-id> [--expected-node ...] \
+  --qualification-node <one-expected-node-id> \
+  --cat-name <bounded-name> \
+  --boot-image-digest <sha256:64hex> \
+  --endpoint-name <bounded-name> \
+  --endpoint-hostname <lowercase-dns-name> \
   --guest-kernel <nonsecret-release-string> \
   --binary <label=/absolute/path> [--binary ...] \
   --config <label=/absolute/path> [--config ...] \
@@ -37,19 +259,33 @@ build_receipt=
 release_manifest=
 release_manifest_sha256=
 installer_receipt=
+token_file=
+control_origin=
+workspace_id=
+qualification_node=
+cat_name=
+boot_image_digest=
+endpoint_name=
+endpoint_hostname=
 guest_kernel=
 scenario_driver=
+expected_nodes=()
 binary_entries=()
 config_entries=()
 key_fingerprint_entries=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--guest-kernel|--scenario-driver)
+    --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--token-file|--control-origin|--workspace-id|--qualification-node|--cat-name|--boot-image-digest|--endpoint-name|--endpoint-hostname|--guest-kernel|--scenario-driver)
       [[ $# -ge 2 ]] || usage
       name=${1#--}
       name=${name//-/_}
       printf -v "$name" '%s' "$2"
+      shift 2
+      ;;
+    --expected-node)
+      [[ $# -ge 2 ]] || usage
+      expected_nodes+=("$2")
       shift 2
       ;;
     --binary)
@@ -82,11 +318,38 @@ case "$block_path" in kernel-nbd|vhost-user) ;; *) fail "--block-path must be ke
   fail "--release-manifest-sha256 must be one independently approved sha256 digest"
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "--installer-receipt must be the canonical production installation receipt"
+[[ $token_file == /* ]] || fail "--token-file must be absolute"
+[[ $control_origin =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || \
+  fail "--control-origin must be one canonical HTTPS origin"
+for coordinate in workspace_id qualification_node cat_name endpoint_name; do
+  value=${!coordinate}
+  [[ $value =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || fail "--${coordinate//_/-} is not canonical"
+done
+[[ $boot_image_digest =~ ^sha256:[0-9a-f]{64}$ ]] || \
+  fail "--boot-image-digest must be one SHA-256 digest"
+[[ $endpoint_hostname =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]] || \
+  fail "--endpoint-hostname is not one bounded lowercase DNS name"
+[[ ${#expected_nodes[@]} -gt 0 ]] || fail "at least one --expected-node is required"
+seen_expected_nodes='|'
+qualification_node_matches=0
+for node in "${expected_nodes[@]}"; do
+  [[ $node =~ ^[A-Za-z0-9._:-]{1,128}$ ]] || fail "--expected-node is not canonical"
+  case "$seen_expected_nodes" in *"|$node|"*) fail "--expected-node $node is repeated" ;; esac
+  seen_expected_nodes+="$node|"
+  [[ $node != "$qualification_node" ]] || qualification_node_matches=$((qualification_node_matches + 1))
+done
+[[ $qualification_node_matches -eq 1 ]] || \
+  fail "--qualification-node must equal exactly one --expected-node"
 [[ $guest_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || fail "--guest-kernel is not a bounded nonsecret release string"
 [[ -n $scenario_driver && $scenario_driver == /* ]] || fail "--scenario-driver must be absolute"
 [[ ${#binary_entries[@]} -gt 0 ]] || fail "at least one --binary is required"
 [[ ${#config_entries[@]} -gt 0 ]] || fail "at least one --config is required"
 [[ ${#key_fingerprint_entries[@]} -gt 0 ]] || fail "at least one --key-fingerprint is required"
+cats_e3_environment_labels_are_unique "${binary_entries[@]}" || \
+  fail "binary labels collide after environment normalization"
+cats_e3_environment_labels_are_unique "${config_entries[@]}" || \
+  fail "config labels collide after environment normalization"
+[[ $EUID -eq 0 ]] || fail "production E3 qualification must run as root"
 
 for command_name in git jq python3 sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
@@ -95,11 +358,7 @@ done
 # The scenario driver may execute only binaries/configs named by this exact
 # invocation.  Do not let a caller's ambient environment smuggle an unrecorded
 # executable or config past the manifest-backed --binary/--config boundary.
-while IFS='=' read -r environment_name _; do
-  case "$environment_name" in
-    CATS_E3_BINARY_*|CATS_E3_CONFIG_*) unset "$environment_name" ;;
-  esac
-done < <(env)
+cats_e3_clear_ambient
 
 script_dir=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$script_dir/../.." && pwd -P)
@@ -129,6 +388,7 @@ canonical_output() {
 build_receipt=$(canonical_existing "$build_receipt") || fail "build receipt must be a regular non-symlink file"
 release_manifest=$(canonical_existing "$release_manifest") || fail "release manifest must be a regular non-symlink file"
 installer_receipt=$(canonical_existing "$installer_receipt") || fail "installer receipt must be a regular non-symlink file"
+token_file=$(canonical_existing "$token_file") || fail "token file must be a regular non-symlink file"
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "installer receipt path must resolve to the canonical production path"
 scenario_driver=$(canonical_existing "$scenario_driver") || fail "scenario driver must be a regular non-symlink file"
@@ -199,6 +459,30 @@ assert parent.st_uid == 0
 assert parent.st_gid == 0
 assert stat.S_IMODE(parent.st_mode) & 0o022 == 0
 PY
+protected_token_file() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+value = os.stat(sys.argv[1], follow_symlinks=False)
+parent = os.stat(os.path.dirname(sys.argv[1]), follow_symlinks=False)
+assert stat.S_ISREG(value.st_mode)
+assert value.st_uid == 0
+assert value.st_gid == 0
+assert value.st_nlink == 1
+assert stat.S_IMODE(value.st_mode) == 0o600
+assert 0 < value.st_size <= 16384
+assert stat.S_ISDIR(parent.st_mode)
+assert parent.st_uid == 0
+assert parent.st_gid == 0
+assert stat.S_IMODE(parent.st_mode) & 0o022 == 0
+raw = open(sys.argv[1], "rb").read()
+if raw.endswith(b"\n"):
+    raw = raw[:-1]
+assert raw and b"\n" not in raw and b"\r" not in raw and b"\0" not in raw
+PY
+}
+protected_token_file "$token_file" || fail "token file or its parent is not protected root-only input"
 manifest_worker_bundle_sha256=$(jq -er '.artifacts.worker.bundle_sha256' "$release_manifest")
 installer_worker_bundle_sha256=$(jq -er '.worker_bundle_sha256' "$installer_receipt")
 [[ $installer_worker_bundle_sha256 == "$manifest_worker_bundle_sha256" ]] || \
@@ -212,7 +496,7 @@ mkdir -m 0700 "$output_dir"
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$scratch"
 stage=$scratch/stage
-mkdir -m 0700 "$stage" "$stage/binaries" "$stage/configs"
+mkdir -m 0700 "$stage" "$stage/binaries" "$stage/configs" "$stage/secrets"
 results_work=$scratch/scenario-results.jsonl
 journal_work=$scratch/component-journal-summary.txt
 catalog_work=$scratch/scenario-catalog.jsonl
@@ -272,6 +556,8 @@ filter_authority_sha256=$(sha256sum "$filter" | awk '{print $1}')
 scenario_driver_authority_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
 build_receipt_authority_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
 installer_receipt_authority_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
+token_file_original=$token_file
+token_file_authority_sha256=$(sha256sum "$token_file" | awk '{print $1}')
 verify_exact_repo_file "$runner"
 verify_exact_repo_file "$filter"
 verify_exact_repo_file "$scenario_driver"
@@ -281,6 +567,13 @@ stage_input scenario-driver "$scenario_driver" "$stage/runtime-cutover-v2-scenar
 stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
 stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
 stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
+token_file=$stage/secrets/control-token
+token_before=$(sha256sum "$token_file_original" | awk '{print $1}')
+[[ $token_before == "$token_file_authority_sha256" ]] || fail "token changed before its private stable-stage copy"
+cp "$token_file_original" "$token_file"
+chmod 0600 "$token_file"
+[[ $(sha256sum "$token_file" | awk '{print $1}') == "$token_file_authority_sha256" ]] || \
+  fail "private stable-stage copy changed token"
 verify_staged_repo_file() {
   local original=$1 staged=$2 relative expected_blob actual_blob
   relative=${original#"$repo"/}
@@ -316,6 +609,7 @@ jq -e -n --slurpfile manifest "$stage/release-manifest.json" \
   >/dev/null || fail "installer receipt members differ from the approved worker manifest"
 
 seen_binary_labels='|'
+seen_binary_environment_labels='|'
 installed_noded_path=
 timeout_bin=
 timeout_bin_original=
@@ -325,6 +619,11 @@ for entry in "${binary_entries[@]}"; do
   [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "binary label is not canonical"
   case "$seen_binary_labels" in *"|$label|"*) fail "binary label $label is repeated" ;; esac
   seen_binary_labels+="$label|"
+  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+  case "$seen_binary_environment_labels" in
+    *"|$environment_label|"*) fail "binary label $label collides after environment normalization" ;;
+  esac
+  seen_binary_environment_labels+="$environment_label|"
   [[ $path != *@sha256:* ]] || fail "binary $label digest must come from the approved manifest and installer receipt"
   canonical=$(canonical_existing "$path") || fail "binary $label must name a regular non-symlink file"
   [[ -f $canonical && -x $canonical ]] || fail "binary $label is not executable"
@@ -367,7 +666,6 @@ for entry in "${binary_entries[@]}"; do
     --arg sha256 "$digest" --argjson size_bytes "$size" \
     '{label:$label,artifact_name:$artifact_name,authority:$authority,path:$path,
       staged_path:$staged_path,sha256:$sha256,size_bytes:$size_bytes}' >>"$binaries_work"
-  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
   printf -v "CATS_E3_BINARY_${environment_label}" '%s' "$staged"
   export "CATS_E3_BINARY_${environment_label}"
   printf -v "CATS_E3_BINARY_${environment_label}_SHA256" '%s' "$digest"
@@ -401,12 +699,18 @@ done
 [[ -n $timeout_bin ]] || fail "--binary timeout is required"
 
 seen_config_labels='|'
+seen_config_environment_labels='|'
 for entry in "${config_entries[@]}"; do
   label=${entry%%=*}
   path=${entry#*=}
   [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "config label is not canonical"
   case "$seen_config_labels" in *"|$label|"*) fail "config label $label is repeated" ;; esac
   seen_config_labels+="$label|"
+  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+  case "$seen_config_environment_labels" in
+    *"|$environment_label|"*) fail "config label $label collides after environment normalization" ;;
+  esac
+  seen_config_environment_labels+="$environment_label|"
   canonical=$(canonical_existing "$path") || fail "config $label must name a regular non-symlink file"
   [[ -f $canonical ]] || fail "config $label is not a regular file"
   digest=$(sha256sum "$canonical" | awk '{print $1}')
@@ -416,17 +720,25 @@ for entry in "${config_entries[@]}"; do
   jq -S -c -n --arg label "$label" --arg path "$canonical" --arg staged_path "$staged" \
     --arg sha256 "$digest" --argjson size_bytes "$size" \
     '{label:$label,path:$path,staged_path:$staged_path,sha256:$sha256,size_bytes:$size_bytes}' >>"$configs_work"
-  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
   printf -v "CATS_E3_CONFIG_${environment_label}" '%s' "$staged"
   export "CATS_E3_CONFIG_${environment_label}"
 done
 
-export CATS_E3_WORKER_SERVICE=cats-worker.service
-export CATS_E3_INSTALLED_NODED_PATH=$installed_noded_path
+for required_config in qualification-ingress-open-plan qualification-ingress-close-plan; do
+  jq -e --arg label "$required_config" 'select(.label == $label)' "$configs_work" >/dev/null || \
+    fail "--config $required_config is required for the bounded qualification ingress window"
+done
+
+cats_e3_export_qualification_environment
+seen_key_fingerprint_labels='|'
 for entry in "${key_fingerprint_entries[@]}"; do
   label=${entry%%=*}
   fingerprint=${entry#*=}
   [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "key fingerprint label is not canonical"
+  case "$seen_key_fingerprint_labels" in
+    *"|$label|"*) fail "key fingerprint label $label is repeated" ;;
+  esac
+  seen_key_fingerprint_labels+="$label|"
   [[ $fingerprint =~ ^sha256:[0-9a-f]{64}$ ]] || fail "key fingerprint must be a nonsecret sha256 value"
   jq -S -c -n --arg label "$label" --arg fingerprint "$fingerprint" \
     '{label:$label,fingerprint:$fingerprint}' >>"$fingerprints_work"
@@ -464,6 +776,8 @@ for index in "${!case_ids[@]}"; do
     '{case_id:$case_id,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,cleanup_required:true}' \
     >>"$catalog_work"
 done
+expected_nodes_work=$scratch/expected-nodes.json
+printf '%s\n' "${expected_nodes[@]}" | jq -Rsc 'split("\n")[:-1]' >"$expected_nodes_work"
 
 started_at_unix_seconds=$(date +%s)
 host_kernel=$(uname -r)
@@ -493,6 +807,13 @@ write_manifest() {
     --arg installer_receipt "$installer_receipt" \
     --arg installer_receipt_sha256 "$installer_receipt_sha256" \
     --arg worker_bundle_sha256 "$manifest_worker_bundle_sha256" \
+    --arg control_origin "$control_origin" \
+    --arg workspace_id "$workspace_id" \
+    --arg qualification_node "$qualification_node" \
+    --arg cat_name "$cat_name" \
+    --arg boot_image_digest "$boot_image_digest" \
+    --arg endpoint_name "$endpoint_name" \
+    --arg endpoint_hostname "$endpoint_hostname" \
     --arg scenario_driver "$scenario_driver_original" \
     --arg scenario_driver_sha256 "$scenario_driver_sha256" \
     --arg timeout_binary "$timeout_bin_original" \
@@ -504,8 +825,9 @@ write_manifest() {
     --slurpfile binaries "$binaries_work" \
     --slurpfile configs "$configs_work" \
     --slurpfile key_fingerprints "$fingerprints_work" \
+    --slurpfile expected_nodes "$expected_nodes_work" \
     --slurpfile scenarios "$catalog_work" \
-    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256,approved_sha256:$approved_release_manifest_sha256},installer_receipt:{path:$installer_receipt,sha256:$installer_receipt_sha256,worker_bundle_sha256:$worker_bundle_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
+    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256,approved_sha256:$approved_release_manifest_sha256},installer_receipt:{path:$installer_receipt,sha256:$installer_receipt_sha256,worker_bundle_sha256:$worker_bundle_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},qualification:{control_origin:$control_origin,workspace_id:$workspace_id,expected_nodes:$expected_nodes[0],qualification_node_id:$qualification_node,cat_name:$cat_name,boot_image_digest:$boot_image_digest,endpoint_name:$endpoint_name,endpoint_hostname:$endpoint_hostname,public_origin:("https://" + $endpoint_hostname)},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
     >"$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$output_dir/manifest.json"
@@ -528,163 +850,7 @@ jq -S -c -n \
   >"$scratch/runtime-state.initial.json"
 atomic_copy "$scratch/runtime-state.initial.json" runtime-state.json
 
-run_filtered() {
-  local action=$1 case_id=$2 deadline=$3 destination=$4 case_dir=$5
-  local statuses command_status filter_status
-  set +e
-  "$timeout_bin" --signal=TERM --kill-after=5 "$deadline" \
-    "$scenario_driver" "$action" "$case_id" "$block_path" "$case_dir" 2>&1 \
-    | "$filter" --mode text --max-bytes 16384 >"$destination"
-  statuses=("${PIPESTATUS[@]}")
-  set -e
-  command_status=${statuses[0]:-125}
-  filter_status=${statuses[1]:-125}
-  if [[ $filter_status -ne 0 ]]; then
-    printf '%s\n' '[evidence filter failed closed]' >"$destination"
-    return 125
-  fi
-  return "$command_status"
-}
-
-append_summary() {
-  local case_id=$1 phase=$2 source=$3 bounded
-  printf '=== %s %s ===\n' "$case_id" "$phase" >>"$journal_work"
-  cat "$source" >>"$journal_work"
-  printf '\n' >>"$journal_work"
-  bounded=$scratch/component-journal-summary.bounded
-  "$filter" --mode text --max-bytes 131072 <"$journal_work" >"$bounded" || \
-    printf '%s\n' '[evidence filter failed closed]' >"$bounded"
-  mv -f "$bounded" "$journal_work"
-  atomic_copy "$journal_work" component-journal-summary.txt
-}
-
-persist_case_receipts() {
-  local case_id=$1 case_dir=$2 receipt filename filtered entry
-  local receipts=()
-  shopt -s nullglob
-  receipts=("$case_dir"/*-receipt.json)
-  shopt -u nullglob
-  for receipt in "${receipts[@]}"; do
-    filename=${receipt##*/}
-    filtered=$(mktemp "$scratch/.case-receipt.XXXXXX")
-    if ! "$filter" --mode inventory --max-bytes 1048576 <"$receipt" >"$filtered"; then
-      rm -f "$filtered"
-      return 125
-    fi
-    entry=$(mktemp "$scratch/.case-receipt-entry.XXXXXX")
-    if ! jq -S -c -n --arg case_id "$case_id" --arg receipt_name "$filename" \
-      --slurpfile receipt "$filtered" \
-      '{case_id:$case_id,receipt_name:$receipt_name,receipt:$receipt[0]}' >"$entry"; then
-      rm -f "$filtered" "$entry"
-      return 125
-    fi
-    cat "$entry" >>"$receipts_work"
-    rm -f "$filtered" "$entry"
-  done
-  atomic_copy "$receipts_work" case-receipts.jsonl
-}
-
-failed_cases=0
-blocked_cases=0
-passed_cases=0
-for index in "${!case_ids[@]}"; do
-  case_id=${case_ids[$index]}
-  deadline=${case_deadlines[$index]}
-  case_dir=$scratch/case-$case_id
-  mkdir -m 0700 "$case_dir"
-  run_summary=$case_dir/run-summary.txt
-  cleanup_summary=$case_dir/cleanup-summary.txt
-  diagnostic_summary=$case_dir/diagnostic-summary.txt
-  case_started=$(date +%s)
-
-  if run_filtered run "$case_id" "$deadline" "$run_summary" "$case_dir"; then
-    run_code=0
-  else
-    run_code=$?
-  fi
-  append_summary "$case_id" run "$run_summary"
-
-  diagnostic_code=0
-  if [[ $run_code -ne 0 ]]; then
-    if run_filtered diagnostics "$case_id" 30 "$diagnostic_summary" "$case_dir"; then
-      diagnostic_code=0
-    else
-      diagnostic_code=$?
-    fi
-    append_summary "$case_id" diagnostics "$diagnostic_summary"
-  fi
-
-  if run_filtered cleanup "$case_id" 60 "$cleanup_summary" "$case_dir"; then
-    cleanup_code=0
-  else
-    cleanup_code=$?
-  fi
-  append_summary "$case_id" cleanup "$cleanup_summary"
-
-  if persist_case_receipts "$case_id" "$case_dir"; then
-    evidence_code=0
-  else
-    evidence_code=$?
-  fi
-
-  case_ended=$(date +%s)
-  status=passed
-  if [[ $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
-    status=failed
-  elif [[ $run_code -eq 124 ]]; then
-    status=timed_out
-  elif [[ $run_code -eq 78 ]]; then
-    if [[ -f $case_dir/blocked-receipt.json ]] && jq -e \
-      --arg case_id "$case_id" --arg block_path "$block_path" \
-      '.version == 1 and .status == "blocked" and .case_id == $case_id
-        and .block_path == $block_path and (.reason | type == "string" and length > 0)' \
-      "$case_dir/blocked-receipt.json" >/dev/null; then
-      status=blocked
-    else
-      status=failed
-      evidence_code=125
-    fi
-  elif [[ $run_code -ne 0 ]]; then
-    status=failed
-  fi
-  case "$status" in
-    passed) passed_cases=$((passed_cases + 1)) ;;
-    blocked) blocked_cases=$((blocked_cases + 1)) ;;
-    failed|timed_out) failed_cases=$((failed_cases + 1)) ;;
-    *) fail "internal case status is not closed" ;;
-  esac
-  jq -S -c -n \
-    --arg case_id "$case_id" \
-    --arg status "$status" \
-    --arg expected_postcondition "${case_postconditions[$index]}" \
-    --argjson deadline_seconds "$deadline" \
-    --argjson started_at_unix_seconds "$case_started" \
-    --argjson ended_at_unix_seconds "$case_ended" \
-    --argjson run_exit_code "$run_code" \
-    --argjson diagnostic_exit_code "$diagnostic_code" \
-    --argjson cleanup_exit_code "$cleanup_code" \
-    --argjson evidence_exit_code "$evidence_code" \
-    '{case_id:$case_id,status:$status,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,evidence_exit_code:$evidence_exit_code}' \
-    >>"$results_work"
-  atomic_copy "$results_work" scenario-results.jsonl
-done
-
-inventory_work=$scratch/final-inventory.json
-set +e
-"$timeout_bin" --signal=TERM --kill-after=5 180 \
-  "$scenario_driver" inventory final "$block_path" "$scratch" 2>/dev/null \
-  | "$filter" --mode inventory --max-bytes 1048576 >"$inventory_work"
-inventory_statuses=("${PIPESTATUS[@]}")
-set -e
-inventory_command_status=${inventory_statuses[0]:-125}
-inventory_filter_status=${inventory_statuses[1]:-125}
-if [[ $inventory_command_status -ne 0 || $inventory_filter_status -ne 0 ]]; then
-  failed_cases=$((failed_cases + 1))
-  printf '%s\n' '{"status":"unavailable"}' >"$inventory_work"
-  printf '%s\n' '[final inventory command or evidence filter failed closed]' >"$scratch/inventory-diagnostic.txt"
-  append_summary final-inventory diagnostics "$scratch/inventory-diagnostic.txt"
-fi
-atomic_copy "$inventory_work" final-inventory.json
+cats_e3_run_cases_post_preflight
 
 input_rehash_work=$scratch/input-rehash-diagnostic.txt
 : >"$input_rehash_work"
@@ -703,6 +869,31 @@ done
 if [[ -s $input_rehash_work ]]; then
   failed_cases=$((failed_cases + 1))
   append_summary stable-inputs diagnostics "$input_rehash_work"
+fi
+
+coordinate_recheck=$scratch/qualification-coordinate-diagnostic.txt
+: >"$coordinate_recheck"
+[[ ${CATS_E3_CONTROL_ORIGIN:-} == "$control_origin" ]] || printf '%s\n' 'control origin changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_WORKSPACE_ID:-} == "$workspace_id" ]] || printf '%s\n' 'workspace ID changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_EXPECTED_NODES:-} == "$(IFS=,; printf '%s' "${expected_nodes[*]}")" ]] || \
+  printf '%s\n' 'expected Node set changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_QUALIFICATION_NODE_ID:-} == "$qualification_node" ]] || \
+  printf '%s\n' 'qualification Node changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_CAT_NAME:-} == "$cat_name" ]] || printf '%s\n' 'Cat name changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_BOOT_IMAGE_DIGEST:-} == "$boot_image_digest" ]] || \
+  printf '%s\n' 'boot image digest changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_ENDPOINT_NAME:-} == "$endpoint_name" ]] || printf '%s\n' 'Endpoint name changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_ENDPOINT_HOSTNAME:-} == "$endpoint_hostname" ]] || \
+  printf '%s\n' 'Endpoint hostname changed' >>"$coordinate_recheck"
+[[ ${CATS_E3_PUBLIC_ORIGIN:-} == "https://$endpoint_hostname" ]] || \
+  printf '%s\n' 'public origin changed' >>"$coordinate_recheck"
+[[ -f $token_file_original && ! -L $token_file_original ]] && \
+  protected_token_file "$token_file_original" >/dev/null 2>&1 && \
+  [[ $(sha256sum "$token_file_original" | awk '{print $1}') == "$token_file_authority_sha256" ]] || \
+  printf '%s\n' 'root-only token input changed' >>"$coordinate_recheck"
+if [[ -s $coordinate_recheck ]]; then
+  failed_cases=$((failed_cases + 1))
+  append_summary qualification-coordinates diagnostics "$coordinate_recheck"
 fi
 
 final_exit=0

@@ -37,14 +37,30 @@ required() {
   printf '%s' "$value"
 }
 
-# Keep the bearer token in this driver only. Every authorized child receives
-# it through one command-scoped environment assignment; focused tests,
-# diagnostics, systemctl and qualification probes never inherit it.
-TOKEN=${CATS_TOKEN:-}
-[[ -n $TOKEN && $TOKEN != *$'\n'* && $TOKEN != *$'\r'* ]] || \
-  fail "CATS_TOKEN must be one nonempty header-safe line"
-unset CATS_TOKEN
-readonly TOKEN
+qualification_node_id() {
+  local value
+  value=$(required CATS_E3_QUALIFICATION_NODE_ID)
+  canonical_id CATS_E3_QUALIFICATION_NODE_ID "$value"
+  printf '%s' "$value"
+}
+
+# The runner supplies only a private staged token file. Capture its path in a
+# non-exported readonly shell variable, then remove even the path from the
+# environment inherited by probes, systemd and diagnostics.
+TOKEN_FILE=${CATS_E3_TOKEN_FILE:-}
+[[ $TOKEN_FILE == /* && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]] || \
+  fail "staged control token file is required"
+export -n TOKEN_FILE
+unset CATS_E3_TOKEN_FILE
+readonly TOKEN_FILE
+
+read_token() {
+  local value
+  value=$(<"$TOKEN_FILE")
+  [[ -n $value && $value != *$'\n'* && $value != *$'\r'* ]] || \
+    fail "staged control token must be one nonempty header-safe line"
+  printf '%s' "$value"
+}
 AUTHORIZATION_TEMP=
 cleanup_authorization_temp() {
   if [[ -n $AUTHORIZATION_TEMP ]]; then
@@ -106,21 +122,24 @@ atomic_json() {
 }
 
 run_cats() {
-  local executable
+  local executable token
   executable=$(binary cats)
-  CATS_TOKEN=$TOKEN "$executable" "$@"
+  token=$(read_token)
+  CATS_TOKEN=$token "$executable" "$@"
 }
 
 curl_json() {
   local method=$1 url=$2 output=$3 expected_status=$4
   shift 4
-  local curl_bin auth_header response_headers status content_types encodings curl_status size
+  local curl_bin auth_header response_headers status content_types encodings curl_status size token
   curl_bin=$(binary curl)
   auth_header=$(mktemp "$CASE_DIR/.authorization.XXXXXX")
   AUTHORIZATION_TEMP=$auth_header
   response_headers=$(mktemp "$CASE_DIR/.response-headers.XXXXXX")
   chmod 0600 "$auth_header" "$response_headers"
-  printf 'authorization: Bearer %s\n' "$TOKEN" >"$auth_header"
+  token=$(read_token)
+  printf 'authorization: Bearer %s\n' "$token" >"$auth_header"
+  unset token
   set +e
   status=$("$curl_bin" --silent --show-error \
     --proto '=https' --tlsv1.2 --max-time 30 --max-filesize 1048576 \
@@ -308,7 +327,7 @@ write_runtime_cat_id() {
 }
 
 run_create() {
-  local output cat_id operation_id expected_name
+  local output cat_id operation_id expected_name expected_node placement_snapshot
   expected_name=$(required CATS_E3_CAT_NAME)
   output=$CASE_DIR/create-response.json
   run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
@@ -327,12 +346,24 @@ run_create() {
   jq -e --arg cat "$cat_id" \
     '.id == $cat and .desired.target == "running" and .observed.stable_state == "running" and (.observed.conditions | index("ready") != null)' \
     "$CASE_DIR/cat-running.json" >/dev/null || fail "Cat did not converge to exact Running/Ready"
+  expected_node=$(qualification_node_id)
+  placement_snapshot=$CASE_DIR/create-placement-snapshot.json
+  run_probe snapshot --cat-id "$cat_id" >"$placement_snapshot"
+  jq -e --arg cat "$cat_id" --arg node "$expected_node" \
+    '.version == 1 and .cat_id == $cat and .node_id == $node' \
+    "$placement_snapshot" >/dev/null || \
+    fail "created Cat was not placed on the exact qualification Node"
   jq -S -c \
     '{version:1,cat_id:.id,desired_target:.desired.target,
       observed_stable_state:.observed.stable_state,conditions:.observed.conditions}' \
     "$CASE_DIR/cat-running.json" >"$CASE_DIR/cat-running-receipt.source.json"
   atomic_json cat-running-receipt.json "$CASE_DIR/cat-running-receipt.source.json"
+  jq -S -c '{version:1,cat_id,node_id,runtime_incarnation,root_block_frontend}' \
+    "$placement_snapshot" >"$CASE_DIR/create-placement-receipt.source.json"
+  atomic_json create-placement-receipt.json \
+    "$CASE_DIR/create-placement-receipt.source.json"
   rm -f "$CASE_DIR/cat-running-receipt.source.json"
+  rm -f "$CASE_DIR/create-placement-receipt.source.json"
 }
 
 cat_id() {
@@ -374,13 +405,15 @@ run_probe() {
 }
 
 run_guest_write() {
-  local cat source
+  local cat source expected_node
   cat=$(cat_id)
+  expected_node=$(qualification_node_id)
   source=$CASE_DIR/durable-write-flush.source.json
   run_probe guest-sync --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" >"$source"
   jq -e \
-    --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" \
+    --arg cat "$cat" --arg node "$expected_node" --arg run_id "$CATS_E3_RUN_ID" \
     '.version == 1 and .cat_id == $cat and .run_id == $run_id
+      and .node_id == $node
       and .strict_flush_remote_durable == true
       and .after_remote_generation > .before_remote_generation' \
     "$source" >/dev/null || fail "Guest write receipt lacks exact Strict remote proof"
@@ -389,16 +422,17 @@ run_guest_write() {
 }
 
 install_route_workload() {
-  local cat workload workload_sha256 source
+  local cat workload workload_sha256 source expected_node
   cat=$1
+  expected_node=$(qualification_node_id)
   workload=$(binary e3-guest-workload)
   workload_sha256=$(binary_sha256 e3-guest-workload)
   source=$CASE_DIR/workload-install.source.json
   run_probe install-workload --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" \
     --workload "$workload" --workload-sha256 "$workload_sha256" --port 8080 >"$source"
-  jq -e --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" \
+  jq -e --arg cat "$cat" --arg node "$expected_node" --arg run_id "$CATS_E3_RUN_ID" \
     --arg workload_sha256 "$workload_sha256" \
-    '.version == 1 and .cat_id == $cat and .run_id == $run_id
+    '.version == 1 and .cat_id == $cat and .node_id == $node and .run_id == $run_id
       and .port == 8080 and .workload_sha256 == $workload_sha256
       and .guest_reread_sha256 == $workload_sha256
       and .guest_file_fsynced == true
@@ -455,7 +489,7 @@ run_route() {
 run_restart() {
   local cat systemctl_bin service installed_noded before after
   local before_fleet after_fleet before_invocation after_invocation before_pid after_pid
-  local node_id before_agent_instance before_agent_epoch
+  local node_id expected_node before_agent_instance before_agent_epoch
   local attempt cat_state ready raw_status source
   cat=$(cat_id)
   systemctl_bin=$(binary systemctl)
@@ -469,6 +503,8 @@ run_restart() {
   run_probe snapshot --cat-id "$cat" >"$before"
   node_id=$(json_field "$before" '.node_id')
   canonical_id checkpoint_node_id "$node_id"
+  expected_node=$(qualification_node_id)
+  [[ $node_id == "$expected_node" ]] || fail "runtime is not on the exact qualification Node"
   raw_fleet_snapshot_to "$before_fleet" || fail "pre-restart raw fleet snapshot is unavailable"
   jq -e --arg node "$node_id" '
     .desired_runtime_count == 1 and .current_runtime_observation_count == 1
@@ -487,7 +523,22 @@ run_restart() {
     "$before_fleet" >/dev/null || fail "pre-restart inventory is not session-bound and complete"
   before_agent_instance=$(json_field "$before_fleet" ".nodes[] | select(.node_id == \"$node_id\") | .session.agent_instance_id")
   before_agent_epoch=$(json_field "$before_fleet" ".nodes[] | select(.node_id == \"$node_id\") | .session.agent_session_epoch")
-  atomic_json restart-fleet-before-receipt.json "$before_fleet"
+  jq -S -c --arg node "$node_id" '
+    [.nodes[] | select(.node_id == $node)][0] as $n
+    | {version:1,node_id:$node,
+       agent_instance_id:$n.session.agent_instance_id,
+       agent_epoch:$n.session.agent_session_epoch,
+       node_boot_id:$n.session.node_boot_id,
+       lease_deadline_unix_ms:$n.session.lease_deadline_unix_ms,
+       inventory_observation_id:$n.inventory.source_observation_id,
+       inventory_complete:$n.inventory.complete_inventory,
+       inventory_runtime_count:$n.inventory.runtime_count,
+       inventory_residue_count:$n.inventory.residue_count,
+       inventory_route_active_count:$n.inventory.route_active_count}' \
+    "$before_fleet" >"$CASE_DIR/restart-fleet-before-receipt.source.json"
+  atomic_json restart-fleet-before-receipt.json \
+    "$CASE_DIR/restart-fleet-before-receipt.source.json"
+  rm -f "$CASE_DIR/restart-fleet-before-receipt.source.json"
   before_invocation=$("$systemctl_bin" show --property=InvocationID --value "$service")
   [[ $before_invocation =~ ^[0-9a-f]{32}$ ]] || fail "Agent has no exact pre-restart InvocationID"
   before_pid=$("$systemctl_bin" show --property=MainPID --value "$service")
@@ -554,8 +605,9 @@ run_restart() {
     and (.observed.conditions | index("ready") != null)' "$cat_state" >/dev/null || \
     fail "new AgentSession did not produce a current Running/Ready Cat observation"
   run_probe snapshot --cat-id "$cat" >"$after"
-  jq -e -n --slurpfile before "$before" --slurpfile after "$after" \
+  jq -e -n --arg node "$expected_node" --slurpfile before "$before" --slurpfile after "$after" \
     '$before[0].cat_id == $after[0].cat_id
+      and $before[0].node_id == $node and $after[0].node_id == $node
       and $before[0].runtime_incarnation == $after[0].runtime_incarnation
       and $before[0].guest_boot_id == $after[0].guest_boot_id
       and $before[0].root_volume_id == $after[0].root_volume_id
@@ -565,11 +617,26 @@ run_restart() {
       and $after[0].active_route_gate_count > 0
       and $after[0].strict_remote_durable == true' >/dev/null || \
     fail "Agent restart did not adopt the exact retained Running runtime"
-  atomic_json restart-fleet-after-receipt.json "$after_fleet"
+  jq -S -c --arg node "$node_id" '
+    [.nodes[] | select(.node_id == $node)][0] as $n
+    | {version:1,node_id:$node,
+       agent_instance_id:$n.session.agent_instance_id,
+       agent_epoch:$n.session.agent_session_epoch,
+       node_boot_id:$n.session.node_boot_id,
+       lease_deadline_unix_ms:$n.session.lease_deadline_unix_ms,
+       inventory_observation_id:$n.inventory.source_observation_id,
+       inventory_complete:$n.inventory.complete_inventory,
+       inventory_runtime_count:$n.inventory.runtime_count,
+       inventory_residue_count:$n.inventory.residue_count,
+       inventory_route_active_count:$n.inventory.route_active_count}' \
+    "$after_fleet" >"$CASE_DIR/restart-fleet-after-receipt.source.json"
+  atomic_json restart-fleet-after-receipt.json \
+    "$CASE_DIR/restart-fleet-after-receipt.source.json"
+  rm -f "$CASE_DIR/restart-fleet-after-receipt.source.json"
   source=$CASE_DIR/restart-guest-sync.source.json
   run_probe guest-sync --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" >"$source"
-  jq -e --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" '
-    .version == 1 and .cat_id == $cat and .run_id == $run_id
+  jq -e --arg cat "$cat" --arg node "$expected_node" --arg run_id "$CATS_E3_RUN_ID" '
+    .version == 1 and .cat_id == $cat and .node_id == $node and .run_id == $run_id
     and .strict_flush_remote_durable == true
     and .after_remote_generation > .before_remote_generation' "$source" >/dev/null || \
     fail "post-restart Guest write lacks exact Strict remote proof"
@@ -587,8 +654,12 @@ run_restart() {
       service:$service,installed_noded:$installed_noded,
       before_main_pid:$before_pid,after_main_pid:$after_pid,
       before_invocation_id:$before_invocation,after_invocation_id:$after_invocation,
-      before_agent_session:([$before_fleet[0].nodes[] | select(.node_id == $before[0].node_id)][0].session),
-      after_agent_session:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].session),
+      before_agent_instance_id:([$before_fleet[0].nodes[] | select(.node_id == $before[0].node_id)][0].session.agent_instance_id),
+      before_agent_epoch:([$before_fleet[0].nodes[] | select(.node_id == $before[0].node_id)][0].session.agent_session_epoch),
+      before_node_boot_id:([$before_fleet[0].nodes[] | select(.node_id == $before[0].node_id)][0].session.node_boot_id),
+      after_agent_instance_id:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].session.agent_instance_id),
+      after_agent_epoch:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].session.agent_session_epoch),
+      after_node_boot_id:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].session.node_boot_id),
       after_inventory_observation_id:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.source_observation_id),
       after_inventory_complete:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.complete_inventory),
       after_route_active_count:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.route_active_count),
@@ -604,12 +675,13 @@ run_restart() {
 }
 
 run_volume_init_matrix() {
-  local cat snapshot source
+  local cat snapshot source expected_node
   cat=$(cat_id)
+  expected_node=$(qualification_node_id)
   snapshot=$CASE_DIR/volume-frontend-snapshot.json
   run_probe snapshot --cat-id "$cat" >"$snapshot"
-  jq -e --arg cat "$cat" --arg block_path "$BLOCK_PATH" \
-    '.version == 1 and .cat_id == $cat
+  jq -e --arg cat "$cat" --arg node "$expected_node" --arg block_path "$BLOCK_PATH" \
+    '.version == 1 and .cat_id == $cat and .node_id == $node
       and .root_block_frontend == $block_path
       and .strict_remote_durable == true' "$snapshot" >/dev/null || \
     fail "installed Running checkpoint does not use the selected block frontend"
@@ -742,16 +814,17 @@ diagnostics() {
 }
 
 cleanup() {
-  local policy source cat
+  local policy source cat expected_node
   policy=observation_only
   if [[ $CASE_ID == route-http-ws ]]; then
     policy=retained_run_bound_guest_workload_for_agent_restart
   elif [[ $CASE_ID == agent-restart-adoption ]]; then
     cat=$(cat_id)
+    expected_node=$(qualification_node_id)
     source=$CASE_DIR/workload-remove.source.json
     run_probe remove-workload --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" >"$source"
-    jq -e --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" \
-      '.version == 1 and .cat_id == $cat and .run_id == $run_id and .removed == true' \
+    jq -e --arg cat "$cat" --arg node "$expected_node" --arg run_id "$CATS_E3_RUN_ID" \
+      '.version == 1 and .cat_id == $cat and .node_id == $node and .run_id == $run_id and .removed == true' \
       "$source" >/dev/null || fail "Guest workload cleanup receipt is not exact"
     atomic_json workload-remove-receipt.json "$source"
     rm -f "$source"

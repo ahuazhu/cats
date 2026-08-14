@@ -365,6 +365,7 @@ fn guest_sync(cat_id: &str, run_id: &str) -> Result<()> {
         serde_json::json!({
             "version": 1,
             "cat_id": cat_id,
+            "node_id": before_checkpoint.node_id,
             "run_id": run_id,
             "marker_path": marker_path,
             "before_remote_generation": before.remote_durable_generation,
@@ -523,7 +524,7 @@ exit 1"#;
     );
     println!(
         "{}",
-        serde_json::json!({"version":1,"cat_id":cat_id,"run_id":run_id,"unit":unit,"path":path,"port":port,"workload_sha256":actual_sha256,"guest_reread_sha256":guest_sha256,"guest_file_fsynced":true,"unit_main_pid":main_pid,"unit_main_executable":main_executable,"installed":true})
+        serde_json::json!({"version":1,"cat_id":cat_id,"node_id":checkpoint.node_id,"run_id":run_id,"unit":unit,"path":path,"port":port,"workload_sha256":actual_sha256,"guest_reread_sha256":guest_sha256,"guest_file_fsynced":true,"unit_main_pid":main_pid,"unit_main_executable":main_executable,"installed":true})
     );
     Ok(())
 }
@@ -549,7 +550,7 @@ fn remove_workload(cat_id: &str, run_id: &str) -> Result<()> {
     );
     println!(
         "{}",
-        serde_json::json!({"version":1,"cat_id":cat_id,"run_id":run_id,"removed":true})
+        serde_json::json!({"version":1,"cat_id":cat_id,"node_id":checkpoint.node_id,"run_id":run_id,"removed":true})
     );
     Ok(())
 }

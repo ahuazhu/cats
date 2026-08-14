@@ -382,6 +382,120 @@ esac
             .current_dir(&self.root);
         command.output().expect("run production v2 driver fixture")
     }
+
+    fn run_post_preflight(
+        &self,
+        output_dir: &Path,
+        configure: impl FnOnce(&mut Command),
+    ) -> Output {
+        let runner = self.root.join("deploy/metal/runtime-cutover-e2e.sh");
+        let driver = self
+            .root
+            .join("deploy/metal/tests/runtime-cutover-e2e-scenario-fixture.sh");
+        let filter = self
+            .root
+            .join("deploy/metal/runtime-cutover-evidence-filter.py");
+        let script = r#"
+set -euo pipefail
+source "$1"
+output_dir=$2
+timeout_bin=$3
+scenario_driver=$4
+filter=$5
+block_path=kernel-nbd
+scratch=$output_dir/.scratch
+mkdir -m 0700 "$output_dir" "$scratch"
+results_work=$scratch/scenario-results.jsonl
+journal_work=$scratch/component-journal-summary.txt
+receipts_work=$scratch/case-receipts.jsonl
+: >"$results_work"
+: >"$journal_work"
+: >"$receipts_work"
+case_ids=(control-startup-schema node-registration-full-inventory cat-create-running durable-write-flush route-http-ws agent-restart-adoption volume-init-matrix usage-final-terminal-receipt delete-cleanup)
+case_deadlines=(120 180 600 300 300 600 900 300 600)
+case_postconditions=(fixture fixture fixture fixture fixture fixture fixture fixture fixture)
+cats_e3_run_cases_post_preflight
+jq -S -c -n --argjson passed "$passed_cases" --argjson blocked "$blocked_cases" --argjson failed "$failed_cases" \
+  '{passed:$passed,blocked:$blocked,failed:$failed}' >"$output_dir/case-counts.json"
+"#;
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .args(["-c", script, "runtime-cutover-post-preflight"])
+            .arg(runner)
+            .arg(output_dir)
+            .arg(&self.timeout)
+            .arg(driver)
+            .arg(filter)
+            .env("CATS_E3_FIXTURE_MODE", "enabled")
+            .env("CATS_E3_FIXTURE_TRACE", &self.trace)
+            .current_dir(&self.root);
+        configure(&mut command);
+        command.output().expect("run post-preflight E3 fixture")
+    }
+}
+
+#[test]
+fn runner_rebuilds_declared_coordinates_after_clearing_wrong_ambient_values() {
+    let root = workspace_root();
+    let runner = root.join("deploy/metal/runtime-cutover-e2e.sh");
+    let script = r#"
+set -euo pipefail
+source "$1"
+control_origin=https://control.example.test
+workspace_id=workspace_e3
+qualification_node=node_qualification
+cat_name=e3-cat
+boot_image_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+endpoint_name=e3-web
+endpoint_hostname=e3.example.test
+installed_noded_path=/opt/cats/bin/cats-noded
+token_file=/private/staged/control-token
+expected_nodes=(node_other node_qualification)
+export CATS_TOKEN=wrong-secret
+export CATS_E3_CONTROL_ORIGIN=https://wrong.example.test
+export CATS_E3_WORKSPACE_ID=wrong-workspace
+export CATS_E3_EXPECTED_NODES=wrong-node
+export CATS_E3_QUALIFICATION_NODE_ID=wrong-node
+cats_e3_clear_ambient
+cats_e3_export_qualification_environment
+test -z "${CATS_TOKEN:-}"
+test "$CATS_E3_CONTROL_ORIGIN" = "$control_origin"
+test "$CATS_E3_WORKSPACE_ID" = "$workspace_id"
+test "$CATS_E3_EXPECTED_NODES" = node_other,node_qualification
+test "$CATS_E3_QUALIFICATION_NODE_ID" = "$qualification_node"
+test "$CATS_E3_TOKEN_FILE" = "$token_file"
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-coordinate-fixture"])
+        .arg(runner)
+        .output()
+        .expect("run coordinate rebuild fixture");
+    assert_success(&output);
+}
+
+#[test]
+fn runner_rejects_labels_that_alias_the_same_scenario_environment_name() {
+    let runner = workspace_root().join("deploy/metal/runtime-cutover-e2e.sh");
+    let script = r#"
+set -euo pipefail
+source "$1"
+cats_e3_environment_labels_are_unique cats=/one runtime-e3-probe=/two
+if cats_e3_environment_labels_are_unique runtime-e3-probe=/one runtime_e3_probe=/two; then
+  exit 1
+fi
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-label-fixture"])
+        .arg(runner)
+        .output()
+        .expect("run environment label collision fixture");
+    assert_success(&output);
 }
 
 fn sha256(path: &Path) -> String {
@@ -439,11 +553,24 @@ fn runtime_cutover_runner_rejects_a_dirty_binary() {
 
 #[test]
 fn runtime_cutover_runner_continues_and_cleans_after_a_case_failure() {
-    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
-    assert!(runner.contains("for index in \"${!case_ids[@]}\"; do"));
-    assert!(runner.contains("run_filtered diagnostics"));
-    assert!(runner.contains("run_filtered cleanup"));
-    assert!(runner.contains("persist_case_receipts"));
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("case-failure");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env("CATS_E3_FIXTURE_FAIL_CASE", "durable-write-flush");
+    });
+    assert_success(&output);
+    let trace = fs::read_to_string(&fixture.trace).expect("read scenario trace");
+    for case_id in CASES {
+        assert!(trace.contains(&format!("run|{case_id}|kernel-nbd")));
+        assert!(trace.contains(&format!("cleanup|{case_id}|kernel-nbd")));
+    }
+    assert!(trace.contains("diagnostics|durable-write-flush|kernel-nbd"));
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    assert_eq!(results.lines().count(), CASES.len());
+    assert!(results
+        .lines()
+        .any(|line| line.contains("\"case_id\":\"durable-write-flush\"")
+            && line.contains("\"status\":\"failed\"")));
 }
 
 #[test]
@@ -465,20 +592,103 @@ fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
 
 #[test]
 fn runtime_cutover_runner_redacts_and_bounds_diagnostics() {
-    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
-    assert!(runner.contains("\"$filter\" --mode text --max-bytes 16384"));
-    assert!(runner.contains("\"$filter\" --mode text --max-bytes 131072"));
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("redaction");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command
+            .env("CATS_E3_FIXTURE_FAIL_CASE", "route-http-ws")
+            .env("CATS_E3_FIXTURE_SECRETS", "true");
+    });
+    assert_success(&output);
+    let journal = fs::read_to_string(output_dir.join("component-journal-summary.txt")).unwrap();
+    for secret in [
+        "fixture-token-must-not-survive",
+        "fixture-password-must-not-survive",
+        "fixture-private-key-must-not-survive",
+    ] {
+        assert!(!journal.contains(secret), "journal retained {secret}");
+    }
+    assert!(journal.contains("[REDACTED]"));
+    assert!(journal.contains("[TRUNCATED:"));
+    assert!(journal.len() <= 131_072);
 }
 
 #[test]
 fn runtime_cutover_runner_rejects_sensitive_final_inventory() {
-    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
-    assert!(runner.contains("\"$filter\" --mode inventory --max-bytes 1048576"));
-    assert!(runner.contains("{\"status\":\"unavailable\"}"));
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("sensitive-inventory");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env("CATS_E3_FIXTURE_SENSITIVE_INVENTORY", "true");
+    });
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(output_dir.join("final-inventory.json")).unwrap(),
+        "{\"status\":\"unavailable\"}\n"
+    );
+    let counts: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_dir.join("case-counts.json")).unwrap()).unwrap();
+    assert_eq!(counts["failed"], 1);
+}
+
+#[test]
+fn runtime_cutover_runner_fails_closed_on_sensitive_restart_receipt_keys() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("sensitive-restart-receipt");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env(
+            "CATS_E3_FIXTURE_SENSITIVE_RECEIPT_CASE",
+            "agent-restart-adoption",
+        );
+    });
+    assert_success(&output);
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    let restart: serde_json::Value = results
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|row: &serde_json::Value| row["case_id"] == "agent-restart-adoption")
+        .unwrap();
+    assert_eq!(restart["status"], "failed");
+    assert_eq!(restart["evidence_exit_code"], 125);
 }
 
 #[test]
 fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("seven-plus-two");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env(
+            "CATS_E3_FIXTURE_BLOCK_CASES",
+            "volume-init-matrix,usage-final-terminal-receipt",
+        );
+    });
+    assert_success(&output);
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    let rows = results
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 9);
+    assert_eq!(
+        rows.iter().filter(|row| row["status"] == "passed").count(),
+        7
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row["status"] == "blocked").count(),
+        2
+    );
+    let restart = rows
+        .iter()
+        .find(|row| row["case_id"] == "agent-restart-adoption")
+        .unwrap();
+    assert_eq!(restart["status"], "passed");
+    assert_eq!(restart["evidence_exit_code"], 0);
+    for blocked in ["volume-init-matrix", "usage-final-terminal-receipt"] {
+        let row = rows.iter().find(|row| row["case_id"] == blocked).unwrap();
+        assert_eq!(row["run_exit_code"], 78);
+        assert_eq!(row["cleanup_exit_code"], 0);
+        assert_eq!(row["evidence_exit_code"], 0);
+    }
+
     let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
     for case_id in CASES {
@@ -489,4 +699,10 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
     assert!(driver.contains("terminal archive/projector receipt remains unavailable"));
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
+    assert!(!driver.contains("before_agent_session:"));
+    assert!(!driver.contains("after_agent_session:"));
+    assert!(driver.contains("unset CATS_E3_TOKEN_FILE"));
+    assert!(driver.contains("export -n TOKEN_FILE"));
+    assert!(runner.contains("cats_e3_run_cases_post_preflight"));
+    assert!(runner.contains("[[ $EUID -eq 0 ]]"));
 }
