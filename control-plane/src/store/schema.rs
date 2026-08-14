@@ -312,6 +312,33 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(constraint));
         }
     }
+    for (table, constraint, definition) in REQUIRED_FOREIGN_KEYS {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                      JOIN pg_class source ON source.oid=c.conrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class target ON target.oid=c.confrelid
+                      JOIN pg_namespace target_namespace
+                        ON target_namespace.oid=target.relnamespace
+                     WHERE source_namespace.nspname=current_schema()
+                       AND target_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND c.conname=$2
+                       AND c.contype='f' AND c.convalidated
+                       AND NOT c.condeferrable AND NOT c.condeferred
+                       AND pg_get_constraintdef(c.oid, FALSE)=$3
+                 )",
+                &[table, constraint, definition],
+            )
+            .map_err(|error| internal(format!("verify authority foreign-key catalog: {error:?}")))?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(constraint));
+        }
+    }
     for (table, constraint, target, source_columns, target_columns, update_action, delete_action) in
         REQUIRED_DEFERRED_FOREIGN_KEYS
     {
@@ -710,9 +737,13 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_signing_authority",
     "route_v2_signer_revisions",
     "route_v2_signer_key_lineage",
-    // G3's accepted persisted rotation lineage is the only schema-15 delta.
+    // Route v2 signer lineage and the Stage B operator-delivery authority.
     "route_v2_public_key_ring_revisions",
     "route_v2_signer_retirements",
+    "route_v2_rotation_operator_authority",
+    "route_v2_rotation_operator_credentials",
+    "route_v2_signing_command_receipts",
+    "route_v2_public_ring_deliveries",
 ];
 
 type RequiredDeferredForeignKey = (
@@ -726,6 +757,166 @@ type RequiredDeferredForeignKey = (
 );
 
 pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_singleton_ck",
+        "CHECK (singleton)",
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_release_sha_ck",
+        "CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_trust_sha_ck",
+        "CHECK (trust_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_threshold_ck",
+        "CHECK (threshold >= 1 AND threshold <= 8)",
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_trust_bytes_ck",
+        "CHECK (octet_length(trust_bytes) >= 1 AND octet_length(trust_bytes) <= 16384)",
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_committed_at_ck",
+        "CHECK (first_committed_at_unix_ms >= 0)",
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_ordinal_ck",
+        "CHECK (credential_ordinal >= 0 AND credential_ordinal <= 7)",
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_spki_sha_ck",
+        "CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_credential_committed_at_ck",
+        "CHECK (first_committed_at_unix_ms >= 0)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_id_ck",
+        "CHECK (command_id ~ '^[0-9a-f]{32}$'::text)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_release_sha_ck",
+        "CHECK (release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_credential_set_sha_ck",
+        "CHECK (credential_set_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_exact_sha_ck",
+        "CHECK (exact_command_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_exact_bytes_ck",
+        "CHECK (octet_length(exact_command_bytes) >= 1 AND octet_length(exact_command_bytes) <= 65536)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_kind_ck",
+        "CHECK (command_kind = ANY (ARRAY['publish_overlap'::text, 'switch_active'::text, 'publish_new_only'::text, 'retire'::text, 'disable'::text, 'activate'::text]))",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_expected_revision_ck",
+        "CHECK (expected_signer_revision > 0)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_expected_sha_ck",
+        "CHECK (expected_signer_reference_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_terminal_outcome_ck",
+        "CHECK (terminal_outcome = ANY (ARRAY['applied'::text, 'authority_precondition_failed'::text]))",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_result_revision_ck",
+        "CHECK (resulting_signer_revision > 0)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_result_ring_ck",
+        "CHECK (resulting_ring_version > 0)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_result_bytes_ck",
+        "CHECK (octet_length(exact_result_bytes) >= 1 AND octet_length(exact_result_bytes) <= 16384)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_committed_at_ck",
+        "CHECK (committed_at_unix_ms >= 0)",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_result_projection_ck",
+        "CHECK (terminal_outcome = 'applied'::text AND resulting_signer_revision IS NOT NULL AND resulting_ring_version IS NOT NULL OR terminal_outcome = 'authority_precondition_failed'::text AND resulting_signer_revision IS NULL AND resulting_ring_version IS NULL)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_version_ck",
+        "CHECK (ring_version > 1)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_digest_ck",
+        "CHECK (key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_previous_version_ck",
+        "CHECK (expected_previous_ring_version > 0)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_previous_digest_ck",
+        "CHECK (expected_previous_key_ring_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_release_sha_ck",
+        "CHECK (source_release_commit_sha ~ '^[0-9a-f]{40}$'::text)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_envelope_sha_ck",
+        "CHECK (exact_signed_envelope_sha256 ~ '^sha256:[0-9a-f]{64}$'::text)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_envelope_bytes_ck",
+        "CHECK (octet_length(exact_signed_envelope_bytes) >= 1 AND octet_length(exact_signed_envelope_bytes) <= 65536)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_committed_at_ck",
+        "CHECK (committed_at_unix_ms >= 0)",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_adjacency_ck",
+        "CHECK (expected_previous_ring_version = (ring_version - 1))",
+    ),
     (
         "route_v2_signing_authority",
         "route_v2_signing_authority_singleton_ck",
@@ -1074,6 +1265,26 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
 ];
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_authority_pkey",
+        "singleton",
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_credentials_pkey",
+        "credential_id",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_receipts_pkey",
+        "authority_id,command_id",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_deliveries_pkey",
+        "deployment_id,ring_version",
+    ),
     ("volume_records", "volume_records_pkey", "volume_id"),
     (
         "route_v2_signing_authority",
@@ -1119,6 +1330,34 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
         "route_v2_gateway_current_credentials",
         "route_v2_gateway_current_credentials_pkey",
         "credential_id",
+    ),
+];
+
+pub(super) const REQUIRED_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_credential_authority_fkey",
+        "FOREIGN KEY (authority_id) REFERENCES route_v2_rotation_operator_authority(authority_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_operator_fkey",
+        "FOREIGN KEY (authority_id) REFERENCES route_v2_rotation_operator_authority(authority_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_target_fkey",
+        "FOREIGN KEY (target_deployment_id) REFERENCES route_v2_signing_authority(deployment_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_ring_fkey",
+        "FOREIGN KEY (deployment_id, ring_version, key_ring_digest) REFERENCES route_v2_public_key_ring_revisions(deployment_id, ring_version, key_ring_digest) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_command_fkey",
+        "FOREIGN KEY (source_authority_id, source_command_id) REFERENCES route_v2_signing_command_receipts(authority_id, command_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
     ),
 ];
 
@@ -1333,6 +1572,48 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
 ];
 
 const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_authority_id_key",
+        "authority_id",
+        None,
+    ),
+    (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_identity_key",
+        "authority_id,route_deployment_id,release_commit_sha,trust_sha256",
+        None,
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_spki_key",
+        "public_key_spki",
+        None,
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_spki_sha_key",
+        "public_key_spki_sha256",
+        None,
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_ordinal_key",
+        "authority_id,credential_ordinal",
+        None,
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_envelope_sha_key",
+        "exact_signed_envelope_sha256",
+        None,
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_predecessor_key",
+        "deployment_id,expected_previous_ring_version,expected_previous_key_ring_digest",
+        None,
+    ),
     (
         "disk_records",
         "disk_records_initialization_token_unique",
@@ -1756,6 +2037,34 @@ const BEFORE_ROW_UPDATE: i16 = 1 | 2 | 16;
 const BEFORE_ROW_UPDATE_DELETE: i16 = 1 | 2 | 8 | 16;
 const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
     (
+        "route_v2_rotation_operator_authority",
+        "route_v2_rotation_operator_authority_is_immutable",
+        "control_route_v2_rotation_record_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8089e0f2c469819e8b3228e1d263d543114b56f81d80b944954bd9b99f5d9f6b",
+    ),
+    (
+        "route_v2_rotation_operator_credentials",
+        "route_v2_rotation_operator_credential_is_immutable",
+        "control_route_v2_rotation_record_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8089e0f2c469819e8b3228e1d263d543114b56f81d80b944954bd9b99f5d9f6b",
+    ),
+    (
+        "route_v2_signing_command_receipts",
+        "route_v2_signing_command_receipt_is_immutable",
+        "control_route_v2_rotation_record_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8089e0f2c469819e8b3228e1d263d543114b56f81d80b944954bd9b99f5d9f6b",
+    ),
+    (
+        "route_v2_public_ring_deliveries",
+        "route_v2_public_ring_delivery_is_immutable",
+        "control_route_v2_rotation_record_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8089e0f2c469819e8b3228e1d263d543114b56f81d80b944954bd9b99f5d9f6b",
+    ),
+    (
         "runtime_node_credential_lineage",
         "runtime_node_credential_lineage_update",
         "control_runtime_node_credential_lineage_update",
@@ -2063,6 +2372,29 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             source, state, ring_removed_version, retired_signer_revision,
             retired_at_unix_ms
        FROM route_v2_signer_retirements WHERE FALSE",
+    "SELECT singleton, authority_id, route_deployment_id,
+            release_commit_sha, trust_sha256, threshold, trust_bytes,
+            first_committed_at_unix_ms
+       FROM route_v2_rotation_operator_authority WHERE FALSE",
+    "SELECT credential_id, authority_id, credential_ordinal,
+            public_key_spki, public_key_spki_sha256,
+            first_committed_at_unix_ms
+       FROM route_v2_rotation_operator_credentials WHERE FALSE",
+    "SELECT authority_id, command_id, release_commit_sha,
+            credential_set_sha256, exact_command_sha256,
+            exact_command_bytes, command_kind, target_deployment_id,
+            expected_signer_revision, expected_signer_reference_sha256,
+            terminal_outcome, resulting_signer_revision,
+            resulting_ring_version, exact_result_bytes,
+            committed_at_unix_ms
+       FROM route_v2_signing_command_receipts WHERE FALSE",
+    "SELECT deployment_id, ring_version, key_ring_digest,
+            expected_previous_ring_version,
+            expected_previous_key_ring_digest, source_authority_id,
+            source_command_id, source_release_commit_sha,
+            exact_signed_envelope_sha256, exact_signed_envelope_bytes,
+            committed_at_unix_ms
+       FROM route_v2_public_ring_deliveries WHERE FALSE",
     "SELECT singleton, authority_id, fleet_id, current_policy_revision,
             current_policy_sha256, first_committed_at_unix_ms
        FROM route_v2_gateway_identity_authority WHERE FALSE",

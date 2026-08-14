@@ -1408,6 +1408,106 @@ fn route_v2_signer_catalog_is_exact_and_current_stamp_rejects_drift() {
 }
 
 #[test]
+fn route_v2_rotation_catalog_is_exact_and_current_stamp_rejects_drift() {
+    fn is_rotation_table(table: &str) -> bool {
+        matches!(
+            table,
+            "route_v2_rotation_operator_authority"
+                | "route_v2_rotation_operator_credentials"
+                | "route_v2_signing_command_receipts"
+                | "route_v2_public_ring_deliveries"
+        )
+    }
+
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let check_constraints = super::schema::REQUIRED_CHECK_CONSTRAINTS
+        .iter()
+        .filter(|(table, _, _)| is_rotation_table(table))
+        .collect::<Vec<_>>();
+    assert_eq!(check_constraints.len(), 32);
+    for (table, constraint, expected_definition) in check_constraints {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    let foreign_keys = super::schema::REQUIRED_FOREIGN_KEYS
+        .iter()
+        .filter(|(table, _, _)| is_rotation_table(table))
+        .collect::<Vec<_>>();
+    assert_eq!(foreign_keys.len(), 5);
+    for (table, constraint, expected_definition) in foreign_keys {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    for (catalog_object, ddl) in [
+        (
+            "route_v2_rotation_operator_release_sha_ck",
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_release_sha_ck;
+             ALTER TABLE route_v2_rotation_operator_authority
+                 ADD CONSTRAINT route_v2_rotation_operator_release_sha_ck
+                 CHECK (release_commit_sha <> '')",
+        ),
+        (
+            "route_v2_rotation_operator_credential_authority_fkey",
+            "ALTER TABLE route_v2_rotation_operator_credentials
+                 DROP CONSTRAINT route_v2_rotation_operator_credential_authority_fkey",
+        ),
+        (
+            "route_v2_rotation_operator_identity_key",
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_identity_key;
+             CREATE INDEX route_v2_rotation_operator_identity_key
+                 ON route_v2_rotation_operator_authority(
+                     authority_id, route_deployment_id,
+                     release_commit_sha, trust_sha256)",
+        ),
+        (
+            "route_v2_public_ring_delivery_is_immutable",
+            "ALTER TABLE route_v2_public_ring_deliveries
+                 DISABLE TRIGGER route_v2_public_ring_delivery_is_immutable",
+        ),
+    ] {
+        let drift_url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&drift_url, None).unwrap());
+        let mut drift_admin = postgres::Client::connect(&drift_url, postgres::NoTls).unwrap();
+        drift_admin.batch_execute(ddl).unwrap();
+        let Err(error) = Store::connect(&drift_url, None) else {
+            panic!("a current stamp with changed {catalog_object} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(catalog_object), "{error}");
+    }
+}
+
+#[test]
 fn refuses_missing_or_replaced_volume_primary_key_without_repair() {
     for (ddl, expected_index_fragment) in [
         (
