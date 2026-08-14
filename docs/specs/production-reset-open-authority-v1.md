@@ -301,7 +301,8 @@ QualificationAdmissionBinding {
   aws_partition, aws_account_id, aws_region, cell_id, cell_namespace,
   cats_account_id, workspace_id,
   allowed_mutation_classes: [
-    "cat_create", "disk_create", "disk_delete", "runtime_mutation"
+    "cat_create", "disk_create", "disk_delete", "object_write_ambiguity",
+    "runtime_mutation"
   ],
   qualification_expires_at_unix_ms
 }
@@ -348,7 +349,8 @@ production-mutation-qualification-begin.receipt.json {
   qualification_id, workspace_id, release_id, source_commit_sha,
   qualification_catalog_sha256,
   allowed_mutation_classes: [
-    "cat_create", "disk_create", "disk_delete", "runtime_mutation"
+    "cat_create", "disk_create", "disk_delete", "object_write_ambiguity",
+    "runtime_mutation"
   ],
   binding_sha256,
   begin_command_id, begin_request_sha256, begin_command_receipt_sha256,

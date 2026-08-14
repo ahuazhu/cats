@@ -282,7 +282,7 @@ fn qualification_product_inventory_in(
 
 /// Gate a new product mutation in the same transaction as its business write.
 /// Exact API replays call this only after finding no stored result.
-pub(super) fn require_production_product_mutation_admitted(
+pub(in crate::store) fn require_production_product_mutation_admitted(
     transaction: &mut Transaction<'_>,
     authenticated_workspace_id: &cats_api::runtime_reconciliation::Id,
     mutation_class: ProductionQualificationMutationClass,
@@ -1094,6 +1094,7 @@ mod tests {
                 ProductionQualificationMutationClass::CatCreate,
                 ProductionQualificationMutationClass::DiskCreate,
                 ProductionQualificationMutationClass::DiskDelete,
+                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
                 ProductionQualificationMutationClass::RuntimeMutation,
             ],
             qualification_expires_at_unix_ms: expires_at_unix_ms,
@@ -1304,6 +1305,15 @@ mod tests {
                 &mut product_transaction,
                 &binding.workspace_id,
                 ProductionQualificationMutationClass::DiskCreate,
+            )
+            .unwrap(),
+            ProductionMutationAdmissionBinding::Qualification(binding.clone())
+        );
+        assert_eq!(
+            require_production_product_mutation_admitted(
+                &mut product_transaction,
+                &binding.workspace_id,
+                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
             )
             .unwrap(),
             ProductionMutationAdmissionBinding::Qualification(binding.clone())

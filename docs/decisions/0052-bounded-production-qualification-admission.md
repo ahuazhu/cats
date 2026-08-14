@@ -31,7 +31,9 @@ terminalization、read/health/reset。结束 qualification 后必须先线性化
    - AWS partition/account/region、cell ID/namespace；
    - 已由独立 identity authority 创建且 active 的 Cats Account 与唯一 Workspace；
    - 固定有序 mutation class closed set
-     `cat_create,disk_create,disk_delete,runtime_mutation`；
+     `cat_create,disk_create,disk_delete,object_write_ambiguity,runtime_mutation`；其中
+     `object_write_ambiguity` 只授权同一 Qualification Workspace 的 V3 对象写响应丢失注入，
+     不授权普通生产 PUT 或任意 provider effect；
    - 以 PostgreSQL clock 判断、最长 24 小时的 expiry。
    binding 不含 reset、fresh target、final proof set、G3/E9/V3/V5 terminal digest。
 3. canonical signed mutation 只有

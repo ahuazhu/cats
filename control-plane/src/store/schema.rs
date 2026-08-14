@@ -5010,7 +5010,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CONSTRAINT production_mutation_admission_commands_qualification_classes_ck
         CHECK (jsonb_typeof(qualification_mutation_classes) = 'array'
             AND qualification_mutation_classes =
-                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"runtime_mutation\"]'::jsonb),
+                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"object_write_ambiguity\",\"runtime_mutation\"]'::jsonb),
     qualification_expires_at_unix_ms BIGINT NULL
         CONSTRAINT production_mutation_admission_commands_qualification_expiry_ck
         CHECK (qualification_expires_at_unix_ms > 0),
@@ -5202,7 +5202,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CONSTRAINT production_mutation_admission_qualification_classes_ck
         CHECK (jsonb_typeof(qualification_mutation_classes) = 'array'
             AND qualification_mutation_classes =
-                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"runtime_mutation\"]'::jsonb),
+                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"object_write_ambiguity\",\"runtime_mutation\"]'::jsonb),
     qualification_expires_at_unix_ms BIGINT NULL
         CONSTRAINT production_mutation_admission_qualification_expiry_ck
         CHECK (qualification_expires_at_unix_ms > 0),

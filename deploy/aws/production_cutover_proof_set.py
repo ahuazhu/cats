@@ -1461,6 +1461,7 @@ def _validate_qualification_admission(
         "cat_create",
         "disk_create",
         "disk_delete",
+        "object_write_ambiguity",
         "runtime_mutation",
     ]:
         raise ProofSetError("Qualification mutation-class set drifted")

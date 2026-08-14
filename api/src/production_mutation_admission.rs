@@ -49,10 +49,11 @@ pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_FILE: &str =
 pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND: &str =
     "cats.production-mutation-qualification-product-inventory.v1";
 
-pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 4] = [
+pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 5] = [
     ProductionQualificationMutationClass::CatCreate,
     ProductionQualificationMutationClass::DiskCreate,
     ProductionQualificationMutationClass::DiskDelete,
+    ProductionQualificationMutationClass::ObjectWriteAmbiguity,
     ProductionQualificationMutationClass::RuntimeMutation,
 ];
 
@@ -200,6 +201,7 @@ pub enum ProductionQualificationMutationClass {
     CatCreate,
     DiskCreate,
     DiskDelete,
+    ObjectWriteAmbiguity,
     RuntimeMutation,
 }
 
@@ -1210,6 +1212,7 @@ mod tests {
                 ProductionQualificationMutationClass::CatCreate,
                 ProductionQualificationMutationClass::DiskCreate,
                 ProductionQualificationMutationClass::DiskDelete,
+                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
                 ProductionQualificationMutationClass::RuntimeMutation,
             ],
             qualification_expires_at_unix_ms: UnixMillis::new(3_600_000).unwrap(),
