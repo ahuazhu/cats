@@ -9,6 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -27,6 +28,9 @@ use postgres_native_tls::MakeTlsConnector;
 
 pub const DEFAULT_SCHEMA: &str = "cats_usage";
 pub const DEFAULT_WORKERS: usize = 4;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 // One slot for each globally admitted signed-runtime request is sufficient
 // even if all of them select the same worker. Other callers then backpressure
 // instead of growing synchronous database work without a bound.
@@ -836,10 +840,34 @@ fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>, schema: &str) -> Res
 
 fn connect_client(url: &str, ca_file: Option<&str>, schema: &str) -> Result<Client> {
     let connector = tls_connector(ca_file)?;
-    let mut client = Client::connect(url, MakeTlsConnector::new(connector))
+    let mut config = client_config(url)?;
+    let mut client = config
+        .connect(MakeTlsConnector::new(connector))
         .map_err(|error| pg_error("connect PostgreSQL", error))?;
+    configure_session(&mut client)?;
     migrate(&mut client, schema)?;
     Ok(client)
+}
+
+fn client_config(url: &str) -> Result<postgres::Config> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|error| MeteringError::Store(format!("parse PostgreSQL URL: {error}")))?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    Ok(config)
+}
+
+/// Apply the same server-side failure bounds on the initial connection and
+/// every reconnect before either migrations or usage work can claim a worker.
+fn configure_session(client: &mut Client) -> Result<()> {
+    let sql = format!(
+        "SET statement_timeout = '{}ms'; SET lock_timeout = '{}ms'",
+        STATEMENT_TIMEOUT.as_millis(),
+        LOCK_TIMEOUT.as_millis(),
+    );
+    client
+        .batch_execute(&sql)
+        .map_err(|error| pg_error("configure PostgreSQL usage session", error))
 }
 
 fn tls_connector(ca_file: Option<&str>) -> Result<TlsConnector> {
@@ -1738,6 +1766,170 @@ mod tests {
         assert!(sql.contains("checkout_intents"));
         assert!(sql.contains("stripe_events"));
         assert!(sql.contains("reject_credit_ledger_mutation"));
+    }
+
+    #[tokio::test]
+    async fn connection_statement_and_lock_stalls_are_bounded_and_the_worker_recovers() {
+        let Ok(url) = std::env::var("CATS_TEST_POSTGRES_URL") else {
+            return;
+        };
+        assert_eq!(
+            client_config(&url).unwrap().get_connect_timeout(),
+            Some(&CONNECT_TIMEOUT),
+            "every initial connection and reconnect must bound its socket attempt"
+        );
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_bounds_{}_{}", std::process::id(), suffix);
+        let store = PostgresUsageStore::connect(&url, None, &schema, 1).unwrap();
+        let settings = store
+            .dispatch(|client| {
+                client
+                    .query(
+                        "SELECT name, setting FROM pg_settings
+                          WHERE name IN ('statement_timeout', 'lock_timeout')",
+                        &[],
+                    )
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|error| pg_error("read usage session failure bounds", error))
+            })
+            .await
+            .unwrap();
+        for (name, expected) in [
+            ("statement_timeout", STATEMENT_TIMEOUT.as_millis()),
+            ("lock_timeout", LOCK_TIMEOUT.as_millis()),
+        ] {
+            let expected = expected.to_string();
+            assert_eq!(
+                settings
+                    .iter()
+                    .find_map(|(setting, value)| (setting == name).then_some(value.as_str())),
+                Some(expected.as_str()),
+                "{name} was not installed on the worker session"
+            );
+        }
+
+        let worker_pid = store
+            .dispatch(|client| {
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .map(|row| row.get::<_, i32>(0))
+                    .map_err(|error| pg_error("read usage worker backend pid", error))
+            })
+            .await
+            .unwrap();
+        let mut blocker = connect_client(&url, None, &schema).unwrap();
+        assert!(blocker
+            .query_one("SELECT pg_terminate_backend($1)", &[&worker_pid])
+            .unwrap()
+            .get::<_, bool>(0));
+        let first_reconnect = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.dispatch(|client| {
+                client
+                    .query_one("SELECT 1::INT", &[])
+                    .map(|row| row.get::<_, i32>(0))
+                    .map_err(|error| pg_error("probe first bounded usage reconnect", error))
+            }),
+        )
+        .await
+        .expect("usage reconnect exceeded its connection bound");
+        let reconnected = match first_reconnect {
+            Ok(value) => value,
+            Err(_) => tokio::time::timeout(
+                Duration::from_secs(10),
+                store.dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("probe retried bounded usage reconnect", error))
+                }),
+            )
+            .await
+            .expect("retried usage reconnect exceeded its connection bound")
+            .unwrap(),
+        };
+        assert_eq!(reconnected, 1);
+
+        let statement_error = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.dispatch(|client| {
+                client
+                    .simple_query("SELECT pg_sleep(30)")
+                    .map(|_| ())
+                    .map_err(|error| pg_error("exercise usage statement timeout", error))
+            }),
+        )
+        .await
+        .expect("server-side statement_timeout did not bound the worker")
+        .unwrap_err();
+        assert!(
+            statement_error.to_string().contains("[57014]"),
+            "statement was not canceled by PostgreSQL: {statement_error}"
+        );
+        assert_eq!(
+            store
+                .dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("reuse worker after statement timeout", error))
+                })
+                .await
+                .unwrap(),
+            1
+        );
+
+        let lock_key = i64::try_from(suffix % u128::try_from(i64::MAX).unwrap()).unwrap();
+        blocker
+            .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
+            .unwrap();
+        let lock_result = tokio::time::timeout(
+            Duration::from_secs(7),
+            store.dispatch(move |client| {
+                client
+                    .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
+                    .map(|_| ())
+                    .map_err(|error| pg_error("exercise usage lock timeout", error))
+            }),
+        )
+        .await;
+        drop(blocker);
+        let lock_error = lock_result
+            .expect("server-side lock_timeout did not bound the worker")
+            .unwrap_err();
+        assert!(
+            lock_error.to_string().contains("[55P03]"),
+            "lock wait was not canceled by PostgreSQL: {lock_error}"
+        );
+        assert_eq!(
+            store
+                .dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("reuse worker after lock timeout", error))
+                })
+                .await
+                .unwrap(),
+            1
+        );
+
+        store
+            .dispatch(move |client| {
+                client
+                    .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                    .map_err(|error| pg_error("drop failure-bounds test schema", error))
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
