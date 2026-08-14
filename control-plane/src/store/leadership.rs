@@ -81,6 +81,14 @@ impl SingletonSession {
                 .map(|_| ())
         })
     }
+
+    /// Destroy the PostgreSQL client on the dedicated leadership executor.
+    /// Unlike `Drop`, this is joinable: graceful singleton shutdown must not
+    /// return while advisory-lock release is still queued as cleanup work.
+    pub(crate) fn close_now(mut self) {
+        drop(self.client.take());
+        drop(self.connection_budget.take());
+    }
 }
 
 impl Drop for SingletonSession {

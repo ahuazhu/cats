@@ -17,7 +17,7 @@ use crate::store::agent_sessions::{
     load_current_session_for_update, load_identity_by_node_for_update,
 };
 use crate::store::transaction::AuthorityTxResult;
-use crate::store::{Result, Store};
+use crate::store::{AuthorityRequestContext, Result, Store};
 
 pub(crate) const RUNTIME_MAINTENANCE_PAGE_SIZE: usize = 64;
 const RUNTIME_MAINTENANCE_PAGE_LIMIT: i64 = 64;
@@ -60,15 +60,18 @@ impl Store {
     pub(crate) fn runtime_maintenance_scan_page(
         &self,
         cursor: &RuntimeMaintenanceCursor,
+        request: &AuthorityRequestContext,
     ) -> Result<RuntimeMaintenanceReport> {
+        ensure_runtime_maintenance_active(request)?;
         let (pending, pending_has_more) =
-            self.runtime_pending_candidates_after(cursor.pending_after.as_ref())?;
+            self.runtime_pending_candidates_after(cursor.pending_after.as_ref(), request)?;
         let mut report = RuntimeMaintenanceReport {
             sampled_pending_operations: u64::try_from(pending.len())
                 .map_err(crate::store::internal)?,
             ..RuntimeMaintenanceReport::default()
         };
         for candidate in &pending {
+            ensure_runtime_maintenance_active(request)?;
             match self.authority_transaction(|transaction| {
                 settle_pending_candidate(transaction, candidate)
             })? {
@@ -89,8 +92,9 @@ impl Store {
             None
         };
 
+        ensure_runtime_maintenance_active(request)?;
         let (deleted, deleted_has_more) =
-            self.runtime_deleted_candidates_after(cursor.deleted_after.as_ref())?;
+            self.runtime_deleted_candidates_after(cursor.deleted_after.as_ref(), request)?;
         report.sampled_deleted_tombstones =
             u64::try_from(deleted.len()).map_err(crate::store::internal)?;
         report.next_cursor.deleted_after = if deleted_has_more {
@@ -99,10 +103,12 @@ impl Store {
             None
         };
 
-        report.sampled_retained_api_results = self.authority_read_snapshot(|transaction| {
-            let count: i64 = transaction
-                .query_one(
-                    "SELECT count(*) FROM (
+        ensure_runtime_maintenance_active(request)?;
+        report.sampled_retained_api_results =
+            self.authority_request_read_snapshot(request, |transaction| {
+                let count: i64 = transaction
+                    .query_one(
+                        "SELECT count(*) FROM (
                         SELECT authenticated_workspace_id, canonical_route, idempotency_key
                           FROM api_idempotency_results
                          ORDER BY authenticated_workspace_id COLLATE \"C\",
@@ -110,24 +116,28 @@ impl Store {
                                   idempotency_key COLLATE \"C\"
                          LIMIT $1
                      ) retained",
-                    &[&RUNTIME_MAINTENANCE_PAGE_LIMIT],
-                )?
-                .try_get(0)?;
-            count.try_into().map_err(corrupt_count)
-        })?;
+                        &[&RUNTIME_MAINTENANCE_PAGE_LIMIT],
+                    )?
+                    .try_get(0)?;
+                count.try_into().map_err(corrupt_count)
+            })?;
         Ok(report)
     }
 
     #[cfg(test)]
     pub(crate) fn runtime_maintenance_scan(&self) -> Result<RuntimeMaintenanceReport> {
-        self.runtime_maintenance_scan_page(&RuntimeMaintenanceCursor::default())
+        let request = AuthorityRequestContext::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        self.runtime_maintenance_scan_page(&RuntimeMaintenanceCursor::default(), &request)
     }
 
     fn runtime_pending_candidates_after(
         &self,
         after: Option<&Id>,
+        request: &AuthorityRequestContext,
     ) -> Result<(Vec<PendingCandidate>, bool)> {
-        self.authority_read_snapshot(|transaction| {
+        self.authority_request_read_snapshot(request, |transaction| {
             let after = after.map(Id::as_str);
             let rows = transaction.query(
                 "SELECT operation_id, cat_id, node_id
@@ -158,8 +168,12 @@ impl Store {
         })
     }
 
-    fn runtime_deleted_candidates_after(&self, after: Option<&Id>) -> Result<(Vec<Id>, bool)> {
-        self.authority_read_snapshot(|transaction| {
+    fn runtime_deleted_candidates_after(
+        &self,
+        after: Option<&Id>,
+        request: &AuthorityRequestContext,
+    ) -> Result<(Vec<Id>, bool)> {
+        self.authority_request_read_snapshot(request, |transaction| {
             let after = after.map(Id::as_str);
             let rows = transaction.query(
                 "SELECT cat_id
@@ -181,6 +195,15 @@ impl Store {
             Ok((candidates, has_more))
         })
     }
+}
+
+fn ensure_runtime_maintenance_active(request: &AuthorityRequestContext) -> Result<()> {
+    if request.is_cancelled_or_expired() {
+        return Err(crate::store::ApiError::unavailable(
+            "runtime maintenance leadership was cancelled or exceeded its deadline",
+        ));
+    }
+    Ok(())
 }
 
 fn settle_pending_candidate(

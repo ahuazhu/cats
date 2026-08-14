@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority;
@@ -24,6 +24,7 @@ use crate::store::{
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_MAINTENANCE_PAGE_DEADLINE: Duration = Duration::from_secs(30);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
 const ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT: usize = 32;
 const GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT: usize = 32;
@@ -489,11 +490,25 @@ impl Drop for RuntimeVolumeTransitionRequestGuard {
 /// release leadership ahead of the role it is fencing.
 struct CancelSingletonOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
-impl Drop for CancelSingletonOnDrop {
-    fn drop(&mut self) {
+impl CancelSingletonOnDrop {
+    fn cancel(&mut self) {
         if let Some(cancel) = self.0.take() {
             let _ = cancel.send(());
         }
+    }
+}
+
+impl Drop for CancelSingletonOnDrop {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct CancelAuthorityRequestOnDrop(AuthorityRequestContext);
+
+impl Drop for CancelAuthorityRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -687,14 +702,38 @@ pub struct Handle {
     pub gateway_machine_addr: Option<std::net::SocketAddr>,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
-    reconciler_task: Option<tokio::task::JoinHandle<()>>,
-    billing_enforcer_task: Option<tokio::task::JoinHandle<()>>,
-    volume_delete_sweeper_task: Option<tokio::task::JoinHandle<()>>,
+    reconciler_task: Option<ManagedSingletonTask>,
+    billing_enforcer_task: Option<ManagedSingletonTask>,
+    volume_delete_sweeper_task: Option<ManagedSingletonTask>,
     image_manifest_resolver: Arc<
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
     >,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     gateway_machine_listener: Option<crate::gateway_machine::GatewayMachineListener>,
+}
+
+pub(crate) struct ManagedSingletonTask {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ManagedSingletonTask {
+    pub(crate) fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        self.begin_shutdown();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.await.context("singleton election task failed")?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ReadinessLatch(std::sync::atomic::AtomicBool);
@@ -741,13 +780,13 @@ impl Handle {
             let _ = shutdown.send(());
         }
         if let Some(task) = &self.reconciler_task {
-            task.abort();
+            task.begin_shutdown();
         }
         if let Some(task) = &self.billing_enforcer_task {
-            task.abort();
+            task.begin_shutdown();
         }
         if let Some(task) = &self.volume_delete_sweeper_task {
-            task.abort();
+            task.begin_shutdown();
         }
     }
 
@@ -772,6 +811,27 @@ impl Handle {
             .runtime_node_authority
             .shutdown_commit_resolutions();
         let manifest_reads = self.image_manifest_resolver.shutdown();
+        let reconciler = async {
+            if let Some(task) = &self.reconciler_task {
+                task.shutdown().await
+            } else {
+                Ok(())
+            }
+        };
+        let billing_enforcer = async {
+            if let Some(task) = &self.billing_enforcer_task {
+                task.shutdown().await
+            } else {
+                Ok(())
+            }
+        };
+        let volume_delete_sweeper = async {
+            if let Some(task) = &self.volume_delete_sweeper_task {
+                task.shutdown().await
+            } else {
+                Ok(())
+            }
+        };
         let gateway_machine = async {
             if let Some(listener) = &self.gateway_machine_listener {
                 listener.shutdown().await
@@ -790,6 +850,9 @@ impl Handle {
             node_authority_result,
             manifest_result,
             gateway_machine_result,
+            reconciler_result,
+            billing_enforcer_result,
+            volume_delete_sweeper_result,
         ) = tokio::join!(
             observation_store,
             volume_transitions,
@@ -800,7 +863,10 @@ impl Handle {
             product_mutation_commit_resolutions,
             node_authority_resolutions,
             manifest_reads,
-            gateway_machine
+            gateway_machine,
+            reconciler,
+            billing_enforcer,
+            volume_delete_sweeper
         );
         if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
@@ -812,6 +878,9 @@ impl Handle {
         fleet_verification_result?;
         route_result?;
         gateway_machine_result?;
+        reconciler_result?;
+        billing_enforcer_result?;
+        volume_delete_sweeper_result?;
         commit_result.map_err(anyhow::Error::from)?;
         persistent_disk_commit_result.map_err(anyhow::Error::from)?;
         product_mutation_commit_result.map_err(anyhow::Error::from)?;
@@ -856,13 +925,66 @@ where
         + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
-        'election: loop {
-            let session_store = store.clone();
-            let mut session = match crate::store::execute_leadership(move || {
-                session_store.singleton_session(role)
-            })
-            .await
+    tokio::spawn(run_singleton_election(store, role, make_task, None))
+}
+
+fn spawn_managed_singleton_task<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+) -> ManagedSingletonTask
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_managed_singleton_task_with_system_resolutions(store, role, move |_| make_task())
+}
+
+pub(crate) fn spawn_managed_singleton_task_with_system_resolutions<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+) -> ManagedSingletonTask
+where
+    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_singleton_election(
+        store,
+        role,
+        make_task,
+        Some(shutdown_rx),
+    ));
+    ManagedSingletonTask {
+        shutdown,
+        task: Mutex::new(Some(task)),
+    }
+}
+
+async fn run_singleton_election<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) where
+    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    'election: loop {
+        if singleton_shutdown_requested(&shutdown) {
+            return;
+        }
+        let session_store = store.clone();
+        let mut session =
+            match crate::store::execute_leadership(move || session_store.singleton_session(role))
+                .await
             {
                 Ok(session) => session,
                 Err(error) => {
@@ -871,60 +993,115 @@ where
                         error = %error,
                         "opening singleton election session failed"
                     );
-                    tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+                    if singleton_retry_or_shutdown(&mut shutdown).await {
+                        return;
+                    }
                     continue;
                 }
             };
 
-            loop {
-                match singleton_try_acquire(session).await {
-                    Ok((returned, true)) => {
-                        session = returned;
-                        break;
-                    }
-                    Ok((returned, false)) => {
-                        session = returned;
-                        tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            role = role.name(),
-                            error = %error,
-                            "singleton election session failed"
-                        );
-                        tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
-                        continue 'election;
+        loop {
+            if singleton_shutdown_requested(&shutdown) {
+                return;
+            }
+            match singleton_try_acquire(session).await {
+                Ok((returned, true)) => {
+                    session = returned;
+                    break;
+                }
+                Ok((returned, false)) => {
+                    session = returned;
+                    if singleton_retry_or_shutdown(&mut shutdown).await {
+                        return;
                     }
                 }
+                Err(error) => {
+                    tracing::warn!(
+                        role = role.name(),
+                        error = %error,
+                        "singleton election session failed"
+                    );
+                    if singleton_retry_or_shutdown(&mut shutdown).await {
+                        return;
+                    }
+                    continue 'election;
+                }
             }
-
-            tracing::info!(role = role.name(), "acquired singleton leadership");
-            let (cancel, cancelled) = tokio::sync::oneshot::channel();
-            let resolutions =
-                crate::store::runtime_authority::SystemDesiredMutationResolutionOwner::default();
-            let task = make_task(resolutions.clone());
-            let supervisor = tokio::spawn(run_elected_singleton(
-                session,
-                role,
-                task,
-                cancelled,
-                resolutions,
-            ));
-            // Declared after the JoinHandle so task cancellation sends the
-            // signal before detaching the supervisor. The supervisor retains
-            // the advisory lock until its role has actually stopped.
-            let cancel_on_drop = CancelSingletonOnDrop(Some(cancel));
-            if let Err(error) = supervisor.await {
-                tracing::error!(
-                    role = role.name(),
-                    %error,
-                    "singleton supervisor failed; relinquishing leadership"
-                );
-            }
-            drop(cancel_on_drop);
-            tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
         }
-    })
+
+        tracing::info!(role = role.name(), "acquired singleton leadership");
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let resolutions =
+            crate::store::runtime_authority::SystemDesiredMutationResolutionOwner::default();
+        let task = make_task(resolutions.clone());
+        let mut supervisor = tokio::spawn(run_elected_singleton(
+            session,
+            role,
+            task,
+            cancelled,
+            resolutions,
+        ));
+        // Declared after the JoinHandle so task cancellation sends the signal
+        // before detaching the supervisor. The supervisor retains the advisory
+        // lock until its role has actually stopped.
+        let mut cancel_on_drop = CancelSingletonOnDrop(Some(cancel));
+        let (supervisor_result, stopping) = match shutdown.as_mut() {
+            Some(shutdown) => tokio::select! {
+                result = &mut supervisor => (result, false),
+                () = wait_for_singleton_shutdown(shutdown) => {
+                    cancel_on_drop.cancel();
+                    (supervisor.await, true)
+                }
+            },
+            None => (supervisor.await, false),
+        };
+        if let Err(error) = supervisor_result {
+            tracing::error!(
+                role = role.name(),
+                %error,
+                "singleton supervisor failed; relinquishing leadership"
+            );
+        }
+        drop(cancel_on_drop);
+        if stopping || singleton_shutdown_requested(&shutdown) {
+            return;
+        }
+        if singleton_retry_or_shutdown(&mut shutdown).await {
+            return;
+        }
+    }
+}
+
+fn singleton_shutdown_requested(shutdown: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown
+        .as_ref()
+        .is_some_and(|shutdown| *shutdown.borrow() || shutdown.has_changed().is_err())
+}
+
+async fn singleton_retry_or_shutdown(
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    match shutdown.as_mut() {
+        Some(shutdown) => tokio::select! {
+            () = tokio::time::sleep(SINGLETON_ELECTION_RETRY) => false,
+            () = wait_for_singleton_shutdown(shutdown) => true,
+        },
+        None => {
+            tokio::time::sleep(SINGLETON_ELECTION_RETRY).await;
+            false
+        }
+    }
+}
+
+async fn wait_for_singleton_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn run_elected_singleton<Fut>(
@@ -985,7 +1162,7 @@ async fn run_elected_singleton<Fut>(
     resolutions.wait_empty().await;
     if let Some(session) = session {
         let _ = crate::store::execute_leadership(move || {
-            drop(session);
+            session.close_now();
             Ok(())
         })
         .await;
@@ -1037,15 +1214,21 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
     tokio::join!(controller.run(interval), reap_interrupted_deploys);
 }
 
-async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
+pub(crate) async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
     let mut cursor = crate::store::runtime_authority::sweepers::RuntimeMaintenanceCursor::default();
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         let page_cursor = cursor.clone();
+        let request =
+            AuthorityRequestContext::new(Instant::now() + RUNTIME_MAINTENANCE_PAGE_DEADLINE);
+        let cancel_on_drop = CancelAuthorityRequestOnDrop(request.clone());
+        let store_request = request.clone();
         match store
-            .execute(move |store| store.runtime_maintenance_scan_page(&page_cursor))
+            .execute_authority_request_owned(&request, move |store| {
+                store.runtime_maintenance_scan_page(&page_cursor, &store_request)
+            })
             .await
         {
             Ok(report) => {
@@ -1061,6 +1244,7 @@ async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
             }
             Err(error) => tracing::error!(%error, "production runtime maintenance scan failed"),
         }
+        drop(cancel_on_drop);
     }
 }
 
@@ -1356,13 +1540,13 @@ async fn spawn_inner(
     let reconciler_task = Some(if retired_product_authority_for_tests {
         let reconciler = controller.clone();
         let reconciler_store = state.store.clone();
-        spawn_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
+        spawn_managed_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
             run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
         })
     } else {
         let maintenance_store = state.store.clone();
         let maintenance_interval = interval.max(Duration::from_secs(5));
-        spawn_singleton_task(
+        spawn_managed_singleton_task(
             state.store.clone(),
             SingletonRole::RuntimeSweeper,
             move || run_runtime_maintenance_role(maintenance_store.clone(), maintenance_interval),
@@ -1370,7 +1554,7 @@ async fn spawn_inner(
     });
     let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
         let enforcement_state = state.clone();
-        spawn_singleton_task_with_system_resolutions(
+        spawn_managed_singleton_task_with_system_resolutions(
             state.store.clone(),
             SingletonRole::BillingEnforcer,
             move |resolution_owner| {
@@ -1401,7 +1585,7 @@ async fn spawn_inner(
             cfg.image_blob.clone(),
         ),
     );
-    let volume_delete_sweeper_task = Some(spawn_singleton_task(
+    let volume_delete_sweeper_task = Some(spawn_managed_singleton_task(
         state.store.clone(),
         SingletonRole::VolumeDeleteSweeper,
         move || {

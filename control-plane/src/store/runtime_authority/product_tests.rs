@@ -1256,7 +1256,7 @@ async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn singleton_response_loss_retains_leadership_through_exact_system_resolution() {
+async fn graceful_singleton_shutdown_waits_for_exact_resolution_and_lock_release() {
     let (url, setup, _unused, workspace) = stores();
     let mut create = request(&workspace, "billing-commit-loss", 87, "billing-loss-create");
     let (_identity, _policy, release) = prepare_mutation_node(&setup, &mut create, 87);
@@ -1275,7 +1275,7 @@ async fn singleton_response_loss_retains_leadership_through_exact_system_resolut
     let standby = Arc::new(Store::connect(&url, None).unwrap());
     let standby_starts = Arc::new(AtomicUsize::new(0));
 
-    let leader_task = crate::server::spawn_singleton_task_with_system_resolutions(
+    let leader_task = crate::server::spawn_managed_singleton_task_with_system_resolutions(
         leader.clone(),
         SingletonRole::BillingEnforcer,
         {
@@ -1328,14 +1328,22 @@ async fn singleton_response_loss_retains_leadership_through_exact_system_resolut
                 }
             }
         });
-    leader_task.abort();
-    let _ = leader_task.await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut shutdown = Box::pin(leader_task.shutdown());
+    tokio::select! {
+        result = &mut shutdown => {
+            panic!("graceful shutdown returned before exact resolution: {result:?}");
+        }
+        () = tokio::time::sleep(Duration::from_millis(400)) => {}
+    }
     assert_eq!(
         standby_starts.load(Ordering::SeqCst),
         0,
-        "leader must retain its advisory session while COMMIT response is still ambiguous"
+        "standby must not acquire while graceful shutdown resolves an ambiguous COMMIT"
     );
+    tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+        .await
+        .expect("graceful shutdown should return after exact resolution")
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while standby_starts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1482,6 +1490,114 @@ fn maintenance_scan_settles_exact_active_fence_as_host_lost() {
             agent_session_epoch: event.expected_agent_session_epoch,
             host_fence_event_id: event.event_id,
         }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_sweeper_leadership_loss_cancels_the_rest_of_a_claimed_page() {
+    const LEADER_APPLICATION: &str = "a3_runtime_sweeper_cancelled_page";
+
+    let (url, setup, _unused, workspace) = stores();
+    let mut operation_ids = Vec::new();
+    for sequence in [90, 91] {
+        let mut create = request(
+            &workspace,
+            &format!("maintenance-cancel-{sequence}"),
+            sequence,
+            &format!("maintenance-cancel-{sequence}-create"),
+        );
+        let (identity, policy, release) = prepare_mutation_node(&setup, &mut create, sequence);
+        setup
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        let target = refresh_mutation_target(&setup, &identity, &policy, &release, sequence * 10);
+        let event = active_host_fence_event(&target, sequence * 10 + 1);
+        setup
+            .authority_transaction(|transaction| insert_event(transaction, &event))
+            .unwrap();
+        operation_ids.push(create.candidate.operation_id.clone());
+    }
+    operation_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    let holder = Store::connect(&url, None).unwrap();
+    let first_operation_id = operation_ids[0].clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder_thread = std::thread::spawn(move || {
+        holder
+            .with(move |client| {
+                let mut transaction = client.transaction()?;
+                transaction.query_one(
+                    "SELECT operation_id FROM runtime_operations
+                      WHERE operation_id=$1 FOR UPDATE",
+                    &[&first_operation_id.as_str()],
+                )?;
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                transaction.rollback()
+            })
+            .unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let leader =
+        Arc::new(Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap());
+    let leader_task =
+        crate::server::spawn_singleton_task(leader, SingletonRole::RuntimeSweeper, move || {
+            crate::server::run_runtime_maintenance_role(
+                Arc::new(
+                    Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap(),
+                ),
+                Duration::from_millis(10),
+            )
+        });
+    wait_for_advisory_lock_wait(&setup, LEADER_APPLICATION);
+
+    leader_task.abort();
+    let _ = leader_task.await;
+    release_tx.send(()).unwrap();
+    holder_thread.join().unwrap();
+
+    let mut worker_is_active = true;
+    for _ in 0..200 {
+        worker_is_active = setup
+            .with(|client| {
+                client
+                    .query_one(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM pg_stat_activity
+                             WHERE application_name=$1 AND state <> 'idle'
+                        )",
+                        &[&LEADER_APPLICATION],
+                    )
+                    .map(|row| row.get::<_, bool>(0))
+            })
+            .unwrap();
+        if !worker_is_active {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !worker_is_active,
+        "the calibrated blocked sweeper worker must observe cancellation"
+    );
+    let phases: Vec<String> = setup
+        .with(|client| {
+            client
+                .query(
+                    "SELECT phase FROM runtime_operations
+                      WHERE operation_id IN ($1, $2)
+                      ORDER BY operation_id COLLATE \"C\"",
+                    &[&operation_ids[0].as_str(), &operation_ids[1].as_str()],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+        .unwrap();
+    assert_eq!(
+        phases,
+        vec!["failed".to_string(), "pending".to_string()],
+        "the in-flight candidate may finish, but the cancelled old leader must not continue into later page candidates"
     );
 }
 
