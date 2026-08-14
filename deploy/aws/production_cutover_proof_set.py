@@ -2334,6 +2334,8 @@ def _validate_qualification_final_support(
     cleanup_inventory: VerifiedFile,
     begin: dict[str, Any],
     terminal: dict[str, Any],
+    manifest_expected_nodes: list[str],
+    final_inventory: VerifiedFile,
     block_path: str,
     context: ProducerContext,
 ) -> None:
@@ -2429,6 +2431,11 @@ def _validate_qualification_final_support(
     digest(
         fleet["fleet_verification_receipt_sha256"],
         "Qualification final Fleet authority",
+    )
+    _validate_qualification_fleet_authority(
+        fleet,
+        manifest_expected_nodes,
+        final_inventory,
     )
     for counter in (
         "desired_runtime_count",
@@ -2589,6 +2596,21 @@ def _validate_qualification_final_support(
         raise ProofSetError("Qualification terminal completion time drifted")
 
 
+def _validate_qualification_fleet_authority(
+    fleet: dict[str, Any],
+    manifest_expected_nodes: list[str],
+    final_inventory: VerifiedFile,
+) -> None:
+    if fleet["expected_node_ids"] != manifest_expected_nodes:
+        raise ProofSetError(
+            "Qualification final Fleet Node set differs from its manifest"
+        )
+    if fleet["fleet_verification_receipt_sha256"] != final_inventory.sha256:
+        raise ProofSetError(
+            "Qualification final Fleet receipt does not bind final-inventory.json"
+        )
+
+
 def _qualification_manifest_evidence(
     manifest: dict[str, Any],
     begin_file: VerifiedFile,
@@ -2671,6 +2693,11 @@ def _validate_qualification(
         if isinstance(qualification_scope, dict)
         else None
     )
+    manifest_expected_nodes = (
+        qualification_scope.get("expected_nodes")
+        if isinstance(qualification_scope, dict)
+        else None
+    )
     if (
         not version_one(manifest.get("version"))
         or manifest.get("state") != "passed"
@@ -2688,6 +2715,16 @@ def _validate_qualification(
         raise ProofSetError(f"{block_path} qualification is not exact-release passed")
     run_id = identifier(run_id, f"{block_path} qualification run ID")
     workspace_id = identifier(workspace_id, f"{block_path} qualification Workspace ID")
+    if (
+        not isinstance(manifest_expected_nodes, list)
+        or not manifest_expected_nodes
+        or manifest_expected_nodes != sorted(set(manifest_expected_nodes))
+    ):
+        raise ProofSetError(
+            f"{block_path} manifest expected Node set is not strict sorted nonempty"
+        )
+    for node_id in manifest_expected_nodes:
+        identifier(node_id, f"{block_path} manifest expected Node ID")
     configs = manifest.get("configs")
     if not isinstance(configs, list):
         raise ProofSetError(f"{block_path} manifest config set is unavailable")
@@ -2799,6 +2836,8 @@ def _validate_qualification(
         cleanup_inventory=support["qualification_cleanup_inventory"],
         begin=begin_receipt,
         terminal=terminal_receipt,
+        manifest_expected_nodes=manifest_expected_nodes,
+        final_inventory=base_files[QUALIFICATION_FINAL_INVENTORY_FILE],
         block_path=block_path,
         context=context,
     )

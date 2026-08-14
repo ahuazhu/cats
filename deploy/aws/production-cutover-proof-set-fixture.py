@@ -459,6 +459,32 @@ def validate_inventory_is_observation_only() -> None:
             ADMISSION.time.sleep = original_sleep
 
 
+def validate_qualification_fleet_cross_binding() -> None:
+    final_inventory = opaque(PROOF.QUALIFICATION_FINAL_INVENTORY_FILE, "fleet")
+    fleet = {
+        "expected_node_ids": ["node-a", "node-b"],
+        "fleet_verification_receipt_sha256": final_inventory.sha256,
+    }
+    PROOF._validate_qualification_fleet_authority(
+        fleet,
+        ["node-a", "node-b"],
+        final_inventory,
+    )
+    for foreign in (
+        {**fleet, "expected_node_ids": ["node-a"]},
+        {**fleet, "fleet_verification_receipt_sha256": SHA_D},
+    ):
+        try:
+            PROOF._validate_qualification_fleet_authority(
+                foreign,
+                ["node-a", "node-b"],
+                final_inventory,
+            )
+        except PROOF.ProofSetError:
+            continue
+        raise AssertionError("foreign qualification Fleet authority was accepted")
+
+
 def validate_release_bound_usage_subprocess() -> None:
     if not Path("/proc/self/fd").is_dir():
         # The production adapter is Linux-only. The native Linux gate executes
@@ -849,6 +875,7 @@ def main() -> int:
         raise AssertionError("non-closed per-run SHA256SUMS was accepted")
     validate_usage_targets_match_reset_targets()
     validate_inventory_is_observation_only()
+    validate_qualification_fleet_cross_binding()
     validate_release_bound_usage_subprocess()
     validate_release_bound_usage_schema_subprocess()
     return 0
