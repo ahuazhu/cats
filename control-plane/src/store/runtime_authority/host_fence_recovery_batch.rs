@@ -727,8 +727,7 @@ fn load_current_open_writer_for_update(
            FROM object_write_authorities
           WHERE host_provider=$1 AND host_partition=$2
             AND host_account_id=$3 AND host_region=$4
-            AND immutable_host_id=$5 AND node_id=$6
-            AND state='open'
+            AND immutable_host_id=$5 AND state='open'
           ORDER BY writer_authority_id COLLATE \"C\"
           LIMIT 2 FOR UPDATE",
         &[
@@ -737,7 +736,6 @@ fn load_current_open_writer_for_update(
             &scope.account_id.as_str(),
             &scope.region.as_str(),
             &identity.immutable_host_id.as_str(),
-            &identity.node_id.as_str(),
         ],
     )?;
     let [row] = rows.as_slice() else {

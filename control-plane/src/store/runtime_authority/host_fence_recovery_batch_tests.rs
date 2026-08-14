@@ -5,8 +5,8 @@ use cats_api::runtime_host_loss_recovery::{
     HostLossRecoveryTerminalOutcomeV1,
 };
 use cats_api::runtime_reconciliation::{
-    AsciiText, ContractVersion, DesiredRuntimeSpec, FleetPolicyPrincipal, Id, NodeIdentity,
-    RandomId128, WireU64,
+    AsciiText, ContractVersion, CredentialBinding, DesiredRuntimeSpec, FleetPolicyPrincipal, Id,
+    NodeIdentity, RandomId128, Sha256Digest, WireU64,
 };
 use cats_storage::host_fence::{
     HostFenceAuthorityBindingsV1, HostFenceAuthorityHostBindingV1, HostFenceBinding,
@@ -62,6 +62,7 @@ fn authority_bindings(identity: &NodeIdentity) -> HostFenceAuthorityBindingsV1 {
 fn open_writer(
     fixture: &RecoveryFixture,
     authority_id: &str,
+    node_id: Id,
     object_provider_scope: cats_api::runtime_reconciliation::ProviderScope,
     workload_principal_id: AsciiText,
     object_store_scope_id: AsciiText,
@@ -71,7 +72,7 @@ fn open_writer(
             authority_id: id(authority_id),
             host_provider_scope: fixture.old_identity.provider_scope.clone(),
             immutable_host_id: fixture.old_identity.immutable_host_id.clone(),
-            node_id: fixture.old_identity.node_id.clone(),
+            node_id,
             object_provider_scope,
             workload_principal_id,
             object_store_scope_id,
@@ -127,6 +128,7 @@ fn insert_open_writer(fixture: &RecoveryFixture, bindings: &HostFenceAuthorityBi
     let authority = open_writer(
         fixture,
         "owa1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        fixture.old_identity.node_id.clone(),
         bindings.provider_scope.clone(),
         bindings.workload_principal_id.clone(),
         bindings.object_store_scope_id.clone(),
@@ -368,9 +370,22 @@ fn two_open_writer_parents_reject_before_queue_or_cutoff() {
         .unwrap();
     let mut foreign_scope = fixture.bindings.provider_scope.clone();
     foreign_scope.region = id("foreign-region");
+    let mut stale_node = fixture.fixture.old_identity.clone();
+    stale_node.node_id = id("node-stale-same-host");
+    stale_node.credential_id = id("credential-stale-same-host");
+    stale_node.credential_binding = CredentialBinding::PublicKey {
+        public_key_spki_sha256: Sha256Digest::from_bytes([93; 32]),
+    };
+    stale_node.state_path_id = id("state-path-stale-same-host");
+    fixture
+        .fixture
+        .store
+        .provision_node_identity(&stale_node)
+        .unwrap();
     let foreign = open_writer(
         &fixture.fixture,
         "owa1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        stale_node.node_id,
         foreign_scope,
         text("foreign-object-writer-principal"),
         text("foreign-object-store/chunks"),

@@ -1575,7 +1575,7 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
     (
         "object_write_authorities",
         "object_write_one_open_authority_per_host",
-        "host_provider,host_partition,host_account_id,host_region,immutable_host_id,node_id",
+        "host_provider,host_partition,host_account_id,host_region,immutable_host_id",
         Some("(state = 'open'::text)"),
     ),
     (
@@ -4067,7 +4067,7 @@ CREATE TABLE IF NOT EXISTS object_write_authorities (
 CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_open_authority_per_host
     ON object_write_authorities(
         host_provider, host_partition, host_account_id, host_region,
-        immutable_host_id, node_id
+        immutable_host_id
     ) WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS object_write_authorities_node_state
     ON object_write_authorities(node_id, state);
