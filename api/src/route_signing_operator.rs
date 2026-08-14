@@ -30,6 +30,7 @@ pub const ROUTE_V2_SIGNING_CURRENT_METHOD: &str = "GET";
 pub const ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES: usize = 65_536;
 pub const ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES: usize = 16_384;
 pub const ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES: usize = 16_384;
+pub const ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES: usize = 32_768;
 pub const ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES: usize =
     ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES;
 pub const ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE: &str = "application/json";
@@ -37,6 +38,9 @@ pub const ROUTE_V2_ROTATION_OPERATOR_MAX_CREDENTIALS: usize = 8;
 pub const ROUTE_V2_ROTATION_OPERATOR_MAX_COMMAND_LIFETIME_MILLIS: u64 = 10 * 60 * 1_000;
 
 const SIGNATURE_DOMAIN: &[u8] = b"cats.route-v2.rotation-operator.command.v1";
+const APPLY_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"cats.route-v2.rotation-operator.apply-receipt.v1";
+pub const ROUTE_V2_ROTATION_RECOVERY_CASE_ID: &str = "route-v2-rotation-disable-live-delivery";
+pub const ROUTE_V2_CONTROL_ROLLOUT_CURRENT_MARKER: &str = "current_process_bound";
 const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
@@ -213,19 +217,24 @@ pub struct SignedRouteV2SigningCommand {
 impl SignedRouteV2SigningCommand {
     pub fn validate_shape(&self) -> Result<(), RouteV2RotationOperatorError> {
         self.payload.validate()?;
-        if self.proofs.is_empty() || self.proofs.len() > ROUTE_V2_ROTATION_OPERATOR_MAX_CREDENTIALS
-        {
+        validate_proof_shape(&self.proofs)
+    }
+}
+
+fn validate_proof_shape(
+    proofs: &[RouteV2RotationOperatorProof],
+) -> Result<(), RouteV2RotationOperatorError> {
+    if proofs.is_empty() || proofs.len() > ROUTE_V2_ROTATION_OPERATOR_MAX_CREDENTIALS {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let mut previous: Option<&str> = None;
+    for proof in proofs {
+        if previous.is_some_and(|value| value >= proof.credential_id.as_str()) {
             return Err(RouteV2RotationOperatorError::InvalidCommand);
         }
-        let mut previous: Option<&str> = None;
-        for proof in &self.proofs {
-            if previous.is_some_and(|value| value >= proof.credential_id.as_str()) {
-                return Err(RouteV2RotationOperatorError::InvalidCommand);
-            }
-            previous = Some(proof.credential_id.as_str());
-        }
-        Ok(())
+        previous = Some(proof.credential_id.as_str());
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +274,100 @@ pub struct RouteV2SigningCommandReceipt {
 pub enum RouteV2LoadedSignerState {
     Active,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteV2ControlRolloutApplyOutcome {
+    Succeeded,
+    AmbiguousResolvedCurrent,
+}
+
+/// Canonical post-apply fact emitted only by the approved deployment-side
+/// controller after Terraform settlement and fresh current-process discovery.
+/// It contains no provider credential, private key, receipt URL or secret
+/// payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteV2ControlRolloutApplyReceiptPayload {
+    pub version: ContractVersion,
+    pub case_id: String,
+    pub qualification_run_id: String,
+    pub source_commit_sha: String,
+    pub qualification_catalog_sha256: Sha256Digest,
+    pub authority_id: Id,
+    pub route_deployment_id: Id,
+    pub rotation_operator_trust_sha256: Sha256Digest,
+    pub phase: String,
+    pub signer_revision: Epoch,
+    pub saved_plan_sha256: Sha256Digest,
+    pub terraform_show_json_sha256: Sha256Digest,
+    pub plan_validation_receipt_sha256: Sha256Digest,
+    pub terraform_executable_sha256: Sha256Digest,
+    pub successor_secret_name: String,
+    pub successor_secret_manifest_sha256: Sha256Digest,
+    pub successor_signer_reference_sha256: Sha256Digest,
+    pub successor_signer_state: RouteV2LoadedSignerState,
+    pub successor_active_kid: Option<KeyId>,
+    pub successor_public_key_ring_version: Epoch,
+    pub successor_public_key_ring_digest: Sha256Digest,
+    pub apply_started_at_unix_ms: UnixMillis,
+    pub apply_completed_at_unix_ms: UnixMillis,
+    pub apply_outcome: RouteV2ControlRolloutApplyOutcome,
+    pub terraform_apply_stdout_sha256: Sha256Digest,
+    pub terraform_apply_stderr_sha256: Sha256Digest,
+    pub postcondition_discovery_sha256: Sha256Digest,
+    pub observed_loaded_signer_reference_sha256: Sha256Digest,
+    pub observed_loaded_signer_state: RouteV2LoadedSignerState,
+    pub observed_loaded_active_kid: Option<KeyId>,
+    pub observed_public_key_ring_version: Epoch,
+    pub observed_public_key_ring_digest: Sha256Digest,
+    pub observed_database_current: bool,
+    pub observed_process_ready: bool,
+    pub terminal_marker: String,
+}
+
+impl RouteV2ControlRolloutApplyReceiptPayload {
+    pub fn validate(&self) -> Result<(), RouteV2RotationOperatorError> {
+        let expected_revision = route_v2_rotation_recovery_phase_revision(&self.phase)
+            .ok_or(RouteV2RotationOperatorError::InvalidCommand)?;
+        let active = self.successor_signer_state == RouteV2LoadedSignerState::Active;
+        if self.version.get() != 1
+            || self.case_id != ROUTE_V2_ROTATION_RECOVERY_CASE_ID
+            || !valid_qualification_run_id(&self.qualification_run_id)
+            || !valid_release_commit_sha(&self.source_commit_sha)
+            || self.signer_revision.get() != expected_revision
+            || !valid_revisioned_secret_name(&self.successor_secret_name, expected_revision)
+            || active != self.successor_active_kid.is_some()
+            || self.observed_loaded_signer_state != self.successor_signer_state
+            || self.observed_loaded_active_kid != self.successor_active_kid
+            || self.observed_loaded_signer_reference_sha256
+                != self.successor_signer_reference_sha256
+            || self.observed_public_key_ring_version != self.successor_public_key_ring_version
+            || self.observed_public_key_ring_digest != self.successor_public_key_ring_digest
+            || !self.observed_database_current
+            || self.observed_process_ready != active
+            || self.terminal_marker != ROUTE_V2_CONTROL_ROLLOUT_CURRENT_MARKER
+            || self.apply_completed_at_unix_ms.get() < self.apply_started_at_unix_ms.get()
+        {
+            return Err(RouteV2RotationOperatorError::InvalidCommand);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedRouteV2ControlRolloutApplyReceipt {
+    pub payload: RouteV2ControlRolloutApplyReceiptPayload,
+    pub proofs: Vec<RouteV2RotationOperatorProof>,
+}
+
+impl SignedRouteV2ControlRolloutApplyReceipt {
+    fn validate_shape(&self) -> Result<(), RouteV2RotationOperatorError> {
+        self.payload.validate()?;
+        validate_proof_shape(&self.proofs)
+    }
 }
 
 /// Public restart/current-binding discovery for one Control process.
@@ -407,6 +510,58 @@ pub fn decode_signed_route_v2_signing_command(
     Ok(command)
 }
 
+pub fn encode_route_v2_control_rollout_apply_receipt_payload(
+    payload: &RouteV2ControlRolloutApplyReceiptPayload,
+) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
+    payload.validate()?;
+    let bytes =
+        serde_json::to_vec(payload).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_route_v2_control_rollout_apply_receipt_payload(
+    bytes: &[u8],
+) -> Result<RouteV2ControlRolloutApplyReceiptPayload, RouteV2RotationOperatorError> {
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let payload: RouteV2ControlRolloutApplyReceiptPayload =
+        serde_json::from_slice(bytes).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if encode_route_v2_control_rollout_apply_receipt_payload(&payload)? != bytes {
+        return Err(RouteV2RotationOperatorError::NonCanonical);
+    }
+    Ok(payload)
+}
+
+pub fn encode_signed_route_v2_control_rollout_apply_receipt(
+    receipt: &SignedRouteV2ControlRolloutApplyReceipt,
+) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
+    receipt.validate_shape()?;
+    let bytes =
+        serde_json::to_vec(receipt).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_signed_route_v2_control_rollout_apply_receipt(
+    bytes: &[u8],
+) -> Result<SignedRouteV2ControlRolloutApplyReceipt, RouteV2RotationOperatorError> {
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_CONTROL_ROLLOUT_APPLY_RECEIPT_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let receipt: SignedRouteV2ControlRolloutApplyReceipt =
+        serde_json::from_slice(bytes).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if encode_signed_route_v2_control_rollout_apply_receipt(&receipt)? != bytes {
+        return Err(RouteV2RotationOperatorError::NonCanonical);
+    }
+    Ok(receipt)
+}
+
 pub fn encode_route_v2_signing_command_receipt(
     receipt: &RouteV2SigningCommandReceipt,
 ) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
@@ -491,6 +646,40 @@ pub fn sign_route_v2_signing_command(
     })
 }
 
+pub fn sign_route_v2_control_rollout_apply_receipt(
+    payload: &RouteV2ControlRolloutApplyReceiptPayload,
+    signer: &Ed25519RequestSigner,
+) -> Result<RouteV2RotationOperatorProof, RouteV2RotationOperatorError> {
+    let payload_bytes = encode_route_v2_control_rollout_apply_receipt_payload(payload)?;
+    let framed = domain_frame(APPLY_RECEIPT_SIGNATURE_DOMAIN, &payload_bytes);
+    Ok(RouteV2RotationOperatorProof {
+        credential_id: signer.credential_id().clone(),
+        signature: Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(signer.sign_framed(&framed)))
+            .ok_or(RouteV2RotationOperatorError::InvalidCommand)?,
+    })
+}
+
+pub fn verify_signed_route_v2_control_rollout_apply_receipt(
+    trust: &RouteV2RotationOperatorTrust,
+    expected_release_commit_sha: &str,
+    signed: &SignedRouteV2ControlRolloutApplyReceipt,
+) -> Result<VerifiedRouteV2RotationOperatorPrincipal, RouteV2RotationOperatorError> {
+    trust.validate()?;
+    signed.validate_shape()?;
+    if signed.payload.authority_id != trust.authority_id
+        || signed.payload.route_deployment_id != trust.route_deployment_id
+        || signed.payload.source_commit_sha != trust.release_commit_sha
+        || signed.payload.source_commit_sha != expected_release_commit_sha
+        || signed.payload.rotation_operator_trust_sha256 != trust.exact_digest()?
+    {
+        return Err(RouteV2RotationOperatorError::ReleaseMismatch);
+    }
+    let payload = encode_route_v2_control_rollout_apply_receipt_payload(&signed.payload)?;
+    let framed = domain_frame(APPLY_RECEIPT_SIGNATURE_DOMAIN, &payload);
+    let accepted = verify_operator_proofs(trust, &signed.proofs, &framed)?;
+    verified_principal(trust, accepted)
+}
+
 pub fn verify_signed_route_v2_signing_command(
     trust: &RouteV2RotationOperatorTrust,
     expected_release_commit_sha: &str,
@@ -507,17 +696,33 @@ pub fn verify_signed_route_v2_signing_command(
     }
     let payload = canonical_payload(&signed.payload)?;
     let framed = signed_frame(&payload);
+    let accepted = verify_operator_proofs(trust, &signed.proofs, &framed)?;
+    verified_principal(trust, accepted)
+}
+
+fn verify_operator_proofs(
+    trust: &RouteV2RotationOperatorTrust,
+    proofs: &[RouteV2RotationOperatorProof],
+    framed: &[u8],
+) -> Result<Vec<Id>, RouteV2RotationOperatorError> {
     let mut accepted = Vec::new();
-    for proof in &signed.proofs {
+    for proof in proofs {
         let credential = trust
             .credential(&proof.credential_id)
             .ok_or(RouteV2RotationOperatorError::AuthenticationFailed)?;
-        verify_proof(credential, &framed, &proof.signature)?;
+        verify_proof(credential, framed, &proof.signature)?;
         accepted.push(proof.credential_id.clone());
     }
     if accepted.len() < usize::from(trust.threshold) {
         return Err(RouteV2RotationOperatorError::AuthenticationFailed);
     }
+    Ok(accepted)
+}
+
+fn verified_principal(
+    trust: &RouteV2RotationOperatorTrust,
+    accepted: Vec<Id>,
+) -> Result<VerifiedRouteV2RotationOperatorPrincipal, RouteV2RotationOperatorError> {
     let mut digest_input = Vec::new();
     for id in &accepted {
         digest_input.extend_from_slice(&(id.as_str().len() as u64).to_be_bytes());
@@ -540,8 +745,12 @@ fn canonical_payload(
 }
 
 fn signed_frame(payload: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(SIGNATURE_DOMAIN.len() + 1 + 8 + payload.len());
-    output.extend_from_slice(SIGNATURE_DOMAIN);
+    domain_frame(SIGNATURE_DOMAIN, payload)
+}
+
+fn domain_frame(domain: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(domain.len() + 1 + 8 + payload.len());
+    output.extend_from_slice(domain);
     output.push(0);
     output.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     output.extend_from_slice(payload);
@@ -575,6 +784,44 @@ fn valid_release_commit_sha(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn route_v2_rotation_recovery_phase_revision(phase: &str) -> Option<u64> {
+    match phase {
+        "publish_overlap" => Some(2),
+        "switch_active" => Some(3),
+        "publish_new_only" => Some(4),
+        "retire" => Some(5),
+        "disable" => Some(6),
+        "publish_recovery" => Some(7),
+        "activate" => Some(8),
+        _ => None,
+    }
+}
+
+fn valid_qualification_run_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_revisioned_secret_name(value: &str, revision: u64) -> bool {
+    let suffix = format!("-r{revision}");
+    !value.is_empty()
+        && value.len() <= 253
+        && value.ends_with(&suffix)
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
 }
 
 #[cfg(test)]
@@ -650,6 +897,48 @@ mod tests {
         }
     }
 
+    fn apply_receipt_payload(
+        trust: &RouteV2RotationOperatorTrust,
+    ) -> RouteV2ControlRolloutApplyReceiptPayload {
+        RouteV2ControlRolloutApplyReceiptPayload {
+            version: ContractVersion::V1,
+            case_id: ROUTE_V2_ROTATION_RECOVERY_CASE_ID.to_owned(),
+            qualification_run_id: "qualification-run-01".to_owned(),
+            source_commit_sha: trust.release_commit_sha.clone(),
+            qualification_catalog_sha256: Sha256Digest::from_bytes([1; 32]),
+            authority_id: trust.authority_id.clone(),
+            route_deployment_id: trust.route_deployment_id.clone(),
+            rotation_operator_trust_sha256: trust.exact_digest().unwrap(),
+            phase: "publish_overlap".to_owned(),
+            signer_revision: Epoch::new(2).unwrap(),
+            saved_plan_sha256: Sha256Digest::from_bytes([2; 32]),
+            terraform_show_json_sha256: Sha256Digest::from_bytes([3; 32]),
+            plan_validation_receipt_sha256: Sha256Digest::from_bytes([4; 32]),
+            terraform_executable_sha256: Sha256Digest::from_bytes([5; 32]),
+            successor_secret_name: "cats-route-signer-r2".to_owned(),
+            successor_secret_manifest_sha256: Sha256Digest::from_bytes([6; 32]),
+            successor_signer_reference_sha256: Sha256Digest::from_bytes([7; 32]),
+            successor_signer_state: RouteV2LoadedSignerState::Active,
+            successor_active_kid: Some(KeyId::new("11".repeat(32)).unwrap()),
+            successor_public_key_ring_version: Epoch::new(2).unwrap(),
+            successor_public_key_ring_digest: Sha256Digest::from_bytes([8; 32]),
+            apply_started_at_unix_ms: UnixMillis::new(3_000).unwrap(),
+            apply_completed_at_unix_ms: UnixMillis::new(4_000).unwrap(),
+            apply_outcome: RouteV2ControlRolloutApplyOutcome::Succeeded,
+            terraform_apply_stdout_sha256: Sha256Digest::from_bytes([9; 32]),
+            terraform_apply_stderr_sha256: Sha256Digest::from_bytes([10; 32]),
+            postcondition_discovery_sha256: Sha256Digest::from_bytes([11; 32]),
+            observed_loaded_signer_reference_sha256: Sha256Digest::from_bytes([7; 32]),
+            observed_loaded_signer_state: RouteV2LoadedSignerState::Active,
+            observed_loaded_active_kid: Some(KeyId::new("11".repeat(32)).unwrap()),
+            observed_public_key_ring_version: Epoch::new(2).unwrap(),
+            observed_public_key_ring_digest: Sha256Digest::from_bytes([8; 32]),
+            observed_database_current: true,
+            observed_process_ready: true,
+            terminal_marker: ROUTE_V2_CONTROL_ROLLOUT_CURRENT_MARKER.to_owned(),
+        }
+    }
+
     #[test]
     fn threshold_proofs_are_independent_and_canonical() {
         let first = signer("operator_a");
@@ -714,6 +1003,119 @@ mod tests {
         assert_eq!(
             decode_route_v2_signing_authority_current(&current_bytes).unwrap(),
             current
+        );
+    }
+
+    #[test]
+    fn apply_receipt_is_canonical_threshold_authenticated_and_domain_separated() {
+        let first = signer("operator_a");
+        let second = signer("operator_b");
+        let trust = RouteV2RotationOperatorTrust {
+            version: ContractVersion::V1,
+            authority_id: Id::new("route_operator".to_owned()).unwrap(),
+            route_deployment_id: Id::new("route_deployment".to_owned()).unwrap(),
+            release_commit_sha: "a".repeat(40),
+            threshold: 2,
+            credentials: vec![credential(&first), credential(&second)],
+        };
+        let receipt_payload = apply_receipt_payload(&trust);
+        let receipt = SignedRouteV2ControlRolloutApplyReceipt {
+            proofs: vec![
+                sign_route_v2_control_rollout_apply_receipt(&receipt_payload, &first).unwrap(),
+                sign_route_v2_control_rollout_apply_receipt(&receipt_payload, &second).unwrap(),
+            ],
+            payload: receipt_payload.clone(),
+        };
+        let bytes = encode_signed_route_v2_control_rollout_apply_receipt(&receipt).unwrap();
+        let decoded = decode_signed_route_v2_control_rollout_apply_receipt(&bytes).unwrap();
+        let principal = verify_signed_route_v2_control_rollout_apply_receipt(
+            &trust,
+            &trust.release_commit_sha,
+            &decoded,
+        )
+        .unwrap();
+        assert_eq!(principal.credential_ids.len(), 2);
+
+        let mut one_proof = decoded.clone();
+        one_proof.proofs.pop();
+        assert_eq!(
+            verify_signed_route_v2_control_rollout_apply_receipt(
+                &trust,
+                &trust.release_commit_sha,
+                &one_proof,
+            ),
+            Err(RouteV2RotationOperatorError::AuthenticationFailed)
+        );
+
+        let command_payload = payload();
+        let mut command_proofs = decoded.clone();
+        command_proofs.proofs = vec![
+            sign_route_v2_signing_command(&command_payload, &first).unwrap(),
+            sign_route_v2_signing_command(&command_payload, &second).unwrap(),
+        ];
+        assert_eq!(
+            verify_signed_route_v2_control_rollout_apply_receipt(
+                &trust,
+                &trust.release_commit_sha,
+                &command_proofs,
+            ),
+            Err(RouteV2RotationOperatorError::AuthenticationFailed)
+        );
+
+        let mut command = SignedRouteV2SigningCommand {
+            payload: command_payload,
+            proofs: decoded.proofs,
+        };
+        command.payload.authority_id = trust.authority_id.clone();
+        command.payload.command.successor.deployment_id = trust.route_deployment_id.clone();
+        assert_eq!(
+            verify_signed_route_v2_signing_command(&trust, &trust.release_commit_sha, &command),
+            Err(RouteV2RotationOperatorError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn apply_receipt_rejects_wrong_run_phase_release_and_current_postcondition() {
+        let signer = signer("operator_a");
+        let trust = RouteV2RotationOperatorTrust {
+            version: ContractVersion::V1,
+            authority_id: Id::new("route_operator".to_owned()).unwrap(),
+            route_deployment_id: Id::new("route_deployment".to_owned()).unwrap(),
+            release_commit_sha: "a".repeat(40),
+            threshold: 1,
+            credentials: vec![credential(&signer)],
+        };
+        let valid = apply_receipt_payload(&trust);
+        assert_eq!(valid.validate(), Ok(()));
+
+        let mut wrong_run = valid.clone();
+        wrong_run.qualification_run_id = "../wrong".to_owned();
+        assert_eq!(
+            wrong_run.validate(),
+            Err(RouteV2RotationOperatorError::InvalidCommand)
+        );
+
+        let mut wrong_phase = valid.clone();
+        wrong_phase.phase = "disable".to_owned();
+        assert_eq!(
+            wrong_phase.validate(),
+            Err(RouteV2RotationOperatorError::InvalidCommand)
+        );
+
+        let mut wrong_current = valid.clone();
+        wrong_current.observed_database_current = false;
+        assert_eq!(
+            wrong_current.validate(),
+            Err(RouteV2RotationOperatorError::InvalidCommand)
+        );
+
+        let receipt = SignedRouteV2ControlRolloutApplyReceipt {
+            proofs: vec![sign_route_v2_control_rollout_apply_receipt(&valid, &signer).unwrap()],
+            payload: valid,
+        };
+        assert_eq!(
+            verify_signed_route_v2_control_rollout_apply_receipt(&trust, &"b".repeat(40), &receipt),
+            Err(RouteV2RotationOperatorError::ReleaseMismatch)
         );
     }
 }
