@@ -126,7 +126,10 @@ full inventory ACK。恢复又必须使用从未出现过的 signer lineage 和 
     Store/apply/current落盘点后的 restart，均先校验本地 prefix与 live current只能处于“prefix revision”或“紧邻
     next revision”，然后从首个不完整 phase exact replay/forward-complete。进入 mutation 后没有 rollback；cleanup
     使用同一 state machine前向恢复到 revision 8 Active、fresh Endpoint 和 full Node ACK。foreign prefix、fork、
-    非相邻 Desired 或陌生 Endpoint 固定失败关闭。
+    非相邻 Desired 或陌生 Endpoint 固定失败关闭。网络与 CLI replay永远先写 private fresh probe；canonical
+    command、response、verification、Operation 与 terminal evidence只可 create-no-replace，已有路径必须逐字节相等。
+    若进程死在同文件系统 no-replace link成功而 private temp unlink之前，恢复只可删除该 canonical path命名空间内
+    唯一、owner-controlled、same-inode的临时链接并 fsync目录；canonical file恢复成 single-link之前不得接受或发布。
 16. recovery Active 后复用既有 Endpoint产品 authority，不新增 refresh/Suspend/Resume mutation。worker 用
     Workspace bearer 调 observation-only collection GET取得 exact old Endpoint ID，DELETE old ID并等待 Operation
     settlement，再以 run-derived fresh name POST新 Endpoint。两个 mutation的 Desired revision必须各自 exact `+1`，
