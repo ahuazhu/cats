@@ -367,7 +367,11 @@ impl PersistentFilesystemEffect {
                 vmm,
                 filesystem.as_ref(),
             ),
-            ReconcileStep::DrainInitialization { filesystem, .. } => self.apply_drain(
+            ReconcileStep::DrainInitialization {
+                filesystem,
+                local_generation,
+                remote_generation,
+            } => self.apply_drain(
                 context,
                 desired,
                 processes,
@@ -375,6 +379,8 @@ impl PersistentFilesystemEffect {
                 &stored,
                 vmm,
                 filesystem.as_ref(),
+                local_generation,
+                remote_generation,
             ),
             ReconcileStep::CommitInitialized {
                 filesystem,
@@ -532,6 +538,8 @@ impl PersistentFilesystemEffect {
         stored: &StoredCheckpoint,
         vmm: &ExactVmmProcessProof,
         filesystem: &PersistentFilesystemBinding,
+        local_generation_lower_bound: Generation,
+        remote_generation_lower_bound: Generation,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         let FilesystemInitialization::Initialize {
             expected_blank_head,
@@ -594,6 +602,11 @@ impl PersistentFilesystemEffect {
             .context("load post-drain Persistent Volume authority")?;
         if !post_drain_authority_is_same_attachment(&accepted_authority, &authority)
             || authority.head.generation.get() == 0
+            || !durability_generations_preserve_lower_bounds(
+                &status,
+                local_generation_lower_bound,
+                remote_generation_lower_bound,
+            )
             || !serving.validates_fully_drained_status_at_head(&status, &authority.head)
         {
             return quarantine(store, stored);
@@ -720,7 +733,7 @@ impl PersistentFilesystemEffect {
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         let (serving, authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
-        if !remote_head_is_same_or_later(&authority.head, expected_head)
+        if !mount_head_is_authorized(&authority.head, expected_head, None)
             || !current_attachment_matches(serving, &authority)
         {
             return quarantine(store, stored);
@@ -752,7 +765,7 @@ impl PersistentFilesystemEffect {
                 .revalidate_exact_retained_running(context, desired, store, stored, vmm)?;
             let (serving, authority) =
                 self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
-            if !remote_head_is_same_or_later(&authority.head, expected_head)
+            if !mount_head_is_authorized(&authority.head, expected_head, Some(&current_head))
                 || !current_attachment_matches(serving, &authority)
             {
                 return quarantine(store, stored);
@@ -858,6 +871,35 @@ fn current_attachment_matches(
 ) -> bool {
     validate_volume_record(authority).is_ok()
         && serving.expectation().matches_current_authority(authority)
+}
+
+/// A fresh Mount authority must preserve both durable bounds: the head sealed
+/// in the checkpoint and, after the final launch barrier, the exact head sent
+/// to the preceding Guest Probe. Checking only the older checkpoint bound
+/// would let a stale authority read regress within the same attachment.
+fn mount_head_is_authorized(
+    current: &RemoteHead,
+    checkpoint_lower_bound: &RemoteHead,
+    probed_head: Option<&RemoteHead>,
+) -> bool {
+    remote_head_is_same_or_later(current, checkpoint_lower_bound)
+        && probed_head.is_none_or(|probed| remote_head_is_same_or_later(current, probed))
+}
+
+/// The DrainInitialization checkpoint preserves acknowledged Relaxed data as
+/// two independent lower bounds. A restarted or replaced blockd cannot turn a
+/// lower, internally consistent `R == L` pair into initialization success.
+fn durability_generations_preserve_lower_bounds(
+    status: &DurabilityStatus,
+    local_generation_lower_bound: Generation,
+    remote_generation_lower_bound: Generation,
+) -> bool {
+    status_generation(status.local_durable_generation)
+        .ok()
+        .zip(status_generation(status.remote_durable_generation).ok())
+        .is_some_and(|(local, remote)| {
+            local >= local_generation_lower_bound && remote >= remote_generation_lower_bound
+        })
 }
 
 /// A successful Relaxed drain may publish a new RemoteHead on the same fenced
@@ -1079,7 +1121,7 @@ mod tests {
 
     use super::*;
 
-    fn relaxed_owned_record() -> VolumeRecord {
+    fn relaxed_owned_record_with_transition(transition_id: &str) -> VolumeRecord {
         let predecessor = VolumeRecord {
             volume_id: Id::new("vol_relaxed").unwrap(),
             size_bytes: 4_096,
@@ -1099,7 +1141,7 @@ mod tests {
             &predecessor,
             &NormalAcquireRequest {
                 volume_id: predecessor.volume_id.clone(),
-                transition_id: RandomId128::new("11111111111111111111111111111111").unwrap(),
+                transition_id: RandomId128::new(transition_id).unwrap(),
                 attachment_id: Id::new("att_relaxed").unwrap(),
                 expected_unowned_epoch: predecessor.lease_epoch,
                 desired_revision: Revision::new(1).unwrap(),
@@ -1110,6 +1152,10 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    fn relaxed_owned_record() -> VolumeRecord {
+        relaxed_owned_record_with_transition("11111111111111111111111111111111")
     }
 
     fn head(generation: u64, fill: u8) -> RemoteHead {
@@ -1152,6 +1198,145 @@ mod tests {
         assert!(!post_drain_authority_is_same_attachment(
             &after,
             &conflicting
+        ));
+    }
+
+    #[test]
+    fn post_drain_rejects_same_owner_epoch_aba_and_contract_drift() {
+        let before = relaxed_owned_record();
+        let mut after = before.clone();
+        after.head = head(1, 1);
+        after.lease_expires_at = Some(UnixMillis::new(70_001).unwrap());
+
+        // An exact attachment is more than the surface owner/epoch pair. A
+        // replayed acquire marker with the same owner and epoch is an ABA
+        // conflict even when all other fields and the drained head agree.
+        let mut replayed_acquire =
+            relaxed_owned_record_with_transition("22222222222222222222222222222222");
+        replayed_acquire.head = after.head.clone();
+        replayed_acquire.lease_expires_at = after.lease_expires_at;
+        assert!(validate_volume_record(&replayed_acquire).is_ok());
+        assert!(!post_drain_authority_is_same_attachment(
+            &before,
+            &replayed_acquire
+        ));
+
+        let mut wrong = after.clone();
+        wrong.volume_id = Id::new("vol_rebound").unwrap();
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after.clone();
+        wrong.size_bytes += 4_096;
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after.clone();
+        wrong.durability = VolumeDurability::Strict;
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after.clone();
+        wrong.admin_state = VolumeAdminState::Deleting {
+            delete_id: Id::new("delete_rebound").unwrap(),
+        };
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+
+        let mut wrong = after;
+        wrong.last_transition = None;
+        assert!(!post_drain_authority_is_same_attachment(&before, &wrong));
+    }
+
+    #[test]
+    fn mount_final_authority_cannot_regress_after_the_guest_probe() {
+        let checkpoint_lower_bound = head(1, 1);
+        let probed_head = head(3, 3);
+
+        // Looking only at the checkpoint lower bound would accept this stale
+        // generation-two read after Probe already observed generation three.
+        let stale_after_probe = head(2, 2);
+        assert!(remote_head_is_same_or_later(
+            &stale_after_probe,
+            &checkpoint_lower_bound
+        ));
+        assert!(!mount_head_is_authorized(
+            &stale_after_probe,
+            &checkpoint_lower_bound,
+            Some(&probed_head)
+        ));
+
+        let conflicting_same_generation = head(3, 9);
+        assert!(!mount_head_is_authorized(
+            &conflicting_same_generation,
+            &checkpoint_lower_bound,
+            Some(&probed_head)
+        ));
+
+        let advanced = head(4, 4);
+        assert!(mount_head_is_authorized(
+            &advanced,
+            &checkpoint_lower_bound,
+            Some(&probed_head)
+        ));
+    }
+
+    #[test]
+    fn initialization_drain_cannot_regress_checkpointed_watermarks() {
+        let status = |local_durable_generation, remote_durable_generation| DurabilityStatus {
+            volume_id: String::new(),
+            attachment_id: String::new(),
+            attachment_epoch: None,
+            acquire_origin: None,
+            node_id: None,
+            placement_epoch: None,
+            guest_io_enabled: None,
+            size_bytes: None,
+            scope_id: None,
+            process_identity_token: None,
+            device_ownership_token: None,
+            guest_device_serial: None,
+            control_only: None,
+            remote_head: None,
+            mode: "relaxed".to_owned(),
+            local_durable_generation,
+            remote_durable_generation,
+            unpublished_generations: 0,
+            unpublished_bytes: 0,
+            oldest_unpublished_age_ms: 0,
+            max_unpublished_generations: 4_096,
+            max_unpublished_bytes: 8 << 30,
+            local_allocated_bytes: 0,
+            local_accounted_bytes: 0,
+            max_local_bytes: 16 << 30,
+            evicted_cache_chunks: 0,
+            backpressured: false,
+            fenced: false,
+            last_publish_error: None,
+        };
+        let local_lower_bound = Generation::new(5).unwrap();
+        let remote_lower_bound = Generation::new(3).unwrap();
+
+        assert!(durability_generations_preserve_lower_bounds(
+            &status(5, 5),
+            local_lower_bound,
+            remote_lower_bound
+        ));
+        assert!(durability_generations_preserve_lower_bounds(
+            &status(7, 7),
+            local_lower_bound,
+            remote_lower_bound
+        ));
+        assert!(!durability_generations_preserve_lower_bounds(
+            &status(4, 4),
+            local_lower_bound,
+            remote_lower_bound
+        ));
+        assert!(!durability_generations_preserve_lower_bounds(
+            &status(6, 2),
+            local_lower_bound,
+            remote_lower_bound
+        ));
+        assert!(!durability_generations_preserve_lower_bounds(
+            &status(-1, -1),
+            local_lower_bound,
+            remote_lower_bound
         ));
     }
 }
