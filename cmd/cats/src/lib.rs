@@ -609,6 +609,42 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         #[arg(long)]
         output: std::path::PathBuf,
     },
+    /// Fresh-sign one staged unsigned recovery phase without a private bundle tree.
+    SignPreparedRotationPhase {
+        /// Fixed root-only operator trust JSON.
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Independent root-only offline operator PKCS#8 v2 PEM.
+        #[arg(long)]
+        operator_private_key: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact prepared phase name.
+        #[arg(long)]
+        phase: String,
+        /// Absolute absent or exact-replay root-only pending command file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify staged current discovery against one unsigned recovery phase.
+    VerifyPreparedRotationCurrent {
+        /// Fixed root-only operator trust JSON.
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact expected signer revision.
+        #[arg(long)]
+        signer_revision: u64,
+        /// Root-only canonical current-binding discovery response.
+        #[arg(long)]
+        discovery: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -3032,6 +3068,42 @@ mod tests {
             "/approved/route-v2-r1",
             "--recovery",
             "/approved/route-v2-recovery",
+            "--signer-revision",
+            "8",
+            "--discovery",
+            "/approved/current-r8.json",
+            "--output",
+            "/approved/current-r8.receipt.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-prepared-rotation-phase",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--operator-private-key",
+            "/approved/rotation-operator-private-key.pem",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
+            "--phase",
+            "disable",
+            "--output",
+            "/approved/pending/disable.command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-prepared-rotation-current",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
             "--signer-revision",
             "8",
             "--discovery",

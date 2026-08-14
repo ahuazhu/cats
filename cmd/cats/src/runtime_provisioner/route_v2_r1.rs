@@ -174,6 +174,38 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
                 output,
             )
         }
+        RuntimeProvisionerRouteV2R1Command::SignPreparedRotationPhase {
+            trust,
+            operator_private_key,
+            command_bundle,
+            phase,
+            output,
+        } => {
+            return sign_prepared_rotation_phase(
+                cli,
+                trust,
+                operator_private_key,
+                command_bundle,
+                phase,
+                output,
+            )
+        }
+        RuntimeProvisionerRouteV2R1Command::VerifyPreparedRotationCurrent {
+            trust,
+            command_bundle,
+            signer_revision,
+            discovery,
+            output,
+        } => {
+            return verify_prepared_rotation_current(
+                cli,
+                trust,
+                command_bundle,
+                *signer_revision,
+                discovery,
+                output,
+            )
+        }
     };
     let candidate = Candidate::open_existing(&inputs.root, 0)?;
     let receipt = verify(&candidate, &inputs)?;
@@ -1763,6 +1795,462 @@ fn verify_rotation_current(
     };
     let receipt_bytes = serde_json::to_vec(&receipt)
         .context("encode Route v2 current-binding verification receipt")?;
+    publish_user_file_idempotent(output, &receipt_bytes, 0o600)?;
+    report(cli, &receipt)
+}
+
+fn load_staged_rotation_contract(
+    trust_path: &Path,
+    bundle_path: &Path,
+) -> Result<(RouteV2RotationOperatorTrust, RotationRecoveryCommandBundle)> {
+    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0o600, true)?;
+    let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
+        .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
+    let bundle_bytes =
+        read_user_file(bundle_path, MAX_ROTATION_RECOVERY_BUNDLE_BYTES, 0o600, true)?;
+    let bundle: RotationRecoveryCommandBundle = serde_json::from_slice(&bundle_bytes)
+        .context("decode staged Route rotation command bundle")?;
+    anyhow::ensure!(
+        serde_json::to_vec(&bundle)? == bundle_bytes
+            && bundle.version == 1
+            && bundle.case_id == ROTATION_RECOVERY_CASE_ID
+            && bundle.source_commit_sha == trust.release_commit_sha
+            && bundle.route_deployment_id == trust.route_deployment_id.as_str()
+            && bundle.rotation_operator_authority_id == trust.authority_id.as_str()
+            && bundle.rotation_operator_trust_sha256 == sha256(&trust_bytes)
+            && bundle.commands.len() == ROTATION_RECOVERY_PHASES.len()
+            && bundle.control_rollouts.len() == ROTATION_RECOVERY_PHASES.len()
+            && bundle
+                .commands
+                .iter()
+                .zip(ROTATION_RECOVERY_PHASES)
+                .all(|(entry, phase)| entry.phase == phase),
+        "staged Route rotation bundle does not bind the fixed trust and closed phase set"
+    );
+    validate_rotation_recovery_run_id(&bundle.qualification_run_id)?;
+    validate_staged_rotation_lineage(&bundle)?;
+    Ok((trust, bundle))
+}
+
+fn validate_staged_rotation_lineage(bundle: &RotationRecoveryCommandBundle) -> Result<()> {
+    let mut previous_reference: Option<RouteGrantV2SignerReference> = None;
+    let mut previous_ring: Option<RouteGrantV2PublicKeyRingArtifact> = None;
+    let mut normal_secret_reference_id: Option<Id> = None;
+    let mut recovery_secret_reference_id: Option<Id> = None;
+    let mut normal_kid = None;
+    let mut secret_name_prefix = None;
+
+    for (index, (((phase, revision), command_entry), rollout)) in ROTATION_RECOVERY_PHASES
+        .into_iter()
+        .zip(ROTATION_RECOVERY_REVISIONS)
+        .zip(&bundle.commands)
+        .zip(&bundle.control_rollouts)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            command_entry.phase == phase
+                && command_entry.signer_revision == revision
+                && command_entry.exact_authority_command_sha256
+                    == sha256(command_entry.exact_authority_command_json.as_bytes()),
+            "staged Route rotation command entry {phase} is not exact"
+        );
+        let command =
+            decode_authority_command(command_entry.exact_authority_command_json.as_bytes())?;
+        anyhow::ensure!(
+            command.successor.signer_revision.get() == revision
+                && command.successor.deployment_id.as_str() == bundle.route_deployment_id,
+            "staged Route rotation command {phase} has the wrong successor coordinate"
+        );
+        if let Some(previous) = &previous_reference {
+            anyhow::ensure!(
+                command.successor.expected_previous
+                    == Some(RouteGrantV2SignerExpectedPrevious {
+                        signer_revision: previous.signer_revision,
+                        signer_reference_sha256: previous.digest().map_err(|error| anyhow!(
+                            "digest staged Route rotation predecessor: {error:?}"
+                        ))?,
+                    }),
+                "staged Route rotation command {phase} is not the adjacent signer successor"
+            );
+        } else {
+            anyhow::ensure!(
+                command.successor.expected_previous.is_some(),
+                "staged Route rotation first command omits its installed predecessor"
+            );
+        }
+
+        let ring = match &command.kind {
+            RouteGrantV2SigningAuthorityCommandKind::PublishOverlap { successor_ring, .. }
+            | RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { successor_ring }
+            | RouteGrantV2SigningAuthorityCommandKind::Disable { successor_ring } => {
+                successor_ring.clone()
+            }
+            RouteGrantV2SigningAuthorityCommandKind::SwitchActive
+            | RouteGrantV2SigningAuthorityCommandKind::Retire
+            | RouteGrantV2SigningAuthorityCommandKind::Activate => previous_ring
+                .clone()
+                .context("staged Route rotation command requires a predecessor ring")?,
+        };
+        command
+            .successor
+            .validate_ring(&ring)
+            .map_err(|error| anyhow!("bind staged Route rotation command {phase}: {error:?}"))?;
+        anyhow::ensure!(
+            command_entry.ring_version == ring.ring_version.get(),
+            "staged Route rotation command {phase} has the wrong ring version"
+        );
+
+        match (phase, &command.kind) {
+            (
+                "publish_overlap",
+                RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                    successor_ring,
+                    new_secret_reference_id,
+                },
+            ) => {
+                let RouteGrantV2SignerSelection::Active { active_kid, .. } =
+                    &command.successor.signer
+                else {
+                    bail!("staged normal overlap does not retain an active predecessor")
+                };
+                let added = successor_ring
+                    .keys
+                    .iter()
+                    .filter(|entry| &entry.kid != active_kid)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    successor_ring.keys.len() == 2
+                        && successor_ring.key(active_kid).is_some()
+                        && added.len() == 1,
+                    "staged normal overlap does not carry one retained and one fresh key"
+                );
+                normal_secret_reference_id = Some(new_secret_reference_id.clone());
+                normal_kid = Some(added[0].kid.clone());
+            }
+            ("switch_active", RouteGrantV2SigningAuthorityCommandKind::SwitchActive) => {
+                let RouteGrantV2SignerSelection::Active {
+                    active_kid,
+                    secret_reference_id,
+                } = &command.successor.signer
+                else {
+                    bail!("staged normal switch does not select an active signer")
+                };
+                anyhow::ensure!(
+                    Some(secret_reference_id) == normal_secret_reference_id.as_ref()
+                        && normal_kid.as_ref() == Some(active_kid),
+                    "staged normal switch does not select its prepared successor"
+                );
+            }
+            (
+                "publish_new_only",
+                RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { successor_ring },
+            ) => {
+                anyhow::ensure!(
+                    successor_ring.keys.len() == 1
+                        && normal_kid
+                            .as_ref()
+                            .is_some_and(|kid| successor_ring.key(kid).is_some()),
+                    "staged new-only phase does not retain only the normal successor"
+                );
+            }
+            ("retire", RouteGrantV2SigningAuthorityCommandKind::Retire) => {}
+            ("disable", RouteGrantV2SigningAuthorityCommandKind::Disable { successor_ring }) => {
+                anyhow::ensure!(
+                    successor_ring.keys.is_empty()
+                        && command.successor.signer == RouteGrantV2SignerSelection::Disabled,
+                    "staged disable phase is not an empty disabled successor"
+                )
+            }
+            (
+                "publish_recovery",
+                RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                    successor_ring,
+                    new_secret_reference_id,
+                },
+            ) => {
+                anyhow::ensure!(
+                    previous_reference.as_ref().is_some_and(|reference| {
+                        reference.signer == RouteGrantV2SignerSelection::Disabled
+                    }) && command.successor.signer == RouteGrantV2SignerSelection::Disabled
+                        && successor_ring.keys.len() == 1
+                        && normal_kid
+                            .as_ref()
+                            .is_some_and(|kid| successor_ring.key(kid).is_none())
+                        && normal_secret_reference_id.as_ref() != Some(new_secret_reference_id),
+                    "staged recovery publication reuses or bypasses the disabled lineage"
+                );
+                recovery_secret_reference_id = Some(new_secret_reference_id.clone());
+            }
+            ("activate", RouteGrantV2SigningAuthorityCommandKind::Activate) => {
+                let RouteGrantV2SignerSelection::Active {
+                    active_kid,
+                    secret_reference_id,
+                } = &command.successor.signer
+                else {
+                    bail!("staged recovery activation does not select an active signer")
+                };
+                anyhow::ensure!(
+                    Some(secret_reference_id) == recovery_secret_reference_id.as_ref()
+                        && ring.keys.len() == 1
+                        && ring.key(active_kid).is_some(),
+                    "staged activation does not select only the fresh recovery signer"
+                );
+            }
+            _ => bail!("staged Route rotation phase {phase} has the wrong typed command"),
+        }
+
+        let secret_suffix = format!("-r{revision}");
+        let prefix = rollout
+            .secret_name
+            .strip_suffix(&secret_suffix)
+            .context("staged Control rollout Secret has the wrong revision suffix")?;
+        if let Some(expected) = &secret_name_prefix {
+            anyhow::ensure!(
+                prefix == expected,
+                "staged Control rollout changes its immutable Secret prefix"
+            );
+        } else {
+            anyhow::ensure!(!prefix.is_empty(), "staged Control Secret prefix is empty");
+            secret_name_prefix = Some(prefix.to_owned());
+        }
+        let reference_digest = command
+            .successor
+            .digest()
+            .map_err(|error| anyhow!("digest staged Route rotation successor: {error:?}"))?;
+        let ring_digest = ring
+            .digest()
+            .map_err(|error| anyhow!("digest staged Route rotation ring: {error:?}"))?;
+        anyhow::ensure!(
+            rollout.signer_revision == revision
+                && rollout.signer_reference_sha256 == reference_digest.to_string()
+                && rollout.public_key_ring_digest == ring_digest.to_string()
+                && is_canonical_sha256(&rollout.secret_manifest_sha256),
+            "staged Control rollout r{revision} differs from its authority command"
+        );
+        if index > 0 {
+            let prior_ring = previous_ring
+                .as_ref()
+                .context("staged Route rotation predecessor ring disappeared")?;
+            match phase {
+                "publish_new_only" | "disable" | "publish_recovery" => anyhow::ensure!(
+                    ring_is_successor_of(prior_ring, &ring)?,
+                    "staged Route rotation ring for {phase} is not adjacent"
+                ),
+                _ => anyhow::ensure!(
+                    &ring == prior_ring,
+                    "staged Route rotation phase {phase} unexpectedly changes the ring"
+                ),
+            }
+        }
+        previous_reference = Some(command.successor);
+        previous_ring = Some(ring);
+    }
+    Ok(())
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sign_prepared_rotation_phase(
+    cli: &Cli,
+    trust_path: &Path,
+    operator_private_key_path: &Path,
+    bundle_path: &Path,
+    phase: &str,
+    output: &Path,
+) -> Result<()> {
+    let (trust, bundle) = load_staged_rotation_contract(trust_path, bundle_path)?;
+    let entry = bundle
+        .commands
+        .iter()
+        .find(|entry| entry.phase == phase)
+        .context("staged Route rotation bundle has no requested phase")?;
+    anyhow::ensure!(
+        entry.exact_authority_command_sha256
+            == sha256(entry.exact_authority_command_json.as_bytes()),
+        "staged Route rotation authority command digest differs"
+    );
+    let authority_command =
+        decode_authority_command(entry.exact_authority_command_json.as_bytes())?;
+    let signed_bytes = if output.exists() {
+        read_user_file(output, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES, 0o600, true)?
+    } else {
+        let mut operator_private_key = read_user_file(
+            operator_private_key_path,
+            MAX_PRIVATE_KEY_BYTES,
+            0o600,
+            true,
+        )?;
+        let signed_result = (|| {
+            anyhow::ensure!(
+                trust.threshold == 1 && trust.credentials.len() == 1,
+                "staged recovery signer requires exact one-of-one operator trust"
+            );
+            let operator = Ed25519RequestSigner::from_pkcs8_v2_pem(
+                trust.credentials[0].credential_id.clone(),
+                &operator_private_key,
+            )
+            .map_err(|_| anyhow!("staged Route rotation operator key is not strict PKCS#8 v2"))?;
+            anyhow::ensure!(
+                Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(operator.public_key_spki_der()))
+                    .as_ref()
+                    == Some(&trust.credentials[0].public_key_spki),
+                "staged Route rotation operator key does not match fixed trust"
+            );
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system time predates the Unix epoch")?
+                .as_millis();
+            let now = u64::try_from(now).context("system time exceeds Route v2 wire range")?;
+            let issued_at = now.saturating_sub(5_000);
+            let expires_at = issued_at
+                .checked_add(ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS)
+                .context("Route v2 recovery command expiry overflow")?;
+            let payload = RouteV2SigningCommandPayload {
+                version: ContractVersion::V1,
+                authority_id: trust.authority_id.clone(),
+                release_commit_sha: trust.release_commit_sha.clone(),
+                command_id: RandomId128::new(random_hex(16)?)
+                    .expect("generated Route v2 command ID is canonical 128-bit hex"),
+                issued_at_unix_ms: UnixMillis::new(issued_at)
+                    .context("invalid Route v2 recovery issue time")?,
+                expires_at_unix_ms: UnixMillis::new(expires_at)
+                    .context("invalid Route v2 recovery expiry time")?,
+                command: authority_command,
+            };
+            let proof = sign_route_v2_signing_command(&payload, &operator)
+                .map_err(|error| anyhow!("sign staged Route v2 recovery command: {error}"))?;
+            encode_signed_route_v2_signing_command(&SignedRouteV2SigningCommand {
+                payload,
+                proofs: vec![proof],
+            })
+            .map_err(|error| anyhow!("encode staged Route v2 recovery command: {error}"))
+        })();
+        operator_private_key.fill(0);
+        let bytes = signed_result?;
+        publish_user_file_idempotent(output, &bytes, 0o600)?;
+        bytes
+    };
+    let signed = decode_signed_route_v2_signing_command(&signed_bytes)
+        .map_err(|error| anyhow!("decode durable staged Route v2 command: {error}"))?;
+    verify_signed_route_v2_signing_command(&trust, &trust.release_commit_sha, &signed)
+        .map_err(|error| anyhow!("verify durable staged Route v2 command: {error}"))?;
+    anyhow::ensure!(
+        signed.payload.command
+            == decode_authority_command(entry.exact_authority_command_json.as_bytes())?
+            && signed
+                .payload
+                .expires_at_unix_ms
+                .get()
+                .checked_sub(signed.payload.issued_at_unix_ms.get())
+                == Some(ROTATION_RECOVERY_COMMAND_LIFETIME_MILLIS),
+        "durable staged Route v2 command differs from the prepared phase"
+    );
+    let payload_bytes = encode_route_v2_signing_command_payload(&signed.payload)
+        .map_err(|error| anyhow!("encode staged Route v2 recovery payload: {error}"))?;
+    report(
+        cli,
+        &RotationRecoveryPhaseSigningReceipt {
+            version: 1,
+            case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+            qualification_run_id: bundle.qualification_run_id,
+            phase: phase.to_owned(),
+            signer_revision: entry.signer_revision,
+            ring_version: entry.ring_version,
+            authority_id: trust.authority_id.to_string(),
+            route_deployment_id: trust.route_deployment_id.to_string(),
+            release_commit_sha: trust.release_commit_sha,
+            command_id: signed.payload.command_id.to_string(),
+            issued_at_unix_ms: signed.payload.issued_at_unix_ms.get(),
+            expires_at_unix_ms: signed.payload.expires_at_unix_ms.get(),
+            exact_authority_command_sha256: entry.exact_authority_command_sha256.clone(),
+            exact_payload_sha256: sha256(&payload_bytes),
+            exact_signed_command_sha256: sha256(&signed_bytes),
+            pending_command_path: output.display().to_string(),
+        },
+    )
+}
+
+fn verify_prepared_rotation_current(
+    cli: &Cli,
+    trust_path: &Path,
+    bundle_path: &Path,
+    signer_revision: u64,
+    discovery_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    let (trust, bundle) = load_staged_rotation_contract(trust_path, bundle_path)?;
+    let entry = bundle
+        .commands
+        .iter()
+        .find(|entry| entry.signer_revision == signer_revision)
+        .context("staged Route rotation bundle has no requested signer revision")?;
+    let command = decode_authority_command(entry.exact_authority_command_json.as_bytes())?;
+    let expected = command.successor;
+    let reference_bytes = encode_route_grant_v2_signer_reference(&expected)
+        .map_err(|error| anyhow!("encode staged expected signer reference: {error:?}"))?;
+    let discovery_bytes = read_user_file(
+        discovery_path,
+        ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES,
+        0o600,
+        true,
+    )?;
+    let discovered = decode_route_v2_signing_authority_current(&discovery_bytes)
+        .map_err(|error| anyhow!("decode staged current-binding discovery: {error}"))?;
+    let (expected_state, expected_active_kid) = match &expected.signer {
+        RouteGrantV2SignerSelection::Active { active_kid, .. } => {
+            (RouteV2LoadedSignerState::Active, Some(active_kid.clone()))
+        }
+        RouteGrantV2SignerSelection::Disabled => (RouteV2LoadedSignerState::Disabled, None),
+    };
+    anyhow::ensure!(
+        discovered.authority_id == trust.authority_id
+            && discovered.route_deployment_id == trust.route_deployment_id
+            && discovered.release_commit_sha == trust.release_commit_sha
+            && discovered.rotation_operator_trust_sha256
+                == trust
+                    .exact_digest()
+                    .map_err(|error| anyhow!("digest staged Route rotation trust: {error}"))?
+            && discovered.loaded_signer_revision == expected.signer_revision
+            && discovered.loaded_signer_reference_sha256
+                == Sha256Digest::from_bytes(Sha256::digest(&reference_bytes).into())
+            && discovered.loaded_signer_state == expected_state
+            && discovered.loaded_active_kid == expected_active_kid
+            && discovered.loaded_public_key_ring_version == expected.public_key_ring_version
+            && discovered.loaded_public_key_ring_digest == expected.public_key_ring_digest
+            && discovered.database_current
+            && discovered.process_ready == (expected_state == RouteV2LoadedSignerState::Active),
+        "staged Control discovery does not prove exact PostgreSQL-current process binding"
+    );
+    let receipt = RotationCurrentVerificationReceipt {
+        version: 1,
+        case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+        qualification_run_id: bundle.qualification_run_id,
+        source_commit_sha: discovered.release_commit_sha,
+        authority_id: discovered.authority_id.to_string(),
+        route_deployment_id: discovered.route_deployment_id.to_string(),
+        rotation_operator_trust_sha256: discovered.rotation_operator_trust_sha256.to_string(),
+        signer_revision: discovered.loaded_signer_revision.get(),
+        signer_reference_sha256: discovered.loaded_signer_reference_sha256.to_string(),
+        signer_state: match discovered.loaded_signer_state {
+            RouteV2LoadedSignerState::Active => "active",
+            RouteV2LoadedSignerState::Disabled => "disabled",
+        }
+        .to_owned(),
+        active_kid: discovered.loaded_active_kid.map(|kid| kid.to_string()),
+        public_key_ring_version: discovered.loaded_public_key_ring_version.get(),
+        public_key_ring_digest: discovered.loaded_public_key_ring_digest.to_string(),
+        database_current: discovered.database_current,
+        process_ready: discovered.process_ready,
+        exact_discovery_sha256: sha256(&discovery_bytes),
+    };
+    let receipt_bytes = serde_json::to_vec(&receipt)
+        .context("encode staged Route v2 current verification receipt")?;
     publish_user_file_idempotent(output, &receipt_bytes, 0o600)?;
     report(cli, &receipt)
 }
