@@ -310,7 +310,7 @@ not from worker registration, observation, IMDS, the listener source address, or
 Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
 rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
 This contract uses the exact clean-slate Control Store authority schema version 15. An existing earlier schema is
-not altered in place and refuses startup; provision or recreate an empty version-14 schema before starting any new
+not altered in place and refuses startup; provision or recreate an empty version-15 schema before starting any new
 Control replica, with no mixed-version rolling window.
 
 Every Host-side worker mutation runs under the single
