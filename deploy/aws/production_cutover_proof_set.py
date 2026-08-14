@@ -29,6 +29,13 @@ PROOF_SET_KIND = "cats.production-cutover-proof-set.v1"
 USAGE_TERMINAL_VERIFIER = Path(
     "/opt/cats/bin/cats-usage-terminal-receipt-verifier"
 )
+USAGE_SCHEMA_VERIFIER = Path("/opt/cats/bin/cats-usage-schema-v16-verifier")
+USAGE_SCHEMA_VERIFICATION_FILE = "usage-schema-v16-verification.receipt.json"
+USAGE_SCHEMA_VERIFICATION_KIND = "cats.usage-schema-v16-verification.v1"
+USAGE_SCHEMA_CATALOG_SHA256 = (
+    "sha256:ec10b4afe112dba411466e9b2d67d1cef5d8d232da4ec52c11ced993d771f157"
+)
+USAGE_SCHEMA_SUCCESS_STDOUT = "Usage schema v16 verified\n"
 USAGE_TERMINAL_REQUEST_FILE = "usage-target-terminal-request.json"
 USAGE_TERMINAL_RECEIPT_FILE = "usage-target-terminal-receipt.json"
 USAGE_TERMINAL_TARGETS_FILE = "usage-terminal-targets.json"
@@ -136,6 +143,7 @@ RANDOM_ID = re.compile(r"^[0-9a-f]{32}$")
 PROOF_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 AWS_REGION = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$")
+CATS_SCHEMA = re.compile(r"^cats_[a-z][a-z0-9_]{0,61}$")
 UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -423,6 +431,7 @@ class ProducerContext:
     release_commit: str
     release_manifest_sha256: str
     worker_bundle_sha256: str
+    usage_schema_verifier_binary_sha256: str
     usage_terminal_verifier_binary_sha256: str
     qualification_manifest_sha256: str
     qualification_catalog_sha256: str
@@ -572,11 +581,14 @@ def _open_release_bound_executable(
     path: Path,
     expected_sha256: str,
 ) -> tuple[int, _FileIdentity]:
-    if not path.is_absolute() or path != USAGE_TERMINAL_VERIFIER:
-        raise ProofSetError("E9 terminal verifier path is not canonical")
+    if not path.is_absolute() or path not in {
+        USAGE_SCHEMA_VERIFIER,
+        USAGE_TERMINAL_VERIFIER,
+    }:
+        raise ProofSetError("Usage verifier path is not canonical")
     try:
         if path.resolve(strict=True) != path:
-            raise ProofSetError("E9 terminal verifier path contains a symlink")
+            raise ProofSetError("Usage verifier path contains a symlink")
         for parent in path.parents:
             metadata = parent.stat(follow_symlinks=False)
             if (
@@ -585,17 +597,17 @@ def _open_release_bound_executable(
                 or metadata.st_mode & 0o022
             ):
                 raise ProofSetError(
-                    "E9 terminal verifier ancestor is not root-controlled"
+                    "Usage verifier ancestor is not root-controlled"
                 )
     except OSError as error:
-        raise ProofSetError("E9 terminal verifier path is unavailable") from error
+        raise ProofSetError("Usage verifier path is unavailable") from error
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
         os, "O_NOFOLLOW", 0
     )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ProofSetError("E9 terminal verifier cannot be opened") from error
+        raise ProofSetError("Usage verifier cannot be opened") from error
     try:
         identity = _FileIdentity.from_stat(os.fstat(descriptor))
         if (
@@ -607,9 +619,9 @@ def _open_release_bound_executable(
             or identity.size <= 0
             or identity.size > MAX_VERIFIER_BINARY_BYTES
         ):
-            raise ProofSetError("E9 terminal verifier metadata is unsafe")
+            raise ProofSetError("Usage verifier metadata is unsafe")
         if _hash_open_descriptor(descriptor, identity) != expected_sha256:
-            raise ProofSetError("E9 terminal verifier differs from the release")
+            raise ProofSetError("Usage verifier differs from the release")
         return descriptor, identity
     except BaseException:
         os.close(descriptor)
@@ -624,16 +636,16 @@ def _hash_open_descriptor(descriptor: int, identity: _FileIdentity) -> str:
         while remaining:
             chunk = os.read(descriptor, min(remaining, 1024 * 1024))
             if not chunk:
-                raise ProofSetError("E9 terminal verifier changed during hashing")
+                raise ProofSetError("Usage verifier changed during hashing")
             hasher.update(chunk)
             remaining -= len(chunk)
         if os.read(descriptor, 1):
-            raise ProofSetError("E9 terminal verifier grew during hashing")
+            raise ProofSetError("Usage verifier grew during hashing")
         if _FileIdentity.from_stat(os.fstat(descriptor)) != identity:
-            raise ProofSetError("E9 terminal verifier changed during hashing")
+            raise ProofSetError("Usage verifier changed during hashing")
         return "sha256:" + hasher.hexdigest()
     except OSError as error:
-        raise ProofSetError("E9 terminal verifier cannot be hashed") from error
+        raise ProofSetError("Usage verifier cannot be hashed") from error
 
 
 def _write_private_staged_file(path: Path, data: bytes) -> None:
@@ -667,6 +679,60 @@ def _terminate_subprocess(process: subprocess.Popen[bytes]) -> None:
         except ProcessLookupError:
             pass
     process.wait()
+
+
+def _run_held_usage_verifier(
+    argv: list[str],
+    binary_descriptor: int,
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+) -> tuple[int, bytes, bytes]:
+    try:
+        process = subprocess.Popen(
+            argv,
+            executable=f"/proc/self/fd/{binary_descriptor}",
+            pass_fds=(binary_descriptor,),
+            close_fds=True,
+            cwd=cwd,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise ProofSetError("cannot execute the release-bound Usage verifier") from error
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        _terminate_subprocess(process)
+        raise ProofSetError("release-bound Usage verifier timed out") from error
+    except BaseException:
+        _terminate_subprocess(process)
+        raise
+    return process.returncode, stdout, stderr
+
+
+def _revalidate_release_bound_executable(
+    path: Path,
+    descriptor: int,
+    identity: _FileIdentity,
+    expected_sha256: str,
+) -> None:
+    try:
+        path_identity = _FileIdentity.from_stat(path.stat(follow_symlinks=False))
+        descriptor_identity = _FileIdentity.from_stat(os.fstat(descriptor))
+    except OSError as error:
+        raise ProofSetError(
+            "Usage verifier identity is unavailable after execution"
+        ) from error
+    if (
+        path_identity != identity
+        or descriptor_identity != identity
+        or _hash_open_descriptor(descriptor, identity) != expected_sha256
+    ):
+        raise ProofSetError("Usage verifier changed during execution")
 
 
 class SubprocessUsageTargetTerminalVerifier:
@@ -752,53 +818,24 @@ class SubprocessUsageTargetTerminalVerifier:
                 "--receipt-out",
                 str(output_path),
             ]
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    executable=f"/proc/self/fd/{binary_descriptor}",
-                    pass_fds=(binary_descriptor,),
-                    close_fds=True,
-                    cwd=invocation,
-                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
-            except OSError as error:
-                raise ProofSetError("cannot execute the E9 terminal verifier") from error
-            try:
-                stdout, stderr = process.communicate(timeout=self._timeout_seconds)
-            except subprocess.TimeoutExpired as error:
-                _terminate_subprocess(process)
-                raise ProofSetError("E9 terminal verifier timed out") from error
-            except BaseException:
-                _terminate_subprocess(process)
-                raise
+            returncode, stdout, stderr = _run_held_usage_verifier(
+                argv,
+                binary_descriptor,
+                cwd=invocation,
+                timeout_seconds=self._timeout_seconds,
+            )
             if (
-                process.returncode != 0
+                returncode != 0
                 or stdout != USAGE_TERMINAL_SUCCESS_STDOUT.encode("ascii")
                 or stderr
             ):
                 raise ProofSetError("E9 terminal verifier rejected the proof")
-            try:
-                path_identity = _FileIdentity.from_stat(
-                    USAGE_TERMINAL_VERIFIER.stat(follow_symlinks=False)
-                )
-                descriptor_identity = _FileIdentity.from_stat(
-                    os.fstat(binary_descriptor)
-                )
-            except OSError as error:
-                raise ProofSetError(
-                    "E9 terminal verifier identity is unavailable after execution"
-                ) from error
-            if (
-                path_identity != binary_identity
-                or descriptor_identity != binary_identity
-                or _hash_open_descriptor(binary_descriptor, binary_identity)
-                != context.usage_terminal_verifier_binary_sha256
-            ):
-                raise ProofSetError("E9 terminal verifier changed during execution")
+            _revalidate_release_bound_executable(
+                USAGE_TERMINAL_VERIFIER,
+                binary_descriptor,
+                binary_identity,
+                context.usage_terminal_verifier_binary_sha256,
+            )
             try:
                 output_metadata = output_path.stat(follow_symlinks=False)
             except OSError as error:
@@ -851,6 +888,137 @@ class SubprocessUsageTargetTerminalVerifier:
                     pass
 
 
+class SubprocessUsageSchemaV16Verifier:
+    """Verify the fresh Usage schema through the exact installed Rust binary."""
+
+    def __init__(
+        self,
+        state_directory: Path,
+        *,
+        timeout_seconds: int = USAGE_VERIFIER_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            type(timeout_seconds) is not int
+            or timeout_seconds <= 0
+            or timeout_seconds > 300
+        ):
+            raise ProofSetError("Usage schema verifier timeout is outside 1..300")
+        self._state_directory = state_directory
+        self._timeout_seconds = timeout_seconds
+
+    def verify(
+        self,
+        *,
+        dsn_file: Path,
+        ca_file: Path,
+        schema: str,
+        context: ProducerContext,
+    ) -> VerifiedFile:
+        _require_root_private_directory(
+            self._state_directory,
+            "Usage schema verifier state directory",
+        )
+        if (
+            not dsn_file.is_absolute()
+            or not ca_file.is_absolute()
+            or CATS_SCHEMA.fullmatch(schema) is None
+        ):
+            raise ProofSetError("Usage schema verifier inputs are not canonical")
+        receipt_path = self._state_directory / USAGE_SCHEMA_VERIFICATION_FILE
+        binary_descriptor, binary_identity = _open_release_bound_executable(
+            USAGE_SCHEMA_VERIFIER,
+            context.usage_schema_verifier_binary_sha256,
+        )
+        try:
+            argv = [
+                str(USAGE_SCHEMA_VERIFIER),
+                "--dsn-file",
+                str(dsn_file),
+                "--ca-file",
+                str(ca_file),
+                "--schema",
+                schema,
+                "--release-commit",
+                context.release_commit,
+                "--worker-bundle-sha256",
+                context.worker_bundle_sha256,
+                "--receipt-out",
+                str(receipt_path),
+            ]
+            returncode, stdout, stderr = _run_held_usage_verifier(
+                argv,
+                binary_descriptor,
+                cwd=self._state_directory,
+                timeout_seconds=self._timeout_seconds,
+            )
+            if (
+                returncode != 0
+                or stdout != USAGE_SCHEMA_SUCCESS_STDOUT.encode("ascii")
+                or stderr
+            ):
+                raise ProofSetError("Usage schema verifier rejected the fresh schema")
+            _revalidate_release_bound_executable(
+                USAGE_SCHEMA_VERIFIER,
+                binary_descriptor,
+                binary_identity,
+                context.usage_schema_verifier_binary_sha256,
+            )
+            try:
+                output_metadata = receipt_path.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ProofSetError("Usage schema verifier emitted no receipt") from error
+            if (
+                not stat.S_ISREG(output_metadata.st_mode)
+                or receipt_path.is_symlink()
+                or output_metadata.st_uid != os.geteuid()
+                or output_metadata.st_nlink != 1
+                or stat.S_IMODE(output_metadata.st_mode) != 0o600
+            ):
+                raise ProofSetError("Usage schema verifier receipt metadata is unsafe")
+            with ProofDirectory(self._state_directory) as directory:
+                actual = directory.read_named(
+                    USAGE_SCHEMA_VERIFICATION_FILE,
+                    "Usage schema verification receipt",
+                    MAX_PROOF_FILE_BYTES,
+                )
+            value = fields(
+                decode_json(
+                    actual.data,
+                    "Usage schema verification receipt",
+                    canonical_lf=True,
+                ),
+                {
+                    "binary_sha256",
+                    "catalog_sha256",
+                    "kind",
+                    "release_commit",
+                    "schema",
+                    "schema_version",
+                    "verified",
+                    "version",
+                    "worker_bundle_sha256",
+                },
+                "Usage schema verification receipt",
+            )
+            if (
+                value["binary_sha256"]
+                != context.usage_schema_verifier_binary_sha256
+                or value["catalog_sha256"] != USAGE_SCHEMA_CATALOG_SHA256
+                or value["kind"] != USAGE_SCHEMA_VERIFICATION_KIND
+                or value["release_commit"] != context.release_commit
+                or value["schema"] != schema
+                or type(value["schema_version"]) is not int
+                or value["schema_version"] != 16
+                or value["verified"] is not True
+                or not version_one(value["version"])
+                or value["worker_bundle_sha256"] != context.worker_bundle_sha256
+            ):
+                raise ProofSetError("Usage schema verification receipt drifted")
+            return actual
+        finally:
+            os.close(binary_descriptor)
+
+
 UNAVAILABLE_ROUTE_V2_VERIFIER: RouteV2QualificationVerifier = _UnavailableRouteV2Verifier()
 UNAVAILABLE_USAGE_VERIFIER: UsageTargetTerminalVerifier = _UnavailableUsageVerifier()
 UNAVAILABLE_HOST_FENCE_VERIFIER: HostFenceTerminalVerifier = _UnavailableHostFenceVerifier()
@@ -869,6 +1037,9 @@ class VerifiedProofSet:
     source_manifest_sha256: str
     source_bundle_sha256: str
     release_manifest_sha256: str
+    worker_bundle_sha256: str
+    usage_schema_verifier_binary_sha256: str
+    usage_terminal_verifier_binary_sha256: str
     qualification_manifest_sha256: str
     qualification_catalog_sha256: str
     fresh_targets_sha256: str
@@ -1043,7 +1214,10 @@ def _validate_build_receipt(value: Any, release: dict[str, Any]) -> None:
     commit(value["tree_sha"], "build receipt tree")
 
 
-def _validate_release_manifest(value: Any, release: dict[str, Any]) -> tuple[str, str]:
+def _validate_release_manifest(
+    value: Any,
+    release: dict[str, Any],
+) -> tuple[str, str, str]:
     value = fields(
         value,
         {"artifacts", "build_inputs", "guest_runtime", "source", "version"},
@@ -1075,6 +1249,9 @@ def _validate_release_manifest(value: Any, release: dict[str, Any]) -> tuple[str
     usage_verifier = members.get(USAGE_TERMINAL_VERIFIER.name)
     if not isinstance(usage_verifier, dict):
         raise ProofSetError("release omits the E9 terminal verifier worker member")
+    usage_schema_verifier = members.get(USAGE_SCHEMA_VERIFIER.name)
+    if not isinstance(usage_schema_verifier, dict):
+        raise ProofSetError("release omits the Usage schema verifier worker member")
     inputs = value["build_inputs"]
     if (
         not isinstance(inputs, dict)
@@ -1082,7 +1259,11 @@ def _validate_release_manifest(value: Any, release: dict[str, Any]) -> tuple[str
         or inputs.get("platform") != "linux/amd64"
     ):
         raise ProofSetError("release manifest target is not production linux/amd64")
-    return worker_digest, usage_verifier["sha256"]
+    return (
+        worker_digest,
+        usage_schema_verifier["sha256"],
+        usage_verifier["sha256"],
+    )
 
 
 def _validate_usage_verification_projection(
@@ -2882,6 +3063,7 @@ def verify(
             raise ProofSetError("artifact digest is not the release-manifest digest")
         (
             worker_bundle_sha256,
+            usage_schema_verifier_binary_sha256,
             usage_terminal_verifier_binary_sha256,
         ) = _validate_release_manifest(
             decode_json(
@@ -2940,6 +3122,9 @@ def verify(
             release_commit=expected_release_commit,
             release_manifest_sha256=release["artifact_sha256"],
             worker_bundle_sha256=worker_bundle_sha256,
+            usage_schema_verifier_binary_sha256=(
+                usage_schema_verifier_binary_sha256
+            ),
             usage_terminal_verifier_binary_sha256=(
                 usage_terminal_verifier_binary_sha256
             ),
@@ -3146,6 +3331,13 @@ def verify(
             source_manifest_sha256=release["source_manifest_sha256"],
             source_bundle_sha256=release["source_bundle_sha256"],
             release_manifest_sha256=release["artifact_sha256"],
+            worker_bundle_sha256=worker_bundle_sha256,
+            usage_schema_verifier_binary_sha256=(
+                usage_schema_verifier_binary_sha256
+            ),
+            usage_terminal_verifier_binary_sha256=(
+                usage_terminal_verifier_binary_sha256
+            ),
             qualification_manifest_sha256=release["qualification_manifest_sha256"],
             qualification_catalog_sha256=release["qualification_catalog_sha256"],
             fresh_targets_sha256="sha256:"

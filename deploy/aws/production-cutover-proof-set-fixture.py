@@ -110,15 +110,16 @@ def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, 
         "target_request_sha256": SHA_D,
     }
     context = PROOF.ProducerContext(
-        "release_a",
-        COMMIT,
-        SHA_A,
-        "sha256:" + "2" * 64,
-        SHA_B,
-        SHA_C,
-        SHA_D,
-        {},
-        {},
+        release_id="release_a",
+        release_commit=COMMIT,
+        release_manifest_sha256=SHA_A,
+        worker_bundle_sha256="sha256:" + "2" * 64,
+        usage_schema_verifier_binary_sha256=SHA_A,
+        usage_terminal_verifier_binary_sha256=SHA_B,
+        qualification_manifest_sha256=SHA_C,
+        qualification_catalog_sha256=SHA_D,
+        old_targets={},
+        fresh_targets={},
     )
     manifest_value = {
         "block_runs": [
@@ -330,7 +331,7 @@ def validate_release_bound_usage_subprocess() -> None:
     original_private_directory = PROOF._require_root_private_directory
     original_open_executable = PROOF._open_release_bound_executable
     with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         state = root / "state"
         state.mkdir(mode=0o700)
         executable = root / "cats-usage-terminal-receipt-verifier"
@@ -465,6 +466,103 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             PROOF._open_release_bound_executable = original_open_executable
 
 
+def validate_release_bound_usage_schema_subprocess() -> None:
+    _manifest, _targets, _request, _receipt, _verification, context, _runs, _value = (
+        fixture()
+    )
+    original_binary = PROOF.USAGE_SCHEMA_VERIFIER
+    original_private_directory = PROOF._require_root_private_directory
+    original_open_executable = PROOF._open_release_bound_executable
+    original_run = PROOF._run_held_usage_verifier
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        executable = root / "cats-usage-schema-v16-verifier"
+        executable.write_bytes(b"fixture usage schema verifier")
+        executable.chmod(0o500)
+        executable_sha256 = "sha256:" + hashlib.sha256(
+            executable.read_bytes()
+        ).hexdigest()
+        context = dataclasses.replace(
+            context,
+            usage_schema_verifier_binary_sha256=executable_sha256,
+        )
+        dsn = root / "dsn"
+        ca = root / "ca"
+        dsn.write_text("postgresql://fixture\n", encoding="utf-8")
+        ca.write_text("fixture-ca\n", encoding="utf-8")
+
+        def open_fixture_executable(path: Path, expected_sha256: str) -> Any:
+            if path != executable or expected_sha256 != executable_sha256:
+                raise AssertionError("schema adapter did not select the release binary")
+            descriptor = os.open(path, os.O_RDONLY)
+            return descriptor, PROOF._FileIdentity.from_stat(os.fstat(descriptor))
+
+        def run_fixture(
+            argv: list[str],
+            _descriptor: int,
+            *,
+            cwd: Path,
+            timeout_seconds: int,
+        ) -> tuple[int, bytes, bytes]:
+            expected = [
+                str(executable),
+                "--dsn-file",
+                str(dsn),
+                "--ca-file",
+                str(ca),
+                "--schema",
+                "cats_usage_fresh",
+                "--release-commit",
+                context.release_commit,
+                "--worker-bundle-sha256",
+                context.worker_bundle_sha256,
+                "--receipt-out",
+                str(state / PROOF.USAGE_SCHEMA_VERIFICATION_FILE),
+            ]
+            if argv != expected or cwd != state or timeout_seconds != 120:
+                raise AssertionError("schema adapter invocation drifted")
+            output = state / PROOF.USAGE_SCHEMA_VERIFICATION_FILE
+            output.write_bytes(
+                PROOF.canonical_json(
+                    {
+                        "binary_sha256": executable_sha256,
+                        "catalog_sha256": PROOF.USAGE_SCHEMA_CATALOG_SHA256,
+                        "kind": PROOF.USAGE_SCHEMA_VERIFICATION_KIND,
+                        "release_commit": context.release_commit,
+                        "schema": "cats_usage_fresh",
+                        "schema_version": 16,
+                        "verified": True,
+                        "version": 1,
+                        "worker_bundle_sha256": context.worker_bundle_sha256,
+                    },
+                    newline=True,
+                )
+            )
+            output.chmod(0o600)
+            return 0, PROOF.USAGE_SCHEMA_SUCCESS_STDOUT.encode("ascii"), b""
+
+        try:
+            PROOF.USAGE_SCHEMA_VERIFIER = executable
+            PROOF._require_root_private_directory = lambda _path, _label: None
+            PROOF._open_release_bound_executable = open_fixture_executable
+            PROOF._run_held_usage_verifier = run_fixture
+            actual = PROOF.SubprocessUsageSchemaV16Verifier(state).verify(
+                dsn_file=dsn,
+                ca_file=ca,
+                schema="cats_usage_fresh",
+                context=context,
+            )
+            if actual.name != PROOF.USAGE_SCHEMA_VERIFICATION_FILE:
+                raise AssertionError("schema adapter receipt name drifted")
+        finally:
+            PROOF.USAGE_SCHEMA_VERIFIER = original_binary
+            PROOF._require_root_private_directory = original_private_directory
+            PROOF._open_release_bound_executable = original_open_executable
+            PROOF._run_held_usage_verifier = original_run
+
+
 def main() -> int:
     if not PROOF.version_one(1) or PROOF.version_one(True):
         raise AssertionError("closed contract version accepted a JSON boolean")
@@ -565,6 +663,7 @@ def main() -> int:
         raise AssertionError("non-closed per-run SHA256SUMS was accepted")
     validate_inventory_is_observation_only()
     validate_release_bound_usage_subprocess()
+    validate_release_bound_usage_schema_subprocess()
     return 0
 
 
