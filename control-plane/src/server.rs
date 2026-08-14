@@ -1525,6 +1525,7 @@ async fn spawn_inner(
                     installed.trust().clone(),
                     release.clone(),
                     Arc::clone(&readiness),
+                    Arc::new(machine.signing_authority.binding().clone()),
                 )?,
             )),
             (None, None) => None,

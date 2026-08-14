@@ -25,13 +25,15 @@ use cats_api::route_grant_v2::{
     RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
 };
 use cats_api::route_signing_operator::{
-    decode_route_v2_rotation_operator_trust, decode_route_v2_signing_command_payload,
-    decode_signed_route_v2_signing_command, encode_route_v2_rotation_operator_trust,
-    encode_route_v2_signing_command_payload, encode_signed_route_v2_signing_command,
-    sign_route_v2_signing_command, verify_signed_route_v2_signing_command,
-    RouteGrantV2SigningAuthorityCommand, RouteGrantV2SigningAuthorityCommandKind,
+    decode_route_v2_rotation_operator_trust, decode_route_v2_signing_authority_current,
+    decode_route_v2_signing_command_payload, decode_signed_route_v2_signing_command,
+    encode_route_v2_rotation_operator_trust, encode_route_v2_signing_command_payload,
+    encode_signed_route_v2_signing_command, sign_route_v2_signing_command,
+    verify_signed_route_v2_signing_command, RouteGrantV2SigningAuthorityCommand,
+    RouteGrantV2SigningAuthorityCommandKind, RouteV2LoadedSignerState,
     RouteV2RotationOperatorCredential, RouteV2RotationOperatorTrust, RouteV2SigningCommandPayload,
     SignedRouteV2SigningCommand, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
+    ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES,
 };
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Hostname, Id,
@@ -156,6 +158,22 @@ pub(super) fn run(cli: &Cli, command: &RuntimeProvisionerRouteV2R1Command) -> Re
             phase,
             output,
         } => return sign_rotation_recovery_phase(cli, input, recovery, phase, output),
+        RuntimeProvisionerRouteV2R1Command::VerifyRotationCurrent {
+            input,
+            recovery,
+            signer_revision,
+            discovery,
+            output,
+        } => {
+            return verify_rotation_current(
+                cli,
+                input,
+                recovery,
+                *signer_revision,
+                discovery,
+                output,
+            )
+        }
     };
     let candidate = Candidate::open_existing(&inputs.root, 0)?;
     let receipt = verify(&candidate, &inputs)?;
@@ -477,6 +495,27 @@ struct RotationRecoveryPhaseSigningReceipt {
     exact_payload_sha256: String,
     exact_signed_command_sha256: String,
     pending_command_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationCurrentVerificationReceipt {
+    version: u32,
+    case_id: String,
+    qualification_run_id: String,
+    source_commit_sha: String,
+    authority_id: String,
+    route_deployment_id: String,
+    rotation_operator_trust_sha256: String,
+    signer_revision: u64,
+    signer_reference_sha256: String,
+    signer_state: String,
+    active_kid: Option<String>,
+    public_key_ring_version: u64,
+    public_key_ring_digest: String,
+    database_current: bool,
+    process_ready: bool,
+    exact_discovery_sha256: String,
 }
 
 struct RotationRecoverySource {
@@ -1624,6 +1663,108 @@ fn sign_rotation_recovery_phase(
             pending_command_path: output.display().to_string(),
         },
     )
+}
+
+fn verify_rotation_current(
+    cli: &Cli,
+    input: &Path,
+    recovery_path: &Path,
+    signer_revision: u64,
+    discovery_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        ROTATION_RECOVERY_REVISIONS.contains(&signer_revision),
+        "current-binding signer revision is outside the prepared recovery lineage"
+    );
+    let candidate = Candidate::open_existing(input, 0)?;
+    let source = load_rotation_recovery_source(&candidate)?;
+    let recovery = RotationRecoveryOutput::open_existing(recovery_path, 0)?;
+    let bundle_bytes = read_file(
+        &recovery.commands,
+        "route-v2-rotation-command-bundle.v1.json",
+        0o600,
+        recovery.expected_uid,
+        MAX_ROTATION_RECOVERY_BUNDLE_BYTES,
+    )?;
+    let bundle: RotationRecoveryCommandBundle = serde_json::from_slice(&bundle_bytes)
+        .context("decode Route v2 recovery bundle for current verification")?;
+    verify_rotation_recovery(&recovery, &source, &bundle.qualification_run_id)?;
+
+    let control_directory = recovery
+        .control
+        .get(&signer_revision)
+        .context("prepared recovery has no requested Control revision")?;
+    let reference_bytes = read_file(
+        control_directory,
+        "signer.v1.json",
+        0o644,
+        recovery.expected_uid,
+        MAX_JSON_BYTES,
+    )?;
+    let expected = decode_route_grant_v2_signer_reference(&reference_bytes)
+        .map_err(|error| anyhow!("decode expected recovery signer: {error:?}"))?;
+    let discovery_bytes = read_user_file(
+        discovery_path,
+        ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES,
+        0o600,
+        true,
+    )?;
+    let discovered = decode_route_v2_signing_authority_current(&discovery_bytes)
+        .map_err(|error| anyhow!("decode canonical Route v2 current discovery: {error}"))?;
+    let (expected_state, expected_active_kid) = match &expected.signer {
+        RouteGrantV2SignerSelection::Active { active_kid, .. } => {
+            (RouteV2LoadedSignerState::Active, Some(active_kid.clone()))
+        }
+        RouteGrantV2SignerSelection::Disabled => (RouteV2LoadedSignerState::Disabled, None),
+    };
+    anyhow::ensure!(
+        discovered.authority_id == source.operator_trust.authority_id
+            && discovered.route_deployment_id == source.operator_trust.route_deployment_id
+            && discovered.release_commit_sha == source.operator_trust.release_commit_sha
+            && discovered.rotation_operator_trust_sha256
+                == source
+                    .operator_trust
+                    .exact_digest()
+                    .map_err(|error| anyhow!("digest Route v2 operator trust: {error}"))?
+            && discovered.loaded_signer_revision == expected.signer_revision
+            && discovered.loaded_signer_reference_sha256
+                == Sha256Digest::from_bytes(Sha256::digest(&reference_bytes).into())
+            && discovered.loaded_signer_state == expected_state
+            && discovered.loaded_active_kid == expected_active_kid
+            && discovered.loaded_public_key_ring_version == expected.public_key_ring_version
+            && discovered.loaded_public_key_ring_digest == expected.public_key_ring_digest
+            && discovered.database_current
+            && discovered.process_ready == (expected_state == RouteV2LoadedSignerState::Active),
+        "Control process does not prove the exact PostgreSQL-current recovery binding"
+    );
+
+    let receipt = RotationCurrentVerificationReceipt {
+        version: 1,
+        case_id: ROTATION_RECOVERY_CASE_ID.to_owned(),
+        qualification_run_id: bundle.qualification_run_id,
+        source_commit_sha: discovered.release_commit_sha,
+        authority_id: discovered.authority_id.to_string(),
+        route_deployment_id: discovered.route_deployment_id.to_string(),
+        rotation_operator_trust_sha256: discovered.rotation_operator_trust_sha256.to_string(),
+        signer_revision: discovered.loaded_signer_revision.get(),
+        signer_reference_sha256: discovered.loaded_signer_reference_sha256.to_string(),
+        signer_state: match discovered.loaded_signer_state {
+            RouteV2LoadedSignerState::Active => "active",
+            RouteV2LoadedSignerState::Disabled => "disabled",
+        }
+        .to_owned(),
+        active_kid: discovered.loaded_active_kid.map(|kid| kid.to_string()),
+        public_key_ring_version: discovered.loaded_public_key_ring_version.get(),
+        public_key_ring_digest: discovered.loaded_public_key_ring_digest.to_string(),
+        database_current: discovered.database_current,
+        process_ready: discovered.process_ready,
+        exact_discovery_sha256: sha256(&discovery_bytes),
+    };
+    let receipt_bytes = serde_json::to_vec(&receipt)
+        .context("encode Route v2 current-binding verification receipt")?;
+    publish_user_file_idempotent(output, &receipt_bytes, 0o600)?;
+    report(cli, &receipt)
 }
 
 struct Inputs {

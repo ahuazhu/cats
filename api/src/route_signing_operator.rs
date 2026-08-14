@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use crate::agent_registration::Ed25519RequestSigner;
 use crate::route_grant_v2::{RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference};
 use crate::runtime_reconciliation::{
-    canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Id, RandomId128,
+    canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, Id, KeyId, RandomId128,
     Sha256Digest, UnixMillis,
 };
 
@@ -25,8 +25,11 @@ pub const ROUTE_V2_SIGNING_COMMAND_PATH: &str = "/v1/internal/route-v2/signing-a
 pub const ROUTE_V2_SIGNING_COMMAND_METHOD: &str = "POST";
 pub const ROUTE_V2_RING_SUCCESSOR_PATH: &str = "/v1/internal/route-v2/public-ring-successors";
 pub const ROUTE_V2_RING_SUCCESSOR_METHOD: &str = "GET";
+pub const ROUTE_V2_SIGNING_CURRENT_PATH: &str = "/v1/internal/route-v2/signing-authority-current";
+pub const ROUTE_V2_SIGNING_CURRENT_METHOD: &str = "GET";
 pub const ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES: usize = 65_536;
 pub const ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES: usize = 16_384;
+pub const ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES: usize = 16_384;
 pub const ROUTE_V2_RING_SUCCESSOR_RESPONSE_MAX_WIRE_BYTES: usize =
     ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES;
 pub const ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE: &str = "application/json";
@@ -257,6 +260,55 @@ pub struct RouteV2SigningCommandReceipt {
     pub committed_at_unix_ms: UnixMillis,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteV2LoadedSignerState {
+    Active,
+    Disabled,
+}
+
+/// Public restart/current-binding discovery for one Control process.
+///
+/// This contains no secret reference or private material. A stale process can
+/// report its loaded descriptor, but `database_current` is true only when that
+/// exact startup-pinned descriptor still equals PostgreSQL current under the
+/// Route v2 machine-authority lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteV2SigningAuthorityCurrent {
+    pub version: ContractVersion,
+    pub authority_id: Id,
+    pub route_deployment_id: Id,
+    pub release_commit_sha: String,
+    pub rotation_operator_trust_sha256: Sha256Digest,
+    pub loaded_signer_revision: Epoch,
+    pub loaded_signer_reference_sha256: Sha256Digest,
+    pub loaded_signer_state: RouteV2LoadedSignerState,
+    pub loaded_active_kid: Option<KeyId>,
+    pub loaded_public_key_ring_version: Epoch,
+    pub loaded_public_key_ring_digest: Sha256Digest,
+    pub database_current: bool,
+    pub process_ready: bool,
+}
+
+impl RouteV2SigningAuthorityCurrent {
+    pub fn validate(&self) -> Result<(), RouteV2RotationOperatorError> {
+        if self.version.get() != 1
+            || !valid_release_commit_sha(&self.release_commit_sha)
+            || matches!(
+                (self.loaded_signer_state, &self.loaded_active_kid),
+                (RouteV2LoadedSignerState::Active, None)
+                    | (RouteV2LoadedSignerState::Disabled, Some(_))
+            )
+            || (self.process_ready
+                && self.loaded_signer_state == RouteV2LoadedSignerState::Disabled)
+        {
+            return Err(RouteV2RotationOperatorError::InvalidCommand);
+        }
+        Ok(())
+    }
+}
+
 impl RouteV2SigningCommandReceipt {
     pub fn validate(&self) -> Result<(), RouteV2RotationOperatorError> {
         if self.version.get() != 1 || !valid_release_commit_sha(&self.release_commit_sha) {
@@ -379,6 +431,32 @@ pub fn decode_route_v2_signing_command_receipt(
         return Err(RouteV2RotationOperatorError::NonCanonical);
     }
     Ok(receipt)
+}
+
+pub fn encode_route_v2_signing_authority_current(
+    current: &RouteV2SigningAuthorityCurrent,
+) -> Result<Vec<u8>, RouteV2RotationOperatorError> {
+    current.validate()?;
+    let bytes =
+        serde_json::to_vec(current).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_route_v2_signing_authority_current(
+    bytes: &[u8],
+) -> Result<RouteV2SigningAuthorityCurrent, RouteV2RotationOperatorError> {
+    if bytes.is_empty() || bytes.len() > ROUTE_V2_SIGNING_CURRENT_RESPONSE_MAX_WIRE_BYTES {
+        return Err(RouteV2RotationOperatorError::InvalidCommand);
+    }
+    let current: RouteV2SigningAuthorityCurrent =
+        serde_json::from_slice(bytes).map_err(|_| RouteV2RotationOperatorError::InvalidCommand)?;
+    if encode_route_v2_signing_authority_current(&current)? != bytes {
+        return Err(RouteV2RotationOperatorError::NonCanonical);
+    }
+    Ok(current)
 }
 
 /// Canonical, percent-free discovery query. All three value alphabets exclude
@@ -614,6 +692,28 @@ mod tests {
         assert_eq!(
             decode_signed_route_v2_signing_command(&noncanonical),
             Err(RouteV2RotationOperatorError::NonCanonical)
+        );
+
+        let trust_digest = trust.exact_digest().unwrap();
+        let current = RouteV2SigningAuthorityCurrent {
+            version: ContractVersion::V1,
+            authority_id: trust.authority_id,
+            route_deployment_id: trust.route_deployment_id,
+            release_commit_sha: trust.release_commit_sha,
+            rotation_operator_trust_sha256: trust_digest,
+            loaded_signer_revision: Epoch::new(2).unwrap(),
+            loaded_signer_reference_sha256: Sha256Digest::from_bytes([4; 32]),
+            loaded_signer_state: RouteV2LoadedSignerState::Disabled,
+            loaded_active_kid: None,
+            loaded_public_key_ring_version: Epoch::new(2).unwrap(),
+            loaded_public_key_ring_digest: Sha256Digest::from_bytes([5; 32]),
+            database_current: true,
+            process_ready: false,
+        };
+        let current_bytes = encode_route_v2_signing_authority_current(&current).unwrap();
+        assert_eq!(
+            decode_route_v2_signing_authority_current(&current_bytes).unwrap(),
+            current
         );
     }
 }

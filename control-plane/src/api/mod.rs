@@ -794,6 +794,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/internal/route-v2/public-ring-successors",
             get(route_signing_operator::discover_successor)
                 .fallback(route_signing_operator::discover_successor),
+        )
+        .route(
+            "/v1/internal/route-v2/signing-authority-current",
+            get(route_signing_operator::discover_current)
+                .fallback(route_signing_operator::discover_current),
         );
 
     Router::new()

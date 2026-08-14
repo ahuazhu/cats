@@ -1,8 +1,10 @@
 //! PostgreSQL current binding for the independent Route Grant v2 signer.
 //!
-//! Startup remains revision-one/exact-replay only. Explicit typed commands
-//! advance immutable signer and public-ring lineage under the same singleton
-//! barrier held by every resolve snapshot.
+//! Startup inserts only a revision-one root into an empty Store; once a
+//! lineage exists, every process startup accepts only an exact replay of the
+//! PostgreSQL current revision. Explicit typed commands alone advance the
+//! immutable signer/public-ring lineage under the singleton barrier held by
+//! every resolve snapshot.
 
 use cats_api::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
@@ -30,7 +32,6 @@ use postgres::{Row, Transaction};
 use sha2::{Digest as _, Sha256};
 
 use super::gateway_identity::lock_route_v2_machine_authority_exclusive;
-#[cfg(test)]
 use super::gateway_identity::lock_route_v2_machine_authority_shared;
 use super::pg_codec::PgBigInt;
 use super::placement_policy::load_policy_unlocked;
@@ -293,8 +294,7 @@ impl Store {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn route_grant_v2_signer_is_current_for_test(
+    pub(crate) fn route_grant_v2_signer_is_current(
         &self,
         binding: &RouteGrantV2SignerBinding,
     ) -> Result<bool> {
@@ -302,6 +302,14 @@ impl Store {
             lock_route_v2_machine_authority_shared(transaction)?;
             route_grant_v2_signer_is_current_in(transaction, binding)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_grant_v2_signer_is_current_for_test(
+        &self,
+        binding: &RouteGrantV2SignerBinding,
+    ) -> Result<bool> {
+        self.route_grant_v2_signer_is_current(binding)
     }
 }
 

@@ -591,6 +591,24 @@ pub enum RuntimeProvisionerRouteV2R1Command {
         #[arg(long)]
         output: std::path::PathBuf,
     },
+    /// Verify a restarted Control process loaded PostgreSQL current exactly.
+    VerifyRotationCurrent {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only prepared recovery artifact directory.
+        #[arg(long)]
+        recovery: std::path::PathBuf,
+        /// Exact expected signer revision in the prepared recovery lineage.
+        #[arg(long)]
+        signer_revision: u64,
+        /// Root-only canonical current-binding discovery response.
+        #[arg(long)]
+        discovery: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -3002,6 +3020,24 @@ mod tests {
             "disable",
             "--output",
             "/approved/pending/disable.command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-rotation-current",
+            "--input",
+            "/approved/route-v2-r1",
+            "--recovery",
+            "/approved/route-v2-recovery",
+            "--signer-revision",
+            "8",
+            "--discovery",
+            "/approved/current-r8.json",
+            "--output",
+            "/approved/current-r8.receipt.json",
         ])
         .is_ok());
     }

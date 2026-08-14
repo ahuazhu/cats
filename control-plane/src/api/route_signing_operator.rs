@@ -14,14 +14,18 @@ use axum::response::{IntoResponse, Response};
 use sha2::Digest as _;
 
 use cats_api::error::{ApiError, ErrorCode};
+use cats_api::route_grant_v2::RouteGrantV2SignerSelection;
 use cats_api::route_signing_operator::{
-    decode_signed_route_v2_signing_command, encode_route_v2_signing_command_receipt,
-    verify_signed_route_v2_signing_command, RouteGrantV2SigningAuthorityCommandResult,
-    RouteV2RotationOperatorTrust, RouteV2SigningCommandReceipt, SignedRouteV2SigningCommand,
-    VerifiedRouteV2RotationOperatorPrincipal, ROUTE_V2_RING_SUCCESSOR_METHOD,
-    ROUTE_V2_RING_SUCCESSOR_PATH, ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE,
-    ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES, ROUTE_V2_SIGNING_COMMAND_METHOD,
-    ROUTE_V2_SIGNING_COMMAND_PATH, ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES,
+    decode_signed_route_v2_signing_command, encode_route_v2_signing_authority_current,
+    encode_route_v2_signing_command_receipt, verify_signed_route_v2_signing_command,
+    RouteGrantV2SigningAuthorityCommandResult, RouteV2LoadedSignerState,
+    RouteV2RotationOperatorTrust, RouteV2SigningAuthorityCurrent, RouteV2SigningCommandReceipt,
+    SignedRouteV2SigningCommand, VerifiedRouteV2RotationOperatorPrincipal,
+    ROUTE_V2_RING_SUCCESSOR_METHOD, ROUTE_V2_RING_SUCCESSOR_PATH,
+    ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE, ROUTE_V2_SIGNING_COMMAND_MAX_WIRE_BYTES,
+    ROUTE_V2_SIGNING_COMMAND_METHOD, ROUTE_V2_SIGNING_COMMAND_PATH,
+    ROUTE_V2_SIGNING_COMMAND_RESPONSE_MAX_WIRE_BYTES, ROUTE_V2_SIGNING_CURRENT_METHOD,
+    ROUTE_V2_SIGNING_CURRENT_PATH,
 };
 use cats_api::runtime_reconciliation::{Epoch, Id, Sha256Digest};
 
@@ -153,6 +157,8 @@ pub(crate) struct RouteV2SigningOperatorService {
     trust: RouteV2RotationOperatorTrust,
     expected_release_commit_sha: String,
     readiness: Arc<crate::server::ReadinessLatch>,
+    loaded_signer_binding:
+        Arc<crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding>,
     global: Arc<tokio::sync::Semaphore>,
     operator: Arc<tokio::sync::Semaphore>,
     accepting: tokio::sync::watch::Sender<bool>,
@@ -165,6 +171,9 @@ impl RouteV2SigningOperatorService {
         trust: RouteV2RotationOperatorTrust,
         expected_release_commit_sha: String,
         readiness: Arc<crate::server::ReadinessLatch>,
+        loaded_signer_binding: Arc<
+            crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding,
+        >,
     ) -> anyhow::Result<Self> {
         trust.validate()?;
         anyhow::ensure!(
@@ -177,6 +186,7 @@ impl RouteV2SigningOperatorService {
             trust,
             expected_release_commit_sha,
             readiness,
+            loaded_signer_binding,
             global: Arc::new(tokio::sync::Semaphore::new(GLOBAL_IN_FLIGHT)),
             operator: Arc::new(tokio::sync::Semaphore::new(OPERATOR_IN_FLIGHT)),
             accepting,
@@ -332,6 +342,51 @@ impl RouteV2SigningOperatorService {
                 )
             })
             .transpose()
+    }
+
+    async fn load_current(
+        &self,
+        deadline: Instant,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Vec<u8>, ApiError> {
+        let store = Arc::clone(&self.store);
+        let binding = Arc::clone(&self.loaded_signer_binding);
+        let read = store.execute(move |store| store.route_grant_v2_signer_is_current(&binding));
+        let database_current =
+            match await_before_deadline_or_shutdown(deadline, &mut shutdown, read).await {
+                AwaitOutcome::Completed(result) => result?,
+                AwaitOutcome::Deadline | AwaitOutcome::Shutdown => {
+                    return Err(ApiError::unavailable(
+                        "Route v2 current-binding discovery is temporarily unavailable",
+                    ));
+                }
+            };
+        let reference = self.loaded_signer_binding.reference();
+        let (loaded_signer_state, loaded_active_kid) = match &reference.signer {
+            RouteGrantV2SignerSelection::Active { active_kid, .. } => {
+                (RouteV2LoadedSignerState::Active, Some(active_kid.clone()))
+            }
+            RouteGrantV2SignerSelection::Disabled => (RouteV2LoadedSignerState::Disabled, None),
+        };
+        encode_route_v2_signing_authority_current(&RouteV2SigningAuthorityCurrent {
+            version: cats_api::runtime_reconciliation::ContractVersion::V1,
+            authority_id: self.trust.authority_id.clone(),
+            route_deployment_id: self.trust.route_deployment_id.clone(),
+            release_commit_sha: self.expected_release_commit_sha.clone(),
+            rotation_operator_trust_sha256: self
+                .trust
+                .exact_digest()
+                .map_err(|_| ApiError::internal("Route v2 operator trust digest failed"))?,
+            loaded_signer_revision: reference.signer_revision,
+            loaded_signer_reference_sha256: self.loaded_signer_binding.reference_sha256().clone(),
+            loaded_signer_state,
+            loaded_active_kid,
+            loaded_public_key_ring_version: reference.public_key_ring_version,
+            loaded_public_key_ring_digest: reference.public_key_ring_digest.clone(),
+            database_current,
+            process_ready: self.readiness.is_ready(),
+        })
+        .map_err(|_| ApiError::internal("encode Route v2 current-binding discovery"))
     }
 }
 
@@ -616,6 +671,80 @@ pub(super) async fn discover_successor(
         }
         Err(error) => {
             tracing::error!(error = %error, "Route v2 ring delivery Store failed closed");
+            state.readiness.poison();
+            temporarily_unavailable()
+        }
+    }
+}
+
+pub(super) async fn discover_current(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let deadline = Instant::now() + DISCOVERY_DEADLINE;
+    let Some(service) = state.route_v2_signing_operator.clone() else {
+        return temporarily_unavailable();
+    };
+    let mut shutdown = service.subscribe();
+    if !*shutdown.borrow() {
+        return temporarily_unavailable();
+    }
+    if request.uri().path() != ROUTE_V2_SIGNING_CURRENT_PATH || request.uri().query().is_some() {
+        return error_response(StatusCode::BAD_REQUEST, INVALID_TARGET, &[]);
+    }
+    if request.method().as_str() != ROUTE_V2_SIGNING_CURRENT_METHOD {
+        return error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            METHOD_NOT_ALLOWED,
+            &[(
+                header::ALLOW,
+                HeaderValue::from_static(ROUTE_V2_SIGNING_CURRENT_METHOD),
+            )],
+        );
+    }
+    if has_forbidden_auth(request.headers()) {
+        return authentication_failed();
+    }
+    if !accepts_json(request.headers()) {
+        return error_response(StatusCode::NOT_ACCEPTABLE, NOT_ACCEPTABLE, &[]);
+    }
+    if request.headers().contains_key(header::CONTENT_TYPE)
+        || request.headers().contains_key(header::CONTENT_ENCODING)
+        || declared_body_exceeds(request.headers(), 0)
+    {
+        return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+    }
+    let global = match Arc::clone(&service.global).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return temporarily_unavailable(),
+    };
+    match await_before_deadline_or_shutdown(
+        deadline,
+        &mut shutdown,
+        to_bytes(request.into_body(), 0),
+    )
+    .await
+    {
+        AwaitOutcome::Completed(Ok(body)) if body.is_empty() => {}
+        AwaitOutcome::Completed(_) => {
+            return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, &[]);
+        }
+        AwaitOutcome::Deadline | AwaitOutcome::Shutdown => return temporarily_unavailable(),
+    };
+    let result = service.load_current(deadline, shutdown).await;
+    drop(global);
+    match result {
+        Ok(bytes) => json_response(StatusCode::OK, bytes),
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
+            ) =>
+        {
+            temporarily_unavailable()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Route v2 current-binding Store failed closed");
             state.readiness.poison();
             temporarily_unavailable()
         }
