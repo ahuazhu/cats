@@ -256,6 +256,14 @@ fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
     assert!(platform.contains("for_each = toset(module.network.private_subnet_ids)"));
     assert!(platform.contains("resource \"aws_efs_backup_policy\" \"object_write_spool\""));
 
+    let mount_targets = between(
+        &platform,
+        "resource \"aws_efs_mount_target\" \"object_write_spool\"",
+        "resource \"aws_efs_access_point\" \"object_write_spool\"",
+    );
+    assert!(mount_targets
+        .contains("depends_on = [aws_efs_file_system_policy.object_write_spool]"));
+
     let file_system_policy = between(
         &platform,
         "data \"aws_iam_policy_document\" \"object_write_spool_client\"",

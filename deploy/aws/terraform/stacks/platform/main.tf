@@ -717,6 +717,11 @@ resource "aws_efs_mount_target" "object_write_spool" {
   file_system_id  = aws_efs_file_system.object_write_spool.id
   subnet_id       = each.value
   security_groups = [aws_security_group.object_write_spool.id]
+
+  # EFS permits anonymous NFS clients while no file-system policy exists.
+  # Do not create a reachable mount target until the exact IAM/TLS/access-point
+  # policy is durable.
+  depends_on = [aws_efs_file_system_policy.object_write_spool]
 }
 
 resource "aws_efs_access_point" "object_write_spool" {
