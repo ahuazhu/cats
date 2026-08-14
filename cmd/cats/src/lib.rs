@@ -647,7 +647,7 @@ pub enum RuntimeProvisionerRouteV2R1Command {
     },
     /// Sign one deployment-side post-apply receipt in an independent domain.
     SignControlRolloutApplyReceipt {
-        /// Fixed public operator trust JSON (mode 0644 under a root-only directory).
+        /// Fixed owner-controlled operator trust JSON (release 0644 or staged 0600).
         #[arg(long)]
         trust: std::path::PathBuf,
         /// Root-only operator PKCS#8 v2 PEMs needed by the trust threshold.
@@ -662,7 +662,7 @@ pub enum RuntimeProvisionerRouteV2R1Command {
     },
     /// Verify one immutable deployment receipt against its exact recovery phase.
     VerifyControlRolloutApplyReceipt {
-        /// Fixed public operator trust JSON (mode 0644 under a root-only directory).
+        /// Fixed owner-controlled operator trust JSON (release 0644 or staged 0600).
         #[arg(long)]
         trust: std::path::PathBuf,
         /// Root-only unsigned seven-phase command bundle.

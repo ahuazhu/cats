@@ -98,6 +98,19 @@ def main() -> int:
 
 
 def produce(args: argparse.Namespace) -> None:
+    deployment_operator_path = Path(os.path.abspath(__file__))
+    validator_path = Path(os.path.abspath(plan_validator.__file__))
+    expected_validator_path = deployment_operator_path.with_name(
+        "validate_route_v2_control_rollout_plan.py"
+    )
+    if validator_path != expected_validator_path:
+        raise Rejected("saved-plan validator is not the exact sibling release input")
+    deployment_operator_bytes = plan_validator.checked_file(
+        deployment_operator_path, private=False, executable=True
+    )
+    validator_bytes = plan_validator.checked_file(
+        validator_path, private=False, executable=True
+    )
     terraform_bytes = plan_validator.checked_file(
         args.terraform, private=False, executable=True
     )
@@ -199,6 +212,9 @@ def produce(args: argparse.Namespace) -> None:
         outcome,
         current_bytes,
         current,
+        deployment_operator_bytes,
+        validator_bytes,
+        cats_bytes,
     )
     payload_bytes = compact_bytes(payload)
     payload_path = state_directory / f"{args.phase}.apply-receipt-payload.v1.json"
@@ -212,6 +228,21 @@ def produce(args: argparse.Namespace) -> None:
         signed_path,
         cats_bytes,
     )
+    if (
+        digest(
+            plan_validator.checked_file(
+                deployment_operator_path, private=False, executable=True
+            )
+        )
+        != digest(deployment_operator_bytes)
+        or digest(
+            plan_validator.checked_file(
+                validator_path, private=False, executable=True
+            )
+        )
+        != digest(validator_bytes)
+    ):
+        raise Rejected("deployment operator release inputs changed during execution")
     signed_bytes = checked_file(
         signed_path, private=True, maximum=MAX_HTTP_BYTES
     )
@@ -757,6 +788,9 @@ def build_apply_payload(
     outcome: str,
     current_bytes: bytes,
     current: dict[str, Any],
+    deployment_operator_bytes: bytes,
+    validator_bytes: bytes,
+    cats_bytes: bytes,
 ) -> dict[str, Any]:
     successor = phase["successor"]
     signer = successor["signer"]
@@ -785,6 +819,11 @@ def build_apply_payload(
         "terraform_executable_sha256": plan_receipt[
             "terraform_executable_sha256"
         ],
+        "deployment_operator_executable_sha256": digest(
+            deployment_operator_bytes
+        ),
+        "saved_plan_validator_executable_sha256": digest(validator_bytes),
+        "receipt_signer_executable_sha256": digest(cats_bytes),
         "successor_secret_name": rollout["secret_name"],
         "successor_secret_manifest_sha256": rollout[
             "secret_manifest_sha256"

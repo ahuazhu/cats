@@ -621,6 +621,12 @@ struct ControlRolloutApplyVerificationReceipt {
     route_deployment_id: String,
     rotation_operator_trust_sha256: String,
     saved_plan_sha256: String,
+    terraform_show_json_sha256: String,
+    plan_validation_receipt_sha256: String,
+    terraform_executable_sha256: String,
+    deployment_operator_executable_sha256: String,
+    saved_plan_validator_executable_sha256: String,
+    receipt_signer_executable_sha256: String,
     successor_secret_name: String,
     successor_secret_manifest_sha256: String,
     successor_signer_reference_sha256: String,
@@ -631,6 +637,9 @@ struct ControlRolloutApplyVerificationReceipt {
     apply_started_at_unix_ms: u64,
     apply_completed_at_unix_ms: u64,
     apply_outcome: String,
+    terraform_apply_stdout_sha256: String,
+    terraform_apply_stderr_sha256: String,
+    postcondition_discovery_sha256: String,
     exact_signed_receipt_sha256: String,
     terminal_marker: String,
 }
@@ -1918,7 +1927,11 @@ fn load_staged_rotation_contract(
 fn load_staged_rotation_trust(
     trust_path: &Path,
 ) -> Result<(RouteV2RotationOperatorTrust, Vec<u8>)> {
-    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0o644, false)?;
+    // The release artifact is public 0644, while the qualification runner
+    // stages every config below its root-only 0700 directory as 0600. Both
+    // are owner-controlled and non-writable by group/other; the exact bytes,
+    // release SHA and digest remain the authority.
+    let trust_bytes = read_user_file(trust_path, MAX_JSON_BYTES, 0, false)?;
     let trust = decode_route_v2_rotation_operator_trust(&trust_bytes)
         .map_err(|error| anyhow!("decode staged Route rotation trust: {error}"))?;
     Ok((trust, trust_bytes))
@@ -2543,6 +2556,16 @@ fn verify_control_rollout_apply_receipt(
         route_deployment_id: payload.route_deployment_id.to_string(),
         rotation_operator_trust_sha256: payload.rotation_operator_trust_sha256.to_string(),
         saved_plan_sha256: payload.saved_plan_sha256.to_string(),
+        terraform_show_json_sha256: payload.terraform_show_json_sha256.to_string(),
+        plan_validation_receipt_sha256: payload.plan_validation_receipt_sha256.to_string(),
+        terraform_executable_sha256: payload.terraform_executable_sha256.to_string(),
+        deployment_operator_executable_sha256: payload
+            .deployment_operator_executable_sha256
+            .to_string(),
+        saved_plan_validator_executable_sha256: payload
+            .saved_plan_validator_executable_sha256
+            .to_string(),
+        receipt_signer_executable_sha256: payload.receipt_signer_executable_sha256.to_string(),
         successor_secret_name: payload.successor_secret_name.clone(),
         successor_secret_manifest_sha256: payload.successor_secret_manifest_sha256.to_string(),
         successor_signer_reference_sha256: payload.successor_signer_reference_sha256.to_string(),
@@ -2566,6 +2589,9 @@ fn verify_control_rollout_apply_receipt(
             }
         }
         .to_owned(),
+        terraform_apply_stdout_sha256: payload.terraform_apply_stdout_sha256.to_string(),
+        terraform_apply_stderr_sha256: payload.terraform_apply_stderr_sha256.to_string(),
+        postcondition_discovery_sha256: payload.postcondition_discovery_sha256.to_string(),
         exact_signed_receipt_sha256: sha256(&receipt_bytes),
         terminal_marker: payload.terminal_marker.clone(),
     };
