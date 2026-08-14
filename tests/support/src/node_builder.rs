@@ -1,7 +1,7 @@
 //! Node-runtime fixtures without a dependency back to `cats-node-agent`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 
 use cats_storage::{AdapterConfig, AdapterSelection};
 
@@ -232,6 +232,48 @@ pub fn workspace_example(package: &str, name: &str) -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Build a launcher for the explicit authorized SQLite block server used by
+/// legacy `NodeRuntime` integration tests.
+///
+/// The production daemon has no unsigned serving mode. The wrapper keeps the
+/// complete test-only grant inputs out of process-global test environment and
+/// passes them only to children started through the returned fixture path.
+pub fn sqlite_node_runtime_blockd_fixture(
+    root: &Path,
+    volume_size_bytes: u64,
+    attachment_epoch: i64,
+) -> PathBuf {
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    static TEST_BLOCKD: OnceLock<PathBuf> = OnceLock::new();
+
+    assert!(volume_size_bytes > 0, "test volume size must be positive");
+    assert!(
+        attachment_epoch > 0,
+        "test attachment epoch must be positive"
+    );
+
+    let fixture_dir = root.join("sqlite-node-runtime-blockd-fixture");
+    std::fs::create_dir_all(&fixture_dir).expect("create SQLite blockd fixture directory");
+    let server_link = fixture_dir.join("sqlite-node-runtime-test-server");
+    let server = TEST_BLOCKD
+        .get_or_init(|| workspace_example("cats-blockd", "sqlite_node_runtime_test_server"));
+    symlink(server, &server_link).expect("link SQLite blockd test server");
+
+    let launcher = fixture_dir.join("cats-blockd");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nexport CATS_TEST_BLOCKD_VOLUME_SIZE_BYTES={volume_size_bytes}\nexport CATS_TEST_BLOCKD_ATTACHMENT_EPOCH={attachment_epoch}\nexec \"${{0%/*}}/sqlite-node-runtime-test-server\" \"$@\"\n"
+    );
+    std::fs::write(&launcher, script).expect("write SQLite blockd test launcher");
+    let mut permissions = std::fs::metadata(&launcher)
+        .expect("inspect SQLite blockd test launcher")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&launcher, permissions)
+        .expect("make SQLite blockd test launcher executable");
+    launcher
 }
 
 #[cfg(test)]

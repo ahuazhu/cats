@@ -9,7 +9,8 @@ pub mod sqlite_volume_authority;
 pub mod storage_contract;
 
 pub use node_builder::{
-    workspace_bin, workspace_example, NodeConfigBuilder, NodeConfigParts, TempDirFixture,
+    sqlite_node_runtime_blockd_fixture, workspace_bin, workspace_example, NodeConfigBuilder,
+    NodeConfigParts, TempDirFixture,
 };
 pub use sqlite_volume_authority::{
     install_sqlite_grant, prepare_sqlite_authorized_serving, SqliteTestVolumeAuthority,

@@ -19,7 +19,7 @@ use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_node_agent::admission::WakeBudget;
 use cats_node_agent::runtime::NodeRuntime;
-use cats_test_support::{fake_node_config, TempDirFixture};
+use cats_test_support::{fake_node_config, sqlite_node_runtime_blockd_fixture, TempDirFixture};
 
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 const MEMORY_MIB: u64 = 256;
@@ -32,7 +32,9 @@ struct Env {
 fn env(budget: WakeBudget) -> Env {
     let dir = TempDirFixture::new();
     let builder = dir.node_config("node_wake");
-    let runtime = NodeRuntime::new(fake_node_config!(builder, wake_budget = budget)).unwrap();
+    let mut config = fake_node_config!(builder, wake_budget = budget);
+    config.blockd_bin = sqlite_node_runtime_blockd_fixture(dir.path(), SIZE, 1);
+    let runtime = NodeRuntime::new(config).unwrap();
     Env {
         _dir: dir,
         runtime: Arc::new(runtime),
@@ -44,7 +46,7 @@ fn grant(cat: &str) -> VolumeGrant {
         disk_id: "root".into(),
         volume_id: format!("vol_{cat}"),
         attachment_id: format!("att_{cat}"),
-        epoch: 0,
+        epoch: 1,
         size_bytes: SIZE,
         mount_path: "/".into(),
         durability: Default::default(),
