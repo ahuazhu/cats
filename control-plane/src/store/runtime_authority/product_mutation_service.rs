@@ -1156,6 +1156,10 @@ fn http_result(result: ApiIdempotencyResult) -> ProductMutationHttpResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::runtime_reconciliation::{
+        DiskKind, Durability, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
+        GuestDeviceIdentity, HostPath, RandomId128, VolumeAccess, VolumeAcquire, VolumeIntent,
+    };
 
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()
@@ -1282,9 +1286,36 @@ mod tests {
             71,
             "create-lifecycle-app",
         );
+        let mut current = create.candidate.desired.clone();
+        current.volumes.push(VolumeIntent {
+            volume_intent_id: id("volume-intent_persistent"),
+            disk_id: id("disk_persistent"),
+            volume_id: id("volume_persistent"),
+            attachment_id: id("attachment_persistent"),
+            size_bytes: 4 * 1024 * 1024,
+            disk_kind: DiskKind::Persistent,
+            access: VolumeAccess::ReadWriteOnce,
+            durability: Durability::Strict,
+            guest_device: GuestDeviceIdentity {
+                serial: id("cats-persistent"),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: RandomId128::new("0000000000000000000000000000d001").unwrap(),
+                expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(Ext4MountIntent {
+                filesystem_uuid: RandomId128::new("0000000000000000000000000000d002").unwrap(),
+                mount_path: HostPath::new("/data").unwrap(),
+                initialization: FilesystemInitialization::Existing,
+            }),
+        });
+        current.spec_digest = Sha256Digest::from_bytes([0; 32]);
+        current.spec_digest = spec_digest(&current).unwrap();
         let endpoint_records = vec![create.candidate.endpoint.clone()];
         let snapshot = LifecycleSnapshot {
-            current: create.candidate.desired.clone(),
+            current: current.clone(),
             endpoint_records: endpoint_records.clone(),
             placement_snapshots: Vec::new(),
         };
@@ -1309,7 +1340,7 @@ mod tests {
             None,
             Some(&delete_id),
             id("op_delete"),
-            create.candidate.desired.runtime.guest_config_digest.clone(),
+            current.runtime.guest_config_digest.clone(),
         )
         .unwrap();
         assert_eq!(delete.desired.target, RuntimeTarget::Deleted);
@@ -1327,6 +1358,11 @@ mod tests {
             VolumeDisposition::DeleteDisposableRoot { delete_id: ref actual }
                 if actual == &delete_id
         ));
+        assert_eq!(delete.desired.volumes[1].disk_kind, DiskKind::Persistent);
+        assert_eq!(
+            delete.desired.volumes[1].disposition,
+            VolumeDisposition::DetachRetained
+        );
         assert_eq!(delete.endpoint_records, endpoint_records);
     }
 

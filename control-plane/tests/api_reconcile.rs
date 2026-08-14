@@ -2156,8 +2156,8 @@ async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
 async fn rwo_second_bind_is_rejected() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("cat-a", None).await;
-    ctx.create_cat("cat-b", None).await;
+    let cat_a = ctx.create_cat("cat-a", None).await.cat;
+    let cat_b = ctx.create_cat("cat-b", None).await.cat;
     ctx.wait_observed("cat-a", ObservedState::Running).await;
     ctx.wait_observed("cat-b", ObservedState::Running).await;
 
@@ -2178,57 +2178,56 @@ async fn rwo_second_bind_is_rejected() {
         .unwrap();
     assert_eq!(disk.state, DiskState::Available);
 
-    let mount = |cat: &str| serde_json::json!({ "cat_id": cat, "mount_at": "/data" });
-    let r1 = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&mount("cat-a"))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        r1.status().is_success(),
-        "first mount failed: {}",
-        r1.status()
-    );
+    // The V1 HTTP writer is intentionally absent even from the retired product
+    // fixture. Keep that cutover boundary closed while the fixture's existing
+    // Store seam characterizes the old product model below.
+    for verb in ["mount", "unmount"] {
+        let response = ctx
+            .http
+            .post(ctx.ws_url(&format!("/disks/shared/actions/{verb}")))
+            .bearer_auth("dev-admin-token")
+            .json(&serde_json::json!({"cat_id": "cat-a", "mount_at": "/data"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "retired {verb} route resurfaced");
+    }
 
-    let r2 = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&mount("cat-b"))
-        .send()
-        .await
+    let first = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &cat_a.id, "/data")
         .unwrap();
-    assert_eq!(r2.status(), 409, "RWO second mount must conflict");
+    assert_eq!(first.disk_id, disk.id);
+    assert_eq!(first.cat_id, cat_a.id);
 
-    // Deleting a bound disk is refused; unmount frees it.
-    let del = ctx
+    let conflict = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &cat_b.id, "/data")
+        .unwrap_err();
+    assert_eq!(conflict.code, cats_api::error::ErrorCode::Conflict);
+
+    let delete_bound = ctx
         .http
         .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(del.status(), 412);
-    let um = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/unmount"))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert!(um.status().is_success());
-    let del = ctx
+    assert_eq!(delete_bound.status(), 412);
+
+    ctx.cp.state.store.unbind_disk(&disk.id).unwrap();
+    let delete_available = ctx
         .http
         .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(del.status(), 204);
+    assert_eq!(delete_available.status(), 204);
 }
 
 #[tokio::test]
@@ -2844,10 +2843,11 @@ async fn exec_retries_a_transient_suspend_conflict() {
 async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let ctx = Ctx::new().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("dev", None).await;
+    let created = ctx.create_cat("dev", None).await;
     ctx.wait_observed("dev", ObservedState::Running).await;
-    // Attach a persistent disk.
-    ctx.http
+
+    let disk: Disk = ctx
+        .http
         .post(ctx.ws_url("/disks"))
         .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
@@ -2857,14 +2857,18 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         })
         .send()
         .await
-        .unwrap();
-    ctx.http
-        .post(ctx.ws_url("/disks/keep/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({"cat_id": "dev", "mount_at": "/data"}))
-        .send()
+        .unwrap()
+        .json()
         .await
         .unwrap();
+    let binding = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &created.cat.id, "/data")
+        .unwrap();
+    assert_eq!(binding.disk_id, disk.id);
+    assert_eq!(binding.cat_id, created.cat.id);
 
     let resp = ctx
         .http
