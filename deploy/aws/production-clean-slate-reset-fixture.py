@@ -550,11 +550,12 @@ def fixture_cutover_authority(
         },
         "fixture cutover evidence",
     )
+    if value["reset_id"] != config.reset_id:
+        raise reset.ResetError("fixture cutover evidence reset_id drifted")
     if (
         value["kind"] != reset.KIND_GREEN
         or type(value["version"]) is not int
         or value["version"] != 1
-        or value["reset_id"] != config.reset_id
         or value["qualified_release_commit"] != config.release_commit
         or value["qualified_artifact_sha256"] != config.artifact_sha256
         or value["aws_account_id"] != config.aws_account_id
