@@ -7,9 +7,10 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -31,6 +32,8 @@ pub const DEFAULT_WORKERS: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 // One slot for each globally admitted signed-runtime request is sufficient
 // even if all of them select the same worker. Other callers then backpressure
 // instead of growing synchronous database work without a bound.
@@ -87,6 +90,8 @@ pub struct PostgresUsageStore {
     workers: Vec<tokio_mpsc::Sender<Job>>,
     next_worker: AtomicUsize,
     schema: String,
+    poisoned: Arc<AtomicBool>,
+    dispatch_timeout: Duration,
 }
 
 impl PostgresUsageStore {
@@ -105,6 +110,24 @@ impl PostgresUsageStore {
         schema: &str,
         workers: usize,
     ) -> Result<Self> {
+        Self::connect_from_with_timeouts(
+            dsn,
+            ca_file,
+            schema,
+            workers,
+            WORKER_STARTUP_TIMEOUT,
+            DISPATCH_TIMEOUT,
+        )
+    }
+
+    fn connect_from_with_timeouts(
+        dsn: &DsnSource,
+        ca_file: Option<&str>,
+        schema: &str,
+        workers: usize,
+        worker_startup_timeout: Duration,
+        dispatch_timeout: Duration,
+    ) -> Result<Self> {
         validate_schema_name(schema)?;
         if !(1..=64).contains(&workers) {
             return Err(MeteringError::Invalid(
@@ -118,12 +141,15 @@ impl PostgresUsageStore {
                 ca_file.map(str::to_string),
                 schema.to_string(),
                 worker_index,
+                worker_startup_timeout,
             )?);
         }
         Ok(Self {
             workers: senders,
             next_worker: AtomicUsize::new(0),
             schema: schema.to_string(),
+            poisoned: Arc::new(AtomicBool::new(false)),
+            dispatch_timeout,
         })
     }
 
@@ -134,27 +160,77 @@ impl PostgresUsageStore {
     where
         T: Send + 'static,
     {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(poisoned_store_error());
+        }
+        let deadline = Instant::now()
+            .checked_add(self.dispatch_timeout)
+            .ok_or_else(poisoned_store_error)?;
+        let mut poison_on_drop = PoisonStoreOnDrop::new(Arc::clone(&self.poisoned));
         let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        self.workers[index]
-            .send(Box::new(move |client| {
-                // A request that timed out while this job waited in the
-                // bounded queue has dropped its receiver. Do not perform its
-                // database effect after cancellation.
-                if result_tx.is_closed() {
-                    return;
-                }
-                let _ = result_tx.send(match client {
-                    Ok(client) => operation(client),
-                    Err(error) => Err(error),
-                });
-            }))
+        let poisoned = Arc::clone(&self.poisoned);
+        let job = Box::new(move |client| {
+            // A request that timed out while this job waited in the
+            // bounded queue has dropped its receiver. Do not perform its
+            // database effect after cancellation.
+            if poisoned.load(Ordering::Acquire) || result_tx.is_closed() {
+                return;
+            }
+            let _ = result_tx.send(match client {
+                Ok(client) => operation(client),
+                Err(error) => Err(error),
+            });
+        });
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.workers[index].send(job),
+        )
+        .await
+        .map_err(|_| poisoned_store_error())?
+        .map_err(|_| poisoned_store_error())?;
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), result_rx)
             .await
-            .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited".to_string()))?;
-        result_rx.await.map_err(|_| {
-            MeteringError::Store("PostgreSQL usage operation was canceled".to_string())
-        })?
+            .map_err(|_| poisoned_store_error())?
+            .map_err(|_| poisoned_store_error())?;
+        poison_on_drop.disarm();
+        result
     }
+}
+
+struct PoisonStoreOnDrop {
+    poisoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl PoisonStoreOnDrop {
+    fn new(poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            poisoned,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PoisonStoreOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            // Synchronous postgres work cannot be cancelled once it starts.
+            // Fail the complete store closed so at most the fixed worker set
+            // can remain stuck and a daemon restart is the only recovery.
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn poisoned_store_error() -> MeteringError {
+    MeteringError::Store(
+        "PostgreSQL usage store timed out or lost a worker; restart required".to_string(),
+    )
 }
 
 impl UsageStore for PostgresUsageStore {
@@ -791,6 +867,7 @@ fn spawn_worker(
     ca_file: Option<String>,
     schema: String,
     worker_index: usize,
+    startup_timeout: Duration,
 ) -> Result<tokio_mpsc::Sender<Job>> {
     let (jobs, mut receiver) = tokio_mpsc::channel::<Job>(JOBS_PER_WORKER);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -826,9 +903,22 @@ fn spawn_worker(
             }
         })
         .map_err(|error| MeteringError::Store(format!("start PostgreSQL usage worker: {error}")))?;
-    ready_rx
-        .recv()
-        .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited at startup".into()))??;
+    // The synchronous postgres handshake has no cancellation handle. A timed
+    // out constructor drops the queue and fails startup; at most this one
+    // fixed worker remains blocked until the daemon exits.
+    match ready_rx.recv_timeout(startup_timeout) {
+        Ok(result) => result?,
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            return Err(MeteringError::Store(
+                "PostgreSQL usage worker startup timed out; restart required".into(),
+            ));
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(MeteringError::Store(
+                "PostgreSQL usage worker exited at startup".into(),
+            ));
+        }
+    }
     Ok(jobs)
 }
 
@@ -1768,11 +1858,185 @@ mod tests {
         assert!(sql.contains("reject_credit_ledger_mutation"));
     }
 
+    #[test]
+    fn a_silent_postgres_peer_cannot_block_worker_startup() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = std_mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            released.recv().unwrap();
+            drop(stream);
+        });
+        let dsn = DsnSource::Literal(format!("postgres://cats@{address}/cats?sslmode=disable"));
+        let started = Instant::now();
+        let error = PostgresUsageStore::connect_from_with_timeouts(
+            &dsn,
+            None,
+            "cats_usage_silent_startup",
+            1,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("silent PostgreSQL peer unexpectedly completed startup");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "silent peer exceeded the worker startup wall-clock bound"
+        );
+        assert!(error.to_string().contains("startup timed out"), "{error}");
+        release.send(()).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_deadline_poisons_the_store_and_skips_queued_effects() {
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_poison_{}_{}", std::process::id(), suffix);
+        let store = Arc::new(
+            PostgresUsageStore::connect_from_with_timeouts(
+                &DsnSource::Literal(url.clone()),
+                None,
+                &schema,
+                1,
+                Duration::from_secs(10),
+                Duration::from_millis(200),
+            )
+            .unwrap(),
+        );
+        let mut cleanup = connect_client(&url, None, &schema).unwrap();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let slow_store = Arc::clone(&store);
+        let slow = tokio::spawn(async move {
+            slow_store
+                .dispatch(move |_| {
+                    let _ = entered.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        struct Processed(std_mpsc::Sender<()>);
+        impl Drop for Processed {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let effects = Arc::new(AtomicUsize::new(0));
+        let (processed, processed_rx) = std_mpsc::channel();
+        let queued_store = Arc::clone(&store);
+        let queued_effects = Arc::clone(&effects);
+        let queued = tokio::spawn(async move {
+            let processed = Processed(processed);
+            queued_store
+                .dispatch(move |_| {
+                    let _processed = processed;
+                    queued_effects.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let error = slow.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("restart required"), "{error}");
+        let dispatches_before_rejection = store.next_worker.load(Ordering::SeqCst);
+        let rejected = store.dispatch(|_| Ok(())).await.unwrap_err();
+        assert_eq!(
+            store.next_worker.load(Ordering::SeqCst),
+            dispatches_before_rejection,
+            "a poisoned store admitted another worker job"
+        );
+        assert!(
+            rejected.to_string().contains("restart required"),
+            "{rejected}"
+        );
+        assert!(queued
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("restart required"));
+
+        release.send(()).unwrap();
+        processed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not discard the queued effect after poison");
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        cleanup
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_worker_poisons_the_store() {
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_cancel_{}_{}", std::process::id(), suffix);
+        let store = Arc::new(
+            PostgresUsageStore::connect_from_with_timeouts(
+                &DsnSource::Literal(url.clone()),
+                None,
+                &schema,
+                1,
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let mut cleanup = connect_client(&url, None, &schema).unwrap();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let (finished, finished_rx) = std_mpsc::channel();
+        let cancelled_store = Arc::clone(&store);
+        let cancelled = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                cancelled_store.dispatch(move |_| {
+                    struct Finished(std_mpsc::Sender<()>);
+                    impl Drop for Finished {
+                        fn drop(&mut self) {
+                            let _ = self.0.send(());
+                        }
+                    }
+
+                    let _finished = Finished(finished);
+                    let _ = entered.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }),
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        assert!(cancelled.await.unwrap().is_err());
+        assert!(store.dispatch(|_| Ok(())).await.is_err());
+        release.send(()).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled worker effect did not exit after release");
+        cleanup
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn connection_statement_and_lock_stalls_are_bounded_and_the_worker_recovers() {
-        let Ok(url) = std::env::var("CATS_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
         assert_eq!(
             client_config(&url).unwrap().get_connect_timeout(),
             Some(&CONNECT_TIMEOUT),
