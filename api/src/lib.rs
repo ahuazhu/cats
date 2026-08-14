@@ -26,6 +26,7 @@ pub mod guest;
 pub mod ids;
 pub mod metering;
 pub mod nodejob;
+pub mod object_write_gateway;
 pub mod oci;
 pub mod persistent_disk;
 pub mod requests;
