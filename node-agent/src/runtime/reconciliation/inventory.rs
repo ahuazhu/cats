@@ -16,9 +16,9 @@ use cats_api::runtime_reconciliation::{
     CheckpointEvidence, Condition, DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id,
     InventorySource, LastVolumeTransition, LifecycleAdmission, LocalLineageState,
     LocalVolumeLineage, NodeResidue, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
-    ProcessEvidence, ProgressingReason, ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint,
-    RuntimeTarget, Sha256Digest, UnixMillis, VolumeAdminState, VolumeAuthorityEvidence,
-    WarmSnapshotEvidence, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
+    ProcessEvidence, ProgressingReason, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
+    RuntimeCheckpoint, RuntimeTarget, Sha256Digest, StableState, UnixMillis, VolumeAdminState,
+    VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
 };
 #[cfg(feature = "proposed-node-residue-reclamation")]
 use cats_api::runtime_reconciliation::{
@@ -47,6 +47,9 @@ use super::{
     classify_superseded_route_retirement,
     guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
+    lifecycle_steps::{
+        cold_membership_rebind_is_supported, current_cold_checkpoint_postcondition_is_exact,
+    },
     network::{
         prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
@@ -2149,6 +2152,20 @@ fn runtime_from_inventory(
                 *attachment_epoch,
                 head,
             ),
+            (
+                ReconcileStep::Stable {
+                    state: StableState::Cold,
+                },
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch,
+                    head,
+                },
+            ) => stable_cold_checkpoint_matches_released_attachment(
+                runtime_checkpoint,
+                attachment,
+                *attachment_epoch,
+                head,
+            ),
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Unowned { .. }) => true,
             _ => false,
         };
@@ -2280,19 +2297,49 @@ fn runtime_from_inventory(
     let unsupported_superseded = checkpoint.as_ref().is_some_and(|evidence| {
         evidence.binding == DesiredCheckpointBinding::Superseded
             && !superseded_checkpoint_has_supported_replan(desired, &evidence.checkpoint, &volumes)
+            && !cold_membership_rebind_is_supported(desired, &evidence.checkpoint, &volumes)
+    });
+    let stable_cold_checkpoint = checkpoint.as_ref().is_some_and(|evidence| {
+        matches!(
+            evidence.checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        )
+    });
+    let current_cold_postcondition_exact = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && current_cold_checkpoint_postcondition_is_exact(
+                desired,
+                &evidence.checkpoint,
+                &volumes,
+            )
+            && managed.processes.is_empty()
+            && managed.networks.is_empty()
+    });
+    let current_cold_postcondition_mismatch = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && matches!(
+                evidence.checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Cold
+                }
+            )
+            && !current_cold_postcondition_exact
     });
     let definite_release_rejected = checkpoint
         .as_ref()
         .is_some_and(|evidence| evidence.definite_release_rejected);
-    let closed_takeover_history = volumes.iter().any(|volume| {
-        volume.local_lineages.iter().any(|lineage| {
-            lineage.state == LocalLineageState::Released
-                && matches!(
-                    lineage.acquire_origin,
-                    cats_api::runtime_reconciliation::AcquireOrigin::Takeover { .. }
-                )
-        })
-    });
+    let closed_takeover_history = !stable_cold_checkpoint
+        && volumes.iter().any(|volume| {
+            volume.local_lineages.iter().any(|lineage| {
+                lineage.state == LocalLineageState::Released
+                    && matches!(
+                        lineage.acquire_origin,
+                        cats_api::runtime_reconciliation::AcquireOrigin::Takeover { .. }
+                    )
+            })
+        });
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
             Some(inventory_checkpoint) => {
@@ -2324,11 +2371,21 @@ fn runtime_from_inventory(
                     require_idle: Box::new(checkpoint.require_idle.clone()),
                     updated_at_unix_ms: checkpoint.updated_at_unix_ms,
                 };
+                let projected_stable_state = if matches!(
+                    &checkpoint.step,
+                    ReconcileStep::Stable {
+                        state: StableState::Cold
+                    }
+                ) {
+                    current_cold_postcondition_exact.then_some(StableState::Cold)
+                } else {
+                    checkpoint.stable_state
+                };
                 (
                     checkpoint.step,
                     evidence,
                     checkpoint.runtime_incarnation,
-                    checkpoint.stable_state,
+                    projected_stable_state,
                     if checkpoint_binding == DesiredCheckpointBinding::Superseded {
                         LifecycleAdmission::Closed
                     } else {
@@ -2366,13 +2423,20 @@ fn runtime_from_inventory(
     let frozen_contract_stop = matches!(&step, ReconcileStep::Quarantined)
         || corrupt_checkpoint_present
         || unsupported_superseded
+        || current_cold_postcondition_mismatch
         || definite_release_rejected
         || closed_takeover_history
         || (matches!(&step, ReconcileStep::CleanupRelease { .. })
             && volumes.iter().any(|volume| {
                 matches!(&volume.authority, VolumeAuthorityEvidence::Unowned { .. })
             }));
-    let conditions = if frozen_contract_stop {
+    let conditions = if current_cold_postcondition_exact {
+        vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Cold,
+            },
+        }]
+    } else if frozen_contract_stop {
         // A superseded checkpoint and a completed release are still exact
         // physical evidence, but neither is itself a terminal typed reason.
         // V1's persisted Quarantined step also lacks the reason required by
@@ -2416,13 +2480,41 @@ fn authority_record_matches_local_attachment(
     attachment: &cats_storage::authority::AuthorizedServingAttachment,
 ) -> bool {
     if record.lease_owner.is_none() {
-        // Released local bytes may remain only behind an exact cleanup or a
-        // durable closed quarantine. The metadata probe validates the release
-        // marker before constructing the former projection.
-        return matches!(
+        let stable_cold_release = matches!(
             checkpoint.step,
-            ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        ) && stable_cold_checkpoint_matches_released_attachment(
+            checkpoint,
+            attachment,
+            record.lease_epoch,
+            &record.head,
+        ) && matches!(
+            &record.last_transition,
+            Some(LastVolumeTransition::Release { request, result })
+                if request.volume_id == attachment.identity.volume_id
+                    && request.attachment_id == attachment.identity.attachment_id
+                    && request.expected_epoch == attachment.identity.attachment_epoch
+                    && result.volume_id == attachment.identity.volume_id
+                    && result.released_attachment_id == attachment.identity.attachment_id
+                    && result.resulting_epoch == record.lease_epoch
+                    && result.resulting_head == record.head
         );
+        // Released local bytes may remain only behind an exact cleanup, a
+        // durable closed quarantine, or the exact fenced R == L lineage of a
+        // Stable Cold checkpoint. The latter remains cache, never an owner.
+        return validate_volume_record(record).is_ok()
+            && validate_authorized_serving_attachment(attachment).is_ok()
+            && record.volume_id == attachment.identity.volume_id
+            && record.size_bytes == attachment.size_bytes
+            && record.durability == attachment.durability
+            && matches!(record.admin_state, VolumeAdminState::Active)
+            && record.lease_expires_at.is_none()
+            && (matches!(
+                checkpoint.step,
+                ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+            ) || stable_cold_release);
     }
 
     validate_volume_record(record).is_ok()
@@ -2673,6 +2765,20 @@ fn current_checkpoint_adopts_blockd(
                         && lineage.placement_epoch == attachment.identity.placement_epoch
                 })
         }),
+        ReconcileStep::Stable {
+            state: StableState::Cold,
+        } => checkpoint.volumes.iter().any(|volume| {
+            volume.volume_id == attachment.identity.volume_id
+                && volume.local_lineages.iter().any(|lineage| {
+                    lineage.attachment_id == attachment.identity.attachment_id
+                        && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                        && lineage.acquire_origin == attachment.identity.acquire_origin
+                        && lineage.node_id == attachment.identity.node_id
+                        && lineage.placement_epoch == attachment.identity.placement_epoch
+                        && lineage.state == LocalLineageState::Released
+                        && lineage.fenced
+                })
+        }),
         _ => false,
     }
 }
@@ -2712,6 +2818,14 @@ fn authority_owner_or_exact_release_matches(
                     } if checkpoint_epoch == attachment_epoch && checkpoint_head == head
                 )
             }),
+            ReconcileStep::Stable {
+                state: StableState::Cold,
+            } => stable_cold_checkpoint_matches_released_attachment(
+                checkpoint,
+                attachment,
+                *attachment_epoch,
+                head,
+            ),
             _ => false,
         },
         _ => false,
@@ -2743,6 +2857,61 @@ fn cleanup_release_matches_released_authority(
         && attachment_id == &attachment.identity.attachment_id
         && *attachment_epoch == attachment.identity.attachment_epoch
         && replay.generation == head.generation
+}
+
+fn stable_cold_checkpoint_matches_released_attachment(
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+    resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    if checkpoint.stable_state != Some(StableState::Cold)
+        || !matches!(
+            checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        )
+        || attachment
+            .identity
+            .attachment_epoch
+            .get()
+            .checked_add(1)
+            .is_none_or(|next| next != resulting_epoch.get())
+        || !remote_head_is_same_or_later(head, &attachment.head)
+    {
+        return false;
+    }
+    let mut matching = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| volume.volume_id == attachment.identity.volume_id);
+    let Some(volume) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    let [lineage] = volume.local_lineages.as_slice() else {
+        return false;
+    };
+    matches!(
+        &volume.authority,
+        VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head: checkpoint_head,
+        } if *attachment_epoch == resulting_epoch && checkpoint_head == head
+    ) && lineage.attachment_id == attachment.identity.attachment_id
+        && lineage.attachment_epoch == attachment.identity.attachment_epoch
+        && lineage.acquire_origin == attachment.identity.acquire_origin
+        && lineage.node_id == attachment.identity.node_id
+        && lineage.placement_epoch == attachment.identity.placement_epoch
+        && lineage.local_durable_generation == head.generation
+        && lineage.remote_durable_generation == head.generation
+        && lineage.pending_pack_count.get() == 0
+        && lineage.fenced
+        && lineage.state == LocalLineageState::Released
+        && volume.devices.is_empty()
 }
 
 /// Sidecar-free structural gate used before a previous-boot VMM receipt may
@@ -3182,6 +3351,9 @@ pub(super) fn validate_scanned_checkpoint(
                 "quarantined pre-launch checkpoint contains a device"
             );
         }
+        ReconcileStep::Stable {
+            state: StableState::Cold,
+        } => validate_stable_cold_checkpoint(checkpoint, blockds)?,
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
     }
     Ok(())
@@ -3193,8 +3365,16 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
             checkpoint.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
         }
         None => {
+            let stable_absent_is_valid = checkpoint.stable_state.is_none()
+                || (checkpoint.stable_state == Some(StableState::Cold)
+                    && matches!(
+                        checkpoint.step,
+                        ReconcileStep::Stable {
+                            state: StableState::Cold
+                        }
+                    ));
             checkpoint.runtime_incarnation.is_none()
-                && checkpoint.stable_state.is_none()
+                && stable_absent_is_valid
                 && checkpoint.networks.is_empty()
                 && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
                 && checkpoint.route_gates.is_empty()
@@ -3204,6 +3384,83 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
                 )
         }
     }
+}
+
+fn validate_stable_cold_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        checkpoint.stable_state == Some(StableState::Cold)
+            && checkpoint.runtime_incarnation.is_none()
+            && checkpoint.runtime_launch.identity().is_none()
+            && checkpoint.processes.is_empty()
+            && !checkpoint.volumes.is_empty()
+            && checkpoint.mounts.is_empty()
+            && checkpoint.networks.is_empty()
+            && matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+            && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+            && checkpoint.route_gates.is_empty()
+            && matches!(
+                checkpoint.require_idle,
+                RequireIdleCheckpoint::NotApplicable
+            ),
+        "Stable Cold checkpoint retains a live physical envelope"
+    );
+    let expected_blockds: BTreeSet<&Id> = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| !volume.local_lineages.is_empty())
+        .map(|volume| &volume.volume_id)
+        .collect();
+    let actual_blockds: BTreeSet<&Id> = blockds
+        .into_iter()
+        .flat_map(|by_volume| by_volume.keys())
+        .collect();
+    anyhow::ensure!(
+        expected_blockds == actual_blockds,
+        "Stable Cold checkpoint and retained cache lineage set differ"
+    );
+    for volume in &checkpoint.volumes {
+        let VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head,
+        } = &volume.authority
+        else {
+            anyhow::bail!("Stable Cold checkpoint retains a non-Unowned Volume")
+        };
+        anyhow::ensure!(
+            volume.devices.is_empty()
+                && (volume.disk_kind != cats_api::runtime_reconciliation::ObservedDiskKind::Root
+                    || head.generation.get() > 0),
+            "Stable Cold checkpoint retains a device or blank Root"
+        );
+        match volume.local_lineages.as_slice() {
+            [] => {}
+            [lineage] => {
+                let blockd = blockds
+                    .and_then(|by_volume| by_volume.get(&volume.volume_id))
+                    .context("Stable Cold released lineage lacks retained cache evidence")?;
+                let attachment = &blockd.checkpoint.attachment;
+                anyhow::ensure!(
+                    lineage.data_directory == blockd.data_directory
+                        && stable_cold_checkpoint_matches_released_attachment(
+                            checkpoint,
+                            attachment,
+                            *attachment_epoch,
+                            head,
+                        ),
+                    "Stable Cold retained cache lineage is stale or ambiguous"
+                );
+            }
+            _ => anyhow::bail!("Stable Cold checkpoint has duplicate local lineages"),
+        }
+    }
+    Ok(())
 }
 
 fn validate_current_prepared_checkpoint(

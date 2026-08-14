@@ -5,6 +5,7 @@
 //! fresh-inventory decision; it must never fall through to the Running
 //! acquire planner or to a legacy teardown path.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,17 +13,19 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use cats_api::guest::GUEST_HOST_CONTROL_VSOCK_PORT_V1;
 use cats_api::runtime_reconciliation::{
-    encode_runtime_checkpoint, AuthorizationConsumedReceipt, AuthorizationState,
-    CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion, DesiredRuntimeSpec,
-    FenceEpoch, Generation, GuestTransportEvidence, HostPath, Id, LastVolumeTransition,
-    LifecycleAdmission, NodeResidue, ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence,
-    ProcessEvidence, ProcessRole, RandomId128, ReconcileStep, RuntimeCheckpoint, RuntimeLaunch,
-    RuntimeTarget, RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
+    encode_desired_runtime_spec, encode_runtime_checkpoint, AuthorizationConsumedReceipt,
+    AuthorizationState, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
+    DesiredRuntimeSpec, DiskKind, FenceEpoch, FilesystemInitialization, Generation,
+    GuestTransportEvidence, HostPath, Id, LastVolumeTransition, LifecycleAdmission, NodeResidue,
+    ObservedDevice, ObservedDiskKind, ObservedRuntimeStatus, ObservedVolume,
+    OwnershipTokenEvidence, ProcessEvidence, ProcessRole, RandomId128, ReconcileStep,
+    RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeLaunch, RuntimeTarget,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionRequest, SessionBinding, StableState, VolumeAcquire, VolumeAdminState,
-    VolumeAuthorityEvidence, VolumeAuthorization, VolumeDisposition, VolumeReleaseReplay,
-    WarmSnapshotEvidence,
+    VolumeAuthorityEvidence, VolumeAuthorization, VolumeDisposition, VolumeIntent,
+    VolumeReleaseReplay, WarmSnapshotEvidence,
 };
-use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
+use cats_storage::authority::{validate_volume_record, VolumeDataAuthority, VolumeRecord};
 
 use crate::guest_client::GuestClient;
 use crate::runtime_spine::{
@@ -1263,6 +1266,16 @@ impl LifecycleStepEffect {
         let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired)? else {
             return Ok(None);
         };
+        if matches!(
+            runtime.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        ) {
+            return self
+                .plan_cold_membership_rebind(context, accepted, desired, runtime)
+                .map(Some);
+        }
         if runtime.stable_state == Some(StableState::Suspended)
             || matches!(
                 runtime.step,
@@ -2053,6 +2066,437 @@ impl LifecycleStepEffect {
         )?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }
+
+    fn plan_cold_membership_rebind(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            desired_revision,
+            spec_digest,
+            placement_epoch,
+            stable_state: Some(StableState::Cold),
+            step,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(stop_local());
+        };
+        if step.as_ref() != &runtime.step
+            || desired_revision >= &desired.desired_revision
+            || spec_digest == &desired.spec_digest
+            || *placement_epoch != desired.placement.placement_epoch
+            || !runtime_cold_physical_absence_is_exact(runtime)
+        {
+            return Ok(stop_local());
+        }
+
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .context("open Cold membership rebind checkpoint")?;
+        if store.path() != Path::new(checkpoint_path.as_str()) {
+            return Ok(stop_local());
+        }
+        let Some(stored) = store
+            .load()
+            .context("load Cold membership rebind checkpoint")?
+        else {
+            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+        };
+        if stored.content_digest() != content_digest
+            || stored.checkpoint().step != runtime.step
+            || !cold_membership_rebind_is_supported(desired, stored.checkpoint(), &runtime.volumes)
+        {
+            return Ok(stop_local());
+        }
+
+        // The accepted full scan is the physical-absence authority, but the
+        // Volume rows are independently mutable. Point-read the complete
+        // predecessor/successor union immediately before checkpoint CAS. A
+        // stale epoch, head ABA, owner, or immutable-field drift forces a new
+        // full scan and never publishes Stable Cold for the successor.
+        for observed in &runtime.volumes {
+            context.check_active()?;
+            let record = match self.volume_authority.load_volume(&observed.volume_id) {
+                Ok(record) => record,
+                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            };
+            if !record_matches_exact_unowned_observation(&record, observed) {
+                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            }
+        }
+        if accepted.attestation().accepted_at_unix_ms < stored.checkpoint().updated_at_unix_ms {
+            return Ok(stop_local());
+        }
+
+        let successor = cold_membership_rebind_successor(
+            desired,
+            runtime,
+            stored.checkpoint(),
+            accepted.attestation().accepted_at_unix_ms,
+        )?;
+        let current = store
+            .assert_current(&stored)
+            .context("retain exact superseded Cold checkpoint for membership CAS")?;
+        persist_lifecycle_successor(
+            context,
+            &store,
+            &stored,
+            &successor,
+            &current,
+            "atomically rebind exact Cold volume membership",
+        )?;
+        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+    }
+}
+
+/// A superseded Stable Cold checkpoint can authorize only one membership
+/// edit. It is never itself the stable observation for the successor.
+pub(super) fn cold_membership_rebind_is_supported(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    observed_union: &[ObservedVolume],
+) -> bool {
+    if encode_desired_runtime_spec(desired).is_err()
+        || desired.target != RuntimeTarget::Cold
+        || checkpoint.version != ContractVersion::V1
+        || checkpoint.cat_id != desired.cat_id
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || checkpoint.desired_revision >= desired.desired_revision
+        || checkpoint.spec_digest == desired.spec_digest
+        || !stable_cold_checkpoint_has_physical_absence(checkpoint)
+    {
+        return false;
+    }
+
+    let Some(checkpoint_by_id) = unique_observed_volumes(&checkpoint.volumes) else {
+        return false;
+    };
+    let Some(union_by_id) = unique_observed_volumes(observed_union) else {
+        return false;
+    };
+    let desired_by_id: BTreeMap<&Id, &VolumeIntent> = desired
+        .volumes
+        .iter()
+        .map(|intent| (&intent.volume_id, intent))
+        .collect();
+    if desired_by_id.len() != desired.volumes.len()
+        || union_by_id.len() != checkpoint_by_id.len().max(desired_by_id.len())
+        || !union_by_id.keys().all(|volume_id| {
+            checkpoint_by_id.contains_key(volume_id) || desired_by_id.contains_key(volume_id)
+        })
+    {
+        return false;
+    }
+
+    for (volume_id, intent) in &desired_by_id {
+        let Some(observed) = union_by_id.get(volume_id) else {
+            return false;
+        };
+        if !cold_observed_identity_matches_intent(observed, intent)
+            || !cold_observed_volume_satisfies_intent(observed, intent)
+        {
+            return false;
+        }
+    }
+    for (volume_id, checkpointed) in &checkpoint_by_id {
+        let Some(observed) = union_by_id.get(volume_id) else {
+            return false;
+        };
+        if observed != checkpointed || !observed_is_exact_unowned_absence(observed) {
+            return false;
+        }
+    }
+
+    let added: Vec<&VolumeIntent> = desired_by_id
+        .iter()
+        .filter_map(|(volume_id, intent)| {
+            (!checkpoint_by_id.contains_key(volume_id)).then_some(*intent)
+        })
+        .collect();
+    let removed: Vec<&ObservedVolume> = checkpoint_by_id
+        .iter()
+        .filter_map(|(volume_id, observed)| {
+            (!desired_by_id.contains_key(volume_id)).then_some(*observed)
+        })
+        .collect();
+    match (added.as_slice(), removed.as_slice()) {
+        ([intent], []) => {
+            let Some(observed) = union_by_id.get(&intent.volume_id) else {
+                return false;
+            };
+            intent.disk_kind == DiskKind::Persistent
+                && newly_attached_volume_matches_unowned_authority(intent, observed)
+        }
+        ([], [observed]) => observed.disk_kind == ObservedDiskKind::Persistent,
+        _ => false,
+    }
+}
+
+/// A current Stable Cold checkpoint is terminal only when the fresh authority
+/// set is byte-exact with its rebound volume vector. Any later owner/epoch/head
+/// change suppresses `stable_state` and therefore cannot settle an Operation.
+pub(super) fn current_cold_checkpoint_postcondition_is_exact(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    observed: &[ObservedVolume],
+) -> bool {
+    if desired.target != RuntimeTarget::Cold
+        || checkpoint.cat_id != desired.cat_id
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || checkpoint.desired_revision != desired.desired_revision
+        || checkpoint.spec_digest != desired.spec_digest
+        || !stable_cold_checkpoint_has_physical_absence(checkpoint)
+    {
+        return false;
+    }
+    let Some(checkpoint_by_id) = unique_observed_volumes(&checkpoint.volumes) else {
+        return false;
+    };
+    let Some(observed_by_id) = unique_observed_volumes(observed) else {
+        return false;
+    };
+    if checkpoint_by_id.len() != desired.volumes.len()
+        || observed_by_id.len() != desired.volumes.len()
+        || checkpoint_by_id != observed_by_id
+    {
+        return false;
+    }
+    desired.volumes.iter().all(|intent| {
+        observed_by_id.get(&intent.volume_id).is_some_and(|volume| {
+            cold_observed_identity_matches_intent(volume, intent)
+                && cold_observed_volume_satisfies_intent(volume, intent)
+                && (intent.disk_kind != DiskKind::Root
+                    || observed_authority_head_generation(volume).is_some_and(|value| value > 0))
+        })
+    })
+}
+
+fn cold_membership_rebind_successor(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    observed_at: cats_api::runtime_reconciliation::UnixMillis,
+) -> anyhow::Result<RuntimeCheckpoint> {
+    anyhow::ensure!(
+        runtime_cold_physical_absence_is_exact(runtime)
+            && cold_membership_rebind_is_supported(desired, checkpoint, &runtime.volumes),
+        "Cold membership successor lacks exact superseded physical absence"
+    );
+    let desired_ids: BTreeSet<&Id> = desired
+        .volumes
+        .iter()
+        .map(|intent| &intent.volume_id)
+        .collect();
+    let mut volumes: Vec<ObservedVolume> = runtime
+        .volumes
+        .iter()
+        .filter(|volume| desired_ids.contains(&volume.volume_id))
+        .cloned()
+        .collect();
+    volumes.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+    anyhow::ensure!(
+        volumes.len() == desired.volumes.len(),
+        "Cold membership successor omitted a Desired Volume"
+    );
+
+    let mut successor = checkpoint.clone();
+    successor.desired_revision = desired.desired_revision;
+    successor.spec_digest = desired.spec_digest.clone();
+    successor.volumes = volumes;
+    successor.updated_at_unix_ms = observed_at;
+    encode_runtime_checkpoint(&successor)
+        .context("validate exact Cold membership successor checkpoint")?;
+    anyhow::ensure!(
+        current_cold_checkpoint_postcondition_is_exact(desired, &successor, &successor.volumes),
+        "Cold membership successor is not an exact current Stable Cold checkpoint"
+    );
+    Ok(successor)
+}
+
+fn stable_cold_checkpoint_has_physical_absence(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint.runtime_incarnation.is_none()
+        && matches!(checkpoint.runtime_launch, RuntimeLaunch::Absent)
+        && checkpoint.stable_state == Some(StableState::Cold)
+        && matches!(
+            checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        )
+        && checkpoint.processes.is_empty()
+        && !checkpoint.volumes.is_empty()
+        && checkpoint.volumes.len() <= 64
+        && checkpoint
+            .volumes
+            .iter()
+            .all(observed_is_exact_unowned_absence)
+        && checkpoint.mounts.is_empty()
+        && checkpoint.networks.is_empty()
+        && matches!(
+            checkpoint.guest_transport,
+            GuestTransportEvidence::Unavailable
+        )
+        && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+        && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+        && checkpoint.route_gates.is_empty()
+        && matches!(
+            checkpoint.require_idle,
+            RequireIdleCheckpoint::NotApplicable
+        )
+}
+
+fn runtime_cold_physical_absence_is_exact(runtime: &ObservedRuntimeStatus) -> bool {
+    runtime.runtime_incarnation.is_none()
+        && runtime.processes.is_empty()
+        && runtime
+            .volumes
+            .iter()
+            .all(observed_is_exact_unowned_absence)
+        && runtime.mounts.is_empty()
+        && runtime.networks.is_empty()
+        && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+        && matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
+        && runtime.lifecycle_admission == LifecycleAdmission::Closed
+        && runtime.routes.is_empty()
+        && runtime.platform_guards == 0
+}
+
+fn unique_observed_volumes(volumes: &[ObservedVolume]) -> Option<BTreeMap<&Id, &ObservedVolume>> {
+    let mut by_id = BTreeMap::new();
+    for volume in volumes {
+        if by_id.insert(&volume.volume_id, volume).is_some() {
+            return None;
+        }
+    }
+    Some(by_id)
+}
+
+fn observed_is_exact_unowned_absence(volume: &ObservedVolume) -> bool {
+    let VolumeAuthorityEvidence::Unowned { head, .. } = &volume.authority else {
+        return false;
+    };
+    volume.devices.is_empty()
+        && match volume.local_lineages.as_slice() {
+            [] => true,
+            [lineage] => {
+                lineage.local_durable_generation == head.generation
+                    && lineage.remote_durable_generation == head.generation
+                    && lineage.pending_pack_count.get() == 0
+                    && lineage.fenced
+                    && lineage.state
+                        == cats_api::runtime_reconciliation::LocalLineageState::Released
+            }
+            _ => false,
+        }
+}
+
+fn cold_observed_volume_satisfies_intent(volume: &ObservedVolume, intent: &VolumeIntent) -> bool {
+    if !observed_is_exact_unowned_absence(volume) {
+        return false;
+    }
+    match volume.local_lineages.as_slice() {
+        [_] => true,
+        [] => {
+            let (
+                DiskKind::Persistent,
+                VolumeAcquire::Normal {
+                    expected_unowned_epoch,
+                    ..
+                },
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch, ..
+                },
+            ) = (intent.disk_kind, &intent.acquire, &volume.authority)
+            else {
+                return false;
+            };
+            expected_unowned_epoch == attachment_epoch
+        }
+        _ => false,
+    }
+}
+
+fn cold_observed_identity_matches_intent(volume: &ObservedVolume, intent: &VolumeIntent) -> bool {
+    volume.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+        && volume.disk_id.as_ref() == Some(&intent.disk_id)
+        && volume.volume_id == intent.volume_id
+        && volume.disk_kind
+            == match intent.disk_kind {
+                DiskKind::Root => ObservedDiskKind::Root,
+                DiskKind::Persistent => ObservedDiskKind::Persistent,
+            }
+        && volume.size_bytes == Some(intent.size_bytes)
+        && volume.durability == Some(intent.durability)
+}
+
+fn newly_attached_volume_matches_unowned_authority(
+    intent: &VolumeIntent,
+    observed: &ObservedVolume,
+) -> bool {
+    let (
+        VolumeAcquire::Normal {
+            expected_unowned_epoch,
+            ..
+        },
+        VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head,
+        },
+        Some(mount),
+    ) = (&intent.acquire, &observed.authority, &intent.mount)
+    else {
+        return false;
+    };
+    expected_unowned_epoch == attachment_epoch
+        && match &mount.initialization {
+            FilesystemInitialization::Initialize {
+                expected_blank_head,
+                ..
+            } => head == expected_blank_head,
+            FilesystemInitialization::Existing => head.generation.get() > 0,
+        }
+}
+
+fn observed_authority_head_generation(volume: &ObservedVolume) -> Option<u64> {
+    match &volume.authority {
+        VolumeAuthorityEvidence::Unowned { head, .. } => Some(head.generation.get()),
+        VolumeAuthorityEvidence::Owned { .. }
+        | VolumeAuthorityEvidence::Deleting { .. }
+        | VolumeAuthorityEvidence::Absent
+        | VolumeAuthorityEvidence::Unavailable => None,
+    }
+}
+
+fn record_matches_exact_unowned_observation(
+    record: &VolumeRecord,
+    observed: &ObservedVolume,
+) -> bool {
+    let VolumeAuthorityEvidence::Unowned {
+        attachment_epoch,
+        head,
+    } = &observed.authority
+    else {
+        return false;
+    };
+    validate_volume_record(record).is_ok()
+        && record.volume_id == observed.volume_id
+        && Some(record.size_bytes) == observed.size_bytes
+        && Some(record.durability) == observed.durability
+        && matches!(record.admin_state, VolumeAdminState::Active)
+        && record.lease_owner.is_none()
+        && record.lease_epoch == *attachment_epoch
+        && record.lease_expires_at.is_none()
+        && record.head == *head
 }
 
 fn cleanup_can_rebind(
@@ -3609,9 +4053,9 @@ mod tests {
     use std::sync::Mutex;
 
     use cats_api::runtime_reconciliation::{
-        decode_desired_runtime_spec, decode_runtime_checkpoint, AdmissionInventoryAttestation,
-        AgentSession, AppliedDesiredEvidence, DesiredReadSnapshot, NodeObservation, ProcessState,
-        RuntimeLaunch,
+        decode_desired_runtime_spec, decode_runtime_checkpoint, spec_digest,
+        AdmissionInventoryAttestation, AgentSession, AppliedDesiredEvidence, DesiredReadSnapshot,
+        NodeObservation, ProcessState, RuntimeLaunch,
     };
     use tempfile::TempDir;
 
@@ -3739,6 +4183,190 @@ mod tests {
         checkpoint.volumes = runtime.volumes.clone();
     }
 
+    fn cold_membership_attach_fixture() -> (
+        DesiredRuntimeSpec,
+        RuntimeCheckpoint,
+        ObservedRuntimeStatus,
+        BTreeMap<Id, VolumeRecord>,
+    ) {
+        let (mut predecessor_desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        predecessor_desired.spec_digest = spec_digest(&predecessor_desired).unwrap();
+        checkpoint.spec_digest = predecessor_desired.spec_digest.clone();
+        checkpoint.runtime_incarnation = None;
+        checkpoint.runtime_launch = RuntimeLaunch::Absent;
+        checkpoint.stable_state = Some(StableState::Cold);
+        checkpoint.step = ReconcileStep::Stable {
+            state: StableState::Cold,
+        };
+        checkpoint.processes.clear();
+        checkpoint.mounts.clear();
+        checkpoint.networks.clear();
+        checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+        checkpoint.warm_snapshot = WarmSnapshotEvidence::Absent;
+        checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+        checkpoint.route_gates.clear();
+        checkpoint.require_idle = RequireIdleCheckpoint::NotApplicable;
+
+        let root = &mut checkpoint.volumes[0];
+        let (owned_epoch, root_head) = match &root.authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_epoch,
+                head,
+                ..
+            } => (*attachment_epoch, head.clone()),
+            other => panic!("fixture Root is not Owned: {other:?}"),
+        };
+        let released_epoch = FenceEpoch::new(owned_epoch.get() + 1).unwrap();
+        root.authority = VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: released_epoch,
+            head: root_head.clone(),
+        };
+        root.devices.clear();
+        let [root_lineage] = root.local_lineages.as_mut_slice() else {
+            panic!("fixture Root lacks one lineage")
+        };
+        root_lineage.local_durable_generation = root_head.generation;
+        root_lineage.remote_durable_generation = root_head.generation;
+        root_lineage.pending_pack_count =
+            cats_api::runtime_reconciliation::WireU64::new(0).unwrap();
+        root_lineage.fenced = true;
+        root_lineage.state = cats_api::runtime_reconciliation::LocalLineageState::Released;
+
+        let mut desired = predecessor_desired.clone();
+        desired.desired_revision = cats_api::runtime_reconciliation::Revision::new(
+            predecessor_desired.desired_revision.get() + 1,
+        )
+        .unwrap();
+        let blank_head = cats_api::runtime_reconciliation::RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        let persistent = VolumeIntent {
+            volume_intent_id: Id::new("vint_data").unwrap(),
+            disk_id: Id::new("disk_data").unwrap(),
+            volume_id: Id::new("vol_data").unwrap(),
+            attachment_id: Id::new("att_data").unwrap(),
+            size_bytes: 4_294_967_296,
+            disk_kind: DiskKind::Persistent,
+            access: cats_api::runtime_reconciliation::VolumeAccess::ReadWriteOnce,
+            durability: cats_api::runtime_reconciliation::Durability::Strict,
+            guest_device: cats_api::runtime_reconciliation::GuestDeviceIdentity {
+                serial: Id::new("cats-data").unwrap(),
+                slot: 1,
+            },
+            acquire: VolumeAcquire::Normal {
+                transition_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                expected_unowned_epoch: FenceEpoch::new(1).unwrap(),
+            },
+            disposition: VolumeDisposition::Retain,
+            mount: Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+                filesystem_uuid: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                mount_path: HostPath::new("/data".to_owned()).unwrap(),
+                initialization: FilesystemInitialization::Initialize {
+                    initialization_token: RandomId128::new("cccccccccccccccccccccccccccccccc")
+                        .unwrap(),
+                    expected_blank_head: blank_head.clone(),
+                },
+            }),
+        };
+        desired.volumes.push(persistent.clone());
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        encode_desired_runtime_spec(&desired).unwrap();
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+
+        let persistent_observed = ObservedVolume {
+            volume_intent_id: Some(persistent.volume_intent_id.clone()),
+            disk_id: Some(persistent.disk_id.clone()),
+            volume_id: persistent.volume_id.clone(),
+            disk_kind: ObservedDiskKind::Persistent,
+            size_bytes: Some(persistent.size_bytes),
+            durability: Some(persistent.durability),
+            authority: VolumeAuthorityEvidence::Unowned {
+                attachment_epoch: FenceEpoch::new(1).unwrap(),
+                head: blank_head.clone(),
+            },
+            local_lineages: Vec::new(),
+            devices: Vec::new(),
+        };
+        runtime.applied_desired = Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: RuntimeTarget::Cold,
+        });
+        runtime.runtime_incarnation = None;
+        runtime.stable_state = None;
+        runtime.step = checkpoint.step.clone();
+        runtime.processes.clear();
+        runtime.volumes = checkpoint.volumes.clone();
+        runtime.volumes.push(persistent_observed.clone());
+        runtime
+            .volumes
+            .sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+        runtime.mounts.clear();
+        runtime.networks.clear();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        runtime.warm_snapshot = WarmSnapshotEvidence::Absent;
+        runtime.lifecycle_admission = LifecycleAdmission::Closed;
+        runtime.routes.clear();
+        runtime.platform_guards = 0;
+        runtime.conditions = vec![cats_api::runtime_reconciliation::Condition::Progressing {
+            reason: cats_api::runtime_reconciliation::ProgressingReason::ReconcileStep {
+                step: checkpoint.step.clone(),
+            },
+        }];
+
+        let mut records = BTreeMap::new();
+        records.insert(
+            checkpoint.volumes[0].volume_id.clone(),
+            VolumeRecord {
+                volume_id: checkpoint.volumes[0].volume_id.clone(),
+                size_bytes: checkpoint.volumes[0].size_bytes.unwrap(),
+                durability: checkpoint.volumes[0].durability.unwrap(),
+                admin_state: VolumeAdminState::Active,
+                head: root_head.clone(),
+                lease_owner: None,
+                lease_epoch: released_epoch,
+                lease_expires_at: None,
+                last_transition: Some(LastVolumeTransition::Release {
+                    request: cats_api::runtime_reconciliation::ReleaseRequest {
+                        volume_id: checkpoint.volumes[0].volume_id.clone(),
+                        transition_id: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                            .unwrap(),
+                        attachment_id: predecessor_desired.volumes[0].attachment_id.clone(),
+                        expected_epoch: owned_epoch,
+                    },
+                    result: cats_api::runtime_reconciliation::ReleaseResult {
+                        volume_id: checkpoint.volumes[0].volume_id.clone(),
+                        transition_id: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                            .unwrap(),
+                        released_attachment_id: predecessor_desired.volumes[0]
+                            .attachment_id
+                            .clone(),
+                        resulting_epoch: released_epoch,
+                        resulting_head: root_head,
+                    },
+                }),
+            },
+        );
+        records.insert(
+            persistent.volume_id.clone(),
+            VolumeRecord {
+                volume_id: persistent.volume_id,
+                size_bytes: persistent.size_bytes,
+                durability: persistent.durability,
+                admin_state: VolumeAdminState::Active,
+                head: blank_head,
+                lease_owner: None,
+                lease_epoch: FenceEpoch::new(1).unwrap(),
+                lease_expires_at: None,
+                last_transition: None,
+            },
+        );
+        (desired, checkpoint, runtime, records)
+    }
+
     fn exact_drain_receipt(
         desired: &DesiredRuntimeSpec,
         runtime: &ObservedRuntimeStatus,
@@ -3766,6 +4394,202 @@ mod tests {
                     }
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn cold_membership_rebind_is_exact_for_attach_then_detach() {
+        let (desired, checkpoint, mut runtime, records) = cold_membership_attach_fixture();
+        assert!(cold_membership_rebind_is_supported(
+            &desired,
+            &checkpoint,
+            &runtime.volumes
+        ));
+        for observed in &runtime.volumes {
+            assert!(record_matches_exact_unowned_observation(
+                records.get(&observed.volume_id).unwrap(),
+                observed
+            ));
+        }
+        let observed_at = cats_api::runtime_reconciliation::UnixMillis::new(
+            checkpoint.updated_at_unix_ms.get() + 1,
+        )
+        .unwrap();
+        let attached =
+            cold_membership_rebind_successor(&desired, &runtime, &checkpoint, observed_at).unwrap();
+        assert!(current_cold_checkpoint_postcondition_is_exact(
+            &desired,
+            &attached,
+            &attached.volumes
+        ));
+        let added = attached
+            .volumes
+            .iter()
+            .find(|volume| volume.disk_kind == ObservedDiskKind::Persistent)
+            .unwrap();
+        assert!(added.local_lineages.is_empty());
+        assert!(added.devices.is_empty());
+
+        let mut detached_desired = desired.clone();
+        detached_desired.desired_revision =
+            cats_api::runtime_reconciliation::Revision::new(desired.desired_revision.get() + 1)
+                .unwrap();
+        detached_desired
+            .volumes
+            .retain(|intent| intent.disk_kind == DiskKind::Root);
+        detached_desired.spec_digest = spec_digest(&detached_desired).unwrap();
+        runtime.applied_desired = Some(AppliedDesiredEvidence {
+            desired_revision: detached_desired.desired_revision,
+            spec_digest: detached_desired.spec_digest.clone(),
+            placement: detached_desired.placement.clone(),
+            target: RuntimeTarget::Cold,
+        });
+        assert!(cold_membership_rebind_is_supported(
+            &detached_desired,
+            &attached,
+            &runtime.volumes
+        ));
+        let detached = cold_membership_rebind_successor(
+            &detached_desired,
+            &runtime,
+            &attached,
+            cats_api::runtime_reconciliation::UnixMillis::new(observed_at.get() + 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detached.volumes.len(), 1);
+        assert_eq!(detached.volumes[0].disk_kind, ObservedDiskKind::Root);
+        assert!(
+            records.contains_key(&added.volume_id),
+            "detach retains Volume data"
+        );
+    }
+
+    #[test]
+    fn cold_membership_rebind_rejects_stale_epoch_owner_aba_and_set_drift() {
+        let (desired, checkpoint, runtime, mut records) = cold_membership_attach_fixture();
+
+        let mut stale_epoch = runtime.clone();
+        let added = stale_epoch
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.disk_kind == ObservedDiskKind::Persistent)
+            .unwrap();
+        let VolumeAuthorityEvidence::Unowned {
+            attachment_epoch, ..
+        } = &mut added.authority
+        else {
+            unreachable!()
+        };
+        *attachment_epoch = FenceEpoch::new(attachment_epoch.get() + 1).unwrap();
+        assert!(!cold_membership_rebind_is_supported(
+            &desired,
+            &checkpoint,
+            &stale_epoch.volumes
+        ));
+
+        let mut predecessor_aba = runtime.clone();
+        let root = predecessor_aba
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.disk_kind == ObservedDiskKind::Root)
+            .unwrap();
+        let VolumeAuthorityEvidence::Unowned {
+            attachment_epoch, ..
+        } = &mut root.authority
+        else {
+            unreachable!()
+        };
+        *attachment_epoch = FenceEpoch::new(attachment_epoch.get() + 2).unwrap();
+        assert!(!cold_membership_rebind_is_supported(
+            &desired,
+            &checkpoint,
+            &predecessor_aba.volumes
+        ));
+
+        let persistent = runtime
+            .volumes
+            .iter()
+            .find(|volume| volume.disk_kind == ObservedDiskKind::Persistent)
+            .unwrap();
+        let record = records.get_mut(&persistent.volume_id).unwrap();
+        record.lease_owner = Some(Id::new("att_aba").unwrap());
+        record.lease_epoch = FenceEpoch::new(record.lease_epoch.get() + 1).unwrap();
+        record.lease_expires_at =
+            Some(cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_060_000).unwrap());
+        assert!(!record_matches_exact_unowned_observation(
+            record, persistent
+        ));
+
+        let mut two_changes = desired.clone();
+        two_changes.volumes[0].volume_intent_id = Id::new("replaced_root_intent").unwrap();
+        two_changes.spec_digest = spec_digest(&two_changes).unwrap();
+        assert!(!cold_membership_rebind_is_supported(
+            &two_changes,
+            &checkpoint,
+            &runtime.volumes
+        ));
+    }
+
+    #[test]
+    fn cold_membership_checkpoint_adopts_atomically_across_every_crash_point() {
+        for stage in [
+            WriteStage::Write,
+            WriteStage::TempWritten,
+            WriteStage::FileSynced,
+            WriteStage::Renamed,
+            WriteStage::DirectorySynced,
+        ] {
+            let (desired, predecessor, runtime, _) = cold_membership_attach_fixture();
+            let successor = cold_membership_rebind_successor(
+                &desired,
+                &runtime,
+                &predecessor,
+                cats_api::runtime_reconciliation::UnixMillis::new(
+                    predecessor.updated_at_unix_ms.get() + 1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let directory = TempDir::new().unwrap();
+            let store = FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
+            let stored = store.create(&predecessor).unwrap();
+            let context = RuntimeDesiredEffectContext::for_test(
+                crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let current = store.assert_current(&stored).unwrap();
+            store.inject_crash_once(stage);
+            assert!(persist_lifecycle_successor(
+                &context,
+                &store,
+                &stored,
+                &successor,
+                &current,
+                "test Cold membership checkpoint crash",
+            )
+            .is_err());
+            drop(current);
+            drop(store);
+
+            let reopened =
+                FileCheckpointStore::open(directory.path(), &predecessor.cat_id).unwrap();
+            let recovered = reopened.load().unwrap().unwrap();
+            if recovered.checkpoint() == &predecessor {
+                reopened.replace(&recovered, &successor).unwrap();
+            } else {
+                assert_eq!(recovered.checkpoint(), &successor);
+            }
+            let adopted = reopened.load().unwrap().unwrap();
+            assert_eq!(
+                adopted.checkpoint(),
+                &successor,
+                "restart failed at {stage:?}"
+            );
+            assert!(current_cold_checkpoint_postcondition_is_exact(
+                &desired,
+                adopted.checkpoint(),
+                &successor.volumes
+            ));
         }
     }
 
