@@ -15,17 +15,21 @@ after it, only exact-forward settlement of that one Open command is allowed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
+import fcntl
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import signal
+import stat
 import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
 
 def load_sibling(module_name: str, filename: str) -> Any:
@@ -86,6 +90,209 @@ def canonical_json(value: Any) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
     ).encode("ascii")
+
+
+class OpenProcessLock:
+    """One persistent inode serializing every final-open transaction."""
+
+    FILENAME = "production-final-open.transaction.lock"
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        directory_descriptor: int,
+        directory_identity: tuple[int, int],
+        descriptor: int,
+        metadata_snapshot: tuple[int, ...],
+    ) -> None:
+        self.path = path
+        self.directory_descriptor = directory_descriptor
+        self.directory_identity = directory_identity
+        self.descriptor = descriptor
+        self.metadata_snapshot = metadata_snapshot
+        self.closed = False
+
+    @staticmethod
+    def _snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _validate_directory(metadata: os.stat_result) -> None:
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise FinalOpenError(
+                "final-open receipt directory must remain actor-owned mode-0700"
+            )
+
+    @staticmethod
+    def _validate_metadata(metadata: os.stat_result) -> None:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != 0
+        ):
+            raise FinalOpenError(
+                "final-open process lock must be actor-owned mode-0600 "
+                "single-link empty regular file"
+            )
+
+    @classmethod
+    def acquire(
+        cls,
+        path: Path,
+        acquisition_hook: Callable[[str, Path], None] | None = None,
+    ) -> OpenProcessLock:
+        directory_descriptor = -1
+        descriptor = -1
+        try:
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            directory_descriptor = os.open(path.parent, directory_flags)
+            directory_metadata = os.fstat(directory_descriptor)
+            cls._validate_directory(directory_metadata)
+            parent_metadata = os.stat(path.parent, follow_symlinks=False)
+            directory_identity = (
+                directory_metadata.st_dev,
+                directory_metadata.st_ino,
+            )
+            if (
+                parent_metadata.st_dev,
+                parent_metadata.st_ino,
+            ) != directory_identity:
+                raise FinalOpenError("final-open receipt directory path was replaced")
+
+            flags = (
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            created = False
+            try:
+                descriptor = os.open(
+                    path.name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                created = True
+                os.fchmod(descriptor, 0o600)
+            except FileExistsError:
+                descriptor = os.open(
+                    path.name,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            metadata = os.fstat(descriptor)
+            cls._validate_metadata(metadata)
+            if metadata.st_nlink != 1:
+                raise FinalOpenError(
+                    "final-open process lock must be a single-link inode"
+                )
+            if created and acquisition_hook is not None:
+                acquisition_hook("after_create_before_fsync", path)
+            os.fsync(descriptor)
+            if created and acquisition_hook is not None:
+                acquisition_hook("after_file_fsync_before_directory_fsync", path)
+            os.fsync(directory_descriptor)
+            if created and acquisition_hook is not None:
+                acquisition_hook("after_directory_fsync_before_flock", path)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise FinalOpenError(
+                    "another final-open process owns final-open"
+                ) from error
+            if created and acquisition_hook is not None:
+                acquisition_hook("after_flock_before_return", path)
+            lock = cls(
+                path=path,
+                directory_descriptor=directory_descriptor,
+                directory_identity=directory_identity,
+                descriptor=descriptor,
+                metadata_snapshot=cls._snapshot(metadata),
+            )
+            lock.assert_current()
+            directory_descriptor = -1
+            descriptor = -1
+            return lock
+        except OSError as error:
+            raise FinalOpenError("cannot securely open final-open process lock") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+
+    def assert_current(self) -> None:
+        if self.closed:
+            raise FinalOpenError("final-open process lock is already closed")
+        try:
+            directory_metadata = os.fstat(self.directory_descriptor)
+            parent_metadata = os.stat(self.path.parent, follow_symlinks=False)
+            descriptor_metadata = os.fstat(self.descriptor)
+            entry_metadata = os.stat(
+                self.path.name,
+                dir_fd=self.directory_descriptor,
+                follow_symlinks=False,
+            )
+            path_metadata = os.stat(self.path, follow_symlinks=False)
+        except OSError as error:
+            raise FinalOpenError("final-open process lock path disappeared") from error
+        self._validate_directory(directory_metadata)
+        self._validate_directory(parent_metadata)
+        self._validate_metadata(descriptor_metadata)
+        self._validate_metadata(entry_metadata)
+        self._validate_metadata(path_metadata)
+        if (
+            (directory_metadata.st_dev, directory_metadata.st_ino)
+            != self.directory_identity
+            or (parent_metadata.st_dev, parent_metadata.st_ino)
+            != self.directory_identity
+            or self._snapshot(descriptor_metadata) != self.metadata_snapshot
+            or self._snapshot(entry_metadata) != self.metadata_snapshot
+            or self._snapshot(path_metadata) != self.metadata_snapshot
+        ):
+            raise FinalOpenError(
+                "final-open process lock path was unlinked, replaced, or changed"
+            )
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        error: BaseException | None = None
+        try:
+            self.assert_current()
+        except BaseException as caught:
+            error = caught
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            try:
+                os.close(self.descriptor)
+            finally:
+                os.close(self.directory_descriptor)
+                self.closed = True
+        if error is not None:
+            raise error
 
 
 def sha256(data: bytes) -> str:
@@ -1019,6 +1226,7 @@ class FinalOpenExecutor:
         forward_authority_verifier: Callable[[], OpenAuthority] | None = None,
         cleanup_authority_verifier: Callable[[], OpenAuthority] | None = None,
         receipt_publication_hook: Callable[[str, Path], None] | None = None,
+        process_lock_acquisition_hook: Callable[[str, Path], None] | None = None,
     ) -> None:
         if OPEN_ID.fullmatch(open_id) is None:
             raise FinalOpenError("open_id is invalid")
@@ -1033,12 +1241,219 @@ class FinalOpenExecutor:
         self.admission = admission
         self.effects = effects
         self.receipt_directory = receipt_directory
+        self.process_lock_path = receipt_directory / OpenProcessLock.FILENAME
         self.authority_verifier = authority_verifier
         self.forward_authority_verifier = forward_authority_verifier
         self.cleanup_authority_verifier = cleanup_authority_verifier
         self.receipt_publication_hook = receipt_publication_hook
+        self.process_lock_acquisition_hook = process_lock_acquisition_hook
+        self._active_process_lock: OpenProcessLock | None = None
+
+    @contextlib.contextmanager
+    def _process_lock(self) -> Iterator[None]:
+        if self._active_process_lock is not None:
+            raise FinalOpenError("final-open process lock is not reentrant")
+        lock = OpenProcessLock.acquire(
+            self.process_lock_path,
+            self.process_lock_acquisition_hook,
+        )
+        self._active_process_lock = lock
+        try:
+            lock.assert_current()
+            yield
+        finally:
+            try:
+                lock.close()
+            finally:
+                self._active_process_lock = None
+
+    def _assert_process_lock(self) -> None:
+        if self._active_process_lock is None:
+            raise FinalOpenError("final-open process lock is not held")
+        self._active_process_lock.assert_current()
+
+    def _foreign_journal_artifacts(self) -> dict[str, set[str]]:
+        self._assert_process_lock()
+        journals: dict[str, set[str]] = {}
+        for entry in self.receipt_directory.iterdir():
+            if entry.name == OpenProcessLock.FILENAME:
+                continue
+            candidate, separator, artifact = entry.name.partition(".")
+            if (
+                not separator
+                or OPEN_ID.fullmatch(candidate) is None
+                or candidate == self.open_id
+            ):
+                continue
+            journals.setdefault(candidate, set()).add(artifact)
+        return journals
+
+    def _foreign_stage(
+        self,
+        open_id: str,
+        stage: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        self._assert_process_lock()
+        try:
+            item = RESET.read_stage_receipt(
+                self.receipt_directory,
+                open_id,
+                stage,
+            )
+        except RESET.ResetError as error:
+            raise FinalOpenError("foreign final-open journal is malformed") from error
+        if item is None:
+            return None
+        _path, value, raw_digest = item
+        value = require_fields(
+            value,
+            {
+                "kind",
+                "version",
+                "open_id",
+                "stage",
+                "created_at_unix_ms",
+                "plan_sha256",
+                "authority_sha256",
+                "previous_receipt_sha256",
+                "evidence",
+            },
+            "foreign final-open receipt",
+        )
+        previous = value["previous_receipt_sha256"]
+        if (
+            value["kind"] != RECEIPT_KIND
+            or not version_one(value["version"])
+            or value["open_id"] != open_id
+            or value["stage"] != stage
+            or type(value["created_at_unix_ms"]) is not int
+            or value["created_at_unix_ms"] <= 0
+            or not isinstance(value["plan_sha256"], str)
+            or SHA256.fullmatch(value["plan_sha256"]) is None
+            or not isinstance(value["authority_sha256"], str)
+            or SHA256.fullmatch(value["authority_sha256"]) is None
+            or (
+                previous is not None
+                and (not isinstance(previous, str) or SHA256.fullmatch(previous) is None)
+            )
+            or not isinstance(value["evidence"], dict)
+        ):
+            raise FinalOpenError("foreign final-open receipt binding drifted")
+        return value, "sha256:" + raw_digest
+
+    def _assert_no_foreign_transaction(self) -> None:
+        safe_plan_artifacts = {
+            "open-plan.json",
+            "open-plan.sha256",
+            "open-dry-run.json",
+            "open-dry-run.sha256",
+        }
+        marker_stages = (
+            "open-started",
+            "mutation-admission-open-finalizing",
+            "mutation-admission-open",
+            "cleanup-started",
+            "cleanup-mutation-admission-closed",
+            "cleanup-fleet-closed",
+            "open-complete",
+            "open-aborted",
+        )
+        for foreign_open_id, artifacts in sorted(
+            self._foreign_journal_artifacts().items()
+        ):
+            if artifacts <= safe_plan_artifacts:
+                continue
+            markers = {
+                stage: self._foreign_stage(foreign_open_id, stage)
+                for stage in marker_stages
+            }
+            complete = markers["open-complete"]
+            aborted = markers["open-aborted"]
+            if complete is not None:
+                if aborted is not None:
+                    raise FinalOpenError(
+                        "foreign final-open journal has conflicting terminal receipts"
+                    )
+                raise FinalOpenError(
+                    "a foreign final-open transaction already completed"
+                )
+            if aborted is None:
+                raise FinalOpenError("a foreign final-open transaction is active")
+            if (
+                markers["open-started"] is None
+                or markers["cleanup-started"] is None
+                or markers["cleanup-mutation-admission-closed"] is None
+                or markers["cleanup-fleet-closed"] is None
+                or markers["mutation-admission-open-finalizing"] is not None
+                or markers["mutation-admission-open"] is not None
+            ):
+                raise FinalOpenError(
+                    "foreign aborted final-open journal is not terminal Closed"
+                )
+            aborted_value, _aborted_digest = aborted
+            started = markers["open-started"]
+            cleanup_started = markers["cleanup-started"]
+            admission_closed = markers["cleanup-mutation-admission-closed"]
+            fleet_closed = markers["cleanup-fleet-closed"]
+            if (
+                started is None
+                or cleanup_started is None
+                or admission_closed is None
+                or fleet_closed is None
+            ):
+                raise FinalOpenError(
+                    "foreign aborted final-open journal lost its terminal receipts"
+                )
+            started_value, _started_digest = started
+            cleanup_started_value, _cleanup_started_digest = cleanup_started
+            admission_value, admission_digest = admission_closed
+            fleet_value, fleet_digest = fleet_closed
+            lineage = {
+                (
+                    value["plan_sha256"],
+                    value["authority_sha256"],
+                )
+                for value in (
+                    started_value,
+                    cleanup_started_value,
+                    admission_value,
+                    fleet_value,
+                    aborted_value,
+                )
+            }
+            cleanup_context = require_fields(
+                cleanup_started_value["evidence"],
+                {
+                    "failed",
+                    "admission_may_be_open",
+                    "ingress_may_be_open",
+                    "possibly_schedulable_node_ids",
+                },
+                "foreign cleanup-started evidence",
+            )
+            if (
+                len(lineage) != 1
+                or started_value["previous_receipt_sha256"] is not None
+                or cleanup_started_value["previous_receipt_sha256"] is not None
+                or cleanup_context["failed"]
+                != "final_open_failed_or_cancelled"
+                or cleanup_context["admission_may_be_open"] is not False
+                or type(cleanup_context["ingress_may_be_open"]) is not bool
+                or not isinstance(
+                    cleanup_context["possibly_schedulable_node_ids"],
+                    list,
+                )
+                or aborted_value["evidence"]
+                != {"outcome": "closed_cleanup_terminal"}
+                or fleet_value["previous_receipt_sha256"] != admission_digest
+                or aborted_value["previous_receipt_sha256"] != fleet_digest
+            ):
+                raise FinalOpenError(
+                    "foreign aborted final-open terminal chain drifted"
+                )
 
     def _authority(self) -> OpenAuthority:
+        self._assert_process_lock()
         if self.authority_verifier is not None:
             return validate_authority(self.authority_verifier(), self.open_id)
         try:
@@ -1150,6 +1565,7 @@ class FinalOpenExecutor:
         *,
         cleanup: bool,
     ) -> OpenAuthority:
+        self._assert_process_lock()
         injected = (
             self.cleanup_authority_verifier
             if cleanup
@@ -1180,6 +1596,7 @@ class FinalOpenExecutor:
             ) from error
 
     def _write(self, stage: str, value: dict[str, Any]) -> tuple[Path, str]:
+        self._assert_process_lock()
         return RESET.write_receipt(
             self.receipt_directory,
             self.open_id,
@@ -1234,6 +1651,13 @@ class FinalOpenExecutor:
         }
 
     def plan(self) -> tuple[Path, str]:
+        with self._process_lock():
+            return self._plan_locked()
+
+    def _plan_locked(self) -> tuple[Path, str]:
+        self._assert_process_lock()
+        self._assert_no_foreign_transaction()
+        self._assert_process_lock()
         existing = RESET.read_stage_receipt(
             self.receipt_directory,
             self.open_id,
@@ -1255,13 +1679,17 @@ class FinalOpenExecutor:
                 )
             return path, digest
         authority = self._authority()
+        self._assert_process_lock()
         effects = validate_effects(
             self.effects.prepare(authority),
             authority,
             self.open_id,
         )
+        self._assert_process_lock()
         self.effects.validate_plan(effects, authority)
+        self._assert_process_lock()
         prepared = self.admission.prepare(authority)
+        self._assert_process_lock()
         self.admission.validate(prepared, authority)
         authority_projection = authority.projection()
         created_at_unix_ms = now_unix_ms()
@@ -1361,7 +1789,9 @@ class FinalOpenExecutor:
         )
         prepared = PreparedAdmission(plan["admission"])
         effects = validate_effects(plan["effects"], authority, self.open_id)
+        self._assert_process_lock()
         self.admission.validate(prepared, authority)
+        self._assert_process_lock()
         self.effects.validate_plan(effects, authority)
         return plan, "sha256:" + actual, authority, prepared, effects
 
@@ -1375,6 +1805,7 @@ class FinalOpenExecutor:
         gap = False
         previous: str | None = None
         for stage in stages:
+            self._assert_process_lock()
             item = RESET.read_stage_receipt(self.receipt_directory, self.open_id, stage)
             if item is None:
                 gap = True
@@ -1435,6 +1866,7 @@ class FinalOpenExecutor:
         for node in effects["nodes"]:
             stage = f"node-{node['node_id']}-schedulable"
             if stage in loaded:
+                self._assert_process_lock()
                 self.effects.validate_node_schedulable(
                     loaded[stage][1]["evidence"],
                     node,
@@ -1448,12 +1880,14 @@ class FinalOpenExecutor:
             if loaded["nodes-schedulable"][1]["evidence"] != expected:
                 raise FinalOpenError("Node schedulable aggregate evidence drifted")
         if "public-ingress-open" in loaded:
+            self._assert_process_lock()
             self.effects.validate_ingress_open(
                 loaded["public-ingress-open"][1]["evidence"],
                 effects,
                 authority,
             )
         if "public-probe-terminal" in loaded:
+            self._assert_process_lock()
             self.effects.validate_public_probe(
                 loaded["public-probe-terminal"][1]["evidence"],
                 effects,
@@ -1466,6 +1900,7 @@ class FinalOpenExecutor:
             ):
                 raise FinalOpenError("Open finalization marker evidence drifted")
         if "mutation-admission-open" in loaded:
+            self._assert_process_lock()
             self.admission.validate_open_evidence(
                 loaded["mutation-admission-open"][1]["evidence"],
                 prepared,
@@ -1529,6 +1964,7 @@ class FinalOpenExecutor:
         dict[str, Any],
         dict[str, tuple[Path, dict[str, Any], str]],
     ] | None:
+        self._assert_process_lock()
         start = RESET.read_stage_receipt(
             self.receipt_directory,
             self.open_id,
@@ -1603,6 +2039,7 @@ class FinalOpenExecutor:
         if loaded["cleanup-started"][1]["evidence"] != context:
             raise FinalOpenError("cleanup-started evidence changed during replay")
         if "cleanup-public-ingress-closed" in loaded:
+            self._assert_process_lock()
             self.effects.validate_ingress_closed(
                 loaded["cleanup-public-ingress-closed"][1]["evidence"],
                 effects,
@@ -1613,18 +2050,21 @@ class FinalOpenExecutor:
         for node_id in reversed(context["possibly_schedulable_node_ids"]):
             stage = f"cleanup-node-{node_id}-cordoned"
             if stage in loaded:
+                self._assert_process_lock()
                 self.effects.validate_node_cordoned(
                     loaded[stage][1]["evidence"],
                     nodes_by_id[node_id],
                     authority,
                 )
         if "cleanup-mutation-admission-closed" in loaded:
+            self._assert_process_lock()
             self.admission.validate_closed_evidence(
                 loaded["cleanup-mutation-admission-closed"][1]["evidence"],
                 prepared,
                 authority,
             )
         if "cleanup-fleet-closed" in loaded:
+            self._assert_process_lock()
             self.effects.validate_cleanup_fleet_closed(
                 loaded["cleanup-fleet-closed"][1]["evidence"],
                 effects,
@@ -1652,9 +2092,13 @@ class FinalOpenExecutor:
             for stage in stages
             for suffix in ("json", "sha256")
         }
+        allowed.add(OpenProcessLock.FILENAME)
         prefix = f"{self.open_id}."
         for entry in self.receipt_directory.iterdir():
-            if entry.name.startswith(prefix) and entry.name not in allowed:
+            if (
+                entry.name == OpenProcessLock.FILENAME
+                or entry.name.startswith(prefix)
+            ) and entry.name not in allowed:
                 raise FinalOpenError("final-open journal contains a foreign artifact")
 
     def _publish_stage(
@@ -1684,12 +2128,31 @@ class FinalOpenExecutor:
         *,
         execute: bool,
     ) -> tuple[Path, str]:
+        with self._process_lock():
+            return self._apply_locked(
+                plan_path,
+                plan_sha256,
+                confirmation,
+                execute=execute,
+            )
+
+    def _apply_locked(
+        self,
+        plan_path: Path,
+        plan_sha256: str,
+        confirmation: str,
+        *,
+        execute: bool,
+    ) -> tuple[Path, str]:
+        self._assert_process_lock()
+        self._assert_no_foreign_transaction()
         if confirmation != self.open_id:
             raise FinalOpenError("--confirm-open-id does not match the reviewed target")
         plan, plan_digest, planned_authority, prepared, effects = self._validate_plan(
             plan_path,
             plan_sha256,
         )
+        self._assert_process_lock()
         stored_plan = RESET.read_stage_receipt(
             self.receipt_directory,
             self.open_id,
@@ -1740,7 +2203,9 @@ class FinalOpenExecutor:
                 planned_authority,
                 cleanup=True,
             )
+            self._assert_process_lock()
             self.admission.validate(prepared, live_authority)
+            self._assert_process_lock()
             self.effects.validate_cleanup(effects, live_authority)
             self._resume_cleanup(
                 context=cleanup_context,
@@ -1766,7 +2231,9 @@ class FinalOpenExecutor:
                     planned_authority,
                     cleanup=False,
                 )
+                self._assert_process_lock()
                 self.admission.validate(prepared, live_authority)
+                self._assert_process_lock()
                 self.effects.validate_post_boundary_forward(
                     effects,
                     live_authority,
@@ -1784,7 +2251,9 @@ class FinalOpenExecutor:
                     planned_authority,
                     cleanup=True,
                 )
+                self._assert_process_lock()
                 self.admission.validate(prepared, cleanup_authority)
+                self._assert_process_lock()
                 self.effects.validate_cleanup(effects, cleanup_authority)
                 (
                     admission_may_be_open,
@@ -1810,6 +2279,7 @@ class FinalOpenExecutor:
                 raise FinalOpenError(
                     "terminal reset/proof authority changed since planning"
                 )
+            self._assert_process_lock()
             self.admission.validate(prepared, live_authority)
         if not execute:
             if existing:
@@ -1821,15 +2291,18 @@ class FinalOpenExecutor:
                 raise FinalOpenError(
                     "final-open plan expired before its mutation-free dry-run"
                 )
+            self._assert_process_lock()
             self.admission.validate_live_closed(
                 prepared,
                 live_authority,
                 evaluated_at_unix_ms,
             )
+            self._assert_process_lock()
             self.effects.validate_live_closed_before_start(
                 effects,
                 live_authority,
             )
+            self._assert_process_lock()
             dry_run = RESET.read_stage_receipt(
                 self.receipt_directory,
                 self.open_id,
@@ -1886,6 +2359,7 @@ class FinalOpenExecutor:
         admission_finalization_started = finalizing_on_entry
         try:
             if not started_on_entry:
+                self._assert_no_foreign_transaction()
                 if cancellation.requested:
                     raise FinalOpenError("final Open cancelled before open-started")
                 evaluated_at_unix_ms = now_unix_ms()
@@ -1893,11 +2367,13 @@ class FinalOpenExecutor:
                     raise FinalOpenError(
                         "final-open plan expired before open-started"
                     )
+                self._assert_process_lock()
                 self.admission.validate_live_closed(
                     prepared,
                     live_authority,
                     evaluated_at_unix_ms,
                 )
+                self._assert_process_lock()
                 self.effects.validate_live_closed_before_start(
                     effects,
                     live_authority,
@@ -1923,6 +2399,7 @@ class FinalOpenExecutor:
                     raise FinalOpenError(
                         "signed Open expired before finalization; closing the attempt"
                     )
+                self._assert_process_lock()
                 self.admission.validate_live_closed(
                     prepared,
                     live_authority,
@@ -1939,6 +2416,7 @@ class FinalOpenExecutor:
                     raise FinalOpenError("final Open cancelled at a stage boundary")
                 if node not in possibly_schedulable:
                     possibly_schedulable.append(node)
+                self._assert_process_lock()
                 evidence = self.effects.settle_node_schedulable(node, live_authority)
                 _path, _value, previous = self._publish_stage(
                     stage,
@@ -1962,6 +2440,7 @@ class FinalOpenExecutor:
                 if cancellation.requested:
                     raise FinalOpenError("final Open cancelled at a stage boundary")
                 ingress_may_be_open = True
+                self._assert_process_lock()
                 evidence = self.effects.settle_ingress_open(effects, live_authority)
                 _path, _value, previous = self._publish_stage(
                     "public-ingress-open",
@@ -1973,6 +2452,7 @@ class FinalOpenExecutor:
             if "public-probe-terminal" not in existing:
                 if cancellation.requested:
                     raise FinalOpenError("final Open cancelled at a stage boundary")
+                self._assert_process_lock()
                 evidence = self.effects.settle_public_probe(effects, live_authority)
                 _path, _value, previous = self._publish_stage(
                     "public-probe-terminal",
@@ -1989,6 +2469,7 @@ class FinalOpenExecutor:
                     raise FinalOpenError(
                         "signed Open expired before finalization; closing the attempt"
                     )
+                self._assert_process_lock()
                 self.admission.validate_live_closed(
                     prepared,
                     live_authority,
@@ -2011,6 +2492,7 @@ class FinalOpenExecutor:
                     previous_sha256=previous,
                 )
             if "mutation-admission-open" not in existing:
+                self._assert_process_lock()
                 evidence = self.admission.settle_open(
                     prepared,
                     live_authority,
@@ -2025,6 +2507,7 @@ class FinalOpenExecutor:
                 )
             else:
                 open_evidence = existing["mutation-admission-open"][1]["evidence"]
+                self._assert_process_lock()
                 settled = self.admission.settle_open(
                     prepared,
                     live_authority,
@@ -2097,6 +2580,7 @@ class FinalOpenExecutor:
                 node["node_id"] for node in possibly_schedulable
             ],
         }
+        self._assert_process_lock()
         existing_start = RESET.read_stage_receipt(
             self.receipt_directory,
             self.open_id,
@@ -2147,6 +2631,7 @@ class FinalOpenExecutor:
         stages = self._cleanup_stage_names(context["possibly_schedulable_node_ids"])
         previous = existing[stages[len(existing) - 1]][2]
         if "cleanup-public-ingress-closed" not in existing:
+            self._assert_process_lock()
             evidence = self.effects.settle_ingress_closed(
                 effects,
                 authority,
@@ -2163,6 +2648,7 @@ class FinalOpenExecutor:
         for node_id in reversed(context["possibly_schedulable_node_ids"]):
             stage = f"cleanup-node-{node_id}-cordoned"
             if stage not in existing:
+                self._assert_process_lock()
                 evidence = self.effects.settle_node_cordoned(
                     nodes_by_id[node_id],
                     authority,
@@ -2175,6 +2661,7 @@ class FinalOpenExecutor:
                     previous_sha256=previous,
                 )
         if "cleanup-mutation-admission-closed" not in existing:
+            self._assert_process_lock()
             closed = self.admission.settle_closed(prepared, authority)
             _path, _value, previous = self._publish_stage(
                 "cleanup-mutation-admission-closed",
@@ -2184,6 +2671,7 @@ class FinalOpenExecutor:
                 previous_sha256=previous,
             )
         if "cleanup-fleet-closed" not in existing:
+            self._assert_process_lock()
             fleet = self.effects.settle_cleanup_fleet_closed(effects, authority)
             _path, _value, previous = self._publish_stage(
                 "cleanup-fleet-closed",

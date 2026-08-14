@@ -1138,6 +1138,14 @@ After rollout, rerun E12's fleet verifier with the now-schedulable policy facts 
 repository's bounded read-only public `GET /healthz` probe while product admission is still Closed;
 do not use the shell WebSocket or another product operation as this probe. Full public WebSocket
 evidence remains the reset-bound G3 qualification rather than a post-reset product mutation.
+Run final-open with only one operator process for the reviewed `open_id`. Both plan and apply acquire
+the one persistent actor-only empty `production-final-open.transaction.lock` for the entire receipt
+directory before reading any open journal and retain its stable directory/file descriptors through
+every forward/cleanup decision and effect. This global scope includes different `open_id` values. A
+concurrent invocation must exit before any adapter call; after a crash, a foreign ID remains blocked
+by the active journal and only the original ID exact-resumes. A new ID is allowed only after terminal
+Closed abort, and completed Open blocks all new IDs. Never unlink, replace or rotate the lock after
+success, abort or operator crash.
 Immediately re-discover the exact planned Closed revision and signed-command lifetime, publish the
 forward-only `mutation-admission-open-finalizing` marker, then settle the one exact Open command as
 the final external effect and publish `open-complete`. Before the marker, failure closes Ingress and

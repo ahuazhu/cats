@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import signal
+import stat
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -313,6 +316,7 @@ class FakeEffects:
         fail_node_id: str | None = None,
         cancel_during_public_probe: bool = False,
         refuse_post_boundary_forward: bool = False,
+        open_id: str = "final-open-01",
     ) -> None:
         self.calls: list[str] = []
         self.failures = dict(failures or {})
@@ -322,7 +326,7 @@ class FakeEffects:
         self.value = {
             "kind": OPEN.EFFECTS_KIND,
             "version": 1,
-            "open_id": "final-open-01",
+            "open_id": open_id,
             "deployment_id": "deployment-stageb-01",
             "release_id": "release-stageb-01",
             "source_commit_sha": "a" * 40,
@@ -494,17 +498,46 @@ def executor(
     admission: FakeAdmission,
     effects: Any,
     *,
+    open_id: str = "final-open-01",
     reset_executor: Any | None = None,
     inject_authority: bool = True,
     receipt_publication_hook: Any | None = None,
+    process_lock_acquisition_hook: Any | None = None,
 ) -> Any:
     root.mkdir(mode=0o700, parents=True)
     root.chmod(0o700)
     receipts = root / "receipts"
     receipts.mkdir(mode=0o700)
     receipts.chmod(0o700)
+    return existing_executor(
+        root,
+        admission,
+        effects,
+        open_id=open_id,
+        reset_executor=reset_executor,
+        inject_authority=inject_authority,
+        receipt_publication_hook=receipt_publication_hook,
+        process_lock_acquisition_hook=process_lock_acquisition_hook,
+    )
+
+
+def existing_executor(
+    root: Path,
+    admission: FakeAdmission,
+    effects: Any,
+    *,
+    open_id: str = "final-open-01",
+    reset_executor: Any | None = None,
+    inject_authority: bool = True,
+    receipt_publication_hook: Any | None = None,
+    process_lock_acquisition_hook: Any | None = None,
+) -> Any:
+    receipts = root / "receipts"
+    optional: dict[str, Any] = {}
+    if process_lock_acquisition_hook is not None:
+        optional["process_lock_acquisition_hook"] = process_lock_acquisition_hook
     return OPEN.FinalOpenExecutor(
-        open_id="final-open-01",
+        open_id=open_id,
         reset_executor=reset_executor if reset_executor is not None else object(),
         reset_plan_path=root / "unused-reset-plan.json",
         reset_plan_sha256="3" * 64,
@@ -513,6 +546,7 @@ def executor(
         receipt_directory=receipts,
         authority_verifier=authority if inject_authority else None,
         receipt_publication_hook=receipt_publication_hook,
+        **optional,
     )
 
 
@@ -524,6 +558,511 @@ def expect_refusal(call: Any, fragment: str) -> None:
             raise AssertionError(f"unexpected refusal: {error}") from error
     else:
         raise AssertionError(f"expected refusal containing {fragment!r}")
+
+
+def append_durable_line(path: Path, value: str) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_APPEND
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        payload = (value + "\n").encode("ascii")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def durable_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return path.read_text(encoding="ascii").splitlines()
+
+
+def wait_for_path(path: Path, timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path.name}")
+
+
+def wait_for_child(pid: int, timeout_seconds: float = 5.0) -> int:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return status
+        time.sleep(0.01)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    raise AssertionError(f"timed out waiting for child {pid}")
+
+
+def kill_and_reap(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def process_lock_is_persistent_and_rejects_aba(root: Path) -> None:
+    admission = FakeAdmission()
+    effects = FakeEffects()
+    subject = executor(root / "persistent", admission, effects)
+    plan_path, plan_digest = subject.plan()
+    lock_path = subject.process_lock_path
+    metadata = lock_path.stat(follow_symlinks=False)
+    identity = (metadata.st_dev, metadata.st_ino)
+    assert stat.S_ISREG(metadata.st_mode)
+    assert metadata.st_uid == os.geteuid()
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert metadata.st_nlink == 1
+    assert metadata.st_size == 0
+    assert lock_path.read_bytes() == b""
+    assert lock_path.name == OPEN.OpenProcessLock.FILENAME
+
+    assert subject.plan() == (plan_path, plan_digest)
+    second_open_id = "final-open-02"
+    second = existing_executor(
+        root / "persistent",
+        FakeAdmission(),
+        FakeEffects(open_id=second_open_id),
+        open_id=second_open_id,
+    )
+    second.plan()
+    second_metadata = lock_path.stat(follow_symlinks=False)
+    assert (second_metadata.st_dev, second_metadata.st_ino) == identity
+    subject.apply(
+        plan_path,
+        plan_digest,
+        "final-open-01",
+        execute=False,
+    )
+    replay_metadata = lock_path.stat(follow_symlinks=False)
+    assert (replay_metadata.st_dev, replay_metadata.st_ino) == identity
+
+    aba = executor(root / "aba", FakeAdmission(), FakeEffects())
+    aba.plan()
+
+    def replace_while_locked() -> None:
+        with aba._process_lock():
+            aba.process_lock_path.unlink()
+            descriptor = os.open(
+                aba.process_lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                0o600,
+            )
+            os.close(descriptor)
+            aba._assert_process_lock()
+
+    expect_refusal(replace_while_locked, "unlinked, replaced, or changed")
+
+
+def malformed_process_locks_fail_before_adapter_calls(root: Path) -> None:
+    for case in ("bytes", "symlink", "hardlink", "mode"):
+        admission = FakeAdmission()
+        effects = FakeEffects()
+        subject = executor(root / case, admission, effects)
+        source = root / case / "lock-source"
+        OPEN.RESET.atomic_write_new(source, b"")
+        if case == "bytes":
+            OPEN.RESET.atomic_write_new(subject.process_lock_path, b"foreign\n")
+        elif case == "symlink":
+            subject.process_lock_path.symlink_to(source)
+        elif case == "hardlink":
+            os.link(source, subject.process_lock_path)
+        else:
+            OPEN.RESET.atomic_write_new(subject.process_lock_path, b"")
+            subject.process_lock_path.chmod(0o640)
+        expect_refusal(subject.plan, "final-open process lock")
+        assert admission.calls == []
+        assert effects.calls == []
+
+
+def process_lock_creation_sigkill_is_replayable(root: Path) -> None:
+    phases = (
+        "after_create_before_fsync",
+        "after_file_fsync_before_directory_fsync",
+        "after_directory_fsync_before_flock",
+        "after_flock_before_return",
+    )
+    for phase in phases:
+        case_root = root / phase
+
+        def crash_at_phase(observed: str, _path: Path) -> None:
+            if observed == phase:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        crashing = executor(
+            case_root,
+            FakeAdmission(),
+            FakeEffects(),
+            process_lock_acquisition_hook=crash_at_phase,
+        )
+        pid = os.fork()
+        if pid == 0:
+            crashing.plan()
+            os._exit(7)
+        status = wait_for_child(pid)
+        assert os.WIFSIGNALED(status)
+        assert os.WTERMSIG(status) == signal.SIGKILL
+
+        lock_path = case_root / "receipts" / OPEN.OpenProcessLock.FILENAME
+        metadata = lock_path.stat(follow_symlinks=False)
+        assert stat.S_ISREG(metadata.st_mode)
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+        assert metadata.st_nlink == 1
+        assert metadata.st_size == 0
+
+        replay = existing_executor(case_root, FakeAdmission(), FakeEffects())
+        plan_path, _plan_digest = replay.plan()
+        assert plan_path.name == "final-open-01.open-plan.json"
+        assert {entry.name for entry in replay.receipt_directory.iterdir()} == {
+            OPEN.OpenProcessLock.FILENAME,
+            "final-open-01.open-plan.json",
+            "final-open-01.open-plan.sha256",
+        }
+
+
+def process_lock_serializes_real_processes(root: Path) -> None:
+    first_open_id = "final-open-01"
+    contender_open_id = "final-open-02"
+    event_log = root / "effects.log"
+    barrier = root / "first-at-probe"
+    first_result = root / "first-result"
+    contender_result = root / "contender-result"
+    resume_result = root / "resume-result"
+
+    class LoggedAdmission(FakeAdmission):
+        def settle_open(
+            self,
+            prepared: Any,
+            authority_value: Any,
+            cancellation: Any,
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "admission-open")
+            return super().settle_open(prepared, authority_value, cancellation)
+
+        def settle_closed(
+            self,
+            prepared: Any,
+            authority_value: Any,
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "admission-closed")
+            return super().settle_closed(prepared, authority_value)
+
+    class LoggedEffects(FakeEffects):
+        def settle_node_schedulable(
+            self, node: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, f"node:{node['node_id']}")
+            return super().settle_node_schedulable(node, authority_value)
+
+        def settle_ingress_open(
+            self, effects_value: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "ingress-open")
+            return super().settle_ingress_open(effects_value, authority_value)
+
+        def settle_public_probe(
+            self, effects_value: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "public-probe")
+            return super().settle_public_probe(effects_value, authority_value)
+
+        def settle_ingress_closed(
+            self,
+            effects_value: dict[str, Any],
+            authority_value: Any,
+            may_be_open: bool,
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "cleanup-ingress")
+            return super().settle_ingress_closed(
+                effects_value,
+                authority_value,
+                may_be_open,
+            )
+
+        def settle_node_cordoned(
+            self, node: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, f"cleanup-node:{node['node_id']}")
+            return super().settle_node_cordoned(node, authority_value)
+
+        def settle_cleanup_fleet_closed(
+            self, effects_value: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            append_durable_line(event_log, "cleanup-fleet")
+            return super().settle_cleanup_fleet_closed(
+                effects_value,
+                authority_value,
+            )
+
+    class BarrierEffects(LoggedEffects):
+        def settle_public_probe(
+            self, effects_value: dict[str, Any], authority_value: Any
+        ) -> dict[str, Any]:
+            OPEN.RESET.atomic_write_new(barrier, b"ready\n")
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise RuntimeError("fixture barrier timed out")
+
+    first_planned_admission = FakeAdmission()
+    contender_planned_admission = FakeAdmission()
+
+    def matching_logged_admission(planned: FakeAdmission) -> LoggedAdmission:
+        value = LoggedAdmission()
+        value.prepared = planned.prepared
+        return value
+
+    initial = executor(root, first_planned_admission, FakeEffects())
+    plan_path, plan_digest = initial.plan()
+    contender_plan_owner = existing_executor(
+        root,
+        contender_planned_admission,
+        FakeEffects(open_id=contender_open_id),
+        open_id=contender_open_id,
+    )
+    contender_plan_path, contender_plan_digest = contender_plan_owner.plan()
+
+    first_pid = os.fork()
+    if first_pid == 0:
+        try:
+            first = existing_executor(
+                root,
+                matching_logged_admission(first_planned_admission),
+                BarrierEffects(),
+            )
+            first.apply(
+                plan_path,
+                plan_digest,
+                "final-open-01",
+                execute=True,
+            )
+            append_durable_line(first_result, "unexpected-success")
+            os._exit(2)
+        except BaseException as error:
+            append_durable_line(
+                first_result,
+                f"{type(error).__name__}:{error}",
+            )
+            os._exit(3)
+
+    contender_status = -1
+    events_before_contender: list[str] = []
+    events_after_contender: list[str] = []
+    try:
+        try:
+            wait_for_path(barrier)
+        except AssertionError as error:
+            raise AssertionError(durable_lines(first_result)) from error
+        assert (
+            root / "receipts" / "final-open-01.open-started.json"
+        ).exists()
+        assert (
+            root / "receipts" / "final-open-01.public-ingress-open.json"
+        ).exists()
+        events_before_contender = durable_lines(event_log)
+        assert events_before_contender == [
+            "node:node-a",
+            "node:node-b",
+            "ingress-open",
+        ]
+
+        contender_pid = os.fork()
+        if contender_pid == 0:
+            contender = existing_executor(
+                root,
+                matching_logged_admission(contender_planned_admission),
+                LoggedEffects(open_id=contender_open_id),
+                open_id=contender_open_id,
+            )
+            outcomes: list[str] = []
+            for label, operation in (
+                ("plan", contender.plan),
+                (
+                    "apply",
+                    lambda: contender.apply(
+                        contender_plan_path,
+                        contender_plan_digest,
+                        contender_open_id,
+                        execute=True,
+                    ),
+                ),
+            ):
+                try:
+                    operation()
+                except OPEN.FinalOpenError as error:
+                    outcomes.append(f"{label}:refused:{error}")
+                except BaseException as error:
+                    outcomes.append(
+                        f"{label}:wrong-error:{type(error).__name__}:{error}"
+                    )
+                else:
+                    outcomes.append(f"{label}:accepted")
+            for outcome in outcomes:
+                append_durable_line(contender_result, outcome)
+            expected_fragment = "another final-open process owns final-open"
+            if all(
+                outcome.startswith(f"{label}:refused:")
+                and expected_fragment in outcome
+                for label, outcome in zip(("plan", "apply"), outcomes)
+            ):
+                os._exit(0)
+            os._exit(4)
+        contender_status = wait_for_child(contender_pid)
+        events_after_contender = durable_lines(event_log)
+    finally:
+        kill_and_reap(first_pid)
+
+    assert os.WIFEXITED(contender_status)
+    assert os.WEXITSTATUS(contender_status) == 0, durable_lines(contender_result)
+    assert events_after_contender == events_before_contender
+    assert not (
+        root / "receipts" / "final-open-01.cleanup-started.json"
+    ).exists()
+    assert not (
+        root / "receipts" / "final-open-01.mutation-admission-open-finalizing.json"
+    ).exists()
+
+    post_crash_contender = existing_executor(
+        root,
+        matching_logged_admission(contender_planned_admission),
+        LoggedEffects(open_id=contender_open_id),
+        open_id=contender_open_id,
+    )
+    expect_refusal(
+        post_crash_contender.plan,
+        "foreign final-open transaction is active",
+    )
+    expect_refusal(
+        lambda: post_crash_contender.apply(
+            contender_plan_path,
+            contender_plan_digest,
+            contender_open_id,
+            execute=True,
+        ),
+        "foreign final-open transaction is active",
+    )
+    assert durable_lines(event_log) == events_before_contender
+
+    resume_pid = os.fork()
+    if resume_pid == 0:
+        try:
+            resumed = existing_executor(
+                root,
+                matching_logged_admission(first_planned_admission),
+                LoggedEffects(),
+            )
+            complete, _digest = resumed.apply(
+                plan_path,
+                plan_digest,
+                "final-open-01",
+                execute=True,
+            )
+            append_durable_line(resume_result, complete.name)
+            os._exit(0)
+        except BaseException as error:
+            append_durable_line(
+                resume_result,
+                f"{type(error).__name__}:{error}",
+            )
+            os._exit(5)
+    resume_status = wait_for_child(resume_pid)
+    assert os.WIFEXITED(resume_status)
+    assert os.WEXITSTATUS(resume_status) == 0, durable_lines(resume_result)
+    assert durable_lines(resume_result) == ["final-open-01.open-complete.json"]
+    assert durable_lines(event_log) == [
+        "node:node-a",
+        "node:node-b",
+        "ingress-open",
+        "public-probe",
+        "admission-open",
+    ]
+    assert not (
+        root / "receipts" / "final-open-01.cleanup-started.json"
+    ).exists()
+
+    completed_contender = existing_executor(
+        root,
+        matching_logged_admission(contender_planned_admission),
+        LoggedEffects(open_id=contender_open_id),
+        open_id=contender_open_id,
+    )
+    expect_refusal(
+        completed_contender.plan,
+        "foreign final-open transaction already completed",
+    )
+    expect_refusal(
+        lambda: completed_contender.apply(
+            contender_plan_path,
+            contender_plan_digest,
+            contender_open_id,
+            execute=True,
+        ),
+        "foreign final-open transaction already completed",
+    )
+    assert durable_lines(event_log) == [
+        "node:node-a",
+        "node:node-b",
+        "ingress-open",
+        "public-probe",
+        "admission-open",
+    ]
+
+
+def terminal_aborted_open_allows_a_new_open_id(root: Path) -> None:
+    first = executor(
+        root,
+        FakeAdmission(),
+        FakeEffects(failures={"public-probe": 1}),
+    )
+    first_plan, first_digest = first.plan()
+    expect_refusal(
+        lambda: first.apply(
+            first_plan,
+            first_digest,
+            "final-open-01",
+            execute=True,
+        ),
+        "closed cleanup reached its terminal receipt",
+    )
+    assert (
+        root / "receipts" / "final-open-01.open-aborted.json"
+    ).exists()
+
+    next_open_id = "final-open-02"
+    second = existing_executor(
+        root,
+        FakeAdmission(),
+        FakeEffects(open_id=next_open_id),
+        open_id=next_open_id,
+    )
+    second_plan, second_digest = second.plan()
+    complete, _complete_digest = second.apply(
+        second_plan,
+        second_digest,
+        next_open_id,
+        execute=True,
+    )
+    assert complete.name == "final-open-02.open-complete.json"
 
 
 def successful_replay(root: Path) -> None:
@@ -1020,19 +1559,20 @@ def expired_started_attempt_closes_without_open(root: Path) -> None:
         "fixture final-open plan",
         OPEN.MAX_OPEN_PLAN_BYTES,
     )[0]
-    subject._publish_stage(
-        "open-started",
-        {
-            "status": "closed_preparation_started",
-            "reset_complete_receipt_sha256": (
-                authority().reset_complete_receipt_sha256
-            ),
-            "proof_set_sha256": authority().binding["proof_set_sha256"],
-        },
-        plan_sha256="sha256:" + plan_digest,
-        authority_sha256=plan["authority_sha256"],
-        previous_sha256=None,
-    )
+    with subject._process_lock():
+        subject._publish_stage(
+            "open-started",
+            {
+                "status": "closed_preparation_started",
+                "reset_complete_receipt_sha256": (
+                    authority().reset_complete_receipt_sha256
+                ),
+                "proof_set_sha256": authority().binding["proof_set_sha256"],
+            },
+            plan_sha256="sha256:" + plan_digest,
+            authority_sha256=plan["authority_sha256"],
+            previous_sha256=None,
+        )
     real_now = OPEN.now_unix_ms
     OPEN.now_unix_ms = lambda: plan["execution_deadline_unix_ms"]
     try:
@@ -1087,14 +1627,15 @@ def publish_through_ingress(
         ("nodes-schedulable", {"node_ids": ["node-a", "node-b"], "count": 2}),
         ("public-ingress-open", {"kind": "fixture.ingress-open.v1", "version": 1}),
     ]
-    for stage, evidence in stages:
-        _path, _value, previous = subject._publish_stage(
-            stage,
-            evidence,
-            plan_sha256="sha256:" + plan_digest,
-            authority_sha256=plan["authority_sha256"],
-            previous_sha256=previous,
-        )
+    with subject._process_lock():
+        for stage, evidence in stages:
+            _path, _value, previous = subject._publish_stage(
+                stage,
+                evidence,
+                plan_sha256="sha256:" + plan_digest,
+                authority_sha256=plan["authority_sha256"],
+                previous_sha256=previous,
+            )
 
 
 def post_boundary_reset_verifier_selection(root: Path) -> None:
@@ -1140,17 +1681,20 @@ def post_boundary_reset_verifier_selection(root: Path) -> None:
         "fixture final-open plan",
         OPEN.MAX_OPEN_PLAN_BYTES,
     )[0]
-    subject._publish_stage(
-        "open-started",
-        {
-            "status": "closed_preparation_started",
-            "reset_complete_receipt_sha256": authority().reset_complete_receipt_sha256,
-            "proof_set_sha256": authority().binding["proof_set_sha256"],
-        },
-        plan_sha256="sha256:" + plan_digest,
-        authority_sha256=plan["authority_sha256"],
-        previous_sha256=None,
-    )
+    with subject._process_lock():
+        subject._publish_stage(
+            "open-started",
+            {
+                "status": "closed_preparation_started",
+                "reset_complete_receipt_sha256": (
+                    authority().reset_complete_receipt_sha256
+                ),
+                "proof_set_sha256": authority().binding["proof_set_sha256"],
+            },
+            plan_sha256="sha256:" + plan_digest,
+            authority_sha256=plan["authority_sha256"],
+            previous_sha256=None,
+        )
     reset.calls.clear()
     reset.pristine_refuses = True
     reset.forward_refuses = True
@@ -1473,6 +2017,11 @@ def cleanup_receipt_publication_crash_matrix(root: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="cats-final-open-fixture-") as temporary:
         root = Path(temporary)
+        process_lock_serializes_real_processes(root / "process-lock-concurrency")
+        process_lock_creation_sigkill_is_replayable(root / "process-lock-sigkill")
+        process_lock_is_persistent_and_rejects_aba(root / "process-lock-identity")
+        malformed_process_locks_fail_before_adapter_calls(root / "process-lock-invalid")
+        terminal_aborted_open_allows_a_new_open_id(root / "aborted-next-open")
         unavailable_is_mutation_free(root / "unavailable")
         public_probe_descriptor_is_exact()
         successful_replay(root / "success")
