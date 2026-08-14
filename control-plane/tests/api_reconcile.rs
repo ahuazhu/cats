@@ -2080,11 +2080,11 @@ async fn default_auto_suspend_is_inert_on_the_last_guest_work_release() {
 }
 
 #[tokio::test]
-async fn automatic_tier_policy_does_not_mutate_a_running_runtime() {
+async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
     let ctx = Ctx::new_with_auto_tier(
         AutoTierPolicy {
-            warm_after_ms: Some(100),
-            cold_after_ms: Some(100),
+            warm_after_ms: Some(500),
+            cold_after_ms: Some(500),
         },
         20,
     )
@@ -2093,41 +2093,63 @@ async fn automatic_tier_policy_does_not_mutate_a_running_runtime() {
     let created = ctx.create_cat("tiered", None).await;
     ctx.wait_operation(&created.operation.id).await;
     let cat = ctx.wait_observed("tiered", ObservedState::Running).await;
-    let operations_before = serde_json::to_value(
-        ctx.get_json::<ListResponse<Operation>>(ctx.ws_url("/operations"))
-            .await,
-    )
-    .unwrap();
-    let jobs_before = node.jobs.lock().unwrap().clone();
+    let cat_id = cat.id.clone();
+    let setup_suspend = ctx
+        .cp
+        .state
+        .store
+        .execute(move |store| {
+            store.set_desired(&cat_id, DesiredState::Suspended, None, "cat.suspend")
+        })
+        .await
+        .unwrap();
+    ctx.cp.state.notify.notify_one();
+    let setup_suspend = ctx.wait_operation(&setup_suspend.id).await;
+    assert_eq!(setup_suspend.phase, OperationPhase::Succeeded);
+    let suspended = ctx.wait_observed("tiered", ObservedState::Suspended).await;
+    assert_eq!(suspended.desired_state, DesiredState::Suspended);
+    assert_eq!(suspended.generation, cat.generation + 1);
+    assert!(suspended.observed_state_since_unix_ms > 0);
 
-    ctx.record_retired_work(NodeWorkStatusRequest {
-        node_id: "node_a".into(),
-        cat_id: cat.id.clone(),
-        generation: cat.generation,
-        guest_source_epoch: "guest-boot-1".into(),
-        guest_lease_sequence: 0,
-        leases: vec![],
-    })
-    .await;
-
-    // Both tier deadlines and many 20 ms reconcile intervals pass. With the
-    // automatic suspend producer disabled, the policy cannot create the
-    // Suspended authority from which Warm or Cold demotion would begin.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let unchanged: Cat = ctx.get_json(ctx.ws_url("/cats/tiered")).await;
-    assert_eq!(unchanged.desired_state, DesiredState::Running);
-    assert_eq!(unchanged.observed_state, ObservedState::Running);
-    assert_eq!(unchanged.generation, cat.generation);
-    assert_eq!(unchanged.node_id, cat.node_id);
-    assert_eq!(node.jobs.lock().unwrap().as_slice(), jobs_before.as_slice());
-    assert_eq!(
-        serde_json::to_value(
-            ctx.get_json::<ListResponse<Operation>>(ctx.ws_url("/operations"))
-                .await,
-        )
-        .unwrap(),
-        operations_before,
+    // Suspend is deliberately not a production API in the first terminal
+    // release. The retired Store fixture above establishes the legal
+    // host-bound state without reviving that route; the automatic deeper-tier
+    // policy still owns persisted-age Suspended -> Warm -> Cold convergence.
+    let cold = ctx.wait_observed("tiered", ObservedState::Cold).await;
+    assert_eq!(cold.desired_state, DesiredState::Cold);
+    assert_eq!(cold.generation, cat.generation + 3);
+    assert!(cold.node_id.is_none());
+    assert!(
+        cold.observed_state_since_unix_ms > suspended.observed_state_since_unix_ms,
+        "each observed tier must persist a new state-age origin"
     );
+
+    let operations: ListResponse<Operation> = ctx.get_json(ctx.ws_url("/operations")).await;
+    for (kind, generation) in [
+        ("cat.auto_warm", cat.generation + 2),
+        ("cat.auto_cold", cat.generation + 3),
+    ] {
+        assert!(
+            operations.items.iter().any(|operation| {
+                operation.kind == kind
+                    && operation.resource_generation == generation
+                    && operation.phase == OperationPhase::Succeeded
+            }),
+            "missing successful {kind} for generation {generation}: {:?}",
+            operations
+                .items
+                .iter()
+                .map(|operation| (
+                    &operation.kind,
+                    operation.resource_generation,
+                    operation.phase
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+    let jobs = node.jobs.lock().unwrap();
+    assert!(jobs.iter().any(|job| job.ends_with("_warm_cat")));
+    assert!(jobs.iter().any(|job| job.ends_with("_stop_cat")));
 }
 
 #[tokio::test]
