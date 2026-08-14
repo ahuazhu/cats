@@ -8,7 +8,6 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 use cats_api::runtime_reconciliation::{
     AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
     RandomId128, RemoteHead, Revision, Sha256Digest,
