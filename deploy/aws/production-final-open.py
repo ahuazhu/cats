@@ -59,6 +59,11 @@ RAW_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 MAX_OPEN_PLAN_BYTES = 2 * 1024 * 1024
 OPEN_EXECUTION_MIN_REMAINING_MS = 30_000
+PRODUCTION_FINAL_OPEN_STATE_ROOT = Path("/var/lib/cats/production-final-open")
+PRODUCTION_ADMISSION_STATE_DIRECTORY = (
+    PRODUCTION_FINAL_OPEN_STATE_ROOT / "admission-state"
+)
+PRODUCTION_OPEN_RECEIPT_DIRECTORY = PRODUCTION_FINAL_OPEN_STATE_ROOT / "receipts"
 
 
 class FinalOpenError(RuntimeError):
@@ -85,11 +90,89 @@ def require_digest(value: Any, label: str) -> str:
     return value
 
 
+def validate_prior_terminal_aborts(
+    value: Any,
+    open_id: str,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise FinalOpenError("prior terminal aborts must be an exact sorted list")
+    validated: list[dict[str, str]] = []
+    previous_open_id: str | None = None
+    for item in value:
+        item = require_fields(
+            item,
+            {"open_id", "open_aborted_sha256"},
+            "prior terminal abort",
+        )
+        prior_open_id = item["open_id"]
+        if (
+            not isinstance(prior_open_id, str)
+            or OPEN_ID.fullmatch(prior_open_id) is None
+            or prior_open_id == open_id
+            or (previous_open_id is not None and prior_open_id <= previous_open_id)
+        ):
+            raise FinalOpenError(
+                "prior terminal aborts are not unique and sorted by open_id"
+            )
+        digest = require_digest(
+            item["open_aborted_sha256"],
+            "prior terminal abort receipt",
+        )
+        validated.append(
+            {
+                "open_id": prior_open_id,
+                "open_aborted_sha256": digest,
+            }
+        )
+        previous_open_id = prior_open_id
+    return validated
+
+
 def canonical_json(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
     ).encode("ascii")
+
+
+def validate_production_final_open_state_root() -> None:
+    if os.geteuid() != 0:
+        raise FinalOpenError("production final-open must run as root")
+    expected = {
+        PRODUCTION_ADMISSION_STATE_DIRECTORY.name,
+        PRODUCTION_OPEN_RECEIPT_DIRECTORY.name,
+    }
+    for path in (
+        PRODUCTION_FINAL_OPEN_STATE_ROOT,
+        PRODUCTION_ADMISSION_STATE_DIRECTORY,
+        PRODUCTION_OPEN_RECEIPT_DIRECTORY,
+    ):
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise FinalOpenError(
+                "production final-open fixed state root is not installed"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise FinalOpenError(
+                "production final-open state paths must be root:root mode-0700 real directories"
+            )
+    try:
+        actual = {entry.name for entry in PRODUCTION_FINAL_OPEN_STATE_ROOT.iterdir()}
+    except OSError as error:
+        raise FinalOpenError(
+            "production final-open fixed state root cannot be enumerated"
+        ) from error
+    if actual != expected:
+        raise FinalOpenError(
+            "production final-open fixed state root has foreign direct children"
+        )
 
 
 class OpenProcessLock:
@@ -1341,7 +1424,86 @@ class FinalOpenExecutor:
             raise FinalOpenError("foreign final-open receipt binding drifted")
         return value, "sha256:" + raw_digest
 
-    def _assert_no_foreign_transaction(self) -> None:
+    def _foreign_plan(
+        self,
+        open_id: str,
+    ) -> tuple[dict[str, Any], str, list[str]]:
+        self._assert_process_lock()
+        try:
+            item = RESET.read_stage_receipt(
+                self.receipt_directory,
+                open_id,
+                "open-plan",
+            )
+        except RESET.ResetError as error:
+            raise FinalOpenError("foreign final-open plan is malformed") from error
+        if item is None:
+            raise FinalOpenError("foreign final-open journal has no immutable plan")
+        _path, plan, raw_digest = item
+        plan = require_fields(
+            plan,
+            {
+                "kind",
+                "version",
+                "mode",
+                "open_id",
+                "created_at_unix_ms",
+                "execution_deadline_unix_ms",
+                "authority",
+                "authority_sha256",
+                "admission",
+                "admission_sha256",
+                "effects",
+                "effects_sha256",
+                "prior_terminal_aborts",
+                "rollback_boundary",
+            },
+            "foreign final-open plan",
+        )
+        if (
+            plan["kind"] != PLAN_KIND
+            or not version_one(plan["version"])
+            or plan["mode"] != "read_only_plan"
+            or plan["open_id"] != open_id
+            or type(plan["created_at_unix_ms"]) is not int
+            or plan["created_at_unix_ms"] <= 0
+            or type(plan["execution_deadline_unix_ms"]) is not int
+            or plan["execution_deadline_unix_ms"] <= plan["created_at_unix_ms"]
+            or plan["authority_sha256"]
+            != sha256(canonical_json(plan["authority"]))
+            or plan["admission_sha256"]
+            != sha256(canonical_json(plan["admission"]))
+            or plan["effects_sha256"]
+            != sha256(canonical_json(plan["effects"]))
+        ):
+            raise FinalOpenError("foreign final-open plan binding drifted")
+        validate_prior_terminal_aborts(
+            plan["prior_terminal_aborts"],
+            open_id,
+        )
+        authority_value = require_fields(
+            plan["authority"],
+            {
+                "operator",
+                "binding",
+                "reset_plan_sha256",
+                "reset_complete_receipt_sha256",
+            },
+            "foreign final-open plan authority",
+        )
+        authority = validate_authority(
+            OpenAuthority(**authority_value),
+            open_id,
+        )
+        effects = validate_effects(plan["effects"], authority, open_id)
+        return (
+            plan,
+            "sha256:" + raw_digest,
+            [node["node_id"] for node in effects["nodes"]],
+        )
+
+    def _assert_no_foreign_transaction(self) -> list[dict[str, str]]:
+        prior_terminal_aborts: list[dict[str, str]] = []
         safe_plan_artifacts = {
             "open-plan.json",
             "open-plan.sha256",
@@ -1390,7 +1552,10 @@ class FinalOpenExecutor:
                 raise FinalOpenError(
                     "foreign aborted final-open journal is not terminal Closed"
                 )
-            aborted_value, _aborted_digest = aborted
+            foreign_plan, foreign_plan_digest, planned_node_ids = self._foreign_plan(
+                foreign_open_id
+            )
+            aborted_value, aborted_digest = aborted
             started = markers["open-started"]
             cleanup_started = markers["cleanup-started"]
             admission_closed = markers["cleanup-mutation-admission-closed"]
@@ -1405,22 +1570,9 @@ class FinalOpenExecutor:
                     "foreign aborted final-open journal lost its terminal receipts"
                 )
             started_value, _started_digest = started
-            cleanup_started_value, _cleanup_started_digest = cleanup_started
+            cleanup_started_value, cleanup_started_digest = cleanup_started
             admission_value, admission_digest = admission_closed
             fleet_value, fleet_digest = fleet_closed
-            lineage = {
-                (
-                    value["plan_sha256"],
-                    value["authority_sha256"],
-                )
-                for value in (
-                    started_value,
-                    cleanup_started_value,
-                    admission_value,
-                    fleet_value,
-                    aborted_value,
-                )
-            }
             cleanup_context = require_fields(
                 cleanup_started_value["evidence"],
                 {
@@ -1431,26 +1583,106 @@ class FinalOpenExecutor:
                 },
                 "foreign cleanup-started evidence",
             )
+            node_ids = cleanup_context["possibly_schedulable_node_ids"]
             if (
-                len(lineage) != 1
-                or started_value["previous_receipt_sha256"] is not None
+                started_value["previous_receipt_sha256"] is not None
                 or cleanup_started_value["previous_receipt_sha256"] is not None
                 or cleanup_context["failed"]
                 != "final_open_failed_or_cancelled"
                 or cleanup_context["admission_may_be_open"] is not False
                 or type(cleanup_context["ingress_may_be_open"]) is not bool
-                or not isinstance(
-                    cleanup_context["possibly_schedulable_node_ids"],
-                    list,
+                or not isinstance(node_ids, list)
+                or any(
+                    not isinstance(node_id, str)
+                    or NODE_ID.fullmatch(node_id) is None
+                    for node_id in node_ids
+                )
+                or node_ids != planned_node_ids[: len(node_ids)]
+                or (
+                    cleanup_context["ingress_may_be_open"]
+                    and node_ids != planned_node_ids
                 )
                 or aborted_value["evidence"]
                 != {"outcome": "closed_cleanup_terminal"}
-                or fleet_value["previous_receipt_sha256"] != admission_digest
-                or aborted_value["previous_receipt_sha256"] != fleet_digest
             ):
                 raise FinalOpenError(
                     "foreign aborted final-open terminal chain drifted"
                 )
+            expected_node_stages = {
+                f"cleanup-node-{node_id}-cordoned" for node_id in node_ids
+            }
+            actual_node_stages: set[str] = set()
+            for artifact in artifacts:
+                for suffix in (".json", ".sha256"):
+                    if artifact.startswith("cleanup-node-") and artifact.endswith(
+                        suffix
+                    ):
+                        actual_node_stages.add(artifact[: -len(suffix)])
+            if actual_node_stages != expected_node_stages:
+                raise FinalOpenError(
+                    "foreign aborted final-open cleanup Node set drifted"
+                )
+
+            ingress_closed = self._foreign_stage(
+                foreign_open_id,
+                "cleanup-public-ingress-closed",
+            )
+            if ingress_closed is None:
+                raise FinalOpenError(
+                    "foreign aborted final-open omitted Ingress cleanup"
+                )
+            ingress_value, previous = ingress_closed
+            if ingress_value["previous_receipt_sha256"] != cleanup_started_digest:
+                raise FinalOpenError(
+                    "foreign aborted final-open Ingress cleanup chain drifted"
+                )
+            dynamic_values = [ingress_value]
+            for node_id in reversed(node_ids):
+                node_stage = f"cleanup-node-{node_id}-cordoned"
+                node_receipt = self._foreign_stage(foreign_open_id, node_stage)
+                if node_receipt is None:
+                    raise FinalOpenError(
+                        "foreign aborted final-open omitted Node cleanup"
+                    )
+                node_value, node_digest = node_receipt
+                if node_value["previous_receipt_sha256"] != previous:
+                    raise FinalOpenError(
+                        "foreign aborted final-open Node cleanup chain drifted"
+                    )
+                dynamic_values.append(node_value)
+                previous = node_digest
+            if (
+                admission_value["previous_receipt_sha256"] != previous
+                or fleet_value["previous_receipt_sha256"] != admission_digest
+                or aborted_value["previous_receipt_sha256"] != fleet_digest
+            ):
+                raise FinalOpenError(
+                    "foreign aborted final-open terminal digest chain drifted"
+                )
+            lineage_values = [
+                started_value,
+                cleanup_started_value,
+                *dynamic_values,
+                admission_value,
+                fleet_value,
+                aborted_value,
+            ]
+            if any(
+                value["plan_sha256"] != foreign_plan_digest
+                or value["authority_sha256"]
+                != foreign_plan["authority_sha256"]
+                for value in lineage_values
+            ):
+                raise FinalOpenError(
+                    "foreign aborted final-open receipt lineage drifted"
+                )
+            prior_terminal_aborts.append(
+                {
+                    "open_id": foreign_open_id,
+                    "open_aborted_sha256": aborted_digest,
+                }
+            )
+        return prior_terminal_aborts
 
     def _authority(self) -> OpenAuthority:
         self._assert_process_lock()
@@ -1656,7 +1888,7 @@ class FinalOpenExecutor:
 
     def _plan_locked(self) -> tuple[Path, str]:
         self._assert_process_lock()
-        self._assert_no_foreign_transaction()
+        prior_terminal_aborts = self._assert_no_foreign_transaction()
         self._assert_process_lock()
         existing = RESET.read_stage_receipt(
             self.receipt_directory,
@@ -1669,6 +1901,11 @@ class FinalOpenExecutor:
                 path,
                 digest,
             )
+            if plan["prior_terminal_aborts"] != prior_terminal_aborts:
+                raise FinalOpenError(
+                    "the existing plan does not bind the current foreign terminal aborts; "
+                    "create a new open_id and plan"
+                )
             if self._authority() != authority:
                 raise FinalOpenError(
                     "terminal reset/proof authority changed since the existing plan"
@@ -1717,6 +1954,7 @@ class FinalOpenExecutor:
             "admission_sha256": sha256(canonical_json(prepared.value)),
             "effects": effects,
             "effects_sha256": sha256(canonical_json(effects)),
+            "prior_terminal_aborts": prior_terminal_aborts,
             "rollback_boundary": (
                 "before open-started: mutation-free; after open-started and before "
                 "mutation-admission-open-finalizing: close ingress, re-cordon, prove "
@@ -1751,6 +1989,7 @@ class FinalOpenExecutor:
                 "admission_sha256",
                 "effects",
                 "effects_sha256",
+                "prior_terminal_aborts",
                 "rollback_boundary",
             },
             "final-open plan",
@@ -1785,6 +2024,10 @@ class FinalOpenExecutor:
         )
         authority = validate_authority(
             OpenAuthority(**authority_value),
+            self.open_id,
+        )
+        validate_prior_terminal_aborts(
+            plan["prior_terminal_aborts"],
             self.open_id,
         )
         prepared = PreparedAdmission(plan["admission"])
@@ -2152,6 +2395,11 @@ class FinalOpenExecutor:
             plan_path,
             plan_sha256,
         )
+        if plan["prior_terminal_aborts"] != self._assert_no_foreign_transaction():
+            raise FinalOpenError(
+                "final-open plan does not bind the current foreign terminal aborts; "
+                "create a new open_id and plan"
+            )
         self._assert_process_lock()
         stored_plan = RESET.read_stage_receipt(
             self.receipt_directory,
@@ -2359,7 +2607,14 @@ class FinalOpenExecutor:
         admission_finalization_started = finalizing_on_entry
         try:
             if not started_on_entry:
-                self._assert_no_foreign_transaction()
+                if (
+                    plan["prior_terminal_aborts"]
+                    != self._assert_no_foreign_transaction()
+                ):
+                    raise FinalOpenError(
+                        "final-open plan does not bind the current foreign terminal "
+                        "aborts; create a new open_id and plan"
+                    )
                 if cancellation.requested:
                     raise FinalOpenError("final Open cancelled before open-started")
                 evaluated_at_unix_ms = now_unix_ms()
@@ -2699,20 +2954,19 @@ def add_open_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         type=Path,
     )
-    parser.add_argument("--open-state-directory", required=True, type=Path)
-    parser.add_argument("--open-receipt-directory", required=True, type=Path)
     parser.add_argument("--reset-plan-receipt", required=True, type=Path)
     parser.add_argument("--reset-plan-sha256", required=True)
 
 
 def executor_from_args(args: argparse.Namespace) -> FinalOpenExecutor:
+    validate_production_final_open_state_root()
     reset_executor = RESET.ResetExecutor(RESET.config_from_args(args), RESET.CommandRunner())
     admission = ProductionAdmissionClient(
         open_id=args.open_id,
         origin=args.control_origin,
         trust_file=args.production_cutover_operator_trust_file,
         private_key_file=args.production_cutover_operator_private_key_file,
-        state_directory=args.open_state_directory,
+        state_directory=PRODUCTION_ADMISSION_STATE_DIRECTORY,
     )
     return FinalOpenExecutor(
         open_id=args.open_id,
@@ -2720,7 +2974,7 @@ def executor_from_args(args: argparse.Namespace) -> FinalOpenExecutor:
         reset_plan_path=args.reset_plan_receipt,
         reset_plan_sha256=args.reset_plan_sha256,
         admission=admission,
-        receipt_directory=args.open_receipt_directory,
+        receipt_directory=PRODUCTION_OPEN_RECEIPT_DIRECTORY,
     )
 
 

@@ -488,30 +488,46 @@ The plan records an execution deadline at least 30 seconds before the signed mut
 expires. A plan at or beyond that deadline is unusable and requires a new `open_id`; it is never
 silently re-signed or refreshed under the reviewed plan.
 
-Before either plan or apply reads or decides any open journal stage, it obtains a nonblocking
-exclusive kernel `flock` on the one directory-global persistent
-`<open-receipt-directory>/production-final-open.transaction.lock`. The lock is an actor-owned mode
-`0600`, empty, regular, single-link file opened descriptor-relative with `O_NOFOLLOW`; first creation
-uses no-replace `O_CREAT|O_EXCL`, never truncates, and fsyncs the file plus the already validated
-actor-owned mode `0700` directory. There is no temporary hard-link publication window and no payload;
-the fixed filename defines the scope across every `open_id`. The process retains stable directory
-and lock descriptors plus their dev/inode for the whole plan/apply call, including every
-forward-versus-cleanup decision, adapter/effect settlement and receipt publication. It revalidates
-both descriptor/path identities, metadata and empty size before each call/publication. A concurrent
-owner fails before reading a stale stage prefix or invoking an adapter. Foreign bytes/metadata,
-unlink, rename/recreate or same-bytes ABA fail closed. Production never deletes or replaces the lock,
-including after complete/aborted; after a process crash the kernel releases the flock and the next
-process opens the same persistent inode. This local serialization is not product admission or
-command outcome authority.
+Production final-open has one installed state root,
+`/var/lib/cats/production-final-open`. It and its exact two direct children, `admission-state/` and
+`receipts/`, are root:root mode `0700` real directories. The production CLI runs as root and has no
+state- or open-receipt-directory override; a missing path, symlink, permission/owner drift or foreign
+direct child fails before an executor is constructed. Offline fixtures may inject a temporary root
+only through the internal executor constructor.
 
-While holding that global lock, plan and apply scan every valid `open_id` journal. Foreign plan and
-dry-run receipts may coexist. Any foreign started/forward/cleanup chain without a terminal
-`open-aborted`, or any foreign `open-complete`, blocks before adapter calls. A foreign aborted chain
-is ignorable only when its exact tail proves cleanup mutation admission Closed, Fleet Closed and
-`open-aborted` adjacency and contains no finalizing/Open receipt. Apply repeats this arbitration
-immediately before publishing its own `open-started`. Thus after an owner crash only the same
-`open_id` may exact-resume an active chain; a new ID is allowed only after a terminal Closed abort,
-and no new ID is allowed after completed Open.
+Before either plan or apply reads or decides any open journal stage, it obtains a nonblocking
+exclusive kernel `flock` on the one global persistent
+`/var/lib/cats/production-final-open/receipts/production-final-open.transaction.lock`. The lock is a
+root-owned mode `0600`, empty, regular, single-link file opened descriptor-relative with
+`O_NOFOLLOW`; first creation uses no-replace `O_CREAT|O_EXCL`, never truncates, and fsyncs the file
+plus the already validated mode `0700` receipts directory. There is no temporary hard-link
+publication window and no payload; the fixed path defines the scope across every `open_id`. The
+process retains stable directory and lock descriptors plus their dev/inode for the whole plan/apply
+call, including every forward-versus-cleanup decision, adapter/effect settlement and receipt
+publication. It revalidates both descriptor/path identities, metadata and empty size before each
+call/publication. A concurrent owner fails before reading a stale stage prefix or invoking an
+adapter. Foreign bytes/metadata, unlink, rename/recreate or same-bytes ABA fail closed. Production
+never deletes or replaces the lock, including after complete/aborted; after a process crash the
+kernel releases the flock and the next process opens the same persistent inode. This local
+serialization is not product admission or command outcome authority.
+
+While holding that global lock, plan and apply scan every valid `open_id` journal in the canonical
+`receipts/` directory. Foreign plan and dry-run receipts may coexist. Any foreign
+started/forward/cleanup chain without a terminal `open-aborted`, or any foreign `open-complete`,
+blocks before adapter calls. A foreign aborted chain is ignorable only when it contains no
+finalizing/Open receipt and validates the complete dynamic cleanup journal: exact cleanup context,
+the Ingress-close receipt, every context-listed Node cordon in reverse order, and one uninterrupted
+digest chain from `cleanup-started` through mutation admission Closed, Fleet Closed and adjacent
+`open-aborted`. Every receipt must bind the foreign immutable plan and authority. Missing, extra,
+reordered or rebound cleanup stages fail closed. Apply repeats this arbitration immediately before
+publishing its own `open-started`. The immutable plan binds the scan as the exact sorted
+`prior_terminal_aborts` list of `{open_id, open_aborted_sha256}`. Apply requires its fresh scan to be
+byte-semantically equal; an added, removed or changed abort invalidates the plan before effects.
+Thus after an owner crash only the same `open_id` may exact-resume an active chain. A plan that
+coexisted before another ID started remains stale after that transaction aborts; only a new ID/plan
+that binds the terminal abort snapshot may proceed. Wall-clock timestamps are audit evidence, not
+causal authorization, so clock rollback or same-millisecond creation cannot confuse the decision.
+No new ID is allowed after completed Open.
 
 Execution revalidates all terminal proof bindings, live Closed fleet and the exact signed Open
 pending request before publishing `open-started`. The effects plan has exact
@@ -568,8 +584,12 @@ cleanup after every partial open stage. A true two-process barrier must hold one
 `open-started` plus Node/Ingress receipts, prove a second process with a different `open_id` performs
 no forward or cleanup effect, kill the first owner, prove the foreign ID remains blocked by the
 durable active chain, and prove only the original ID exact-resumes. Completed Open blocks the foreign
-ID, while a separate terminal-aborted case admits a new ID. A SIGKILL immediately after first lock
+ID, while separate terminal-aborted cases reject a preplanned ID and admit only a new plan that binds
+the exact abort-digest snapshot under clock rollback and same-millisecond clocks. Removing a bound
+abort also invalidates that new plan before effects. A SIGKILL immediately after first lock
 creation must leave one replayable empty single-link inode with no temporary hard link. Foreign
 bytes/symlink/hardlink/mode drift and unlink/recreate same-byte lock ABA also fail before adapter
-calls. Tests assert zero external mutation before all terminal proofs validate and zero
+calls. Negative fixtures remove an Ingress or Node cleanup receipt and rebind a Node link to prove
+that no later `open_id` can accept an incomplete foreign abort. Tests assert zero external mutation
+before all terminal proofs validate and zero
 uncordon/Ingress calls before `reset-complete` is verified.

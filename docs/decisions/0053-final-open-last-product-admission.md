@@ -23,10 +23,13 @@ G3 qualification 证明，不能在这里重新执行。
 
 ## 决策
 
-1. 整个 final-open receipt directory 固定使用唯一持久的
+1. Production CLI 唯一状态根固定为 `/var/lib/cats/production-final-open`；它必须是预安装并 fsync 的
+   root:root `0700` real directory，direct children exact 为 root:root `0700` 的 `admission-state/` 与
+   `receipts/`。CLI 不接受 state/receipt directory override，非 root 或 foreign child fail closed；offline
+   fixture 只能从内部 constructor 注入 temporary root。整个固定 `receipts/` 使用唯一持久的
    `production-final-open.transaction.lock`，不能按 `open_id` 分锁。`plan` 与 `apply` 都必须在读取或判断任何
    本地 open stage、调用 adapter 或执行 cleanup/forward effect 前，从 stable directory descriptor
-   no-follow `O_CREAT|O_EXCL` 或打开该 actor-owned `0600` single-link empty regular file、fsync file/directory、
+   no-follow `O_CREAT|O_EXCL` 或打开该 root-owned `0600` single-link empty regular file、fsync file/directory、
    取得 nonblocking exclusive kernel `flock`，并把同一 descriptor 持有到整个调用返回。它没有 temp-link
    publication 或 payload；fixed filename 给出 scope。持锁期间在每个 adapter/effect 和 receipt publication
    前重验 directory/lock descriptor 与 pathname 的 dev/inode、metadata 和 empty bytes。锁文件永久保留，
@@ -35,8 +38,13 @@ G3 qualification 证明，不能在这里重新执行。
    本地 operator，不新增 admission authority。
 2. 持全局锁后，plan/apply 扫描所有合法 `open_id` journal。foreign plan/dry-run 可以共存；foreign
    `open-started`/cleanup/forward chain 未 terminal 时拒绝任何新 ID，foreign `open-complete` 永久阻止新 ID。
-   只有 exact `open-aborted` 且其 Closed cleanup terminal tail 完整时，新的 `open_id` 才可计划/执行。apply
-   在自己的 `open-started` 紧前再次扫描；因此不同 ID 也不能让 loser cleanup re-cordon/close winner。
+   只有 exact `open-aborted` 且其完整动态 cleanup chain（Ingress close、context 中每个 Node 的 reverse cordon、
+   admission Closed、Fleet Closed、aborted）逐 digest 相邻并绑定同一 plan/authority 时，新的 `open_id` 才可
+   计划/执行；缺失、额外、错序或重绑定都 fail closed。plan 把扫描所得的 exact sorted
+   `prior_terminal_aborts`（`open_id`、`open_aborted_sha256`）快照写入 immutable bytes；apply 在自己的
+   `open-started` 紧前重扫并要求 byte-semantic exact 相等。新增或消失的 abort 都让此前共存的 plan stale，
+   必须换 ID 重做；wall clock timestamp 只用于审计，不是该因果授权。因此不同 ID 也不能让 loser cleanup
+   re-cordon/close winner。
 3. final-open 的外部 effect 顺序固定为：A23 exact Node schedulable apply、aggregate receipt、reviewed
    Ingress open、read-only public probe、最后一个 exact mutation-admission `Open` CAS。`Open` 之后没有
    Terraform、Node、probe 或其他外部 effect；紧邻它的只有 immutable command receipt 和
@@ -74,7 +82,8 @@ G3 qualification 证明，不能在这里重新执行。
 - final-open fixture 必须覆盖每个 forward/cleanup effect 的 response-loss 与 receipt-link crash、marker
   两侧 cancellation、foreign same-binding command、lock foreign/ABA，以及两个真实进程在已
   `open-started` 后跨不同 open ID 的互斥、lock publish SIGKILL、owner crash exact replay，以及 terminal
-  aborted 后的新 ID positive。
+  aborted 后的新 ID positive、preplanned ID negative、clock rollback/same-millisecond 与 abort snapshot
+  disappearance。
 
 ## 不采用的方案
 

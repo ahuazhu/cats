@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import signal
@@ -695,6 +696,71 @@ def malformed_process_locks_fail_before_adapter_calls(root: Path) -> None:
         assert effects.calls == []
 
 
+def production_cli_uses_one_fixed_state_root() -> None:
+    parser = argparse.ArgumentParser()
+    OPEN.add_open_arguments(parser)
+    help_text = parser.format_help()
+    assert "--open-id" in help_text
+    assert "--open-state-directory" not in help_text
+    assert "--open-receipt-directory" not in help_text
+    assert OPEN.PRODUCTION_FINAL_OPEN_STATE_ROOT == Path(
+        "/var/lib/cats/production-final-open"
+    )
+    assert OPEN.PRODUCTION_ADMISSION_STATE_DIRECTORY == (
+        OPEN.PRODUCTION_FINAL_OPEN_STATE_ROOT / "admission-state"
+    )
+    assert OPEN.PRODUCTION_OPEN_RECEIPT_DIRECTORY == (
+        OPEN.PRODUCTION_FINAL_OPEN_STATE_ROOT / "receipts"
+    )
+
+    real_config_from_args = OPEN.RESET.config_from_args
+    real_reset_executor = OPEN.RESET.ResetExecutor
+    real_command_runner = OPEN.RESET.CommandRunner
+    real_admission = OPEN.ProductionAdmissionClient
+    real_executor = OPEN.FinalOpenExecutor
+    real_state_root_validation = OPEN.validate_production_final_open_state_root
+    admission_arguments: dict[str, Any] = {}
+    validated = False
+    try:
+        OPEN.RESET.config_from_args = lambda _args: object()
+        OPEN.RESET.CommandRunner = lambda: object()
+        OPEN.RESET.ResetExecutor = lambda _config, _runner: object()
+
+        def capture_admission(**kwargs: Any) -> object:
+            admission_arguments.update(kwargs)
+            return object()
+
+        def validate_fixed_root() -> None:
+            nonlocal validated
+            validated = True
+
+        OPEN.validate_production_final_open_state_root = validate_fixed_root
+        OPEN.ProductionAdmissionClient = capture_admission
+        OPEN.FinalOpenExecutor = lambda **kwargs: kwargs
+        result = OPEN.executor_from_args(
+            types.SimpleNamespace(
+                open_id="final-open-01",
+                control_origin="https://control.example",
+                production_cutover_operator_trust_file=Path("/fixed/trust.json"),
+                production_cutover_operator_private_key_file=Path("/secret/key.pem"),
+                reset_plan_receipt=Path("/evidence/reset-plan.json"),
+                reset_plan_sha256="3" * 64,
+            )
+        )
+    finally:
+        OPEN.RESET.config_from_args = real_config_from_args
+        OPEN.RESET.ResetExecutor = real_reset_executor
+        OPEN.RESET.CommandRunner = real_command_runner
+        OPEN.validate_production_final_open_state_root = real_state_root_validation
+        OPEN.ProductionAdmissionClient = real_admission
+        OPEN.FinalOpenExecutor = real_executor
+    assert validated
+    assert admission_arguments["state_directory"] == (
+        OPEN.PRODUCTION_ADMISSION_STATE_DIRECTORY
+    )
+    assert result["receipt_directory"] == OPEN.PRODUCTION_OPEN_RECEIPT_DIRECTORY
+
+
 def process_lock_creation_sigkill_is_replayable(root: Path) -> None:
     phases = (
         "after_create_before_fsync",
@@ -1029,6 +1095,116 @@ def process_lock_serializes_real_processes(root: Path) -> None:
 
 
 def terminal_aborted_open_allows_a_new_open_id(root: Path) -> None:
+    real_now_unix_ms = OPEN.now_unix_ms
+    base = 1_800_000_000_000
+    for case, preplanned_at, aborted_at, fresh_at in (
+        ("clock-rollback", base + 400, base + 300, base + 200),
+        ("same-millisecond", base + 100, base + 100, base + 100),
+    ):
+        case_root = root / case
+        clock = [base]
+        OPEN.now_unix_ms = lambda: clock[0]
+        try:
+            first = executor(
+                case_root,
+                FakeAdmission(),
+                FakeEffects(failures={"public-probe": 1}),
+            )
+            first_plan, first_digest = first.plan()
+
+            preplanned_open_id = "final-open-02"
+            clock[0] = preplanned_at
+            preplanned_admission = FakeAdmission()
+            preplanned_effects = FakeEffects(open_id=preplanned_open_id)
+            preplanned = existing_executor(
+                case_root,
+                preplanned_admission,
+                preplanned_effects,
+                open_id=preplanned_open_id,
+            )
+            preplanned_plan, preplanned_digest = preplanned.plan()
+            preplanned_item = OPEN.RESET.read_stage_receipt(
+                first.receipt_directory,
+                preplanned_open_id,
+                "open-plan",
+            )
+            assert preplanned_item is not None
+            assert preplanned_item[1]["prior_terminal_aborts"] == []
+            preplanned_admission_calls = list(preplanned_admission.calls)
+            preplanned_calls = list(preplanned_effects.calls)
+
+            clock[0] = aborted_at
+            expect_refusal(
+                lambda: first.apply(
+                    first_plan,
+                    first_digest,
+                    "final-open-01",
+                    execute=True,
+                ),
+                "closed cleanup reached its terminal receipt",
+            )
+            aborted_item = OPEN.RESET.read_stage_receipt(
+                first.receipt_directory,
+                "final-open-01",
+                "open-aborted",
+            )
+            assert aborted_item is not None
+            aborted_value = aborted_item[1]
+            aborted_digest = "sha256:" + aborted_item[2]
+            assert preplanned_item[1]["created_at_unix_ms"] >= aborted_at
+
+            expect_refusal(
+                preplanned.plan,
+                "existing plan does not bind the current foreign terminal aborts",
+            )
+            expect_refusal(
+                lambda: preplanned.apply(
+                    preplanned_plan,
+                    preplanned_digest,
+                    preplanned_open_id,
+                    execute=True,
+                ),
+                "plan does not bind the current foreign terminal aborts",
+            )
+            assert preplanned_admission.calls == preplanned_admission_calls
+            assert preplanned_effects.calls == preplanned_calls
+
+            clock[0] = fresh_at
+            next_open_id = "final-open-03"
+            second = existing_executor(
+                case_root,
+                FakeAdmission(),
+                FakeEffects(open_id=next_open_id),
+                open_id=next_open_id,
+            )
+            second_plan, second_digest = second.plan()
+            second_item = OPEN.RESET.read_stage_receipt(
+                first.receipt_directory,
+                next_open_id,
+                "open-plan",
+            )
+            assert second_item is not None
+            assert second_item[1]["created_at_unix_ms"] <= aborted_value[
+                "created_at_unix_ms"
+            ]
+            assert second_item[1]["prior_terminal_aborts"] == [
+                {
+                    "open_id": "final-open-01",
+                    "open_aborted_sha256": aborted_digest,
+                }
+            ]
+            complete, _complete_digest = second.apply(
+                second_plan,
+                second_digest,
+                next_open_id,
+                execute=True,
+            )
+            assert complete.name == "final-open-03.open-complete.json"
+        finally:
+            OPEN.now_unix_ms = real_now_unix_ms
+
+
+def disappearing_foreign_abort_invalidates_plan(root: Path) -> None:
     first = executor(
         root,
         FakeAdmission(),
@@ -1044,25 +1220,108 @@ def terminal_aborted_open_allows_a_new_open_id(root: Path) -> None:
         ),
         "closed cleanup reached its terminal receipt",
     )
-    assert (
-        root / "receipts" / "final-open-01.open-aborted.json"
-    ).exists()
 
     next_open_id = "final-open-02"
-    second = existing_executor(
+    next_admission = FakeAdmission()
+    next_effects = FakeEffects(open_id=next_open_id)
+    next_open = existing_executor(
         root,
-        FakeAdmission(),
-        FakeEffects(open_id=next_open_id),
+        next_admission,
+        next_effects,
         open_id=next_open_id,
     )
-    second_plan, second_digest = second.plan()
-    complete, _complete_digest = second.apply(
-        second_plan,
-        second_digest,
+    next_plan, next_digest = next_open.plan()
+    next_item = OPEN.RESET.read_stage_receipt(
+        first.receipt_directory,
         next_open_id,
-        execute=True,
+        "open-plan",
     )
-    assert complete.name == "final-open-02.open-complete.json"
+    assert next_item is not None
+    assert len(next_item[1]["prior_terminal_aborts"]) == 1
+    admission_calls = list(next_admission.calls)
+    effect_calls = list(next_effects.calls)
+
+    for path in first.receipt_directory.iterdir():
+        if path.name.startswith("final-open-01."):
+            path.unlink()
+    expect_refusal(
+        lambda: next_open.apply(
+            next_plan,
+            next_digest,
+            next_open_id,
+            execute=True,
+        ),
+        "plan does not bind the current foreign terminal aborts",
+    )
+    assert next_admission.calls == admission_calls
+    assert next_effects.calls == effect_calls
+    assert not (
+        first.receipt_directory / f"{next_open_id}.open-started.json"
+    ).exists()
+
+
+def foreign_aborted_cleanup_chain_must_be_complete(root: Path) -> None:
+    for case, expected in (
+        ("missing-ingress", "omitted Ingress cleanup"),
+        ("missing-node", "cleanup Node set drifted"),
+        ("node-chain", "Node cleanup chain drifted"),
+    ):
+        case_root = root / case
+        first = executor(
+            case_root,
+            FakeAdmission(),
+            FakeEffects(failures={"public-probe": 1}),
+        )
+        first_plan, first_digest = first.plan()
+        expect_refusal(
+            lambda: first.apply(
+                first_plan,
+                first_digest,
+                "final-open-01",
+                execute=True,
+            ),
+            "closed cleanup reached its terminal receipt",
+        )
+        receipts = first.receipt_directory
+
+        def remove_stage(stage: str) -> None:
+            (receipts / f"final-open-01.{stage}.json").unlink()
+            (receipts / f"final-open-01.{stage}.sha256").unlink()
+
+        if case == "missing-ingress":
+            remove_stage("cleanup-public-ingress-closed")
+        elif case == "missing-node":
+            remove_stage("cleanup-node-node-b-cordoned")
+        else:
+            stage = "cleanup-node-node-b-cordoned"
+            loaded = OPEN.RESET.read_stage_receipt(
+                receipts,
+                "final-open-01",
+                stage,
+            )
+            assert loaded is not None
+            _path, value, _digest = loaded
+            value["previous_receipt_sha256"] = "sha256:" + "9" * 64
+            remove_stage(stage)
+            OPEN.RESET.write_receipt(
+                receipts,
+                "final-open-01",
+                stage,
+                value,
+            )
+
+        next_open_id = "final-open-02"
+        next_admission = FakeAdmission()
+        next_effects = FakeEffects(open_id=next_open_id)
+        next_open = existing_executor(
+            case_root,
+            next_admission,
+            next_effects,
+            open_id=next_open_id,
+        )
+        expect_refusal(next_open.plan, expected)
+        assert next_admission.calls == []
+        assert next_effects.calls == []
 
 
 def successful_replay(root: Path) -> None:
@@ -2017,11 +2276,18 @@ def cleanup_receipt_publication_crash_matrix(root: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="cats-final-open-fixture-") as temporary:
         root = Path(temporary)
+        production_cli_uses_one_fixed_state_root()
         process_lock_serializes_real_processes(root / "process-lock-concurrency")
         process_lock_creation_sigkill_is_replayable(root / "process-lock-sigkill")
         process_lock_is_persistent_and_rejects_aba(root / "process-lock-identity")
         malformed_process_locks_fail_before_adapter_calls(root / "process-lock-invalid")
         terminal_aborted_open_allows_a_new_open_id(root / "aborted-next-open")
+        disappearing_foreign_abort_invalidates_plan(
+            root / "aborted-disappeared"
+        )
+        foreign_aborted_cleanup_chain_must_be_complete(
+            root / "aborted-cleanup-chain"
+        )
         unavailable_is_mutation_free(root / "unavailable")
         public_probe_descriptor_is_exact()
         successful_replay(root / "success")
