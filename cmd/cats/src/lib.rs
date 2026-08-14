@@ -481,6 +481,17 @@ pub enum RuntimeProvisionerNodeIdentityCommand {
     Prepare {
         #[arg(long)]
         node_id: String,
+        /// Cloud provider of the Host (for example `aws`). Together with the
+        /// partition, account, region and immutable Host ID this forms the
+        /// complete immutable Host identity.
+        #[arg(long)]
+        host_provider: String,
+        #[arg(long)]
+        host_partition: String,
+        #[arg(long)]
+        host_account_id: String,
+        #[arg(long)]
+        host_region: String,
         #[arg(long)]
         immutable_host_id: String,
         #[arg(long)]

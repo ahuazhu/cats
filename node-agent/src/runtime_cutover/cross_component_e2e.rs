@@ -263,6 +263,8 @@ impl ControlContext {
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
@@ -516,6 +518,12 @@ fn node_identity(signer: &Ed25519RequestSigner) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_cross_component_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: Id::new("test_provider").unwrap(),
+            partition: Id::new("test_partition").unwrap(),
+            account_id: Id::new("test_account").unwrap(),
+            region: Id::new("test_region").unwrap(),
+        },
         immutable_host_id: id("host_cross_component_a"),
         credential_id: signer.credential_id().clone(),
         credential_binding: CredentialBinding::PublicKey {

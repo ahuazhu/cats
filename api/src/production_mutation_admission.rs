@@ -203,6 +203,10 @@ pub enum ProductionQualificationMutationClass {
     RuntimeMutation,
 }
 
+// Cold-path operator admission receipt. Its size is dominated by the fixed
+// digest set each binding must carry verbatim; it is constructed a handful of
+// times per cutover window, so indirection would only churn authority code.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -335,6 +339,9 @@ pub struct ProductionMutationAdmissionState {
     pub updated_at_unix_ms: UnixMillis,
 }
 
+// Cold-path stored outcome mirroring the admission state verbatim; see the
+// size note on ProductionMutationAdmissionBinding above.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProductionMutationAdmissionStoredOutcome {

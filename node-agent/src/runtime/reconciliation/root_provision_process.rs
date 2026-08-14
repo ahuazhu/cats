@@ -3393,6 +3393,7 @@ mod tests {
                 node_id: id("node_a"),
                 placement_epoch: epoch(3),
             },
+            object_write_credential: None,
             size_bytes: 4_194_304,
             durability: Durability::Strict,
             head: blank_head(),

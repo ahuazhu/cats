@@ -2319,6 +2319,7 @@ mod tests {
             };
             let attachment = AuthorizedServingAttachment {
                 identity: identity.clone(),
+                object_write_credential: None,
                 size_bytes: volume.size_bytes,
                 durability: volume.durability,
                 head: blank.clone(),

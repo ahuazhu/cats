@@ -7133,6 +7133,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: blank_head(),

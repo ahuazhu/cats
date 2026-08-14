@@ -86,6 +86,9 @@ const COMMAND_COLUMNS: &str = "
     qualification_expires_at_unix_ms, outcome::text AS outcome_json,
     outcome_kind, resulting_revision, resulting_mode, committed_at_unix_ms";
 
+// Cold-path admission store outcomes: constructed once per operator command,
+// sized by the receipt's fixed digest set. Indirection buys nothing here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProductionMutationAdmissionCommandStoreOutcome {
     Stored(ProductionMutationAdmissionCommandReceipt),
@@ -93,6 +96,7 @@ pub(crate) enum ProductionMutationAdmissionCommandStoreOutcome {
     AuthenticationFailed,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProductionQualificationProductInventoryStoreOutcome {
     Found(ProductionQualificationProductInventoryReceipt),
@@ -1012,7 +1016,7 @@ fn qualified_release_commit() -> Option<&'static str> {
     }
     #[cfg(any(test, feature = "test-support"))]
     {
-        return Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     }
     #[cfg(not(any(test, feature = "test-support")))]
     {

@@ -365,6 +365,7 @@ pub(super) enum AuthorityRequestDisposition<T> {
     Reject(T),
 }
 
+#[derive(Debug)]
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),

@@ -137,6 +137,7 @@ impl TestEnv {
                 node_id: Id::new("node_nbd_crash").unwrap(),
                 placement_epoch: request.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head,

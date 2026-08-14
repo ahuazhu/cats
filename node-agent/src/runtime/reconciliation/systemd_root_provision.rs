@@ -4798,6 +4798,7 @@ while True:
                 node_id: id("node_a"),
                 placement_epoch: request.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: 4_194_304,
             durability: Durability::Strict,
             head: head.clone(),

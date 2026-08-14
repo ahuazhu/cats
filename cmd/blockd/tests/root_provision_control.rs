@@ -301,6 +301,7 @@ fn authorized_attachment(epoch: i64) -> AuthorizedServingAttachment {
             node_id: Id::new("node_a").unwrap(),
             placement_epoch: acquire_request.placement_epoch,
         },
+        object_write_credential: None,
         size_bytes: VOLUME_SIZE,
         durability: VolumeDurability::Strict,
         head: blank_head(),

@@ -3330,6 +3330,9 @@ fn attachment_from_checkpoint_acquire(
             node_id: checkpoint.node_id.clone(),
             placement_epoch: checkpoint.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3391,6 +3394,9 @@ fn attachment_from_current_desired(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3538,6 +3544,9 @@ fn takeover_attachment_from_signed_evidence(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: volume.size_bytes,
         durability: volume.durability,
         // This publication is the immutable R0 acquire artifact. A signed
@@ -12070,6 +12079,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch: desired.placement.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: blank_head(),

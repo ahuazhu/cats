@@ -2331,6 +2331,7 @@ mod tests {
                 node_id: Id::new("node_a").unwrap(),
                 placement_epoch: acquire_request.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: 4 * 1024 * 1024,
             durability: VolumeDurability::Strict,
             head: target_head,

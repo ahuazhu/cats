@@ -54,7 +54,11 @@ pub struct AuthorizedServingAttachment {
     pub identity: AttachmentLineageIdentity,
     /// Public binding only. The matching attachment-scoped private key lives
     /// in a separate root-only artifact and never enters this receipt.
-    pub object_write_credential: ObjectWriteCredentialReference,
+    /// `None` means no object-write credential is bound to this attachment;
+    /// every qualified object-write publish path must fail closed on it.
+    /// Node-side credential generation and A19 registration are not composed
+    /// yet (see DEFERRED), so ordinary serving attachments carry `None`.
+    pub object_write_credential: Option<ObjectWriteCredentialReference>,
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub head: RemoteHead,

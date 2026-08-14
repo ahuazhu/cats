@@ -285,6 +285,7 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
     };
     let attachment = AuthorizedServingAttachment {
         identity,
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: record.head.clone(),

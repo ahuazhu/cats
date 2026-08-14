@@ -709,6 +709,9 @@ pub fn recover_normal_acquire_from_authority(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: record.head.clone(),
@@ -1047,6 +1050,9 @@ fn exact_success_attachment(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: grant.size_bytes,
         durability: grant.durability,
         head: grant.head,

@@ -78,6 +78,8 @@ async fn fleet_verification_route_is_production_admin_only_and_observation_only(
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -700,6 +702,8 @@ impl Ctx {
                 cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "dev-admin-token".into(),
             workos: None,
@@ -1265,6 +1269,8 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -1402,6 +1408,8 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2610,6 +2618,8 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2947,6 +2957,8 @@ async fn static_user_tokens_are_not_accepted() {
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "token-admin".into(),
         workos: None,
@@ -3455,6 +3467,8 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,

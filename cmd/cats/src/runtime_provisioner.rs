@@ -27,7 +27,7 @@ use cats_api::runtime_reconciliation::{
     encode_node_identity, encode_runtime_node_authority_apply_result,
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
     runtime_provisioner_active_set_digest, Base64UrlNoPad, ContractVersion, CredentialBinding,
-    Epoch, Id, NodeIdentity, NodeIdentityState, RuntimeNodeAuthorityOutcome,
+    Epoch, Id, NodeIdentity, NodeIdentityState, ProviderScope, RuntimeNodeAuthorityOutcome,
     RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerTrustBundle,
     Sha256Digest, RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES,
     RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
@@ -259,18 +259,34 @@ fn run_node_identity(
     match command {
         RuntimeProvisionerNodeIdentityCommand::Prepare {
             node_id,
+            host_provider,
+            host_partition,
+            host_account_id,
+            host_region,
             immutable_host_id,
             state_path_id,
             credential_id,
         } => {
             let node_id = Id::new(node_id.clone()).context("invalid Node ID")?;
+            let provider_scope = ProviderScope {
+                provider: Id::new(host_provider.clone()).context("invalid Host provider")?,
+                partition: Id::new(host_partition.clone()).context("invalid Host partition")?,
+                account_id: Id::new(host_account_id.clone()).context("invalid Host account ID")?,
+                region: Id::new(host_region.clone()).context("invalid Host region")?,
+            };
             let immutable_host_id =
                 Id::new(immutable_host_id.clone()).context("invalid immutable Host ID")?;
             let state_path_id = Id::new(state_path_id.clone()).context("invalid state path ID")?;
             validate_state_path_component(&state_path_id)
                 .context("state path ID is not a safe path component")?;
             let credential_id = Id::new(credential_id.clone()).context("invalid credential ID")?;
-            let set = root.prepare(&node_id, &immutable_host_id, &state_path_id, &credential_id)?;
+            let set = root.prepare(
+                &node_id,
+                &provider_scope,
+                &immutable_host_id,
+                &state_path_id,
+                &credential_id,
+            )?;
             report_node_identity(cli, &set, "prepared")
         }
         RuntimeProvisionerNodeIdentityCommand::Export => {
@@ -359,6 +375,7 @@ impl HostIdentityRoot {
     fn prepare(
         &self,
         node_id: &Id,
+        provider_scope: &ProviderScope,
         immutable_host_id: &Id,
         state_path_id: &Id,
         credential_id: &Id,
@@ -368,6 +385,7 @@ impl HostIdentityRoot {
             ensure_identity_fields(
                 &existing.identity,
                 node_id,
+                provider_scope,
                 immutable_host_id,
                 state_path_id,
                 credential_id,
@@ -400,6 +418,7 @@ impl HostIdentityRoot {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: node_id.clone(),
+            provider_scope: provider_scope.clone(),
             immutable_host_id: immutable_host_id.clone(),
             credential_id: credential_id.clone(),
             credential_binding: CredentialBinding::PublicKey {
@@ -420,6 +439,7 @@ impl HostIdentityRoot {
         ensure_identity_fields(
             &set.identity,
             node_id,
+            provider_scope,
             immutable_host_id,
             state_path_id,
             credential_id,
@@ -745,12 +765,14 @@ fn identity_set(
 fn ensure_identity_fields(
     identity: &NodeIdentity,
     node_id: &Id,
+    provider_scope: &ProviderScope,
     immutable_host_id: &Id,
     state_path_id: &Id,
     credential_id: &Id,
 ) -> Result<()> {
     anyhow::ensure!(
         identity.node_id == *node_id
+            && identity.provider_scope == *provider_scope
             && identity.immutable_host_id == *immutable_host_id
             && identity.state_path_id == *state_path_id
             && identity.credential_id == *credential_id,
@@ -1310,6 +1332,10 @@ mod tests {
         let root = temp.path();
         let prepare = RuntimeProvisionerNodeIdentityCommand::Prepare {
             node_id: "node_a".to_owned(),
+            host_provider: "aws".to_owned(),
+            host_partition: "aws".to_owned(),
+            host_account_id: "acct_test".to_owned(),
+            host_region: "us-east-1".to_owned(),
             immutable_host_id: "host_a".to_owned(),
             state_path_id: "state_path_a".to_owned(),
             credential_id: "credential_a".to_owned(),
@@ -1321,6 +1347,10 @@ mod tests {
             root,
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),
@@ -1335,6 +1365,10 @@ mod tests {
             root,
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_b".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),
@@ -1375,6 +1409,10 @@ mod tests {
             root,
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),
@@ -1405,6 +1443,10 @@ mod tests {
             another.path(),
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),
@@ -1423,6 +1465,10 @@ mod tests {
         let root = temp.path();
         let prepare = RuntimeProvisionerNodeIdentityCommand::Prepare {
             node_id: "node_a".to_owned(),
+            host_provider: "aws".to_owned(),
+            host_partition: "aws".to_owned(),
+            host_account_id: "acct_test".to_owned(),
+            host_region: "us-east-1".to_owned(),
             immutable_host_id: "host_a".to_owned(),
             state_path_id: "state_path_a".to_owned(),
             credential_id: "credential_a".to_owned(),
@@ -1490,6 +1536,10 @@ mod tests {
             root,
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),
@@ -1552,6 +1602,10 @@ mod tests {
             root,
             RuntimeProvisionerNodeIdentityCommand::Prepare {
                 node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_test".to_owned(),
+                host_region: "us-east-1".to_owned(),
                 immutable_host_id: "host_a".to_owned(),
                 state_path_id: "state_path_a".to_owned(),
                 credential_id: "credential_a".to_owned(),

@@ -223,6 +223,7 @@ impl ServingBlockdExpectation {
                     node_id: desired.placement.node_id.clone(),
                     placement_epoch: desired.placement.placement_epoch,
                 },
+                object_write_credential: None,
                 size_bytes: intent.size_bytes,
                 durability: intent.durability,
                 head: prepared.expected_head.clone(),

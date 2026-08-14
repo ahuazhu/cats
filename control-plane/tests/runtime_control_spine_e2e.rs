@@ -272,6 +272,8 @@ impl Context {
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
