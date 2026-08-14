@@ -20,6 +20,7 @@ members = [
     "cmd/cats",
     "cmd/blockd",
     "cmd/controld",
+    "cmd/object-write-gatewayd",
     "cmd/noded",
     "tests/support",
     "tests",

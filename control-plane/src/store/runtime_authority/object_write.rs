@@ -892,6 +892,18 @@ fn same_ingress_request(
         && left.ingress.content_length == right.ingress.content_length
 }
 
+fn same_spool_material(
+    left: &DurableObjectWriteSpoolReceipt,
+    right: &DurableObjectWriteSpoolReceipt,
+) -> bool {
+    left.spool_id == right.spool_id
+        && left.request_id == right.request_id
+        && left.content_sha256 == right.content_sha256
+        && left.content_length == right.content_length
+        && left.file_fsync_receipt_id == right.file_fsync_receipt_id
+        && left.directory_fsync_receipt_id == right.directory_fsync_receipt_id
+}
+
 fn begin_ingress_in(
     transaction: &mut Transaction<'_>,
     authenticated_attachment: &AuthenticatedNodeCredential,
@@ -1155,7 +1167,7 @@ impl Store {
                             | TerminalObjectWriteSpool::Removed { spool, .. } => spool,
                         },
                     };
-                    if embedded != spool {
+                    if !same_spool_material(embedded, spool) {
                         return Err(application(ApiError::conflict(
                             "object-write durable spool replay changed its receipt",
                         )));
@@ -1167,14 +1179,28 @@ impl Store {
                         spool: embedded, ..
                     } = &attempt.state
                     {
-                        if embedded != spool {
+                        if !same_spool_material(embedded, spool) {
                             return Err(application(ApiError::conflict(
                                 "object-write durable spool replay changed its receipt",
                             )));
                         }
                         return Ok(StoredObjectWriteAttempt::Ingress(attempt));
                     }
-                    let updated = mark_object_write_spool_durable(&attempt, spool.clone())
+                    if let ObjectWriteIngressState::DurableSpooled { spool: embedded } =
+                        &attempt.state
+                    {
+                        if !same_spool_material(embedded, spool) {
+                            return Err(application(ApiError::conflict(
+                                "object-write durable spool replay changed its receipt",
+                            )));
+                        }
+                        return Ok(StoredObjectWriteAttempt::Ingress(attempt));
+                    }
+                    let mut spool = spool.clone();
+                    // PostgreSQL time orders the fsync receipt after the
+                    // receiving row without trusting Pod wall-clock skew.
+                    spool.durable_at_unix_ms = database_now(transaction)?;
+                    let updated = mark_object_write_spool_durable(&attempt, spool)
                         .map_err(authority_error)?;
                     if updated != attempt {
                         persist_durable_ingress(transaction, &updated)?;
@@ -1366,8 +1392,12 @@ impl Store {
     /// Bounded crash-recovery page. Accepted spools, ambiguous issued PUTs,
     /// and terminal rows whose durable body has not yet been removed remain
     /// discoverable; provisional orphan spools are not accepted authority.
-    pub fn recoverable_object_write_attempts(&self) -> crate::store::Result<Vec<ObjectPutAttempt>> {
+    pub fn recoverable_object_write_attempts(
+        &self,
+        after_request_id: Option<&Sha256Digest>,
+    ) -> crate::store::Result<Vec<ObjectPutAttempt>> {
         self.authority_transaction(|transaction| {
+            let after = after_request_id.map(Sha256Digest::as_str);
             transaction
                 .query(
                     "SELECT attempt.record::text AS record_json, attempt.state,
@@ -1379,10 +1409,11 @@ impl Store {
                         'accepted_spooled', 'provider_issued',
                         'terminal_visible', 'permanent'
                       )
-                      ORDER BY attempt.writer_authority_id COLLATE \"C\",
-                               attempt.accepted_sequence
-                      LIMIT $1",
-                    &[&OBJECT_WRITE_RECOVERY_LIMIT],
+                        AND ($1::TEXT IS NULL
+                             OR attempt.request_id COLLATE \"C\" > $1 COLLATE \"C\")
+                      ORDER BY attempt.request_id COLLATE \"C\"
+                      LIMIT $2",
+                    &[&after, &OBJECT_WRITE_RECOVERY_LIMIT],
                 )?
                 .iter()
                 .map(|row| {
@@ -1393,6 +1424,41 @@ impl Store {
                         return Err(corrupt("object-write recovery selected a provisional row"));
                     };
                     validate_object_put_attempt(&authority, &attempt).map_err(authority_error)?;
+                    Ok(attempt)
+                })
+                .collect()
+        })
+    }
+
+    /// Bounded keyset page for recovering pre-accept crash windows. A
+    /// receiving row may already have a fully linked durable body when the
+    /// gateway crashed before persisting its fsync receipt.
+    pub fn recoverable_object_write_ingress_attempts(
+        &self,
+        after_request_id: Option<&Sha256Digest>,
+    ) -> crate::store::Result<Vec<ObjectWriteIngressAttempt>> {
+        self.authority_transaction(|transaction| {
+            let after = after_request_id.map(Sha256Digest::as_str);
+            transaction
+                .query(
+                    "SELECT record::text AS record_json, state
+                       FROM object_write_attempts
+                      WHERE state IN (
+                        'receiving', 'durable_spooled', 'rejected_before_accept'
+                      )
+                        AND ($1::TEXT IS NULL OR request_id COLLATE \"C\" > $1 COLLATE \"C\")
+                      ORDER BY request_id COLLATE \"C\"
+                      LIMIT $2",
+                    &[&after, &OBJECT_WRITE_RECOVERY_LIMIT],
+                )?
+                .iter()
+                .map(|row| {
+                    let StoredObjectWriteAttempt::Ingress(attempt) = decode_stored_attempt(row)?
+                    else {
+                        return Err(corrupt(
+                            "provisional object-write recovery selected an accepted row",
+                        ));
+                    };
                     Ok(attempt)
                 })
                 .collect()

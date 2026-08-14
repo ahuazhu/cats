@@ -27,6 +27,9 @@ pub const OBJECT_WRITE_GATEWAY_METHOD: &str = "POST";
 pub const OBJECT_WRITE_GATEWAY_CONTENT_TYPE: &str = "application/octet-stream";
 pub const OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE: &str = "application/json";
 pub const OBJECT_WRITE_DESCRIPTOR_HEADER: &str = "cats-object-write-descriptor";
+pub const OBJECT_WRITE_CREDENTIAL_ID_HEADER: &str = "cats-object-write-credential-id";
+pub const OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER: &str = "cats-object-write-public-key-spki";
+pub const OBJECT_WRITE_SIGNATURE_HEADER: &str = "cats-object-write-signature";
 pub const OBJECT_WRITE_DESCRIPTOR_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
@@ -266,6 +269,26 @@ pub fn decode_object_write_gateway_receipt(
     if serde_json::to_vec(&receipt).map_err(|_| ObjectWriteGatewayContractError::InvalidReceipt)?
         != bytes
     {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    Ok(receipt)
+}
+
+pub fn encode_object_write_credential_registration_receipt(
+    receipt: &ObjectWriteCredentialRegistrationReceipt,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    if receipt.version != ContractVersion::V1 || receipt.attachment_epoch.get() == 0 {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    }
+    serde_json::to_vec(receipt).map_err(|_| ObjectWriteGatewayContractError::InvalidReceipt)
+}
+
+pub fn decode_object_write_credential_registration_receipt(
+    bytes: &[u8],
+) -> Result<ObjectWriteCredentialRegistrationReceipt, ObjectWriteGatewayContractError> {
+    let receipt: ObjectWriteCredentialRegistrationReceipt = serde_json::from_slice(bytes)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidReceipt)?;
+    if encode_object_write_credential_registration_receipt(&receipt)? != bytes {
         return Err(ObjectWriteGatewayContractError::InvalidReceipt);
     }
     Ok(receipt)

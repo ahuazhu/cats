@@ -5,6 +5,7 @@ pub mod auth;
 pub mod billing;
 pub mod controller;
 pub(crate) mod gateway_machine;
+pub mod object_write_gateway;
 pub mod route_grant;
 pub(crate) mod route_grant_v2;
 pub mod server;

@@ -1387,6 +1387,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cats-object-write-gateway-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "cats-api",
+ "cats-control-plane",
+ "cats-host-fence-aws",
+ "clap",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cats-storage"
 version = "0.1.0"
 dependencies = [
