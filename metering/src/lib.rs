@@ -1129,17 +1129,28 @@ impl SqliteUsageStore {
             ],
         )?;
         if inserted == 0 {
-            let existing: String = transaction.query_row(
-                "SELECT evidence_json FROM usage_archive_projections WHERE event_id=?1",
+            let existing: (String, String) = transaction.query_row(
+                "SELECT checkpoint.payload_json, archive.evidence_json
+                   FROM usage_archive_projections archive
+                   JOIN usage_checkpoints checkpoint ON checkpoint.event_id=archive.event_id
+                  WHERE archive.event_id=?1",
                 params![value.value.checkpoint.event_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if existing != evidence_json {
+            let payload_json = serde_json::to_string(&value.value.checkpoint)?;
+            if outcome != IngestOutcome::Duplicate || existing.0 != payload_json {
                 return Err(MeteringError::Conflict(format!(
-                    "event {} was projected from conflicting archive evidence",
+                    "event {} was replayed without one exact archived payload",
                     value.value.checkpoint.event_id
                 )));
             }
+            // Kinesis assigns a new sequence number to an exact PutRecord
+            // replay, and a retry after a lost DynamoDB checkpoint can rebuild
+            // a different immutable NDJSON batch around the same sequence.
+            // Both are additional archive copies of the exact event, not a
+            // reason to replace or reject its first canonical evidence.
+            let canonical_evidence: UsageArchiveEvidence = serde_json::from_str(&existing.1)?;
+            validate_archive_evidence(&canonical_evidence)?;
         }
         maybe_insert_sqlite_source_terminal_receipt(
             &transaction,
@@ -3197,6 +3208,19 @@ mod tests {
             ledger.project_archived(&archived(memory, "42")).unwrap(),
             IngestOutcome::Duplicate
         );
+        let replay = archived(
+            final_checkpoint(9, 11_000, 4_096, UsageMetric::MemoryByteMillis),
+            "99",
+        );
+        assert_eq!(
+            ledger.project_archived(&replay).unwrap(),
+            IngestOutcome::Duplicate
+        );
+        let receipt = ledger
+            .source_terminal_receipt("node/node-a/cat/cat-a", "runtime-7")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.final_events[1].archive.sequence_number, "42");
         let later = checkpoint(10, 12_000, 1_000, UsageMetric::CpuUsec);
         assert!(matches!(
             ledger.project_archived(&archived(later, "43")),

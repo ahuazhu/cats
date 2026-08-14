@@ -1217,18 +1217,27 @@ fn pg_project_archived(
         .map_err(|error| pg_error("insert usage archive projection", error))?;
     if inserted == 0 {
         let existing_sql = format!(
-            "SELECT evidence_json FROM {schema}.usage_archive_projections WHERE event_id=$1"
+            "SELECT checkpoint.payload_json, archive.evidence_json
+               FROM {schema}.usage_archive_projections archive
+               JOIN {schema}.usage_checkpoints checkpoint
+                 ON checkpoint.event_id=archive.event_id
+              WHERE archive.event_id=$1"
         );
-        let existing: String = transaction
+        let existing = transaction
             .query_one(&existing_sql, &[&archived.value.checkpoint.event_id])
-            .map_err(|error| pg_error("read usage archive projection replay", error))?
-            .get(0);
-        if existing != evidence_json {
+            .map_err(|error| pg_error("read usage archive projection replay", error))?;
+        let payload_json = serde_json::to_string(&archived.value.checkpoint)?;
+        if outcome != IngestOutcome::Duplicate || existing.get::<_, String>(0) != payload_json {
             return Err(MeteringError::Conflict(format!(
-                "event {} was projected from conflicting archive evidence",
+                "event {} was replayed without one exact archived payload",
                 archived.value.checkpoint.event_id
             )));
         }
+        // Preserve the first canonical evidence. Exact Kinesis retries can
+        // legitimately have another stream position or immutable batch key.
+        let canonical_evidence: UsageArchiveEvidence =
+            serde_json::from_str(&existing.get::<_, String>(1))?;
+        validate_archive_evidence(&canonical_evidence)?;
     }
     pg_maybe_insert_source_terminal_receipt(
         &mut transaction,
@@ -1519,9 +1528,24 @@ fn pg_project_terminal_barrier(
                 &[&barrier.marker.marker_id, &barrier.archive.sequence_number],
             )
             .map_err(|error| pg_error("read Usage terminal barrier replay", error))?;
-        if (row.get::<_, String>(0), row.get::<_, String>(1)) != (marker_json, evidence_json) {
+        if row.get::<_, String>(0) != marker_json {
             return Err(MeteringError::Conflict(
-                "terminal barrier position was replayed with conflicting evidence".into(),
+                "terminal barrier position was replayed with a foreign marker".into(),
+            ));
+        }
+        // A retry after archive/project success but before the DynamoDB
+        // checkpoint may regroup this exact Kinesis position into a different
+        // immutable batch. Keep the first canonical evidence and let the
+        // shard checkpoint advance over the exact marker replay.
+        let canonical_evidence: UsageArchiveEvidence =
+            serde_json::from_str(&row.get::<_, String>(1))?;
+        validate_archive_evidence(&canonical_evidence)?;
+        if canonical_evidence.shard_id != barrier.marker.shard_id
+            || canonical_evidence.stream_name != request.old_target.stream_name
+            || canonical_evidence.archive_bucket != request.old_target.archive_bucket_name
+        {
+            return Err(MeteringError::Conflict(
+                "terminal barrier canonical archive evidence drifted".into(),
             ));
         }
     }
