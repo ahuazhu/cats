@@ -262,18 +262,12 @@ impl AwsHostFenceProvider {
             .await?;
         validate_object_write_cutoff_evidence(request, &object_write_cutoff)?;
 
-        let policy = self
+        let initial_policy = self
             .ec2
             .describe_security_group(&self.config.quarantine_security_group_id, absolute_deadline)
             .await
             .map_err(map_observation_error)?;
-        if policy.security_group_id != self.config.quarantine_security_group_id
-            || policy.vpc_id != target.vpc_id
-            || policy.ingress_rule_count != 0
-            || policy.egress_rule_count != 0
-        {
-            return Err(HostFenceProviderError::ServingCutoffObservationAmbiguous);
-        }
+        validate_quarantine_policy(&self.config, &target, &initial_policy)?;
 
         let execution = self
             .ensure_execution_stopped(request, &target, absolute_deadline)
@@ -281,6 +275,16 @@ impl AwsHostFenceProvider {
         let interfaces = self
             .ensure_interfaces_quarantined(request, &target, absolute_deadline)
             .await?;
+        // The security-group policy is a separate mutable AWS resource. Its
+        // pre-effect observation only prevents knowingly attaching a serving
+        // boundary; a fresh post-effect Describe closes a concurrent rule
+        // change before producing deny-all evidence.
+        let policy = self
+            .ec2
+            .describe_security_group(&self.config.quarantine_security_group_id, absolute_deadline)
+            .await
+            .map_err(map_observation_error)?;
+        validate_quarantine_policy(&self.config, &target, &policy)?;
 
         let mut aggregate = Sha256::new();
         aggregate.update(b"cats.aws-network-observation.v1");
@@ -556,6 +560,21 @@ fn validate_interface_set(
             observation.attached_host_id != request.binding.immutable_host_id
                 || observation.vpc_id != target.vpc_id
         })
+    {
+        return Err(HostFenceProviderError::ServingCutoffObservationAmbiguous);
+    }
+    Ok(())
+}
+
+fn validate_quarantine_policy(
+    config: &AwsHostFenceConfig,
+    target: &AwsHostTarget,
+    observation: &SecurityGroupObservation,
+) -> Result<(), HostFenceProviderError> {
+    if observation.security_group_id != config.quarantine_security_group_id
+        || observation.vpc_id != target.vpc_id
+        || observation.ingress_rule_count != 0
+        || observation.egress_rule_count != 0
     {
         return Err(HostFenceProviderError::ServingCutoffObservationAmbiguous);
     }
@@ -1037,14 +1056,14 @@ mod tests {
         }
     }
 
-    fn policy() -> SecurityGroupObservation {
+    fn policy(at: u64, observation: &str) -> SecurityGroupObservation {
         SecurityGroupObservation {
             security_group_id: id("sg-0fence000000000001"),
             vpc_id: id("vpc-0123456789abcdef0"),
             ingress_rule_count: 0,
             egress_rule_count: 0,
-            observation_id: text("describe-sg-1"),
-            observed_at_unix_ms: time(20),
+            observation_id: text(observation),
+            observed_at_unix_ms: time(at),
         }
     }
 
@@ -1160,7 +1179,10 @@ mod tests {
                         "describe-eni-2",
                     )]),
                 ])),
-                policies: Mutex::new(VecDeque::from([Ok(policy())])),
+                policies: Mutex::new(VecDeque::from([
+                    Ok(policy(20, "describe-sg-1")),
+                    Ok(policy(25, "describe-sg-2")),
+                ])),
                 stop_results: Mutex::new(VecDeque::from([stop_result])),
                 quarantine_results: Mutex::new(VecDeque::from([Ok(MutationAcknowledgement {
                     request_id: text("modify-eni-1"),
@@ -1254,7 +1276,34 @@ mod tests {
         assert_eq!(*ec2.stop_calls.lock().unwrap(), 1);
         assert_eq!(*ec2.quarantine_calls.lock().unwrap(), 1);
         assert_eq!(cutoff.calls(), 1);
-        assert_eq!(evidence.completed_at_unix_ms, UnixMillis::new(24).unwrap());
+        assert_eq!(evidence.completed_at_unix_ms, UnixMillis::new(25).unwrap());
+    }
+
+    #[tokio::test]
+    async fn quarantine_policy_is_reobserved_after_eni_mutation() {
+        let mut changed_policy = policy(25, "describe-sg-2");
+        changed_policy.egress_rule_count = 1;
+        let ec2 = Arc::new(FakeEc2::successful(Ok(MutationAcknowledgement {
+            request_id: text("stop-host-1"),
+        })));
+        *ec2.policies.lock().unwrap() =
+            VecDeque::from([Ok(policy(20, "describe-sg-1")), Ok(changed_policy)]);
+        let provider = AwsHostFenceProvider::with_api(
+            config(),
+            ec2.clone(),
+            Arc::new(FakeCutoff {
+                calls: Mutex::new(0),
+            }),
+        );
+
+        assert_eq!(
+            provider
+                .establish_fence(&request(), Instant::now() + Duration::from_secs(2))
+                .await,
+            Err(HostFenceProviderError::ServingCutoffObservationAmbiguous)
+        );
+        assert_eq!(*ec2.stop_calls.lock().unwrap(), 1);
+        assert_eq!(*ec2.quarantine_calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1303,7 +1352,7 @@ mod tests {
                 Ok(host(Ec2InstanceState::Running, 22, "describe-host-2")),
             ])),
             interfaces: Mutex::new(VecDeque::new()),
-            policies: Mutex::new(VecDeque::from([Ok(policy())])),
+            policies: Mutex::new(VecDeque::from([Ok(policy(20, "describe-sg-1"))])),
             stop_results: Mutex::new(VecDeque::from([Err(Ec2CallError::Ambiguous)])),
             quarantine_results: Mutex::new(VecDeque::new()),
             stop_calls: Mutex::new(0),
