@@ -149,6 +149,30 @@ pub enum TrustedHostFenceStrictVolumeProblemV1 {
     PendingPacksRemain,
 }
 
+/// The exact PostgreSQL authority member that changed after the immutable
+/// attempt was frozen. Provider evidence can remain valid while recovery is
+/// conservatively blocked by one of these concurrent Control changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedHostFenceCurrentAuthorityComponentV1 {
+    SourceIdentity,
+    SourceAgentSession,
+    AssignedCatSet,
+    Desired,
+    OldOperation,
+    VolumeRecord,
+    VolumeOwner,
+    TakeoverAuthorization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedHostFenceRecoveryTargetProblemV1 {
+    NoEligibleReplacementNode,
+    ReplacementPolicyChanged,
+    TakeoverAuthorizationUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TrustedHostFenceRecoveryBlockedReasonV1 {
@@ -163,6 +187,15 @@ pub enum TrustedHostFenceRecoveryBlockedReasonV1 {
         cat_id: Id,
         volume_id: Id,
         problem: TrustedHostFenceStrictVolumeProblemV1,
+    },
+    CurrentAuthorityChanged {
+        cat_id: Option<Id>,
+        volume_id: Option<Id>,
+        component: TrustedHostFenceCurrentAuthorityComponentV1,
+    },
+    RecoveryTargetUnavailable {
+        cat_id: Id,
+        problem: TrustedHostFenceRecoveryTargetProblemV1,
     },
 }
 
@@ -265,6 +298,8 @@ pub enum TrustedHostFenceRecoveryError {
     UnsafeTakeover,
     #[error("trusted Host recovery terminal event is invalid")]
     TerminalEvent,
+    #[error("trusted Host recovery Blocked receipt is invalid or unordered")]
+    BlockedReceipt,
 }
 
 #[derive(Serialize)]
@@ -493,6 +528,136 @@ pub fn trusted_host_fence_recovery_blockers(
     Ok(reasons)
 }
 
+/// Sorts a complete Blocked reason set into its canonical persisted order and
+/// rejects duplicates or a component whose Cat/Volume coordinates have the
+/// wrong shape. Callers must not silently deduplicate independently-derived
+/// reasons.
+pub fn canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(
+    reasons: &mut [TrustedHostFenceRecoveryBlockedReasonV1],
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    for reason in reasons.iter() {
+        validate_blocked_reason_shape(reason)?;
+    }
+    reasons.sort_by_cached_key(blocked_reason_sort_key);
+    if reasons
+        .windows(2)
+        .any(|pair| blocked_reason_sort_key(&pair[0]) == blocked_reason_sort_key(&pair[1]))
+    {
+        return Err(TrustedHostFenceRecoveryError::BlockedReceipt);
+    }
+    Ok(())
+}
+
+pub fn validate_trusted_host_fence_blocked_receipt_v1(
+    receipt: &TrustedHostFenceBlockedReceiptV1,
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    validate_trusted_host_fence_event_v1(&receipt.terminal_event)
+        .map_err(|_| TrustedHostFenceRecoveryError::TerminalEvent)?;
+    if receipt.reasons.is_empty() {
+        return Err(TrustedHostFenceRecoveryError::BlockedReceipt);
+    }
+    for reason in &receipt.reasons {
+        validate_blocked_reason_shape(reason)?;
+    }
+    for pair in receipt.reasons.windows(2) {
+        if blocked_reason_sort_key(&pair[0]) >= blocked_reason_sort_key(&pair[1]) {
+            return Err(TrustedHostFenceRecoveryError::BlockedReceipt);
+        }
+    }
+    Ok(())
+}
+
+fn blocked_reason_sort_key(
+    reason: &TrustedHostFenceRecoveryBlockedReasonV1,
+) -> (u8, String, String, u8) {
+    match reason {
+        TrustedHostFenceRecoveryBlockedReasonV1::SourceInventoryUnavailable { reason } => {
+            let reason = match reason {
+                TrustedHostFenceInventoryUnavailableReasonV1::NoAcceptedFullInventory => 0,
+                TrustedHostFenceInventoryUnavailableReasonV1::AcceptedFullInventoryNotCurrent => 1,
+            };
+            (0, String::new(), String::new(), reason)
+        }
+        TrustedHostFenceRecoveryBlockedReasonV1::RelaxedDurabilityUnprovableAfterInventory {
+            cat_id,
+            volume_id,
+        } => (
+            1,
+            cat_id.as_str().to_owned(),
+            volume_id.as_str().to_owned(),
+            0,
+        ),
+        TrustedHostFenceRecoveryBlockedReasonV1::StrictVolumeNotSafelyRecoverable {
+            cat_id,
+            volume_id,
+            problem,
+        } => (
+            2,
+            cat_id.as_str().to_owned(),
+            volume_id.as_str().to_owned(),
+            strict_volume_problem_order(*problem),
+        ),
+        TrustedHostFenceRecoveryBlockedReasonV1::CurrentAuthorityChanged {
+            cat_id,
+            volume_id,
+            component,
+        } => (
+            3,
+            cat_id
+                .as_ref()
+                .map_or_else(String::new, |id| id.as_str().to_owned()),
+            volume_id
+                .as_ref()
+                .map_or_else(String::new, |id| id.as_str().to_owned()),
+            current_authority_component_order(*component),
+        ),
+        TrustedHostFenceRecoveryBlockedReasonV1::RecoveryTargetUnavailable { cat_id, problem } => (
+            4,
+            cat_id.as_str().to_owned(),
+            String::new(),
+            recovery_target_problem_order(*problem),
+        ),
+    }
+}
+
+fn strict_volume_problem_order(problem: TrustedHostFenceStrictVolumeProblemV1) -> u8 {
+    match problem {
+        TrustedHostFenceStrictVolumeProblemV1::InventoryUnavailable => 0,
+        TrustedHostFenceStrictVolumeProblemV1::DesiredOrAuthorityBindingMismatch => 1,
+        TrustedHostFenceStrictVolumeProblemV1::ObservedVolumeBindingMismatch => 2,
+        TrustedHostFenceStrictVolumeProblemV1::ObservedAuthorityNotExactOwner => 3,
+        TrustedHostFenceStrictVolumeProblemV1::LocalLineagesNotCanonical => 4,
+        TrustedHostFenceStrictVolumeProblemV1::CurrentLineageMissing => 5,
+        TrustedHostFenceStrictVolumeProblemV1::CurrentLineageDuplicated => 6,
+        TrustedHostFenceStrictVolumeProblemV1::CurrentLineageBindingMismatch => 7,
+        TrustedHostFenceStrictVolumeProblemV1::CurrentLineageNotActive => 8,
+        TrustedHostFenceStrictVolumeProblemV1::LocalGenerationAheadOfRemote => 9,
+        TrustedHostFenceStrictVolumeProblemV1::RemoteGenerationDoesNotMatchHead => 10,
+        TrustedHostFenceStrictVolumeProblemV1::PendingPacksRemain => 11,
+    }
+}
+
+fn current_authority_component_order(component: TrustedHostFenceCurrentAuthorityComponentV1) -> u8 {
+    match component {
+        TrustedHostFenceCurrentAuthorityComponentV1::SourceIdentity => 0,
+        TrustedHostFenceCurrentAuthorityComponentV1::SourceAgentSession => 1,
+        TrustedHostFenceCurrentAuthorityComponentV1::AssignedCatSet => 2,
+        TrustedHostFenceCurrentAuthorityComponentV1::Desired => 3,
+        TrustedHostFenceCurrentAuthorityComponentV1::OldOperation => 4,
+        TrustedHostFenceCurrentAuthorityComponentV1::VolumeRecord => 5,
+        TrustedHostFenceCurrentAuthorityComponentV1::VolumeOwner => 6,
+        TrustedHostFenceCurrentAuthorityComponentV1::TakeoverAuthorization => 7,
+    }
+}
+
+fn recovery_target_problem_order(problem: TrustedHostFenceRecoveryTargetProblemV1) -> u8 {
+    match problem {
+        TrustedHostFenceRecoveryTargetProblemV1::NoEligibleReplacementNode => 0,
+        TrustedHostFenceRecoveryTargetProblemV1::ReplacementPolicyChanged => 1,
+        TrustedHostFenceRecoveryTargetProblemV1::TakeoverAuthorizationUnavailable => 2,
+    }
+}
+
 pub fn validate_trusted_host_fence_batch_recovery_commit_v1(
     attempt: &TrustedHostFenceRecoveryAttemptV1,
     commit: &TrustedHostFenceBatchRecoveryCommitV1,
@@ -678,6 +843,33 @@ fn validate_strict_volume(
     Ok(())
 }
 
+fn validate_blocked_reason_shape(
+    reason: &TrustedHostFenceRecoveryBlockedReasonV1,
+) -> Result<(), TrustedHostFenceRecoveryError> {
+    let TrustedHostFenceRecoveryBlockedReasonV1::CurrentAuthorityChanged {
+        cat_id,
+        volume_id,
+        component,
+    } = reason
+    else {
+        return Ok(());
+    };
+    let expected_coordinates = match component {
+        TrustedHostFenceCurrentAuthorityComponentV1::SourceIdentity
+        | TrustedHostFenceCurrentAuthorityComponentV1::SourceAgentSession
+        | TrustedHostFenceCurrentAuthorityComponentV1::AssignedCatSet => (false, false),
+        TrustedHostFenceCurrentAuthorityComponentV1::Desired
+        | TrustedHostFenceCurrentAuthorityComponentV1::OldOperation => (true, false),
+        TrustedHostFenceCurrentAuthorityComponentV1::VolumeRecord
+        | TrustedHostFenceCurrentAuthorityComponentV1::VolumeOwner
+        | TrustedHostFenceCurrentAuthorityComponentV1::TakeoverAuthorization => (true, true),
+    };
+    if (cat_id.is_some(), volume_id.is_some()) != expected_coordinates {
+        return Err(TrustedHostFenceRecoveryError::BlockedReceipt);
+    }
+    Ok(())
+}
+
 fn lineage_origin_matches(
     intent: &cats_api::runtime_reconciliation::VolumeIntent,
     record: &VolumeRecord,
@@ -822,4 +1014,52 @@ fn digest_canonical<T: Serialize>(
     hasher.update([0]);
     hasher.update(canonical);
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: &str) -> Id {
+        Id::new(value.to_owned()).expect("test ID is valid")
+    }
+
+    #[test]
+    fn current_authority_blocker_requires_coordinates_for_its_component() {
+        let mut reasons = [
+            TrustedHostFenceRecoveryBlockedReasonV1::CurrentAuthorityChanged {
+                cat_id: Some(id("cat-1")),
+                volume_id: None,
+                component: TrustedHostFenceCurrentAuthorityComponentV1::SourceIdentity,
+            },
+        ];
+
+        assert_eq!(
+            canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(&mut reasons),
+            Err(TrustedHostFenceRecoveryError::BlockedReceipt)
+        );
+    }
+
+    #[test]
+    fn blocked_reasons_have_one_canonical_order_and_reject_duplicates() {
+        let relaxed =
+            TrustedHostFenceRecoveryBlockedReasonV1::RelaxedDurabilityUnprovableAfterInventory {
+                cat_id: id("cat-1"),
+                volume_id: id("volume-1"),
+            };
+        let source = TrustedHostFenceRecoveryBlockedReasonV1::SourceInventoryUnavailable {
+            reason: TrustedHostFenceInventoryUnavailableReasonV1::NoAcceptedFullInventory,
+        };
+        let mut reasons = [relaxed.clone(), source.clone()];
+
+        canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(&mut reasons)
+            .expect("distinct valid reasons canonicalize");
+        assert_eq!(reasons, [source.clone(), relaxed]);
+
+        let mut duplicates = [source.clone(), source];
+        assert_eq!(
+            canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(&mut duplicates),
+            Err(TrustedHostFenceRecoveryError::BlockedReceipt)
+        );
+    }
 }
