@@ -329,7 +329,6 @@ def validate_release_bound_usage_subprocess() -> None:
     original_binary = PROOF.USAGE_TERMINAL_VERIFIER
     original_private_directory = PROOF._require_root_private_directory
     original_open_executable = PROOF._open_release_bound_executable
-    original_open_child = PROOF._open_child_executable
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         state = root / "state"
@@ -378,11 +377,9 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             ),
         )
         opened: list[str] = []
-        held_descriptor = -1
         swap_path = False
 
         def open_fixture_executable(path: Path, expected_sha256: str) -> Any:
-            nonlocal held_descriptor
             if (
                 path != executable
                 or expected_sha256
@@ -390,7 +387,6 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             ):
                 raise AssertionError("subprocess adapter did not use the release verifier")
             descriptor = os.open(path, os.O_RDONLY)
-            held_descriptor = descriptor
             if swap_path:
                 foreign = root / "foreign-verifier"
                 foreign.write_text(
@@ -404,27 +400,10 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             opened.append(expected_sha256)
             return descriptor, PROOF._FileIdentity.from_stat(os.fstat(descriptor))
 
-        def open_fixture_child(
-            _process: Any,
-            expected_identity: Any,
-            expected_sha256: str,
-        ) -> int:
-            if (
-                held_descriptor < 0
-                or expected_sha256
-                != context.usage_terminal_verifier_binary_sha256
-            ):
-                raise AssertionError("subprocess adapter did not hold its executable")
-            descriptor = os.dup(held_descriptor)
-            if PROOF._FileIdentity.from_stat(os.fstat(descriptor)) != expected_identity:
-                raise AssertionError("subprocess adapter child inode drifted")
-            return descriptor
-
         try:
             PROOF.USAGE_TERMINAL_VERIFIER = executable
             PROOF._require_root_private_directory = lambda _path, _label: None
             PROOF._open_release_bound_executable = open_fixture_executable
-            PROOF._open_child_executable = open_fixture_child
             verifier = PROOF.SubprocessUsageTargetTerminalVerifier(state)
             verifier.verify(
                 manifest,
@@ -437,6 +416,16 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             )
             if opened != [context.usage_terminal_verifier_binary_sha256]:
                 raise AssertionError("subprocess adapter did not pin the verifier binary")
+            for _attempt in range(16):
+                verifier.verify(
+                    manifest,
+                    targets,
+                    receipt,
+                    request,
+                    verification_file,
+                    runs,
+                    context,
+                )
             wrong = opaque(PROOF.USAGE_TERMINAL_VERIFICATION_FILE, "foreign")
             try:
                 verifier.verify(
@@ -474,7 +463,6 @@ sys.stdout.write({PROOF.USAGE_TERMINAL_SUCCESS_STDOUT!r})
             PROOF.USAGE_TERMINAL_VERIFIER = original_binary
             PROOF._require_root_private_directory = original_private_directory
             PROOF._open_release_bound_executable = original_open_executable
-            PROOF._open_child_executable = original_open_child
 
 
 def main() -> int:

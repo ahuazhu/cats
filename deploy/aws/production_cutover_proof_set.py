@@ -636,28 +636,6 @@ def _hash_open_descriptor(descriptor: int, identity: _FileIdentity) -> str:
         raise ProofSetError("E9 terminal verifier cannot be hashed") from error
 
 
-def _open_child_executable(
-    process: subprocess.Popen[bytes],
-    expected_identity: _FileIdentity,
-    expected_sha256: str,
-) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(f"/proc/{process.pid}/exe", flags)
-    except OSError as error:
-        raise ProofSetError("cannot pin the running E9 terminal verifier") from error
-    try:
-        identity = _FileIdentity.from_stat(os.fstat(descriptor))
-        if identity != expected_identity:
-            raise ProofSetError("the running E9 verifier is not the held release inode")
-        if _hash_open_descriptor(descriptor, identity) != expected_sha256:
-            raise ProofSetError("the running E9 verifier differs from the release")
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
 def _write_private_staged_file(path: Path, data: bytes) -> None:
     flags = (
         os.O_WRONLY
@@ -727,7 +705,6 @@ class SubprocessUsageTargetTerminalVerifier:
             USAGE_TERMINAL_VERIFIER,
             context.usage_terminal_verifier_binary_sha256,
         )
-        child_executable_descriptor = -1
         invocation: Path | None = None
         try:
             try:
@@ -791,11 +768,6 @@ class SubprocessUsageTargetTerminalVerifier:
             except OSError as error:
                 raise ProofSetError("cannot execute the E9 terminal verifier") from error
             try:
-                child_executable_descriptor = _open_child_executable(
-                    process,
-                    binary_identity,
-                    context.usage_terminal_verifier_binary_sha256,
-                )
                 stdout, stderr = process.communicate(timeout=self._timeout_seconds)
             except subprocess.TimeoutExpired as error:
                 _terminate_subprocess(process)
@@ -816,9 +788,6 @@ class SubprocessUsageTargetTerminalVerifier:
                 descriptor_identity = _FileIdentity.from_stat(
                     os.fstat(binary_descriptor)
                 )
-                child_identity = _FileIdentity.from_stat(
-                    os.fstat(child_executable_descriptor)
-                )
             except OSError as error:
                 raise ProofSetError(
                     "E9 terminal verifier identity is unavailable after execution"
@@ -826,13 +795,7 @@ class SubprocessUsageTargetTerminalVerifier:
             if (
                 path_identity != binary_identity
                 or descriptor_identity != binary_identity
-                or child_identity != binary_identity
                 or _hash_open_descriptor(binary_descriptor, binary_identity)
-                != context.usage_terminal_verifier_binary_sha256
-                or _hash_open_descriptor(
-                    child_executable_descriptor,
-                    binary_identity,
-                )
                 != context.usage_terminal_verifier_binary_sha256
             ):
                 raise ProofSetError("E9 terminal verifier changed during execution")
@@ -859,8 +822,6 @@ class SubprocessUsageTargetTerminalVerifier:
                     "E9 terminal verifier receipt differs from the proof set"
                 )
         finally:
-            if child_executable_descriptor >= 0:
-                os.close(child_executable_descriptor)
             os.close(binary_descriptor)
             if invocation is not None:
                 expected_names = {
