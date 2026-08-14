@@ -11,6 +11,36 @@ case_id=${2:-none}
 block_path=${3:-none}
 case_dir=${4:-none}
 trace=${CATS_E3_FIXTURE_TRACE:?missing fixture trace}
+catalog=${CATS_E3_FIXTURE_CATALOG:?missing fixture qualification catalog}
+
+write_catalog_evidence() {
+  local scope=$1 filename kind sensitive_written=false
+  while IFS=$'\t' read -r filename kind; do
+    [[ -n $filename && -n $kind ]] || continue
+    if [[ $kind == json ]]; then
+      if [[ $scope == case && ${CATS_E3_FIXTURE_SENSITIVE_RECEIPT_CASE:-} == "$case_id" \
+        && $sensitive_written == false ]]; then
+        printf '%s\n' '{"agent_session":"must-be-rejected"}' >"$case_dir/$filename"
+        sensitive_written=true
+      else
+        jq -S -c -n --arg case_id "$case_id" --arg filename "$filename" \
+          '{version:1,case_id:$case_id,evidence:$filename}' >"$case_dir/$filename"
+      fi
+    elif [[ $kind == text ]]; then
+      printf 'fixture evidence for %s: %s\n' "$case_id" "$filename" >"$case_dir/$filename"
+    else
+      exit 64
+    fi
+  done < <(
+    if [[ $scope == case ]]; then
+      jq -r --arg case_id "$case_id" \
+        '.cases[] | select(.case_id == $case_id) | .required_evidence[] | [.filename,.kind] | @tsv' \
+        "$catalog"
+    else
+      jq -r '.framework_required_evidence[] | [.filename,.kind] | @tsv' "$catalog"
+    fi
+  )
+}
 
 printf '%s|%s|%s\n' "$action" "$case_id" "$block_path" >>"$trace"
 
@@ -25,11 +55,10 @@ case "$action" in
         exit 78
         ;;
     esac
-    if [[ ${CATS_E3_FIXTURE_SENSITIVE_RECEIPT_CASE:-} == "$case_id" ]]; then
-      printf '%s\n' '{"agent_session":"must-be-rejected"}' >"$case_dir/sensitive-receipt.json"
-    else
+    write_catalog_evidence case
+    if [[ ${CATS_E3_FIXTURE_EXTRA_EVIDENCE_CASE:-} == "$case_id" ]]; then
       jq -S -c -n --arg case_id "$case_id" \
-        '{version:1,case_id:$case_id,evidence:"fixture"}' >"$case_dir/fixture-receipt.json"
+        '{version:1,case_id:$case_id,unexpected:true}' >"$case_dir/extra-receipt.json"
     fi
     if [[ ${CATS_E3_FIXTURE_SECRETS:-false} == true ]]; then
       printf 'Authorization: Bearer fixture-token-must-not-survive\n'
@@ -44,6 +73,7 @@ case "$action" in
     ;;
   cleanup)
     printf 'fixture cleanup %s\n' "$case_id"
+    write_catalog_evidence framework
     ;;
   diagnostics)
     printf 'diagnostic for %s\n' "$case_id"

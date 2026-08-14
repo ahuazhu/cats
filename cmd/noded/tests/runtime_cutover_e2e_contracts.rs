@@ -3,15 +3,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const CASES: [&str; 9] = [
+const CASES: [&str; 11] = [
     "control-startup-schema",
     "node-registration-full-inventory",
     "cat-create-running",
     "durable-write-flush",
     "route-http-ws",
+    "route-v2-rotation-disable-live-delivery",
     "agent-restart-adoption",
     "volume-init-matrix",
     "usage-final-terminal-receipt",
+    "v3-aws-host-fence-authority",
     "delete-cleanup",
 ];
 
@@ -169,6 +171,11 @@ exec "$@"
             )
             .env("CATS_E3_FIXTURE_MODE", "enabled")
             .env("CATS_E3_FIXTURE_TRACE", &self.trace)
+            .env(
+                "CATS_E3_FIXTURE_CATALOG",
+                self.root
+                    .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
+            )
             .env("CATS_E3_TIMEOUT_BIN", &self.timeout)
             .current_dir(&self.root);
         configure(&mut command);
@@ -402,18 +409,29 @@ output_dir=$2
 timeout_bin=$3
 scenario_driver=$4
 filter=$5
+catalog=$6
 block_path=kernel-nbd
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$output_dir" "$scratch"
 results_work=$scratch/scenario-results.jsonl
 journal_work=$scratch/component-journal-summary.txt
-receipts_work=$scratch/case-receipts.jsonl
+evidence_work=$scratch/case-evidence.jsonl
 : >"$results_work"
 : >"$journal_work"
-: >"$receipts_work"
-case_ids=(control-startup-schema node-registration-full-inventory cat-create-running durable-write-flush route-http-ws agent-restart-adoption volume-init-matrix usage-final-terminal-receipt delete-cleanup)
-case_deadlines=(120 180 600 300 300 600 900 300 600)
-case_postconditions=(fixture fixture fixture fixture fixture fixture fixture fixture fixture)
+: >"$evidence_work"
+case_ids=()
+case_deadlines=()
+case_expected_outcomes=()
+case_required_evidence=()
+while IFS= read -r case_record; do
+  case_ids+=("$(jq -r '.case_id' <<<"$case_record")")
+  case_deadlines+=("$(jq -r '.deadline_seconds' <<<"$case_record")")
+  case_expected_outcomes+=("$(jq -c '.expected_outcome' <<<"$case_record")")
+  case_required_evidence+=("$(jq -c '.required_evidence' <<<"$case_record")")
+done < <(jq -S -c '
+  .framework_required_evidence as $framework
+  | .cases[]
+  | .required_evidence = (.required_evidence + $framework)' "$catalog")
 cats_e3_run_cases_post_preflight
 jq -S -c -n --argjson passed "$passed_cases" --argjson blocked "$blocked_cases" --argjson failed "$failed_cases" \
   '{passed:$passed,blocked:$blocked,failed:$failed}' >"$output_dir/case-counts.json"
@@ -428,8 +446,17 @@ jq -S -c -n --argjson passed "$passed_cases" --argjson blocked "$blocked_cases" 
             .arg(&self.timeout)
             .arg(driver)
             .arg(filter)
+            .arg(
+                self.root
+                    .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
+            )
             .env("CATS_E3_FIXTURE_MODE", "enabled")
             .env("CATS_E3_FIXTURE_TRACE", &self.trace)
+            .env(
+                "CATS_E3_FIXTURE_CATALOG",
+                self.root
+                    .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
+            )
             .current_dir(&self.root);
         configure(&mut command);
         command.output().expect("run post-preflight E3 fixture")
@@ -822,6 +849,47 @@ fn runtime_cutover_runner_rejects_a_dirty_binary() {
 }
 
 #[test]
+fn runtime_cutover_catalog_is_closed_release_bound_and_all_pass() {
+    let catalog: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../deploy/metal/runtime-cutover-e2e-catalog.v1.json"
+    ))
+    .expect("parse canonical qualification catalog");
+    let object = catalog.as_object().expect("catalog object");
+    let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, ["cases", "framework_required_evidence", "version"]);
+    assert_eq!(catalog["version"], 1);
+    assert_eq!(
+        catalog["framework_required_evidence"],
+        serde_json::json!([{"filename":"cleanup-receipt.json","kind":"json"}])
+    );
+
+    let cases = catalog["cases"].as_array().expect("catalog cases");
+    assert_eq!(cases.len(), CASES.len());
+    for (case, expected_id) in cases.iter().zip(CASES) {
+        assert_eq!(case["case_id"], expected_id);
+        assert_eq!(
+            case["expected_outcome"],
+            serde_json::json!({"kind":"passed"})
+        );
+        assert!(case["deadline_seconds"]
+            .as_u64()
+            .is_some_and(|value| value > 0));
+        assert!(!case["required_evidence"]
+            .as_array()
+            .expect("case evidence")
+            .is_empty());
+    }
+
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    let builder = include_str!("../../../deploy/aws/tools/build-manual-release.sh");
+    assert!(runner.contains(".build_inputs.files.qualification_catalog"));
+    assert!(runner.contains("differs from the exact commit"));
+    assert!(runner.contains("actual_json == \"$expected_json\""));
+    assert!(builder.contains("--input-file \"qualification_catalog="));
+}
+
+#[test]
 fn runtime_cutover_runner_continues_and_cleans_after_a_case_failure() {
     let fixture = Fixture::new();
     let output_dir = fixture.output_dir("case-failure");
@@ -850,7 +918,8 @@ fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
         "manifest.json",
         "scenario-results.jsonl",
         "component-journal-summary.txt",
-        "case-receipts.jsonl",
+        "case-evidence.jsonl",
+        "qualification-catalog.v1.json",
         "final-inventory.json",
         "exit-code",
         "SHA256SUMS",
@@ -922,7 +991,25 @@ fn runtime_cutover_runner_fails_closed_on_sensitive_restart_receipt_keys() {
 }
 
 #[test]
-fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
+fn runtime_cutover_runner_rejects_evidence_outside_the_catalog_union() {
+    let fixture = Fixture::new();
+    let output_dir = fixture.output_dir("extra-case-evidence");
+    let output = fixture.run_post_preflight(&output_dir, |command| {
+        command.env("CATS_E3_FIXTURE_EXTRA_EVIDENCE_CASE", "durable-write-flush");
+    });
+    assert_success(&output);
+    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    let durable: serde_json::Value = results
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|row: &serde_json::Value| row["case_id"] == "durable-write-flush")
+        .unwrap();
+    assert_eq!(durable["status"], "failed");
+    assert_eq!(durable["evidence_exit_code"], 125);
+}
+
+#[test]
+fn final_catalog_treats_every_typed_block_as_a_failed_expected_pass() {
     let fixture = Fixture::new();
     let output_dir = fixture.output_dir("seven-plus-two");
     let output = fixture.run_post_preflight(&output_dir, |command| {
@@ -937,13 +1024,13 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 9);
+    assert_eq!(rows.len(), CASES.len());
     assert_eq!(
         rows.iter().filter(|row| row["status"] == "passed").count(),
-        7
+        CASES.len() - 2
     );
     assert_eq!(
-        rows.iter().filter(|row| row["status"] == "blocked").count(),
+        rows.iter().filter(|row| row["status"] == "failed").count(),
         2
     );
     let restart = rows
@@ -957,16 +1044,18 @@ fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
         assert_eq!(row["run_exit_code"], 78);
         assert_eq!(row["cleanup_exit_code"], 0);
         assert_eq!(row["evidence_exit_code"], 0);
+        assert_eq!(row["observed_outcome"], "blocked");
+        assert_eq!(row["expected_outcome"]["kind"], "passed");
+        assert_eq!(row["outcome_matches"], false);
     }
 
     let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let catalog = include_str!("../../../deploy/metal/runtime-cutover-e2e-catalog.v1.json");
     for case_id in CASES {
         assert!(runner.contains(case_id));
-        assert!(driver.contains(case_id));
+        assert!(catalog.contains(case_id));
     }
-    assert!(driver.contains("DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)"));
-    assert!(driver.contains("terminal archive/projector receipt remains unavailable"));
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
     assert!(!driver.contains("before_agent_session:"));

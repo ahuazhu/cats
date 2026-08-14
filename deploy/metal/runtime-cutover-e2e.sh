@@ -46,30 +46,98 @@ cats_e3_run_cases_post_preflight() {
     atomic_copy "$journal_work" component-journal-summary.txt
   }
 
-  persist_case_receipts() {
-    local case_id=$1 case_dir=$2 receipt filename filtered entry
-    local receipts=()
+  persist_case_evidence() {
+    local case_id=$1 case_dir=$2 required_evidence=$3 exact_set_required=$4
+    local candidate filename kind filtered entry digest size actual_json expected_json
+    local candidates=() actual_names=() evidence_names=()
+    expected_json=$(jq -c '[.[].filename] | sort' <<<"$required_evidence") || return 125
     shopt -s nullglob
-    receipts=("$case_dir"/*-receipt.json)
+    candidates=("$case_dir"/*)
     shopt -u nullglob
-    for receipt in "${receipts[@]}"; do
-      filename=${receipt##*/}
-      filtered=$(mktemp "$scratch/.case-receipt.XXXXXX")
-      if ! "$filter" --mode inventory --max-bytes 1048576 <"$receipt" >"$filtered"; then
-        rm -f "$filtered"
-        return 125
+    for candidate in "${candidates[@]}"; do
+      [[ -f $candidate && ! -L $candidate ]] || continue
+      filename=${candidate##*/}
+      case "$filename" in
+        *receipt*.json|*.node-acks.json|*.transcript.log) actual_names+=("$filename") ;;
+        *)
+          if jq -e --arg filename "$filename" \
+            'any(.[]; .filename == $filename)' <<<"$required_evidence" >/dev/null; then
+            actual_names+=("$filename")
+          fi
+          ;;
+      esac
+    done
+
+    if [[ $exact_set_required == true ]]; then
+      if [[ ${#actual_names[@]} -eq 0 ]]; then
+        actual_json='[]'
+      else
+        actual_json=$(printf '%s\n' "${actual_names[@]}" | LC_ALL=C sort | jq -Rsc 'split("\n")[:-1]') || return 125
       fi
-      entry=$(mktemp "$scratch/.case-receipt-entry.XXXXXX")
-      if ! jq -S -c -n --arg case_id "$case_id" --arg receipt_name "$filename" \
-        --slurpfile receipt "$filtered" \
-        '{case_id:$case_id,receipt_name:$receipt_name,receipt:$receipt[0]}' >"$entry"; then
+      [[ $actual_json == "$expected_json" ]] || return 125
+      while IFS= read -r filename; do
+        evidence_names+=("$filename")
+      done < <(jq -r '.[].filename' <<<"$required_evidence")
+    else
+      evidence_names=("${actual_names[@]}")
+    fi
+
+    for filename in "${evidence_names[@]}"; do
+      candidate=$case_dir/$filename
+      [[ -f $candidate && ! -L $candidate ]] || return 125
+      if [[ $exact_set_required == true ]]; then
+        kind=$(jq -r --arg filename "$filename" \
+          '.[] | select(.filename == $filename) | .kind' <<<"$required_evidence") || return 125
+      else
+        case "$filename" in
+          *.json) kind=json ;;
+          *.log) kind=text ;;
+          *) return 125 ;;
+        esac
+      fi
+      filtered=$(mktemp "$scratch/.case-evidence.XXXXXX")
+      case "$kind" in
+        json)
+          if ! "$filter" --mode inventory --max-bytes 1048576 <"$candidate" >"$filtered"; then
+            rm -f "$filtered"
+            return 125
+          fi
+          ;;
+        text)
+          if ! "$filter" --mode text --max-bytes 131072 <"$candidate" >"$filtered"; then
+            rm -f "$filtered"
+            return 125
+          fi
+          ;;
+        *)
+          rm -f "$filtered"
+          return 125
+          ;;
+      esac
+      digest=$(sha256sum "$filtered" | awk '{print $1}')
+      size=$(wc -c <"$filtered" | tr -d ' ')
+      entry=$(mktemp "$scratch/.case-evidence-entry.XXXXXX")
+      if [[ $kind == json ]]; then
+        if ! jq -S -c -n --arg case_id "$case_id" --arg filename "$filename" \
+          --arg kind "$kind" --arg sha256 "sha256:$digest" --argjson size_bytes "$size" \
+          --slurpfile content "$filtered" \
+          '{case_id:$case_id,filename:$filename,kind:$kind,sha256:$sha256,
+            size_bytes:$size_bytes,content:$content[0]}' >"$entry"; then
+          rm -f "$filtered" "$entry"
+          return 125
+        fi
+      elif ! jq -S -c -n --arg case_id "$case_id" --arg filename "$filename" \
+        --arg kind "$kind" --arg sha256 "sha256:$digest" --argjson size_bytes "$size" \
+        --rawfile content "$filtered" \
+        '{case_id:$case_id,filename:$filename,kind:$kind,sha256:$sha256,
+          size_bytes:$size_bytes,content:$content}' >"$entry"; then
         rm -f "$filtered" "$entry"
         return 125
       fi
-      cat "$entry" >>"$receipts_work"
+      cat "$entry" >>"$evidence_work"
       rm -f "$filtered" "$entry"
     done
-    atomic_copy "$receipts_work" case-receipts.jsonl
+    atomic_copy "$evidence_work" case-evidence.jsonl
   }
 
   failed_cases=0
@@ -78,6 +146,8 @@ cats_e3_run_cases_post_preflight() {
   for index in "${!case_ids[@]}"; do
     case_id=${case_ids[$index]}
     deadline=${case_deadlines[$index]}
+    expected_outcome=${case_expected_outcomes[$index]}
+    required_evidence=${case_required_evidence[$index]}
     case_dir=$scratch/case-$case_id
     mkdir -m 0700 "$case_dir"
     run_summary=$case_dir/run-summary.txt
@@ -109,42 +179,53 @@ cats_e3_run_cases_post_preflight() {
     fi
     append_summary "$case_id" cleanup "$cleanup_summary"
 
-    if persist_case_receipts "$case_id" "$case_dir"; then
+    exact_set_required=false
+    if [[ $run_code -eq 0 && $cleanup_code -eq 0 ]]; then
+      exact_set_required=true
+    fi
+    if persist_case_evidence "$case_id" "$case_dir" "$required_evidence" "$exact_set_required"; then
       evidence_code=0
     else
       evidence_code=$?
     fi
 
     case_ended=$(date +%s)
-    status=passed
+    observed_outcome=passed
     if [[ $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
-      status=failed
+      observed_outcome=failed
     elif [[ $run_code -eq 124 ]]; then
-      status=timed_out
+      observed_outcome=timed_out
     elif [[ $run_code -eq 78 ]]; then
       if [[ -f $case_dir/blocked-receipt.json ]] && jq -e \
         --arg case_id "$case_id" --arg block_path "$block_path" \
         '.version == 1 and .status == "blocked" and .case_id == $case_id
           and .block_path == $block_path and (.reason | type == "string" and length > 0)' \
         "$case_dir/blocked-receipt.json" >/dev/null; then
-        status=blocked
+        observed_outcome=blocked
       else
-        status=failed
+        observed_outcome=failed
         evidence_code=125
       fi
     elif [[ $run_code -ne 0 ]]; then
-      status=failed
+      observed_outcome=failed
     fi
-    case "$status" in
-      passed) passed_cases=$((passed_cases + 1)) ;;
-      blocked) blocked_cases=$((blocked_cases + 1)) ;;
-      failed|timed_out) failed_cases=$((failed_cases + 1)) ;;
-      *) return 125 ;;
-    esac
+    expected_kind=$(jq -r '.kind' <<<"$expected_outcome") || return 125
+    outcome_matches=false
+    status=failed
+    if [[ $observed_outcome == "$expected_kind" ]]; then
+      outcome_matches=true
+      status=passed
+      passed_cases=$((passed_cases + 1))
+    else
+      failed_cases=$((failed_cases + 1))
+      [[ $observed_outcome != blocked ]] || blocked_cases=$((blocked_cases + 1))
+    fi
     jq -S -c -n \
       --arg case_id "$case_id" \
       --arg status "$status" \
-      --arg expected_postcondition "${case_postconditions[$index]}" \
+      --arg observed_outcome "$observed_outcome" \
+      --argjson expected_outcome "$expected_outcome" \
+      --argjson outcome_matches "$outcome_matches" \
       --argjson deadline_seconds "$deadline" \
       --argjson started_at_unix_seconds "$case_started" \
       --argjson ended_at_unix_seconds "$case_ended" \
@@ -152,7 +233,12 @@ cats_e3_run_cases_post_preflight() {
       --argjson diagnostic_exit_code "$diagnostic_code" \
       --argjson cleanup_exit_code "$cleanup_code" \
       --argjson evidence_exit_code "$evidence_code" \
-      '{case_id:$case_id,status:$status,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,evidence_exit_code:$evidence_exit_code}' \
+      '{case_id:$case_id,status:$status,observed_outcome:$observed_outcome,
+        expected_outcome:$expected_outcome,outcome_matches:$outcome_matches,
+        deadline_seconds:$deadline_seconds,started_at_unix_seconds:$started_at_unix_seconds,
+        ended_at_unix_seconds:$ended_at_unix_seconds,run_exit_code:$run_exit_code,
+        diagnostic_exit_code:$diagnostic_exit_code,cleanup_exit_code:$cleanup_exit_code,
+        evidence_exit_code:$evidence_exit_code}' \
       >>"$results_work"
     atomic_copy "$results_work" scenario-results.jsonl
   done
@@ -394,6 +480,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$script_dir/../.." && pwd -P)
 filter=$script_dir/runtime-cutover-evidence-filter.py
 runner=$script_dir/runtime-cutover-e2e.sh
+qualification_catalog=$script_dir/runtime-cutover-e2e-catalog.v1.json
 
 canonical_existing() {
   local path=$1
@@ -422,25 +509,141 @@ token_file=$(canonical_existing "$token_file") || fail "token file must be a reg
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "installer receipt path must resolve to the canonical production path"
 scenario_driver=$(canonical_existing "$scenario_driver") || fail "scenario driver must be a regular non-symlink file"
+qualification_catalog=$(canonical_existing "$qualification_catalog") || \
+  fail "qualification catalog must be the fixed regular non-symlink repository file"
 output_dir=$(canonical_output "$output_dir") || fail "absolute output parent must already exist and be a real directory"
 [[ ! -e $output_dir && ! -L $output_dir ]] || fail "output directory already exists; refusing to overwrite evidence"
 
 [[ $(git -C "$repo" rev-parse HEAD) == "$exact_commit" ]] || fail "checkout HEAD does not equal the exact commit"
 [[ $(git -C "$repo" rev-parse "${exact_commit}^{commit}") == "$exact_commit" ]] || fail "exact commit is not a commit object"
 
-verify_exact_repo_file() {
+verify_exact_repo_blob() {
   local path=$1 relative expected_blob actual_blob
-  case "$path" in "$repo"/*) ;; *) fail "scenario and evidence executables must be repo-owned" ;; esac
+  case "$path" in "$repo"/*) ;; *) fail "runner authority inputs must be repo-owned" ;; esac
   relative=${path#"$repo"/}
   expected_blob=$(git -C "$repo" rev-parse "${exact_commit}:${relative}" 2>/dev/null) || fail "$relative is not tracked by the exact commit"
   actual_blob=$(git -C "$repo" hash-object "$path")
   [[ $actual_blob == "$expected_blob" ]] || fail "$relative differs from the exact commit"
-  [[ -f $path && -x $path && ! -L $path ]] || fail "$relative must be an executable regular file"
+  [[ -f $path && ! -L $path ]] || fail "$relative must be a regular non-symlink file"
+}
+
+verify_exact_repo_file() {
+  local path=$1
+  verify_exact_repo_blob "$path"
+  [[ -f $path && -x $path && ! -L $path ]] || fail "$path must be an executable regular file"
 }
 
 verify_exact_repo_file "$runner"
 verify_exact_repo_file "$filter"
 verify_exact_repo_file "$scenario_driver"
+verify_exact_repo_blob "$qualification_catalog"
+
+python3 - "$qualification_catalog" <<'PY' || fail "qualification catalog is not canonical or violates its closed schema"
+import json
+from pathlib import Path
+import re
+import sys
+
+
+class DuplicateKey(ValueError):
+    pass
+
+
+def closed_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKey
+        value[key] = item
+    return value
+
+
+raw = Path(sys.argv[1]).read_bytes()
+if not 1 <= len(raw) <= 65536:
+    raise SystemExit(1)
+try:
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
+except (UnicodeDecodeError, json.JSONDecodeError, DuplicateKey):
+    raise SystemExit(1)
+canonical = (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
+if raw != canonical or not isinstance(value, dict):
+    raise SystemExit(1)
+if set(value) != {"cases", "framework_required_evidence", "version"} or value["version"] != 1:
+    raise SystemExit(1)
+
+filename_pattern = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+case_pattern = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+
+
+def validate_evidence(items):
+    if not isinstance(items, list) or not items or len(items) > 32:
+        raise SystemExit(1)
+    names = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"filename", "kind"}:
+            raise SystemExit(1)
+        filename = item["filename"]
+        if not isinstance(filename, str) or filename_pattern.fullmatch(filename) is None:
+            raise SystemExit(1)
+        if filename in {".", ".."} or item["kind"] not in {"json", "text"}:
+            raise SystemExit(1)
+        if item["kind"] == "json" and not filename.endswith(".json"):
+            raise SystemExit(1)
+        if item["kind"] == "text" and not filename.endswith(".log"):
+            raise SystemExit(1)
+        names.append(filename)
+    if len(names) != len(set(names)):
+        raise SystemExit(1)
+    return set(names)
+
+
+framework_names = validate_evidence(value["framework_required_evidence"])
+if value["framework_required_evidence"] != [
+    {"filename": "cleanup-receipt.json", "kind": "json"}
+]:
+    raise SystemExit(1)
+cases = value["cases"]
+if not isinstance(cases, list) or not cases:
+    raise SystemExit(1)
+expected_cases = {
+    "control-startup-schema",
+    "node-registration-full-inventory",
+    "cat-create-running",
+    "durable-write-flush",
+    "route-http-ws",
+    "route-v2-rotation-disable-live-delivery",
+    "agent-restart-adoption",
+    "volume-init-matrix",
+    "usage-final-terminal-receipt",
+    "v3-aws-host-fence-authority",
+    "delete-cleanup",
+}
+case_ids = []
+for case in cases:
+    if not isinstance(case, dict) or set(case) != {
+        "case_id",
+        "deadline_seconds",
+        "expected_outcome",
+        "required_evidence",
+    }:
+        raise SystemExit(1)
+    case_id = case["case_id"]
+    if not isinstance(case_id, str) or case_pattern.fullmatch(case_id) is None:
+        raise SystemExit(1)
+    deadline = case["deadline_seconds"]
+    if type(deadline) is not int or not 1 <= deadline <= 3600:
+        raise SystemExit(1)
+    if case["expected_outcome"] != {"kind": "passed"}:
+        raise SystemExit(1)
+    if validate_evidence(case["required_evidence"]) & framework_names:
+        raise SystemExit(1)
+    case_ids.append(case_id)
+if len(case_ids) != len(set(case_ids)) or set(case_ids) != expected_cases:
+    raise SystemExit(1)
+PY
+
+qualification_catalog_sha256=$(sha256sum "$qualification_catalog" | awk '{print $1}')
+qualification_catalog_size=$(wc -c <"$qualification_catalog" | tr -d ' ')
 
 [[ $(wc -c <"$build_receipt") -le 1048576 ]] || fail "build receipt is too large"
 [[ $(wc -c <"$release_manifest") -le 1048576 ]] || fail "release manifest is too large"
@@ -449,9 +652,13 @@ jq -e --arg commit "$exact_commit" \
   '.source_sha == $commit and .exit_status == 0 and .output_frozen == true' \
   "$build_receipt" >/dev/null || fail "build receipt does not prove a successful frozen build of the exact commit"
 jq -e --arg commit "$exact_commit" \
+  --arg catalog_sha256 "sha256:$qualification_catalog_sha256" \
+  --argjson catalog_size "$qualification_catalog_size" \
   '.version == 1 and .source.commit == $commit
     and (.artifacts.worker.bundle_sha256 | test("^sha256:[0-9a-f]{64}$"))
-    and (.artifacts.worker.members | type == "object" and length > 0)' \
+    and (.artifacts.worker.members | type == "object" and length > 0)
+    and .build_inputs.files.qualification_catalog
+      == {sha256:$catalog_sha256,size_bytes:$catalog_size}' \
   "$release_manifest" >/dev/null || fail "release manifest does not bind the exact commit"
 approved_release_manifest_sha256=${release_manifest_sha256#sha256:}
 [[ $(sha256sum "$release_manifest" | awk '{print $1}') == "$approved_release_manifest_sha256" ]] || \
@@ -533,14 +740,14 @@ catalog_work=$scratch/scenario-catalog.jsonl
 binaries_work=$scratch/binaries.jsonl
 configs_work=$scratch/configs.jsonl
 fingerprints_work=$scratch/key-fingerprints.jsonl
-receipts_work=$scratch/case-receipts.jsonl
+evidence_work=$scratch/case-evidence.jsonl
 : >"$results_work"
 : >"$journal_work"
 : >"$catalog_work"
 : >"$binaries_work"
 : >"$configs_work"
 : >"$fingerprints_work"
-: >"$receipts_work"
+: >"$evidence_work"
 
 original_labels=()
 original_paths=()
@@ -580,10 +787,12 @@ atomic_text() {
 }
 
 scenario_driver_original=$scenario_driver
+qualification_catalog_original=$qualification_catalog
 filter_original=$filter
 runner_authority_sha256=$(sha256sum "$runner" | awk '{print $1}')
 filter_authority_sha256=$(sha256sum "$filter" | awk '{print $1}')
 scenario_driver_authority_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
+qualification_catalog_authority_sha256=$(sha256sum "$qualification_catalog" | awk '{print $1}')
 build_receipt_authority_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
 installer_receipt_authority_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
 token_file_original=$token_file
@@ -594,6 +803,7 @@ verify_exact_repo_file "$scenario_driver"
 stage_input runner "$runner" "$stage/runtime-cutover-e2e.sh" 0700 "$runner_authority_sha256"
 stage_input evidence-filter "$filter" "$stage/runtime-cutover-evidence-filter.py" 0700 "$filter_authority_sha256"
 stage_input scenario-driver "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh" 0700 "$scenario_driver_authority_sha256"
+stage_input qualification-catalog "$qualification_catalog" "$stage/qualification-catalog.v1.json" 0600 "$qualification_catalog_authority_sha256"
 stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
 stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
 stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
@@ -617,14 +827,20 @@ verify_staged_repo_file() {
 verify_staged_repo_file "$runner" "$stage/runtime-cutover-e2e.sh"
 verify_staged_repo_file "$filter" "$stage/runtime-cutover-evidence-filter.py"
 verify_staged_repo_file "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh"
+verify_staged_repo_file "$qualification_catalog" "$stage/qualification-catalog.v1.json"
 filter=$stage/runtime-cutover-evidence-filter.py
 scenario_driver=$stage/runtime-cutover-v2-scenarios.sh
+qualification_catalog=$stage/qualification-catalog.v1.json
 
 jq -e --arg commit "$exact_commit" \
   '.source_sha == $commit and .exit_status == 0 and .output_frozen == true' \
   "$stage/build-receipt.json" >/dev/null || fail "staged build receipt changed authority"
 jq -e --arg commit "$exact_commit" \
-  '.version == 1 and .source.commit == $commit' \
+  --arg catalog_sha256 "sha256:$qualification_catalog_authority_sha256" \
+  --argjson catalog_size "$qualification_catalog_size" \
+  '.version == 1 and .source.commit == $commit
+    and .build_inputs.files.qualification_catalog
+      == {sha256:$catalog_sha256,size_bytes:$catalog_size}' \
   "$stage/release-manifest.json" >/dev/null || fail "staged release manifest changed authority"
 jq -e '
   (keys == ["host_tools","members","service","version","worker_bundle_sha256"])
@@ -776,38 +992,21 @@ for entry in "${key_fingerprint_entries[@]}"; do
     '{label:$label,fingerprint:$fingerprint}' >>"$fingerprints_work"
 done
 
-case_ids=(
-  control-startup-schema
-  node-registration-full-inventory
-  cat-create-running
-  durable-write-flush
-  route-http-ws
-  agent-restart-adoption
-  volume-init-matrix
-  usage-final-terminal-receipt
-  delete-cleanup
-)
-case_deadlines=(120 180 600 300 300 600 900 300 600)
-case_postconditions=(
-  'exact schema starts and rejects every other schema'
-  'current AgentSession owns one complete full-inventory attestation with gates Closed'
-  'production Desired converges through the physical executor to stable Running'
-  'Guest write and successful FLUSH reach the selected durability postcondition'
-  'HTTP and WebSocket traverse Gateway, Control resolve, Node guard and Guest'
-  'Agent restart adopts exact runtime and retained pending data without gate resurrection'
-  'installed Root proves the selected frontend; live PersistentDisk attach/first-format/restart matrix remains DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)'
-  'live sampler, durable spool and signed ingest ACK are proven; terminal archive/projector receipt remains explicit Blocked'
-  'delete reaches exact physical cleanup with no residue or writer'
-)
-
-for index in "${!case_ids[@]}"; do
-  jq -S -c -n \
-    --arg case_id "${case_ids[$index]}" \
-    --argjson deadline_seconds "${case_deadlines[$index]}" \
-    --arg expected_postcondition "${case_postconditions[$index]}" \
-    '{case_id:$case_id,deadline_seconds:$deadline_seconds,expected_postcondition:$expected_postcondition,cleanup_required:true}' \
-    >>"$catalog_work"
-done
+case_ids=()
+case_deadlines=()
+case_expected_outcomes=()
+case_required_evidence=()
+while IFS= read -r case_record; do
+  case_ids+=("$(jq -r '.case_id' <<<"$case_record")")
+  case_deadlines+=("$(jq -r '.deadline_seconds' <<<"$case_record")")
+  case_expected_outcomes+=("$(jq -c '.expected_outcome' <<<"$case_record")")
+  case_required_evidence+=("$(jq -c '.required_evidence' <<<"$case_record")")
+  printf '%s\n' "$case_record" >>"$catalog_work"
+done < <(jq -S -c '
+  .framework_required_evidence as $framework
+  | .cases[]
+  | .required_evidence = (.required_evidence + $framework)' "$qualification_catalog")
+[[ ${#case_ids[@]} -gt 0 ]] || fail "qualification catalog contains no cases"
 expected_nodes_work=$scratch/expected-nodes.json
 printf '%s\n' "${expected_nodes[@]}" | jq -Rsc 'split("\n")[:-1]' >"$expected_nodes_work"
 
@@ -821,7 +1020,9 @@ scenario_driver_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
 scenario_catalog_sha256=$(sha256sum "$catalog_work" | awk '{print $1}')
 
 write_manifest() {
-  local state=$1 exit_value=$2 ended=$3 temporary
+  local state=$1 exit_value=$2 ended=$3 temporary case_evidence_sha256 case_evidence_count
+  case_evidence_sha256=$(sha256sum "$evidence_work" | awk '{print $1}')
+  case_evidence_count=$(wc -l <"$evidence_work" | tr -d ' ')
   temporary=$(mktemp "$output_dir/.manifest.json.XXXXXX")
   jq -S -c -n \
     --arg state "$state" \
@@ -848,9 +1049,14 @@ write_manifest() {
     --arg endpoint_hostname "$endpoint_hostname" \
     --arg scenario_driver "$scenario_driver_original" \
     --arg scenario_driver_sha256 "$scenario_driver_sha256" \
+    --arg qualification_catalog "$qualification_catalog_original" \
+    --arg qualification_catalog_sha256 "$qualification_catalog_authority_sha256" \
+    --argjson qualification_catalog_size_bytes "$qualification_catalog_size" \
     --arg timeout_binary "$timeout_bin_original" \
     --arg timeout_binary_sha256 "$timeout_bin_sha256" \
     --arg scenario_catalog_sha256 "$scenario_catalog_sha256" \
+    --arg case_evidence_sha256 "$case_evidence_sha256" \
+    --argjson case_evidence_count "$case_evidence_count" \
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
     --argjson ended_at_unix_seconds "$ended" \
     --argjson exit_code "$exit_value" \
@@ -859,7 +1065,26 @@ write_manifest() {
     --slurpfile key_fingerprints "$fingerprints_work" \
     --slurpfile expected_nodes "$expected_nodes_work" \
     --slurpfile scenarios "$catalog_work" \
-    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256,approved_sha256:$approved_release_manifest_sha256},installer_receipt:{path:$installer_receipt,sha256:$installer_receipt_sha256,worker_bundle_sha256:$worker_bundle_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},qualification:{control_origin:$control_origin,workspace_id:$workspace_id,expected_nodes:$expected_nodes[0],qualification_node_id:$qualification_node,cat_name:$cat_name,boot_image_digest:$boot_image_digest,endpoint_name:$endpoint_name,endpoint_hostname:$endpoint_hostname,public_origin:("https://" + $endpoint_hostname)},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
+    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,
+      run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},
+      build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},
+      release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256,
+        approved_sha256:$approved_release_manifest_sha256},
+      installer_receipt:{path:$installer_receipt,sha256:$installer_receipt_sha256,
+        worker_bundle_sha256:$worker_bundle_sha256},
+      scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},
+      qualification_catalog:{path:$qualification_catalog,sha256:$qualification_catalog_sha256,
+        size_bytes:$qualification_catalog_size_bytes},
+      case_evidence:{sha256:$case_evidence_sha256,count:$case_evidence_count},
+      timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},
+      qualification:{control_origin:$control_origin,workspace_id:$workspace_id,
+        expected_nodes:$expected_nodes[0],qualification_node_id:$qualification_node,
+        cat_name:$cat_name,boot_image_digest:$boot_image_digest,endpoint_name:$endpoint_name,
+        endpoint_hostname:$endpoint_hostname,public_origin:("https://" + $endpoint_hostname)},
+      scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,
+      key_fingerprints:$key_fingerprints,scenarios:$scenarios,
+      started_at_unix_seconds:$started_at_unix_seconds,
+      ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
     >"$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$output_dir/manifest.json"
@@ -868,7 +1093,8 @@ write_manifest() {
 write_manifest running -1 0
 atomic_copy "$results_work" scenario-results.jsonl
 atomic_copy "$journal_work" component-journal-summary.txt
-atomic_copy "$receipts_work" case-receipts.jsonl
+atomic_copy "$evidence_work" case-evidence.jsonl
+atomic_copy "$qualification_catalog" qualification-catalog.v1.json
 
 export CATS_E3_EXACT_COMMIT=$exact_commit
 export CATS_E3_BLOCK_PATH=$block_path
@@ -930,12 +1156,9 @@ fi
 
 final_exit=0
 final_state=passed
-if [[ $failed_cases -ne 0 ]]; then
+if [[ $failed_cases -ne 0 || $blocked_cases -ne 0 ]]; then
   final_exit=1
   final_state=failed
-elif [[ $blocked_cases -ne 0 ]]; then
-  final_exit=78
-  final_state=blocked
 fi
 atomic_text exit-code "$final_exit"$'\n'
 ended_at_unix_seconds=$(date +%s)
@@ -947,10 +1170,11 @@ checksums_tmp=$(mktemp "$output_dir/.SHA256SUMS.XXXXXX")
   cd "$output_dir"
   LC_ALL=C sha256sum \
     component-journal-summary.txt \
-    case-receipts.jsonl \
+    case-evidence.jsonl \
     exit-code \
     final-inventory.json \
     manifest.json \
+    qualification-catalog.v1.json \
     runtime-state.json \
     scenario-results.jsonl
 ) >"$checksums_tmp"

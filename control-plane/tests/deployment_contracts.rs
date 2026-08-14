@@ -3840,6 +3840,7 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--gateway-image-registry-verified true",
         "--input-file \"guest_host_kernel=$guest_kernel\"",
         "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
+        "--input-file \"qualification_catalog=$source_root/deploy/metal/runtime-cutover-e2e-catalog.v1.json\"",
         "--export-images",
         "type=oci,dest=$control_archive",
         "type=oci,dest=$gateway_archive",
