@@ -513,38 +513,11 @@ async fn handle_tunnel_request(
         canonical_hostname: frame.hostname,
         protocol: HttpProtocol::Http,
     };
-    let Some(publication) = service
-        .registry
-        .begin_route_admission_publication()
-        .ok()
-        .flatten()
-    else {
-        return Ok(failure_response(
-            RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
-                .expect("RuntimeNotReady is pre-admission"),
-        ));
-    };
-    let admitted = {
-        let verified =
-            match service
-                .verifier
-                .verify_request(&principal, &frame.opaque_grant, &binding, now)
-            {
-                Ok(verified) => verified,
-                Err(failure) => return Ok(failure_response(failure)),
-            };
-        let Some(cell) = publication.cell(verified.cat_id()) else {
-            return Ok(failure_response(
-                RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::RuntimeNotReady)
-                    .expect("RuntimeNotReady is pre-admission"),
-            ));
-        };
-        match verified.admit(&cell) {
+    let admitted =
+        match verify_and_admit_route(&service, &principal, &binding, &frame.opaque_grant, now) {
             Ok(admitted) => admitted,
             Err(failure) => return Ok(failure_response(failure)),
-        }
-    };
-    drop(publication);
+        };
     let upstream_target = format!(
         "{}:{}",
         admitted.guest_ipv4(),
@@ -579,6 +552,40 @@ async fn handle_tunnel_request(
         ));
     }
     Ok(upgrade_response())
+}
+
+/// Complete the synchronous Route publication linearization before the
+/// async handler may begin Guest I/O. The registry barrier covers verification,
+/// verified-Cat lookup and guard acquisition, so an emergency disable either
+/// wins first or closes the already-acquired cell guard after this returns.
+fn verify_and_admit_route(
+    service: &RouteV2MachineService,
+    principal: &AuthenticatedGatewayPrincipal,
+    binding: &RouteAdmissionV2RequestBinding,
+    opaque_grant: &str,
+    now: u64,
+) -> Result<AdmittedRouteV2, RouteAdmissionV2Failure> {
+    let Some(publication) = service
+        .registry
+        .begin_route_admission_publication()
+        .ok()
+        .flatten()
+    else {
+        return Err(RouteAdmissionV2Failure::pre_admission(
+            RouteAdmissionV2Reason::RuntimeNotReady,
+        )
+        .expect("RuntimeNotReady is pre-admission"));
+    };
+    let verified = service
+        .verifier
+        .verify_request(principal, opaque_grant, binding, now)?;
+    let Some(cell) = publication.cell(verified.cat_id()) else {
+        return Err(RouteAdmissionV2Failure::pre_admission(
+            RouteAdmissionV2Reason::RuntimeNotReady,
+        )
+        .expect("RuntimeNotReady is pre-admission"));
+    };
+    verified.admit(&cell)
 }
 
 fn valid_tunnel_head(request: &Request<Incoming>) -> bool {
@@ -1075,6 +1082,51 @@ mod tests {
             .begin_route_admission_publication()
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn publication_scope_ends_before_guest_io_and_emergency_close_cancels_guard() {
+        let keys = keys();
+        let claims = claims("cat_publication", "ep_publication", 9);
+        let token = sign(&keys, &claims);
+        let active = cell(&claims, RouteGateState::Active);
+        let temp = TempDir::new().unwrap();
+        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        registry
+            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .unwrap();
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![keys.public.clone()]).unwrap(),
+        ));
+        let service =
+            RouteV2MachineService::new(claims.node_id.clone(), verifier, Arc::clone(&registry));
+        let principal = AuthenticatedGatewayPrincipal::from_verified_spki_sha256(gateway_digest());
+        let binding = RouteAdmissionV2RequestBinding {
+            local_node_id: claims.node_id.clone(),
+            cat_id: claims.cat_id.clone(),
+            endpoint_id: claims.endpoint_id.clone(),
+            canonical_hostname: claims.hostname.clone(),
+            protocol: claims.protocol,
+        };
+
+        let mut admitted =
+            verify_and_admit_route(&service, &principal, &binding, &token, claims.nbf).unwrap();
+        assert_eq!(active.active_guards(&claims.endpoint_id), Some(1));
+
+        // The synchronous helper no longer owns the registry barrier here,
+        // so emergency close can linearize before any Guest-network await and
+        // cancel the already-acquired Endpoint guard.
+        registry.latch_emergency_route_disable();
+        tokio::time::timeout(Duration::from_secs(1), admitted.cancelled())
+            .await
+            .expect("emergency close cancels the admitted guard");
+        drop(admitted);
+        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+
+        let failure =
+            verify_and_admit_route(&service, &principal, &binding, &token, claims.nbf).unwrap_err();
+        assert_eq!(failure.reason, RouteAdmissionV2Reason::RuntimeNotReady);
+        assert!(!failure.guard_acquired);
     }
 
     fn client_tls(client_certificate: &[u8], client_private_key: &[u8]) -> Arc<ClientConfig> {
