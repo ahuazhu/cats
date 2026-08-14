@@ -102,6 +102,63 @@ fn production_metal_fleet_keeps_stable_addresses_and_one_explicit_root_cutover()
 }
 
 #[test]
+fn production_cutover_runbook_orders_gates_and_fences_destructive_commands() {
+    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
+    let ordered_stages = [
+        "<!-- cutover-stage: 00-current-blocker -->",
+        "<!-- cutover-stage: 10-maintenance-ingress-closed -->",
+        "<!-- cutover-stage: 20-fresh-targets -->",
+        "<!-- cutover-stage: 30-exact-release-credentials -->",
+        "<!-- cutover-stage: 40-cordoned-nodes -->",
+        "<!-- cutover-stage: 50-e12-empty-fleet -->",
+        "<!-- cutover-stage: 60-e3-runtime-path -->",
+        "<!-- cutover-stage: 70-final-gates -->",
+        "<!-- cutover-stage: 80-reset-read-only -->",
+        "<!-- cutover-stage: 90-reset-execute-forward-only -->",
+        "<!-- cutover-stage: 100-uncordon-open -->",
+    ];
+    let mut prior = 0;
+    for stage in ordered_stages {
+        assert_eq!(
+            runbook.matches(stage).count(),
+            1,
+            "cutover stage marker must be unique: {stage}"
+        );
+        let position = runbook.find(stage).expect("cutover stage marker");
+        assert!(position >= prior, "cutover stage is out of order: {stage}");
+        prior = position + stage.len();
+    }
+
+    for forbidden in [
+        "rm -rf",
+        "aws s3 rm",
+        "kubectl delete namespace",
+        "DROP DATABASE",
+        "DROP SCHEMA",
+        "terraform destroy",
+    ] {
+        assert!(
+            !runbook.contains(forbidden),
+            "runbook regained a broad destructive command: {forbidden}"
+        );
+    }
+
+    let blocker = runbook
+        .find("Current verdict: HOLD before destructive reset and public opening")
+        .expect("top-level reset blocker");
+    let boundary = runbook
+        .find("<!-- forward-only-boundary: immutable-reset-started -->")
+        .expect("forward-only boundary");
+    let opening = runbook
+        .find("<!-- cutover-stage: 100-uncordon-open -->")
+        .expect("opening stage");
+    assert!(blocker < boundary && boundary < opening);
+    assert!(runbook[..boundary].contains("dry-run only"));
+    assert!(runbook[boundary..opening].contains("there is no rollback/cancel path"));
+    assert!(runbook[opening..].contains("DEFERRED(CROSS_COMPONENT_MUTATION_ADMISSION_OPEN)"));
+}
+
+#[test]
 fn production_platform_defaults_to_independent_az_dependencies() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let example =
