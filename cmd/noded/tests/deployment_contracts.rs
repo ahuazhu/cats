@@ -545,6 +545,51 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         2,
         "manual verifier fixture must mirror cats in its file and executable sets"
     );
+    for binary in ["cats-runtime-e3-probe", "cats-e3-guest-workload"] {
+        assert!(
+            dockerfile.contains(&format!("COPY --from=builder /out/{binary} /{binary}")),
+            "worker artifact must publish qualification binary {binary}"
+        );
+        assert!(
+            installer.contains(&format!(
+                "target/release/{binary}\" \"$CATS_PREFIX/bin/{binary}"
+            )),
+            "metal source installer must install qualification binary {binary}"
+        );
+        assert!(
+            deployment.contains(&format!(
+                "\"$stage_path/{binary}\" \"${{var.install_root}}/bin/{binary}"
+            )),
+            "Terraform worker transaction must install qualification binary {binary}"
+        );
+        assert_eq!(
+            manual_verifier
+                .matches(&format!("    \"{binary}\","))
+                .count(),
+            2,
+            "manual verifier must classify {binary} in its closed file and executable sets"
+        );
+        assert_eq!(
+            manual_fixture
+                .matches(&format!("    \"{binary}\","))
+                .count(),
+            2,
+            "manual release fixture must mirror qualification binary {binary}"
+        );
+    }
+    for receipt_fragment in [
+        "worker-installation-receipt.v1.json",
+        "\"worker_bundle_sha256\": bundle_digest",
+        "\"service\": \"cats-worker.service\"",
+        "host_tool_names = (\"curl\", \"systemctl\", \"journalctl\", \"timeout\")",
+        "os.replace(temporary_name, receipt_path)",
+        "os.fsync(directory_descriptor)",
+    ] {
+        assert!(
+            deployment.contains(receipt_fragment),
+            "Terraform worker receipt lost fragment {receipt_fragment:?}"
+        );
+    }
     for executable_copy in [
         "COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh",
         "COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh",

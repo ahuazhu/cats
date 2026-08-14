@@ -229,12 +229,18 @@ install -m 0755 "$CATS_REPO/target/release/cats" "$CATS_PREFIX/bin/cats"
 cats_worker_deployment_crash_probe after-install-cats-cli
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 cats_worker_deployment_crash_probe after-install-cats-noded
+install -m 0755 "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" "$CATS_PREFIX/bin/cats-route-v2-node-r1-validator"
+cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
 install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"
 cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
+install -m 0755 "$CATS_REPO/target/release/cats-runtime-e3-probe" "$CATS_PREFIX/bin/cats-runtime-e3-probe"
+cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 cats_worker_deployment_crash_probe after-install-cats-blockd
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"
 cats_worker_deployment_crash_probe after-install-cats-guest-agent
+install -m 0755 "$CATS_REPO/target/release/cats-e3-guest-workload" "$CATS_PREFIX/bin/cats-e3-guest-workload"
+cats_worker_deployment_crash_probe after-install-cats-e3-guest-workload
 if [[ ! -x "$CATS_PREFIX/bin/cloud-hypervisor" ]]; then
   curl -fsSL -o "$CATS_PREFIX/bin/cloud-hypervisor" \
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CATS_CH_VERSION/cloud-hypervisor-static"

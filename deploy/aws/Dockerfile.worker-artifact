@@ -29,14 +29,18 @@ RUN cargo build --locked --release \
       target/release/cats-noded \
       target/release/cats-route-v2-node-r1-validator \
       target/release/cats-vmm-launcher \
+      target/release/cats-runtime-e3-probe \
       target/release/cats-blockd \
       target/release/cats-guest-agent \
+      target/release/cats-e3-guest-workload \
     && install -D -m 0755 target/release/cats /out/cats \
     && install -D -m 0755 target/release/cats-noded /out/cats-noded \
     && install -D -m 0755 target/release/cats-route-v2-node-r1-validator /out/cats-route-v2-node-r1-validator \
     && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
+    && install -D -m 0755 target/release/cats-runtime-e3-probe /out/cats-runtime-e3-probe \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
-    && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent
+    && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent \
+    && install -D -m 0755 target/release/cats-e3-guest-workload /out/cats-e3-guest-workload
 
 COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
 COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
@@ -54,8 +58,10 @@ COPY --from=builder /out/cats /cats
 COPY --from=builder /out/cats-noded /cats-noded
 COPY --from=builder /out/cats-route-v2-node-r1-validator /cats-route-v2-node-r1-validator
 COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
+COPY --from=builder /out/cats-runtime-e3-probe /cats-runtime-e3-probe
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
+COPY --from=builder /out/cats-e3-guest-workload /cats-e3-guest-workload
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
 COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
 COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py

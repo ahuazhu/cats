@@ -111,47 +111,6 @@ run_cats() {
   CATS_TOKEN=$TOKEN "$executable" "$@"
 }
 
-run_focused() {
-  local binary_label=$1 exact_test=$2 ignored=${3:-false}
-  local executable receipt temporary status listing matches
-  executable=$(binary "$binary_label")
-  receipt=$CASE_DIR/focused-${binary_label}.json
-  listing=$(mktemp "$CASE_DIR/.focused-${binary_label}.list.XXXXXX")
-  set +e
-  "$executable" --list --format terse >"$listing" 2>&1
-  status=$?
-  set -e
-  [[ $status -eq 0 && $(wc -c <"$listing") -le 1048576 ]] || {
-    rm -f "$listing"
-    fail "$binary_label could not produce one bounded libtest catalog"
-  }
-  matches=$(awk -F': ' -v expected="$exact_test" \
-    '$1 == expected && $2 == "test" { count += 1 } END { print count + 0 }' "$listing")
-  rm -f "$listing"
-  [[ $matches -eq 1 ]] || fail "$binary_label catalog contains $matches matches for exact test $exact_test"
-  set +e
-  if [[ $ignored == true ]]; then
-    "$executable" --exact "$exact_test" --ignored --nocapture
-  else
-    "$executable" --exact "$exact_test" --nocapture
-  fi
-  status=$?
-  set -e
-  temporary=$(mktemp "$CASE_DIR/.focused-${binary_label}.json.XXXXXX")
-  jq -S -c -n \
-    --arg binary_label "$binary_label" \
-    --arg exact_test "$exact_test" \
-    --arg exact_commit "$CATS_E3_EXACT_COMMIT" \
-    --argjson exit_code "$status" \
-    '{version:1,binary_label:$binary_label,exact_test:$exact_test,exact_commit:$exact_commit,catalog_matches:1,exit_code:$exit_code,live_proof:false}' \
-    >"$temporary"
-  chmod 0600 "$temporary"
-  mv -f "$temporary" "$receipt"
-  printf 'FOCUSED_RECEIPT binary_label=%s exact_test=%s exact_commit=%s exit_code=%s\n' \
-    "$binary_label" "$exact_test" "$CATS_E3_EXACT_COMMIT" "$status"
-  [[ $status -eq 0 ]] || return "$status"
-}
-
 curl_json() {
   local method=$1 url=$2 output=$3 expected_status=$4
   shift 4
@@ -302,6 +261,14 @@ fleet_verify_to() {
   run_cats "${args[@]}" >"$destination"
 }
 
+raw_fleet_snapshot_to() {
+  local destination=$1
+  curl_json GET "$(control_origin)/v1/admin/runtime/fleet-verification" "$destination" 200 || return $?
+  jq -e --arg commit "$CATS_E3_EXACT_COMMIT" '
+    .version == 1 and .control_release_commit_sha == $commit
+    and (.nodes | type == "array" and length > 0)' "$destination" >/dev/null
+}
+
 run_fleet_verify() {
   fleet_verify_to "$CASE_DIR/fleet-verification.json"
   fleet_safe_summary "$CASE_DIR/fleet-verification.json" \
@@ -421,10 +388,9 @@ run_guest_write() {
   rm -f "$source"
 }
 
-run_route() {
-  local workspace cat body workload workload_sha256 origin source attempt route_status
-  workspace=$(required CATS_E3_WORKSPACE_ID)
-  cat=$(cat_id)
+install_route_workload() {
+  local cat workload workload_sha256 source
+  cat=$1
   workload=$(binary e3-guest-workload)
   workload_sha256=$(binary_sha256 e3-guest-workload)
   source=$CASE_DIR/workload-install.source.json
@@ -434,20 +400,19 @@ run_route() {
     --arg workload_sha256 "$workload_sha256" \
     '.version == 1 and .cat_id == $cat and .run_id == $run_id
       and .port == 8080 and .workload_sha256 == $workload_sha256
+      and .guest_reread_sha256 == $workload_sha256
+      and .guest_file_fsynced == true
+      and (.unit_main_pid | type == "string" and test("^[1-9][0-9]*$"))
+      and (.path | type == "string" and startswith("/run/cats/"))
+      and .unit_main_executable == .path
       and .installed == true' \
     "$source" >/dev/null || fail "Guest workload install receipt is not exact"
   atomic_json workload-install-receipt.json "$source"
   rm -f "$source"
-  body=$CASE_DIR/endpoint-bind.json
-  jq -S -c -n \
-    --arg name "$(required CATS_E3_ENDPOINT_NAME)" \
-    --arg hostname "$(required CATS_E3_ENDPOINT_HOSTNAME)" \
-    '{name:$name,hostname:$hostname,target_port:8080}' >"$body"
-  product_mutation POST "/v1/workspaces/$workspace/cats/$cat/endpoints" \
-    "e3-$CATS_E3_RUN_ID-endpoint-$BLOCK_PATH" running "$body"
-  # These focused tests calibrate the bridge but are explicitly not live proof.
-  run_focused route-g5-http public_http_bytes_cross_one_route_lookup_and_one_node_tunnel
-  run_focused route-g5-ws websocket_upgrade_and_frames_remain_raw_on_the_one_admitted_tunnel
+}
+
+probe_public_route() {
+  local origin source attempt route_status
   origin=${CATS_E3_PUBLIC_ORIGIN:-https://$(required CATS_E3_ENDPOINT_HOSTNAME)}
   [[ $origin == "https://$(required CATS_E3_ENDPOINT_HOSTNAME)" ]] || \
     fail "CATS_E3_PUBLIC_ORIGIN must be the exact deployed endpoint origin"
@@ -472,38 +437,122 @@ run_route() {
   rm -f "$source"
 }
 
+run_route() {
+  local workspace cat body
+  workspace=$(required CATS_E3_WORKSPACE_ID)
+  cat=$(cat_id)
+  install_route_workload "$cat"
+  body=$CASE_DIR/endpoint-bind.json
+  jq -S -c -n \
+    --arg name "$(required CATS_E3_ENDPOINT_NAME)" \
+    --arg hostname "$(required CATS_E3_ENDPOINT_HOSTNAME)" \
+    '{name:$name,hostname:$hostname,target_port:8080}' >"$body"
+  product_mutation POST "/v1/workspaces/$workspace/cats/$cat/endpoints" \
+    "e3-$CATS_E3_RUN_ID-endpoint-$BLOCK_PATH" running "$body"
+  probe_public_route
+}
+
 run_restart() {
-  local cat systemctl_bin service before after before_invocation after_invocation
-  local attempt cat_state ready
+  local cat systemctl_bin service installed_noded before after
+  local before_fleet after_fleet before_invocation after_invocation before_pid after_pid
+  local node_id before_agent_instance before_agent_epoch
+  local attempt cat_state ready raw_status source
   cat=$(cat_id)
   systemctl_bin=$(binary systemctl)
-  service=$(required CATS_E3_NODE_SERVICE)
-  [[ $service =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || fail "CATS_E3_NODE_SERVICE is not canonical"
+  service=$(required CATS_E3_WORKER_SERVICE)
+  [[ $service == cats-worker.service ]] || fail "installer receipt did not select exact cats-worker.service"
+  installed_noded=$(nonsecret_path CATS_E3_INSTALLED_NODED_PATH)
   before=$CASE_DIR/restart-before.json
   after=$CASE_DIR/restart-after.json
+  before_fleet=$CASE_DIR/restart-fleet-before.json
+  after_fleet=$CASE_DIR/restart-fleet-after.json
   run_probe snapshot --cat-id "$cat" >"$before"
+  node_id=$(json_field "$before" '.node_id')
+  canonical_id checkpoint_node_id "$node_id"
+  raw_fleet_snapshot_to "$before_fleet" || fail "pre-restart raw fleet snapshot is unavailable"
+  jq -e --arg node "$node_id" '
+    .desired_runtime_count == 1 and .current_runtime_observation_count == 1
+    and ([.nodes[] | select(.node_id == $node)] | length == 1)
+    and ([.nodes[] | select(.node_id == $node)][0] as $n
+      | $n.session != null and $n.inventory != null
+      and $n.inventory.complete_inventory == true
+      and $n.inventory.assigned_desired_count == 1
+      and $n.inventory.runtime_count == 1
+      and $n.inventory.residue_count == 0
+      and $n.inventory.source_session.node_id == $n.session.node_id
+      and $n.inventory.source_session.node_boot_id == $n.session.node_boot_id
+      and $n.inventory.source_session.agent_instance_id == $n.session.agent_instance_id
+      and $n.inventory.source_session.agent_session_epoch == $n.session.agent_session_epoch
+      and $n.inventory.attestation.agent_session_epoch == $n.session.agent_session_epoch)' \
+    "$before_fleet" >/dev/null || fail "pre-restart inventory is not session-bound and complete"
+  before_agent_instance=$(json_field "$before_fleet" ".nodes[] | select(.node_id == \"$node_id\") | .session.agent_instance_id")
+  before_agent_epoch=$(json_field "$before_fleet" ".nodes[] | select(.node_id == \"$node_id\") | .session.agent_session_epoch")
+  atomic_json restart-fleet-before-receipt.json "$before_fleet"
   before_invocation=$("$systemctl_bin" show --property=InvocationID --value "$service")
   [[ $before_invocation =~ ^[0-9a-f]{32}$ ]] || fail "Agent has no exact pre-restart InvocationID"
+  before_pid=$("$systemctl_bin" show --property=MainPID --value "$service")
+  [[ $before_pid =~ ^[1-9][0-9]*$ ]] || fail "cats-worker has no live pre-restart MainPID"
+  [[ /proc/$before_pid/exe -ef $installed_noded ]] || \
+    fail "cats-worker pre-restart MainPID is not the installed cats-noded"
   "$systemctl_bin" restart "$service"
   cat_state=$CASE_DIR/cat-after-restart.json
   attempt=0
   ready=false
   while [[ $attempt -lt 240 ]]; do
     attempt=$((attempt + 1))
-    if "$systemctl_bin" is-active --quiet "$service" &&
-      run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" \
-        --json get "$cat" >"$cat_state" 2>/dev/null &&
-      jq -e '.desired.target == "running" and .observed.stable_state == "running"
-        and (.observed.conditions | index("ready") != null)' "$cat_state" >/dev/null; then
-      ready=true
-      break
+    if "$systemctl_bin" is-active --quiet "$service"; then
+      after_pid=$("$systemctl_bin" show --property=MainPID --value "$service")
+      if [[ $after_pid =~ ^[1-9][0-9]*$ && $after_pid != "$before_pid" ]]; then
+        if [[ /proc/$after_pid/exe -ef $installed_noded ]]; then
+          set +e
+          raw_fleet_snapshot_to "$after_fleet"
+          raw_status=$?
+          set -e
+          if [[ $raw_status -eq 0 ]] && jq -e -n \
+            --arg node "$node_id" --arg before_instance "$before_agent_instance" \
+            --argjson before_epoch "$before_agent_epoch" \
+            --slurpfile before "$before_fleet" --slurpfile after "$after_fleet" '
+            $after[0].desired_runtime_count == 1
+            and $after[0].current_runtime_observation_count == 1
+            and ([$after[0].nodes[] | select(.node_id == $node)] | length == 1)
+            and ([$after[0].nodes[] | select(.node_id == $node)][0] as $a
+              | [$before[0].nodes[] | select(.node_id == $node)][0] as $b
+              | $a.session.agent_instance_id != $before_instance
+              and $a.session.agent_session_epoch > $before_epoch
+              and $a.session.node_boot_id == $b.session.node_boot_id
+              and $a.session.lease_deadline_unix_ms > $after[0].evaluated_at_unix_ms
+              and $a.inventory.complete_inventory == true
+              and $a.inventory.assigned_desired_count == 1
+              and $a.inventory.runtime_count == 1
+              and $a.inventory.residue_count == 0
+              and $a.inventory.source_session.node_id == $a.session.node_id
+              and $a.inventory.source_session.node_boot_id == $a.session.node_boot_id
+              and $a.inventory.source_session.agent_instance_id == $a.session.agent_instance_id
+              and $a.inventory.source_session.agent_session_epoch == $a.session.agent_session_epoch
+              and $a.inventory.attestation.agent_session_epoch == $a.session.agent_session_epoch
+              and ($a.inventory.source_observation_id | type == "string" and length == 32)
+              and $a.inventory.source_observation_id != $b.inventory.source_observation_id
+              and $a.inventory.attestation.accepted_at_unix_ms <= $after[0].evaluated_at_unix_ms
+              and $after[0].evaluated_at_unix_ms < ($a.inventory.attestation.accepted_at_unix_ms + 60000)
+              and $a.inventory.route_active_count > 0
+              and $a.inventory.active_guard_count == 0)' >/dev/null; then
+            ready=true
+            break
+          fi
+        fi
+      fi
     fi
     sleep 0.5
   done
-  [[ $ready == true ]] || fail "Agent restart did not return the Cat to exact Running/Ready"
+  [[ $ready == true ]] || fail "Agent restart did not produce a new session-bound complete inventory and active route gate"
   after_invocation=$("$systemctl_bin" show --property=InvocationID --value "$service")
   [[ $after_invocation =~ ^[0-9a-f]{32}$ && $after_invocation != "$before_invocation" ]] || \
     fail "systemctl restart did not create a fresh Agent invocation"
+  run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" \
+    --json get "$cat" >"$cat_state"
+  jq -e '.desired.target == "running" and .observed.stable_state == "running"
+    and (.observed.conditions | index("ready") != null)' "$cat_state" >/dev/null || \
+    fail "new AgentSession did not produce a current Running/Ready Cat observation"
   run_probe snapshot --cat-id "$cat" >"$after"
   jq -e -n --slurpfile before "$before" --slurpfile after "$after" \
     '$before[0].cat_id == $after[0].cat_id
@@ -513,20 +562,41 @@ run_restart() {
       and $before[0].root_attachment_id == $after[0].root_attachment_id
       and $before[0].root_attachment_epoch == $after[0].root_attachment_epoch
       and $before[0].root_remote_head == $after[0].root_remote_head
+      and $after[0].active_route_gate_count > 0
       and $after[0].strict_remote_durable == true' >/dev/null || \
     fail "Agent restart did not adopt the exact retained Running runtime"
-  run_focused node-agent-tests \
-    runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
-    true
+  atomic_json restart-fleet-after-receipt.json "$after_fleet"
+  source=$CASE_DIR/restart-guest-sync.source.json
+  run_probe guest-sync --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" >"$source"
+  jq -e --arg cat "$cat" --arg run_id "$CATS_E3_RUN_ID" '
+    .version == 1 and .cat_id == $cat and .run_id == $run_id
+    and .strict_flush_remote_durable == true
+    and .after_remote_generation > .before_remote_generation' "$source" >/dev/null || \
+    fail "post-restart Guest write lacks exact Strict remote proof"
+  atomic_json restart-guest-sync-receipt.json "$source"
+  rm -f "$source"
+  probe_public_route
   jq -S -c -n \
     --arg cat_id "$cat" --arg before_invocation "$before_invocation" \
     --arg after_invocation "$after_invocation" \
+    --arg service "$service" --arg installed_noded "$installed_noded" \
+    --arg before_pid "$before_pid" --arg after_pid "$after_pid" \
     --slurpfile before "$before" --slurpfile after "$after" \
+    --slurpfile before_fleet "$before_fleet" --slurpfile after_fleet "$after_fleet" \
     '{version:1,cat_id:$cat_id,systemctl_restart:true,
+      service:$service,installed_noded:$installed_noded,
+      before_main_pid:$before_pid,after_main_pid:$after_pid,
       before_invocation_id:$before_invocation,after_invocation_id:$after_invocation,
+      before_agent_session:([$before_fleet[0].nodes[] | select(.node_id == $before[0].node_id)][0].session),
+      after_agent_session:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].session),
+      after_inventory_observation_id:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.source_observation_id),
+      after_inventory_complete:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.complete_inventory),
+      after_route_active_count:([$after_fleet[0].nodes[] | select(.node_id == $after[0].node_id)][0].inventory.route_active_count),
       retained_runtime_incarnation:$after[0].runtime_incarnation,
       retained_guest_boot_id:$after[0].guest_boot_id,
       retained_root_remote_head:$after[0].root_remote_head,
+      active_route_gate_count:$after[0].active_route_gate_count,
+      post_restart_guest_sync:true,post_restart_public_http_ws:true,
       strict_remote_durable:$after[0].strict_remote_durable}' \
     >"$CASE_DIR/restart-adoption-receipt.source.json"
   atomic_json restart-adoption-receipt.json "$CASE_DIR/restart-adoption-receipt.source.json"
@@ -534,46 +604,24 @@ run_restart() {
 }
 
 run_volume_init_matrix() {
-  local cat snapshot flush source v5_run_id exact_test
+  local cat snapshot source
   cat=$(cat_id)
-  case "$BLOCK_PATH" in
-    kernel-nbd)
-      exact_test=runtime::reconciliation::clean_slate_probes::tests::full_scanner_seals_exact_root_and_persistent_kernel_nbd_mount_set
-      ;;
-    vhost-user)
-      exact_test=runtime::reconciliation::clean_slate_probes::tests::full_scanner_seals_exact_root_and_persistent_vhost_mount_set
-      ;;
-    *) fail "unknown selected block path $BLOCK_PATH" ;;
-  esac
-  # This existing shared fixture covers first init, the lost-mkfs-response
-  # crash boundary, exact ext4 UUID adoption, drain/commit, remount/restart
-  # inventory and Guest mounted-set readiness. It remains subordinate to the
-  # installed Strict-FLUSH proof below and is never presented as live proof.
-  run_focused node-agent-tests "$exact_test"
-  snapshot=$CASE_DIR/volume-matrix-snapshot.json
-  flush=$CASE_DIR/volume-matrix-flush.json
-  v5_run_id=v5-${CATS_E3_RUN_ID:0:61}
+  snapshot=$CASE_DIR/volume-frontend-snapshot.json
   run_probe snapshot --cat-id "$cat" >"$snapshot"
-  run_probe guest-sync --cat-id "$cat" --run-id "$v5_run_id" >"$flush"
-  jq -e --arg cat "$cat" \
-    '.cat_id == $cat and .strict_remote_durable == true' "$snapshot" >/dev/null || \
-    fail "selected live block path lacks exact Running mount readiness"
-  jq -e --arg cat "$cat" \
-    '.cat_id == $cat and .strict_flush_remote_durable == true
-      and .after_remote_generation > .before_remote_generation' "$flush" >/dev/null || \
-    fail "selected live block path lacks Strict FLUSH proof"
-  source=$CASE_DIR/volume-init-matrix-receipt.source.json
-  jq -S -c -n --arg cat_id "$cat" --arg block_path "$BLOCK_PATH" \
-    --slurpfile snapshot "$snapshot" --slurpfile flush "$flush" \
-    '{version:1,cat_id:$cat_id,block_path:$block_path,
-      shared_matrix_exact_match:true,live_mount_ready:true,
-      runtime_incarnation:$snapshot[0].runtime_incarnation,
-      guest_boot_id:$snapshot[0].guest_boot_id,
-      root_remote_head:$snapshot[0].root_remote_head,
-      strict_flush_remote_durable:$flush[0].strict_flush_remote_durable,
-      strict_flush_generation:$flush[0].after_remote_generation}' >"$source"
-  atomic_json volume-init-matrix-receipt.json "$source"
+  jq -e --arg cat "$cat" --arg block_path "$BLOCK_PATH" \
+    '.version == 1 and .cat_id == $cat
+      and .root_block_frontend == $block_path
+      and .strict_remote_durable == true' "$snapshot" >/dev/null || \
+    fail "installed Running checkpoint does not use the selected block frontend"
+  source=$CASE_DIR/volume-frontend-receipt.source.json
+  jq -S -c --arg block_path "$BLOCK_PATH" \
+    '{version:1,cat_id,node_id,block_path:$block_path,
+      actual_root_block_frontend:.root_block_frontend,
+      runtime_incarnation,guest_boot_id,strict_remote_durable,
+      persistent_disk_live_matrix_proved:false}' "$snapshot" >"$source"
+  atomic_json volume-frontend-receipt.json "$source"
   rm -f "$source"
+  blocked 'DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION): production v2 exposes PersistentDisk create/read/delete but no attach mutation; add the separately reviewed product attach entry before live first-mkfs-response-loss, exact filesystem UUID, mounted-set, Agent-restart remount and Strict-write qualification'
 }
 
 run_usage_final() {
@@ -613,7 +661,7 @@ run_usage_final() {
       and ([.details[]
         | select(.attributed_cat_id == $cat
           and (.source_id | startswith("node/") and endswith("/cat/" + $cat))
-          and (.source_epoch | test("^[0-9a-f]{32}$"))
+          and (.source_epoch | type == "string" and length > 0)
           and (.metric == "cpu_usec" or .metric == "memory_byte_millis")
           and (.quantity | test("^(0|[1-9][0-9]*)$")))]
         | group_by([.source_id,.source_epoch,.end_sequence])
@@ -635,7 +683,7 @@ run_usage_final() {
     [.details[]
       | select(.attributed_cat_id == $cat
         and (.source_id | startswith("node/") and endswith("/cat/" + $cat))
-        and (.source_epoch | test("^[0-9a-f]{32}$"))
+        and (.source_epoch | type == "string" and length > 0)
         and (.metric == "cpu_usec" or .metric == "memory_byte_millis"))]
       | group_by([.source_id,.source_epoch,.end_sequence])
       | map(select(length == 2
@@ -688,7 +736,8 @@ run_case() {
 diagnostics() {
   local journalctl_bin service
   journalctl_bin=$(binary journalctl)
-  service=$(required CATS_E3_NODE_SERVICE)
+  service=$(required CATS_E3_WORKER_SERVICE)
+  [[ $service == cats-worker.service ]] || fail "diagnostics service is not installer-bound"
   "$journalctl_bin" --no-pager --output=short-monotonic --lines=200 --unit "$service" || true
 }
 
@@ -696,6 +745,8 @@ cleanup() {
   local policy source cat
   policy=observation_only
   if [[ $CASE_ID == route-http-ws ]]; then
+    policy=retained_run_bound_guest_workload_for_agent_restart
+  elif [[ $CASE_ID == agent-restart-adoption ]]; then
     cat=$(cat_id)
     source=$CASE_DIR/workload-remove.source.json
     run_probe remove-workload --cat-id "$cat" --run-id "$CATS_E3_RUN_ID" >"$source"
@@ -704,7 +755,7 @@ cleanup() {
       "$source" >/dev/null || fail "Guest workload cleanup receipt is not exact"
     atomic_json workload-remove-receipt.json "$source"
     rm -f "$source"
-    policy=removed_run_bound_guest_workload
+    policy=removed_run_bound_guest_workload_after_restart_reprobe
   fi
   # Product teardown remains the numbered delete-cleanup case. No failure path
   # guesses physical ownership or issues an extra destructive transition.

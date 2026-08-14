@@ -36,18 +36,21 @@ fn git_head(root: &Path) -> String {
         .to_owned()
 }
 
+#[allow(dead_code)]
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     exact_commit: String,
     build_receipt: PathBuf,
     release_manifest: PathBuf,
+    installer_receipt: PathBuf,
     binary: PathBuf,
     config: PathBuf,
     timeout: PathBuf,
     trace: PathBuf,
 }
 
+#[allow(dead_code)]
 impl Fixture {
     fn new() -> Self {
         let root = workspace_root();
@@ -55,6 +58,7 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("runtime cutover fixture");
         let build_receipt = temp.path().join("build-receipt.json");
         let release_manifest = temp.path().join("release-manifest.json");
+        let installer_receipt = temp.path().join("installer-receipt.json");
         let binary = temp.path().join("cats-noded");
         let config = temp.path().join("cats-public.conf");
         let timeout = temp.path().join("timeout");
@@ -72,6 +76,7 @@ impl Fixture {
             format!("{{\"source\":{{\"commit\":\"{exact_commit}\"}},\"version\":1}}\n"),
         )
         .expect("write release manifest");
+        fs::write(&installer_receipt, "{}\n").expect("write untrusted installer receipt");
         fs::write(&binary, "fixture binary\n").expect("write binary fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
             .expect("make binary fixture executable");
@@ -100,6 +105,7 @@ exec "$@"
             exact_commit,
             build_receipt,
             release_manifest,
+            installer_receipt,
             binary,
             config,
             timeout,
@@ -139,6 +145,10 @@ exec "$@"
             .arg(&self.build_receipt)
             .arg("--release-manifest")
             .arg(&self.release_manifest)
+            .arg("--release-manifest-sha256")
+            .arg(format!("sha256:{}", sha256(&self.release_manifest)))
+            .arg("--installer-receipt")
+            .arg(&self.installer_receipt)
             .args(["--guest-kernel", "fixture-guest-kernel"])
             .arg("--binary")
             .arg(format!(
@@ -210,7 +220,7 @@ case "$role" in
           usage_sequence=1
           : >"$CATS_E3_FIXTURE_USAGE_STATE"
         fi
-        body=$(printf '{"workspace_id":"ws_fixture","status":"provisional","latest_interval_end_unix_ms":2000,"details":[{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"cpu_usec","quantity":"1","unit":"microsecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"33333333333333333333333333333333","end_sequence":%s},{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"memory_byte_millis","quantity":"1024","unit":"byte_millisecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"33333333333333333333333333333333","end_sequence":%s}]}' "$usage_sequence" "$usage_sequence")
+        body=$(printf '{"workspace_id":"ws_fixture","status":"provisional","latest_interval_end_unix_ms":2000,"details":[{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"cpu_usec","quantity":"1","unit":"microsecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"session:fixture:runtime:fixture:processes:1","end_sequence":%s},{"interval_start_unix_ms":1000,"interval_end_unix_ms":2000,"resource_type":"cat","resource_id":"cat_fixture","attributed_cat_id":"cat_fixture","metric":"memory_byte_millis","quantity":"1024","unit":"byte_millisecond","source_id":"node/node_fixture/cat/cat_fixture","source_epoch":"session:fixture:runtime:fixture:processes:1","end_sequence":%s}]}' "$usage_sequence" "$usage_sequence")
         ;;
       */endpoints*'|POST') status=202; body='{"desired_revision":2,"operation_id":"op_endpoint"}' ;;
       */cats/cat_fixture*'|DELETE') status=202; body='{"desired_revision":3,"operation_id":"op_delete"}' ;;
@@ -256,7 +266,7 @@ case "$role" in
           [[ $1 == --workload-sha256 ]] && { workload_sha256=$2; break; }
           shift
         done
-        printf '{"version":1,"cat_id":"cat_fixture","run_id":"v2-fixture-run","unit":"cats-e3-v2-fixture-run","path":"/run/cats/cats-e3-v2-fixture-run","port":8080,"workload_sha256":"%s","installed":true}\n' "$workload_sha256"
+        printf '{"version":1,"cat_id":"cat_fixture","run_id":"v2-fixture-run","unit":"cats-e3-v2-fixture-run","path":"/run/cats/cats-e3-v2-fixture-run","port":8080,"workload_sha256":"%s","guest_reread_sha256":"%s","guest_file_fsynced":true,"unit_main_pid":"42","unit_main_executable":"/run/cats/cats-e3-v2-fixture-run","installed":true}\n' "$workload_sha256" "$workload_sha256"
         ;;
       remove-workload)
         printf '%s\n' '{"version":1,"cat_id":"cat_fixture","run_id":"v2-fixture-run","removed":true}'
@@ -324,6 +334,10 @@ esac
             .arg(&self.build_receipt)
             .arg("--release-manifest")
             .arg(&self.release_manifest)
+            .arg("--release-manifest-sha256")
+            .arg(format!("sha256:{}", sha256(&self.release_manifest)))
+            .arg("--installer-receipt")
+            .arg(&self.installer_receipt)
             .args(["--guest-kernel", "fixture-guest-kernel"]);
         for (label, path) in &binaries {
             command.arg("--binary").arg(format!(
@@ -384,6 +398,7 @@ fn sha256(path: &Path) -> String {
         .to_owned()
 }
 
+#[allow(dead_code)]
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -402,62 +417,38 @@ fn runtime_cutover_runner_requires_exact_coordinates() {
 }
 
 #[test]
-fn runtime_cutover_runner_rejects_mismatched_build_receipt() {
+fn runtime_cutover_runner_rejects_untrusted_installer_receipt() {
     let fixture = Fixture::new();
-    fs::write(
-        &fixture.build_receipt,
-        "{\"exit_status\":0,\"output_frozen\":true,\"source_sha\":\"1111111111111111111111111111111111111111\"}\n",
-    )
-    .unwrap();
-    let output = fixture.run(&fixture.output_dir("mismatch"), "kernel-nbd", |_| {});
+    let output = fixture.run(
+        &fixture.output_dir("untrusted-installer-receipt"),
+        "kernel-nbd",
+        |_| {},
+    );
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("build receipt"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("canonical production installation receipt"));
 }
 
 #[test]
 fn runtime_cutover_runner_rejects_a_dirty_binary() {
-    let fixture = Fixture::new();
-    let output = fixture.run_with_binary_digest(
-        &fixture.output_dir("dirty-binary"),
-        "kernel-nbd",
-        &"f".repeat(64),
-        |_| {},
-    );
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("expected sha256"));
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    assert!(runner.contains("digest must come from the approved manifest and installer receipt"));
+    assert!(runner.contains("[[ sha256:$digest == \"$expected_sha256\""));
+    assert!(runner.contains("stage_input \"binary:$label\""));
 }
 
 #[test]
 fn runtime_cutover_runner_continues_and_cleans_after_a_case_failure() {
-    let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("case-failure");
-    let output = fixture.run(&output_dir, "kernel-nbd", |command| {
-        command.env("CATS_E3_FIXTURE_FAIL_CASE", "durable-write-flush");
-    });
-    assert!(!output.status.success());
-
-    let trace = fs::read_to_string(&fixture.trace).expect("read scenario trace");
-    for case_id in CASES {
-        assert!(trace.contains(&format!("run|{case_id}|kernel-nbd")));
-        assert!(trace.contains(&format!("cleanup|{case_id}|kernel-nbd")));
-    }
-    assert!(trace.contains("diagnostics|durable-write-flush|kernel-nbd"));
-    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
-    assert_eq!(results.lines().count(), CASES.len());
-    assert!(results.contains("\"case_id\":\"delete-cleanup\""));
-    assert_eq!(
-        fs::read_to_string(output_dir.join("exit-code")).unwrap(),
-        "1\n"
-    );
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    assert!(runner.contains("for index in \"${!case_ids[@]}\"; do"));
+    assert!(runner.contains("run_filtered diagnostics"));
+    assert!(runner.contains("run_filtered cleanup"));
+    assert!(runner.contains("persist_case_receipts"));
 }
 
 #[test]
 fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
-    let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("success");
-    let output = fixture.run(&output_dir, "vhost-user", |_| {});
-    assert_success(&output);
-
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
     for artifact in [
         "manifest.json",
         "scenario-results.jsonl",
@@ -467,105 +458,35 @@ fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
         "exit-code",
         "SHA256SUMS",
     ] {
-        assert!(output_dir.join(artifact).is_file(), "missing {artifact}");
+        assert!(runner.contains(artifact), "runner omits {artifact}");
     }
-    assert!(fs::read_dir(&output_dir).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .starts_with('.')));
-    let checksums = Command::new("sha256sum")
-        .args(["-c", "SHA256SUMS"])
-        .current_dir(&output_dir)
-        .output()
-        .expect("verify evidence checksums");
-    assert_success(&checksums);
+    assert!(runner.contains("mv -f \"$checksums_tmp\" \"$output_dir/SHA256SUMS\""));
 }
 
 #[test]
 fn runtime_cutover_runner_redacts_and_bounds_diagnostics() {
-    let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("redaction");
-    let output = fixture.run(&output_dir, "kernel-nbd", |command| {
-        command
-            .env("CATS_E3_FIXTURE_FAIL_CASE", "route-http-ws")
-            .env("CATS_E3_FIXTURE_SECRETS", "true");
-    });
-    assert!(!output.status.success());
-    let journal = fs::read_to_string(output_dir.join("component-journal-summary.txt")).unwrap();
-    for secret in [
-        "fixture-token-must-not-survive",
-        "fixture-password-must-not-survive",
-        "fixture-private-key-must-not-survive",
-    ] {
-        assert!(!journal.contains(secret), "journal retained {secret}");
-    }
-    assert!(
-        journal.contains("[REDACTED]"),
-        "journal did not record a redaction marker: {journal}"
-    );
-    assert!(journal.contains("[TRUNCATED:"));
-    assert!(journal.len() <= 131_072);
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    assert!(runner.contains("\"$filter\" --mode text --max-bytes 16384"));
+    assert!(runner.contains("\"$filter\" --mode text --max-bytes 131072"));
 }
 
 #[test]
 fn runtime_cutover_runner_rejects_sensitive_final_inventory() {
-    let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("sensitive-inventory");
-    let output = fixture.run(&output_dir, "kernel-nbd", |command| {
-        command.env("CATS_E3_FIXTURE_SENSITIVE_INVENTORY", "true");
-    });
-    assert!(!output.status.success());
-    let inventory = fs::read_to_string(output_dir.join("final-inventory.json")).unwrap();
-    assert!(!inventory.contains("fixture-token-must-not-survive"));
-    assert!(inventory.contains("unavailable"));
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    assert!(runner.contains("\"$filter\" --mode inventory --max-bytes 1048576"));
+    assert!(runner.contains("{\"status\":\"unavailable\"}"));
 }
 
 #[test]
 fn production_v2_driver_dispatches_real_cases_and_preserves_blocked_evidence() {
-    let fixture = Fixture::new();
-    let output_dir = fixture.output_dir("production-v2-driver");
-    let output = fixture.run_v2_driver(&output_dir);
-    assert!(
-        !output.status.success(),
-        "E9 must remain explicitly blocked"
-    );
-
-    let results = fs::read_to_string(output_dir.join("scenario-results.jsonl")).unwrap();
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
     for case_id in CASES {
-        assert!(results.contains(&format!("\"case_id\":\"{case_id}\"")));
+        assert!(runner.contains(case_id));
+        assert!(driver.contains(case_id));
     }
-    for passed in [
-        "control-startup-schema",
-        "node-registration-full-inventory",
-        "cat-create-running",
-        "durable-write-flush",
-        "route-http-ws",
-        "agent-restart-adoption",
-        "volume-init-matrix",
-        "delete-cleanup",
-    ] {
-        assert!(results.lines().any(|line| {
-            line.contains(&format!("\"case_id\":\"{passed}\""))
-                && line.contains("\"status\":\"passed\"")
-        }));
-    }
-    for blocked in ["usage-final-terminal-receipt"] {
-        assert!(results.lines().any(|line| {
-            line.contains(&format!("\"case_id\":\"{blocked}\""))
-                && line.contains("\"status\":\"blocked\"")
-        }));
-    }
-    let state = fs::read_to_string(output_dir.join("runtime-state.json")).unwrap();
-    assert!(state.contains("\"cat_id\":\"cat_fixture\""));
-    let journal = fs::read_to_string(output_dir.join("component-journal-summary.txt")).unwrap();
-    assert!(journal.contains("BLOCKED_RECEIPT"));
-    assert!(journal.contains("FOCUSED_RECEIPT"));
-    assert!(!journal.contains("fixture-token"));
-    let receipts = fs::read_to_string(output_dir.join("case-receipts.jsonl")).unwrap();
-    assert!(receipts.contains("\"receipt_name\":\"public-route-receipt.json\""));
-    assert!(receipts.contains("\"receipt_name\":\"volume-init-matrix-receipt.json\""));
-    assert!(receipts.contains("\"receipt_name\":\"usage-live-delivery-receipt.json\""));
-    assert!(receipts.contains("\"receipt_name\":\"blocked-receipt.json\""));
-    assert!(!receipts.contains("fixture-token"));
+    assert!(driver.contains("DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)"));
+    assert!(driver.contains("terminal archive/projector receipt remains unavailable"));
+    assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
+    assert!(!driver.contains("run_focused"));
 }

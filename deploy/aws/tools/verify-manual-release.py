@@ -37,8 +37,10 @@ WORKER_STATIC_FILES = {
     "cats-noded",
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
     "cats-blockd",
     "cats-guest-agent",
+    "cats-e3-guest-workload",
     "update-guest-seed.sh",
     "require-idle-worker.sh",
     "old-host-positive-stop.py",
@@ -69,8 +71,10 @@ WORKER_EXECUTABLE_FILES = {
     "cats-noded",
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
     "cats-blockd",
     "cats-guest-agent",
+    "cats-e3-guest-workload",
     "update-guest-seed.sh",
     "require-idle-worker.sh",
     "old-host-positive-stop.py",
@@ -79,6 +83,9 @@ WORKER_EXECUTABLE_FILES = {
     "validate-node-identity-installation.sh",
     "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
+}
+WORKER_BINARY_MEMBER_FILES = {
+    relative for relative in WORKER_EXECUTABLE_FILES if relative.startswith("cats")
 }
 
 
@@ -673,10 +680,31 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
         "guest_kernel_sha256",
         "guest_manifest_sha256",
         "guest_profile_sha256",
+        "members",
     }:
         raise VerificationError("existing worker artifact has the wrong shape")
     if worker["bundle_name"] != "cats-worker.tar.zst":
         raise VerificationError("existing worker artifact has the wrong bundle name")
+    members = worker["members"]
+    if not isinstance(members, dict) or set(members) != WORKER_BINARY_MEMBER_FILES:
+        raise VerificationError("existing worker artifact has the wrong member set")
+    for relative in sorted(WORKER_BINARY_MEMBER_FILES):
+        member = members[relative]
+        if not isinstance(member, dict) or set(member) != {"sha256", "size_bytes"}:
+            raise VerificationError(
+                f"existing worker member {relative} has the wrong shape"
+            )
+        require_sha256(
+            member["sha256"], name=f"existing worker member {relative} digest"
+        )
+        if (
+            type(member["size_bytes"]) is not int
+            or member["size_bytes"] <= 0
+            or member["size_bytes"] > MAX_WORKER_MEMBER_BYTES
+        ):
+            raise VerificationError(
+                f"existing worker member {relative} has an invalid size"
+            )
 
     build_inputs = value["build_inputs"]
     guest_runtime = value["guest_runtime"]
@@ -898,6 +926,7 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
         raise VerificationError("reviewed input old_host_positive_stop is required")
 
     shared = verify_guest_release(arguments.shared_guest_runtime)
+    worker_binary_members: dict[str, dict[str, Any]] = {}
     worker_temporary = tempfile.TemporaryDirectory(prefix="cats-worker-verify-")
     try:
         worker_root = Path(worker_temporary.name) / "root"
@@ -928,6 +957,14 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
             or stat.S_IMODE(installer_metadata.st_mode) & 0o111 == 0
         ):
             raise VerificationError("worker release installer is not an executable single-link file")
+        for relative in sorted(WORKER_BINARY_MEMBER_FILES):
+            digest, size = hash_regular(
+                worker_root / relative, cap=MAX_WORKER_MEMBER_BYTES
+            )
+            worker_binary_members[relative] = {
+                "sha256": digest,
+                "size_bytes": size,
+            }
     finally:
         worker_temporary.cleanup()
     control_release_root = arguments.control_root / "opt/cats/release"
@@ -994,6 +1031,7 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                 "guest_kernel_sha256": worker["kernel"]["sha256"],
                 "guest_manifest_sha256": worker["manifest_sha256"],
                 "guest_profile_sha256": worker["profile_sha256"],
+                "members": worker_binary_members,
             },
         },
         "build_inputs": {

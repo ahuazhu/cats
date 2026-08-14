@@ -19,8 +19,10 @@ WORKER_FILES = {
     "cats-noded",
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
     "cats-blockd",
     "cats-guest-agent",
+    "cats-e3-guest-workload",
     "update-guest-seed.sh",
     "require-idle-worker.sh",
     "old-host-positive-stop.py",
@@ -40,6 +42,27 @@ WORKER_FILES = {
     "guest-runtime-release.v1/guest-runtime-profile.v1.json",
     "guest-runtime-release.v1/guest/vmlinuz",
     "guest-runtime-release.v1/guest/initramfs.img",
+}
+WORKER_EXECUTABLE_FILES = {
+    "cats",
+    "cats-noded",
+    "cats-route-v2-node-r1-validator",
+    "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
+    "cats-blockd",
+    "cats-guest-agent",
+    "cats-e3-guest-workload",
+    "update-guest-seed.sh",
+    "require-idle-worker.sh",
+    "old-host-positive-stop.py",
+    "render-postgres-url.sh",
+    "install-guest-runtime-release.sh",
+    "validate-node-identity-installation.sh",
+    "install-route-v2-node-r1.sh",
+    "worker-deployment-transaction.sh",
+}
+WORKER_BINARY_MEMBER_FILES = {
+    relative for relative in WORKER_EXECUTABLE_FILES if relative.startswith("cats")
 }
 WORKER_DIRECTORIES = {
     ".",
@@ -223,29 +246,13 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
     members = make_guest_release(shared)
     worker_release = root / "worker/guest-runtime-release.v1"
     shutil.copytree(shared, worker_release)
-    executable = {
-        "cats",
-        "cats-noded",
-        "cats-route-v2-node-r1-validator",
-        "cats-vmm-launcher",
-        "cats-blockd",
-        "cats-guest-agent",
-        "update-guest-seed.sh",
-        "require-idle-worker.sh",
-        "old-host-positive-stop.py",
-        "render-postgres-url.sh",
-        "install-guest-runtime-release.sh",
-        "validate-node-identity-installation.sh",
-        "install-route-v2-node-r1.sh",
-        "worker-deployment-transaction.sh",
-    }
     for relative in WORKER_FILES - {
         "guest-runtime-release.v1/manifest.v1.json",
         "guest-runtime-release.v1/guest-runtime-profile.v1.json",
         "guest-runtime-release.v1/guest/vmlinuz",
         "guest-runtime-release.v1/guest/initramfs.img",
     }:
-        mode = 0o755 if relative in executable else 0o644
+        mode = 0o755 if relative in WORKER_EXECUTABLE_FILES else 0o644
         write_member(root / "worker" / relative, f"fixture-{relative}\n".encode(), mode)
     package_worker(root)
     write_member(root / "Cargo.lock", b"fixture-lockfile")
@@ -291,6 +298,13 @@ def main() -> int:
             "image_digest": "sha256:" + "6" * 64,
             "image_reference": "registry.example/cats/gateway:fixture",
             "registry_verified": False,
+        }
+        assert parsed["artifacts"]["worker"]["members"] == {
+            relative: {
+                "sha256": digest((root / "worker" / relative).read_bytes()),
+                "size_bytes": (root / "worker" / relative).stat().st_size,
+            }
+            for relative in sorted(WORKER_BINARY_MEMBER_FILES)
         }
         assert b"guest_runtime_release_id=" + expected_release_id.encode() in result.stdout
 
@@ -357,6 +371,30 @@ def main() -> int:
         )
         assert wrong_manifest_digest.returncode != 0
         assert b"differs from its approved digest" in wrong_manifest_digest.stderr
+
+        malformed_member_set = json.loads(raw)
+        del malformed_member_set["artifacts"]["worker"]["members"][
+            "cats-runtime-e3-probe"
+        ]
+        malformed_member_raw = canonical(malformed_member_set)
+        malformed_member_manifest = root / "release-manifest.missing-worker-member.v1.json"
+        write_member(malformed_member_manifest, malformed_member_raw)
+        missing_manifest_member = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(verifier),
+                "registry-candidate",
+                "--manifest",
+                str(malformed_member_manifest),
+                "--manifest-sha256",
+                digest(malformed_member_raw),
+            ],
+            check=False,
+            capture_output=True,
+        )
+        assert missing_manifest_member.returncode != 0
+        assert b"wrong member set" in missing_manifest_member.stderr
 
         # The verifier never overwrites its canonical receipt.
         run_verifier(verifier, root, output, expect_success=False)

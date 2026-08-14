@@ -80,7 +80,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 cmp flock stat systemd-run; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 cmp flock stat systemd-run systemctl journalctl timeout python3 readlink; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -232,6 +232,14 @@ locals {
     "$release_installer" prepare "$stage_path/guest-runtime-release.v1"
     cats_worker_deployment_crash_probe after-installer-return
 
+    # The fixed receipt describes the currently installed bytes. Invalidate an
+    # older receipt before the first binary replacement so a crash cannot leave
+    # stale evidence claiming that the previous bundle is still installed.
+    worker_installation_receipt="${var.install_root}/release/worker-installation-receipt.v1.json"
+    rm -f -- "$worker_installation_receipt"
+    sync -f "${var.install_root}/release"
+    cats_worker_deployment_crash_probe after-invalidate-worker-installation-receipt
+
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
@@ -239,12 +247,18 @@ locals {
     cats_worker_deployment_crash_probe after-install-cats-cli
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     cats_worker_deployment_crash_probe after-install-cats-noded
+    install -D -m 0755 "$stage_path/cats-route-v2-node-r1-validator" "${var.install_root}/bin/cats-route-v2-node-r1-validator"
+    cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
     install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
     cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
+    install -D -m 0755 "$stage_path/cats-runtime-e3-probe" "${var.install_root}/bin/cats-runtime-e3-probe"
+    cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
     cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
     cats_worker_deployment_crash_probe after-install-cats-guest-agent
+    install -D -m 0755 "$stage_path/cats-e3-guest-workload" "${var.install_root}/bin/cats-e3-guest-workload"
+    cats_worker_deployment_crash_probe after-install-cats-e3-guest-workload
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
     cats_worker_deployment_crash_probe after-install-guest-seed-updater
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
@@ -255,6 +269,173 @@ locals {
     cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
     cats_worker_deployment_crash_probe after-install-postgres-timer
+
+    curl_path="$(readlink -f "$(command -v curl)")"
+    systemctl_path="$(readlink -f "$(command -v systemctl)")"
+    journalctl_path="$(readlink -f "$(command -v journalctl)")"
+    timeout_path="$(readlink -f "$(command -v timeout)")"
+    sync -f "${var.install_root}/bin"
+    python3 - \
+      "$worker_installation_receipt" \
+      "sha256:${var.worker_bundle_sha256}" \
+      "${var.install_root}" \
+      "$curl_path" "$systemctl_path" "$journalctl_path" "$timeout_path" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+
+def same_metadata(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_mode,
+        left.st_uid,
+        left.st_gid,
+        left.st_nlink,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_mode,
+        right.st_uid,
+        right.st_gid,
+        right.st_nlink,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def fingerprint(path: Path, *, installed_member: bool) -> dict[str, object]:
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size <= 0:
+        raise SystemExit(f"receipt input is not a non-empty regular file: {path}")
+    if before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) & 0o022:
+        raise SystemExit(f"receipt input is not root-owned and write-protected: {path}")
+    if installed_member and (
+        before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o755
+    ):
+        raise SystemExit(f"installed worker member metadata is invalid: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if not same_metadata(before, opened):
+            raise SystemExit(f"receipt input changed before read: {path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"receipt input ended during read: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"receipt input grew during read: {path}")
+        if installed_member:
+            os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        if not same_metadata(opened, after):
+            raise SystemExit(f"receipt input changed during read: {path}")
+    finally:
+        os.close(descriptor)
+    return {
+        "path": str(path),
+        "sha256": "sha256:" + digest.hexdigest(),
+        "size_bytes": before.st_size,
+    }
+
+
+if os.geteuid() != 0:
+    raise SystemExit("worker installation receipt must be written by root")
+receipt_path = Path(sys.argv[1])
+bundle_digest = sys.argv[2]
+install_root = Path(sys.argv[3])
+if re.fullmatch(r"sha256:[0-9a-f]{64}", bundle_digest) is None:
+    raise SystemExit("worker bundle digest is invalid")
+
+member_names = (
+    "cats",
+    "cats-noded",
+    "cats-route-v2-node-r1-validator",
+    "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
+    "cats-blockd",
+    "cats-guest-agent",
+    "cats-e3-guest-workload",
+)
+members = {
+    name: fingerprint(install_root / "bin" / name, installed_member=True)
+    for name in member_names
+}
+host_tool_names = ("curl", "systemctl", "journalctl", "timeout")
+host_tools = {
+    name: fingerprint(Path(path), installed_member=False)
+    for name, path in zip(host_tool_names, sys.argv[4:8])
+}
+receipt = {
+    "host_tools": host_tools,
+    "members": members,
+    "service": "cats-worker.service",
+    "version": 1,
+    "worker_bundle_sha256": bundle_digest,
+}
+raw = json.dumps(
+    receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+).encode("utf-8")
+
+receipt_parent_metadata = receipt_path.parent.lstat()
+if (
+    not stat.S_ISDIR(receipt_parent_metadata.st_mode)
+    or stat.S_ISLNK(receipt_parent_metadata.st_mode)
+    or receipt_parent_metadata.st_uid != 0
+    or receipt_parent_metadata.st_gid != 0
+    or stat.S_IMODE(receipt_parent_metadata.st_mode) & 0o022
+):
+    raise SystemExit("worker installation receipt parent is not a protected real directory")
+temporary_descriptor, temporary_name = tempfile.mkstemp(
+    prefix=".worker-installation-receipt.", dir=receipt_path.parent
+)
+try:
+    os.fchmod(temporary_descriptor, 0o600)
+    os.fchown(temporary_descriptor, 0, 0)
+    view = memoryview(raw)
+    while view:
+        written = os.write(temporary_descriptor, view)
+        if written <= 0:
+            raise OSError("short write while publishing worker installation receipt")
+        view = view[written:]
+    os.fsync(temporary_descriptor)
+    os.close(temporary_descriptor)
+    temporary_descriptor = -1
+    os.replace(temporary_name, receipt_path)
+    directory_descriptor = os.open(
+        receipt_path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+except BaseException:
+    if temporary_descriptor >= 0:
+        os.close(temporary_descriptor)
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+    cats_worker_deployment_crash_probe after-publish-worker-installation-receipt
 
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"

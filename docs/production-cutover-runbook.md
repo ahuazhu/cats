@@ -623,9 +623,12 @@ scenario driver is an input to the orchestrator and must be tracked, executable 
 to `<FINAL_RELEASE_SHA>`. If `<FINAL_RELEASE_SCENARIO_DRIVER>` is absent from the final release,
 record `DEFERRED(E3_SCENARIO_DRIVER)` and stop.
 
-**Assert first.** E12 is green; build receipt and release manifest bind the same SHA; every binary,
-config and non-secret key fingerprint below is explicit; each output directory is absolute and does
-not yet exist. Run both block paths against the same release and scenario oracle.
+**Assert first.** E12 is green; build receipt and release manifest bind the same SHA; the release
+manifest digest was independently approved; and
+`/opt/cats/release/worker-installation-receipt.v1.json` is the root-owned, single-link receipt from
+the exact worker installation. Its worker bundle and member set must match the approved manifest.
+Every binary, config and non-secret key fingerprint below is explicit; each output directory is
+absolute and does not yet exist. Run both block paths against the same release and scenario oracle.
 
 **Command — kernel NBD:**
 
@@ -637,8 +640,10 @@ deploy/metal/runtime-cutover-e2e.sh \
   --output-dir /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd \
   --build-receipt /approved/evidence/<CUTOVER_ID>/00-release/<BUILD_RECEIPT>.json \
   --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
+  --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
+  --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
   --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
-  --binary <LABEL>=<ABSOLUTE_BINARY_PATH>@sha256:<BINARY_SHA256> \
+  --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
   --config <LABEL>=<ABSOLUTE_CONFIG_PATH> \
   --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
   --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
@@ -654,34 +659,47 @@ deploy/metal/runtime-cutover-e2e.sh \
   --output-dir /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user \
   --build-receipt /approved/evidence/<CUTOVER_ID>/00-release/<BUILD_RECEIPT>.json \
   --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
+  --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
+  --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
   --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
-  --binary <LABEL>=<ABSOLUTE_BINARY_PATH>@sha256:<BINARY_SHA256> \
+  --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
   --config <LABEL>=<ABSOLUTE_CONFIG_PATH> \
   --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
   --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
 ```
 
-Repeat `--binary`, `--config` and `--key-fingerprint` for the complete reviewed manifest. For each
-output directory, assert the exact eight ordered cases and all-green status:
+Repeat `--binary`, `--config` and `--key-fingerprint` for the complete reviewed input set. Binary
+digests and installed paths are not caller assertions: the runner derives them from
+`.artifacts.worker.members` and the installer receipt, copies every input to a private stable stage,
+and re-hashes the original inputs at the end. The explicit binaries include the installed
+`cats-noded`, `cats`, `cats-runtime-e3-probe`, `cats-e3-guest-workload`, and the receipt-recorded
+`curl`, `systemctl`, `journalctl` and GNU `timeout`; focused test binaries are not live prerequisites.
+
+There are exactly nine ordered cases. In the current release, seven pass and two return the typed
+exit 78: V5 is `DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)` and E9 lacks its accepted terminal
+archive/projector receipt. Assert this honest blocked result for each output directory:
 
 ```sh
 sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/SHA256SUMS
-jq -e '.state == "passed" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "kernel-nbd" and .exit_code == 0' \
+jq -e '.state == "blocked" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "kernel-nbd" and .exit_code == 78' \
   /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/manifest.json
-jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","usage-final-terminal-receipt","delete-cleanup"] and all(.[]; .status == "passed" and .run_exit_code == 0 and .cleanup_exit_code == 0)' \
+jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","volume-init-matrix","usage-final-terminal-receipt","delete-cleanup"] and ([.[] | select(.status == "passed")] | length) == 7 and (.[] | select(.case_id == "volume-init-matrix") | .status == "blocked" and .run_exit_code == 78) and (.[] | select(.case_id == "usage-final-terminal-receipt") | .status == "blocked" and .run_exit_code == 78) and all(.[]; .cleanup_exit_code == 0 and .evidence_exit_code == 0)' \
   /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/scenario-results.jsonl
 
 sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/SHA256SUMS
-jq -e '.state == "passed" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "vhost-user" and .exit_code == 0' \
+jq -e '.state == "blocked" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "vhost-user" and .exit_code == 78' \
   /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/manifest.json
-jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","usage-final-terminal-receipt","delete-cleanup"] and all(.[]; .status == "passed" and .run_exit_code == 0 and .cleanup_exit_code == 0)' \
+jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","volume-init-matrix","usage-final-terminal-receipt","delete-cleanup"] and ([.[] | select(.status == "passed")] | length) == 7 and (.[] | select(.case_id == "volume-init-matrix") | .status == "blocked" and .run_exit_code == 78) and (.[] | select(.case_id == "usage-final-terminal-receipt") | .status == "blocked" and .run_exit_code == 78) and all(.[]; .cleanup_exit_code == 0 and .evidence_exit_code == 0)' \
   /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/scenario-results.jsonl
 ```
 
-The fixed sequence proves create and stable Running, Guest write plus successful FLUSH/sync,
-Gateway HTTP and WebSocket, exact Agent restart adoption without gate resurrection, durable usage
-delivery, and exact delete cleanup. It does not convert the case-level usage result into the missing
-accepted reset barrier.
+After V5 is implemented, the only acceptable intermediate shape is eight passed cases plus the same
+typed E9 block. Neither the current seven-plus-two shape nor that future eight-plus-one shape opens
+Stage B: keep the fleet cordoned until all nine pass, the manifest is `passed`, and exit code is zero.
+The fixed sequence otherwise proves create and stable Running, Guest write plus successful
+FLUSH/sync, public Gateway HTTP and WebSocket, an exact `cats-worker.service` restart with changed
+AgentSession and fresh session-bound full inventory, post-restart Guest and route/gate evidence,
+durable usage delivery, and exact delete cleanup.
 
 **Retain.** For each block path retain `manifest.json`, `scenario-results.jsonl`, bounded journal,
 `final-inventory.json`, `exit-code` and `SHA256SUMS` through the append-only evidence boundary.

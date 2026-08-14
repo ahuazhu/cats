@@ -13,8 +13,10 @@ usage: runtime-cutover-e2e.sh \
   --output-dir </absolute/new/directory> \
   --build-receipt </absolute/build-receipt.json> \
   --release-manifest </absolute/release-manifest.json> \
+  --release-manifest-sha256 <sha256:64hex> \
+  --installer-receipt </absolute/installer-receipt.json> \
   --guest-kernel <nonsecret-release-string> \
-  --binary <label=/absolute/path@sha256:64hex> [--binary ...] \
+  --binary <label=/absolute/path> [--binary ...] \
   --config <label=/absolute/path> [--config ...] \
   --key-fingerprint <label=sha256:64hex> [--key-fingerprint ...] \
   --scenario-driver </absolute/repo-owned/executable>
@@ -33,6 +35,8 @@ run_id=
 output_dir=
 build_receipt=
 release_manifest=
+release_manifest_sha256=
+installer_receipt=
 guest_kernel=
 scenario_driver=
 binary_entries=()
@@ -41,7 +45,7 @@ key_fingerprint_entries=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--guest-kernel|--scenario-driver)
+    --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--guest-kernel|--scenario-driver)
       [[ $# -ge 2 ]] || usage
       name=${1#--}
       name=${name//-/_}
@@ -74,6 +78,10 @@ case "$block_path" in kernel-nbd|vhost-user) ;; *) fail "--block-path must be ke
 [[ $output_dir == /* ]] || fail "--output-dir must be an absolute output path"
 [[ -n $build_receipt && $build_receipt == /* ]] || fail "--build-receipt must be absolute"
 [[ -n $release_manifest && $release_manifest == /* ]] || fail "--release-manifest must be absolute"
+[[ $release_manifest_sha256 =~ ^sha256:[0-9a-f]{64}$ ]] || \
+  fail "--release-manifest-sha256 must be one independently approved sha256 digest"
+[[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
+  fail "--installer-receipt must be the canonical production installation receipt"
 [[ $guest_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || fail "--guest-kernel is not a bounded nonsecret release string"
 [[ -n $scenario_driver && $scenario_driver == /* ]] || fail "--scenario-driver must be absolute"
 [[ ${#binary_entries[@]} -gt 0 ]] || fail "at least one --binary is required"
@@ -120,6 +128,9 @@ canonical_output() {
 
 build_receipt=$(canonical_existing "$build_receipt") || fail "build receipt must be a regular non-symlink file"
 release_manifest=$(canonical_existing "$release_manifest") || fail "release manifest must be a regular non-symlink file"
+installer_receipt=$(canonical_existing "$installer_receipt") || fail "installer receipt must be a regular non-symlink file"
+[[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
+  fail "installer receipt path must resolve to the canonical production path"
 scenario_driver=$(canonical_existing "$scenario_driver") || fail "scenario driver must be a regular non-symlink file"
 output_dir=$(canonical_output "$output_dir") || fail "absolute output parent must already exist and be a real directory"
 [[ ! -e $output_dir && ! -L $output_dir ]] || fail "output directory already exists; refusing to overwrite evidence"
@@ -143,29 +154,65 @@ verify_exact_repo_file "$scenario_driver"
 
 [[ $(wc -c <"$build_receipt") -le 1048576 ]] || fail "build receipt is too large"
 [[ $(wc -c <"$release_manifest") -le 1048576 ]] || fail "release manifest is too large"
+[[ $(wc -c <"$installer_receipt") -le 1048576 ]] || fail "installer receipt is too large"
 jq -e --arg commit "$exact_commit" \
   '.source_sha == $commit and .exit_status == 0 and .output_frozen == true' \
   "$build_receipt" >/dev/null || fail "build receipt does not prove a successful frozen build of the exact commit"
 jq -e --arg commit "$exact_commit" \
-  '.version == 1 and .source.commit == $commit' \
+  '.version == 1 and .source.commit == $commit
+    and (.artifacts.worker.bundle_sha256 | test("^sha256:[0-9a-f]{64}$"))
+    and (.artifacts.worker.members | type == "object" and length > 0)' \
   "$release_manifest" >/dev/null || fail "release manifest does not bind the exact commit"
+approved_release_manifest_sha256=${release_manifest_sha256#sha256:}
+[[ $(sha256sum "$release_manifest" | awk '{print $1}') == "$approved_release_manifest_sha256" ]] || \
+  fail "release manifest differs from the independently approved sha256"
+jq -e '
+  (keys == ["host_tools","members","service","version","worker_bundle_sha256"])
+  and .version == 1 and .service == "cats-worker.service"
+  and (.worker_bundle_sha256 | test("^sha256:[0-9a-f]{64}$"))
+  and (.members | keys) == ["cats","cats-blockd","cats-e3-guest-workload","cats-guest-agent","cats-noded","cats-route-v2-node-r1-validator","cats-runtime-e3-probe","cats-vmm-launcher"]
+  and (.host_tools | keys) == ["curl","journalctl","systemctl","timeout"]
+  and all(.members[];
+    (keys == ["path","sha256","size_bytes"])
+    and (.path | type == "string" and startswith("/"))
+    and (.sha256 | test("^sha256:[0-9a-f]{64}$"))
+    and (.size_bytes | type == "number" and . > 0 and floor == .))
+  and all(.host_tools[];
+    (keys == ["path","sha256","size_bytes"])
+    and (.path | type == "string" and startswith("/"))
+    and (.sha256 | test("^sha256:[0-9a-f]{64}$"))
+    and (.size_bytes | type == "number" and . > 0 and floor == .))' \
+  "$installer_receipt" >/dev/null || fail "installer receipt has the wrong closed shape"
+python3 - "$installer_receipt" <<'PY' || fail "installer receipt or its parent is not protected production evidence"
+import os
+import stat
+import sys
+value = os.stat(sys.argv[1], follow_symlinks=False)
+parent = os.stat(os.path.dirname(sys.argv[1]), follow_symlinks=False)
+assert stat.S_ISREG(value.st_mode)
+assert value.st_uid == 0
+assert value.st_gid == 0
+assert value.st_nlink == 1
+assert stat.S_IMODE(value.st_mode) in (0o600, 0o644)
+assert stat.S_ISDIR(parent.st_mode)
+assert parent.st_uid == 0
+assert parent.st_gid == 0
+assert stat.S_IMODE(parent.st_mode) & 0o022 == 0
+PY
+manifest_worker_bundle_sha256=$(jq -er '.artifacts.worker.bundle_sha256' "$release_manifest")
+installer_worker_bundle_sha256=$(jq -er '.worker_bundle_sha256' "$installer_receipt")
+[[ $installer_worker_bundle_sha256 == "$manifest_worker_bundle_sha256" ]] || \
+  fail "installer receipt is not bound to the approved worker bundle"
 
 schema_version=$(git -C "$repo" show "${exact_commit}:storage/src/authority.rs" |
   sed -nE 's/^pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p')
 [[ $schema_version =~ ^[1-9][0-9]*$ ]] || fail "exact source does not expose one authority schema version"
 
-timeout_bin=${CATS_E3_TIMEOUT_BIN:-}
-if [[ -z $timeout_bin ]]; then
-  timeout_bin=$(command -v timeout || true)
-fi
-[[ -n $timeout_bin ]] || fail "GNU timeout is required on the qualification host"
-timeout_bin=$(canonical_existing "$timeout_bin") || fail "timeout command must be an absolute non-symlink executable"
-[[ -x $timeout_bin && -f $timeout_bin ]] || fail "timeout command is not executable"
-timeout_bin_sha256=$(sha256sum "$timeout_bin" | awk '{print $1}')
-
 mkdir -m 0700 "$output_dir"
 scratch=$output_dir/.scratch
 mkdir -m 0700 "$scratch"
+stage=$scratch/stage
+mkdir -m 0700 "$stage" "$stage/binaries" "$stage/configs"
 results_work=$scratch/scenario-results.jsonl
 journal_work=$scratch/component-journal-summary.txt
 catalog_work=$scratch/scenario-catalog.jsonl
@@ -180,6 +227,27 @@ receipts_work=$scratch/case-receipts.jsonl
 : >"$configs_work"
 : >"$fingerprints_work"
 : >"$receipts_work"
+
+original_labels=()
+original_paths=()
+original_digests=()
+
+remember_original() {
+  original_labels+=("$1")
+  original_paths+=("$2")
+  original_digests+=("$3")
+}
+
+stage_input() {
+  local label=$1 source=$2 destination=$3 mode=$4 expected=$5 before after
+  before=$(sha256sum "$source" | awk '{print $1}')
+  [[ $before == "$expected" ]] || fail "$label changed before its stable-stage copy"
+  cp "$source" "$destination"
+  chmod "$mode" "$destination"
+  after=$(sha256sum "$destination" | awk '{print $1}')
+  [[ $after == "$expected" ]] || fail "stable-stage copy changed $label"
+  remember_original "$label" "$source" "$expected"
+}
 
 atomic_copy() {
   local source=$1 destination=$2 temporary
@@ -197,46 +265,164 @@ atomic_text() {
   mv -f "$temporary" "$output_dir/$destination"
 }
 
-record_hashed_entries() {
-  local kind=$1 output=$2 entry label path canonical digest expected size environment_label
-  shift 2
-  for entry in "$@"; do
-    label=${entry%%=*}
-    path=${entry#*=}
-    [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "$kind label is not canonical"
-    expected=
-    if [[ $kind == binary ]]; then
-      expected=${path##*@sha256:}
-      [[ $path != "$expected" && $expected =~ ^[0-9a-f]{64}$ ]] || fail "binary $label requires an expected sha256"
-      path=${path%@sha256:*}
-    fi
-    canonical=$(canonical_existing "$path") || fail "$kind $label must name a regular non-symlink file"
-    [[ -f $canonical ]] || fail "$kind $label is not a regular file"
-    if [[ $kind == binary && ! -x $canonical ]]; then
-      fail "binary $label is not executable"
-    fi
-    digest=$(sha256sum "$canonical" | awk '{print $1}')
-    if [[ $kind == binary && $digest != "$expected" ]]; then
-      fail "binary $label differs from its exact expected sha256"
-    fi
-    size=$(wc -c <"$canonical" | tr -d ' ')
-    jq -S -c -n --arg label "$label" --arg path "$canonical" --arg sha256 "$digest" --arg expected_sha256 "$expected" --argjson size_bytes "$size" \
-      '{label:$label,path:$path,sha256:$sha256,size_bytes:$size_bytes} + (if $expected_sha256 == "" then {} else {expected_sha256:$expected_sha256} end)' >>"$output"
-    environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
-    if [[ $kind == binary ]]; then
-      printf -v "CATS_E3_BINARY_${environment_label}" '%s' "$canonical"
-      export "CATS_E3_BINARY_${environment_label}"
-      printf -v "CATS_E3_BINARY_${environment_label}_SHA256" '%s' "$digest"
-      export "CATS_E3_BINARY_${environment_label}_SHA256"
-    else
-      printf -v "CATS_E3_CONFIG_${environment_label}" '%s' "$canonical"
-      export "CATS_E3_CONFIG_${environment_label}"
-    fi
-  done
+scenario_driver_original=$scenario_driver
+filter_original=$filter
+runner_authority_sha256=$(sha256sum "$runner" | awk '{print $1}')
+filter_authority_sha256=$(sha256sum "$filter" | awk '{print $1}')
+scenario_driver_authority_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
+build_receipt_authority_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
+installer_receipt_authority_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
+verify_exact_repo_file "$runner"
+verify_exact_repo_file "$filter"
+verify_exact_repo_file "$scenario_driver"
+stage_input runner "$runner" "$stage/runtime-cutover-e2e.sh" 0700 "$runner_authority_sha256"
+stage_input evidence-filter "$filter" "$stage/runtime-cutover-evidence-filter.py" 0700 "$filter_authority_sha256"
+stage_input scenario-driver "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh" 0700 "$scenario_driver_authority_sha256"
+stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
+stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
+stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
+verify_staged_repo_file() {
+  local original=$1 staged=$2 relative expected_blob actual_blob
+  relative=${original#"$repo"/}
+  expected_blob=$(git -C "$repo" rev-parse "${exact_commit}:${relative}") || \
+    fail "$relative has no exact-commit blob"
+  actual_blob=$(git -C "$repo" hash-object "$staged")
+  [[ $actual_blob == "$expected_blob" ]] || fail "stable-stage $relative differs from the exact commit"
 }
+verify_staged_repo_file "$runner" "$stage/runtime-cutover-e2e.sh"
+verify_staged_repo_file "$filter" "$stage/runtime-cutover-evidence-filter.py"
+verify_staged_repo_file "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh"
+filter=$stage/runtime-cutover-evidence-filter.py
+scenario_driver=$stage/runtime-cutover-v2-scenarios.sh
 
-record_hashed_entries binary "$binaries_work" "${binary_entries[@]}"
-record_hashed_entries config "$configs_work" "${config_entries[@]}"
+jq -e --arg commit "$exact_commit" \
+  '.source_sha == $commit and .exit_status == 0 and .output_frozen == true' \
+  "$stage/build-receipt.json" >/dev/null || fail "staged build receipt changed authority"
+jq -e --arg commit "$exact_commit" \
+  '.version == 1 and .source.commit == $commit' \
+  "$stage/release-manifest.json" >/dev/null || fail "staged release manifest changed authority"
+jq -e '
+  (keys == ["host_tools","members","service","version","worker_bundle_sha256"])
+  and .version == 1 and .service == "cats-worker.service"' \
+  "$stage/installer-receipt.json" >/dev/null || fail "staged installer receipt changed authority"
+
+jq -e -n --slurpfile manifest "$stage/release-manifest.json" \
+  --slurpfile receipt "$stage/installer-receipt.json" \
+  '($manifest[0].artifacts.worker.members | keys) == ($receipt[0].members | keys)
+    and all($manifest[0].artifacts.worker.members | to_entries[];
+      . as $member
+      | $member.value.sha256 == $receipt[0].members[$member.key].sha256
+        and $member.value.size_bytes == $receipt[0].members[$member.key].size_bytes)' \
+  >/dev/null || fail "installer receipt members differ from the approved worker manifest"
+
+seen_binary_labels='|'
+installed_noded_path=
+timeout_bin=
+timeout_bin_original=
+for entry in "${binary_entries[@]}"; do
+  label=${entry%%=*}
+  path=${entry#*=}
+  [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "binary label is not canonical"
+  case "$seen_binary_labels" in *"|$label|"*) fail "binary label $label is repeated" ;; esac
+  seen_binary_labels+="$label|"
+  [[ $path != *@sha256:* ]] || fail "binary $label digest must come from the approved manifest and installer receipt"
+  canonical=$(canonical_existing "$path") || fail "binary $label must name a regular non-symlink file"
+  [[ -f $canonical && -x $canonical ]] || fail "binary $label is not executable"
+  artifact_name=${canonical##*/}
+  authority=$(jq -er --arg name "$artifact_name" '
+    if .members[$name] != null then "worker-member"
+    elif .host_tools[$name] != null then "installer-host-tool"
+    else empty end' "$stage/installer-receipt.json") || \
+    fail "binary $label is absent from the installer receipt"
+  case "$authority" in
+    worker-member)
+      expected_path=$(jq -er --arg name "$artifact_name" '.members[$name].path' "$stage/installer-receipt.json")
+      expected_sha256=$(jq -er --arg name "$artifact_name" '.members[$name].sha256' "$stage/installer-receipt.json")
+      expected_size=$(jq -er --arg name "$artifact_name" '.members[$name].size_bytes' "$stage/installer-receipt.json")
+      manifest_sha256=$(jq -er --arg name "$artifact_name" '.artifacts.worker.members[$name].sha256' "$stage/release-manifest.json")
+      manifest_size=$(jq -er --arg name "$artifact_name" '.artifacts.worker.members[$name].size_bytes' "$stage/release-manifest.json")
+      [[ $expected_sha256 == "$manifest_sha256" && $expected_size == "$manifest_size" ]] || \
+        fail "installed worker member $artifact_name differs from the approved manifest"
+      ;;
+    installer-host-tool)
+      expected_path=$(jq -er --arg name "$artifact_name" '.host_tools[$name].path' "$stage/installer-receipt.json")
+      expected_sha256=$(jq -er --arg name "$artifact_name" '.host_tools[$name].sha256' "$stage/installer-receipt.json")
+      expected_size=$(jq -er --arg name "$artifact_name" '.host_tools[$name].size_bytes' "$stage/installer-receipt.json")
+      ;;
+    *) fail "binary $label has no closed installer authority" ;;
+  esac
+  [[ $expected_path == /* && $expected_sha256 =~ ^sha256:[0-9a-f]{64}$ && $expected_size =~ ^[1-9][0-9]*$ ]] || \
+    fail "installer receipt entry for $artifact_name is invalid"
+  canonical_expected=$(canonical_existing "$expected_path") || \
+    fail "installer receipt path for $artifact_name is not a real regular file"
+  [[ $canonical == "$canonical_expected" ]] || fail "binary $label path differs from the installer receipt"
+  digest=$(sha256sum "$canonical" | awk '{print $1}')
+  size=$(wc -c <"$canonical" | tr -d ' ')
+  [[ sha256:$digest == "$expected_sha256" && $size == "$expected_size" ]] || \
+    fail "binary $label bytes differ from the installer receipt"
+  staged=$stage/binaries/$label
+  stage_input "binary:$label" "$canonical" "$staged" 0700 "$digest"
+  jq -S -c -n --arg label "$label" --arg artifact_name "$artifact_name" \
+    --arg authority "$authority" --arg path "$canonical" --arg staged_path "$staged" \
+    --arg sha256 "$digest" --argjson size_bytes "$size" \
+    '{label:$label,artifact_name:$artifact_name,authority:$authority,path:$path,
+      staged_path:$staged_path,sha256:$sha256,size_bytes:$size_bytes}' >>"$binaries_work"
+  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+  printf -v "CATS_E3_BINARY_${environment_label}" '%s' "$staged"
+  export "CATS_E3_BINARY_${environment_label}"
+  printf -v "CATS_E3_BINARY_${environment_label}_SHA256" '%s' "$digest"
+  export "CATS_E3_BINARY_${environment_label}_SHA256"
+  if [[ $artifact_name == cats-noded ]]; then
+    installed_noded_path=$canonical
+  fi
+  if [[ $label == timeout ]]; then
+    [[ $artifact_name == timeout && $authority == installer-host-tool ]] || \
+      fail "--binary timeout must be the installer-recorded Host timeout"
+    timeout_bin=$staged
+    timeout_bin_original=$canonical
+    timeout_bin_sha256=$digest
+  fi
+done
+for required_binding in \
+  cats=cats \
+  runtime-e3-probe=cats-runtime-e3-probe \
+  e3-guest-workload=cats-e3-guest-workload \
+  curl=curl \
+  systemctl=systemctl \
+  journalctl=journalctl \
+  timeout=timeout; do
+  required_label=${required_binding%%=*}
+  required_artifact=${required_binding#*=}
+  jq -e --arg label "$required_label" --arg artifact "$required_artifact" \
+    'select(.label == $label and .artifact_name == $artifact)' "$binaries_work" >/dev/null || \
+    fail "--binary $required_label must bind installer-recorded $required_artifact"
+done
+[[ -n $installed_noded_path ]] || fail "the installed cats-noded worker member must be an explicit --binary"
+[[ -n $timeout_bin ]] || fail "--binary timeout is required"
+
+seen_config_labels='|'
+for entry in "${config_entries[@]}"; do
+  label=${entry%%=*}
+  path=${entry#*=}
+  [[ $label != "$entry" && $label =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "config label is not canonical"
+  case "$seen_config_labels" in *"|$label|"*) fail "config label $label is repeated" ;; esac
+  seen_config_labels+="$label|"
+  canonical=$(canonical_existing "$path") || fail "config $label must name a regular non-symlink file"
+  [[ -f $canonical ]] || fail "config $label is not a regular file"
+  digest=$(sha256sum "$canonical" | awk '{print $1}')
+  size=$(wc -c <"$canonical" | tr -d ' ')
+  staged=$stage/configs/$label
+  stage_input "config:$label" "$canonical" "$staged" 0600 "$digest"
+  jq -S -c -n --arg label "$label" --arg path "$canonical" --arg staged_path "$staged" \
+    --arg sha256 "$digest" --argjson size_bytes "$size" \
+    '{label:$label,path:$path,staged_path:$staged_path,sha256:$sha256,size_bytes:$size_bytes}' >>"$configs_work"
+  environment_label=$(printf '%s' "$label" | tr '[:lower:]-' '[:upper:]_')
+  printf -v "CATS_E3_CONFIG_${environment_label}" '%s' "$staged"
+  export "CATS_E3_CONFIG_${environment_label}"
+done
+
+export CATS_E3_WORKER_SERVICE=cats-worker.service
+export CATS_E3_INSTALLED_NODED_PATH=$installed_noded_path
 for entry in "${key_fingerprint_entries[@]}"; do
   label=${entry%%=*}
   fingerprint=${entry#*=}
@@ -265,7 +451,7 @@ case_postconditions=(
   'Guest write and successful FLUSH reach the selected durability postcondition'
   'HTTP and WebSocket traverse Gateway, Control resolve, Node guard and Guest'
   'Agent restart adopts exact runtime and retained pending data without gate resurrection'
-  'selected block path proves first initialization, crash recovery, exact ext4 identity, remount readiness and Strict FLUSH'
+  'installed Root proves the selected frontend; live PersistentDisk attach/first-format/restart matrix remains DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)'
   'live sampler, durable spool and signed ingest ACK are proven; terminal archive/projector receipt remains explicit Blocked'
   'delete reaches exact physical cleanup with no residue or writer'
 )
@@ -284,6 +470,7 @@ host_kernel=$(uname -r)
 [[ $host_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || fail "Host kernel release is not a bounded nonsecret string"
 build_receipt_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
 release_manifest_sha256=$(sha256sum "$release_manifest" | awk '{print $1}')
+installer_receipt_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
 scenario_driver_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
 scenario_catalog_sha256=$(sha256sum "$catalog_work" | awk '{print $1}')
 
@@ -302,9 +489,13 @@ write_manifest() {
     --arg build_receipt_sha256 "$build_receipt_sha256" \
     --arg release_manifest "$release_manifest" \
     --arg release_manifest_sha256 "$release_manifest_sha256" \
-    --arg scenario_driver "$scenario_driver" \
+    --arg approved_release_manifest_sha256 "$approved_release_manifest_sha256" \
+    --arg installer_receipt "$installer_receipt" \
+    --arg installer_receipt_sha256 "$installer_receipt_sha256" \
+    --arg worker_bundle_sha256 "$manifest_worker_bundle_sha256" \
+    --arg scenario_driver "$scenario_driver_original" \
     --arg scenario_driver_sha256 "$scenario_driver_sha256" \
-    --arg timeout_binary "$timeout_bin" \
+    --arg timeout_binary "$timeout_bin_original" \
     --arg timeout_binary_sha256 "$timeout_bin_sha256" \
     --arg scenario_catalog_sha256 "$scenario_catalog_sha256" \
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
@@ -314,7 +505,7 @@ write_manifest() {
     --slurpfile configs "$configs_work" \
     --slurpfile key_fingerprints "$fingerprints_work" \
     --slurpfile scenarios "$catalog_work" \
-    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
+    '{version:1,state:$state,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,schema_version:$schema_version,kernels:{host:$host_kernel,guest:$guest_kernel},build_receipt:{path:$build_receipt,sha256:$build_receipt_sha256},release_manifest:{path:$release_manifest,sha256:$release_manifest_sha256,approved_sha256:$approved_release_manifest_sha256},installer_receipt:{path:$installer_receipt,sha256:$installer_receipt_sha256,worker_bundle_sha256:$worker_bundle_sha256},scenario_driver:{path:$scenario_driver,sha256:$scenario_driver_sha256},timeout_binary:{path:$timeout_binary,sha256:$timeout_binary_sha256},scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,key_fingerprints:$key_fingerprints,scenarios:$scenarios,started_at_unix_seconds:$started_at_unix_seconds,ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
     >"$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$output_dir/manifest.json"
@@ -394,6 +585,8 @@ persist_case_receipts() {
 }
 
 failed_cases=0
+blocked_cases=0
+passed_cases=0
 for index in "${!case_ids[@]}"; do
   case_id=${case_ids[$index]}
   deadline=${case_deadlines[$index]}
@@ -436,17 +629,30 @@ for index in "${!case_ids[@]}"; do
 
   case_ended=$(date +%s)
   status=passed
-  if [[ $run_code -ne 0 || $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
-    status=failed
-    failed_cases=$((failed_cases + 1))
-  fi
   if [[ $cleanup_code -ne 0 || $evidence_code -ne 0 ]]; then
     status=failed
   elif [[ $run_code -eq 124 ]]; then
     status=timed_out
   elif [[ $run_code -eq 78 ]]; then
-    status=blocked
+    if [[ -f $case_dir/blocked-receipt.json ]] && jq -e \
+      --arg case_id "$case_id" --arg block_path "$block_path" \
+      '.version == 1 and .status == "blocked" and .case_id == $case_id
+        and .block_path == $block_path and (.reason | type == "string" and length > 0)' \
+      "$case_dir/blocked-receipt.json" >/dev/null; then
+      status=blocked
+    else
+      status=failed
+      evidence_code=125
+    fi
+  elif [[ $run_code -ne 0 ]]; then
+    status=failed
   fi
+  case "$status" in
+    passed) passed_cases=$((passed_cases + 1)) ;;
+    blocked) blocked_cases=$((blocked_cases + 1)) ;;
+    failed|timed_out) failed_cases=$((failed_cases + 1)) ;;
+    *) fail "internal case status is not closed" ;;
+  esac
   jq -S -c -n \
     --arg case_id "$case_id" \
     --arg status "$status" \
@@ -480,11 +686,33 @@ if [[ $inventory_command_status -ne 0 || $inventory_filter_status -ne 0 ]]; then
 fi
 atomic_copy "$inventory_work" final-inventory.json
 
+input_rehash_work=$scratch/input-rehash-diagnostic.txt
+: >"$input_rehash_work"
+for index in "${!original_paths[@]}"; do
+  original=${original_paths[$index]}
+  expected=${original_digests[$index]}
+  actual=unavailable
+  if [[ -f $original && ! -L $original ]]; then
+    actual=$(sha256sum "$original" | awk '{print $1}')
+  fi
+  if [[ $actual != "$expected" ]]; then
+    printf 'stable input changed label=%s expected_sha256=%s actual_sha256=%s\n' \
+      "${original_labels[$index]}" "$expected" "$actual" >>"$input_rehash_work"
+  fi
+done
+if [[ -s $input_rehash_work ]]; then
+  failed_cases=$((failed_cases + 1))
+  append_summary stable-inputs diagnostics "$input_rehash_work"
+fi
+
 final_exit=0
 final_state=passed
 if [[ $failed_cases -ne 0 ]]; then
   final_exit=1
   final_state=failed
+elif [[ $blocked_cases -ne 0 ]]; then
+  final_exit=78
+  final_state=blocked
 fi
 atomic_text exit-code "$final_exit"$'\n'
 ended_at_unix_seconds=$(date +%s)

@@ -13,8 +13,8 @@ use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilitySt
 use cats_api::runtime_reconciliation::{
     decode_node_identity, decode_runtime_checkpoint, encode_node_identity,
     encode_runtime_checkpoint, GuestTransportEvidence, Id, NodeIdentity, NodeIdentityState,
-    ObservedDiskKind, ProcessRole, RuntimeCheckpoint, RuntimeLaunch, StableState,
-    VolumeAuthorityEvidence, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+    ObservedDiskKind, PrepareDeviceFrontend, ProcessRole, RuntimeCheckpoint, RuntimeLaunch,
+    StableState, VolumeAuthorityEvidence, RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
 use cats_node_agent::agent_registration::{NODE_IDENTITY_PATH, NODE_STATE_ROOT};
 use cats_node_agent::guest_client::GuestClient;
@@ -194,6 +194,7 @@ struct RootFacts<'a> {
     attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
     head: &'a cats_api::runtime_reconciliation::RemoteHead,
     control_socket: &'a Path,
+    block_frontend: &'static str,
 }
 
 fn root_facts(checkpoint: &RuntimeCheckpoint) -> Result<RootFacts<'_>> {
@@ -233,12 +234,32 @@ fn root_facts(checkpoint: &RuntimeCheckpoint) -> Result<RootFacts<'_>> {
     let [process] = processes.as_slice() else {
         bail!("Root volume does not have exactly one matching blockd process")
     };
+    let RuntimeLaunch::Present(launch) = &checkpoint.runtime_launch else {
+        bail!("Running checkpoint has no retained VMM launch")
+    };
+    let devices = launch
+        .devices
+        .iter()
+        .filter(|device| {
+            device.volume_id == root.volume_id
+                && device.attachment_id == *attachment_id
+                && device.attachment_epoch == *attachment_epoch
+        })
+        .collect::<Vec<_>>();
+    let [device] = devices.as_slice() else {
+        bail!("Root volume does not have exactly one retained launch device")
+    };
+    let block_frontend = match &device.frontend {
+        PrepareDeviceFrontend::KernelNbd { .. } => "kernel-nbd",
+        PrepareDeviceFrontend::VhostUserBlk { .. } => "vhost-user",
+    };
     Ok(RootFacts {
         volume_id: &root.volume_id,
         attachment_id,
         attachment_epoch: *attachment_epoch,
         head,
         control_socket: Path::new(process.control_socket_path.as_str()),
+        block_frontend,
     })
 }
 
@@ -372,6 +393,7 @@ fn snapshot(cat_id: &str) -> Result<()> {
         serde_json::json!({
             "version": 1,
             "cat_id": cat_id,
+            "node_id": checkpoint.node_id,
             "runtime_incarnation": launch.runtime_incarnation,
             "guest_boot_id": guest_boot_id,
             "vmm_scope_id": launch.scope_id,
@@ -380,6 +402,10 @@ fn snapshot(cat_id: &str) -> Result<()> {
             "root_attachment_epoch": facts.attachment_epoch,
             "root_remote_head": status.remote_head,
             "root_remote_generation": status.remote_durable_generation,
+            "root_block_frontend": facts.block_frontend,
+            "lifecycle_admission": checkpoint.lifecycle_admission,
+            "route_gate_count": checkpoint.route_gates.len(),
+            "active_route_gate_count": checkpoint.route_gates.iter().filter(|gate| matches!(gate.gate, cats_api::runtime_reconciliation::RouteGateState::Active)).count(),
             "strict_remote_durable": true
         })
     );
@@ -443,7 +469,27 @@ fn install_workload(
             "copy Guest workload failed: stdout={stdout:?} stderr={stderr:?}"
         );
     }
-    let script = "set -eu; chmod 0700 \"$1\"; systemd-run --quiet --collect --unit \"$2\" --property=Restart=no -- \"$1\" --port \"$3\" --nonce \"$4\"";
+    let script = r#"set -eu
+sync -f "$1"
+actual=$(sha256sum "$1")
+actual=${actual%% *}
+test "$actual" = "$5"
+chmod 0700 "$1"
+systemd-run --quiet --collect --unit "$2" --property=Restart=no -- "$1" --port "$3" --nonce "$4"
+attempt=0
+while test "$attempt" -lt 100; do
+  attempt=$((attempt + 1))
+  main_pid=$(systemctl show --property=MainPID --value "$2.service")
+  case "$main_pid" in ''|0|*[!0-9]*) sleep 0.1; continue ;; esac
+  main_exe=$(readlink -f "/proc/$main_pid/exe")
+  expected_exe=$(readlink -f "$1")
+  if test "$main_exe" = "$expected_exe"; then
+    printf '%s\n%s\n%s\n' "$actual" "$main_pid" "$main_exe"
+    exit 0
+  fi
+  sleep 0.1
+done
+exit 1"#;
     let (code, stdout, stderr) = guest.exec(vec![
         "sh".into(),
         "-c".into(),
@@ -453,14 +499,31 @@ fn install_workload(
         unit.clone(),
         port.to_string(),
         run_id.into(),
+        expected_sha256.into(),
     ])?;
     anyhow::ensure!(
         code == 0,
         "install Guest workload failed: stdout={stdout:?} stderr={stderr:?}"
     );
+    let proof = stdout.lines().collect::<Vec<_>>();
+    let [guest_sha256, main_pid, main_executable] = proof.as_slice() else {
+        bail!("Guest workload start did not return exact hash and MainPID proof")
+    };
+    anyhow::ensure!(
+        *guest_sha256 == expected_sha256,
+        "Guest re-read digest differs from the E3 manifest"
+    );
+    anyhow::ensure!(
+        main_pid.parse::<u32>().is_ok_and(|pid| pid > 0),
+        "Guest workload MainPID is invalid"
+    );
+    anyhow::ensure!(
+        *main_executable == path,
+        "Guest workload MainPID executes another file"
+    );
     println!(
         "{}",
-        serde_json::json!({"version":1,"cat_id":cat_id,"run_id":run_id,"unit":unit,"path":path,"port":port,"workload_sha256":actual_sha256,"installed":true})
+        serde_json::json!({"version":1,"cat_id":cat_id,"run_id":run_id,"unit":unit,"path":path,"port":port,"workload_sha256":actual_sha256,"guest_reread_sha256":guest_sha256,"guest_file_fsynced":true,"unit_main_pid":main_pid,"unit_main_executable":main_executable,"installed":true})
     );
     Ok(())
 }
