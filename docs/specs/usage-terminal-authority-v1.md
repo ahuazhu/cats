@@ -94,6 +94,12 @@ corruption，不能授权reset。旧Kinesis/DynamoDB可删除，但old/fresh imm
 HTTP 200、`state=terminal`且receipt非空表示成功，HTTP 202/`pending`绝不授权清理。marker ID为request digest与
 shard ID分别用u64 big-endian byte length framing后的SHA-256，固定前缀`usage_terminal_marker_`。
 
+离线reset只调用release member `cats-usage-terminal-receipt-verifier`。除canonical target receipt与其exact request
+journal外，它还必须读取manifest绑定的root-only `usage-terminal-targets` v1文件及其expected SHA-256；Rust逐字段
+比较old/fresh完整target和shard集合。verification receipt除binary/release/bundle/request/receipt digest外固定包含
+`expected_targets_file_sha256`与不含末尾LF的canonical `target_binding_sha256`。因此proof目录内自带一份内部自洽但
+属于foreign target的request/receipt不能授权reset；Python不得重构ARN或复制Rust target语义。
+
 ## 4. DDL closed set
 
 - `usage_checkpoints.source_binding_json TEXT NOT NULL CONSTRAINT

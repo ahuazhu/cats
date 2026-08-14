@@ -12,7 +12,8 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use cats_metering::{
-    validate_target_terminal_receipt, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
+    validate_target_terminal_receipt, UsageTargetBinding, UsageTargetTerminalReceipt,
+    UsageTargetTerminalRequest, UsageTerminalShardTarget,
 };
 use clap::Parser;
 use serde_json::Value;
@@ -41,6 +42,14 @@ struct Args {
     #[arg(long, value_name = "ABSOLUTE_PATH")]
     expected_request_file: PathBuf,
 
+    /// Root-owned canonical release/qualification target descriptor.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    expected_targets_file: PathBuf,
+
+    /// Manifest-bound digest of the exact expected target descriptor file.
+    #[arg(long)]
+    expected_targets_sha256: String,
+
     /// Exact qualified release commit.
     #[arg(long)]
     release_commit: String,
@@ -58,8 +67,10 @@ struct Args {
 struct VerificationReceipt<'a> {
     binary_sha256: &'a str,
     expected_request_file_sha256: &'a str,
+    expected_targets_file_sha256: &'a str,
     release_commit: &'a str,
     target_receipt_file_sha256: &'a str,
+    target_binding_sha256: &'a str,
     target_request_sha256: &'a str,
     worker_bundle_sha256: &'a str,
 }
@@ -72,12 +83,17 @@ impl VerificationReceipt<'_> {
             "expected_request_file_sha256",
             self.expected_request_file_sha256.into(),
         );
+        value.insert(
+            "expected_targets_file_sha256",
+            self.expected_targets_file_sha256.into(),
+        );
         value.insert("kind", RECEIPT_KIND.into());
         value.insert("release_commit", self.release_commit.into());
         value.insert(
             "target_receipt_file_sha256",
             self.target_receipt_file_sha256.into(),
         );
+        value.insert("target_binding_sha256", self.target_binding_sha256.into());
         value.insert("target_request_sha256", self.target_request_sha256.into());
         value.insert("validated", true.into());
         value.insert("version", RECEIPT_VERSION.into());
@@ -90,6 +106,15 @@ impl VerificationReceipt<'_> {
         }
         Ok(bytes)
     }
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageTerminalTargets {
+    version: u16,
+    old_target: UsageTargetBinding,
+    fresh_target: UsageTargetBinding,
+    shards: Vec<UsageTerminalShardTarget>,
 }
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
@@ -125,6 +150,7 @@ fn validate_release_binding(
 fn validate_inputs(
     receipt: &UsageTargetTerminalReceipt,
     expected_request: &UsageTargetTerminalRequest,
+    expected_targets: &UsageTerminalTargets,
     release_commit: &str,
     worker_bundle_sha256: &str,
 ) -> Result<()> {
@@ -132,6 +158,13 @@ fn validate_inputs(
         .map_err(|_error| anyhow::anyhow!("Usage target terminal receipt is invalid"))?;
     if receipt.request != *expected_request {
         bail!("Usage target terminal receipt does not bind the expected request journal");
+    }
+    if expected_targets.version != 1
+        || receipt.request.old_target != expected_targets.old_target
+        || receipt.request.fresh_target != expected_targets.fresh_target
+        || receipt.request.shards != expected_targets.shards
+    {
+        bail!("Usage target terminal receipt does not bind the expected release targets");
     }
     validate_release_binding(&receipt.request, release_commit, worker_bundle_sha256)
 }
@@ -142,6 +175,10 @@ fn run(args: Args) -> Result<()> {
     }
     validate_lower_hex(&args.release_commit, 40, "release commit")?;
     validate_sha256(&args.worker_bundle_sha256, "worker bundle digest")?;
+    validate_sha256(
+        &args.expected_targets_sha256,
+        "expected target descriptor digest",
+    )?;
 
     let receipt_bytes = open_protected_input(
         &args.receipt_file,
@@ -157,17 +194,35 @@ fn run(args: Args) -> Result<()> {
         "Usage target terminal request",
     )?
     .read_bounded(MAX_INPUT_BYTES, "Usage target terminal request")?;
+    let targets_bytes = open_protected_input(
+        &args.expected_targets_file,
+        MAX_INPUT_BYTES,
+        &[0o400, 0o600],
+        "Usage terminal expected targets",
+    )?
+    .read_bounded(MAX_INPUT_BYTES, "Usage terminal expected targets")?;
 
     let receipt_value = decode_canonical_value(&receipt_bytes, "Usage target terminal receipt")?;
     let request_value = decode_canonical_value(&request_bytes, "Usage target terminal request")?;
+    let targets_value = decode_canonical_value(&targets_bytes, "Usage terminal expected targets")?;
+    let expected_targets_file_sha256 = sha256_prefixed(&targets_bytes);
+    if expected_targets_file_sha256 != args.expected_targets_sha256 {
+        bail!("Usage terminal expected target descriptor digest drifted");
+    }
+    let target_binding_sha256 = sha256_prefixed(
+        &serde_json::to_vec(&targets_value).context("encode canonical Usage target binding")?,
+    );
     let receipt: UsageTargetTerminalReceipt = serde_json::from_value(receipt_value)
         .context("decode typed Usage target terminal receipt")?;
     let expected_request: UsageTargetTerminalRequest = serde_json::from_value(request_value)
         .context("decode typed Usage target terminal request")?;
+    let expected_targets: UsageTerminalTargets = serde_json::from_value(targets_value)
+        .context("decode typed Usage terminal expected targets")?;
 
     validate_inputs(
         &receipt,
         &expected_request,
+        &expected_targets,
         &args.release_commit,
         &args.worker_bundle_sha256,
     )?;
@@ -178,8 +233,10 @@ fn run(args: Args) -> Result<()> {
     let verification = VerificationReceipt {
         binary_sha256: &binary_sha256,
         expected_request_file_sha256: &expected_request_file_sha256,
+        expected_targets_file_sha256: &expected_targets_file_sha256,
         release_commit: &args.release_commit,
         target_receipt_file_sha256: &target_receipt_file_sha256,
+        target_binding_sha256: &target_binding_sha256,
         target_request_sha256: &receipt.request_sha256,
         worker_bundle_sha256: &args.worker_bundle_sha256,
     }
@@ -221,8 +278,10 @@ mod tests {
         let bytes = VerificationReceipt {
             binary_sha256: SHA,
             expected_request_file_sha256: SHA,
+            expected_targets_file_sha256: SHA,
             release_commit: "0123456789abcdef0123456789abcdef01234567",
             target_receipt_file_sha256: SHA,
+            target_binding_sha256: SHA,
             target_request_sha256: SHA,
             worker_bundle_sha256: SHA,
         }
@@ -233,8 +292,10 @@ mod tests {
             concat!(
                 "{\"binary_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
                 "\"expected_request_file_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
+                "\"expected_targets_file_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
                 "\"kind\":\"cats.usage-terminal-receipt-verification.v1\",",
                 "\"release_commit\":\"0123456789abcdef0123456789abcdef01234567\",",
+                "\"target_binding_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
                 "\"target_receipt_file_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
                 "\"target_request_sha256\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
                 "\"validated\":true,\"version\":1,",
@@ -275,7 +336,11 @@ mod tests {
         }
     }
 
-    fn valid_pair() -> (UsageTargetTerminalRequest, UsageTargetTerminalReceipt) {
+    fn valid_pair() -> (
+        UsageTerminalTargets,
+        UsageTargetTerminalRequest,
+        UsageTargetTerminalReceipt,
+    ) {
         let sources = Vec::new();
         let request = UsageTargetTerminalRequest {
             contract_version: 1,
@@ -311,15 +376,25 @@ mod tests {
                 },
             }],
         };
-        (request, receipt)
+        (
+            UsageTerminalTargets {
+                version: 1,
+                old_target: request.old_target.clone(),
+                fresh_target: request.fresh_target.clone(),
+                shards: request.shards.clone(),
+            },
+            request,
+            receipt,
+        )
     }
 
     #[test]
     fn rust_validator_and_external_request_and_release_binding_are_all_required() {
-        let (request, receipt) = valid_pair();
+        let (targets, request, receipt) = valid_pair();
         validate_inputs(
             &receipt,
             &request,
+            &targets,
             "0123456789abcdef0123456789abcdef01234567",
             SHA,
         )
@@ -330,6 +405,7 @@ mod tests {
         assert!(validate_inputs(
             &receipt,
             &foreign_request,
+            &targets,
             "0123456789abcdef0123456789abcdef01234567",
             SHA,
         )
@@ -337,19 +413,71 @@ mod tests {
         assert!(validate_inputs(
             &receipt,
             &request,
+            &targets,
             "1123456789abcdef0123456789abcdef01234567",
             SHA,
         )
         .is_err());
 
-        let mut corrupt = receipt;
+        let mut corrupt = receipt.clone();
         corrupt.barriers[0].archive.sequence_number = "043".into();
         assert!(validate_inputs(
             &corrupt,
             &request,
+            &targets,
             "0123456789abcdef0123456789abcdef01234567",
             SHA,
         )
         .is_err());
+
+        let mut foreign_targets = targets;
+        foreign_targets.old_target.stream_name = "usage-foreign".into();
+        foreign_targets.old_target.stream_arn =
+            "arn:aws:kinesis:us-east-1:123456789012:stream/usage-foreign".into();
+        assert!(validate_inputs(
+            &receipt,
+            &request,
+            &foreign_targets,
+            "0123456789abcdef0123456789abcdef01234567",
+            SHA,
+        )
+        .is_err());
+
+        let mut foreign_shards = UsageTerminalTargets {
+            version: 1,
+            old_target: request.old_target.clone(),
+            fresh_target: request.fresh_target.clone(),
+            shards: request.shards.clone(),
+        };
+        foreign_shards.shards[0].explicit_hash_key = "1".into();
+        assert!(validate_inputs(
+            &receipt,
+            &request,
+            &foreign_shards,
+            "0123456789abcdef0123456789abcdef01234567",
+            SHA,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn expected_target_descriptor_rejects_extra_or_missing_fields() {
+        let (targets, _, _) = valid_pair();
+        let valid = serde_json::json!({
+            "version": targets.version,
+            "old_target": targets.old_target,
+            "fresh_target": targets.fresh_target,
+            "shards": targets.shards,
+        });
+        assert!(serde_json::from_value::<UsageTerminalTargets>(valid.clone()).is_ok());
+        let mut extra = valid.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("foreign".into(), Value::Bool(true));
+        assert!(serde_json::from_value::<UsageTerminalTargets>(extra).is_err());
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("fresh_target");
+        assert!(serde_json::from_value::<UsageTerminalTargets>(missing).is_err());
     }
 }
