@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io::SeekFrom;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,19 +18,20 @@ use cats_api::object_write_gateway::object_write_key;
 use cats_api::object_write_gateway::{
     ObjectWriteConditionalRequestEvidenceV1, ObjectWriteConditionalRequestOutcomeV1,
     ObjectWriteProviderRequestObservationV1, ObjectWriteQualificationHeadEvidenceV1,
-    ObjectWriteQualificationUnprovenReasonV1, ObjectWriteSuccessfulPutV1,
+    ObjectWriteSuccessfulPutV1,
 };
 #[cfg(test)]
 use cats_api::runtime_reconciliation::Id;
 use cats_api::runtime_reconciliation::{AsciiText, ProviderScope, Sha256Digest, UnixMillis};
 use cats_storage::object_write_authority::{
     object_put_provider_attempt_id, object_put_request_id, validate_downstream_put,
-    ObjectPutDescriptor, ObjectWriteDownstreamError, ObjectWriteDownstreamFuture,
-    ObjectWriteDownstreamPut, ObjectWriteDownstreamPutOutcome, ObjectWriteGatewayDownstream,
+    validate_qualification_downstream_put, ObjectPutDescriptor, ObjectWriteDownstreamError,
+    ObjectWriteDownstreamFuture, ObjectWriteDownstreamPut, ObjectWriteDownstreamPutOutcome,
+    ObjectWriteGatewayDownstream, ObjectWriteQualificationPut, ObjectWriteQualificationPutOutcome,
     ObjectWriteVisibilityOutcome,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::VerifiedAwsProviderBinding;
 
@@ -40,9 +42,9 @@ const CONTENT_LENGTH_METADATA: &str = "cats-content-length";
 
 fn put_retry_config() -> RetryConfig {
     // The outer accepted-write state machine performs HEAD discovery before
-    // every conditional PUT retry. An SDK-internal retry would reopen the EFS
-    // path without rerunning validate_spool_file, so one adapter invocation is
-    // deliberately one provider request attempt.
+    // every conditional PUT retry and revalidates a fresh pinned EFS handle.
+    // One adapter invocation is deliberately one provider request attempt;
+    // the SDK must never replay its consumed handle behind that state machine.
     RetryConfig::disabled()
 }
 
@@ -196,32 +198,93 @@ impl AwsObjectWriteGatewayDownstream {
     ) -> Result<ObjectWriteDownstreamPutOutcome, ObjectWriteDownstreamError> {
         validate_downstream_put(&request, absolute_deadline)
             .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?;
-        let provider_key = self.config.provider_key(&request.descriptor)?;
-        let spool_path = self.config.spool_path(&request.spool.spool_id)?;
-        validate_spool_file(
+        match self
+            .conditional_put(&request.descriptor, &request.spool, absolute_deadline)
+            .await?
+        {
+            AwsConditionalPutOutcome::Created(successful_put) => {
+                Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
+                    provider_attempt_id: successful_put.provider_attempt_id,
+                    put_receipt_id: successful_put.put_receipt_id,
+                    completed_at_unix_ms: successful_put.completed_at_unix_ms,
+                })
+            }
+            AwsConditionalPutOutcome::PreconditionFailedExactVisible(head) => {
+                Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
+                    provider_attempt_id: head.provider_attempt_id,
+                    put_receipt_id: replay_put_receipt_id(
+                        &request.descriptor,
+                        &head.visibility_receipt_id,
+                    )?,
+                    completed_at_unix_ms: head.observed_at_unix_ms,
+                })
+            }
+            AwsConditionalPutOutcome::Conflicting {
+                failure_receipt_id,
+                failed_at_unix_ms,
+            } => Ok(ObjectWriteDownstreamPutOutcome::PermanentlyFailed {
+                provider_attempt_id: request.descriptor.provider_attempt_id,
+                failure_receipt_id,
+                failed_at_unix_ms,
+            }),
+        }
+    }
+
+    async fn put_qualification(
+        &self,
+        request: &ObjectWriteQualificationPut,
+    ) -> Result<ObjectWriteQualificationPutOutcome, ObjectWriteDownstreamError> {
+        validate_qualification_downstream_put(request)
+            .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?;
+        let absolute_deadline = request.absolute_deadline();
+        match self
+            .conditional_put(request.descriptor(), request.spool(), absolute_deadline)
+            .await?
+        {
+            AwsConditionalPutOutcome::Created(successful_put) => Ok(
+                ObjectWriteQualificationPutOutcome::SuccessfulPut(Box::new(successful_put)),
+            ),
+            AwsConditionalPutOutcome::PreconditionFailedExactVisible(head) => Ok(
+                ObjectWriteQualificationPutOutcome::PreconditionFailedExactVisible(Box::new(head)),
+            ),
+            AwsConditionalPutOutcome::Conflicting { .. } => {
+                Err(ObjectWriteDownstreamError::ConflictingObject)
+            }
+        }
+    }
+
+    async fn conditional_put(
+        &self,
+        descriptor: &ObjectPutDescriptor,
+        spool: &cats_storage::object_write_authority::DurableObjectWriteSpoolReceipt,
+        absolute_deadline: Instant,
+    ) -> Result<AwsConditionalPutOutcome, ObjectWriteDownstreamError> {
+        let provider_key = self.config.provider_key(descriptor)?;
+        let spool_path = self.config.spool_path(&spool.spool_id)?;
+        let spool_file = validate_spool_file(
             &spool_path,
-            &request.descriptor,
+            descriptor,
             self.config.durable_spool_root_uid,
             absolute_deadline,
         )
         .await?;
 
-        let checksum_sha256 = STANDARD.encode(request.descriptor.content_sha256.as_bytes());
+        let checksum_sha256 = STANDARD.encode(descriptor.content_sha256.as_bytes());
         let metadata = BTreeMap::from([
             (
                 CONTENT_SHA256_METADATA.to_owned(),
-                request.descriptor.content_sha256.as_str().to_owned(),
+                descriptor.content_sha256.as_str().to_owned(),
             ),
             (
                 CONTENT_LENGTH_METADATA.to_owned(),
-                request.descriptor.content_length.get().to_string(),
+                descriptor.content_length.get().to_string(),
             ),
         ]);
         let put = ExactPutRequest {
             bucket: self.config.bucket.clone(),
             key: provider_key.clone(),
-            spool_path,
-            content_length: request.descriptor.content_length.get(),
+            spool_file,
+            content_length: descriptor.content_length.get(),
             checksum_sha256,
             metadata,
         };
@@ -229,82 +292,45 @@ impl AwsObjectWriteGatewayDownstream {
         match self.s3.put_exact(put, absolute_deadline).await {
             Ok(observation) => {
                 if observation.checksum_sha256
-                    != STANDARD.encode(request.descriptor.content_sha256.as_bytes())
+                    != STANDARD.encode(descriptor.content_sha256.as_bytes())
                 {
                     return Err(ObjectWriteDownstreamError::Ambiguous);
                 }
-                let put_receipt_id = put_receipt_id(&request.descriptor, &observation, b"created")?;
-                if request.descriptor.qualification_fault.is_some() {
-                    Ok(
-                        ObjectWriteDownstreamPutOutcome::QualificationSuccessfulPut {
-                            successful_put: ObjectWriteSuccessfulPutV1 {
-                                provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                                put_receipt_id,
-                                provider_request: put_provider_request_observation(
-                                    &request.descriptor,
-                                    &observation,
-                                ),
-                                completed_at_unix_ms: observation.completed_at_unix_ms,
-                            },
-                        },
-                    )
-                } else {
-                    Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
-                        provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                        put_receipt_id,
+                Ok(AwsConditionalPutOutcome::Created(
+                    ObjectWriteSuccessfulPutV1 {
+                        provider_attempt_id: descriptor.provider_attempt_id.clone(),
+                        put_receipt_id: put_receipt_id(descriptor, &observation, b"created")?,
+                        provider_request: put_provider_request_observation(
+                            descriptor,
+                            &observation,
+                        ),
                         completed_at_unix_ms: observation.completed_at_unix_ms,
-                    })
-                }
+                    },
+                ))
             }
             Err(S3CallError::PreconditionFailed(conditional)) => match self
                 .s3
                 .head_exact(&self.config.bucket, &provider_key, absolute_deadline)
                 .await
             {
-                Ok(observation) if head_matches(&request.descriptor, &observation) => {
-                    let visibility_receipt_id =
-                        visibility_receipt_id(&request.descriptor, &observation)?;
-                    if request.descriptor.qualification_fault.is_some() {
-                        Ok(
-                            ObjectWriteDownstreamPutOutcome::QualificationUnprovenVisible {
-                                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
-                                head_evidence: Box::new(ObjectWriteQualificationHeadEvidenceV1 {
-                                    provider_attempt_id: request
-                                        .descriptor
-                                        .provider_attempt_id
-                                        .clone(),
-                                    visibility_receipt_id,
-                                    preceding_conditional_request: Some(Box::new(
-                                        conditional_request_evidence(
-                                            &request.descriptor,
-                                            &conditional,
-                                        ),
-                                    )),
-                                    provider_request: head_provider_request_observation(
-                                        &request.descriptor,
-                                        &observation,
-                                    )?,
-                                    observed_at_unix_ms: observation.observed_at_unix_ms,
-                                }),
-                            },
-                        )
-                    } else {
-                        Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
-                            provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                            put_receipt_id: replay_put_receipt_id(
-                                &request.descriptor,
-                                &visibility_receipt_id,
+                Ok(observation) if head_matches(descriptor, &observation) => {
+                    Ok(AwsConditionalPutOutcome::PreconditionFailedExactVisible(
+                        ObjectWriteQualificationHeadEvidenceV1 {
+                            provider_attempt_id: descriptor.provider_attempt_id.clone(),
+                            visibility_receipt_id: visibility_receipt_id(descriptor, &observation)?,
+                            preceding_conditional_request: Some(Box::new(
+                                conditional_request_evidence(descriptor, &conditional),
+                            )),
+                            provider_request: head_provider_request_observation(
+                                descriptor,
+                                &observation,
                             )?,
-                            completed_at_unix_ms: observation.observed_at_unix_ms,
-                        })
-                    }
+                            observed_at_unix_ms: observation.observed_at_unix_ms,
+                        },
+                    ))
                 }
-                Ok(observation) => Ok(ObjectWriteDownstreamPutOutcome::PermanentlyFailed {
-                    provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                    failure_receipt_id: conflict_failure_receipt_id(
-                        &request.descriptor,
-                        &observation,
-                    )?,
+                Ok(observation) => Ok(AwsConditionalPutOutcome::Conflicting {
+                    failure_receipt_id: conflict_failure_receipt_id(descriptor, &observation)?,
                     failed_at_unix_ms: observation.observed_at_unix_ms,
                 }),
                 Err(S3CallError::NotFound) => Err(ObjectWriteDownstreamError::Ambiguous),
@@ -348,6 +374,16 @@ impl AwsObjectWriteGatewayDownstream {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AwsConditionalPutOutcome {
+    Created(ObjectWriteSuccessfulPutV1),
+    PreconditionFailedExactVisible(ObjectWriteQualificationHeadEvidenceV1),
+    Conflicting {
+        failure_receipt_id: AsciiText,
+        failed_at_unix_ms: UnixMillis,
+    },
+}
+
 impl ObjectWriteGatewayDownstream for AwsObjectWriteGatewayDownstream {
     fn put_exact<'a>(
         &'a self,
@@ -355,6 +391,13 @@ impl ObjectWriteGatewayDownstream for AwsObjectWriteGatewayDownstream {
         absolute_deadline: Instant,
     ) -> ObjectWriteDownstreamFuture<'a, ObjectWriteDownstreamPutOutcome> {
         Box::pin(async move { self.put(request, absolute_deadline).await })
+    }
+
+    fn put_qualification_exact<'a>(
+        &'a self,
+        request: &'a ObjectWriteQualificationPut,
+    ) -> ObjectWriteDownstreamFuture<'a, ObjectWriteQualificationPutOutcome> {
+        Box::pin(async move { self.put_qualification(request).await })
     }
 
     fn discover_visibility<'a>(
@@ -378,7 +421,10 @@ fn validate_descriptor_for_discovery(
             &descriptor.key,
             &descriptor.content_sha256,
             descriptor.content_length,
-            descriptor.qualification_fault.as_ref(),
+            descriptor
+                .qualification_fault
+                .as_ref()
+                .map(|fault| (&descriptor.credential, fault)),
         )
         .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?
             != descriptor.request_id
@@ -520,7 +566,7 @@ async fn validate_spool_file(
     descriptor: &ObjectPutDescriptor,
     expected_owner_uid: u32,
     deadline: Instant,
-) -> Result<(), ObjectWriteDownstreamError> {
+) -> Result<tokio::fs::File, ObjectWriteDownstreamError> {
     let metadata = timeout_read(tokio::fs::symlink_metadata(path), deadline).await?;
     if !valid_spool_metadata(
         &metadata,
@@ -567,7 +613,18 @@ async fn validate_spool_file(
     {
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
-    Ok(())
+    timeout_read(file.seek(SeekFrom::Start(0)), deadline).await?;
+    let rewound = timeout_read(file.metadata(), deadline).await?;
+    if file_identity(&rewound) != before
+        || !valid_spool_metadata(
+            &rewound,
+            descriptor.content_length.get(),
+            expected_owner_uid,
+        )
+    {
+        return Err(ObjectWriteDownstreamError::InvalidRequest);
+    }
+    Ok(file)
 }
 
 async fn timeout_read<T>(
@@ -584,11 +641,10 @@ async fn timeout_read<T>(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactPutRequest {
     bucket: String,
     key: String,
-    spool_path: PathBuf,
+    spool_file: tokio::fs::File,
     content_length: u64,
     checksum_sha256: String,
     metadata: BTreeMap<String, String>,
@@ -663,11 +719,14 @@ impl ExactS3Api for SdkExactS3Api {
         Box::pin(async move {
             let content_length =
                 i64::try_from(request.content_length).map_err(|_| S3CallError::InvalidResponse)?;
-            // A path-backed stream is deliberately retryable. Every SDK retry
-            // reopens the durable EFS object instead of buffering it in RAM or
-            // reusing a consumed process-local file handle.
+            // Keep the exact inode opened, hashed and rewound by
+            // validate_spool_file. Reopening its pathname here would permit a
+            // same-UID recovery/cleanup race to substitute different bytes
+            // after validation. SDK mutation retries are disabled, so this
+            // non-retryable handle is consumed by exactly one provider call.
             let body = ByteStream::read_from()
-                .path(&request.spool_path)
+                .file(request.spool_file)
+                .length(Length::Exact(request.content_length))
                 .buffer_size(SPOOL_READ_BUFFER_BYTES)
                 .build()
                 .await
@@ -1186,7 +1245,10 @@ mod tests {
             &descriptor.key,
             &descriptor.content_sha256,
             descriptor.content_length,
-            descriptor.qualification_fault.as_ref(),
+            descriptor
+                .qualification_fault
+                .as_ref()
+                .map(|fault| (&descriptor.credential, fault)),
         )
         .unwrap();
         descriptor.provider_attempt_id =
@@ -1377,19 +1439,12 @@ mod tests {
             AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
 
         let outcome = downstream
-            .put_exact(
-                ObjectWriteDownstreamPut {
-                    descriptor: descriptor.clone(),
-                    spool,
-                },
-                Instant::now() + Duration::from_secs(2),
-            )
+            .conditional_put(&descriptor, &spool, Instant::now() + Duration::from_secs(2))
             .await
             .unwrap();
         assert!(matches!(
             outcome,
-            ObjectWriteDownstreamPutOutcome::QualificationSuccessfulPut {
-                successful_put: ObjectWriteSuccessfulPutV1 {
+            AwsConditionalPutOutcome::Created(ObjectWriteSuccessfulPutV1 {
                     provider_attempt_id,
                     provider_request: ObjectWriteProviderRequestObservationV1 {
                         request_id,
@@ -1398,12 +1453,33 @@ mod tests {
                     },
                     completed_at_unix_ms,
                     ..
-                }
-            } if provider_attempt_id == descriptor.provider_attempt_id
+                }) if provider_attempt_id == descriptor.provider_attempt_id
                 && request_id == observation.request_id
                 && completed_at_unix_ms == observation.completed_at_unix_ms
         ));
         assert_eq!(s3.puts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_put_capability_rejects_a_qualification_marker_before_s3() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"qualification cannot cross ordinary dispatch";
+        let descriptor = qualification_descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let s3 = Arc::new(FakeS3::new(vec![Ok(put_observation(&descriptor))], vec![]));
+        let downstream =
+            AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
+
+        assert_eq!(
+            downstream
+                .put_exact(
+                    ObjectWriteDownstreamPut { descriptor, spool },
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await,
+            Err(ObjectWriteDownstreamError::InvalidRequest)
+        );
+        assert!(s3.puts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1418,10 +1494,7 @@ mod tests {
 
         assert_eq!(
             downstream
-                .put_exact(
-                    ObjectWriteDownstreamPut { descriptor, spool },
-                    Instant::now() + Duration::from_secs(2),
-                )
+                .conditional_put(&descriptor, &spool, Instant::now() + Duration::from_secs(2),)
                 .await,
             Err(ObjectWriteDownstreamError::Ambiguous)
         );
@@ -1505,21 +1578,13 @@ mod tests {
             AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
 
         let outcome = downstream
-            .put_exact(
-                ObjectWriteDownstreamPut {
-                    descriptor: descriptor.clone(),
-                    spool,
-                },
-                Instant::now() + Duration::from_secs(2),
-            )
+            .conditional_put(&descriptor, &spool, Instant::now() + Duration::from_secs(2))
             .await
             .unwrap();
         assert!(matches!(
             outcome,
-            ObjectWriteDownstreamPutOutcome::QualificationUnprovenVisible {
-                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
-                head_evidence,
-            } if head_evidence.provider_attempt_id == descriptor.provider_attempt_id
+            AwsConditionalPutOutcome::PreconditionFailedExactVisible(head_evidence)
+                if head_evidence.provider_attempt_id == descriptor.provider_attempt_id
                 && head_evidence.provider_request.request_id == head.request_id
                 && head_evidence
                     .preceding_conditional_request
@@ -1664,7 +1729,7 @@ mod tests {
             actual_uid + 1
         };
 
-        assert_eq!(
+        assert!(matches!(
             validate_spool_file(
                 &spool_path,
                 &descriptor,
@@ -1673,7 +1738,36 @@ mod tests {
             )
             .await,
             Err(ObjectWriteDownstreamError::InvalidRequest)
-        );
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_spool_handle_survives_a_path_replacement_without_changing_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"accepted immutable bytes";
+        let descriptor = descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let spool_path = temporary
+            .path()
+            .join(format!("{}{SPOOL_FILE_SUFFIX}", spool.spool_id.as_str()));
+        let owner_uid = std::fs::symlink_metadata(&spool_path).unwrap().uid();
+        let mut validated = validate_spool_file(
+            &spool_path,
+            &descriptor,
+            owner_uid,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        let retained = temporary.path().join("retained-validated-inode");
+        std::fs::rename(&spool_path, &retained).unwrap();
+        std::fs::write(&spool_path, b"substituted pathname bytes").unwrap();
+        std::fs::set_permissions(&spool_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut observed = Vec::new();
+        validated.read_to_end(&mut observed).await.unwrap();
+        assert_eq!(observed, body);
     }
 
     #[tokio::test]
@@ -1689,7 +1783,10 @@ mod tests {
             &descriptor.key,
             &descriptor.content_sha256,
             descriptor.content_length,
-            descriptor.qualification_fault.as_ref(),
+            descriptor
+                .qualification_fault
+                .as_ref()
+                .map(|fault| (&descriptor.credential, fault)),
         )
         .unwrap();
         descriptor.provider_attempt_id =
