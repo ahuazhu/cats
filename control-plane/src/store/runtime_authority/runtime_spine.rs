@@ -24,7 +24,9 @@ use cats_api::runtime_reconciliation::{
     Sequence, SessionBinding, StableState, UnixMillis, VolumeAuthorityEvidence, WireU64,
     DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
 };
-use cats_storage::authority::{DeleteCompletionReceipt, VolumeAdminState, VolumeDurability};
+use cats_storage::authority::{
+    DeleteCompletionReceipt, Generation, VolumeAdminState, VolumeDurability,
+};
 use postgres::{Row, Transaction};
 
 use super::pg_codec::PgBigInt;
@@ -2540,14 +2542,15 @@ fn active_volume_evidence_matches(
     volume: &cats_storage::authority::VolumeRecord,
     desired: &DesiredRuntimeSpec,
 ) -> bool {
+    // Suspended retains the exact active writer and its local lineage. A
+    // Relaxed volume may therefore retain an unpublished local tail (L > R),
+    // unlike the released Cold/Deleted evidence checked separately below.
     let durable_generation_matches =
         |lineage: &cats_api::runtime_reconciliation::LocalVolumeLineage| {
-            if desired.target == RuntimeTarget::Suspended {
-                lineage.local_durable_generation == lineage.remote_durable_generation
-                    && lineage.pending_pack_count.get() == 0
-            } else {
-                lineage.local_durable_generation >= lineage.remote_durable_generation
-            }
+            active_lineage_generations_match(
+                lineage.local_durable_generation,
+                lineage.remote_durable_generation,
+            )
         };
     let lineage_matches = observed.local_lineages.len() == 1
         && observed.local_lineages.first().is_some_and(|lineage| {
@@ -2605,6 +2608,18 @@ fn active_volume_evidence_matches(
         && devices_match
         && blockd_count == 1
         && runtime.processes.len() == desired.volumes.len() + 1
+}
+
+fn active_lineage_generations_match(local: Generation, remote: Generation) -> bool {
+    local >= remote
+}
+
+#[cfg(test)]
+pub(super) fn active_lineage_generations_match_for_test(
+    local: Generation,
+    remote: Generation,
+) -> bool {
+    active_lineage_generations_match(local, remote)
 }
 
 fn cold_volume_evidence_matches(

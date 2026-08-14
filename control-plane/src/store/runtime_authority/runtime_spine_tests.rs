@@ -33,6 +33,7 @@ use cats_api::runtime_reconciliation::{
     RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState, UnixMillis,
     WarmSnapshotEvidence, WireU64,
 };
+use cats_storage::authority::Generation;
 
 use super::placement_policy::insert_policy_on_store_for_test;
 use super::product::{CatRecord, EndpointRecord, HostnameDesiredLookup};
@@ -42,9 +43,9 @@ use super::product_rows::{
 use super::route_signer::{RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection};
 use super::rows::database_now;
 use super::runtime_spine::{
-    lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
-    PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection, RuntimeSpineOutcome,
-    RuntimeSpineRejection,
+    active_lineage_generations_match_for_test, lock_placement_admission_for_desired_mutation,
+    PlacementAdmissionLoad, PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection,
+    RuntimeSpineOutcome, RuntimeSpineRejection,
 };
 use crate::store::agent_sessions::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy};
 use crate::store::AuthorityRequestContext;
@@ -79,6 +80,14 @@ fn boot(value: u128) -> NodeBootId {
 
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
+}
+
+#[test]
+fn suspended_active_lineage_retains_a_relaxed_local_tail() {
+    let remote = Generation::new(4).unwrap();
+    let local = Generation::new(5).unwrap();
+    assert!(active_lineage_generations_match_for_test(local, remote));
+    assert!(!active_lineage_generations_match_for_test(remote, local));
 }
 
 fn release() -> GuestRuntimeProfileReceipt {
