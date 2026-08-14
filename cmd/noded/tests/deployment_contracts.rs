@@ -2109,22 +2109,17 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         "guard must name all runtime pids and the journal hazard: {stderr}"
     );
 
-    for installer_path in [
-        "deploy/aws/metal/install-worker.sh",
-        "deploy/metal/install.sh",
+    for (installer_path, service, expected_guard_count) in [
+        ("deploy/aws/metal/install-worker.sh", "cats-worker", 1),
+        ("deploy/metal/install.sh", "cats-noded", 2),
     ] {
         let installer = read_workspace_file(installer_path);
-        let early_guard = installer
+        let first_guard = installer
             .find("require-idle-worker.sh\"")
             .unwrap_or_else(|| panic!("{installer_path} lost its physical idle guard"));
         let lock = installer
             .find("cats_acquire_worker_deployment_lock")
             .unwrap_or_else(|| panic!("{installer_path} lost its deployment lock"));
-        let service = if installer_path == "deploy/metal/install.sh" {
-            "cats-noded"
-        } else {
-            "cats-worker"
-        };
         let locked_metering = installer[lock..]
             .find(&format!(
                 "metering_root=$(cats_worker_metering_root {service})"
@@ -2139,9 +2134,24 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             .find("cats_gate_node_service")
             .map(|offset| locked_guard + offset)
             .unwrap_or_else(|| panic!("{installer_path} lost its masked stop boundary"));
+        assert_eq!(
+            installer.matches("require-idle-worker.sh\"").count(),
+            expected_guard_count,
+            "{installer_path} has an unexpected number of physical idle checks"
+        );
+        if expected_guard_count == 1 {
+            assert_eq!(
+                first_guard, locked_guard,
+                "{installer_path} must keep its sole authoritative physical idle check under the Host lock"
+            );
+        } else {
+            assert!(
+                first_guard < lock,
+                "{installer_path} must retain its unlocked, non-mutating idle preflight"
+            );
+        }
         assert!(
-            early_guard < lock
-                && lock < locked_metering
+            lock < locked_metering
                 && locked_metering < locked_guard
                 && locked_guard < stop,
             "{installer_path} must re-prove physical idle under the lock immediately before stopping"
