@@ -72,8 +72,36 @@ variable "gateway_replicas" {
 }
 
 variable "route_v2_control_artifact_secret_name" {
-  description = "Pre-created immutable Kubernetes Secret name for the closed seven-file Control Route v2 artifact set."
+  description = "Pre-created immutable Kubernetes Secret name for the closed eight-file Control Route v2 artifact set."
   type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_control_artifact_secret_name)) &&
+      endswith(var.route_v2_control_artifact_secret_name, "-r${var.route_v2_control_artifact_signer_revision}")
+    )
+    error_message = "route_v2_control_artifact_secret_name must end in the exact positive signer revision suffix."
+  }
+}
+
+variable "route_v2_control_artifact_signer_revision" {
+  description = "Positive signer revision encoded by the staged Control descriptor and immutable Secret name."
+  type        = number
+
+  validation {
+    condition     = var.route_v2_control_artifact_signer_revision > 0 && floor(var.route_v2_control_artifact_signer_revision) == var.route_v2_control_artifact_signer_revision
+    error_message = "route_v2_control_artifact_signer_revision must be a positive integer."
+  }
+}
+
+variable "route_v2_control_artifact_secret_sha256" {
+  description = "Canonical digest of the reviewed immutable Control Secret manifest; no secret bytes."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.route_v2_control_artifact_secret_sha256))
+    error_message = "route_v2_control_artifact_secret_sha256 must be canonical sha256:<64-lowerhex>."
+  }
 }
 
 variable "route_v2_gateway_artifact_secret_name" {

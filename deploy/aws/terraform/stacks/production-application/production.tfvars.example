@@ -25,6 +25,8 @@ gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control
 # before planning. They must be immutable and have exactly the documented
 # closed key sets; Terraform receives only their opaque names.
 route_v2_control_artifact_secret_name = "cats-route-v2-control-r1"
+route_v2_control_artifact_signer_revision = 1
+route_v2_control_artifact_secret_sha256 = "sha256:REPLACE_WITH_CONTROL_SECRET_MANIFEST_64_LOWERHEX"
 route_v2_gateway_artifact_secret_name = "cats-route-v2-gateway-r1"
 endpoint_wildcard_host                = "*.cats.run"
 chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"

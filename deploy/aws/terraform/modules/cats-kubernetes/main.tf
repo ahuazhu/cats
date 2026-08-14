@@ -63,6 +63,18 @@ locals {
   )
 }
 
+# This state/plan object is deliberately non-secret. It makes a reviewed saved
+# plan bind the immutable Secret identity, manifest digest, and descriptor
+# revision as one rollout coordinate; the secret-channel bytes never enter
+# Terraform state.
+resource "terraform_data" "route_v2_control_artifact" {
+  input = {
+    secret_name     = var.route_v2_control_artifact_secret_name
+    secret_sha256   = var.route_v2_control_artifact_secret_sha256
+    signer_revision = var.route_v2_control_artifact_signer_revision
+  }
+}
+
 check "public_target_drain_fits_termination_grace" {
   assert {
     condition     = local.public_target_pre_stop_delay_seconds + 30 <= local.public_target_termination_grace_period_seconds
@@ -242,11 +254,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256"           = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
-          "cats.run/route-v2-control-artifact-secret" = var.route_v2_control_artifact_secret_name
-          "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
-          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"                   = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256"                  = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/route-v2-control-artifact-secret"        = terraform_data.route_v2_control_artifact.output.secret_name
+          "cats.run/route-v2-control-artifact-secret-sha256" = terraform_data.route_v2_control_artifact.output.secret_sha256
+          "cats.run/route-v2-control-signer-revision"        = tostring(terraform_data.route_v2_control_artifact.output.signer_revision)
+          "cats.run/runtime-provisioner-trust-sha256"        = sha256(var.runtime_provisioner_trust_bundle_json)
+          "cats.run/rds-ca-sha256"                           = sha256(local.rds_ca_pem)
         }
       }
 
@@ -533,7 +547,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
           name = "route-v2-control-artifact-source"
 
           secret {
-            secret_name  = var.route_v2_control_artifact_secret_name
+            secret_name  = terraform_data.route_v2_control_artifact.output.secret_name
             default_mode = "0400"
             optional     = false
           }

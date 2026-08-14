@@ -52,15 +52,35 @@ variable "gateway_replicas" {
 }
 
 variable "route_v2_control_artifact_secret_name" {
-  description = "Name of a pre-created immutable Kubernetes Secret containing the exact seven-file Control Route v2 artifact set. Terraform never receives its bytes."
+  description = "Name of a pre-created immutable Kubernetes Secret containing the exact eight-file Control Route v2 artifact set. Terraform never receives its bytes."
   type        = string
 
   validation {
     condition = (
       can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_control_artifact_secret_name)) &&
-      endswith(var.route_v2_control_artifact_secret_name, "-r1")
+      endswith(var.route_v2_control_artifact_secret_name, "-r${var.route_v2_control_artifact_signer_revision}")
     )
-    error_message = "route_v2_control_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in -r1; rotation is outside the initial G2 deployment contract."
+    error_message = "route_v2_control_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in the exact positive -r<route_v2_control_artifact_signer_revision> suffix."
+  }
+}
+
+variable "route_v2_control_artifact_signer_revision" {
+  description = "Positive signer revision encoded by the staged Control descriptor and immutable Secret name."
+  type        = number
+
+  validation {
+    condition     = var.route_v2_control_artifact_signer_revision > 0 && floor(var.route_v2_control_artifact_signer_revision) == var.route_v2_control_artifact_signer_revision
+    error_message = "route_v2_control_artifact_signer_revision must be a positive integer."
+  }
+}
+
+variable "route_v2_control_artifact_secret_sha256" {
+  description = "Canonical sha256:<64-lowerhex> digest of the reviewed immutable Control Secret manifest; never secret bytes."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.route_v2_control_artifact_secret_sha256))
+    error_message = "route_v2_control_artifact_secret_sha256 must be canonical sha256:<64-lowerhex>."
   }
 }
 

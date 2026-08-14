@@ -274,6 +274,8 @@ export TF_VAR_stripe_webhook_secret='whsec_...'
 # Opaque names of pre-created immutable Secrets; their Route v2 bytes never
 # become Terraform inputs or state.
 export TF_VAR_route_v2_control_artifact_secret_name='cats-route-v2-control-r1'
+export TF_VAR_route_v2_control_artifact_signer_revision='1'
+export TF_VAR_route_v2_control_artifact_secret_sha256='sha256:REPLACE_WITH_CONTROL_SECRET_MANIFEST_64_LOWERHEX'
 export TF_VAR_route_v2_gateway_artifact_secret_name='cats-route-v2-gateway-r1'
 
 cd deploy/aws/terraform/stacks/production-application
