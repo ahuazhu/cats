@@ -2795,53 +2795,95 @@ ALTER TABLE node_identities
         node_id, credential_id, public_key_spki_sha256, state)
     ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
 CREATE TABLE IF NOT EXISTS object_write_authorities (
-    writer_authority_id TEXT PRIMARY KEY,
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    writer_authority_id TEXT
+        CONSTRAINT object_write_authorities_pkey PRIMARY KEY,
+    record JSONB NOT NULL
+        CONSTRAINT object_write_authorities_record_object_check
+        CHECK (jsonb_typeof(record) = 'object'),
     host_provider TEXT NOT NULL,
     host_partition TEXT NOT NULL,
     host_account_id TEXT NOT NULL,
     host_region TEXT NOT NULL,
     immutable_host_id TEXT NOT NULL,
-    node_id TEXT NOT NULL REFERENCES node_identities(node_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    node_id TEXT NOT NULL
+        CONSTRAINT object_write_authorities_node_id_fkey
+        REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     object_provider TEXT NOT NULL,
     object_partition TEXT NOT NULL,
     object_account_id TEXT NOT NULL,
     object_region TEXT NOT NULL,
     workload_principal_id TEXT NOT NULL,
     object_store_scope_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (
+    state TEXT NOT NULL
+        CONSTRAINT object_write_authorities_state_check CHECK (
         state IN ('open', 'cutoff_pending', 'cutoff_complete')
     ),
-    max_accepted_sequence BIGINT NOT NULL CHECK (max_accepted_sequence >= 0),
-    terminal_prefix_sequence BIGINT NOT NULL CHECK (
+    max_accepted_sequence BIGINT NOT NULL
+        CONSTRAINT object_write_authorities_max_sequence_check
+        CHECK (max_accepted_sequence >= 0),
+    terminal_prefix_sequence BIGINT NOT NULL
+        CONSTRAINT object_write_authorities_terminal_prefix_sequence_check CHECK (
         terminal_prefix_sequence >= 0
         AND terminal_prefix_sequence <= max_accepted_sequence
     ),
     terminal_prefix_sha256 TEXT NOT NULL
+        CONSTRAINT object_write_authorities_terminal_prefix_digest_check
         CHECK (terminal_prefix_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     fence_attempt_id TEXT,
-    cutoff_effective_at_unix_ms BIGINT CHECK (cutoff_effective_at_unix_ms >= 0),
-    cutoff_sequence BIGINT CHECK (cutoff_sequence >= 0),
-    cutoff_receipt JSONB CHECK (
+    cutoff_effective_at_unix_ms BIGINT
+        CONSTRAINT object_write_authorities_cutoff_time_check
+        CHECK (cutoff_effective_at_unix_ms >= 0),
+    cutoff_sequence BIGINT
+        CONSTRAINT object_write_authorities_cutoff_sequence_check
+        CHECK (cutoff_sequence >= 0),
+    cutoff_receipt JSONB
+        CONSTRAINT object_write_authorities_cutoff_receipt_check CHECK (
         cutoff_receipt IS NULL OR jsonb_typeof(cutoff_receipt) = 'object'
     ),
-    UNIQUE (
+    CONSTRAINT object_write_authorities_host_lineage_key UNIQUE (
         host_provider, host_partition, host_account_id, host_region,
         immutable_host_id, writer_authority_id
     ),
-    CHECK (
+    CONSTRAINT object_write_authorities_record_projection_check CHECK (
+        record #>> '{writer,authority_id}' = writer_authority_id
+        AND record #>> '{writer,host_provider_scope,provider}' = host_provider
+        AND record #>> '{writer,host_provider_scope,partition}' = host_partition
+        AND record #>> '{writer,host_provider_scope,account_id}' = host_account_id
+        AND record #>> '{writer,host_provider_scope,region}' = host_region
+        AND record #>> '{writer,immutable_host_id}' = immutable_host_id
+        AND record #>> '{writer,node_id}' = node_id
+        AND record #>> '{writer,object_provider_scope,provider}' = object_provider
+        AND record #>> '{writer,object_provider_scope,partition}' = object_partition
+        AND record #>> '{writer,object_provider_scope,account_id}' = object_account_id
+        AND record #>> '{writer,object_provider_scope,region}' = object_region
+        AND record #>> '{writer,workload_principal_id}' = workload_principal_id
+        AND record #>> '{writer,object_store_scope_id}' = object_store_scope_id
+        AND record #>> '{state,kind}' = state
+        AND record #>> '{max_accepted_sequence}' = max_accepted_sequence::TEXT
+        AND record #>> '{terminal_prefix_sequence}' = terminal_prefix_sequence::TEXT
+        AND record #>> '{terminal_prefix_sha256}' = terminal_prefix_sha256
+    ),
+    CONSTRAINT object_write_authorities_state_shape_check CHECK (
         (state = 'open' AND fence_attempt_id IS NULL
             AND cutoff_effective_at_unix_ms IS NULL
             AND cutoff_sequence IS NULL AND cutoff_receipt IS NULL) OR
         (state = 'cutoff_pending' AND fence_attempt_id IS NOT NULL
             AND cutoff_effective_at_unix_ms IS NOT NULL
             AND cutoff_sequence = max_accepted_sequence
+            AND record #>> '{state,fence_attempt_id}' = fence_attempt_id
+            AND record #>> '{state,cutoff_effective_at_unix_ms}' =
+                cutoff_effective_at_unix_ms::TEXT
+            AND record #>> '{state,cutoff_sequence}' = cutoff_sequence::TEXT
             AND cutoff_receipt IS NULL) OR
         (state = 'cutoff_complete' AND fence_attempt_id IS NOT NULL
             AND cutoff_effective_at_unix_ms IS NOT NULL
             AND cutoff_sequence = max_accepted_sequence
             AND terminal_prefix_sequence = cutoff_sequence
+            AND record #>> '{state,receipt,fence_attempt_id}' = fence_attempt_id
+            AND record #>> '{state,receipt,cutoff_effective_at_unix_ms}' =
+                cutoff_effective_at_unix_ms::TEXT
+            AND record #>> '{state,receipt,cutoff_sequence}' = cutoff_sequence::TEXT
+            AND record #> '{state,receipt}' = cutoff_receipt
             AND cutoff_receipt IS NOT NULL)
     )
 );
@@ -2854,49 +2896,104 @@ CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_open_authority_per_host
 CREATE INDEX IF NOT EXISTS object_write_authorities_node_state
     ON object_write_authorities(node_id, state);
 CREATE TABLE IF NOT EXISTS object_write_credentials (
-    credential_id TEXT PRIMARY KEY,
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
-    public_key_spki TEXT NOT NULL CHECK (
+    credential_id TEXT
+        CONSTRAINT object_write_credentials_pkey PRIMARY KEY,
+    record JSONB NOT NULL
+        CONSTRAINT object_write_credentials_record_object_check
+        CHECK (jsonb_typeof(record) = 'object'),
+    public_key_spki TEXT NOT NULL
+        CONSTRAINT object_write_credentials_public_key_spki_check CHECK (
         octet_length(public_key_spki) BETWEEN 1 AND 512
         AND public_key_spki ~ '^[A-Za-z0-9_-]+$'
     ),
-    public_key_spki_sha256 TEXT NOT NULL UNIQUE
+    public_key_spki_sha256 TEXT NOT NULL
+        CONSTRAINT object_write_credentials_public_key_digest_key UNIQUE
+        CONSTRAINT object_write_credentials_public_key_digest_check
         CHECK (public_key_spki_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    writer_authority_id TEXT NOT NULL REFERENCES object_write_authorities(writer_authority_id)
+    writer_authority_id TEXT NOT NULL
+        CONSTRAINT object_write_credentials_writer_authority_id_fkey
+        REFERENCES object_write_authorities(writer_authority_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     host_provider TEXT NOT NULL,
     host_partition TEXT NOT NULL,
     host_account_id TEXT NOT NULL,
     host_region TEXT NOT NULL,
     immutable_host_id TEXT NOT NULL,
-    node_id TEXT NOT NULL REFERENCES node_identities(node_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    node_boot_id TEXT NOT NULL CHECK (node_boot_id ~ '^[0-9a-f]{32}$'),
-    agent_instance_id TEXT NOT NULL CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
-    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
+    node_id TEXT NOT NULL
+        CONSTRAINT object_write_credentials_node_id_fkey
+        REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    node_boot_id TEXT NOT NULL
+        CONSTRAINT object_write_credentials_node_boot_id_check
+        CHECK (node_boot_id ~ '^[0-9a-f]{32}$'),
+    agent_instance_id TEXT NOT NULL
+        CONSTRAINT object_write_credentials_agent_instance_id_check
+        CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
+    agent_session_epoch BIGINT NOT NULL
+        CONSTRAINT object_write_credentials_agent_epoch_check
+        CHECK (agent_session_epoch > 0),
     volume_id TEXT NOT NULL,
     attachment_id TEXT NOT NULL,
-    attachment_epoch BIGINT NOT NULL CHECK (attachment_epoch > 0),
-    private_artifact_id TEXT NOT NULL UNIQUE,
+    attachment_epoch BIGINT NOT NULL
+        CONSTRAINT object_write_credentials_attachment_epoch_check
+        CHECK (attachment_epoch > 0),
+    private_artifact_id TEXT NOT NULL
+        CONSTRAINT object_write_credentials_private_artifact_key UNIQUE,
     private_file_fsync_receipt_id TEXT NOT NULL,
     private_directory_fsync_receipt_id TEXT NOT NULL,
-    registered_at_unix_ms BIGINT NOT NULL CHECK (registered_at_unix_ms >= 0),
-    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
-    retirement_kind TEXT CHECK (retirement_kind IN ('parent_cutoff', 'exact_release')),
+    registered_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT object_write_credentials_registered_time_check
+        CHECK (registered_at_unix_ms >= 0),
+    state TEXT NOT NULL
+        CONSTRAINT object_write_credentials_state_check
+        CHECK (state IN ('active', 'retired')),
+    retirement_kind TEXT
+        CONSTRAINT object_write_credentials_retirement_kind_check
+        CHECK (retirement_kind IN ('parent_cutoff', 'exact_release')),
     retirement_transition_id TEXT,
     retirement_receipt_id TEXT,
-    retired_at_unix_ms BIGINT CHECK (retired_at_unix_ms >= registered_at_unix_ms),
-    UNIQUE (
+    retired_at_unix_ms BIGINT
+        CONSTRAINT object_write_credentials_retired_time_check
+        CHECK (retired_at_unix_ms >= registered_at_unix_ms),
+    CONSTRAINT object_write_credentials_attachment_lineage_key UNIQUE (
         writer_authority_id, volume_id, attachment_id, attachment_epoch,
         credential_id
     ),
-    CHECK (
+    CONSTRAINT object_write_credentials_record_projection_check CHECK (
+        record #>> '{credential,credential_id}' = credential_id
+        AND record #>> '{credential,public_key_spki_sha256}' = public_key_spki_sha256
+        AND record #>> '{public_key_spki}' = public_key_spki
+        AND record #>> '{writer_authority_id}' = writer_authority_id
+        AND record #>> '{host_provider_scope,provider}' = host_provider
+        AND record #>> '{host_provider_scope,partition}' = host_partition
+        AND record #>> '{host_provider_scope,account_id}' = host_account_id
+        AND record #>> '{host_provider_scope,region}' = host_region
+        AND record #>> '{immutable_host_id}' = immutable_host_id
+        AND record #>> '{node_id}' = node_id
+        AND record #>> '{node_boot_id}' = node_boot_id
+        AND record #>> '{agent_instance_id}' = agent_instance_id
+        AND record #>> '{agent_session_epoch}' = agent_session_epoch::TEXT
+        AND record #>> '{volume_id}' = volume_id
+        AND record #>> '{attachment_id}' = attachment_id
+        AND record #>> '{attachment_epoch}' = attachment_epoch::TEXT
+        AND record #>> '{private_artifact_id}' = private_artifact_id
+        AND record #>> '{private_file_fsync_receipt_id}' = private_file_fsync_receipt_id
+        AND record #>> '{private_directory_fsync_receipt_id}' = private_directory_fsync_receipt_id
+        AND record #>> '{registered_at_unix_ms}' = registered_at_unix_ms::TEXT
+        AND record #>> '{state,kind}' = state
+    ),
+    CONSTRAINT object_write_credentials_state_shape_check CHECK (
         (state = 'active' AND retirement_kind IS NULL
             AND retirement_transition_id IS NULL
             AND retirement_receipt_id IS NULL AND retired_at_unix_ms IS NULL) OR
         (state = 'retired' AND retirement_kind IS NOT NULL
             AND retirement_transition_id IS NOT NULL
-            AND retirement_receipt_id IS NOT NULL AND retired_at_unix_ms IS NOT NULL)
+            AND retirement_receipt_id IS NOT NULL AND retired_at_unix_ms IS NOT NULL
+            AND record #>> '{state,cause,kind}' = retirement_kind
+            AND COALESCE(record #>> '{state,cause,fence_attempt_id}',
+                         record #>> '{state,cause,release_transition_id}') =
+                retirement_transition_id
+            AND record #>> '{state,retirement_receipt_id}' = retirement_receipt_id
+            AND record #>> '{state,retired_at_unix_ms}' = retired_at_unix_ms::TEXT)
     )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_active_credential_per_attachment
@@ -2906,79 +3003,230 @@ CREATE UNIQUE INDEX IF NOT EXISTS object_write_one_active_credential_per_attachm
 CREATE INDEX IF NOT EXISTS object_write_credentials_parent_state
     ON object_write_credentials(writer_authority_id, state, credential_id COLLATE \"C\");
 CREATE TABLE IF NOT EXISTS object_write_attempts (
-    request_id TEXT PRIMARY KEY CHECK (request_id ~ '^sha256:[0-9a-f]{64}$'),
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
-    writer_authority_id TEXT NOT NULL REFERENCES object_write_authorities(writer_authority_id)
+    request_id TEXT
+        CONSTRAINT object_write_attempts_pkey PRIMARY KEY
+        CONSTRAINT object_write_attempts_request_id_check
+        CHECK (request_id ~ '^sha256:[0-9a-f]{64}$'),
+    record JSONB NOT NULL
+        CONSTRAINT object_write_attempts_record_object_check
+        CHECK (jsonb_typeof(record) = 'object'),
+    writer_authority_id TEXT NOT NULL
+        CONSTRAINT object_write_attempts_writer_authority_id_fkey
+        REFERENCES object_write_authorities(writer_authority_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
-    credential_id TEXT NOT NULL REFERENCES object_write_credentials(credential_id)
+    credential_id TEXT NOT NULL
+        CONSTRAINT object_write_attempts_credential_id_fkey
+        REFERENCES object_write_credentials(credential_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     volume_id TEXT NOT NULL,
-    key_kind TEXT NOT NULL CHECK (key_kind IN ('volume_data', 'volume_map', 'volume_commit')),
+    key_kind TEXT NOT NULL
+        CONSTRAINT object_write_attempts_key_kind_check
+        CHECK (key_kind IN ('volume_data', 'volume_map', 'volume_commit')),
     object_provider TEXT NOT NULL,
     object_partition TEXT NOT NULL,
     object_account_id TEXT NOT NULL,
     object_region TEXT NOT NULL,
     object_store_scope_id TEXT NOT NULL,
     object_key TEXT NOT NULL,
-    content_sha256 TEXT NOT NULL CHECK (content_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    content_length BIGINT NOT NULL CHECK (content_length BETWEEN 0 AND 33554432),
-    receiving_started_at_unix_ms BIGINT NOT NULL CHECK (receiving_started_at_unix_ms >= 0),
-    state TEXT NOT NULL CHECK (state IN (
+    content_sha256 TEXT NOT NULL
+        CONSTRAINT object_write_attempts_content_digest_check
+        CHECK (content_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    content_length BIGINT NOT NULL
+        CONSTRAINT object_write_attempts_content_length_check
+        CHECK (content_length BETWEEN 0 AND 33554432),
+    receiving_started_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT object_write_attempts_receiving_time_check
+        CHECK (receiving_started_at_unix_ms >= 0),
+    state TEXT NOT NULL
+        CONSTRAINT object_write_attempts_state_check CHECK (state IN (
         'receiving', 'durable_spooled', 'rejected_before_accept',
         'accepted_spooled', 'provider_issued', 'terminal_visible',
         'permanent', 'spool_removed'
     )),
-    spool_id TEXT CHECK (spool_id ~ '^owsp1_[0-9a-f]{64}$'),
+    spool_id TEXT
+        CONSTRAINT object_write_attempts_spool_id_check
+        CHECK (spool_id ~ '^owsp1_[0-9a-f]{64}$'),
     spool_file_fsync_receipt_id TEXT,
     spool_directory_fsync_receipt_id TEXT,
-    spool_durable_at_unix_ms BIGINT CHECK (
+    spool_durable_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_spool_time_check CHECK (
         spool_durable_at_unix_ms >= receiving_started_at_unix_ms
     ),
+    rejection_kind TEXT
+        CONSTRAINT object_write_attempts_rejection_kind_check
+        CHECK (rejection_kind IN ('writer_closed', 'object_key_conflict')),
     rejection_receipt_id TEXT,
-    rejected_at_unix_ms BIGINT CHECK (rejected_at_unix_ms >= spool_durable_at_unix_ms),
-    accepted_sequence BIGINT CHECK (accepted_sequence > 0),
-    accepted_at_unix_ms BIGINT CHECK (accepted_at_unix_ms >= spool_durable_at_unix_ms),
-    provider_attempt_id TEXT CHECK (provider_attempt_id ~ '^owpa1_[0-9a-f]{64}$'),
-    provider_issued_at_unix_ms BIGINT CHECK (provider_issued_at_unix_ms >= accepted_at_unix_ms),
-    terminal_kind TEXT CHECK (terminal_kind IN ('succeeded_visible', 'permanently_failed')),
+    rejected_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_rejected_time_check
+        CHECK (rejected_at_unix_ms >= spool_durable_at_unix_ms),
+    accepted_sequence BIGINT
+        CONSTRAINT object_write_attempts_accepted_sequence_check
+        CHECK (accepted_sequence > 0),
+    accepted_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_accepted_time_check
+        CHECK (accepted_at_unix_ms >= spool_durable_at_unix_ms),
+    provider_attempt_id TEXT
+        CONSTRAINT object_write_attempts_provider_attempt_id_check
+        CHECK (provider_attempt_id ~ '^owpa1_[0-9a-f]{64}$'),
+    provider_issued_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_provider_issued_time_check
+        CHECK (provider_issued_at_unix_ms >= accepted_at_unix_ms),
+    terminal_kind TEXT
+        CONSTRAINT object_write_attempts_terminal_kind_check
+        CHECK (terminal_kind IN ('succeeded_visible', 'permanently_failed')),
     put_receipt_id TEXT,
-    put_completed_at_unix_ms BIGINT CHECK (put_completed_at_unix_ms >= provider_issued_at_unix_ms),
+    put_completed_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_put_completed_time_check
+        CHECK (put_completed_at_unix_ms >= provider_issued_at_unix_ms),
     visibility_receipt_id TEXT,
-    visible_at_unix_ms BIGINT CHECK (visible_at_unix_ms >= put_completed_at_unix_ms),
+    visible_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_visible_time_check
+        CHECK (visible_at_unix_ms >= put_completed_at_unix_ms),
     failure_receipt_id TEXT,
-    failed_at_unix_ms BIGINT CHECK (failed_at_unix_ms >= provider_issued_at_unix_ms),
+    failed_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_failed_time_check
+        CHECK (failed_at_unix_ms >= provider_issued_at_unix_ms),
     spool_removal_receipt_id TEXT,
-    spool_removed_at_unix_ms BIGINT CHECK (
+    spool_removed_at_unix_ms BIGINT
+        CONSTRAINT object_write_attempts_spool_removed_time_check CHECK (
         spool_removed_at_unix_ms >= COALESCE(visible_at_unix_ms, failed_at_unix_ms)
     ),
-    CHECK (
+    CONSTRAINT object_write_attempts_phase_shape_check CHECK (
         (state = 'receiving' AND spool_id IS NULL AND accepted_sequence IS NULL) OR
         (state = 'durable_spooled' AND spool_id IS NOT NULL
             AND spool_file_fsync_receipt_id IS NOT NULL
             AND spool_directory_fsync_receipt_id IS NOT NULL
-            AND spool_durable_at_unix_ms IS NOT NULL AND accepted_sequence IS NULL) OR
+            AND spool_durable_at_unix_ms IS NOT NULL
+            AND rejection_kind IS NULL AND accepted_sequence IS NULL) OR
         (state = 'rejected_before_accept' AND spool_id IS NOT NULL
+            AND spool_file_fsync_receipt_id IS NOT NULL
+            AND spool_directory_fsync_receipt_id IS NOT NULL
+            AND spool_durable_at_unix_ms IS NOT NULL
+            AND rejection_kind IS NOT NULL
             AND rejection_receipt_id IS NOT NULL AND rejected_at_unix_ms IS NOT NULL
             AND accepted_sequence IS NULL AND provider_attempt_id IS NULL) OR
         (state IN ('accepted_spooled', 'provider_issued', 'terminal_visible', 'permanent', 'spool_removed')
-            AND spool_id IS NOT NULL AND accepted_sequence IS NOT NULL
+            AND spool_id IS NOT NULL
+            AND spool_file_fsync_receipt_id IS NOT NULL
+            AND spool_directory_fsync_receipt_id IS NOT NULL
+            AND spool_durable_at_unix_ms IS NOT NULL
+            AND rejection_kind IS NULL AND rejection_receipt_id IS NULL
+            AND rejected_at_unix_ms IS NULL AND accepted_sequence IS NOT NULL
             AND accepted_at_unix_ms IS NOT NULL AND provider_attempt_id IS NOT NULL)
     ),
+    CONSTRAINT object_write_attempts_provider_issue_shape_check
     CHECK ((state IN ('provider_issued', 'terminal_visible', 'permanent', 'spool_removed'))
         = (provider_issued_at_unix_ms IS NOT NULL)),
+    CONSTRAINT object_write_attempts_visible_terminal_shape_check
     CHECK ((terminal_kind = 'succeeded_visible') =
         (put_receipt_id IS NOT NULL AND put_completed_at_unix_ms IS NOT NULL
          AND visibility_receipt_id IS NOT NULL AND visible_at_unix_ms IS NOT NULL)),
+    CONSTRAINT object_write_attempts_failure_terminal_shape_check
     CHECK ((terminal_kind = 'permanently_failed') =
         (failure_receipt_id IS NOT NULL AND failed_at_unix_ms IS NOT NULL)),
+    CONSTRAINT object_write_attempts_spool_removal_shape_check
     CHECK ((state = 'spool_removed') =
         (spool_removal_receipt_id IS NOT NULL AND spool_removed_at_unix_ms IS NOT NULL)),
-    CHECK (
+    CONSTRAINT object_write_attempts_terminal_state_shape_check CHECK (
         (state = 'terminal_visible' AND terminal_kind = 'succeeded_visible') OR
         (state = 'permanent' AND terminal_kind = 'permanently_failed') OR
         (state = 'spool_removed' AND terminal_kind IS NOT NULL) OR
         (state NOT IN ('terminal_visible', 'permanent', 'spool_removed')
             AND terminal_kind IS NULL)
+    ),
+    CONSTRAINT object_write_attempts_unused_fields_check CHECK (
+        (state = 'receiving'
+            AND spool_id IS NULL
+            AND spool_file_fsync_receipt_id IS NULL
+            AND spool_directory_fsync_receipt_id IS NULL
+            AND spool_durable_at_unix_ms IS NULL
+            AND rejection_kind IS NULL AND rejection_receipt_id IS NULL
+            AND rejected_at_unix_ms IS NULL
+            AND accepted_sequence IS NULL AND accepted_at_unix_ms IS NULL
+            AND provider_attempt_id IS NULL AND provider_issued_at_unix_ms IS NULL
+            AND terminal_kind IS NULL AND put_receipt_id IS NULL
+            AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state = 'durable_spooled'
+            AND rejection_kind IS NULL AND rejection_receipt_id IS NULL
+            AND rejected_at_unix_ms IS NULL
+            AND accepted_sequence IS NULL AND accepted_at_unix_ms IS NULL
+            AND provider_attempt_id IS NULL AND provider_issued_at_unix_ms IS NULL
+            AND terminal_kind IS NULL AND put_receipt_id IS NULL
+            AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state = 'rejected_before_accept'
+            AND accepted_sequence IS NULL AND accepted_at_unix_ms IS NULL
+            AND provider_attempt_id IS NULL AND provider_issued_at_unix_ms IS NULL
+            AND terminal_kind IS NULL AND put_receipt_id IS NULL
+            AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state = 'accepted_spooled'
+            AND provider_issued_at_unix_ms IS NULL AND terminal_kind IS NULL
+            AND put_receipt_id IS NULL AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state = 'provider_issued'
+            AND terminal_kind IS NULL
+            AND put_receipt_id IS NULL AND put_completed_at_unix_ms IS NULL
+            AND visibility_receipt_id IS NULL AND visible_at_unix_ms IS NULL
+            AND failure_receipt_id IS NULL AND failed_at_unix_ms IS NULL
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        (state IN ('terminal_visible', 'permanent')
+            AND spool_removal_receipt_id IS NULL AND spool_removed_at_unix_ms IS NULL) OR
+        state = 'spool_removed'
+    ),
+    CONSTRAINT object_write_attempts_record_projection_check CHECK (
+        COALESCE(record #>> '{ingress,request_id}',
+                 record #>> '{descriptor,request_id}') = request_id
+        AND COALESCE(record #>> '{ingress,writer_authority_id}',
+                     record #>> '{descriptor,writer_authority_id}') = writer_authority_id
+        AND COALESCE(record #>> '{ingress,volume_id}',
+                     record #>> '{descriptor,volume_id}') = volume_id
+        AND COALESCE(record #>> '{ingress,key,kind}',
+                     record #>> '{descriptor,key,kind}') = key_kind
+        AND COALESCE(record #>> '{ingress,target,object_provider_scope,provider}',
+                     record #>> '{descriptor,target,object_provider_scope,provider}') = object_provider
+        AND COALESCE(record #>> '{ingress,target,object_provider_scope,partition}',
+                     record #>> '{descriptor,target,object_provider_scope,partition}') = object_partition
+        AND COALESCE(record #>> '{ingress,target,object_provider_scope,account_id}',
+                     record #>> '{descriptor,target,object_provider_scope,account_id}') = object_account_id
+        AND COALESCE(record #>> '{ingress,target,object_provider_scope,region}',
+                     record #>> '{descriptor,target,object_provider_scope,region}') = object_region
+        AND COALESCE(record #>> '{ingress,target,object_store_scope_id}',
+                     record #>> '{descriptor,target,object_store_scope_id}') = object_store_scope_id
+        AND COALESCE(record #>> '{ingress,target,canonical_logical_key}',
+                     record #>> '{descriptor,target,canonical_logical_key}') = object_key
+        AND COALESCE(record #>> '{ingress,content_sha256}',
+                     record #>> '{descriptor,content_sha256}') = content_sha256
+        AND COALESCE(record #>> '{ingress,content_length}',
+                     record #>> '{descriptor,content_length}') = content_length::TEXT
+        AND (
+            (state IN ('receiving', 'durable_spooled', 'rejected_before_accept')
+                AND record #>> '{state,kind}' = state) OR
+            (state = 'accepted_spooled'
+                AND record #>> '{state,kind}' = 'accepted_spooled') OR
+            (state = 'provider_issued'
+                AND record #>> '{state,kind}' = 'provider_issued') OR
+            (state = 'terminal_visible'
+                AND record #>> '{state,kind}' = 'terminal'
+                AND record #>> '{state,outcome,kind}' = 'succeeded_visible'
+                AND record #>> '{state,spool,kind}' = 'retained') OR
+            (state = 'permanent'
+                AND record #>> '{state,kind}' = 'terminal'
+                AND record #>> '{state,outcome,kind}' = 'permanently_failed'
+                AND record #>> '{state,spool,kind}' = 'retained') OR
+            (state = 'spool_removed'
+                AND record #>> '{state,kind}' = 'terminal'
+                AND record #>> '{state,spool,kind}' = 'removed')
+        )
     )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS object_write_attempts_writer_sequence
@@ -2991,6 +3239,136 @@ CREATE INDEX IF NOT EXISTS object_write_attempts_terminal_prefix
     ON object_write_attempts(writer_authority_id, accepted_sequence)
     WHERE accepted_sequence IS NOT NULL
       AND state IN ('terminal_visible', 'permanent', 'spool_removed');
+CREATE OR REPLACE FUNCTION object_write_authority_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.writer_authority_id, OLD.host_provider, OLD.host_partition,
+        OLD.host_account_id, OLD.host_region, OLD.immutable_host_id,
+        OLD.node_id, OLD.object_provider, OLD.object_partition,
+        OLD.object_account_id, OLD.object_region, OLD.workload_principal_id,
+        OLD.object_store_scope_id)
+       IS DISTINCT FROM
+       (NEW.writer_authority_id, NEW.host_provider, NEW.host_partition,
+        NEW.host_account_id, NEW.host_region, NEW.immutable_host_id,
+        NEW.node_id, NEW.object_provider, NEW.object_partition,
+        NEW.object_account_id, NEW.object_region, NEW.workload_principal_id,
+        NEW.object_store_scope_id)
+       OR NEW.max_accepted_sequence < OLD.max_accepted_sequence
+       OR NEW.terminal_prefix_sequence < OLD.terminal_prefix_sequence
+       OR NEW.terminal_prefix_sequence > NEW.max_accepted_sequence
+       OR (NEW.terminal_prefix_sequence = OLD.terminal_prefix_sequence
+           AND NEW.terminal_prefix_sha256 IS DISTINCT FROM OLD.terminal_prefix_sha256)
+       OR (NEW.max_accepted_sequence > OLD.max_accepted_sequence AND NOT (
+            OLD.state = 'open' AND NEW.state = 'open'
+            AND NEW.max_accepted_sequence = OLD.max_accepted_sequence + 1))
+       OR NOT (
+            NEW.state = OLD.state
+            OR (OLD.state = 'open' AND NEW.state = 'cutoff_pending')
+            OR (OLD.state = 'cutoff_pending' AND NEW.state = 'cutoff_complete'))
+       OR (OLD.fence_attempt_id IS NOT NULL
+           AND OLD.fence_attempt_id IS DISTINCT FROM NEW.fence_attempt_id)
+       OR (OLD.cutoff_effective_at_unix_ms IS NOT NULL
+           AND (OLD.cutoff_effective_at_unix_ms, OLD.cutoff_sequence)
+               IS DISTINCT FROM
+               (NEW.cutoff_effective_at_unix_ms, NEW.cutoff_sequence))
+       OR (OLD.cutoff_receipt IS NOT NULL
+           AND OLD.cutoff_receipt IS DISTINCT FROM NEW.cutoff_receipt)
+    THEN
+        RAISE EXCEPTION 'invalid object-write authority transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER object_write_authority_transition_is_forward_only
+BEFORE UPDATE ON object_write_authorities FOR EACH ROW
+EXECUTE FUNCTION object_write_authority_transition_guard();
+CREATE OR REPLACE FUNCTION object_write_credential_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.credential_id, OLD.public_key_spki, OLD.public_key_spki_sha256,
+        OLD.writer_authority_id, OLD.host_provider, OLD.host_partition,
+        OLD.host_account_id, OLD.host_region, OLD.immutable_host_id,
+        OLD.node_id, OLD.node_boot_id, OLD.agent_instance_id,
+        OLD.agent_session_epoch, OLD.volume_id, OLD.attachment_id,
+        OLD.attachment_epoch, OLD.private_artifact_id,
+        OLD.private_file_fsync_receipt_id,
+        OLD.private_directory_fsync_receipt_id, OLD.registered_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.credential_id, NEW.public_key_spki, NEW.public_key_spki_sha256,
+        NEW.writer_authority_id, NEW.host_provider, NEW.host_partition,
+        NEW.host_account_id, NEW.host_region, NEW.immutable_host_id,
+        NEW.node_id, NEW.node_boot_id, NEW.agent_instance_id,
+        NEW.agent_session_epoch, NEW.volume_id, NEW.attachment_id,
+        NEW.attachment_epoch, NEW.private_artifact_id,
+        NEW.private_file_fsync_receipt_id,
+        NEW.private_directory_fsync_receipt_id, NEW.registered_at_unix_ms)
+       OR NOT (OLD.state = 'active' AND NEW.state = 'retired')
+    THEN
+        RAISE EXCEPTION 'invalid object-write credential transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER object_write_credential_transition_is_retirement_only
+BEFORE UPDATE ON object_write_credentials FOR EACH ROW
+EXECUTE FUNCTION object_write_credential_transition_guard();
+CREATE OR REPLACE FUNCTION object_write_attempt_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.request_id, OLD.writer_authority_id, OLD.credential_id,
+        OLD.volume_id, OLD.key_kind, OLD.object_provider,
+        OLD.object_partition, OLD.object_account_id, OLD.object_region,
+        OLD.object_store_scope_id, OLD.object_key, OLD.content_sha256,
+        OLD.content_length, OLD.receiving_started_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.request_id, NEW.writer_authority_id, NEW.credential_id,
+        NEW.volume_id, NEW.key_kind, NEW.object_provider,
+        NEW.object_partition, NEW.object_account_id, NEW.object_region,
+        NEW.object_store_scope_id, NEW.object_key, NEW.content_sha256,
+        NEW.content_length, NEW.receiving_started_at_unix_ms)
+       OR NOT (
+            (OLD.state = 'receiving' AND NEW.state = 'durable_spooled')
+            OR (OLD.state = 'durable_spooled'
+                AND NEW.state IN ('rejected_before_accept', 'accepted_spooled'))
+            OR (OLD.state = 'accepted_spooled' AND NEW.state = 'provider_issued')
+            OR (OLD.state = 'provider_issued'
+                AND NEW.state IN ('terminal_visible', 'permanent'))
+            OR (OLD.state IN ('terminal_visible', 'permanent')
+                AND NEW.state = 'spool_removed'))
+       OR (OLD.spool_id IS NOT NULL AND
+           (OLD.spool_id, OLD.spool_file_fsync_receipt_id,
+            OLD.spool_directory_fsync_receipt_id, OLD.spool_durable_at_unix_ms)
+           IS DISTINCT FROM
+           (NEW.spool_id, NEW.spool_file_fsync_receipt_id,
+            NEW.spool_directory_fsync_receipt_id, NEW.spool_durable_at_unix_ms))
+       OR (OLD.accepted_sequence IS NOT NULL AND
+           (OLD.accepted_sequence, OLD.accepted_at_unix_ms,
+            OLD.provider_attempt_id)
+           IS DISTINCT FROM
+           (NEW.accepted_sequence, NEW.accepted_at_unix_ms,
+            NEW.provider_attempt_id))
+       OR (OLD.provider_issued_at_unix_ms IS NOT NULL
+           AND OLD.provider_issued_at_unix_ms IS DISTINCT FROM
+               NEW.provider_issued_at_unix_ms)
+       OR (OLD.terminal_kind IS NOT NULL AND
+           (OLD.terminal_kind, OLD.put_receipt_id,
+            OLD.put_completed_at_unix_ms, OLD.visibility_receipt_id,
+            OLD.visible_at_unix_ms, OLD.failure_receipt_id,
+            OLD.failed_at_unix_ms)
+           IS DISTINCT FROM
+           (NEW.terminal_kind, NEW.put_receipt_id,
+            NEW.put_completed_at_unix_ms, NEW.visibility_receipt_id,
+            NEW.visible_at_unix_ms, NEW.failure_receipt_id,
+            NEW.failed_at_unix_ms))
+    THEN
+        RAISE EXCEPTION 'invalid object-write attempt transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER object_write_attempt_transition_is_forward_only
+BEFORE UPDATE ON object_write_attempts FOR EACH ROW
+EXECUTE FUNCTION object_write_attempt_transition_guard();
 CREATE OR REPLACE FUNCTION object_write_credential_parent_guard()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -3000,15 +3378,16 @@ BEGIN
           JOIN object_write_authorities authority
             ON authority.writer_authority_id = credential.writer_authority_id
          WHERE credential.writer_authority_id = NEW.writer_authority_id
-           AND (credential.host_provider, credential.host_partition,
-                credential.host_account_id, credential.host_region,
-                credential.immutable_host_id, credential.node_id)
-               IS DISTINCT FROM
-               (authority.host_provider, authority.host_partition,
-                authority.host_account_id, authority.host_region,
-                authority.immutable_host_id, authority.node_id)
-            OR credential.writer_authority_id = NEW.writer_authority_id
-           AND credential.state = 'active' AND authority.state <> 'open'
+           AND (
+                (credential.host_provider, credential.host_partition,
+                 credential.host_account_id, credential.host_region,
+                 credential.immutable_host_id, credential.node_id)
+                IS DISTINCT FROM
+                (authority.host_provider, authority.host_partition,
+                 authority.host_account_id, authority.host_region,
+                 authority.immutable_host_id, authority.node_id)
+                OR (credential.state = 'active' AND authority.state <> 'open')
+           )
     ) THEN
         RAISE EXCEPTION 'active object-write credential under closed parent authority';
     END IF;

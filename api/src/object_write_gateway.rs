@@ -510,7 +510,7 @@ fn registration_pop_frame(body: &[u8], credential_id: &str, public_key_spki: &st
 }
 
 const fn encoded_descriptor_maximum() -> usize {
-    ((OBJECT_WRITE_DESCRIPTOR_MAX_BYTES + 2) / 3) * 4
+    OBJECT_WRITE_DESCRIPTOR_MAX_BYTES.div_ceil(3) * 4
 }
 
 #[cfg(test)]

@@ -184,9 +184,17 @@ pub enum ObjectWriteIngressState {
     /// This body must never be sent to the object provider.
     RejectedBeforeAccept {
         spool: DurableObjectWriteSpoolReceipt,
+        reason: ObjectWriteRejectionReason,
         rejection_receipt_id: AsciiText,
         rejected_at_unix_ms: UnixMillis,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectWriteRejectionReason {
+    WriterClosed,
+    ObjectKeyConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +240,21 @@ pub enum ObjectPutState {
 pub struct ObjectPutAttempt {
     pub descriptor: ObjectPutDescriptor,
     pub state: ObjectPutState,
+}
+
+/// One persisted request across the provisional and accepted phases. The
+/// provisional variant is outside every cutoff prefix; only the accepted
+/// variant has an assigned writer sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredObjectWriteAttempt {
+    Ingress(ObjectWriteIngressAttempt),
+    Accepted(ObjectPutAttempt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectWriteAcceptanceOutcome {
+    Accepted(ObjectPutAttempt),
+    RejectedBeforeAccept(ObjectWriteIngressAttempt),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,6 +783,32 @@ fn terminal_at(outcome: &ObjectPutTerminalState) -> UnixMillis {
     }
 }
 
+/// Record that the exact request body is reopenable after a process or
+/// replica crash. This still does not assign an accepted sequence.
+pub fn mark_object_write_spool_durable(
+    ingress_attempt: &ObjectWriteIngressAttempt,
+    spool: DurableObjectWriteSpoolReceipt,
+) -> Result<ObjectWriteIngressAttempt, ObjectWriteAuthorityError> {
+    validate_object_write_ingress_attempt(ingress_attempt)?;
+    match &ingress_attempt.state {
+        ObjectWriteIngressState::Receiving => {}
+        ObjectWriteIngressState::DurableSpooled { spool: existing } if existing == &spool => {
+            return Ok(ingress_attempt.clone());
+        }
+        ObjectWriteIngressState::DurableSpooled { .. }
+        | ObjectWriteIngressState::RejectedBeforeAccept { .. } => {
+            return Err(ObjectWriteAuthorityError::StaleAttempt);
+        }
+    }
+    validate_ingress_spool_receipt(&spool, &ingress_attempt.ingress)?;
+    let updated = ObjectWriteIngressAttempt {
+        ingress: ingress_attempt.ingress.clone(),
+        state: ObjectWriteIngressState::DurableSpooled { spool },
+    };
+    validate_object_write_ingress_attempt(&updated)?;
+    Ok(updated)
+}
+
 /// Assign the accepted sequence only after the exact body has a stable,
 /// cross-replica durable spool receipt. The caller persists the returned
 /// authority and attempt in one transaction while holding the authority row
@@ -814,15 +863,135 @@ pub fn accept_durable_object_write(
     Ok((updated, attempt))
 }
 
+pub fn mark_object_write_provider_issued(
+    authority: &ObjectWriteAuthority,
+    attempt: &ObjectPutAttempt,
+    issued_at_unix_ms: UnixMillis,
+) -> Result<ObjectPutAttempt, ObjectWriteAuthorityError> {
+    validate_object_put_attempt(authority, attempt)?;
+    let ObjectPutState::AcceptedSpooled { spool } = &attempt.state else {
+        return match &attempt.state {
+            ObjectPutState::ProviderIssued { .. } => Ok(attempt.clone()),
+            _ => Err(ObjectWriteAuthorityError::InvalidTransition),
+        };
+    };
+    if issued_at_unix_ms < attempt.descriptor.accepted_at_unix_ms {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    let mut updated = attempt.clone();
+    updated.state = ObjectPutState::ProviderIssued {
+        spool: spool.clone(),
+        issued_at_unix_ms,
+    };
+    validate_object_put_attempt(authority, &updated)?;
+    Ok(updated)
+}
+
+pub fn complete_object_write_terminal(
+    authority: &ObjectWriteAuthority,
+    attempt: &ObjectPutAttempt,
+    outcome: ObjectPutTerminalState,
+) -> Result<ObjectPutAttempt, ObjectWriteAuthorityError> {
+    validate_object_put_attempt(authority, attempt)?;
+    if let ObjectPutState::Terminal {
+        outcome: existing, ..
+    } = &attempt.state
+    {
+        return if existing == &outcome {
+            Ok(attempt.clone())
+        } else {
+            Err(ObjectWriteAuthorityError::StaleAttempt)
+        };
+    }
+    let ObjectPutState::ProviderIssued {
+        spool,
+        issued_at_unix_ms,
+    } = &attempt.state
+    else {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    };
+    if terminal_at(&outcome) < *issued_at_unix_ms {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    let mut updated = attempt.clone();
+    updated.state = ObjectPutState::Terminal {
+        outcome,
+        spool: TerminalObjectWriteSpool::Retained {
+            spool: spool.clone(),
+        },
+    };
+    validate_object_put_attempt(authority, &updated)?;
+    Ok(updated)
+}
+
+pub fn mark_terminal_object_write_spool_removed(
+    authority: &ObjectWriteAuthority,
+    attempt: &ObjectPutAttempt,
+    removal_receipt_id: AsciiText,
+    removed_at_unix_ms: UnixMillis,
+) -> Result<ObjectPutAttempt, ObjectWriteAuthorityError> {
+    validate_object_put_attempt(authority, attempt)?;
+    let ObjectPutState::Terminal { outcome, spool } = &attempt.state else {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    };
+    if matches!(spool, TerminalObjectWriteSpool::Removed { .. }) {
+        return Ok(attempt.clone());
+    }
+    let TerminalObjectWriteSpool::Retained { spool } = spool else {
+        return Err(ObjectWriteAuthorityError::CorruptState);
+    };
+    if removed_at_unix_ms < terminal_at(outcome) {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    }
+    let mut updated = attempt.clone();
+    updated.state = ObjectPutState::Terminal {
+        outcome: outcome.clone(),
+        spool: TerminalObjectWriteSpool::Removed {
+            spool: spool.clone(),
+            removal_receipt_id,
+            removed_at_unix_ms,
+        },
+    };
+    validate_object_put_attempt(authority, &updated)?;
+    Ok(updated)
+}
+
+pub fn advance_object_write_terminal_prefix(
+    authority: &ObjectWriteAuthority,
+    contiguous_terminal_attempts: &[ObjectPutAttempt],
+) -> Result<ObjectWriteAuthority, ObjectWriteAuthorityError> {
+    validate_object_write_authority(authority)?;
+    let mut updated = authority.clone();
+    for attempt in contiguous_terminal_attempts {
+        validate_object_put_attempt(authority, attempt)?;
+        let expected = updated
+            .terminal_prefix_sequence
+            .get()
+            .checked_add(1)
+            .ok_or(ObjectWriteAuthorityError::SequenceExhausted)?;
+        if attempt.descriptor.accepted_sequence.get() != expected {
+            return Err(ObjectWriteAuthorityError::NonContiguousTerminalPrefix);
+        }
+        updated.terminal_prefix_sha256 =
+            advance_terminal_prefix_sha256(&updated.terminal_prefix_sha256, attempt)?;
+        updated.terminal_prefix_sequence = attempt.descriptor.accepted_sequence;
+    }
+    validate_object_write_authority(&updated)?;
+    Ok(updated)
+}
+
 pub fn reject_object_write_before_accept(
     authority: &ObjectWriteAuthority,
     ingress_attempt: &ObjectWriteIngressAttempt,
+    reason: ObjectWriteRejectionReason,
     rejection_receipt_id: AsciiText,
     rejected_at_unix_ms: UnixMillis,
 ) -> Result<ObjectWriteIngressAttempt, ObjectWriteAuthorityError> {
     validate_object_write_authority(authority)?;
     validate_object_write_ingress_attempt(ingress_attempt)?;
-    if matches!(authority.state, ObjectWriteAuthorityState::Open) {
+    if reason == ObjectWriteRejectionReason::WriterClosed
+        && matches!(authority.state, ObjectWriteAuthorityState::Open)
+    {
         return Err(ObjectWriteAuthorityError::InvalidTransition);
     }
     if ingress_attempt.ingress.writer_authority_id != authority.writer.authority_id {
@@ -835,6 +1004,7 @@ pub fn reject_object_write_before_accept(
         ingress: ingress_attempt.ingress.clone(),
         state: ObjectWriteIngressState::RejectedBeforeAccept {
             spool: spool.clone(),
+            reason,
             rejection_receipt_id,
             rejected_at_unix_ms,
         },
@@ -983,9 +1153,6 @@ pub fn begin_object_writer_cutoff(
 
 pub fn complete_object_writer_cutoff(
     authority: &ObjectWriteAuthority,
-    cutoff_receipt_id: AsciiText,
-    accepted_put_terminal_receipt_id: AsciiText,
-    successful_put_visibility_receipt_id: AsciiText,
     completed_at_unix_ms: UnixMillis,
 ) -> Result<(ObjectWriteAuthority, ObjectWriteCutoffReceipt), ObjectWriteAuthorityError> {
     validate_object_write_authority(authority)?;
@@ -1003,6 +1170,11 @@ pub fn complete_object_writer_cutoff(
     if authority.terminal_prefix_sequence != *cutoff_sequence {
         return Err(ObjectWriteAuthorityError::CutoffNotReady);
     }
+    let cutoff_receipt_id = barrier_receipt_id(authority, b"cutoff", "owcut1_")?;
+    let accepted_put_terminal_receipt_id =
+        barrier_receipt_id(authority, b"terminal-prefix", "owterm1_")?;
+    let successful_put_visibility_receipt_id =
+        barrier_receipt_id(authority, b"successful-visible", "owvis1_")?;
     let receipt = ObjectWriteCutoffReceipt {
         writer_authority_id: authority.writer.authority_id.clone(),
         fence_attempt_id: fence_attempt_id.clone(),
@@ -1022,6 +1194,40 @@ pub fn complete_object_writer_cutoff(
     };
     validate_object_write_authority(&updated)?;
     Ok((updated, receipt))
+}
+
+fn barrier_receipt_id(
+    authority: &ObjectWriteAuthority,
+    kind: &[u8],
+    prefix: &str,
+) -> Result<AsciiText, ObjectWriteAuthorityError> {
+    let ObjectWriteAuthorityState::CutoffPending {
+        fence_attempt_id,
+        cutoff_sequence,
+        cutoff_effective_at_unix_ms,
+    } = &authority.state
+    else {
+        return Err(ObjectWriteAuthorityError::InvalidTransition);
+    };
+    let mut hasher = Sha256::new();
+    hash_frame(&mut hasher, b"cats.object-write-barrier-receipt.v1")?;
+    hash_frame(&mut hasher, kind)?;
+    hash_frame(
+        &mut hasher,
+        authority.writer.authority_id.as_str().as_bytes(),
+    )?;
+    hash_frame(&mut hasher, fence_attempt_id.as_str().as_bytes())?;
+    hash_frame(
+        &mut hasher,
+        &cutoff_effective_at_unix_ms.get().to_be_bytes(),
+    )?;
+    hash_frame(&mut hasher, &cutoff_sequence.get().to_be_bytes())?;
+    hash_frame(
+        &mut hasher,
+        authority.terminal_prefix_sha256.as_str().as_bytes(),
+    )?;
+    AsciiText::new(format!("{prefix}{}", hex_lower(&hasher.finalize())))
+        .ok_or(ObjectWriteAuthorityError::InvalidRequest)
 }
 
 pub fn advance_terminal_prefix_sha256(

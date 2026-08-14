@@ -8,17 +8,31 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ApiError;
 use cats_api::object_write_gateway::{
     ObjectWriteCredentialReference, ObjectWriteCredentialRegistration,
-    ObjectWriteCredentialRegistrationReceipt,
+    ObjectWriteCredentialRegistrationReceipt, ObjectWriteImmutableKey,
+    ObjectWriteIngressDescriptor,
 };
 use cats_api::runtime_reconciliation::{
-    ContractVersion, CredentialBinding, Id, NodeIdentityState, UnixMillis,
+    AsciiText, ContractVersion, CredentialBinding, Id, NodeIdentityState, Sha256Digest, UnixMillis,
 };
 use cats_storage::object_write_authority::{
-    begin_object_writer_cutoff, register_object_write_credential, validate_object_write_authority,
-    validate_object_write_credential, ObjectWriteAuthority, ObjectWriteAuthorityState,
+    accept_durable_object_write, advance_object_write_terminal_prefix,
+    authorize_object_write_ingress, begin_object_writer_cutoff, classify_object_key_acceptance,
+    complete_object_write_terminal, complete_object_writer_cutoff,
+    mark_object_write_provider_issued, mark_object_write_spool_durable,
+    mark_terminal_object_write_spool_removed, register_object_write_credential,
+    reject_object_write_before_accept, validate_object_put_attempt,
+    validate_object_write_authority, validate_object_write_credential,
+    validate_object_write_ingress_attempt, DurableObjectWriteSpoolReceipt, ObjectKeyAcceptance,
+    ObjectPutAttempt, ObjectPutState, ObjectPutTerminalState, ObjectWriteAcceptanceOutcome,
+    ObjectWriteAuthority, ObjectWriteAuthorityError, ObjectWriteAuthorityState,
     ObjectWriteCredentialBinding, ObjectWriteCredentialRetirementCause, ObjectWriteCredentialState,
+    ObjectWriteIngressAttempt, ObjectWriteIngressState, ObjectWriteRejectionReason,
+    StoredObjectWriteAttempt, TerminalObjectWriteSpool,
 };
-use postgres::Transaction;
+use postgres::{Row, Transaction};
+
+const OBJECT_WRITE_PREFIX_ADVANCE_LIMIT: i64 = 256;
+const OBJECT_WRITE_RECOVERY_LIMIT: i64 = 256;
 
 use super::rows::database_now;
 use crate::store::agent_sessions::{
@@ -34,6 +48,28 @@ fn application(error: ApiError) -> AuthorityTransactionError {
 
 fn corrupt(message: impl Into<String>) -> AuthorityTransactionError {
     application(ApiError::failed_precondition(message.into()))
+}
+
+fn authority_error(error: ObjectWriteAuthorityError) -> AuthorityTransactionError {
+    let api = match error {
+        ObjectWriteAuthorityError::InvalidRequest | ObjectWriteAuthorityError::SpoolNotDurable => {
+            ApiError::invalid(error.to_string())
+        }
+        ObjectWriteAuthorityError::StaleAttempt | ObjectWriteAuthorityError::ObjectKeyConflict => {
+            ApiError::conflict(error.to_string())
+        }
+        ObjectWriteAuthorityError::WriterClosed
+        | ObjectWriteAuthorityError::BindingMismatch
+        | ObjectWriteAuthorityError::InvalidTransition
+        | ObjectWriteAuthorityError::NonContiguousTerminalPrefix
+        | ObjectWriteAuthorityError::CutoffNotReady => {
+            ApiError::failed_precondition(error.to_string())
+        }
+        ObjectWriteAuthorityError::SequenceExhausted | ObjectWriteAuthorityError::CorruptState => {
+            return corrupt(format!("object-write authority failure: {error}"));
+        }
+    };
+    application(api)
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> AuthorityTxResult<String> {
@@ -95,6 +131,98 @@ fn load_credential_for_update(
         )?
         .map(|row| decode(row.get("record_json")))
         .transpose()
+}
+
+fn load_credential_parent_id(
+    transaction: &mut Transaction<'_>,
+    credential_id: &Id,
+) -> AuthorityTxResult<Option<Id>> {
+    transaction
+        .query_opt(
+            "SELECT writer_authority_id
+               FROM object_write_credentials
+              WHERE credential_id=$1",
+            &[&credential_id.as_str()],
+        )?
+        .map(|row| {
+            Id::new(row.get::<_, String>("writer_authority_id"))
+                .ok_or_else(|| corrupt("stored object-write authority ID is invalid"))
+        })
+        .transpose()
+}
+
+fn decode_stored_attempt(row: &Row) -> AuthorityTxResult<StoredObjectWriteAttempt> {
+    let state: String = row.try_get("state")?;
+    let record: String = row.try_get("record_json")?;
+    if matches!(
+        state.as_str(),
+        "receiving" | "durable_spooled" | "rejected_before_accept"
+    ) {
+        let attempt: ObjectWriteIngressAttempt = decode(record)?;
+        validate_object_write_ingress_attempt(&attempt)
+            .map_err(|error| corrupt(format!("invalid provisional object-write row: {error}")))?;
+        if ingress_state(&attempt) != state {
+            return Err(corrupt(
+                "object-write ingress state projection disagrees with record",
+            ));
+        }
+        return Ok(StoredObjectWriteAttempt::Ingress(attempt));
+    }
+    let attempt: ObjectPutAttempt = decode(record)?;
+    if accepted_state(&attempt) != state {
+        return Err(corrupt(
+            "object-write accepted state projection disagrees with record",
+        ));
+    }
+    Ok(StoredObjectWriteAttempt::Accepted(attempt))
+}
+
+fn load_attempt_for_update(
+    transaction: &mut Transaction<'_>,
+    request_id: &Sha256Digest,
+) -> AuthorityTxResult<Option<StoredObjectWriteAttempt>> {
+    transaction
+        .query_opt(
+            "SELECT record::text AS record_json, state
+               FROM object_write_attempts WHERE request_id=$1 FOR UPDATE",
+            &[&request_id.as_str()],
+        )?
+        .as_ref()
+        .map(decode_stored_attempt)
+        .transpose()
+}
+
+fn ingress_state(attempt: &ObjectWriteIngressAttempt) -> &'static str {
+    match attempt.state {
+        ObjectWriteIngressState::Receiving => "receiving",
+        ObjectWriteIngressState::DurableSpooled { .. } => "durable_spooled",
+        ObjectWriteIngressState::RejectedBeforeAccept { .. } => "rejected_before_accept",
+    }
+}
+
+fn accepted_state(attempt: &ObjectPutAttempt) -> &'static str {
+    match &attempt.state {
+        ObjectPutState::AcceptedSpooled { .. } => "accepted_spooled",
+        ObjectPutState::ProviderIssued { .. } => "provider_issued",
+        ObjectPutState::Terminal { outcome, spool } => {
+            if matches!(spool, TerminalObjectWriteSpool::Removed { .. }) {
+                "spool_removed"
+            } else {
+                match outcome {
+                    ObjectPutTerminalState::SucceededVisible { .. } => "terminal_visible",
+                    ObjectPutTerminalState::PermanentlyFailed { .. } => "permanent",
+                }
+            }
+        }
+    }
+}
+
+fn key_kind(key: &ObjectWriteImmutableKey) -> &'static str {
+    match key {
+        ObjectWriteImmutableKey::VolumeData { .. } => "volume_data",
+        ObjectWriteImmutableKey::VolumeMap => "volume_map",
+        ObjectWriteImmutableKey::VolumeCommit { .. } => "volume_commit",
+    }
 }
 
 fn load_authority_credentials_for_update(
@@ -210,6 +338,322 @@ fn insert_credential(
         return Err(application(ApiError::conflict(
             "object-write credential or attachment already has a different active key",
         )));
+    }
+    Ok(())
+}
+
+fn insert_ingress_attempt(
+    transaction: &mut Transaction<'_>,
+    credential_id: &Id,
+    attempt: &ObjectWriteIngressAttempt,
+) -> AuthorityTxResult<bool> {
+    validate_object_write_ingress_attempt(attempt).map_err(authority_error)?;
+    let ingress = &attempt.ingress;
+    let record = encode(attempt)?;
+    let receiving_started_at = pg(ingress.receiving_started_at_unix_ms.get())?;
+    let content_length = pg(ingress.content_length.get())?;
+    let inserted = transaction.execute(
+        "INSERT INTO object_write_attempts (
+            request_id, record, writer_authority_id, credential_id, volume_id,
+            key_kind, object_provider, object_partition, object_account_id,
+            object_region, object_store_scope_id, object_key, content_sha256,
+            content_length, receiving_started_at_unix_ms, state
+         ) VALUES (
+            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, 'receiving'
+         ) ON CONFLICT (request_id) DO NOTHING",
+        &[
+            &ingress.request_id.as_str(),
+            &record,
+            &ingress.writer_authority_id.as_str(),
+            &credential_id.as_str(),
+            &ingress.volume_id.as_str(),
+            &key_kind(&ingress.key),
+            &ingress.target.object_provider_scope.provider.as_str(),
+            &ingress.target.object_provider_scope.partition.as_str(),
+            &ingress.target.object_provider_scope.account_id.as_str(),
+            &ingress.target.object_provider_scope.region.as_str(),
+            &ingress.target.object_store_scope_id.as_str(),
+            &ingress.target.canonical_logical_key,
+            &ingress.content_sha256.as_str(),
+            &content_length,
+            &receiving_started_at,
+        ],
+    )?;
+    Ok(inserted == 1)
+}
+
+fn persist_durable_ingress(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectWriteIngressAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectWriteIngressState::DurableSpooled { spool } = &attempt.state else {
+        return Err(corrupt(
+            "durable object-write projection has the wrong state",
+        ));
+    };
+    let record = encode(attempt)?;
+    let durable_at = pg(spool.durable_at_unix_ms.get())?;
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state='durable_spooled', spool_id=$3,
+                spool_file_fsync_receipt_id=$4,
+                spool_directory_fsync_receipt_id=$5,
+                spool_durable_at_unix_ms=$6
+          WHERE request_id=$1 AND state='receiving'",
+        &[
+            &attempt.ingress.request_id.as_str(),
+            &record,
+            &spool.spool_id.as_str(),
+            &spool.file_fsync_receipt_id.as_str(),
+            &spool.directory_fsync_receipt_id.as_str(),
+            &durable_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt("object-write receiving row changed while locked"));
+    }
+    Ok(())
+}
+
+fn rejection_receipt_id(
+    request_id: &Sha256Digest,
+    reason: ObjectWriteRejectionReason,
+) -> AuthorityTxResult<AsciiText> {
+    let digest = request_id
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| corrupt("object-write request digest is invalid"))?;
+    let reason = match reason {
+        ObjectWriteRejectionReason::WriterClosed => "writer_closed",
+        ObjectWriteRejectionReason::ObjectKeyConflict => "object_key_conflict",
+    };
+    AsciiText::new(format!("owrej1_{digest}_{reason}"))
+        .ok_or_else(|| corrupt("object-write rejection receipt ID is invalid"))
+}
+
+fn persist_rejected_ingress(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectWriteIngressAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectWriteIngressState::RejectedBeforeAccept {
+        reason,
+        rejection_receipt_id,
+        rejected_at_unix_ms,
+        ..
+    } = &attempt.state
+    else {
+        return Err(corrupt(
+            "rejected object-write projection has the wrong state",
+        ));
+    };
+    let rejection_kind = match reason {
+        ObjectWriteRejectionReason::WriterClosed => "writer_closed",
+        ObjectWriteRejectionReason::ObjectKeyConflict => "object_key_conflict",
+    };
+    let record = encode(attempt)?;
+    let rejected_at = pg(rejected_at_unix_ms.get())?;
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state='rejected_before_accept',
+                rejection_kind=$3, rejection_receipt_id=$4,
+                rejected_at_unix_ms=$5
+          WHERE request_id=$1 AND state='durable_spooled'",
+        &[
+            &attempt.ingress.request_id.as_str(),
+            &record,
+            &rejection_kind,
+            &rejection_receipt_id.as_str(),
+            &rejected_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt("durable object-write row changed while locked"));
+    }
+    Ok(())
+}
+
+fn persist_accepted_attempt(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectPutAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectPutState::AcceptedSpooled { spool } = &attempt.state else {
+        return Err(corrupt(
+            "newly accepted object-write row has the wrong state",
+        ));
+    };
+    let record = encode(attempt)?;
+    let sequence = pg(attempt.descriptor.accepted_sequence.get())?;
+    let accepted_at = pg(attempt.descriptor.accepted_at_unix_ms.get())?;
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state='accepted_spooled',
+                accepted_sequence=$3, accepted_at_unix_ms=$4,
+                provider_attempt_id=$5
+          WHERE request_id=$1 AND state='durable_spooled'",
+        &[
+            &attempt.descriptor.request_id.as_str(),
+            &record,
+            &sequence,
+            &accepted_at,
+            &attempt.descriptor.provider_attempt_id.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt("durable object-write row changed while accepting"));
+    }
+    // The durable spool projection was persisted before acceptance and must
+    // stay byte-for-byte attached to the accepted row.
+    if spool.request_id != attempt.descriptor.request_id {
+        return Err(corrupt("accepted object-write spool changed request"));
+    }
+    Ok(())
+}
+
+fn persist_provider_issued(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectPutAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectPutState::ProviderIssued {
+        issued_at_unix_ms, ..
+    } = &attempt.state
+    else {
+        return Err(corrupt(
+            "provider-issued object-write row has the wrong state",
+        ));
+    };
+    let record = encode(attempt)?;
+    let issued_at = pg(issued_at_unix_ms.get())?;
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state='provider_issued',
+                provider_issued_at_unix_ms=$3
+          WHERE request_id=$1 AND state='accepted_spooled'",
+        &[&attempt.descriptor.request_id.as_str(), &record, &issued_at],
+    )?;
+    if changed != 1 {
+        return Err(corrupt(
+            "accepted object-write row changed before provider issue",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_terminal_attempt(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectPutAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectPutState::Terminal {
+        outcome,
+        spool: TerminalObjectWriteSpool::Retained { .. },
+    } = &attempt.state
+    else {
+        return Err(corrupt("terminal object-write row has the wrong state"));
+    };
+    let record = encode(attempt)?;
+    let (
+        state,
+        kind,
+        put_receipt,
+        put_at,
+        visibility_receipt,
+        visible_at,
+        failure_receipt,
+        failed_at,
+    ) = match outcome {
+        ObjectPutTerminalState::SucceededVisible {
+            put_receipt_id,
+            put_completed_at_unix_ms,
+            visibility_receipt_id,
+            visible_at_unix_ms,
+        } => (
+            "terminal_visible",
+            "succeeded_visible",
+            Some(put_receipt_id.as_str()),
+            Some(pg(put_completed_at_unix_ms.get())?),
+            Some(visibility_receipt_id.as_str()),
+            Some(pg(visible_at_unix_ms.get())?),
+            None,
+            None,
+        ),
+        ObjectPutTerminalState::PermanentlyFailed {
+            failure_receipt_id,
+            failed_at_unix_ms,
+        } => (
+            "permanent",
+            "permanently_failed",
+            None,
+            None,
+            None,
+            None,
+            Some(failure_receipt_id.as_str()),
+            Some(pg(failed_at_unix_ms.get())?),
+        ),
+    };
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state=$3, terminal_kind=$4,
+                put_receipt_id=$5, put_completed_at_unix_ms=$6,
+                visibility_receipt_id=$7, visible_at_unix_ms=$8,
+                failure_receipt_id=$9, failed_at_unix_ms=$10
+          WHERE request_id=$1 AND state='provider_issued'",
+        &[
+            &attempt.descriptor.request_id.as_str(),
+            &record,
+            &state,
+            &kind,
+            &put_receipt,
+            &put_at,
+            &visibility_receipt,
+            &visible_at,
+            &failure_receipt,
+            &failed_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt(
+            "provider-issued object-write row changed before settlement",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_spool_removed(
+    transaction: &mut Transaction<'_>,
+    attempt: &ObjectPutAttempt,
+) -> AuthorityTxResult<()> {
+    let ObjectPutState::Terminal {
+        spool:
+            TerminalObjectWriteSpool::Removed {
+                removal_receipt_id,
+                removed_at_unix_ms,
+                ..
+            },
+        ..
+    } = &attempt.state
+    else {
+        return Err(corrupt(
+            "spool-removed object-write row has the wrong state",
+        ));
+    };
+    let record = encode(attempt)?;
+    let removed_at = pg(removed_at_unix_ms.get())?;
+    let changed = transaction.execute(
+        "UPDATE object_write_attempts
+            SET record=$2::TEXT::jsonb, state='spool_removed',
+                spool_removal_receipt_id=$3, spool_removed_at_unix_ms=$4
+          WHERE request_id=$1 AND state IN ('terminal_visible', 'permanent')",
+        &[
+            &attempt.descriptor.request_id.as_str(),
+            &record,
+            &removal_receipt_id.as_str(),
+            &removed_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt(
+            "terminal object-write row changed before spool removal",
+        ));
     }
     Ok(())
 }
@@ -400,6 +844,266 @@ fn persist_retired_credential(
     Ok(())
 }
 
+fn load_attempt_parent_id(
+    transaction: &mut Transaction<'_>,
+    request_id: &Sha256Digest,
+) -> AuthorityTxResult<Option<Id>> {
+    transaction
+        .query_opt(
+            "SELECT writer_authority_id
+               FROM object_write_attempts WHERE request_id=$1",
+            &[&request_id.as_str()],
+        )?
+        .map(|row| {
+            Id::new(row.get::<_, String>("writer_authority_id"))
+                .ok_or_else(|| corrupt("stored object-write authority ID is invalid"))
+        })
+        .transpose()
+}
+
+fn validate_attempt_for_authority(
+    authority: &ObjectWriteAuthority,
+    stored: &StoredObjectWriteAttempt,
+) -> AuthorityTxResult<()> {
+    match stored {
+        StoredObjectWriteAttempt::Ingress(attempt) => {
+            validate_object_write_ingress_attempt(attempt).map_err(authority_error)?;
+            if attempt.ingress.writer_authority_id != authority.writer.authority_id {
+                return Err(corrupt("provisional object-write row has the wrong parent"));
+            }
+        }
+        StoredObjectWriteAttempt::Accepted(attempt) => {
+            validate_object_put_attempt(authority, attempt).map_err(authority_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn same_ingress_request(
+    left: &ObjectWriteIngressAttempt,
+    right: &ObjectWriteIngressAttempt,
+) -> bool {
+    left.ingress.writer_authority_id == right.ingress.writer_authority_id
+        && left.ingress.request_id == right.ingress.request_id
+        && left.ingress.volume_id == right.ingress.volume_id
+        && left.ingress.key == right.ingress.key
+        && left.ingress.target == right.ingress.target
+        && left.ingress.content_sha256 == right.ingress.content_sha256
+        && left.ingress.content_length == right.ingress.content_length
+}
+
+fn begin_ingress_in(
+    transaction: &mut Transaction<'_>,
+    authenticated_attachment: &AuthenticatedNodeCredential,
+    descriptor: &ObjectWriteIngressDescriptor,
+) -> AuthorityTxResult<StoredObjectWriteAttempt> {
+    let credential = authenticated_attachment_reference(authenticated_attachment)?;
+    let Some(writer_authority_id) =
+        load_credential_parent_id(transaction, &credential.credential_id)?
+    else {
+        return Err(application(ApiError::unauthenticated(
+            "unknown object-write attachment credential",
+        )));
+    };
+    // Every path locks the parent before its child. Cutoff takes the same
+    // order, so no request can authenticate beneath a concurrently closed
+    // writer.
+    let Some(authority) = load_authority_for_update(transaction, &writer_authority_id)? else {
+        return Err(corrupt("object-write credential parent is missing"));
+    };
+    let Some(binding) = load_credential_for_update(transaction, &credential.credential_id)? else {
+        return Err(corrupt(
+            "object-write credential disappeared while its parent was locked",
+        ));
+    };
+    validate_object_write_credential(&authority, &binding).map_err(authority_error)?;
+    let now = database_now(transaction)?;
+    let candidate =
+        authorize_object_write_ingress(&authority, &binding, &credential, descriptor, now)
+            .map_err(authority_error)?;
+    if let Some(existing) = load_attempt_for_update(transaction, &candidate.ingress.request_id)? {
+        validate_attempt_for_authority(&authority, &existing)?;
+        let same = match &existing {
+            StoredObjectWriteAttempt::Ingress(attempt) => same_ingress_request(attempt, &candidate),
+            StoredObjectWriteAttempt::Accepted(attempt) => {
+                attempt.descriptor.writer_authority_id == candidate.ingress.writer_authority_id
+                    && attempt.descriptor.request_id == candidate.ingress.request_id
+                    && attempt.descriptor.volume_id == candidate.ingress.volume_id
+                    && attempt.descriptor.key == candidate.ingress.key
+                    && attempt.descriptor.target == candidate.ingress.target
+                    && attempt.descriptor.content_sha256 == candidate.ingress.content_sha256
+                    && attempt.descriptor.content_length == candidate.ingress.content_length
+            }
+        };
+        if !same {
+            return Err(application(ApiError::conflict(
+                "object-write request ID replay changed immutable request fields",
+            )));
+        }
+        return Ok(existing);
+    }
+    if !insert_ingress_attempt(transaction, &credential.credential_id, &candidate)? {
+        return Err(corrupt(
+            "object-write request appeared while parent authority was locked",
+        ));
+    }
+    Ok(StoredObjectWriteAttempt::Ingress(candidate))
+}
+
+fn load_accepted_object_key_for_update(
+    transaction: &mut Transaction<'_>,
+    authority: &ObjectWriteAuthority,
+    object_key: &str,
+) -> AuthorityTxResult<Option<ObjectPutAttempt>> {
+    let stored = transaction
+        .query_opt(
+            "SELECT record::text AS record_json, state
+               FROM object_write_attempts
+              WHERE writer_authority_id=$1 AND object_key=$2
+                AND accepted_sequence IS NOT NULL
+              FOR UPDATE",
+            &[&authority.writer.authority_id.as_str(), &object_key],
+        )?
+        .as_ref()
+        .map(decode_stored_attempt)
+        .transpose()?;
+    match stored {
+        Some(StoredObjectWriteAttempt::Accepted(attempt)) => {
+            validate_object_put_attempt(authority, &attempt).map_err(authority_error)?;
+            if attempt.descriptor.target.canonical_logical_key != object_key {
+                return Err(corrupt("object-write key projection disagrees with record"));
+            }
+            Ok(Some(attempt))
+        }
+        Some(StoredObjectWriteAttempt::Ingress(_)) => Err(corrupt(
+            "accepted object-write index selected a provisional row",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn accept_durable_in(
+    transaction: &mut Transaction<'_>,
+    request_id: &Sha256Digest,
+) -> AuthorityTxResult<ObjectWriteAcceptanceOutcome> {
+    let Some(writer_authority_id) = load_attempt_parent_id(transaction, request_id)? else {
+        return Err(application(ApiError::not_found("ObjectWriteAttempt")));
+    };
+    let Some(authority) = load_authority_for_update(transaction, &writer_authority_id)? else {
+        return Err(corrupt("object-write attempt parent is missing"));
+    };
+    let Some(stored) = load_attempt_for_update(transaction, request_id)? else {
+        return Err(corrupt(
+            "object-write attempt disappeared while parent was locked",
+        ));
+    };
+    validate_attempt_for_authority(&authority, &stored)?;
+    let ingress = match stored {
+        StoredObjectWriteAttempt::Accepted(attempt) => {
+            return Ok(ObjectWriteAcceptanceOutcome::Accepted(attempt));
+        }
+        StoredObjectWriteAttempt::Ingress(attempt) => attempt,
+    };
+    if matches!(
+        ingress.state,
+        ObjectWriteIngressState::RejectedBeforeAccept { .. }
+    ) {
+        return Ok(ObjectWriteAcceptanceOutcome::RejectedBeforeAccept(ingress));
+    }
+    if matches!(ingress.state, ObjectWriteIngressState::Receiving) {
+        return Err(application(ApiError::failed_precondition(
+            "object-write body is not durably spooled",
+        )));
+    }
+    let now = database_now(transaction)?;
+    if !matches!(authority.state, ObjectWriteAuthorityState::Open) {
+        let reason = ObjectWriteRejectionReason::WriterClosed;
+        let rejected = reject_object_write_before_accept(
+            &authority,
+            &ingress,
+            reason,
+            rejection_receipt_id(request_id, reason)?,
+            now,
+        )
+        .map_err(authority_error)?;
+        persist_rejected_ingress(transaction, &rejected)?;
+        return Ok(ObjectWriteAcceptanceOutcome::RejectedBeforeAccept(rejected));
+    }
+    let object_key = &ingress.ingress.target.canonical_logical_key;
+    let existing = load_accepted_object_key_for_update(transaction, &authority, object_key)?;
+    match classify_object_key_acceptance(existing.as_ref(), &ingress) {
+        Ok(ObjectKeyAcceptance::Vacant) => {}
+        Ok(ObjectKeyAcceptance::ExactReplay) => {
+            return Ok(ObjectWriteAcceptanceOutcome::Accepted(
+                existing.ok_or_else(|| corrupt("exact object-write replay has no stored row"))?,
+            ));
+        }
+        Err(ObjectWriteAuthorityError::ObjectKeyConflict) => {
+            let reason = ObjectWriteRejectionReason::ObjectKeyConflict;
+            let rejected = reject_object_write_before_accept(
+                &authority,
+                &ingress,
+                reason,
+                rejection_receipt_id(request_id, reason)?,
+                now,
+            )
+            .map_err(authority_error)?;
+            persist_rejected_ingress(transaction, &rejected)?;
+            return Ok(ObjectWriteAcceptanceOutcome::RejectedBeforeAccept(rejected));
+        }
+        Err(error) => return Err(authority_error(error)),
+    }
+    let (updated_authority, accepted) =
+        accept_durable_object_write(&authority, &ingress, now).map_err(authority_error)?;
+    persist_authority(transaction, &updated_authority)?;
+    persist_accepted_attempt(transaction, &accepted)?;
+    Ok(ObjectWriteAcceptanceOutcome::Accepted(accepted))
+}
+
+fn advance_terminal_prefix_in(
+    transaction: &mut Transaction<'_>,
+    authority: &ObjectWriteAuthority,
+) -> AuthorityTxResult<ObjectWriteAuthority> {
+    let rows = transaction.query(
+        "SELECT record::text AS record_json, state
+           FROM object_write_attempts
+          WHERE writer_authority_id=$1
+            AND accepted_sequence > $2
+            AND state IN ('terminal_visible', 'permanent', 'spool_removed')
+          ORDER BY accepted_sequence
+          LIMIT $3",
+        &[
+            &authority.writer.authority_id.as_str(),
+            &pg(authority.terminal_prefix_sequence.get())?,
+            &OBJECT_WRITE_PREFIX_ADVANCE_LIMIT,
+        ],
+    )?;
+    let mut expected = authority.terminal_prefix_sequence.get();
+    let mut contiguous = Vec::new();
+    for row in &rows {
+        let StoredObjectWriteAttempt::Accepted(attempt) = decode_stored_attempt(row)? else {
+            return Err(corrupt(
+                "terminal prefix selected a provisional object-write row",
+            ));
+        };
+        validate_object_put_attempt(authority, &attempt).map_err(authority_error)?;
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| corrupt("object-write terminal prefix overflow"))?;
+        if attempt.descriptor.accepted_sequence.get() != expected {
+            break;
+        }
+        contiguous.push(attempt);
+    }
+    if contiguous.is_empty() {
+        return Ok(authority.clone());
+    }
+    let updated =
+        advance_object_write_terminal_prefix(authority, &contiguous).map_err(authority_error)?;
+    persist_authority(transaction, &updated)?;
+    Ok(updated)
+}
+
 impl Store {
     pub fn register_object_write_credential(
         &self,
@@ -414,6 +1118,284 @@ impl Store {
                 authenticated_attachment,
                 registration,
             )
+        })
+    }
+
+    /// Authenticate one attachment-scoped descriptor and persist its
+    /// provisional request before any body bytes become provider-visible.
+    pub fn begin_object_write_ingress(
+        &self,
+        authenticated_attachment: &AuthenticatedNodeCredential,
+        descriptor: &ObjectWriteIngressDescriptor,
+    ) -> crate::store::Result<StoredObjectWriteAttempt> {
+        self.authority_transaction(|transaction| {
+            begin_ingress_in(transaction, authenticated_attachment, descriptor)
+        })
+    }
+
+    /// Bind a stable, cross-replica spool receipt to a provisional request.
+    /// An exact retry may discover that a prior call already accepted or
+    /// rejected the request, so the complete stored phase is returned.
+    pub fn mark_object_write_spool_durable(
+        &self,
+        request_id: &Sha256Digest,
+        spool: &DurableObjectWriteSpoolReceipt,
+    ) -> crate::store::Result<StoredObjectWriteAttempt> {
+        self.authority_transaction(|transaction| {
+            let Some(stored) = load_attempt_for_update(transaction, request_id)? else {
+                return Err(application(ApiError::not_found("ObjectWriteAttempt")));
+            };
+            match stored {
+                StoredObjectWriteAttempt::Accepted(attempt) => {
+                    let embedded = match &attempt.state {
+                        ObjectPutState::AcceptedSpooled { spool }
+                        | ObjectPutState::ProviderIssued { spool, .. } => spool,
+                        ObjectPutState::Terminal { spool, .. } => match spool {
+                            TerminalObjectWriteSpool::Retained { spool }
+                            | TerminalObjectWriteSpool::Removed { spool, .. } => spool,
+                        },
+                    };
+                    if embedded != spool {
+                        return Err(application(ApiError::conflict(
+                            "object-write durable spool replay changed its receipt",
+                        )));
+                    }
+                    Ok(StoredObjectWriteAttempt::Accepted(attempt))
+                }
+                StoredObjectWriteAttempt::Ingress(attempt) => {
+                    if let ObjectWriteIngressState::RejectedBeforeAccept {
+                        spool: embedded, ..
+                    } = &attempt.state
+                    {
+                        if embedded != spool {
+                            return Err(application(ApiError::conflict(
+                                "object-write durable spool replay changed its receipt",
+                            )));
+                        }
+                        return Ok(StoredObjectWriteAttempt::Ingress(attempt));
+                    }
+                    let updated = mark_object_write_spool_durable(&attempt, spool.clone())
+                        .map_err(authority_error)?;
+                    if updated != attempt {
+                        persist_durable_ingress(transaction, &updated)?;
+                    }
+                    Ok(StoredObjectWriteAttempt::Ingress(updated))
+                }
+            }
+        })
+    }
+
+    /// Assign a writer sequence only after durable spooling. Closing the
+    /// parent or finding a conflicting immutable object key persists a
+    /// terminal pre-accept rejection and never issues a provider request.
+    pub fn accept_durable_object_write(
+        &self,
+        request_id: &Sha256Digest,
+    ) -> crate::store::Result<ObjectWriteAcceptanceOutcome> {
+        self.authority_transaction(|transaction| accept_durable_in(transaction, request_id))
+    }
+
+    /// Persist provider issue before the first external PUT. Exact replay
+    /// returns the existing later phase rather than issuing another attempt.
+    pub fn mark_object_write_provider_issued(
+        &self,
+        request_id: &Sha256Digest,
+    ) -> crate::store::Result<ObjectPutAttempt> {
+        self.authority_transaction(|transaction| {
+            let Some(writer_authority_id) = load_attempt_parent_id(transaction, request_id)? else {
+                return Err(application(ApiError::not_found("ObjectWriteAttempt")));
+            };
+            let Some(authority) = load_authority_for_update(transaction, &writer_authority_id)?
+            else {
+                return Err(corrupt("object-write attempt parent is missing"));
+            };
+            let Some(stored) = load_attempt_for_update(transaction, request_id)? else {
+                return Err(corrupt(
+                    "object-write attempt disappeared while parent was locked",
+                ));
+            };
+            let StoredObjectWriteAttempt::Accepted(attempt) = stored else {
+                return Err(application(ApiError::failed_precondition(
+                    "object-write request has not been accepted",
+                )));
+            };
+            validate_object_put_attempt(&authority, &attempt).map_err(authority_error)?;
+            if !matches!(attempt.state, ObjectPutState::AcceptedSpooled { .. }) {
+                return Ok(attempt);
+            }
+            let updated =
+                mark_object_write_provider_issued(&authority, &attempt, database_now(transaction)?)
+                    .map_err(authority_error)?;
+            persist_provider_issued(transaction, &updated)?;
+            Ok(updated)
+        })
+    }
+
+    /// Settle the provider attempt only after exact visibility discovery or a
+    /// provider-authoritative permanent failure, then advance the contiguous
+    /// terminal prefix in the same transaction.
+    pub fn complete_object_write_terminal(
+        &self,
+        request_id: &Sha256Digest,
+        outcome: &ObjectPutTerminalState,
+    ) -> crate::store::Result<ObjectPutAttempt> {
+        self.authority_transaction(|transaction| {
+            let Some(writer_authority_id) = load_attempt_parent_id(transaction, request_id)? else {
+                return Err(application(ApiError::not_found("ObjectWriteAttempt")));
+            };
+            let Some(authority) = load_authority_for_update(transaction, &writer_authority_id)?
+            else {
+                return Err(corrupt("object-write attempt parent is missing"));
+            };
+            let Some(stored) = load_attempt_for_update(transaction, request_id)? else {
+                return Err(corrupt(
+                    "object-write attempt disappeared while parent was locked",
+                ));
+            };
+            let StoredObjectWriteAttempt::Accepted(attempt) = stored else {
+                return Err(application(ApiError::failed_precondition(
+                    "object-write request has not been accepted",
+                )));
+            };
+            validate_object_put_attempt(&authority, &attempt).map_err(authority_error)?;
+            if matches!(attempt.state, ObjectPutState::Terminal { .. }) {
+                return Ok(attempt);
+            }
+            let terminal = complete_object_write_terminal(&authority, &attempt, outcome.clone())
+                .map_err(authority_error)?;
+            persist_terminal_attempt(transaction, &terminal)?;
+            let _ = advance_terminal_prefix_in(transaction, &authority)?;
+            Ok(terminal)
+        })
+    }
+
+    pub fn mark_terminal_object_write_spool_removed(
+        &self,
+        request_id: &Sha256Digest,
+        removal_receipt_id: &AsciiText,
+    ) -> crate::store::Result<ObjectPutAttempt> {
+        self.authority_transaction(|transaction| {
+            let Some(writer_authority_id) = load_attempt_parent_id(transaction, request_id)? else {
+                return Err(application(ApiError::not_found("ObjectWriteAttempt")));
+            };
+            let Some(authority) = load_authority_for_update(transaction, &writer_authority_id)?
+            else {
+                return Err(corrupt("object-write attempt parent is missing"));
+            };
+            let Some(stored) = load_attempt_for_update(transaction, request_id)? else {
+                return Err(corrupt(
+                    "object-write attempt disappeared while parent was locked",
+                ));
+            };
+            let StoredObjectWriteAttempt::Accepted(attempt) = stored else {
+                return Err(application(ApiError::failed_precondition(
+                    "object-write request has not been accepted",
+                )));
+            };
+            validate_object_put_attempt(&authority, &attempt).map_err(authority_error)?;
+            if matches!(
+                attempt.state,
+                ObjectPutState::Terminal {
+                    spool: TerminalObjectWriteSpool::Removed { .. },
+                    ..
+                }
+            ) {
+                return Ok(attempt);
+            }
+            let updated = mark_terminal_object_write_spool_removed(
+                &authority,
+                &attempt,
+                removal_receipt_id.clone(),
+                database_now(transaction)?,
+            )
+            .map_err(authority_error)?;
+            persist_spool_removed(transaction, &updated)?;
+            Ok(updated)
+        })
+    }
+
+    /// Advance at most one bounded page. Recovery repeats this call until the
+    /// returned prefix stops changing or reaches the cutoff snapshot.
+    pub fn advance_object_write_terminal_prefix(
+        &self,
+        writer_authority_id: &Id,
+    ) -> crate::store::Result<ObjectWriteAuthority> {
+        self.authority_transaction(|transaction| {
+            let Some(authority) = load_authority_for_update(transaction, writer_authority_id)?
+            else {
+                return Err(application(ApiError::not_found("ObjectWriteAuthority")));
+            };
+            advance_terminal_prefix_in(transaction, &authority)
+        })
+    }
+
+    pub fn complete_object_writer_cutoff(
+        &self,
+        writer_authority_id: &Id,
+    ) -> crate::store::Result<ObjectWriteAuthority> {
+        self.authority_transaction(|transaction| {
+            let Some(authority) = load_authority_for_update(transaction, writer_authority_id)?
+            else {
+                return Err(application(ApiError::not_found("ObjectWriteAuthority")));
+            };
+            let authority = advance_terminal_prefix_in(transaction, &authority)?;
+            let cutoff_sequence = match &authority.state {
+                ObjectWriteAuthorityState::CutoffPending {
+                    cutoff_sequence, ..
+                } => *cutoff_sequence,
+                ObjectWriteAuthorityState::CutoffComplete { .. } => return Ok(authority),
+                ObjectWriteAuthorityState::Open => {
+                    return Err(application(ApiError::failed_precondition(
+                        "object-write authority cutoff has not started",
+                    )));
+                }
+            };
+            if authority.terminal_prefix_sequence != cutoff_sequence {
+                // Commit this bounded prefix page. The recovery coordinator
+                // repeats the same call until it reaches the cutoff snapshot.
+                return Ok(authority);
+            }
+            let (complete, _) =
+                complete_object_writer_cutoff(&authority, database_now(transaction)?)
+                    .map_err(authority_error)?;
+            persist_authority(transaction, &complete)?;
+            Ok(complete)
+        })
+    }
+
+    /// Bounded crash-recovery page. Accepted spools, ambiguous issued PUTs,
+    /// and terminal rows whose durable body has not yet been removed remain
+    /// discoverable; provisional orphan spools are not accepted authority.
+    pub fn recoverable_object_write_attempts(&self) -> crate::store::Result<Vec<ObjectPutAttempt>> {
+        self.authority_transaction(|transaction| {
+            transaction
+                .query(
+                    "SELECT attempt.record::text AS record_json, attempt.state,
+                            authority.record::text AS authority_json
+                       FROM object_write_attempts attempt
+                       JOIN object_write_authorities authority
+                         ON authority.writer_authority_id=attempt.writer_authority_id
+                      WHERE attempt.state IN (
+                        'accepted_spooled', 'provider_issued',
+                        'terminal_visible', 'permanent'
+                      )
+                      ORDER BY attempt.writer_authority_id COLLATE \"C\",
+                               attempt.accepted_sequence
+                      LIMIT $1",
+                    &[&OBJECT_WRITE_RECOVERY_LIMIT],
+                )?
+                .iter()
+                .map(|row| {
+                    let authority: ObjectWriteAuthority = decode(row.try_get("authority_json")?)?;
+                    validate_object_write_authority(&authority).map_err(authority_error)?;
+                    let StoredObjectWriteAttempt::Accepted(attempt) = decode_stored_attempt(row)?
+                    else {
+                        return Err(corrupt("object-write recovery selected a provisional row"));
+                    };
+                    validate_object_put_attempt(&authority, &attempt).map_err(authority_error)?;
+                    Ok(attempt)
+                })
+                .collect()
         })
     }
 
