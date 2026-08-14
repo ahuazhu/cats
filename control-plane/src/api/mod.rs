@@ -560,10 +560,11 @@ pub fn router(state: AppState) -> Router {
     let endpoint_collection_route = if state.retired_product_authority_for_tests() {
         post(create_endpoint).get(list_endpoints)
     } else {
-        post(bind_endpoint_v2)
+        post(bind_endpoint_v2).get(runtime_product_reads::list_runtime_endpoints)
     };
     #[cfg(not(debug_assertions))]
-    let endpoint_collection_route = post(bind_endpoint_v2);
+    let endpoint_collection_route =
+        post(bind_endpoint_v2).get(runtime_product_reads::list_runtime_endpoints);
     #[cfg(debug_assertions)]
     let disk_item_route = if state.retired_product_authority_for_tests() {
         get(get_disk).delete(delete_disk)
@@ -1235,6 +1236,10 @@ mod tests {
                 && router.contains("disk_item_route")
                 && router.contains("product_mutations_v2"),
             "conditional retired/new mutation routers are missing",
+        );
+        assert!(
+            router.contains(".get(runtime_product_reads::list_runtime_endpoints)"),
+            "production Endpoint collection route is missing its observation GET",
         );
         routes.push("DELETE /v1/workspaces/{workspace}/cats/{cat}".to_string());
         routes.push("GET /v1/workspaces/{workspace}/cats/{cat}".to_string());

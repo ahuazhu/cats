@@ -3638,6 +3638,192 @@ fn g4_endpoint_planner_is_workspace_scoped_and_unbind_preserves_other_epoch() {
 }
 
 #[test]
+fn runtime_endpoint_read_is_complete_sorted_and_excludes_retained_removed_records() {
+    let (_url, store, _unused, workspace) = stores();
+    let mut create = request(&workspace, "endpoint-read", 1, "endpoint-read-create");
+    let (_identity, _policy, _release) = prepare_mutation_node(&store, &mut create, 1);
+    store
+        .create_cat_covered_without_admission_for_product_test(&create)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .list_runtime_endpoints(&id("ws_foreign"), &create.candidate.cat_id)
+            .unwrap(),
+        ProductRead::NotFound
+    );
+    assert_eq!(
+        store
+            .list_runtime_endpoints(&workspace, &id("cat_missing"))
+            .unwrap(),
+        ProductRead::NotFound
+    );
+
+    let second_endpoint_id = id("ep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let second_hostname = Hostname::new("metrics-endpoint-read.cats.run").unwrap();
+    let bind_plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Bind {
+                record: EndpointRecordCandidate {
+                    endpoint_id: second_endpoint_id.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: create.candidate.cat_id.clone(),
+                    name: id("metrics"),
+                },
+                intent: EndpointBindingWithoutEpoch::http(second_hostname.clone(), 9090).unwrap(),
+            },
+        )
+        .unwrap();
+    let bind = desired_mutation_from_route_plan(bind_plan, "op_endpoint_read_bind", "read-bind");
+    assert!(matches!(
+        commit_desired_mutation(&store, &bind).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+
+    let ProductRead::Found(current) = store
+        .list_runtime_endpoints(&workspace, &create.candidate.cat_id)
+        .unwrap()
+    else {
+        panic!("current Endpoint set was not readable")
+    };
+    assert_eq!(current.cat_id, create.candidate.cat_id);
+    assert_eq!(current.desired_revision, revision(2));
+    assert!(current.complete);
+    assert_eq!(current.items.len(), 2);
+    assert!(current
+        .items
+        .windows(2)
+        .all(|pair| pair[0].endpoint_id < pair[1].endpoint_id));
+    let second = current
+        .items
+        .iter()
+        .find(|item| item.endpoint_id == second_endpoint_id)
+        .unwrap();
+    assert_eq!(second.name, id("metrics"));
+    assert_eq!(second.hostname, second_hostname);
+    assert_eq!(second.target_port, 9090);
+    assert_eq!(second.protocol, HttpProtocol::Http);
+    assert_eq!(
+        second.wake_policy,
+        cats_api::runtime_product_reads::EndpointReadWakePolicy::Disabled
+    );
+    assert_eq!(second.route_epoch, epoch(1));
+
+    let remove_default_plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Unbind {
+                endpoint_id: create.candidate.endpoint.endpoint_id.clone(),
+            },
+        )
+        .unwrap();
+    let remove_default = desired_mutation_from_route_plan(
+        remove_default_plan,
+        "op_endpoint_read_remove_default",
+        "read-remove-default",
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &remove_default).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    let ProductRead::Found(after_remove) = store
+        .list_runtime_endpoints(&workspace, &create.candidate.cat_id)
+        .unwrap()
+    else {
+        panic!("Endpoint set after removal was not readable")
+    };
+    assert_eq!(after_remove.desired_revision, revision(3));
+    assert_eq!(after_remove.items.len(), 1);
+    assert_eq!(after_remove.items[0].endpoint_id, second_endpoint_id);
+    assert_eq!(
+        store
+            .with(|client| client.query_one(
+                "SELECT count(*) FROM endpoint_records WHERE endpoint_id=$1",
+                &[&create.candidate.endpoint.endpoint_id.as_str()],
+            ))
+            .unwrap()
+            .get::<_, i64>(0),
+        1,
+        "removed Endpoint product record must remain retained"
+    );
+
+    let remove_last_plan = store
+        .plan_endpoint_route_mutation(
+            &workspace,
+            &create.candidate.cat_id,
+            EndpointMutation::Unbind {
+                endpoint_id: second_endpoint_id,
+            },
+        )
+        .unwrap();
+    let remove_last = desired_mutation_from_route_plan(
+        remove_last_plan,
+        "op_endpoint_read_remove_last",
+        "read-remove-last",
+    );
+    assert!(matches!(
+        commit_desired_mutation(&store, &remove_last).unwrap(),
+        DesiredMutationCommit::Changed(_)
+    ));
+    let ProductRead::Found(empty) = store
+        .list_runtime_endpoints(&workspace, &create.candidate.cat_id)
+        .unwrap()
+    else {
+        panic!("empty current Endpoint set was not readable")
+    };
+    assert_eq!(empty.desired_revision, revision(4));
+    assert!(empty.complete);
+    assert!(empty.items.is_empty());
+}
+
+#[test]
+fn runtime_endpoint_read_fails_closed_for_each_current_record_failure() {
+    for failure in ["missing", "projection-drift"] {
+        let (_url, store, _unused, workspace) = stores();
+        let create = request(
+            &workspace,
+            &format!("endpoint-read-{failure}"),
+            1,
+            &format!("endpoint-read-{failure}"),
+        );
+        store
+            .create_cat_covered_without_admission_for_product_test(&create)
+            .unwrap();
+        store
+            .with(|client| {
+                if failure == "missing" {
+                    client.execute(
+                        "DELETE FROM hostname_desired_lookups WHERE endpoint_id=$1",
+                        &[&create.candidate.endpoint.endpoint_id.as_str()],
+                    )?;
+                    client.execute(
+                        "DELETE FROM endpoint_records WHERE endpoint_id=$1",
+                        &[&create.candidate.endpoint.endpoint_id.as_str()],
+                    )?;
+                } else {
+                    client.execute(
+                        "UPDATE endpoint_records SET created_at=created_at+1
+                          WHERE endpoint_id=$1",
+                        &[&create.candidate.endpoint.endpoint_id.as_str()],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .list_runtime_endpoints(&workspace, &create.candidate.cat_id)
+                .unwrap(),
+            ProductRead::Corrupt,
+            "{failure} current record escaped the closed projection"
+        );
+    }
+}
+
+#[test]
 fn g4_concurrent_endpoint_plans_have_one_revision_winner() {
     let (url, seed, _unused, workspace) = stores();
     let mut create = request(&workspace, "g4-concurrent", 1, "g4-concurrent-create");

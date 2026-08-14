@@ -1,8 +1,11 @@
-//! Repeatable-read composition for the public runtime Cat and Disk projections.
+//! Repeatable-read composition for public runtime product projections.
+
+use std::collections::BTreeSet;
 
 use cats_api::runtime_product_reads::{
     CatDesiredReadV2, CatObservedReadV2, CatReadV2, DiskReadAdminState, DiskReadBinding,
-    DiskReadKind, DiskReadV2, ProductReadPage, ProductReadResource, RuntimeConditionKind,
+    DiskReadKind, DiskReadV2, EndpointCollectionReadV2, EndpointReadV2, EndpointReadWakePolicy,
+    ProductReadPage, ProductReadResource, RuntimeConditionKind, ENDPOINT_READ_MAX_ITEMS,
 };
 use cats_api::runtime_reconciliation::{
     AuthorizationConsumedReceipt, AuthorizationState, Condition, ContractVersion,
@@ -14,8 +17,8 @@ use postgres::{Row, Transaction};
 
 use super::product::{CatRecord, DiskAdminState, DiskRecord, DiskRole};
 use super::product_rows::{
-    decode_cat, decode_desired, decode_disk, load_cat_by_id_unlocked, load_desired_unlocked,
-    CAT_COLUMNS, DESIRED_COLUMNS, DISK_COLUMNS,
+    decode_cat, decode_desired, decode_disk, decode_endpoint, load_cat_by_id_unlocked,
+    load_desired_unlocked, CAT_COLUMNS, DESIRED_COLUMNS, DISK_COLUMNS, ENDPOINT_COLUMNS,
 };
 use super::rows::{
     load_disposable_root_graph_authorizations, load_root_delete_completion_candidates,
@@ -228,6 +231,58 @@ impl Store {
             }))
         })
     }
+
+    pub(crate) fn list_runtime_endpoints(
+        &self,
+        workspace_id: &Id,
+        cat_id: &Id,
+    ) -> StoreResult<ProductRead<EndpointCollectionReadV2>> {
+        self.authority_read_snapshot(|transaction| {
+            let cat_rows = exact_candidates(
+                transaction,
+                "cat_records",
+                CAT_COLUMNS,
+                "cat_id",
+                workspace_id,
+                cat_id,
+            )?;
+            if cat_rows.len() != 1 {
+                return Ok(if cat_rows.is_empty() {
+                    ProductRead::NotFound
+                } else {
+                    ProductRead::Corrupt
+                });
+            }
+            let cat = match decode_cat(&cat_rows[0]) {
+                Ok(cat) if cat.workspace_id == *workspace_id && cat.cat_id == *cat_id => cat,
+                _ => return Ok(ProductRead::Corrupt),
+            };
+            let desired_rows = exact_candidates(
+                transaction,
+                "desired_runtime_specs",
+                DESIRED_COLUMNS,
+                "cat_id",
+                workspace_id,
+                cat_id,
+            )?;
+            let [desired_row] = desired_rows.as_slice() else {
+                return Ok(ProductRead::Corrupt);
+            };
+            let desired = match decode_desired(desired_row) {
+                Ok(desired)
+                    if desired.workspace_id == cat.workspace_id && desired.cat_id == cat.cat_id =>
+                {
+                    desired
+                }
+                _ => return Ok(ProductRead::Corrupt),
+            };
+            Ok(match compose_endpoints(transaction, desired) {
+                Ok(endpoints) => ProductRead::Found(Box::new(endpoints)),
+                Err(ComposeError::Corrupt) => ProductRead::Corrupt,
+                Err(ComposeError::Store(error)) => return Err(error),
+            })
+        })
+    }
 }
 
 fn exact_candidates(
@@ -391,6 +446,65 @@ fn compose_cat(
             root_disk_id: root.disk_id.clone(),
         },
         observed,
+    })
+}
+
+fn compose_endpoints(
+    transaction: &mut Transaction<'_>,
+    desired: DesiredRuntimeSpec,
+) -> std::result::Result<EndpointCollectionReadV2, ComposeError> {
+    if desired.endpoints.len() > ENDPOINT_READ_MAX_ITEMS {
+        return Err(ComposeError::Corrupt);
+    }
+    let workspace_id = desired.workspace_id.clone();
+    let cat_id = desired.cat_id.clone();
+    let desired_revision = desired.desired_revision;
+    let mut names = BTreeSet::new();
+    let mut items = Vec::with_capacity(desired.endpoints.len());
+    for intent in desired.endpoints {
+        let rows = projection_result(exact_candidates(
+            transaction,
+            "endpoint_records",
+            ENDPOINT_COLUMNS,
+            "endpoint_id",
+            &workspace_id,
+            &intent.endpoint_id,
+        ))?;
+        let [row] = rows.as_slice() else {
+            return Err(ComposeError::Corrupt);
+        };
+        let record = projection_result(decode_endpoint(row))?;
+        if record.endpoint_id != intent.endpoint_id
+            || record.workspace_id != workspace_id
+            || record.cat_id != cat_id
+            || !names.insert(record.name.clone())
+        {
+            return Err(ComposeError::Corrupt);
+        }
+        items.push(EndpointReadV2 {
+            version: ContractVersion::V1,
+            endpoint_id: intent.endpoint_id,
+            name: record.name,
+            hostname: intent.hostname,
+            target_port: intent.target_port,
+            protocol: intent.protocol,
+            wake_policy: EndpointReadWakePolicy::Disabled,
+            route_epoch: intent.route_epoch,
+        });
+    }
+    items.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+    if items
+        .windows(2)
+        .any(|pair| pair[0].endpoint_id >= pair[1].endpoint_id)
+    {
+        return Err(ComposeError::Corrupt);
+    }
+    Ok(EndpointCollectionReadV2 {
+        version: ContractVersion::V1,
+        cat_id,
+        desired_revision,
+        complete: true,
+        items,
     })
 }
 

@@ -23,7 +23,10 @@ use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, PROVISIONER_CREDENTIAL_ID_HEADER,
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
-use cats_api::runtime_product_reads::{CatReadV2, DiskReadAdminState, DiskReadV2, ProductReadPage};
+use cats_api::runtime_product_reads::{
+    CatReadV2, DiskReadAdminState, DiskReadV2, EndpointCollectionReadV2, EndpointReadWakePolicy,
+    ProductReadPage,
+};
 use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
     decode_operation, decode_runtime_node_authority_apply_result,
@@ -784,6 +787,68 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     )
     .unwrap();
     assert_eq!(exact_cat, cat_page.items[0]);
+
+    let endpoint_url = format!(
+        "{}/v1/workspaces/{workspace_id}/cats/{}/endpoints",
+        context.first.base_url(),
+        created.cat_id
+    );
+    let unauthenticated_endpoint_query = context
+        .http
+        .get(format!("{endpoint_url}?limit=1"))
+        .body("not-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_endpoint_query.status(),
+        StatusCode::UNAUTHORIZED,
+        "workspace authorization must precede Endpoint query/body validation"
+    );
+    let endpoint_query = context
+        .http
+        .get(format!("{endpoint_url}?limit=1"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(endpoint_query.status(), StatusCode::BAD_REQUEST);
+    let endpoint_body = context
+        .http
+        .get(&endpoint_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .body("not-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(endpoint_body.status(), StatusCode::BAD_REQUEST);
+    let endpoint_response = context
+        .http
+        .get(&endpoint_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint_response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    let endpoint_collection: EndpointCollectionReadV2 =
+        serde_json::from_slice(&json_body(endpoint_response, StatusCode::OK).await).unwrap();
+    assert_eq!(endpoint_collection.cat_id, created.cat_id);
+    assert_eq!(endpoint_collection.desired_revision.get(), 1);
+    assert!(endpoint_collection.complete);
+    assert_eq!(endpoint_collection.items.len(), 1);
+    let endpoint = &endpoint_collection.items[0];
+    assert_eq!(endpoint.name.as_str(), "web");
+    assert_eq!(endpoint.target_port, 8080);
+    assert_eq!(
+        endpoint.protocol,
+        cats_api::runtime_reconciliation::HttpProtocol::Http
+    );
+    assert_eq!(endpoint.wake_policy, EndpointReadWakePolicy::Disabled);
+    assert_eq!(endpoint.route_epoch.get(), 1);
+
     let name_is_not_an_item_key = context
         .http
         .get(format!(

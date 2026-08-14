@@ -10,11 +10,13 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime_reconciliation::{
-    ContractVersion, Durability, Id, Revision, RuntimeTarget, Sha256Digest, StableState, UnixMillis,
+    ContractVersion, Durability, Epoch, Hostname, HttpProtocol, Id, Revision, RuntimeTarget,
+    Sha256Digest, StableState, UnixMillis,
 };
 
 pub const PRODUCT_READ_DEFAULT_LIMIT: usize = 50;
 pub const PRODUCT_READ_MAX_LIMIT: usize = 100;
+pub const ENDPOINT_READ_MAX_ITEMS: usize = 256;
 const PRODUCT_READ_CURSOR_MAX_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +105,41 @@ pub enum DiskReadAdminState {
 pub struct DiskReadBinding {
     pub cat_id: Id,
     pub desired_revision: Revision,
+}
+
+/// One complete current Endpoint membership projection for a Cat.
+///
+/// This is observation-only product state. In particular, `complete` is not
+/// route admission authority and `items` never includes retained records that
+/// are absent from the current DesiredRuntimeSpec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCollectionReadV2 {
+    pub version: ContractVersion,
+    pub cat_id: Id,
+    pub desired_revision: Revision,
+    pub complete: bool,
+    pub items: Vec<EndpointReadV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointReadV2 {
+    pub version: ContractVersion,
+    pub endpoint_id: Id,
+    pub name: Id,
+    pub hostname: Hostname,
+    pub target_port: u16,
+    pub protocol: HttpProtocol,
+    pub wake_policy: EndpointReadWakePolicy,
+    pub route_epoch: Epoch,
+}
+
+/// Route Grant v2 has no public wake authority in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointReadWakePolicy {
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,5 +255,36 @@ mod tests {
         );
         assert!(decode_product_read_cursor(ProductReadResource::Cats, "").is_err());
         assert!(decode_product_read_cursor(ProductReadResource::Cats, &"A".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn endpoint_collection_is_the_closed_v2_product_projection() {
+        let response = EndpointCollectionReadV2 {
+            version: ContractVersion::V1,
+            cat_id: id("cat_01"),
+            desired_revision: Revision::new(7).unwrap(),
+            complete: true,
+            items: vec![EndpointReadV2 {
+                version: ContractVersion::V1,
+                endpoint_id: id("ep_01"),
+                name: id("web"),
+                hostname: Hostname::new("web.example.test").unwrap(),
+                target_port: 8080,
+                protocol: HttpProtocol::Http,
+                wake_policy: EndpointReadWakePolicy::Disabled,
+                route_epoch: Epoch::new(3).unwrap(),
+            }],
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            encoded,
+            br#"{"version":1,"cat_id":"cat_01","desired_revision":7,"complete":true,"items":[{"version":1,"endpoint_id":"ep_01","name":"web","hostname":"web.example.test","target_port":8080,"protocol":"http","wake_policy":"disabled","route_epoch":3}]}"#
+        );
+        assert_eq!(
+            serde_json::from_slice::<EndpointCollectionReadV2>(&encoded).unwrap(),
+            response
+        );
+        let with_extra = br#"{"version":1,"cat_id":"cat_01","desired_revision":7,"complete":true,"items":[],"extra":true}"#;
+        assert!(serde_json::from_slice::<EndpointCollectionReadV2>(with_extra).is_err());
     }
 }

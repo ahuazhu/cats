@@ -1,8 +1,8 @@
 //! Workspace-qualified public reads composed from current runtime authority.
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{OriginalUri, State};
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
 use axum::response::Response;
 use cats_api::error::ApiError;
 use cats_api::runtime_product_reads::{
@@ -126,6 +126,41 @@ pub(super) async fn get_runtime_disk(
     }
 }
 
+pub(super) async fn list_runtime_endpoints(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    request: Request<Body>,
+) -> ApiResult<Response> {
+    let workspace_id = authorize_workspace(&state, &uri, request.headers()).await?;
+    if uri.query().is_some() {
+        return Err(ApiError::invalid("Endpoint read does not accept a query").into());
+    }
+    let Some(raw_cat_id) = exact_endpoint_collection_cat(&uri, &workspace_id) else {
+        return Err(ApiError::not_found("cat").into());
+    };
+    let Some(cat_id) = Id::new(raw_cat_id.to_owned()).filter(|id| id.as_str().starts_with("cat_"))
+    else {
+        return Err(ApiError::not_found("cat").into());
+    };
+    require_empty_body(request.into_body()).await?;
+    let readiness = state.readiness.clone();
+    let read = state
+        .store
+        .execute(move |store| {
+            let read = store.list_runtime_endpoints(&workspace_id, &cat_id);
+            if matches!(read, Ok(ProductRead::Corrupt)) {
+                readiness.poison();
+            }
+            read
+        })
+        .await?;
+    match read {
+        ProductRead::Found(endpoints) => json_response(endpoints.as_ref()),
+        ProductRead::NotFound => Err(ApiError::not_found("cat").into()),
+        ProductRead::Corrupt => corrupt_response("Endpoint collection"),
+    }
+}
+
 async fn authorize_workspace(state: &AppState, uri: &Uri, headers: &HeaderMap) -> ApiResult<Id> {
     let workspace = uri.path().split('/').nth(3).unwrap_or("");
     let scope = check_workspace_auth(state, headers, workspace).await?;
@@ -165,6 +200,42 @@ fn exact_item_segment<'a>(uri: &'a Uri, workspace_id: &Id, collection: &str) -> 
         }
         _ => None,
     }
+}
+
+fn exact_endpoint_collection_cat<'a>(uri: &'a Uri, workspace_id: &Id) -> Option<&'a str> {
+    let mut segments = uri.path().split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (
+            Some(""),
+            Some("v1"),
+            Some("workspaces"),
+            Some(workspace),
+            Some("cats"),
+            Some(cat),
+            Some("endpoints"),
+            None,
+        ) if workspace == workspace_id.as_str() && !cat.is_empty() => Some(cat),
+        _ => None,
+    }
+}
+
+async fn require_empty_body(body: Body) -> ApiResult<()> {
+    let bytes = to_bytes(body, 1)
+        .await
+        .map_err(|_| ApiError::invalid("Endpoint read body must be empty"))?;
+    if !bytes.is_empty() {
+        return Err(ApiError::invalid("Endpoint read body must be empty").into());
+    }
+    Ok(())
 }
 
 fn parse_page_query(uri: &Uri, resource: ProductReadResource) -> ApiResult<(usize, Option<Id>)> {
@@ -278,5 +349,36 @@ mod tests {
             encode_product_read_cursor(ProductReadResource::Disks, &Id::new("disk_01").unwrap());
         let uri = format!("/cats?cursor={disk_cursor}").parse().unwrap();
         assert!(parse_page_query(&uri, ProductReadResource::Cats).is_err());
+    }
+
+    #[test]
+    fn endpoint_collection_path_is_exact_and_has_no_query() {
+        let workspace = Id::new("ws_01").unwrap();
+        let exact: Uri = "/v1/workspaces/ws_01/cats/cat_01/endpoints"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            exact_endpoint_collection_cat(&exact, &workspace),
+            Some("cat_01")
+        );
+        for path in [
+            "/v1/workspaces/ws_02/cats/cat_01/endpoints",
+            "/v1/workspaces/ws_01/cats/cat_01/endpoints/",
+            "/v1/workspaces/ws_01/cats//endpoints",
+            "/v1/workspaces/ws_01/cats/cat_01/endpoints/extra",
+        ] {
+            assert!(exact_endpoint_collection_cat(&path.parse().unwrap(), &workspace).is_none());
+        }
+        let query: Uri = "/v1/workspaces/ws_01/cats/cat_01/endpoints?limit=1"
+            .parse()
+            .unwrap();
+        assert!(query.query().is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_collection_rejects_every_nonempty_body() {
+        require_empty_body(Body::empty()).await.unwrap();
+        assert!(require_empty_body(Body::from("x")).await.is_err());
+        assert!(require_empty_body(Body::from("too large")).await.is_err());
     }
 }

@@ -20,7 +20,7 @@ use crate::store::{internal, Result, Store};
 
 pub(super) const CAT_COLUMNS: &str =
     "cat_id, record::text AS record_json, workspace_id, name, created_at";
-const ENDPOINT_COLUMNS: &str = "
+pub(super) const ENDPOINT_COLUMNS: &str = "
     endpoint_id, record::text AS record_json, workspace_id, cat_id, name,
     created_at";
 pub(super) const DISK_COLUMNS: &str = "
@@ -570,7 +570,7 @@ pub(super) fn load_endpoint_by_cat_name_unlocked(
         .transpose()
 }
 
-fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
+pub(super) fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
     let stored = EndpointProjection::from_row(row)?;
     let record: EndpointRecord = decode_json(row.try_get("record_json")?)?;
     if stored != EndpointProjection::from_record(&record) {
