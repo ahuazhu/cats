@@ -129,6 +129,13 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
+    /// Prove public TLS ingress is reachable but Route v2 admission is closed.
+    PublicRouteClosed {
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        run_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -178,6 +185,7 @@ fn main() -> Result<()> {
         } => install_workload(&cat_id, &run_id, &workload, &workload_sha256, port),
         Command::RemoveWorkload { cat_id, run_id } => remove_workload(&cat_id, &run_id),
         Command::PublicRoute { origin, run_id } => public_route(&origin, &run_id),
+        Command::PublicRouteClosed { origin, run_id } => public_route_closed(&origin, &run_id),
     }
 }
 
@@ -1515,6 +1523,89 @@ fn public_route(origin: &str, run_id: &str) -> Result<()> {
             "run_id": run_id,
             "http_guest_body": true,
             "websocket_guest_echo": true
+        })
+    );
+    Ok(())
+}
+
+fn public_route_closed(origin: &str, run_id: &str) -> Result<()> {
+    canonical_run_id(run_id)?;
+    let origin = reqwest::Url::parse(origin).context("parse --origin")?;
+    anyhow::ensure!(
+        origin.scheme() == "https"
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none(),
+        "--origin must be one canonical HTTPS origin"
+    );
+    let http_url = origin.join(&format!("e3/{run_id}"))?;
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client
+        .get(http_url.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .context("closed public HTTP response is ambiguous")?;
+    anyhow::ensure!(
+        response.url() == &http_url,
+        "closed public HTTP request redirected"
+    );
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "closed public HTTP status is not 503"
+    );
+    let content_types = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_TYPE)
+        .iter()
+        .map(reqwest::header::HeaderValue::as_bytes)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        content_types.as_slice() == [b"text/plain"],
+        "closed public HTTP Content-Type is not exact"
+    );
+    let retry_after = response
+        .headers()
+        .get_all(reqwest::header::RETRY_AFTER)
+        .iter()
+        .map(reqwest::header::HeaderValue::as_bytes)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        retry_after.as_slice() == [b"1"],
+        "closed public HTTP Retry-After is not exact"
+    );
+    anyhow::ensure!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_none(),
+        "closed public HTTP response is encoded"
+    );
+    let mut body = Vec::new();
+    response.take(4_097).read_to_end(&mut body)?;
+    anyhow::ensure!(
+        body == b"service unavailable\n",
+        "closed public HTTP body is not the fixed Gateway rejection"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "version": 1,
+            "kind": "route_v2_public_admission_closed_v1",
+            "origin": http_url.origin().ascii_serialization(),
+            "path": http_url.path(),
+            "run_id": run_id,
+            "tls_reachable": true,
+            "http_status": 503,
+            "content_type": "text/plain",
+            "retry_after_seconds": 1,
+            "content_encoding_absent": true,
+            "body_sha256": format!("sha256:{}", hex::encode(Sha256::digest(&body))),
+            "terminal_marker": "public_ingress_reachable_route_v2_closed"
         })
     );
     Ok(())
