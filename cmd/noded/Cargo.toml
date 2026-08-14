@@ -25,8 +25,13 @@ path = "src/runtime_e3_probe.rs"
 name = "cats-usage-schema-v16-verifier"
 path = "src/usage_schema_v16_verifier.rs"
 
+[[bin]]
+name = "cats-usage-terminal-receipt-verifier"
+path = "src/usage_terminal_receipt_verifier.rs"
+
 [dependencies]
 cats-api = { workspace = true }
+cats-metering = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }

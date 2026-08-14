@@ -1300,6 +1300,7 @@ dependencies = [
  "anyhow",
  "cats-api",
  "cats-metadata-store-postgres",
+ "cats-metering",
  "cats-node-agent",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
