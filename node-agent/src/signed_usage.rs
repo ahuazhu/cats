@@ -491,27 +491,61 @@ pub(crate) async fn run_delivery(
         tokio::select! {
             _ = interval.tick() => {}
             _ = pipeline.delivery_wake.notified() => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-                continue;
-            }
+            _ = wait_for_usage_shutdown(&mut shutdown) => return Ok(()),
         }
-        if let Err(error) = pipeline.deliver_pending().await {
-            tracing::warn!(
-                error = format!("{error:#}"),
-                "signed usage delivery will retry"
-            );
+        tokio::select! {
+            result = pipeline.deliver_pending() => {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "signed usage delivery will retry"
+                    );
+                }
+            }
+            // Dropping an in-flight delivery before its exact ACK keeps that
+            // prefix in the durable spool. The runner joins the sampler first,
+            // then gives the complete spool one separately bounded final try.
+            _ = wait_for_usage_shutdown(&mut shutdown) => return Ok(()),
+        }
+    }
+}
+
+async fn wait_for_usage_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use super::signed_source_epoch;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use cats_api::agent_registration::Ed25519RequestSigner;
+    use cats_api::metering::{
+        CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
+        UsageMetric, MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+    };
+    use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+    use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair;
+    use tokio::sync::{oneshot, Semaphore};
+
+    use super::{
+        new_meter, run_delivery, run_sampler, signed_source_epoch, SignedMeterTarget,
+        SignedUsagePipeline, SignedUsageSampler,
+    };
+    use crate::usage_delivery::UsageDeliveryState;
+    use crate::usage_spool::UsageSpool;
 
     #[test]
     fn desired_revision_separates_accumulator_epochs_after_counter_reset() {
@@ -527,5 +561,165 @@ mod tests {
         assert_ne!(first, next);
         assert!(first.contains(":desired:7:"));
         assert!(next.contains(":desired:8:"));
+    }
+
+    #[derive(Clone)]
+    struct SlowIngestion {
+        request_sizes: Arc<Mutex<Vec<usize>>>,
+        request_number: Arc<AtomicUsize>,
+        first_started: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release_first: Arc<Semaphore>,
+    }
+
+    async fn ingest_slow_first(
+        State(state): State<SlowIngestion>,
+        body: Bytes,
+    ) -> Json<IngestUsageCheckpointsResponse> {
+        let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+        state
+            .request_sizes
+            .lock()
+            .unwrap()
+            .push(request.checkpoints.len());
+        if state.request_number.fetch_add(1, Ordering::SeqCst) == 0 {
+            if let Some(started) = state.first_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            state.release_first.acquire().await.unwrap().forget();
+        }
+        Json(IngestUsageCheckpointsResponse {
+            accepted: request.checkpoints.len() as u64,
+            duplicates: 0,
+            rejected: Vec::new(),
+        })
+    }
+
+    fn queued_checkpoint(sequence: u64) -> CatUsageCheckpoint {
+        CatUsageCheckpoint {
+            event_id: format!("queued-{sequence:04}"),
+            source_id: "node/node-a/cat/cat-a".to_owned(),
+            source_epoch: "queued-epoch".to_owned(),
+            sequence,
+            observed_at_unix_ms: 1_000 + i64::try_from(sequence).unwrap(),
+            cat_id: "cat-a".to_owned(),
+            cat_generation: 1,
+            metric: UsageMetric::CpuUsec,
+            cumulative_quantity: u128::from(sequence),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_backlog_delivery_then_persists_and_replays_final_sample() {
+        let (first_started, first_started_rx) = oneshot::channel();
+        let ingestion = SlowIngestion {
+            request_sizes: Arc::new(Mutex::new(Vec::new())),
+            request_number: Arc::new(AtomicUsize::new(0)),
+            first_started: Arc::new(Mutex::new(Some(first_started))),
+            release_first: Arc::new(Semaphore::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(ingest_slow_first))
+            .with_state(ingestion.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let cgroup = directory.path().join("cat-a.service");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cpu.stat"), "usage_usec 41\n").unwrap();
+        std::fs::write(cgroup.join("memory.current"), "4096\n").unwrap();
+        let session = SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(3).unwrap(),
+        };
+        let mut sampler = SignedUsageSampler::new(session.clone(), PathBuf::new());
+        sampler.meters = BTreeMap::from([(
+            "cat-a".to_owned(),
+            new_meter(
+                "node-a",
+                SignedMeterTarget {
+                    cat_id: "cat-a".to_owned(),
+                    generation: 7,
+                    source_epoch: "final-epoch".to_owned(),
+                    cgroups: vec![cgroup],
+                },
+            )
+            .unwrap(),
+        )]);
+        let spool = UsageSpool::open(&directory.path().join("usage-spool.sqlite3")).unwrap();
+        let queued = u64::try_from(MAX_USAGE_CHECKPOINTS_PER_REQUEST).unwrap() + 1;
+        spool
+            .enqueue(&(0..queued).map(queued_checkpoint).collect::<Vec<_>>())
+            .unwrap();
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519RequestSigner::from_pkcs8_der(
+            Id::new("credential-a").unwrap(),
+            document.as_ref(),
+        )
+        .unwrap();
+        let pipeline = Arc::new(SignedUsagePipeline {
+            sampler: Mutex::new(sampler),
+            spool,
+            delivery: tokio::sync::Mutex::new(UsageDeliveryState::default()),
+            delivery_wake: tokio::sync::Notify::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            endpoint,
+            signer,
+            session,
+        });
+
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let usage_task = tokio::spawn({
+            let sampler = Arc::clone(&pipeline);
+            let delivery = Arc::clone(&pipeline);
+            let sampler_shutdown = shutdown_rx.clone();
+            async move {
+                tokio::try_join!(
+                    run_sampler(sampler, sampler_shutdown),
+                    run_delivery(delivery, shutdown_rx),
+                )
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_started_rx)
+            .await
+            .expect("ordinary delivery never reached its first slow ACK")
+            .unwrap();
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), usage_task)
+            .await
+            .expect("ordinary backlog delivery made shutdown unbounded")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            pipeline.spool.len().unwrap(),
+            queued + 2,
+            "the unACKed prefix and final two-metric sample must remain durable"
+        );
+        ingestion.release_first.add_permits(1);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            pipeline.deliver_pending_for_shutdown(),
+        )
+        .await
+        .expect("the single bounded final attempt did not finish")
+        .unwrap();
+        assert!(pipeline.spool.is_empty().unwrap());
+        assert_eq!(
+            *ingestion.request_sizes.lock().unwrap(),
+            vec![
+                MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+                MAX_USAGE_CHECKPOINTS_PER_REQUEST,
+                3,
+            ],
+            "final delivery must replay the cancelled prefix before the final sample"
+        );
+        server.abort();
     }
 }
