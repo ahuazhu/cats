@@ -8,8 +8,13 @@ an explicit input.  ``plan`` is read-only.  ``apply`` is also read-only unless
 
 Production execution consumes the exact closed E13 proof directory and invokes
 the release-bound Rust Usage terminal/schema verifiers before it can publish
-``reset-started``. Unavailable V3/G3/local-stop or admission-discovery adapters
-fail closed; no CLI option can bypass them.
+``reset-started``. The G3 rotation-qualification and Qualification-admission
+typed verifiers are wired in source. V3 HostFence and local positive-stop have
+no accepted automatic producer (DEFERRED.md V3/E13); their proof branches fail
+closed unless the operator supplies a validated CUTOVER-DECISIONS.md D7 manual
+fence/stop attestation through ``--accept-manual-fence-evidence``. That input
+is validated for completeness and exact receipt binding; it mints no
+HostFenceEvent or takeover authority, and no CLI option skips a verifier.
 
 The reset is a post-cutover retirement tool.  It proves that a disjoint fresh
 schema/object/stream/checkpoint/archive namespace is already qualified and
@@ -196,6 +201,7 @@ class Config:
     cutover_proof_directory: Path
     production_cutover_operator_trust_file: Path
     fresh_usage_postgres_ca_file: Path
+    manual_fence_evidence_file: Path | None = None
     legacy_fixture_post_green_evidence_file: Path | None = None
 
     @property
@@ -579,6 +585,11 @@ def validate_config(config: Config) -> None:
         and not config.legacy_fixture_post_green_evidence_file.is_absolute()
     ):
         raise ResetError("legacy fixture evidence path must be absolute")
+    if (
+        config.manual_fence_evidence_file is not None
+        and not config.manual_fence_evidence_file.is_absolute()
+    ):
+        raise ResetError("manual fence evidence path must be absolute")
     try:
         receipt_stat = config.receipt_directory.stat(follow_symlinks=False)
     except OSError as error:
@@ -810,6 +821,27 @@ class ResetExecutor:
                     self.config.receipt_directory
                 )
             )
+            # V3 HostFence and local positive-stop stay at their fail-closed
+            # defaults unless the operator supplies validated D7 manual
+            # attestation; this input never skips the other typed verifiers.
+            fence_verifiers: dict[str, Any] = {}
+            if self.config.manual_fence_evidence_file is not None:
+                manual_fence = cutover_proof.ManualOperatorFenceEvidence.parse(
+                    admission.read_stable_file(
+                        self.config.manual_fence_evidence_file,
+                        "manual old-host fence evidence",
+                        cutover_proof.MAX_MANUAL_FENCE_EVIDENCE_BYTES,
+                        private=False,
+                    ),
+                    expected_account_id=self.config.aws_account_id,
+                    now=reference_time,
+                )
+                fence_verifiers = {
+                    "host_fence_verifier": manual_fence.host_fence_verifier(),
+                    "local_positive_stop_verifier": (
+                        manual_fence.local_positive_stop_verifier()
+                    ),
+                }
             proof = cutover_proof.verify(
                 self.config.cutover_proof_directory,
                 expected_reset_id=self.config.reset_id,
@@ -817,7 +849,17 @@ class ResetExecutor:
                 expected_operator=operator,
                 expected_old_targets=self.config.targets()["old"],
                 expected_fresh_targets=self.config.fresh_targets(),
+                route_v2_verifier=(
+                    cutover_proof.RouteV2RotationQualificationEvidenceVerifier()
+                ),
                 usage_verifier=usage_terminal_verifier,
+                qualification_admission_verifier=(
+                    cutover_proof.QualificationAdmissionEvidenceVerifier(
+                        admission,
+                        trust_raw,
+                    )
+                ),
+                **fence_verifiers,
                 now=reference_time,
             )
             if (
@@ -3076,6 +3118,22 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         type=Path,
     )
+    parser.add_argument(
+        "--accept-manual-fence-evidence",
+        type=Path,
+        default=None,
+        help=(
+            "operator manual fence/stop attestation JSON"
+            " (kind cats.manual-old-host-fence-evidence.v1) under"
+            " CUTOVER-DECISIONS.md D7: who fenced, when, per-host EC2 stop"
+            " evidence or stopped systemd units, an all-true checklist, and"
+            " the exact sha256 of each staged forensic receipt. V1 has no"
+            " automatic V3 HostFence or accepted local positive-stop producer"
+            " (DEFERRED.md V3/E13); without this validated input those two"
+            " proof branches fail closed. It is input validation only and"
+            " mints no HostFenceEvent or takeover authority"
+        ),
+    )
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -3113,6 +3171,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
             args.production_cutover_operator_trust_file
         ),
         fresh_usage_postgres_ca_file=args.fresh_usage_postgres_ca_file,
+        manual_fence_evidence_file=args.accept_manual_fence_evidence,
     )
 
 

@@ -125,6 +125,78 @@ ADR/accepted spec approves the authority, parser, freshness and reset-consumptio
 transaction. A self-written document or this repository's offline fixture is
 not positive shutdown evidence.
 
+## Old-Host coverage: V3/E13 verifiers and D7 manual fence evidence
+
+The E13 proof set covers every declared old Host with one terminal proof of
+kind `host_fence_event` (V3) or `local_positive_stop` (E13). V1 has no
+automatic V3 HostFenceEvent producer and the local positive-stop contract
+remains Proposed (`DEFERRED.md` V3/E13,
+[old-host-positive-stop-v1](../../docs/specs/old-host-positive-stop-v1.md)),
+so both branches fail closed by default.
+
+Under the accepted v1 decision `CUTOVER-DECISIONS.md` D7 (manual fencing: EC2
+stop, console/CLI forensics, operator submits the fence facts), the operator
+may instead supply an explicit attestation file via
+`--accept-manual-fence-evidence /absolute/path/manual-fence.json`. The reset
+tool validates that input for completeness — who fenced, when, per-host EC2
+stop evidence or stopped systemd units, an all-true checklist, and the exact
+SHA-256 of each staged forensic receipt in the proof directory — and only then
+admits the matching coverage entries. This is reset-tool input validation
+only: it mints no HostFenceEvent, no takeover authorization and no database
+authority, and it never skips the G3/E9/V5/admission verifiers.
+
+```json
+{
+  "kind": "cats.manual-old-host-fence-evidence.v1",
+  "version": 1,
+  "decision": "cutover-decisions-d7-manual-fence",
+  "operator_principal_arn": "arn:aws:sts::123456789012:assumed-role/ROLE/SESSION",
+  "recorded_at": "2026-08-15T00:00:00Z",
+  "hosts": [
+    {
+      "host_id": "old-host-a",
+      "components": ["blockd", "node_agent", "vmm"],
+      "terminal_kind": "host_fence_event",
+      "event_id": "manual-fence-old-host-a",
+      "ec2_stop": {
+        "instance_id": "i-0123456789abcdef0",
+        "stopped_at": "2026-08-14T23:50:00Z"
+      },
+      "checklist": {
+        "instance_stopped": true,
+        "no_running_writers": true,
+        "object_write_cutoff_verified": true,
+        "forensic_artifact_retained": true
+      },
+      "receipt_sha256": "sha256:REPLACE_WITH_STAGED_RECEIPT_SHA256"
+    },
+    {
+      "host_id": "old-host-b",
+      "components": ["controller", "gateway"],
+      "terminal_kind": "local_positive_stop",
+      "stopped_units": ["cats-controld.service", "cats-gatewayd.service"],
+      "stopped_at": "2026-08-14T23:40:00Z",
+      "checklist": {
+        "units_stopped": true,
+        "no_running_writers": true,
+        "object_write_cutoff_verified": true,
+        "forensic_artifact_retained": true
+      },
+      "receipt_sha256": "sha256:REPLACE_WITH_STAGED_RECEIPT_SHA256"
+    }
+  ]
+}
+```
+
+The file must be canonical JSON with one terminal LF, `hosts` strictly sorted
+by unique `host_id`, and the principal an assumed-role ARN in the reset
+account; `recorded_at` must not be in the future. Each attested host must
+match its `old_host_coverage` entry exactly (host, sorted component set,
+`event_id` for fence entries) and bind the exact staged receipt digest, or the
+proof branch fails closed. Each staged receipt remains the retained raw
+forensic artifact (for example the EC2 console/CLI stop record); the
+attestation binds it by digest and does not reinterpret it.
+
 ## Database and credential boundary
 
 Supply all four old/fresh PostgreSQL URLs only through absolute single-link
@@ -231,14 +303,13 @@ and review a new plan; never edit a receipt.
 
 ## Execute and receipts
 
-Production execution is intentionally unavailable in this binary. E13 positive
-stop/isolation remains Proposed and non-authoritative, and E9 signed final
-usage epoch/barrier plus the cross-component Closed route/mutation admission
-proof still have no accepted canonical formats. Each is a separate mechanical
-pre-start block, evaluated before AWS or PostgreSQL access. `plan`, dry-run and
-the offline fake fixture remain available; no digest or declaration bypasses
-these blocks. Removing a block belongs to the branch that lands its accepted
-proof parser and calibrated negative fixtures.
+Production execution consumes the closed E13 proof directory. The G3 rotation
+qualification, E9 release-bound Rust Usage verifiers and the Qualification
+admission chain verifier are wired in source; V3 HostFence and local
+positive-stop coverage fail closed unless the operator supplies the validated
+D7 manual fence attestation described above. Every verifier is evaluated
+before AWS or PostgreSQL access; `plan`, dry-run and the offline fake fixture
+remain available, and no digest or declaration bypasses a verifier.
 
 Only the independent maintenance actor has the narrow delete/drop permissions.
 Add `--execute` to the already reviewed `apply` invocation. Before the first

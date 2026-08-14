@@ -124,6 +124,53 @@ QUALIFICATION_PROOF_LOGICAL_FILES = {
 USAGE_SOURCE_TERMINAL_SET_KIND = (
     "cats.usage-source-terminal-receipts.v1"
 )
+ROUTE_V2_ROTATION_CASE_ID = "route-v2-rotation-disable-live-delivery"
+ROUTE_V2_ROTATION_RECEIPT_KIND = "route_v2_rotation_terminal_receipt_v1"
+ROUTE_V2_NODE_ACK_SET_KIND = "route_v2_node_ring_ack_set_v1"
+ROUTE_V2_ROTATION_TRANSCRIPT_KIND = "route_v2_rotation_transcript_v1"
+ROUTE_V2_ROTATION_TERMINAL_MARKER = (
+    "route_v2_rotation_disable_recovered_active_http_ws"
+)
+ROUTE_V2_NODE_ACK_TERMINAL_MARKER = (
+    "recovery_ring_acked_and_active_routes_reopened"
+)
+ROUTE_V2_ROTATION_PHASES = (
+    "publish_overlap",
+    "switch_active",
+    "publish_new_only",
+    "retire",
+    "disable",
+    "publish_recovery",
+    "activate",
+)
+ROUTE_V2_ROTATION_CHECKPOINTS = (
+    ("publish_overlap", "switch_active", "all_schedulable_nodes_ack_ring"),
+    ("publish_new_only", "retire", "all_schedulable_nodes_ack_ring"),
+    ("disable", "publish_recovery", "all_provisioned_nodes_closed_or_fenced"),
+    (
+        "publish_recovery",
+        "activate",
+        "all_provisioned_nodes_closed_or_fenced_and_ack_ring",
+    ),
+)
+MANUAL_FENCE_EVIDENCE_KIND = "cats.manual-old-host-fence-evidence.v1"
+MANUAL_FENCE_EVIDENCE_DECISION = "cutover-decisions-d7-manual-fence"
+MANUAL_FENCE_CHECKLIST_FIELDS = {
+    "host_fence_event": {
+        "instance_stopped",
+        "no_running_writers",
+        "object_write_cutoff_verified",
+        "forensic_artifact_retained",
+    },
+    "local_positive_stop": {
+        "units_stopped",
+        "no_running_writers",
+        "object_write_cutoff_verified",
+        "forensic_artifact_retained",
+    },
+}
+MANUAL_FENCE_COMPONENTS = {"blockd", "controller", "gateway", "node_agent", "vmm"}
+MAX_MANUAL_FENCE_EVIDENCE_BYTES = 1024 * 1024
 MAX_PROOF_SET_BYTES = 2 * 1024 * 1024
 MAX_PROOF_FILE_BYTES = 16 * 1024 * 1024
 MAX_VERIFIER_BINARY_BYTES = 256 * 1024 * 1024
@@ -143,6 +190,11 @@ AWS_REGION = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$")
 CATS_SCHEMA = re.compile(r"^cats_[a-z][a-z0-9_]{0,61}$")
 UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+EC2_INSTANCE_ID = re.compile(r"^i-[0-9a-f]{8,32}$")
+SYSTEMD_UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,246}\.service$")
+STS_ASSUMED_ROLE = re.compile(
+    r"^arn:(aws|aws-us-gov|aws-cn):sts::([0-9]{12}):assumed-role/[^/]+/.+$"
 )
 
 TARGET_FIELDS = {
@@ -524,13 +576,24 @@ class _UnavailableUsageVerifier:
 
 class _UnavailableHostFenceVerifier:
     def verify(self, _receipt: VerifiedFile, _expected: dict[str, Any]) -> None:
-        raise ProofSetError("V3 core HostFence verifier is not implementation-accepted")
+        raise ProofSetError(
+            "V3 automatic HostFenceEvent producer/core verifier is not implemented"
+            " (DEFERRED.md V3; docs/specs/production-reset-open-authority-v1.md"
+            " section 3.4); under CUTOVER-DECISIONS.md D7 manual fencing, supply"
+            " operator attestation through the reset tool"
+            " --accept-manual-fence-evidence input instead"
+        )
 
 
 class _UnavailableLocalPositiveStopVerifier:
     def verify(self, _receipt: VerifiedFile, _expected: dict[str, Any]) -> None:
         raise ProofSetError(
-            "local positive-stop proof is Proposed and not implementation-accepted"
+            "local positive-stop evidence remains Proposed with no accepted"
+            " terminal verifier (DEFERRED.md E13;"
+            " docs/specs/old-host-positive-stop-v1.md producer"
+            " deploy/aws/old-host-positive-stop.py); under CUTOVER-DECISIONS.md"
+            " D7 manual fencing, supply operator attestation through the reset"
+            " tool --accept-manual-fence-evidence input instead"
         )
 
 
@@ -1018,6 +1081,875 @@ class SubprocessUsageSchemaV16Verifier:
             os.close(binary_descriptor)
 
 
+class RouteV2RotationQualificationEvidenceVerifier:
+    """Reviewed G3 typed verifier over the three exact rotation evidence files.
+
+    The producer is the dedicated qualification-cell runner
+    (``deploy/metal/runtime-cutover-e2e.sh`` driving
+    ``deploy/metal/runtime-cutover-v2-scenarios.sh``).  This adapter validates
+    the terminal receipt, the Node ring-ACK set and the transcript as one
+    bound terminal set: exact kinds and case identity, exact release/catalog
+    binding, the closed seven-phase signed command chain, both closed
+    disable/recovery checkpoints, the recovered fresh-endpoint proof and the
+    exact node-acks/transcript digests named by the receipt.  It does not
+    accept a single phase receipt, a provisional template or AWS rollout
+    detail as terminal qualification evidence.
+    """
+
+    def verify(
+        self,
+        receipt: VerifiedFile,
+        node_acks: VerifiedFile,
+        transcript: VerifiedFile,
+        context: ProducerContext,
+    ) -> None:
+        value = fields(
+            decode_json(receipt.data, "G3 rotation terminal receipt"),
+            {
+                "version",
+                "kind",
+                "case_id",
+                "qualification_run_id",
+                "source_commit_sha",
+                "qualification_catalog_sha256",
+                "authority_id",
+                "route_deployment_id",
+                "rotation_operator_trust_sha256",
+                "command_bundle_sha256",
+                "recovery_transport_sha256",
+                "phase_receipts",
+                "disabled_checkpoint",
+                "recovery_checkpoint",
+                "fresh_endpoint",
+                "node_acks_sha256",
+                "transcript_sha256",
+                "terminal_marker",
+            },
+            "G3 rotation terminal receipt",
+        )
+        if (
+            not version_one(value["version"])
+            or value["kind"] != ROUTE_V2_ROTATION_RECEIPT_KIND
+            or value["case_id"] != ROUTE_V2_ROTATION_CASE_ID
+            or value["source_commit_sha"] != context.release_commit
+            or value["qualification_catalog_sha256"]
+            != context.qualification_catalog_sha256
+            or value["terminal_marker"] != ROUTE_V2_ROTATION_TERMINAL_MARKER
+        ):
+            raise ProofSetError(
+                "G3 rotation terminal receipt is not the exact-release closed case"
+            )
+        run_id = identifier(value["qualification_run_id"], "G3 rotation run ID")
+        identifier(value["authority_id"], "G3 rotation authority ID")
+        deployment_id = identifier(
+            value["route_deployment_id"], "G3 rotation Route deployment ID"
+        )
+        for name in (
+            "rotation_operator_trust_sha256",
+            "command_bundle_sha256",
+            "recovery_transport_sha256",
+        ):
+            digest(value[name], f"G3 rotation {name}")
+        if (
+            value["node_acks_sha256"] != node_acks.sha256
+            or value["transcript_sha256"] != transcript.sha256
+        ):
+            raise ProofSetError(
+                "G3 rotation receipt does not bind the exact node-acks/transcript files"
+            )
+        phases = value["phase_receipts"]
+        if (
+            not isinstance(phases, list)
+            or len(phases) != len(ROUTE_V2_ROTATION_PHASES)
+            or any(not isinstance(phase, dict) for phase in phases)
+            or [phase.get("phase") for phase in phases]
+            != list(ROUTE_V2_ROTATION_PHASES)
+        ):
+            raise ProofSetError(
+                "G3 rotation receipt is not the exact seven-phase command chain"
+            )
+        disabled = fields(
+            value["disabled_checkpoint"],
+            {
+                "signer_revision",
+                "ring_version",
+                "signer_state",
+                "loaded_kids",
+                "public_route_closed",
+                "public_route_closed_observation_count",
+                "disabled_public_route_sha256",
+                "all_nodes_closed_or_fenced",
+                "active_guard_count",
+                "disabled_fleet_sha256",
+                "disable_store_receipt_sha256",
+                "closed_fleet_settlement_store_receipt_sha256",
+            },
+            "G3 disabled checkpoint",
+        )
+        if (
+            disabled["signer_state"] != "disabled"
+            or disabled["loaded_kids"] != []
+            or disabled["public_route_closed"] is not True
+            or disabled["public_route_closed_observation_count"] != 3
+            or isinstance(disabled["public_route_closed_observation_count"], bool)
+            or disabled["all_nodes_closed_or_fenced"] is not True
+        ):
+            raise ProofSetError("G3 disabled checkpoint is not a closed disable proof")
+        integer(disabled["signer_revision"], "G3 disabled signer revision", minimum=1)
+        integer(disabled["ring_version"], "G3 disabled ring version", minimum=1)
+        _zero(disabled["active_guard_count"], "G3 disabled active guards")
+        for name in (
+            "disabled_public_route_sha256",
+            "disabled_fleet_sha256",
+            "disable_store_receipt_sha256",
+            "closed_fleet_settlement_store_receipt_sha256",
+        ):
+            digest(disabled[name], f"G3 disabled {name}")
+        recovery = fields(
+            value["recovery_checkpoint"],
+            {
+                "signer_revision",
+                "ring_version",
+                "signer_state",
+                "active_kid",
+                "database_current",
+                "process_ready",
+                "all_nodes_acknowledged",
+                "all_active_guards_zero",
+                "terminal_fleet_sha256",
+            },
+            "G3 recovery checkpoint",
+        )
+        if (
+            recovery["signer_state"] != "active"
+            or recovery["database_current"] is not True
+            or recovery["process_ready"] is not True
+            or recovery["all_nodes_acknowledged"] is not True
+            or recovery["all_active_guards_zero"] is not True
+        ):
+            raise ProofSetError("G3 recovery checkpoint is not a closed active recovery")
+        recovery_revision = integer(
+            recovery["signer_revision"], "G3 recovery signer revision", minimum=1
+        )
+        recovery_ring = integer(
+            recovery["ring_version"], "G3 recovery ring version", minimum=1
+        )
+        if (
+            recovery_revision <= integer(
+                disabled["signer_revision"], "G3 disabled signer revision", minimum=1
+            )
+            or recovery_ring <= integer(
+                disabled["ring_version"], "G3 disabled ring version", minimum=1
+            )
+        ):
+            raise ProofSetError("G3 recovery did not advance the disabled signer/ring")
+        identifier(recovery["active_kid"], "G3 recovery active kid")
+        digest(recovery["terminal_fleet_sha256"], "G3 recovery terminal fleet")
+        endpoint = fields(
+            value["fresh_endpoint"],
+            {
+                "mechanism",
+                "calibrated_baseline_public_route_sha256",
+                "lineage_receipt_sha256",
+                "old_endpoint",
+                "unbind",
+                "fresh_endpoint",
+                "bind",
+                "pre_probe_collection_sha256",
+                "public_route_receipt_sha256",
+                "http_guest_body",
+                "websocket_guest_echo",
+            },
+            "G3 fresh-endpoint proof",
+        )
+        if (
+            endpoint["mechanism"] != "unbind_old_bind_fresh_endpoint"
+            or endpoint["http_guest_body"] is not True
+            or endpoint["websocket_guest_echo"] is not True
+            or not isinstance(endpoint["old_endpoint"], dict)
+            or not isinstance(endpoint["fresh_endpoint"], dict)
+            or not isinstance(endpoint["unbind"], dict)
+            or not isinstance(endpoint["bind"], dict)
+        ):
+            raise ProofSetError("G3 fresh-endpoint proof is not a closed live delivery")
+        for name in (
+            "calibrated_baseline_public_route_sha256",
+            "lineage_receipt_sha256",
+            "pre_probe_collection_sha256",
+            "public_route_receipt_sha256",
+        ):
+            digest(endpoint[name], f"G3 fresh-endpoint {name}")
+        old_endpoint = endpoint["old_endpoint"]
+        fresh_endpoint = endpoint["fresh_endpoint"]
+        for label, item in (("old", old_endpoint), ("fresh", fresh_endpoint)):
+            for name in ("endpoint_id", "name", "hostname"):
+                if not isinstance(item.get(name), str) or not item[name]:
+                    raise ProofSetError(
+                        f"G3 {label} endpoint identity field {name} is incomplete"
+                    )
+        if (
+            fresh_endpoint["endpoint_id"] == old_endpoint["endpoint_id"]
+            or fresh_endpoint["hostname"] != old_endpoint["hostname"]
+            or fresh_endpoint.get("route_epoch") != 1
+            or isinstance(fresh_endpoint.get("route_epoch"), bool)
+        ):
+            raise ProofSetError(
+                "G3 fresh endpoint is not a fresh epoch-one identity on the old hostname"
+            )
+
+        acks = fields(
+            decode_json(node_acks.data, "G3 Node ring-ACK set"),
+            {
+                "version",
+                "kind",
+                "case_id",
+                "qualification_run_id",
+                "source_commit_sha",
+                "route_deployment_id",
+                "expected_nodes",
+                "disabled_fleet_sha256",
+                "disabled_evaluated_at_unix_ms",
+                "disabled_nodes",
+                "disabled_all_nodes_closed_or_fenced",
+                "checkpoints",
+                "terminal_fleet_sha256",
+                "terminal_evaluated_at_unix_ms",
+                "terminal_signing_authority",
+                "terminal_nodes",
+                "all_nodes_acknowledged",
+                "all_active_guards_zero",
+                "terminal_marker",
+            },
+            "G3 Node ring-ACK set",
+        )
+        if (
+            not version_one(acks["version"])
+            or acks["kind"] != ROUTE_V2_NODE_ACK_SET_KIND
+            or acks["case_id"] != ROUTE_V2_ROTATION_CASE_ID
+            or acks["qualification_run_id"] != run_id
+            or acks["source_commit_sha"] != context.release_commit
+            or acks["route_deployment_id"] != deployment_id
+            or acks["terminal_marker"] != ROUTE_V2_NODE_ACK_TERMINAL_MARKER
+            or acks["disabled_all_nodes_closed_or_fenced"] is not True
+            or acks["all_nodes_acknowledged"] is not True
+            or acks["all_active_guards_zero"] is not True
+        ):
+            raise ProofSetError("G3 Node ring-ACK set is not the receipt's closed run")
+        if (
+            acks["disabled_fleet_sha256"] != disabled["disabled_fleet_sha256"]
+            or acks["terminal_fleet_sha256"] != recovery["terminal_fleet_sha256"]
+        ):
+            raise ProofSetError("G3 Node ring-ACK fleet digests differ from the receipt")
+        expected_nodes = acks["expected_nodes"]
+        if (
+            not isinstance(expected_nodes, list)
+            or not expected_nodes
+            or expected_nodes != sorted(set(expected_nodes))
+        ):
+            raise ProofSetError("G3 expected Node set is not strict sorted nonempty")
+        for node_id in expected_nodes:
+            identifier(node_id, "G3 expected Node ID")
+        integer(
+            acks["disabled_evaluated_at_unix_ms"],
+            "G3 disabled evaluation time",
+            minimum=1,
+        )
+        integer(
+            acks["terminal_evaluated_at_unix_ms"],
+            "G3 terminal evaluation time",
+            minimum=1,
+        )
+        signer = fields(
+            acks["terminal_signing_authority"],
+            {
+                "deployment_id",
+                "signer_revision",
+                "signer_reference_sha256",
+                "active_kid",
+                "public_key_ring_version",
+                "public_key_ring_digest",
+            },
+            "G3 terminal signing authority",
+        )
+        if (
+            signer["deployment_id"] != deployment_id
+            or signer["signer_revision"] != recovery_revision
+            or signer["active_kid"] != recovery["active_kid"]
+            or signer["public_key_ring_version"] != recovery_ring
+        ):
+            raise ProofSetError(
+                "G3 terminal signing authority differs from the recovery checkpoint"
+            )
+        digest(signer["signer_reference_sha256"], "G3 terminal signer reference")
+        digest(signer["public_key_ring_digest"], "G3 terminal ring digest")
+        checkpoints = acks["checkpoints"]
+        if not isinstance(checkpoints, list) or len(checkpoints) != len(
+            ROUTE_V2_ROTATION_CHECKPOINTS
+        ):
+            raise ProofSetError("G3 ring-ACK checkpoints are not the exact four gates")
+        for index, expected in enumerate(ROUTE_V2_ROTATION_CHECKPOINTS):
+            checkpoint = fields(
+                checkpoints[index],
+                {
+                    "observed_phase",
+                    "signer_revision",
+                    "ring_version",
+                    "ring_digest",
+                    "loaded_kids",
+                    "settled_by_phase",
+                    "required_store_precondition",
+                    "settled_by_store_receipt_sha256",
+                    "settled_at_unix_ms",
+                    "precondition",
+                    "store_precondition_satisfied",
+                },
+                f"G3 ring-ACK checkpoint {index}",
+            )
+            precondition = checkpoint["precondition"]
+            if (
+                (
+                    checkpoint["observed_phase"],
+                    checkpoint["settled_by_phase"],
+                    checkpoint["required_store_precondition"],
+                )
+                != expected
+                or checkpoint["store_precondition_satisfied"] is not True
+                or not isinstance(precondition, dict)
+                or precondition.get("satisfied") is not True
+            ):
+                raise ProofSetError(
+                    f"G3 ring-ACK checkpoint {index} is not its settled Store gate"
+                )
+            digest(
+                checkpoint["settled_by_store_receipt_sha256"],
+                f"G3 checkpoint {index} Store receipt",
+            )
+            integer(
+                checkpoint["settled_at_unix_ms"],
+                f"G3 checkpoint {index} settlement time",
+                minimum=1,
+            )
+        for label, entries in (
+            ("disabled", acks["disabled_nodes"]),
+            ("terminal", acks["terminal_nodes"]),
+        ):
+            if not isinstance(entries, list) or [
+                entry.get("node_id")
+                for entry in entries
+                if isinstance(entry, dict)
+            ] != expected_nodes:
+                raise ProofSetError(
+                    f"G3 {label} Node projection differs from the expected Node set"
+                )
+            for entry in entries:
+                entry = fields(
+                    entry, {"node_id", "binding", "inventory"}, f"G3 {label} Node"
+                )
+                inventory = entry["inventory"]
+                if (
+                    not isinstance(entry["binding"], dict)
+                    or not isinstance(inventory, dict)
+                    or inventory.get("complete_inventory") is not True
+                ):
+                    raise ProofSetError(f"G3 {label} Node inventory is partial")
+                _zero(
+                    inventory.get("active_guard_count"),
+                    f"G3 {label} Node active guards",
+                )
+                _zero(inventory.get("residue_count"), f"G3 {label} Node residue")
+                if label == "disabled":
+                    _zero(
+                        inventory.get("route_active_count"),
+                        "G3 disabled Node active routes",
+                    )
+
+        try:
+            transcript_text = transcript.data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ProofSetError("G3 rotation transcript is not UTF-8 text") from error
+        if not transcript_text.endswith("\n"):
+            raise ProofSetError("G3 rotation transcript has no terminal LF")
+        lines = transcript_text.splitlines()
+        expected_header = (
+            f"version=1 kind={ROUTE_V2_ROTATION_TRANSCRIPT_KIND}"
+            f" case_id={ROUTE_V2_ROTATION_CASE_ID}"
+            f" qualification_run_id={run_id}"
+            f" source_commit_sha={context.release_commit}"
+        )
+        if not lines or lines[0] != expected_header:
+            raise ProofSetError("G3 rotation transcript header is not this exact run")
+        markers = [
+            line
+            for line in lines
+            if line == f"terminal_marker={ROUTE_V2_ROTATION_TERMINAL_MARKER}"
+        ]
+        if len(markers) != 1:
+            raise ProofSetError(
+                "G3 rotation transcript has no single terminal marker line"
+            )
+
+
+class QualificationAdmissionEvidenceVerifier:
+    """Validate the staged Begin/close admission chain with the operator tool.
+
+    The producer is ``deploy/aws/production-mutation-admission.py``.  This
+    adapter reuses that module's own reviewed validators (``validate_trust``,
+    ``validate_command``, ``validate_state``, ``command_state_binding``); it
+    is a consumer of the producer's implementation, not a second authority.
+    It proves that both pending commands are the exact canonical signed
+    requests under the reset's release-bound cutover trust, that both command
+    receipts bind those exact commands and the same STS principal, that Begin
+    installed Qualification and close installed the exact Closed successor,
+    and that the staged final admission state is byte-exact the close
+    receipt's applied state.
+    """
+
+    def __init__(self, admission_module: Any, trust_data: bytes) -> None:
+        for name in (
+            "AdmissionError",
+            "validate_trust",
+            "validate_command",
+            "validate_state",
+            "command_plain_binding",
+            "command_state_binding",
+        ):
+            if not hasattr(admission_module, name):
+                raise ProofSetError(
+                    "Qualification admission verifier requires the reviewed"
+                    " production-mutation-admission operator module"
+                )
+        self._admission = admission_module
+        self._trust_data = trust_data
+
+    def verify(
+        self,
+        begin_pending: VerifiedFile,
+        begin_command_receipt: VerifiedFile,
+        close_pending: VerifiedFile,
+        close_command_receipt: VerifiedFile,
+        final_state: VerifiedFile,
+        context: ProducerContext,
+    ) -> None:
+        admission = self._admission
+        try:
+            trust, credential = admission.validate_trust(
+                admission.decode_json(
+                    self._trust_data, "production cutover operator trust"
+                )
+            )
+            if (
+                admission.canonical_json(trust) != self._trust_data
+                or trust["release_id"] != context.release_id
+                or trust["source_commit_sha"] != context.release_commit
+            ):
+                raise ProofSetError(
+                    "Qualification admission trust is outside the reset release"
+                )
+            begin_body, begin_command = self._pending_command(
+                begin_pending,
+                "Qualification Begin pending command",
+                trust,
+                credential,
+                "begin_qualification",
+            )
+            close_body, close_command = self._pending_command(
+                close_pending,
+                "Qualification close pending command",
+                trust,
+                credential,
+                "end_qualification",
+            )
+            begin_state = self._command_receipt(
+                begin_command_receipt,
+                "Qualification Begin command receipt",
+                begin_command,
+                begin_body,
+                begin_pending,
+                "qualification",
+            )
+            close_state = self._command_receipt(
+                close_command_receipt,
+                "Qualification close command receipt",
+                close_command,
+                close_body,
+                close_pending,
+                "closed",
+            )
+            binding = admission.command_plain_binding(begin_command)
+            if (
+                close_command["mutation"]["binding"] != binding
+                or close_command["command_id"] == begin_command["command_id"]
+                or close_command["operator"] != begin_command["operator"]
+                or close_command["expected_revision"] != begin_state["revision"]
+                or close_state["revision"] != begin_state["revision"] + 1
+            ):
+                raise ProofSetError(
+                    "Qualification close is not the exact Begin successor command"
+                )
+            if (
+                binding["release_id"] != context.release_id
+                or binding["source_commit_sha"] != context.release_commit
+                or binding["release_manifest_sha256"]
+                != context.release_manifest_sha256
+                or binding["worker_bundle_sha256"] != context.worker_bundle_sha256
+                or binding["qualification_catalog_sha256"]
+                != context.qualification_catalog_sha256
+            ):
+                raise ProofSetError(
+                    "Qualification admission binding is outside the reset release"
+                )
+            if final_state.data != admission.canonical_json(close_state):
+                raise ProofSetError(
+                    "final admission state is not the close receipt's applied state"
+                )
+        except admission.AdmissionError as error:
+            raise ProofSetError(
+                "Qualification admission evidence failed the operator-tool validators"
+            ) from error
+
+    def _pending_command(
+        self,
+        pending_file: VerifiedFile,
+        label: str,
+        trust: dict[str, Any],
+        credential: dict[str, Any],
+        expected_mutation: str,
+    ) -> tuple[bytes, dict[str, Any]]:
+        admission = self._admission
+        pending = admission.require_fields(
+            admission.decode_json(pending_file.data, label),
+            {
+                "version",
+                "origin",
+                "method",
+                "target",
+                "discovery_target",
+                "state_target",
+                "credential_id",
+                "public_key_spki_sha256",
+                "trust_sha256",
+                "request_sha256",
+                "body_base64",
+                "signature",
+                "created_at_unix_ms",
+            },
+            label,
+        )
+        if admission.canonical_json(pending, newline=True) != pending_file.data:
+            raise ProofSetError(f"{label} is not canonical")
+        if (
+            not admission.version_one(pending["version"])
+            or pending["method"] != "POST"
+            or pending["target"] != admission.COMMAND_PATH
+            or pending["discovery_target"] != admission.DISCOVERY_PATH
+            or pending["state_target"] != admission.STATE_PATH
+        ):
+            raise ProofSetError(f"{label} has an unsupported request binding")
+        admission.validate_origin(pending["origin"])
+        if (
+            pending["trust_sha256"] != admission.sha256(self._trust_data)
+            or pending["credential_id"] != credential["credential_id"]
+            or pending["public_key_spki_sha256"]
+            != admission.sha256(
+                admission.decode_base64url(
+                    credential["public_key_spki"], "public_key_spki"
+                )
+            )
+        ):
+            raise ProofSetError(f"{label} is outside the reset cutover trust")
+        body = admission.decode_base64url(pending["body_base64"], f"{label} body")
+        command = admission.validate_command(
+            admission.decode_json(body, f"{label} body")
+        )
+        if (
+            admission.canonical_json(command) != body
+            or admission.sha256(body) != pending["request_sha256"]
+        ):
+            raise ProofSetError(f"{label} body is not its exact canonical request")
+        if command["mutation"]["kind"] != expected_mutation:
+            raise ProofSetError(f"{label} is not one exact {expected_mutation} command")
+        plain_binding = admission.command_plain_binding(command)
+        scope = credential["scope"]
+        if (
+            plain_binding["deployment_id"] != trust["deployment_id"]
+            or plain_binding["release_id"] != trust["release_id"]
+            or plain_binding["source_commit_sha"] != trust["source_commit_sha"]
+            or command["operator"]["aws_partition"] != scope["aws_partition"]
+            or command["operator"]["account_id"] != scope["account_id"]
+            or command["operator"]["role_arn"] != scope["role_arn"]
+        ):
+            raise ProofSetError(f"{label} drifted from its trust scope")
+        if len(admission.decode_base64url(pending["signature"], f"{label} signature")) != 64:
+            raise ProofSetError(f"{label} signature is not Ed25519")
+        return body, command
+
+    def _command_receipt(
+        self,
+        receipt_file: VerifiedFile,
+        label: str,
+        command: dict[str, Any],
+        body: bytes,
+        pending_file: VerifiedFile,
+        expected_mode: str,
+    ) -> dict[str, Any]:
+        admission = self._admission
+        pending = admission.decode_json(pending_file.data, f"{label} pending")
+        receipt = admission.require_fields(
+            admission.decode_json(receipt_file.data, label),
+            {
+                "version",
+                "command",
+                "request_sha256",
+                "principal",
+                "outcome",
+                "committed_at_unix_ms",
+            },
+            label,
+        )
+        if admission.canonical_json(receipt) != receipt_file.data:
+            raise ProofSetError(f"{label} is not canonical")
+        if (
+            not admission.version_one(receipt["version"])
+            or receipt["command"] != command
+            or receipt["request_sha256"] != admission.sha256(body)
+        ):
+            raise ProofSetError(f"{label} does not bind the exact pending command")
+        principal = admission.require_fields(
+            receipt["principal"],
+            {"credential_id", "public_key_spki_sha256", "trust_bundle_sha256", "sts"},
+            f"{label} principal",
+        )
+        if (
+            principal["credential_id"] != pending["credential_id"]
+            or principal["public_key_spki_sha256"]
+            != pending["public_key_spki_sha256"]
+            or principal["trust_bundle_sha256"] != pending["trust_sha256"]
+            or principal["sts"] != command["operator"]
+        ):
+            raise ProofSetError(f"{label} principal does not bind the signed STS claim")
+        outcome = receipt["outcome"]
+        if not isinstance(outcome, dict) or outcome.get("kind") != "applied":
+            raise ProofSetError(f"{label} did not reach the Applied outcome")
+        admission.require_fields(outcome, {"kind", "state"}, f"{label} outcome")
+        state = admission.validate_state(outcome["state"])
+        if (
+            state["mode"] != expected_mode
+            or state["revision"] != command["expected_revision"] + 1
+            or state["last_command_id"] != command["command_id"]
+            or state["binding"] != admission.command_state_binding(command)
+            or state["updated_at_unix_ms"] != receipt["committed_at_unix_ms"]
+        ):
+            raise ProofSetError(f"{label} has a mismatched applied successor state")
+        return state
+
+
+class _ManualFenceEntryVerifier:
+    """Shared lookup for operator manual-fence attestation entries."""
+
+    def __init__(
+        self,
+        entries: dict[str, dict[str, Any]],
+        terminal_kind: str,
+    ) -> None:
+        self._entries = entries
+        self._terminal_kind = terminal_kind
+
+    def _entry(self, receipt: VerifiedFile, expected: dict[str, Any]) -> None:
+        host_id = expected.get("host_id")
+        entry = self._entries.get(host_id) if isinstance(host_id, str) else None
+        if entry is None or entry["terminal_kind"] != self._terminal_kind:
+            raise ProofSetError(
+                f"manual fence evidence has no {self._terminal_kind} attestation"
+                " for this old Host"
+            )
+        if entry["components"] != expected.get("components"):
+            raise ProofSetError(
+                "manual fence attestation component set differs from old Host coverage"
+            )
+        if self._terminal_kind == "host_fence_event" and entry[
+            "event_id"
+        ] != expected.get("event_id"):
+            raise ProofSetError(
+                "manual fence attestation event ID differs from old Host coverage"
+            )
+        if entry["receipt_sha256"] != receipt.sha256:
+            raise ProofSetError(
+                "manual fence attestation does not bind this exact staged receipt"
+            )
+
+
+class _ManualHostFenceVerifier(_ManualFenceEntryVerifier):
+    def verify(self, receipt: VerifiedFile, expected: dict[str, Any]) -> None:
+        self._entry(receipt, expected)
+
+
+class _ManualLocalPositiveStopVerifier(_ManualFenceEntryVerifier):
+    def verify(self, receipt: VerifiedFile, expected: dict[str, Any]) -> None:
+        self._entry(receipt, expected)
+
+
+class ManualOperatorFenceEvidence:
+    """CUTOVER-DECISIONS.md D7 operator manual fence/stop attestation.
+
+    V1 has no automatic HostFenceEvent producer and the local positive-stop
+    contract remains Proposed (DEFERRED.md V3/E13).  Under decision D7 the
+    operator fences old Hosts manually (EC2 stop plus console/CLI forensics,
+    or manual systemd stop) and submits the fence facts.  This class is reset
+    tool **input validation only**: it validates the operator-supplied
+    attestation for completeness (who, when, EC2 stop evidence or stopped
+    units, an all-true checklist, and an exact digest binding to each staged
+    forensic receipt) and then admits the matching old-Host coverage entries.
+    It mints no HostFenceEvent, no takeover authorization and no database
+    authority.
+    """
+
+    def __init__(self, entries: dict[str, dict[str, Any]]) -> None:
+        self._entries = entries
+
+    @classmethod
+    def parse(
+        cls,
+        data: bytes,
+        *,
+        expected_account_id: str,
+        now: dt.datetime,
+    ) -> "ManualOperatorFenceEvidence":
+        value = fields(
+            decode_json(data, "manual fence evidence", canonical_lf=True),
+            {
+                "kind",
+                "version",
+                "decision",
+                "operator_principal_arn",
+                "recorded_at",
+                "hosts",
+            },
+            "manual fence evidence",
+        )
+        if (
+            value["kind"] != MANUAL_FENCE_EVIDENCE_KIND
+            or not version_one(value["version"])
+            or value["decision"] != MANUAL_FENCE_EVIDENCE_DECISION
+        ):
+            raise ProofSetError("manual fence evidence kind/version/decision drifted")
+        principal = value["operator_principal_arn"]
+        match = (
+            STS_ASSUMED_ROLE.fullmatch(principal)
+            if isinstance(principal, str)
+            else None
+        )
+        if match is None or match.group(2) != expected_account_id:
+            raise ProofSetError(
+                "manual fence evidence operator is not an assumed-role principal"
+                " in the reset account"
+            )
+        recorded = parse_time(value["recorded_at"], "manual fence evidence recorded_at")
+        if recorded > now.astimezone(dt.timezone.utc):
+            raise ProofSetError("manual fence evidence is recorded in the future")
+        hosts = value["hosts"]
+        if not isinstance(hosts, list) or not hosts:
+            raise ProofSetError("manual fence evidence has no attested old Host")
+        entries: dict[str, dict[str, Any]] = {}
+        for index, entry in enumerate(hosts):
+            entry = cls._parse_host(entry, f"manual fence evidence host {index}")
+            if entry["host_id"] in entries:
+                raise ProofSetError(
+                    "manual fence evidence attests one old Host more than once"
+                )
+            entries[entry["host_id"]] = entry
+        if list(entries) != sorted(entries):
+            raise ProofSetError("manual fence evidence hosts are not strict sorted")
+        return cls(entries)
+
+    @staticmethod
+    def _parse_host(value: Any, label: str) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ProofSetError(f"{label} is not an object")
+        terminal_kind = value.get("terminal_kind")
+        if terminal_kind == "host_fence_event":
+            value = fields(
+                value,
+                {
+                    "host_id",
+                    "components",
+                    "terminal_kind",
+                    "event_id",
+                    "ec2_stop",
+                    "checklist",
+                    "receipt_sha256",
+                },
+                label,
+            )
+            identifier(value["event_id"], f"{label} event ID")
+            ec2_stop = fields(
+                value["ec2_stop"], {"instance_id", "stopped_at"}, f"{label} EC2 stop"
+            )
+            instance_id = ec2_stop["instance_id"]
+            if (
+                not isinstance(instance_id, str)
+                or EC2_INSTANCE_ID.fullmatch(instance_id) is None
+            ):
+                raise ProofSetError(f"{label} EC2 instance ID is not canonical")
+            parse_time(ec2_stop["stopped_at"], f"{label} EC2 stop time")
+        elif terminal_kind == "local_positive_stop":
+            value = fields(
+                value,
+                {
+                    "host_id",
+                    "components",
+                    "terminal_kind",
+                    "stopped_units",
+                    "stopped_at",
+                    "checklist",
+                    "receipt_sha256",
+                },
+                label,
+            )
+            units = value["stopped_units"]
+            if (
+                not isinstance(units, list)
+                or not units
+                or units != sorted(set(units))
+                or any(
+                    not isinstance(unit, str)
+                    or SYSTEMD_UNIT.fullmatch(unit) is None
+                    for unit in units
+                )
+            ):
+                raise ProofSetError(
+                    f"{label} stopped units are not a strict sorted service set"
+                )
+            parse_time(value["stopped_at"], f"{label} stop time")
+        else:
+            raise ProofSetError(f"{label} terminal kind is unavailable")
+        identifier(value["host_id"], f"{label} Host ID")
+        components = value["components"]
+        if (
+            not isinstance(components, list)
+            or not components
+            or components != sorted(set(components))
+            or any(item not in MANUAL_FENCE_COMPONENTS for item in components)
+        ):
+            raise ProofSetError(
+                f"{label} component set is not closed sorted nonempty"
+            )
+        checklist = fields(
+            value["checklist"],
+            MANUAL_FENCE_CHECKLIST_FIELDS[terminal_kind],
+            f"{label} checklist",
+        )
+        if any(item is not True for item in checklist.values()):
+            raise ProofSetError(f"{label} checklist is not completely attested")
+        digest(value["receipt_sha256"], f"{label} receipt digest")
+        return value
+
+    def host_fence_verifier(self) -> HostFenceTerminalVerifier:
+        return _ManualHostFenceVerifier(self._entries, "host_fence_event")
+
+    def local_positive_stop_verifier(self) -> LocalPositiveStopVerifier:
+        return _ManualLocalPositiveStopVerifier(self._entries, "local_positive_stop")
+
+
 UNAVAILABLE_ROUTE_V2_VERIFIER: RouteV2QualificationVerifier = _UnavailableRouteV2Verifier()
 UNAVAILABLE_USAGE_VERIFIER: UsageTargetTerminalVerifier = _UnavailableUsageVerifier()
 UNAVAILABLE_HOST_FENCE_VERIFIER: HostFenceTerminalVerifier = _UnavailableHostFenceVerifier()
@@ -1278,6 +2210,19 @@ def _validate_release_manifest(
         or inputs.get("platform") != "linux/amd64"
     ):
         raise ProofSetError("release manifest target is not production linux/amd64")
+    input_files = inputs.get("files")
+    catalog_input = (
+        input_files.get("qualification_catalog")
+        if isinstance(input_files, dict)
+        else None
+    )
+    if not isinstance(catalog_input, dict) or catalog_input.get("sha256") != release[
+        "qualification_catalog_sha256"
+    ]:
+        raise ProofSetError(
+            "release manifest fingerprinted qualification catalog differs from"
+            " the proof-set release catalog"
+        )
     return (
         worker_digest,
         usage_schema_verifier["sha256"],

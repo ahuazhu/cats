@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import datetime as dt
 import hashlib
 import importlib.util
 import os
@@ -87,6 +88,23 @@ def verified(name: str, value: Any) -> Any:
 
 def opaque(name: str, marker: str) -> Any:
     return verified(name, {"marker": marker})
+
+
+def verified_bytes(name: str, data: bytes) -> Any:
+    return PROOF.VerifiedFile(
+        name,
+        data,
+        "sha256:" + hashlib.sha256(data).hexdigest(),
+        len(data),
+    )
+
+
+def expect_proof_error(call: Any, message: str) -> None:
+    try:
+        call()
+    except PROOF.ProofSetError:
+        return
+    raise AssertionError(message)
 
 
 def fixture() -> tuple[Any, Any, Any, Any, Any, Any, tuple[Any, Any], dict[str, Any]]:
@@ -775,6 +793,711 @@ def validate_release_bound_usage_schema_subprocess() -> None:
             PROOF._run_held_usage_verifier = original_run
 
 
+def validate_release_manifest_catalog_cross_check() -> None:
+    release = {
+        "source_commit_sha": COMMIT,
+        "qualification_catalog_sha256": SHA_D,
+    }
+    manifest = {
+        "artifacts": {
+            "control_plane": {"marker": "control"},
+            "gateway": {"marker": "gateway"},
+            "worker": {
+                "bundle_name": "cats-worker.tar.zst",
+                "bundle_sha256": SHA_A,
+                "members": {
+                    PROOF.USAGE_SCHEMA_VERIFIER.name: {
+                        "sha256": SHA_C,
+                        "size_bytes": 1,
+                    },
+                    PROOF.USAGE_TERMINAL_VERIFIER.name: {
+                        "sha256": SHA_B,
+                        "size_bytes": 1,
+                    },
+                },
+            },
+        },
+        "build_inputs": {
+            "files": {
+                "qualification_catalog": {"sha256": SHA_D, "size_bytes": 1},
+            },
+            "guest_target": "x86_64-unknown-linux-musl",
+            "platform": "linux/amd64",
+        },
+        "guest_runtime": {"marker": "guest"},
+        "source": {
+            "commit": COMMIT,
+            "fingerprint": SHA_A,
+            "tree": "2" * 40,
+        },
+        "version": 1,
+    }
+    result = PROOF._validate_release_manifest(copy.deepcopy(manifest), release)
+    if result != (SHA_A, SHA_C, SHA_B):
+        raise AssertionError("release manifest digests drifted")
+    drifted_catalog = copy.deepcopy(manifest)
+    drifted_catalog["build_inputs"]["files"]["qualification_catalog"]["sha256"] = SHA_A
+    missing_catalog = copy.deepcopy(manifest)
+    del missing_catalog["build_inputs"]["files"]["qualification_catalog"]
+    missing_files = copy.deepcopy(manifest)
+    del missing_files["build_inputs"]["files"]
+    for label, candidate in (
+        ("drifted", drifted_catalog),
+        ("missing catalog input", missing_catalog),
+        ("missing fingerprinted files", missing_files),
+    ):
+        expect_proof_error(
+            lambda candidate=candidate: PROOF._validate_release_manifest(
+                candidate, release
+            ),
+            f"release manifest with {label} qualification catalog was accepted",
+        )
+
+
+def route_rotation_fixture(context: Any) -> tuple[Any, Any, Any, dict[str, Any], dict[str, Any]]:
+    run_id = "run_route"
+    deployment = "route-deployment-a"
+    transcript_lines = [
+        (
+            f"version=1 kind={PROOF.ROUTE_V2_ROTATION_TRANSCRIPT_KIND}"
+            f" case_id={PROOF.ROUTE_V2_ROTATION_CASE_ID}"
+            f" qualification_run_id={run_id}"
+            f" source_commit_sha={context.release_commit}"
+        ),
+        "phase=setup event=resume_current detail=signer_revision_5",
+        f"terminal_marker={PROOF.ROUTE_V2_ROTATION_TERMINAL_MARKER}",
+    ]
+    transcript = verified_bytes(
+        "route-transcript",
+        ("\n".join(transcript_lines) + "\n").encode("ascii"),
+    )
+
+    def node(route_active: int) -> dict[str, Any]:
+        return {
+            "node_id": "node-a",
+            "binding": {"node_id": "node-a"},
+            "inventory": {
+                "complete_inventory": True,
+                "active_guard_count": 0,
+                "residue_count": 0,
+                "route_active_count": route_active,
+            },
+        }
+
+    checkpoints = [
+        {
+            "observed_phase": observed,
+            "signer_revision": 5,
+            "ring_version": 4,
+            "ring_digest": SHA_A,
+            "loaded_kids": ["kid-a"],
+            "settled_by_phase": settled,
+            "required_store_precondition": condition,
+            "settled_by_store_receipt_sha256": SHA_B,
+            "settled_at_unix_ms": 100,
+            "precondition": {"satisfied": True},
+            "store_precondition_satisfied": True,
+        }
+        for observed, settled, condition in PROOF.ROUTE_V2_ROTATION_CHECKPOINTS
+    ]
+    acks_value = {
+        "version": 1,
+        "kind": PROOF.ROUTE_V2_NODE_ACK_SET_KIND,
+        "case_id": PROOF.ROUTE_V2_ROTATION_CASE_ID,
+        "qualification_run_id": run_id,
+        "source_commit_sha": context.release_commit,
+        "route_deployment_id": deployment,
+        "expected_nodes": ["node-a"],
+        "disabled_fleet_sha256": SHA_A,
+        "disabled_evaluated_at_unix_ms": 100,
+        "disabled_nodes": [node(0)],
+        "disabled_all_nodes_closed_or_fenced": True,
+        "checkpoints": checkpoints,
+        "terminal_fleet_sha256": SHA_B,
+        "terminal_evaluated_at_unix_ms": 200,
+        "terminal_signing_authority": {
+            "deployment_id": deployment,
+            "signer_revision": 8,
+            "signer_reference_sha256": SHA_C,
+            "active_kid": "kid-recovery",
+            "public_key_ring_version": 5,
+            "public_key_ring_digest": SHA_D,
+        },
+        "terminal_nodes": [node(1)],
+        "all_nodes_acknowledged": True,
+        "all_active_guards_zero": True,
+        "terminal_marker": PROOF.ROUTE_V2_NODE_ACK_TERMINAL_MARKER,
+    }
+    acks = verified("route-node-acks", acks_value)
+    receipt_value = {
+        "version": 1,
+        "kind": PROOF.ROUTE_V2_ROTATION_RECEIPT_KIND,
+        "case_id": PROOF.ROUTE_V2_ROTATION_CASE_ID,
+        "qualification_run_id": run_id,
+        "source_commit_sha": context.release_commit,
+        "qualification_catalog_sha256": context.qualification_catalog_sha256,
+        "authority_id": "authority-a",
+        "route_deployment_id": deployment,
+        "rotation_operator_trust_sha256": SHA_A,
+        "command_bundle_sha256": SHA_B,
+        "recovery_transport_sha256": SHA_C,
+        "phase_receipts": [
+            {"phase": phase} for phase in PROOF.ROUTE_V2_ROTATION_PHASES
+        ],
+        "disabled_checkpoint": {
+            "signer_revision": 6,
+            "ring_version": 4,
+            "signer_state": "disabled",
+            "loaded_kids": [],
+            "public_route_closed": True,
+            "public_route_closed_observation_count": 3,
+            "disabled_public_route_sha256": SHA_A,
+            "all_nodes_closed_or_fenced": True,
+            "active_guard_count": 0,
+            "disabled_fleet_sha256": SHA_A,
+            "disable_store_receipt_sha256": SHA_B,
+            "closed_fleet_settlement_store_receipt_sha256": SHA_C,
+        },
+        "recovery_checkpoint": {
+            "signer_revision": 8,
+            "ring_version": 5,
+            "signer_state": "active",
+            "active_kid": "kid-recovery",
+            "database_current": True,
+            "process_ready": True,
+            "all_nodes_acknowledged": True,
+            "all_active_guards_zero": True,
+            "terminal_fleet_sha256": SHA_B,
+        },
+        "fresh_endpoint": {
+            "mechanism": "unbind_old_bind_fresh_endpoint",
+            "calibrated_baseline_public_route_sha256": SHA_A,
+            "lineage_receipt_sha256": SHA_B,
+            "old_endpoint": {
+                "endpoint_id": "ep-old",
+                "hostname": "app.example",
+                "name": "app",
+            },
+            "unbind": {"operation_id": "op-unbind"},
+            "fresh_endpoint": {
+                "endpoint_id": "ep-fresh",
+                "hostname": "app.example",
+                "name": "g3-fresh",
+                "route_epoch": 1,
+            },
+            "bind": {"operation_id": "op-bind"},
+            "pre_probe_collection_sha256": SHA_C,
+            "public_route_receipt_sha256": SHA_D,
+            "http_guest_body": True,
+            "websocket_guest_echo": True,
+        },
+        "node_acks_sha256": acks.sha256,
+        "transcript_sha256": transcript.sha256,
+        "terminal_marker": PROOF.ROUTE_V2_ROTATION_TERMINAL_MARKER,
+    }
+    receipt = verified("route-receipt", receipt_value)
+    return receipt, acks, transcript, receipt_value, acks_value
+
+
+def validate_route_v2_rotation_verifier() -> None:
+    context = fixture()[5]
+    verifier = PROOF.RouteV2RotationQualificationEvidenceVerifier()
+    receipt, acks, transcript, receipt_value, acks_value = route_rotation_fixture(
+        context
+    )
+    verifier.verify(receipt, acks, transcript, context)
+
+    def rebound_receipt(**overrides: Any) -> Any:
+        candidate = copy.deepcopy(receipt_value)
+        candidate.update(overrides)
+        return verified("route-receipt", candidate)
+
+    expect_proof_error(
+        lambda: verifier.verify(
+            rebound_receipt(source_commit_sha="3" * 40),
+            acks,
+            transcript,
+            context,
+        ),
+        "G3 receipt for a foreign release commit was accepted",
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            rebound_receipt(node_acks_sha256=SHA_D),
+            acks,
+            transcript,
+            context,
+        ),
+        "G3 receipt rebinding a foreign node-ack file was accepted",
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            rebound_receipt(qualification_catalog_sha256=SHA_A),
+            acks,
+            transcript,
+            context,
+        ),
+        "G3 receipt for a foreign qualification catalog was accepted",
+    )
+
+    unsatisfied = copy.deepcopy(acks_value)
+    unsatisfied["checkpoints"][2]["store_precondition_satisfied"] = False
+    unsatisfied_acks = verified("route-node-acks", unsatisfied)
+    expect_proof_error(
+        lambda: verifier.verify(
+            rebound_receipt(node_acks_sha256=unsatisfied_acks.sha256),
+            unsatisfied_acks,
+            transcript,
+            context,
+        ),
+        "G3 unsatisfied Store precondition checkpoint was accepted",
+    )
+    unacknowledged = copy.deepcopy(acks_value)
+    unacknowledged["all_nodes_acknowledged"] = False
+    unacknowledged_acks = verified("route-node-acks", unacknowledged)
+    expect_proof_error(
+        lambda: verifier.verify(
+            rebound_receipt(node_acks_sha256=unacknowledged_acks.sha256),
+            unacknowledged_acks,
+            transcript,
+            context,
+        ),
+        "G3 unacknowledged Node ring-ACK set was accepted",
+    )
+
+    header, event, marker = transcript.data.decode("ascii").splitlines()
+    for label, lines in (
+        ("without its terminal marker", [header, event]),
+        ("with a repeated terminal marker", [header, event, marker, marker]),
+        ("with a foreign header", [event, marker]),
+    ):
+        candidate = verified_bytes(
+            "route-transcript",
+            ("\n".join(lines) + "\n").encode("ascii"),
+        )
+        expect_proof_error(
+            lambda candidate=candidate: verifier.verify(
+                rebound_receipt(transcript_sha256=candidate.sha256),
+                acks,
+                candidate,
+                context,
+            ),
+            f"G3 transcript {label} was accepted",
+        )
+
+
+def admission_chain_fixture(context: Any) -> Any:
+    spki = ADMISSION.ED25519_SPKI_PREFIX + b"\x00" * 32
+    credential = {
+        "credential_id": "cred_a",
+        "public_key_spki": ADMISSION.encode_base64url(spki),
+        "scope": {
+            "aws_partition": "aws",
+            "account_id": "123456789012",
+            "role_arn": "arn:aws:iam::123456789012:role/cutover",
+        },
+    }
+    trust = {
+        "version": 1,
+        "deployment_id": "dep_a",
+        "release_id": context.release_id,
+        "source_commit_sha": context.release_commit,
+        "signature_threshold": 1,
+        "credentials": [credential],
+    }
+    trust_data = ADMISSION.canonical_json(trust)
+    operator = {
+        "aws_partition": "aws",
+        "account_id": "123456789012",
+        "role_arn": credential["scope"]["role_arn"],
+        "principal_arn": "arn:aws:sts::123456789012:assumed-role/cutover/session",
+    }
+    binding = {
+        "qualification_id": "qual_a",
+        "deployment_id": "dep_a",
+        "release_id": context.release_id,
+        "source_commit_sha": context.release_commit,
+        "control_schema_version": 16,
+        "source_manifest_sha256": SHA_A,
+        "source_bundle_sha256": SHA_B,
+        "build_receipt_sha256": SHA_C,
+        "release_manifest_sha256": context.release_manifest_sha256,
+        "worker_bundle_sha256": context.worker_bundle_sha256,
+        "qualification_catalog_sha256": context.qualification_catalog_sha256,
+        "qualification_cell_manifest_sha256": SHA_D,
+        "aws_partition": "aws",
+        "aws_account_id": "123456789012",
+        "aws_region": "us-east-1",
+        "cell_id": "cell_a",
+        "cell_namespace": "cats",
+        "cats_account_id": "acct_a",
+        "workspace_id": "workspace_a",
+        "allowed_mutation_classes": list(ADMISSION.QUALIFICATION_MUTATION_CLASSES),
+        "qualification_expires_at_unix_ms": 10_000_000,
+    }
+
+    def command(
+        command_id: str,
+        issued: int,
+        mutation: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "command_id": command_id,
+            "issued_at_unix_ms": issued,
+            "expires_at_unix_ms": issued + 240_000,
+            "operator": operator,
+            "expected_revision": expected_revision,
+            "mutation": {"kind": mutation, "binding": binding},
+        }
+
+    def pending_file(
+        name: str,
+        value: dict[str, Any],
+        *,
+        signature: bytes = b"\x00" * 64,
+    ) -> tuple[Any, bytes]:
+        body = ADMISSION.canonical_json(value)
+        pending = {
+            "version": 1,
+            "origin": "https://control.example",
+            "method": "POST",
+            "target": ADMISSION.COMMAND_PATH,
+            "discovery_target": ADMISSION.DISCOVERY_PATH,
+            "state_target": ADMISSION.STATE_PATH,
+            "credential_id": credential["credential_id"],
+            "public_key_spki_sha256": ADMISSION.sha256(spki),
+            "trust_sha256": ADMISSION.sha256(trust_data),
+            "request_sha256": ADMISSION.sha256(body),
+            "body_base64": ADMISSION.encode_base64url(body),
+            "signature": ADMISSION.encode_base64url(signature),
+            "created_at_unix_ms": value["issued_at_unix_ms"],
+        }
+        return (
+            verified_bytes(name, ADMISSION.canonical_json(pending, newline=True)),
+            body,
+        )
+
+    def receipt_file(
+        name: str,
+        value: dict[str, Any],
+        body: bytes,
+        mode: str,
+        committed: int,
+        *,
+        sts: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        state = {
+            "version": 1,
+            "revision": value["expected_revision"] + 1,
+            "mode": mode,
+            "binding": {"kind": "qualification", "binding": binding},
+            "last_command_id": value["command_id"],
+            "updated_at_unix_ms": committed,
+        }
+        receipt = {
+            "version": 1,
+            "command": value,
+            "request_sha256": ADMISSION.sha256(body),
+            "principal": {
+                "credential_id": credential["credential_id"],
+                "public_key_spki_sha256": ADMISSION.sha256(spki),
+                "trust_bundle_sha256": ADMISSION.sha256(trust_data),
+                "sts": operator if sts is None else sts,
+            },
+            "outcome": {"kind": "applied", "state": state},
+            "committed_at_unix_ms": committed,
+        }
+        return verified_bytes(name, ADMISSION.canonical_json(receipt)), state
+
+    begin_command = command("a" * 32, 1_000, "begin_qualification", 1)
+    close_command = command("b" * 32, 2_000, "end_qualification", 2)
+    begin_pending, begin_body = pending_file("begin-pending", begin_command)
+    close_pending, close_body = pending_file("close-pending", close_command)
+    begin_receipt, begin_state = receipt_file(
+        "begin-receipt", begin_command, begin_body, "qualification", 1_500
+    )
+    close_receipt, close_state = receipt_file(
+        "close-receipt", close_command, close_body, "closed", 2_500
+    )
+    final_state = verified_bytes(
+        "final-state", ADMISSION.canonical_json(close_state)
+    )
+    return SimpleNamespace(
+        trust=trust,
+        trust_data=trust_data,
+        operator=operator,
+        binding=binding,
+        command=command,
+        pending_file=pending_file,
+        receipt_file=receipt_file,
+        begin_pending=begin_pending,
+        begin_receipt=begin_receipt,
+        begin_state=begin_state,
+        close_pending=close_pending,
+        close_receipt=close_receipt,
+        close_state=close_state,
+        final_state=final_state,
+    )
+
+
+def validate_qualification_admission_verifier() -> None:
+    context = fixture()[5]
+    chain = admission_chain_fixture(context)
+    verifier = PROOF.QualificationAdmissionEvidenceVerifier(
+        ADMISSION, chain.trust_data
+    )
+    verifier.verify(
+        chain.begin_pending,
+        chain.begin_receipt,
+        chain.close_pending,
+        chain.close_receipt,
+        chain.final_state,
+        context,
+    )
+
+    expect_proof_error(
+        lambda: verifier.verify(
+            chain.begin_pending,
+            chain.begin_receipt,
+            chain.close_pending,
+            chain.close_receipt,
+            verified_bytes(
+                "final-state", ADMISSION.canonical_json(chain.begin_state)
+            ),
+            context,
+        ),
+        "final state that is not the close successor was accepted",
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            chain.begin_pending,
+            chain.begin_receipt,
+            chain.close_pending,
+            chain.close_receipt,
+            chain.final_state,
+            dataclasses.replace(
+                context, worker_bundle_sha256="sha256:" + "9" * 64
+            ),
+        ),
+        "admission binding outside the reset release was accepted",
+    )
+
+    skipped_close = chain.command("c" * 32, 3_000, "end_qualification", 7)
+    skipped_pending, skipped_body = chain.pending_file(
+        "close-pending", skipped_close
+    )
+    skipped_receipt, _skipped_state = chain.receipt_file(
+        "close-receipt", skipped_close, skipped_body, "closed", 3_500
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            chain.begin_pending,
+            chain.begin_receipt,
+            skipped_pending,
+            skipped_receipt,
+            chain.final_state,
+            context,
+        ),
+        "close command that is not the exact Begin successor was accepted",
+    )
+
+    short_pending, _short_body = chain.pending_file(
+        "begin-pending",
+        chain.command("a" * 32, 1_000, "begin_qualification", 1),
+        signature=b"\x00" * 63,
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            short_pending,
+            chain.begin_receipt,
+            chain.close_pending,
+            chain.close_receipt,
+            chain.final_state,
+            context,
+        ),
+        "pending command without an Ed25519 signature was accepted",
+    )
+
+    foreign_sts = dict(chain.operator, account_id="210987654321")
+    foreign_receipt, _foreign_state = chain.receipt_file(
+        "begin-receipt",
+        chain.command("a" * 32, 1_000, "begin_qualification", 1),
+        ADMISSION.canonical_json(
+            chain.command("a" * 32, 1_000, "begin_qualification", 1)
+        ),
+        "qualification",
+        1_500,
+        sts=foreign_sts,
+    )
+    expect_proof_error(
+        lambda: verifier.verify(
+            chain.begin_pending,
+            foreign_receipt,
+            chain.close_pending,
+            chain.close_receipt,
+            chain.final_state,
+            context,
+        ),
+        "command receipt with a foreign STS principal was accepted",
+    )
+
+    foreign_trust = copy.deepcopy(chain.trust)
+    foreign_trust["release_id"] = "release_b"
+    expect_proof_error(
+        lambda: PROOF.QualificationAdmissionEvidenceVerifier(
+            ADMISSION, ADMISSION.canonical_json(foreign_trust)
+        ).verify(
+            chain.begin_pending,
+            chain.begin_receipt,
+            chain.close_pending,
+            chain.close_receipt,
+            chain.final_state,
+            context,
+        ),
+        "cutover trust outside the reset release was accepted",
+    )
+
+
+def manual_fence_evidence_fixture() -> tuple[dict[str, Any], Any, Any]:
+    fence_receipt = verified_bytes("fence-receipt", b"ec2 stop forensic artifact\n")
+    stop_receipt = verified_bytes("stop-receipt", b"systemd stop forensic artifact\n")
+    evidence = {
+        "kind": PROOF.MANUAL_FENCE_EVIDENCE_KIND,
+        "version": 1,
+        "decision": PROOF.MANUAL_FENCE_EVIDENCE_DECISION,
+        "operator_principal_arn": (
+            "arn:aws:sts::123456789012:assumed-role/cutover/session"
+        ),
+        "recorded_at": "2026-08-12T00:00:00Z",
+        "hosts": [
+            {
+                "host_id": "old-host-a",
+                "components": ["blockd", "node_agent", "vmm"],
+                "terminal_kind": "host_fence_event",
+                "event_id": "manual-fence-old-host-a",
+                "ec2_stop": {
+                    "instance_id": "i-0123456789abcdef0",
+                    "stopped_at": "2026-08-11T23:50:00Z",
+                },
+                "checklist": {
+                    "instance_stopped": True,
+                    "no_running_writers": True,
+                    "object_write_cutoff_verified": True,
+                    "forensic_artifact_retained": True,
+                },
+                "receipt_sha256": fence_receipt.sha256,
+            },
+            {
+                "host_id": "old-host-b",
+                "components": ["controller", "gateway"],
+                "terminal_kind": "local_positive_stop",
+                "stopped_units": [
+                    "cats-controld.service",
+                    "cats-gatewayd.service",
+                ],
+                "stopped_at": "2026-08-11T23:40:00Z",
+                "checklist": {
+                    "units_stopped": True,
+                    "no_running_writers": True,
+                    "object_write_cutoff_verified": True,
+                    "forensic_artifact_retained": True,
+                },
+                "receipt_sha256": stop_receipt.sha256,
+            },
+        ],
+    }
+    return evidence, fence_receipt, stop_receipt
+
+
+def validate_manual_fence_evidence() -> None:
+    now = dt.datetime(2026, 8, 13, tzinfo=dt.timezone.utc)
+    evidence, fence_receipt, stop_receipt = manual_fence_evidence_fixture()
+
+    def parse(value: dict[str, Any], *, account: str = "123456789012") -> Any:
+        return PROOF.ManualOperatorFenceEvidence.parse(
+            PROOF.canonical_json(value, newline=True),
+            expected_account_id=account,
+            now=now,
+        )
+
+    manual = parse(evidence)
+    fence_verifier = manual.host_fence_verifier()
+    stop_verifier = manual.local_positive_stop_verifier()
+    fence_expected = {
+        "event_id": "manual-fence-old-host-a",
+        "host_id": "old-host-a",
+        "components": ["blockd", "node_agent", "vmm"],
+    }
+    stop_expected = {
+        "host_id": "old-host-b",
+        "components": ["controller", "gateway"],
+    }
+    fence_verifier.verify(fence_receipt, fence_expected)
+    stop_verifier.verify(stop_receipt, stop_expected)
+
+    unchecked = copy.deepcopy(evidence)
+    unchecked["hosts"][0]["checklist"]["object_write_cutoff_verified"] = False
+    future = copy.deepcopy(evidence)
+    future["recorded_at"] = "2026-08-14T00:00:00Z"
+    duplicated = copy.deepcopy(evidence)
+    duplicated["hosts"].append(copy.deepcopy(duplicated["hosts"][0]))
+    isolation_only = copy.deepcopy(evidence)
+    isolation_only["hosts"][0]["terminal_kind"] = "ec2_isolation"
+    for label, candidate in (
+        ("an incomplete checklist", unchecked),
+        ("a future recording time", future),
+        ("a duplicated host attestation", duplicated),
+        ("an EC2-isolation terminal kind", isolation_only),
+    ):
+        expect_proof_error(
+            lambda candidate=candidate: parse(candidate),
+            f"manual fence evidence with {label} was accepted",
+        )
+    expect_proof_error(
+        lambda: parse(evidence, account="210987654321"),
+        "manual fence evidence outside the reset account was accepted",
+    )
+
+    expect_proof_error(
+        lambda: fence_verifier.verify(
+            fence_receipt,
+            dict(fence_expected, host_id="old-host-c"),
+        ),
+        "manual fence attestation for an unattested Host was accepted",
+    )
+    expect_proof_error(
+        lambda: fence_verifier.verify(
+            fence_receipt,
+            dict(fence_expected, event_id="foreign-event"),
+        ),
+        "manual fence attestation with a foreign event ID was accepted",
+    )
+    expect_proof_error(
+        lambda: fence_verifier.verify(
+            fence_receipt,
+            dict(fence_expected, components=["blockd"]),
+        ),
+        "manual fence attestation with drifted components was accepted",
+    )
+    expect_proof_error(
+        lambda: fence_verifier.verify(stop_receipt, fence_expected),
+        "manual fence attestation accepted a foreign staged receipt",
+    )
+    expect_proof_error(
+        lambda: fence_verifier.verify(
+            stop_receipt,
+            dict(stop_expected, event_id="manual-fence-old-host-b"),
+        ),
+        "host_fence branch accepted a local positive-stop attestation",
+    )
+    expect_proof_error(
+        lambda: stop_verifier.verify(fence_receipt, fence_expected),
+        "local positive-stop branch accepted a fence attestation",
+    )
+
+
 def main() -> int:
     if not PROOF.version_one(1) or PROOF.version_one(True):
         raise AssertionError("closed contract version accepted a JSON boolean")
@@ -878,6 +1601,10 @@ def main() -> int:
     validate_qualification_fleet_cross_binding()
     validate_release_bound_usage_subprocess()
     validate_release_bound_usage_schema_subprocess()
+    validate_release_manifest_catalog_cross_check()
+    validate_route_v2_rotation_verifier()
+    validate_qualification_admission_verifier()
+    validate_manual_fence_evidence()
     return 0
 
 

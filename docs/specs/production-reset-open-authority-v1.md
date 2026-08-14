@@ -232,7 +232,13 @@ OldHostCoverageV1 {
 ```
 
 The current local positive-stop contract remains Proposed, so its typed verifier is unavailable and
-such an entry fails closed. EC2 Security Group isolation cannot appear as terminal coverage. A
+such an entry fails closed by default. EC2 Security Group isolation cannot appear as terminal
+coverage. Under the accepted v1 manual-fencing decision (`CUTOVER-DECISIONS.md` D7), the reset
+operator may admit `local_positive_stop` and `host_fence_event` coverage entries by supplying an
+explicit, completeness-validated manual attestation (`--accept-manual-fence-evidence`, documented in
+[`deploy/aws/production-clean-slate-reset.md`](../../deploy/aws/production-clean-slate-reset.md));
+that input binds each staged forensic receipt by exact digest and mints no HostFenceEvent or
+takeover authority. Otherwise a
 HostFence receipt must be a committed
 V3 core event in `Active` state, pass the core validator, bind provider scope + immutable Host + Node
 + boot + session + fence attempt, and include the mandatory object-write cutoff terminal proof.
