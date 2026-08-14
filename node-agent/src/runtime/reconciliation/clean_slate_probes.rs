@@ -14639,6 +14639,8 @@ mod tests {
                 Residue::ForeignCat => {
                     let path = environment.state.join(DATA_NAMESPACE).join("cat-foreign");
                     std::fs::create_dir(&path).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
                     path
                 }
                 Residue::DuplicateEpoch => {
@@ -14670,7 +14672,13 @@ mod tests {
                             ..
                         }])
                 )),
-                Residue::DuplicateEpoch | Residue::Symlink | Residue::Hardlink => {
+                Residue::Symlink | Residue::Hardlink => {
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    assert_eq!(result.unwrap(), InventoryAbsence::Unavailable);
+                    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                    result.expect_err("unsafe lineage must remain fail-closed");
+                }
+                Residue::DuplicateEpoch => {
                     result.expect_err("unsafe or duplicate lineage must remain fail-closed");
                 }
             }
