@@ -1935,7 +1935,7 @@ fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
 }
 
 #[test]
-fn last_guest_work_release_is_immediately_suspend_eligible() {
+fn default_endpoint_update_reuses_the_default_route() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "worker").unwrap();
@@ -1963,44 +1963,40 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
     let (route, _) = store.resolve_route(&updated.hostname).unwrap();
     assert_eq!(route.target_port, 3000);
     assert_eq!(route.epoch, 1);
+}
+
+#[test]
+fn automatic_suspend_is_disabled_for_an_idle_running_cat() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "auto-suspend-disabled");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "idle").unwrap();
     store
         .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
     store.set_observed(&cat.id, ObservedState::Running).unwrap();
-    let status = |sequence, leases| NodeWorkStatusRequest {
-        node_id: "node-1".into(),
-        cat_id: cat.id.clone(),
-        generation: 1,
-        guest_source_epoch: "guest-boot-1".into(),
-        guest_lease_sequence: sequence,
-        leases,
-    };
     store
-        .ingest_guest_work(&status(
-            1,
-            vec![GuestWorkLease {
-                id: "lease-1".into(),
-                label: "user-job".into(),
-                remaining_ttl_ms: 5_000,
-            }],
-        ))
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![],
+        })
         .unwrap();
-    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
-    assert_eq!(
-        store.work_status(&cat.id, 5_000).unwrap().reason,
-        "active_work"
-    );
+    let operation_count = store.list_operations(&workspace.id).unwrap().len();
 
-    store.ingest_guest_work(&status(2, vec![])).unwrap();
-    let operation = store
-        .try_auto_suspend(&cat.id, 5_000)
-        .unwrap()
-        .expect("last release should trigger suspend without an idle timer");
-    assert_eq!(operation.kind, "cat.auto_suspend");
-    let sleeping = store.must_get_cat_by_id(&cat.id).unwrap();
-    assert_eq!(sleeping.desired_state, DesiredState::Suspended);
-    assert_eq!(sleeping.generation, 2);
+    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
+
+    let unchanged = store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(unchanged.desired_state, DesiredState::Running);
+    assert_eq!(unchanged.observed_state, ObservedState::Running);
+    assert_eq!(unchanged.generation, 1);
+    assert_eq!(
+        store.list_operations(&workspace.id).unwrap().len(),
+        operation_count
+    );
 }
 
 #[test]
@@ -2400,7 +2396,7 @@ fn uncordon_rechecks_the_fingerprint_after_a_concurrent_key_change() {
 }
 
 #[test]
-fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
+fn gateway_work_lease_can_be_shortened_and_released() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
@@ -2423,7 +2419,10 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let lease = store
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "GET /", 5_000)
         .unwrap();
-    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
+    assert_eq!(
+        store.work_status(&cat.id, 5_000).unwrap().active_work_count,
+        1
+    );
     let shortened = store
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "handoff", 100)
         .unwrap();
@@ -2436,13 +2435,10 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         "renewal must be able to shorten a wake lease to its handoff window"
     );
     store.release_work(&shortened.id).unwrap();
-    store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
-
-    let first = store.ensure_desired_running(&cat.id).unwrap();
-    let second = store.ensure_desired_running(&cat.id).unwrap();
-    assert!(first.is_some());
-    assert!(second.is_none());
-    assert_eq!(store.must_get_cat_by_id(&cat.id).unwrap().generation, 3);
+    assert_eq!(
+        store.work_status(&cat.id, 5_000).unwrap().active_work_count,
+        0
+    );
 }
 
 #[test]
@@ -2465,7 +2461,9 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         leases,
     };
     store.ingest_guest_work(&report(0, vec![])).unwrap();
-    let auto = store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
+    let auto = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     store
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -2514,9 +2512,8 @@ fn guest_work_from_the_retained_runtime_survives_cancel_first_ordering() {
         })
         .unwrap());
     let auto = store
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     store
         .set_observed(&cat.id, ObservedState::Suspending)
         .unwrap();
@@ -2744,9 +2741,8 @@ fn stale_guest_work_cannot_cancel_a_newer_cold_during_inflight_suspend() {
         })
         .unwrap());
     let auto = lifecycle_store
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     lifecycle_store
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -2962,9 +2958,8 @@ fn guest_work_and_rejected_suspend_cancellation_share_cat_first_lock_order() {
         })
         .unwrap());
     let auto = setup
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     setup
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -3015,84 +3010,6 @@ fn guest_work_and_rejected_suspend_cancellation_share_cat_first_lock_order() {
         observer.get_operation(&auto.id).unwrap().phase,
         OperationPhase::Failed
     );
-    assert_eq!(
-        observer
-            .work_status(&cat.id, 60_000)
-            .unwrap()
-            .active_work_count,
-        1
-    );
-}
-
-#[test]
-fn guest_work_and_auto_suspend_share_cat_first_lock_order() {
-    let _serial = serialize_structural_postgres_lock_test();
-    let url = crate::testsupport::isolated_control_store_url();
-    let setup = concurrency_store(&url);
-    let ingest_store = concurrency_store(&url);
-    let auto_store = concurrency_store(&url);
-    let blocker_store = concurrency_store(&url);
-    let observer = concurrency_store(&url);
-    let guest_pid = backend_pid(&ingest_store);
-    let auto_pid = backend_pid(&auto_store);
-    let workspace = bootstrap_workspace(&setup, "guest-auto-suspend-lock-order");
-    let (cat, _, create) =
-        create_test_cat(&setup, &workspace, "guest-auto-suspend-lock-order").unwrap();
-    setup
-        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
-        .unwrap();
-    setup.set_placement(&cat.id, Some("node-1")).unwrap();
-    setup.set_observed(&cat.id, ObservedState::Running).unwrap();
-    setup.finish_operation(&create.id, None).unwrap();
-    assert!(!setup
-        .ingest_guest_work(&NodeWorkStatusRequest {
-            node_id: "node-1".into(),
-            cat_id: cat.id.clone(),
-            generation: 1,
-            guest_source_epoch: "guest-boot-1".into(),
-            guest_lease_sequence: 0,
-            leases: vec![],
-        })
-        .unwrap());
-    seed_expired_guest_lease(&setup, &cat.id);
-
-    let (blocker, release_blocker, blocker_pid) = hold_work_sources_table(blocker_store);
-    let report_cat_id = cat.id.clone();
-    let guest = std::thread::spawn(move || {
-        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
-            node_id: "node-1".into(),
-            cat_id: report_cat_id,
-            generation: 1,
-            guest_source_epoch: "guest-boot-1".into(),
-            guest_lease_sequence: 1,
-            leases: vec![GuestWorkLease {
-                id: "active-request".into(),
-                label: "active-request".into(),
-                remaining_ttl_ms: 30_000,
-            }],
-        })
-    });
-    assert!(
-        wait_until_blocked_by(&observer, guest_pid, blocker_pid),
-        "Guest work never acquired the Cat before reaching its source row"
-    );
-
-    let auto_cat_id = cat.id.clone();
-    let auto = std::thread::spawn(move || auto_store.try_auto_suspend(&auto_cat_id, 60_000));
-    let auto_waited_on_guest = wait_until_blocked_by(&observer, auto_pid, guest_pid);
-    release_blocker.send(()).unwrap();
-    blocker.join().unwrap();
-    assert!(
-        auto_waited_on_guest,
-        "auto-suspend never queued behind Guest Cat authority"
-    );
-    assert!(!guest.join().unwrap().unwrap());
-    assert!(auto.join().unwrap().unwrap().is_none());
-
-    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
-    assert_eq!(current.desired_state, DesiredState::Running);
-    assert_eq!(current.observed_state, ObservedState::Running);
-    assert_eq!(current.generation, 1);
     assert_eq!(
         observer
             .work_status(&cat.id, 60_000)

@@ -427,95 +427,13 @@ impl Store {
 
     pub fn try_auto_suspend(
         &self,
-        cat_id: &str,
-        signal_stale_ms: i64,
+        _cat_id: &str,
+        _signal_stale_ms: i64,
     ) -> Result<Option<Operation>> {
-        self.enter(|client| {
-            let client = client?;
-            let mut tx = client.transaction().map_err(internal)?;
-            let now = now_ms();
-            let cat: Option<(String, i64, bool, String, String)> = tx
-                .query_opt(
-                    "SELECT workspace_id, generation, auto_suspend,
-                        desired_state, observed_state
-                 FROM cats WHERE id=$1 FOR UPDATE",
-                    &[&cat_id],
-                )
-                .map_err(internal)?
-                .map(|row| -> std::result::Result<_, postgres::Error> {
-                    Ok((
-                        row.try_get(0)?,
-                        row.try_get(1)?,
-                        row.try_get(2)?,
-                        row.try_get(3)?,
-                        row.try_get(4)?,
-                    ))
-                })
-                .transpose()
-                .map_err(internal)?;
-            let Some((workspace_id, generation, auto_suspend, desired, observed)) = cat else {
-                return Ok(None);
-            };
-            let expired = tx
-                .execute(
-                    "DELETE FROM cat_work_leases WHERE cat_id=$1 AND expires_at_ms<=$2",
-                    &[&cat_id, &now],
-                )
-                .map_err(internal)?;
-            if expired > 0 {
-                tx.execute(
-                    "UPDATE cats SET work_version=work_version+1 WHERE id=$1",
-                    &[&cat_id],
-                )
-                .map_err(internal)?;
-            }
-            if !auto_suspend || desired != "running" || observed != "running" {
-                return Ok(None);
-            }
-            let source_seen: Option<i64> = tx
-                .query_opt(
-                    "SELECT seen_at_ms FROM cat_work_sources WHERE cat_id=$1",
-                    &[&cat_id],
-                )
-                .map_err(internal)?
-                .map(|row| row.try_get(0))
-                .transpose()
-                .map_err(internal)?;
-            if !source_seen.is_some_and(|seen| now.saturating_sub(seen) <= signal_stale_ms) {
-                return Ok(None);
-            }
-            let active: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM cat_work_leases
-                 WHERE cat_id=$1 AND expires_at_ms>$2",
-                    &[&cat_id, &now],
-                )
-                .map_err(internal)?
-                .try_get(0)
-                .map_err(internal)?;
-            if active != 0 {
-                return Ok(None);
-            }
-            let next = generation + 1;
-            let changed = tx
-                .execute(
-                    "UPDATE cats SET desired_state='suspended', generation=$2
-                 WHERE id=$1 AND generation=$3 AND desired_state='running'
-                   AND observed_state='running' AND auto_suspend
-                   AND NOT EXISTS (
-                     SELECT 1 FROM cat_work_leases
-                     WHERE cat_id=$1 AND expires_at_ms>$4)",
-                    &[&cat_id, &next, &generation, &now],
-                )
-                .map_err(internal)?;
-            if changed == 0 {
-                return Ok(None);
-            }
-            let operation =
-                Self::insert_operation(&mut tx, &workspace_id, "cat.auto_suspend", cat_id, next)?;
-            tx.commit().map_err(internal)?;
-            Ok(Some(operation))
-        })
+        // The first terminal release has no persisted ResumeRuntime token.
+        // Keep the public auto-suspend setting inert rather than create an
+        // intent the Node cannot safely reverse.
+        Ok(None)
     }
 
     /// Stable sleeping Cats whose persisted state age has crossed the next
