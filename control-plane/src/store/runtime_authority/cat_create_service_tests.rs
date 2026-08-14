@@ -444,6 +444,7 @@ fn service_fixture_at(
 ) {
     let store = Arc::new(Store::connect(url, None).unwrap());
     let workspace = bootstrap_workspace(&store, slug);
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let release = release_receipt();
     let admission = super::runtime_spine_tests::establish_empty_admission(store.as_ref(), &release);
     store

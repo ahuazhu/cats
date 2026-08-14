@@ -1715,6 +1715,7 @@ fn stale_plan_is_ignored_only_for_a_closed_existing_name_conflict() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "stale-plan-conflict");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut occupied = super::product_tests::request(&workspace, "occupied", 1, "occupy");
     bind_create_to_admission(&mut occupied, &admission, &active_guest_digest);
     assert_eq!(
@@ -1761,6 +1762,7 @@ fn free_name_revalidates_after_a_concurrent_session_replacement() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "admission-race");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -1899,6 +1901,7 @@ fn full_observation_committing_first_invalidates_an_empty_create_plan() {
         Vec::new(),
     );
     let workspace = super::product_tests::bootstrap_workspace(&store, "observation-first");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -2014,6 +2017,7 @@ fn create_committing_first_makes_the_old_empty_cursor_fail_closed() {
         Vec::new(),
     );
     let workspace = super::product_tests::bootstrap_workspace(&store, "create-first");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -2127,6 +2131,7 @@ fn free_name_rejects_candidate_plan_binding_drift_without_writes() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "candidate-binding");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
 
     let mut wrong_node = super::product_tests::request(&workspace, "wrong-node", 1, "wrong-node");
     bind_create_to_admission(&mut wrong_node, &admission, &active_guest_digest);

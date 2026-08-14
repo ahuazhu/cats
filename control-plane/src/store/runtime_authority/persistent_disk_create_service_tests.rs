@@ -107,6 +107,7 @@ fn fixture(
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = super::product_tests::bootstrap_workspace(&store, slug);
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let identities = Arc::new(SequentialIdentities::default());
     let service = PersistentDiskCreateService::new(
         Arc::clone(&store),
@@ -435,6 +436,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = super::product_tests::bootstrap_workspace(&store, "disk-owner-abort");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let service = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&store),
         Arc::new(SequentialIdentities::default()),
@@ -510,6 +512,7 @@ fn shutdown_between_request_admission_and_owner_registration_rejects_without_wri
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = super::product_tests::bootstrap_workspace(&store, "disk-owner-close-race");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let identities = Arc::new(PausingIdentities::new());
     let service = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&store),
@@ -570,6 +573,10 @@ fn cat_root_and_persistent_disk_name_race_has_only_closed_typed_outcomes() {
     let observer = Store::connect(&url, None).unwrap();
     let workspace =
         super::product_tests::bootstrap_workspace(&persistent_store, "disk-root-name-race");
+    crate::testsupport::begin_production_qualification_for_product_test(
+        &persistent_store,
+        &workspace,
+    );
     let cat_request = super::product_tests::request(&workspace, "app", 42, "cat-create");
     let root_disk_name = cat_request.candidate.root_disk.name.clone();
     let network_id = cat_request
@@ -725,6 +732,7 @@ fn concurrent_name_claims_across_store_replicas_publish_one_resource_and_two_res
     let first_store = Arc::new(Store::connect(&url, None).unwrap());
     let second_store = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = super::product_tests::bootstrap_workspace(&first_store, "disk-name-race");
+    crate::testsupport::begin_production_qualification_for_product_test(&first_store, &workspace);
     let first = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&first_store),
         Arc::new(SequentialIdentities::starting_after(0)),

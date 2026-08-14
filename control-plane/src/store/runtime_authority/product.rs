@@ -55,7 +55,7 @@ use super::product_rows::{
     load_root_disk_by_cat_unlocked, persistent_intent_identity_exists_unlocked, replace_desired,
     update_operation,
 };
-use super::production_mutation_admission::require_production_product_mutations_open;
+use super::production_mutation_admission::require_production_product_mutation_admitted;
 use super::route_epoch_engine::{
     RequireIdleBusyEvidence, RequireIdleGateOutcome, RequireIdleOpenBusyProof,
 };
@@ -74,6 +74,7 @@ use crate::store::transaction::{
     AuthorityExecutionError, AuthorityTransactionError, AuthorityTxResult,
 };
 use crate::store::{internal, Result, Store};
+use cats_api::production_mutation_admission::ProductionQualificationMutationClass;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 const CAT_NAME_CONFLICT_BODY: &[u8] =
@@ -1391,7 +1392,11 @@ fn begin_disk_delete_in(
         return check_replay(result, &request.idempotency.request_fingerprint)
             .map_err(AuthorityTransactionError::from);
     }
-    require_production_product_mutations_open(transaction)?;
+    require_production_product_mutation_admitted(
+        transaction,
+        &request.idempotency.authenticated_workspace_id,
+        ProductionQualificationMutationClass::DiskDelete,
+    )?;
     let context = PersistentDiskDeleteContext {
         authenticated_workspace_id: request.idempotency.authenticated_workspace_id.clone(),
         disk_id: request.disk_id.clone(),
@@ -1976,7 +1981,11 @@ fn commit_desired_mutation_in(
         let result = check_replay(result, &request.idempotency.request_fingerprint)?;
         return Ok(DesiredMutationTransactionOutcome::Replayed(result));
     }
-    require_production_product_mutations_open(transaction)?;
+    require_production_product_mutation_admitted(
+        transaction,
+        &request.idempotency.authenticated_workspace_id,
+        ProductionQualificationMutationClass::RuntimeMutation,
+    )?;
     validate_desired_mutation_request(request)?;
     let publication = DesiredMutationPublication {
         expected_current: &request.expected_current,
@@ -2601,8 +2610,12 @@ fn create_persistent_disk_in(
             .map_err(AuthorityTransactionError::from)
             .map_err(CreatePersistentDiskTransactionError::from);
     }
-    require_production_product_mutations_open(transaction)
-        .map_err(CreatePersistentDiskTransactionError::from)?;
+    require_production_product_mutation_admitted(
+        transaction,
+        &request.idempotency.authenticated_workspace_id,
+        ProductionQualificationMutationClass::DiskCreate,
+    )
+    .map_err(CreatePersistentDiskTransactionError::from)?;
 
     validate_persistent_disk_candidate(request).map_err(AuthorityTransactionError::from)?;
     checkpoint_covered_commit(transaction, commit_state)?;
@@ -2762,8 +2775,12 @@ fn create_cat_in(
             .map_err(AuthorityTransactionError::from)
             .map_err(CreateCatTransactionError::from);
     }
-    require_production_product_mutations_open(transaction)
-        .map_err(CreateCatTransactionError::from)?;
+    require_production_product_mutation_admitted(
+        transaction,
+        &request.idempotency.authenticated_workspace_id,
+        ProductionQualificationMutationClass::CatCreate,
+    )
+    .map_err(CreateCatTransactionError::from)?;
 
     validate_candidate(request).map_err(AuthorityTransactionError::from)?;
     checkpoint_cat_create(transaction, commit_state)?;

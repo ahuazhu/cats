@@ -789,6 +789,8 @@ const CONTROL_TABLES: &[&str] = &[
     "hostname_desired_lookups",
     "runtime_operations",
     "api_idempotency_results",
+    "production_mutation_admission_commands",
+    "production_mutation_admission",
     "node_identities",
     "agent_registration_attempts",
     "current_agent_sessions",
@@ -1359,6 +1361,16 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
     ),
     ("volume_records", "volume_records_pkey", "volume_id"),
     (
+        "production_mutation_admission_commands",
+        "production_mutation_admission_commands_pkey",
+        "command_id",
+    ),
+    (
+        "production_mutation_admission",
+        "production_mutation_admission_pkey",
+        "singleton",
+    ),
+    (
         "route_v2_signing_authority",
         "route_v2_signing_authority_pkey",
         "singleton",
@@ -1434,6 +1446,15 @@ pub(super) const REQUIRED_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
 ];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
+    (
+        "production_mutation_admission",
+        "production_mutation_admission_exact_command_fkey",
+        "production_mutation_admission_commands",
+        "last_command_id,revision,mode,binding_sha256",
+        "command_id,resulting_revision,resulting_mode,binding_sha256",
+        "r",
+        "r",
+    ),
     (
         "route_v2_signing_authority",
         "route_v2_signing_authority_current_revision_fkey",
@@ -1684,6 +1705,18 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         "route_v2_public_ring_deliveries",
         "route_v2_public_ring_delivery_predecessor_key",
         "deployment_id,expected_previous_ring_version,expected_previous_key_ring_digest",
+        None,
+    ),
+    (
+        "production_mutation_admission_commands",
+        "production_mutation_admission_commands_state_key",
+        "command_id,resulting_revision,resulting_mode,binding_sha256",
+        None,
+    ),
+    (
+        "production_mutation_admission",
+        "production_mutation_admission_last_command_key",
+        "last_command_id",
         None,
     ),
     (
@@ -2137,6 +2170,27 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "8089e0f2c469819e8b3228e1d263d543114b56f81d80b944954bd9b99f5d9f6b",
     ),
     (
+        "production_mutation_admission_commands",
+        "production_mutation_admission_command_is_immutable",
+        "control_production_mutation_admission_command_is_immutable",
+        BEFORE_ROW_UPDATE_DELETE,
+        "8b1d09afb32bb828dd3869a742d7cdce06e4ef367f85b83932fd8f469d26aea2",
+    ),
+    (
+        "production_mutation_admission",
+        "production_mutation_admission_successor",
+        "control_production_mutation_admission_successor",
+        BEFORE_ROW_UPDATE,
+        "ec2504cf1e185105fe156688a2026b7d7779725d366e0741ec7f48b0b86bed6a",
+    ),
+    (
+        "production_mutation_admission",
+        "production_mutation_admission_cannot_delete",
+        "control_production_mutation_admission_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "9651671a2ac23952c11607ca1b45394534c5855e2bbf7929fe3b96924801a9d1",
+    ),
+    (
         "runtime_node_credential_lineage",
         "runtime_node_credential_lineage_update",
         "control_runtime_node_credential_lineage_update",
@@ -2364,6 +2418,55 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             request_fingerprint, http_status, content_type, response_body,
             created_at
        FROM api_idempotency_results WHERE FALSE",
+    "SELECT command_id, command, request_sha256, principal, principal_kind,
+            operator_credential_id, operator_public_key_spki_sha256,
+            operator_trust_bundle_sha256, operator_aws_partition,
+            operator_account_id, operator_role_arn, operator_principal_arn,
+            issued_at_unix_ms, expires_at_unix_ms, expected_revision,
+            mutation_kind, target_mode, binding_kind, binding_sha256,
+            qualification_id, reset_id, deployment_id, release_id,
+            source_commit_sha, control_schema_version, source_manifest_sha256,
+            source_bundle_sha256, build_receipt_sha256,
+            release_manifest_sha256, worker_bundle_sha256,
+            qualification_manifest_sha256, qualification_catalog_sha256,
+            proof_set_sha256, fresh_targets_sha256,
+            reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
+            route_v2_rotation_qualification_receipt_sha256,
+            route_v2_rotation_qualification_node_ack_sets_sha256,
+            route_v2_rotation_qualification_transcript_sha256,
+            usage_terminal_receipt_sha256, old_host_coverage_sha256,
+            kernel_nbd_qualification_bundle_sha256,
+            vhost_user_qualification_bundle_sha256,
+            qualification_cell_manifest_sha256,
+            qualification_aws_partition, qualification_aws_account_id,
+            qualification_aws_region, qualification_cell_id,
+            qualification_cell_namespace, qualification_cats_account_id,
+            qualification_workspace_id, qualification_mutation_classes,
+            qualification_expires_at_unix_ms, outcome, outcome_kind,
+            resulting_revision, resulting_mode, committed_at_unix_ms
+       FROM production_mutation_admission_commands WHERE FALSE",
+    "SELECT singleton, revision, mode, binding, binding_sha256, binding_kind,
+            qualification_id, reset_id, deployment_id, release_id,
+            source_commit_sha, control_schema_version, source_manifest_sha256,
+            source_bundle_sha256, build_receipt_sha256,
+            release_manifest_sha256, worker_bundle_sha256,
+            qualification_manifest_sha256, qualification_catalog_sha256,
+            proof_set_sha256, fresh_targets_sha256,
+            reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
+            route_v2_rotation_qualification_receipt_sha256,
+            route_v2_rotation_qualification_node_ack_sets_sha256,
+            route_v2_rotation_qualification_transcript_sha256,
+            usage_terminal_receipt_sha256, old_host_coverage_sha256,
+            kernel_nbd_qualification_bundle_sha256,
+            vhost_user_qualification_bundle_sha256,
+            qualification_cell_manifest_sha256,
+            qualification_aws_partition, qualification_aws_account_id,
+            qualification_aws_region, qualification_cell_id,
+            qualification_cell_namespace, qualification_cats_account_id,
+            qualification_workspace_id, qualification_mutation_classes,
+            qualification_expires_at_unix_ms, last_command_id,
+            updated_at_unix_ms
+       FROM production_mutation_admission WHERE FALSE",
     "SELECT node_id, record, immutable_host_id, credential_id,
             credential_kind, credential_public_key_spki_sha256,
             credential_provider, credential_principal,
@@ -3117,10 +3220,11 @@ CREATE TABLE IF NOT EXISTS api_idempotency_results (
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
     PRIMARY KEY (authenticated_workspace_id, canonical_route, idempotency_key)
 );
--- ADR-0051: immutable operator commands and the one production mutation
--- admission pointer.  The pointer is born Closed at revision 1.  The binding
--- columns are deliberately repeated beside JSONB so a malformed or manually
--- edited projection cannot silently become authority.
+-- ADR-0051/0052: immutable operator commands and the one production mutation
+-- admission pointer.  The pointer is born Closed at revision 1.  Qualification
+-- is a time-bounded, exact-workspace release test scope; it is not an Open
+-- binding with missing proofs.  Repeated projections make the sum type and its
+-- nullability closed in PostgreSQL as well as in the canonical JSON decoder.
 CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
     command_id TEXT PRIMARY KEY
         CONSTRAINT production_mutation_admission_commands_id_ck
@@ -3166,13 +3270,22 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
     expected_revision BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_expected_revision_ck
         CHECK (expected_revision > 0),
+    mutation_kind TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_mutation_kind_ck
+        CHECK (mutation_kind IN (
+            'begin_qualification', 'end_qualification', 'open', 'emergency_close'
+        )),
     target_mode TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_target_mode_ck
-        CHECK (target_mode IN ('closed', 'open')),
+        CHECK (target_mode IN ('closed', 'qualification', 'open')),
+    binding_kind TEXT NOT NULL
+        CONSTRAINT production_mutation_admission_commands_binding_kind_ck
+        CHECK (binding_kind IN ('qualification', 'open')),
     binding_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_binding_digest_ck
         CHECK (binding_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    reset_id TEXT NOT NULL,
+    qualification_id TEXT NULL,
+    reset_id TEXT NULL,
     deployment_id TEXT NOT NULL,
     release_id TEXT NOT NULL,
     source_commit_sha TEXT NOT NULL
@@ -3187,48 +3300,80 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
     source_bundle_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_source_bundle_ck
         CHECK (source_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    build_receipt_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_build_receipt_ck
+        CHECK (build_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     release_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_release_manifest_ck
         CHECK (release_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    qualification_manifest_sha256 TEXT NOT NULL
+    worker_bundle_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_worker_bundle_ck
+        CHECK (worker_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_qualification_manifest_ck
         CHECK (qualification_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     qualification_catalog_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_qualification_catalog_ck
         CHECK (qualification_catalog_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    proof_set_sha256 TEXT NOT NULL
+    proof_set_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_proof_set_ck
         CHECK (proof_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    fresh_targets_sha256 TEXT NOT NULL
+    fresh_targets_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_fresh_targets_ck
         CHECK (fresh_targets_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    reset_complete_receipt_sha256 TEXT NOT NULL
+    reset_complete_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_reset_complete_ck
         CHECK (reset_complete_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    fleet_closed_receipt_sha256 TEXT NOT NULL
+    fleet_closed_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_fleet_closed_ck
         CHECK (fleet_closed_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_v2_rotation_qualification_receipt_sha256 TEXT NOT NULL
+    route_v2_rotation_qualification_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_route_v2_qualification_ck
         CHECK (route_v2_rotation_qualification_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_v2_rotation_qualification_node_ack_sets_sha256 TEXT NOT NULL
+    route_v2_rotation_qualification_node_ack_sets_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_route_v2_node_acks_ck
         CHECK (route_v2_rotation_qualification_node_ack_sets_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    route_v2_rotation_qualification_transcript_sha256 TEXT NOT NULL
+    route_v2_rotation_qualification_transcript_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_route_v2_transcript_ck
         CHECK (route_v2_rotation_qualification_transcript_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    usage_terminal_receipt_sha256 TEXT NOT NULL
+    usage_terminal_receipt_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_usage_terminal_ck
         CHECK (usage_terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    old_host_coverage_sha256 TEXT NOT NULL
+    old_host_coverage_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_host_coverage_ck
         CHECK (old_host_coverage_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    kernel_nbd_qualification_bundle_sha256 TEXT NOT NULL
+    kernel_nbd_qualification_bundle_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_kernel_nbd_ck
         CHECK (kernel_nbd_qualification_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    vhost_user_qualification_bundle_sha256 TEXT NOT NULL
+    vhost_user_qualification_bundle_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_commands_vhost_user_ck
         CHECK (vhost_user_qualification_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_cell_manifest_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_cell_manifest_ck
+        CHECK (qualification_cell_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_aws_partition TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_partition_ck
+        CHECK (qualification_aws_partition IN ('aws', 'aws-us-gov', 'aws-cn')),
+    qualification_aws_account_id TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_aws_account_ck
+        CHECK (qualification_aws_account_id ~ '^[0-9]{12}$'),
+    qualification_aws_region TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_region_ck
+        CHECK (qualification_aws_region ~ '^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$'),
+    qualification_cell_id TEXT NULL,
+    qualification_cell_namespace TEXT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_namespace_ck
+        CHECK (qualification_cell_namespace ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    qualification_cats_account_id TEXT NULL,
+    qualification_workspace_id TEXT NULL,
+    qualification_mutation_classes JSONB NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_classes_ck
+        CHECK (jsonb_typeof(qualification_mutation_classes) = 'array'
+            AND qualification_mutation_classes =
+                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"runtime_mutation\"]'::jsonb),
+    qualification_expires_at_unix_ms BIGINT NULL
+        CONSTRAINT production_mutation_admission_commands_qualification_expiry_ck
+        CHECK (qualification_expires_at_unix_ms > 0),
     outcome JSONB NOT NULL
         CONSTRAINT production_mutation_admission_commands_outcome_ck
         CHECK (jsonb_typeof(outcome) = 'object'),
@@ -3240,7 +3385,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CHECK (resulting_revision > 0),
     resulting_mode TEXT NULL
         CONSTRAINT production_mutation_admission_commands_result_mode_ck
-        CHECK (resulting_mode IN ('closed', 'open')),
+        CHECK (resulting_mode IN ('closed', 'qualification', 'open')),
     committed_at_unix_ms BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_time_ck
         CHECK (committed_at_unix_ms >= 0),
@@ -3250,7 +3395,69 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
             AND resulting_mode = target_mode) OR
         (outcome_kind = 'authority_precondition_failed'
             AND resulting_revision IS NULL AND resulting_mode IS NULL)
-    )
+    ),
+    CONSTRAINT production_mutation_admission_commands_mutation_target_ck CHECK (
+        (mutation_kind = 'begin_qualification'
+            AND binding_kind = 'qualification' AND target_mode = 'qualification') OR
+        (mutation_kind = 'end_qualification'
+            AND binding_kind = 'qualification' AND target_mode = 'closed') OR
+        (mutation_kind = 'open'
+            AND binding_kind = 'open' AND target_mode = 'open') OR
+        (mutation_kind = 'emergency_close' AND target_mode = 'closed')
+    ),
+    CONSTRAINT production_mutation_admission_commands_binding_closed_ck CHECK (
+        (binding_kind = 'qualification'
+            AND qualification_id IS NOT NULL AND reset_id IS NULL
+            AND build_receipt_sha256 IS NOT NULL
+            AND worker_bundle_sha256 IS NOT NULL
+            AND qualification_manifest_sha256 IS NULL
+            AND proof_set_sha256 IS NULL AND fresh_targets_sha256 IS NULL
+            AND reset_complete_receipt_sha256 IS NULL
+            AND fleet_closed_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_node_ack_sets_sha256 IS NULL
+            AND route_v2_rotation_qualification_transcript_sha256 IS NULL
+            AND usage_terminal_receipt_sha256 IS NULL
+            AND old_host_coverage_sha256 IS NULL
+            AND kernel_nbd_qualification_bundle_sha256 IS NULL
+            AND vhost_user_qualification_bundle_sha256 IS NULL
+            AND qualification_cell_manifest_sha256 IS NOT NULL
+            AND qualification_aws_partition IS NOT NULL
+            AND qualification_aws_account_id IS NOT NULL
+            AND qualification_aws_region IS NOT NULL
+            AND qualification_cell_id IS NOT NULL
+            AND qualification_cell_namespace IS NOT NULL
+            AND qualification_cats_account_id IS NOT NULL
+            AND qualification_workspace_id IS NOT NULL
+            AND qualification_mutation_classes IS NOT NULL
+            AND qualification_expires_at_unix_ms IS NOT NULL) OR
+        (binding_kind = 'open'
+            AND qualification_id IS NULL AND reset_id IS NOT NULL
+            AND build_receipt_sha256 IS NULL AND worker_bundle_sha256 IS NULL
+            AND qualification_manifest_sha256 IS NOT NULL
+            AND proof_set_sha256 IS NOT NULL AND fresh_targets_sha256 IS NOT NULL
+            AND reset_complete_receipt_sha256 IS NOT NULL
+            AND fleet_closed_receipt_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_receipt_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_node_ack_sets_sha256 IS NOT NULL
+            AND route_v2_rotation_qualification_transcript_sha256 IS NOT NULL
+            AND usage_terminal_receipt_sha256 IS NOT NULL
+            AND old_host_coverage_sha256 IS NOT NULL
+            AND kernel_nbd_qualification_bundle_sha256 IS NOT NULL
+            AND vhost_user_qualification_bundle_sha256 IS NOT NULL
+            AND qualification_cell_manifest_sha256 IS NULL
+            AND qualification_aws_partition IS NULL
+            AND qualification_aws_account_id IS NULL
+            AND qualification_aws_region IS NULL
+            AND qualification_cell_id IS NULL
+            AND qualification_cell_namespace IS NULL
+            AND qualification_cats_account_id IS NULL
+            AND qualification_workspace_id IS NULL
+            AND qualification_mutation_classes IS NULL
+            AND qualification_expires_at_unix_ms IS NULL)
+    ),
+    CONSTRAINT production_mutation_admission_commands_state_key
+        UNIQUE (command_id, resulting_revision, resulting_mode, binding_sha256)
 );
 CREATE TABLE IF NOT EXISTS production_mutation_admission (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE
@@ -3259,13 +3466,17 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CONSTRAINT production_mutation_admission_revision_ck CHECK (revision > 0),
     mode TEXT NOT NULL
         CONSTRAINT production_mutation_admission_mode_ck
-        CHECK (mode IN ('closed', 'open')),
+        CHECK (mode IN ('closed', 'qualification', 'open')),
     binding JSONB NULL
         CONSTRAINT production_mutation_admission_binding_json_ck
         CHECK (jsonb_typeof(binding) = 'object'),
     binding_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_binding_digest_ck
         CHECK (binding_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    binding_kind TEXT NULL
+        CONSTRAINT production_mutation_admission_binding_kind_ck
+        CHECK (binding_kind IN ('qualification', 'open')),
+    qualification_id TEXT NULL,
     reset_id TEXT NULL,
     deployment_id TEXT NULL,
     release_id TEXT NULL,
@@ -3281,9 +3492,15 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
     source_bundle_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_source_bundle_ck
         CHECK (source_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    build_receipt_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_build_receipt_ck
+        CHECK (build_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     release_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_release_manifest_ck
         CHECK (release_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    worker_bundle_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_worker_bundle_ck
+        CHECK (worker_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     qualification_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_qualification_manifest_ck
         CHECK (qualification_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -3323,17 +3540,46 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
     vhost_user_qualification_bundle_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_vhost_user_ck
         CHECK (vhost_user_qualification_bundle_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_cell_manifest_sha256 TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_cell_manifest_ck
+        CHECK (qualification_cell_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    qualification_aws_partition TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_partition_ck
+        CHECK (qualification_aws_partition IN ('aws', 'aws-us-gov', 'aws-cn')),
+    qualification_aws_account_id TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_aws_account_ck
+        CHECK (qualification_aws_account_id ~ '^[0-9]{12}$'),
+    qualification_aws_region TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_region_ck
+        CHECK (qualification_aws_region ~ '^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$'),
+    qualification_cell_id TEXT NULL,
+    qualification_cell_namespace TEXT NULL
+        CONSTRAINT production_mutation_admission_qualification_namespace_ck
+        CHECK (qualification_cell_namespace ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    qualification_cats_account_id TEXT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+    qualification_workspace_id TEXT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+    qualification_mutation_classes JSONB NULL
+        CONSTRAINT production_mutation_admission_qualification_classes_ck
+        CHECK (jsonb_typeof(qualification_mutation_classes) = 'array'
+            AND qualification_mutation_classes =
+                '[\"cat_create\",\"disk_create\",\"disk_delete\",\"runtime_mutation\"]'::jsonb),
+    qualification_expires_at_unix_ms BIGINT NULL
+        CONSTRAINT production_mutation_admission_qualification_expiry_ck
+        CHECK (qualification_expires_at_unix_ms > 0),
     last_command_id TEXT NULL
         CONSTRAINT production_mutation_admission_last_command_key UNIQUE,
     updated_at_unix_ms BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_time_ck
         CHECK (updated_at_unix_ms >= 0),
     CONSTRAINT production_mutation_admission_initial_or_bound_ck CHECK (
-        (binding IS NULL AND binding_sha256 IS NULL AND reset_id IS NULL
+        (binding IS NULL AND binding_sha256 IS NULL AND binding_kind IS NULL
+            AND qualification_id IS NULL AND reset_id IS NULL
             AND deployment_id IS NULL AND release_id IS NULL
             AND source_commit_sha IS NULL AND control_schema_version IS NULL
             AND source_manifest_sha256 IS NULL AND source_bundle_sha256 IS NULL
+            AND build_receipt_sha256 IS NULL
             AND release_manifest_sha256 IS NULL
+            AND worker_bundle_sha256 IS NULL
             AND qualification_manifest_sha256 IS NULL
             AND qualification_catalog_sha256 IS NULL
             AND proof_set_sha256 IS NULL
@@ -3347,15 +3593,63 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND old_host_coverage_sha256 IS NULL
             AND kernel_nbd_qualification_bundle_sha256 IS NULL
             AND vhost_user_qualification_bundle_sha256 IS NULL
+            AND qualification_cell_manifest_sha256 IS NULL
+            AND qualification_aws_partition IS NULL
+            AND qualification_aws_account_id IS NULL
+            AND qualification_aws_region IS NULL
+            AND qualification_cell_id IS NULL
+            AND qualification_cell_namespace IS NULL
+            AND qualification_cats_account_id IS NULL
+            AND qualification_workspace_id IS NULL
+            AND qualification_mutation_classes IS NULL
+            AND qualification_expires_at_unix_ms IS NULL
             AND mode = 'closed' AND revision = 1
             AND last_command_id IS NULL AND updated_at_unix_ms = 0) OR
         (binding IS NOT NULL AND binding_sha256 IS NOT NULL
-            AND reset_id IS NOT NULL AND deployment_id IS NOT NULL
+            AND binding_kind = 'qualification'
+            AND qualification_id IS NOT NULL AND reset_id IS NULL
+            AND deployment_id IS NOT NULL
             AND release_id IS NOT NULL AND source_commit_sha IS NOT NULL
             AND control_schema_version IS NOT NULL
             AND source_manifest_sha256 IS NOT NULL
             AND source_bundle_sha256 IS NOT NULL
+            AND build_receipt_sha256 IS NOT NULL
             AND release_manifest_sha256 IS NOT NULL
+            AND worker_bundle_sha256 IS NOT NULL
+            AND qualification_manifest_sha256 IS NULL
+            AND qualification_catalog_sha256 IS NOT NULL
+            AND proof_set_sha256 IS NULL AND fresh_targets_sha256 IS NULL
+            AND reset_complete_receipt_sha256 IS NULL
+            AND fleet_closed_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_receipt_sha256 IS NULL
+            AND route_v2_rotation_qualification_node_ack_sets_sha256 IS NULL
+            AND route_v2_rotation_qualification_transcript_sha256 IS NULL
+            AND usage_terminal_receipt_sha256 IS NULL
+            AND old_host_coverage_sha256 IS NULL
+            AND kernel_nbd_qualification_bundle_sha256 IS NULL
+            AND vhost_user_qualification_bundle_sha256 IS NULL
+            AND qualification_cell_manifest_sha256 IS NOT NULL
+            AND qualification_aws_partition IS NOT NULL
+            AND qualification_aws_account_id IS NOT NULL
+            AND qualification_aws_region IS NOT NULL
+            AND qualification_cell_id IS NOT NULL
+            AND qualification_cell_namespace IS NOT NULL
+            AND qualification_cats_account_id IS NOT NULL
+            AND qualification_workspace_id IS NOT NULL
+            AND qualification_mutation_classes IS NOT NULL
+            AND qualification_expires_at_unix_ms IS NOT NULL
+            AND mode IN ('closed', 'qualification')
+            AND last_command_id IS NOT NULL) OR
+        (binding IS NOT NULL AND binding_sha256 IS NOT NULL
+            AND binding_kind = 'open'
+            AND qualification_id IS NULL AND reset_id IS NOT NULL
+            AND deployment_id IS NOT NULL AND release_id IS NOT NULL
+            AND source_commit_sha IS NOT NULL AND control_schema_version IS NOT NULL
+            AND source_manifest_sha256 IS NOT NULL
+            AND source_bundle_sha256 IS NOT NULL
+            AND build_receipt_sha256 IS NULL
+            AND release_manifest_sha256 IS NOT NULL
+            AND worker_bundle_sha256 IS NULL
             AND qualification_manifest_sha256 IS NOT NULL
             AND qualification_catalog_sha256 IS NOT NULL
             AND proof_set_sha256 IS NOT NULL AND fresh_targets_sha256 IS NOT NULL
@@ -3368,31 +3662,27 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
             AND old_host_coverage_sha256 IS NOT NULL
             AND kernel_nbd_qualification_bundle_sha256 IS NOT NULL
             AND vhost_user_qualification_bundle_sha256 IS NOT NULL
+            AND qualification_cell_manifest_sha256 IS NULL
+            AND qualification_aws_partition IS NULL
+            AND qualification_aws_account_id IS NULL
+            AND qualification_aws_region IS NULL
+            AND qualification_cell_id IS NULL
+            AND qualification_cell_namespace IS NULL
+            AND qualification_cats_account_id IS NULL
+            AND qualification_workspace_id IS NULL
+            AND qualification_mutation_classes IS NULL
+            AND qualification_expires_at_unix_ms IS NULL
+            AND mode IN ('closed', 'open')
             AND last_command_id IS NOT NULL)
     ),
-    CONSTRAINT production_mutation_admission_last_command_fkey
-        FOREIGN KEY (last_command_id)
-        REFERENCES production_mutation_admission_commands(command_id)
+    CONSTRAINT production_mutation_admission_exact_command_fkey
+        FOREIGN KEY (last_command_id, revision, mode, binding_sha256)
+        REFERENCES production_mutation_admission_commands(
+            command_id, resulting_revision, resulting_mode, binding_sha256)
         ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
-INSERT INTO production_mutation_admission (
-    singleton, revision, mode, binding, binding_sha256, reset_id,
-    deployment_id, release_id, source_commit_sha, control_schema_version,
-    source_manifest_sha256, source_bundle_sha256, release_manifest_sha256,
-    qualification_manifest_sha256, qualification_catalog_sha256,
-    proof_set_sha256, fresh_targets_sha256, reset_complete_receipt_sha256,
-    fleet_closed_receipt_sha256, route_v2_rotation_qualification_receipt_sha256,
-    route_v2_rotation_qualification_node_ack_sets_sha256,
-    route_v2_rotation_qualification_transcript_sha256,
-    usage_terminal_receipt_sha256,
-    old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
-    vhost_user_qualification_bundle_sha256, last_command_id,
-    updated_at_unix_ms
-) VALUES (
-    TRUE, 1, 'closed', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0
-);
+INSERT INTO production_mutation_admission (singleton, revision, mode, updated_at_unix_ms)
+VALUES (TRUE, 1, 'closed', 0);
 CREATE TABLE IF NOT EXISTS node_identities (
     node_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -4537,39 +4827,20 @@ BEGIN
        OR NEW.updated_at_unix_ms < OLD.updated_at_unix_ms
        OR NOT (
             (OLD.binding IS NULL AND OLD.mode = 'closed'
-                AND OLD.revision = 1 AND NEW.mode = 'open'
+                AND OLD.revision = 1
+                AND NEW.mode IN ('qualification', 'open')
                 AND NEW.binding IS NOT NULL) OR
-            (OLD.binding IS NOT NULL AND NEW.binding = OLD.binding
+            (OLD.mode = 'closed' AND OLD.binding_kind = 'qualification'
+                AND NEW.mode IN ('qualification', 'open')
+                AND NEW.binding IS NOT NULL) OR
+            (OLD.mode = 'closed' AND OLD.binding_kind = 'open'
+                AND NEW.mode = 'open' AND NEW.binding = OLD.binding
                 AND NEW.binding_sha256 = OLD.binding_sha256
-                AND NEW.reset_id = OLD.reset_id
-                AND NEW.deployment_id = OLD.deployment_id
-                AND NEW.release_id = OLD.release_id
-                AND NEW.source_commit_sha = OLD.source_commit_sha
-                AND NEW.control_schema_version = OLD.control_schema_version
-                AND NEW.source_manifest_sha256 = OLD.source_manifest_sha256
-                AND NEW.source_bundle_sha256 = OLD.source_bundle_sha256
-                AND NEW.release_manifest_sha256 = OLD.release_manifest_sha256
-                AND NEW.qualification_manifest_sha256 =
-                    OLD.qualification_manifest_sha256
-                AND NEW.qualification_catalog_sha256 =
-                    OLD.qualification_catalog_sha256
-                AND NEW.proof_set_sha256 = OLD.proof_set_sha256
-                AND NEW.fresh_targets_sha256 = OLD.fresh_targets_sha256
-                AND NEW.reset_complete_receipt_sha256 = OLD.reset_complete_receipt_sha256
-                AND NEW.fleet_closed_receipt_sha256 = OLD.fleet_closed_receipt_sha256
-                AND NEW.route_v2_rotation_qualification_receipt_sha256 =
-                    OLD.route_v2_rotation_qualification_receipt_sha256
-                AND NEW.route_v2_rotation_qualification_node_ack_sets_sha256 =
-                    OLD.route_v2_rotation_qualification_node_ack_sets_sha256
-                AND NEW.route_v2_rotation_qualification_transcript_sha256 =
-                    OLD.route_v2_rotation_qualification_transcript_sha256
-                AND NEW.usage_terminal_receipt_sha256 =
-                    OLD.usage_terminal_receipt_sha256
-                AND NEW.old_host_coverage_sha256 = OLD.old_host_coverage_sha256
-                AND NEW.kernel_nbd_qualification_bundle_sha256 =
-                    OLD.kernel_nbd_qualification_bundle_sha256
-                AND NEW.vhost_user_qualification_bundle_sha256 =
-                    OLD.vhost_user_qualification_bundle_sha256)
+                AND NEW.binding_kind = OLD.binding_kind) OR
+            (OLD.mode IN ('qualification', 'open') AND NEW.mode = 'closed'
+                AND NEW.binding = OLD.binding
+                AND NEW.binding_sha256 = OLD.binding_sha256
+                AND NEW.binding_kind = OLD.binding_kind)
        ) THEN
         RAISE EXCEPTION 'production mutation admission pointer is not an exact successor';
     END IF;

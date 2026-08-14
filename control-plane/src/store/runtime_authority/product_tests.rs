@@ -175,6 +175,7 @@ fn stores() -> (String, Store, Store, Id) {
     let first = Store::connect(&url, None).unwrap();
     let second = Store::connect(&url, None).unwrap();
     let workspace = bootstrap_workspace(&first, "f2a");
+    crate::testsupport::begin_production_qualification_for_product_test(&first, &workspace);
     (url, first, second, workspace)
 }
 
@@ -1794,6 +1795,7 @@ fn a2_persistent_disk_delete_is_workspace_hidden_atomic_and_exactly_replayable()
         "a2-disk-delete-foreign",
         "delete_a2_hidden",
     );
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &foreign);
     let hidden_error = begin_disk_delete(&store, &hidden).unwrap_err();
     assert_eq!(hidden_error.code, ErrorCode::NotFound);
     store
@@ -1813,6 +1815,7 @@ fn a2_persistent_disk_delete_is_workspace_hidden_atomic_and_exactly_replayable()
         "a2-disk-delete",
         "delete_a2_persistent",
     );
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let first = begin_disk_delete(&store, &request).unwrap();
     assert_eq!(first.http_status, 202);
     assert_eq!(begin_disk_delete(&store, &request).unwrap(), first);
@@ -2222,6 +2225,7 @@ fn a2_cat_and_endpoint_cross_workspace_misses_persist_nothing() {
         ProductMutation::Lifecycle(CatLifecycleAction::Stop),
     )
     .unwrap();
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &caller_workspace);
     assert!(matches!(
         runtime.block_on(service.mutate(cat_ingress)),
         Err(ProductMutationServiceError::Request(ref error))
@@ -5473,24 +5477,42 @@ fn idempotency_scope_isolated_by_workspace_and_canonical_route() {
     .unwrap();
 
     assert_eq!(
-        store
-            .create_cat_covered_without_admission_for_product_test(&first)
-            .unwrap()
-            .http_status,
+        {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                &store,
+                &first_workspace,
+            );
+            store
+                .create_cat_covered_without_admission_for_product_test(&first)
+                .unwrap()
+                .http_status
+        },
         202
     );
     assert_eq!(
-        store
-            .create_cat_covered_without_admission_for_product_test(&second)
-            .unwrap()
-            .http_status,
+        {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                &store,
+                &second_workspace,
+            );
+            store
+                .create_cat_covered_without_admission_for_product_test(&second)
+                .unwrap()
+                .http_status
+        },
         202
     );
     assert_eq!(
-        store
-            .create_cat_covered_without_admission_for_product_test(&third)
-            .unwrap()
-            .http_status,
+        {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                &store,
+                &first_workspace,
+            );
+            store
+                .create_cat_covered_without_admission_for_product_test(&third)
+                .unwrap()
+                .http_status
+        },
         202
     );
     assert_eq!(counts(&store), [3, 3, 3, 3, 3, 3, 3, 3]);
@@ -5722,6 +5744,10 @@ fn hostname_is_globally_unique_within_and_across_workspaces() {
     let cross_workspace = request(&other_workspace, "same-workspace", 2, "cross-workspace-key");
 
     for candidate in [&same_workspace, &cross_workspace] {
+        crate::testsupport::begin_production_qualification_for_product_test(
+            &store,
+            &candidate.idempotency.authenticated_workspace_id,
+        );
         assert!(matches!(
             store
                 .create_cat_covered_without_admission_for_product_test(candidate)
@@ -6959,6 +6985,7 @@ fn runtime_operation_exact_get_rejects_duplicates_but_ignores_foreign_and_missin
         3,
         "operation-foreign",
     );
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &foreign_workspace);
     store
         .create_cat_covered_without_admission_for_product_test(&foreign)
         .unwrap();
@@ -7529,6 +7556,7 @@ async fn cancelling_started_create_finishes_physical_transaction_and_replays() {
     );
     let second = Arc::new(Store::connect(&url, None).unwrap());
     let workspace = bootstrap_workspace(&first, "cancel");
+    crate::testsupport::begin_production_qualification_for_product_test(&first, &workspace);
     let create = request(&workspace, "demo", 1, "cancel-key");
 
     let blocker_url = url.clone();

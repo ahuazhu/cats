@@ -50,6 +50,7 @@ MAX_TRUST_BYTES = 65_536
 MAX_BINDING_BYTES = 65_536
 MAX_KEY_BYTES = 16_384
 MAX_COMMAND_LIFETIME_MS = 5 * 60 * 1_000
+MAX_QUALIFICATION_LIFETIME_MS = 24 * 60 * 60 * 1_000
 DEFAULT_COMMAND_LIFETIME_MS = 4 * 60 * 1_000
 DEFAULT_RESOLUTION_SECONDS = 120
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
@@ -60,7 +61,7 @@ ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 
-BINDING_FIELDS = {
+OPEN_BINDING_FIELDS = {
     "reset_id",
     "deployment_id",
     "release_id",
@@ -83,6 +84,35 @@ BINDING_FIELDS = {
     "kernel_nbd_qualification_bundle_sha256",
     "vhost_user_qualification_bundle_sha256",
 }
+QUALIFICATION_BINDING_FIELDS = {
+    "qualification_id",
+    "deployment_id",
+    "release_id",
+    "source_commit_sha",
+    "control_schema_version",
+    "source_manifest_sha256",
+    "source_bundle_sha256",
+    "build_receipt_sha256",
+    "release_manifest_sha256",
+    "worker_bundle_sha256",
+    "qualification_catalog_sha256",
+    "qualification_cell_manifest_sha256",
+    "aws_partition",
+    "aws_account_id",
+    "aws_region",
+    "cell_id",
+    "cell_namespace",
+    "cats_account_id",
+    "workspace_id",
+    "allowed_mutation_classes",
+    "qualification_expires_at_unix_ms",
+}
+QUALIFICATION_MUTATION_CLASSES = [
+    "cat_create",
+    "disk_create",
+    "disk_delete",
+    "runtime_mutation",
+]
 
 
 class AdmissionError(RuntimeError):
@@ -300,14 +330,14 @@ def validate_origin(value: str) -> str:
     return canonical
 
 
-def validate_binding(value: Any) -> dict[str, Any]:
-    binding = require_fields(value, BINDING_FIELDS, "admission binding")
+def validate_open_binding(value: Any) -> dict[str, Any]:
+    binding = require_fields(value, OPEN_BINDING_FIELDS, "Open admission binding")
     for field in ("reset_id", "deployment_id", "release_id"):
         require_string(binding[field], ID, f"binding.{field}")
     require_string(binding["source_commit_sha"], COMMIT, "binding.source_commit_sha")
     if binding["control_schema_version"] != 16:
         raise AdmissionError("binding.control_schema_version must be 16")
-    for field in BINDING_FIELDS - {
+    for field in OPEN_BINDING_FIELDS - {
         "reset_id",
         "deployment_id",
         "release_id",
@@ -316,6 +346,75 @@ def validate_binding(value: Any) -> dict[str, Any]:
     }:
         require_string(binding[field], SHA256, f"binding.{field}")
     return binding
+
+
+def validate_qualification_binding(value: Any) -> dict[str, Any]:
+    binding = require_fields(
+        value, QUALIFICATION_BINDING_FIELDS, "Qualification admission binding"
+    )
+    for field in (
+        "qualification_id",
+        "deployment_id",
+        "release_id",
+        "cell_id",
+        "cats_account_id",
+        "workspace_id",
+    ):
+        require_string(binding[field], ID, f"qualification binding.{field}")
+    require_string(
+        binding["source_commit_sha"], COMMIT, "qualification binding.source_commit_sha"
+    )
+    if binding["control_schema_version"] != 16:
+        raise AdmissionError("qualification binding.control_schema_version must be 16")
+    for field in (
+        "source_manifest_sha256",
+        "source_bundle_sha256",
+        "build_receipt_sha256",
+        "release_manifest_sha256",
+        "worker_bundle_sha256",
+        "qualification_catalog_sha256",
+        "qualification_cell_manifest_sha256",
+    ):
+        require_string(binding[field], SHA256, f"qualification binding.{field}")
+    if binding["aws_partition"] not in {"aws", "aws-us-gov", "aws-cn"}:
+        raise AdmissionError("qualification binding AWS partition is invalid")
+    require_string(
+        binding["aws_account_id"], ACCOUNT_ID, "qualification binding.aws_account_id"
+    )
+    if (
+        not isinstance(binding["aws_region"], str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}[a-z0-9]", binding["aws_region"])
+        is None
+        or "-" not in binding["aws_region"]
+    ):
+        raise AdmissionError("qualification binding AWS region is invalid")
+    if (
+        not isinstance(binding["cell_namespace"], str)
+        or re.fullmatch(
+            r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", binding["cell_namespace"]
+        )
+        is None
+    ):
+        raise AdmissionError("qualification binding cell namespace is invalid")
+    if binding["allowed_mutation_classes"] != QUALIFICATION_MUTATION_CLASSES:
+        raise AdmissionError(
+            "qualification binding must carry the exact sorted mutation-class closed set"
+        )
+    expires = binding["qualification_expires_at_unix_ms"]
+    if not isinstance(expires, int) or isinstance(expires, bool) or expires <= 0:
+        raise AdmissionError("qualification binding expiry is invalid")
+    return binding
+
+
+def validate_state_binding(value: Any) -> dict[str, Any]:
+    state_binding = require_fields(value, {"kind", "binding"}, "state binding")
+    if state_binding["kind"] == "qualification":
+        validate_qualification_binding(state_binding["binding"])
+    elif state_binding["kind"] == "open":
+        validate_open_binding(state_binding["binding"])
+    else:
+        raise AdmissionError("state binding kind is invalid")
+    return state_binding
 
 
 def validate_trust(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -551,14 +650,47 @@ def validate_command(value: Any) -> dict[str, Any]:
         "command operator",
     )
     mutation = require_fields(command["mutation"], {"kind", "binding"}, "command mutation")
-    if mutation["kind"] not in {"open", "emergency_close"}:
+    if mutation["kind"] == "begin_qualification":
+        binding = validate_qualification_binding(mutation["binding"])
+        qualification_expiry = binding["qualification_expires_at_unix_ms"]
+        if (
+            qualification_expiry <= expires
+            or qualification_expiry - issued > MAX_QUALIFICATION_LIFETIME_MS
+        ):
+            raise AdmissionError("Qualification lifetime is outside its closed DB window")
+    elif mutation["kind"] == "end_qualification":
+        validate_qualification_binding(mutation["binding"])
+    elif mutation["kind"] == "open":
+        validate_open_binding(mutation["binding"])
+    elif mutation["kind"] == "emergency_close":
+        validate_state_binding(mutation["binding"])
+    else:
         raise AdmissionError("unsupported admission mutation")
-    validate_binding(mutation["binding"])
     return command
+
+
+def command_plain_binding(command: dict[str, Any]) -> dict[str, Any]:
+    mutation = command["mutation"]
+    if mutation["kind"] == "emergency_close":
+        return mutation["binding"]["binding"]
+    return mutation["binding"]
+
+
+def command_state_binding(command: dict[str, Any]) -> dict[str, Any]:
+    mutation = command["mutation"]
+    if mutation["kind"] == "emergency_close":
+        return mutation["binding"]
+    kind = "qualification" if mutation["kind"] in {
+        "begin_qualification",
+        "end_qualification",
+    } else "open"
+    return {"kind": kind, "binding": mutation["binding"]}
 
 
 def prepare(args: argparse.Namespace) -> tuple[Path, str]:
     validate_private_directory(args.state_directory)
+    if args.mutation != "emergency_close" and args.binding_kind is not None:
+        raise AdmissionError("--binding-kind is valid only for emergency_close")
     origin = validate_origin(args.origin)
     trust_bytes = read_stable_file(args.trust_file, "cutover trust", MAX_TRUST_BYTES, private=False)
     trust_value = decode_json(trust_bytes, "cutover trust")
@@ -568,7 +700,18 @@ def prepare(args: argparse.Namespace) -> tuple[Path, str]:
     binding_bytes = read_stable_file(
         args.binding_file, "admission binding", MAX_BINDING_BYTES, private=False
     )
-    binding = validate_binding(decode_json(binding_bytes, "admission binding"))
+    decoded_binding = decode_json(binding_bytes, "admission binding")
+    if args.mutation in {"begin_qualification", "end_qualification"}:
+        binding = validate_qualification_binding(decoded_binding)
+    elif args.mutation == "open":
+        binding = validate_open_binding(decoded_binding)
+    else:
+        if args.binding_kind == "qualification":
+            binding = validate_qualification_binding(decoded_binding)
+        elif args.binding_kind == "open":
+            binding = validate_open_binding(decoded_binding)
+        else:
+            raise AdmissionError("emergency-close requires an exact --binding-kind")
     if canonical_json(binding, newline=True) != binding_bytes:
         raise AdmissionError("admission binding must be canonical JSON with one terminal LF")
     if (
@@ -584,6 +727,11 @@ def prepare(args: argparse.Namespace) -> tuple[Path, str]:
     lifetime = args.command_lifetime_seconds * 1_000
     if lifetime <= 0 or lifetime > MAX_COMMAND_LIFETIME_MS:
         raise AdmissionError("command lifetime exceeds the closed five-minute limit")
+    wire_binding = (
+        {"kind": args.binding_kind, "binding": binding}
+        if args.mutation == "emergency_close"
+        else binding
+    )
     command = {
         "version": 1,
         "command_id": command_id,
@@ -591,7 +739,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, str]:
         "expires_at_unix_ms": issued + lifetime,
         "operator": operator,
         "expected_revision": args.expected_revision,
-        "mutation": {"kind": args.mutation, "binding": binding},
+        "mutation": {"kind": args.mutation, "binding": wire_binding},
     }
     validate_command(command)
     body = canonical_json(command)
@@ -674,9 +822,9 @@ def load_pending(path: Path, trust_path: Path) -> tuple[dict[str, Any], bytes, d
     if canonical_json(command) != body or sha256(body) != pending["request_sha256"]:
         raise AdmissionError("pending command body is not its exact canonical request")
     if (
-        command["mutation"]["binding"]["deployment_id"] != trust["deployment_id"]
-        or command["mutation"]["binding"]["release_id"] != trust["release_id"]
-        or command["mutation"]["binding"]["source_commit_sha"] != trust["source_commit_sha"]
+        command_plain_binding(command)["deployment_id"] != trust["deployment_id"]
+        or command_plain_binding(command)["release_id"] != trust["release_id"]
+        or command_plain_binding(command)["source_commit_sha"] != trust["source_commit_sha"]
         or command["operator"]["aws_partition"] != credential["scope"]["aws_partition"]
         or command["operator"]["account_id"] != credential["scope"]["account_id"]
         or command["operator"]["role_arn"] != credential["scope"]["role_arn"]
@@ -772,12 +920,17 @@ def validate_receipt(
     if outcome["kind"] == "applied":
         require_fields(outcome, {"kind", "state"}, "applied admission outcome")
         state = validate_state(outcome["state"])
-        expected_mode = "open" if command["mutation"]["kind"] == "open" else "closed"
+        expected_mode = {
+            "begin_qualification": "qualification",
+            "end_qualification": "closed",
+            "open": "open",
+            "emergency_close": "closed",
+        }[command["mutation"]["kind"]]
         if (
             state["mode"] != expected_mode
             or state["revision"] != command["expected_revision"] + 1
             or state["last_command_id"] != command["command_id"]
-            or state["binding"] != command["mutation"]["binding"]
+            or state["binding"] != command_state_binding(command)
             or state["updated_at_unix_ms"] != receipt["committed_at_unix_ms"]
         ):
             raise AdmissionError("applied admission receipt has a mismatched successor")
@@ -801,14 +954,18 @@ def validate_state(value: Any) -> dict[str, Any]:
         or not isinstance(state["revision"], int)
         or isinstance(state["revision"], bool)
         or state["revision"] <= 0
-        or state["mode"] not in {"closed", "open"}
+        or state["mode"] not in {"closed", "qualification", "open"}
     ):
         raise AdmissionError("admission state scalar fields are invalid")
     if state["binding"] is None:
         if state["mode"] != "closed" or state["revision"] != 1 or state["last_command_id"] is not None:
             raise AdmissionError("unbound admission state is not initial Closed")
     else:
-        validate_binding(state["binding"])
+        state_binding = validate_state_binding(state["binding"])
+        if state["mode"] == "qualification" and state_binding["kind"] != "qualification":
+            raise AdmissionError("Qualification state does not carry a Qualification binding")
+        if state["mode"] == "open" and state_binding["kind"] != "open":
+            raise AdmissionError("Open state does not carry an Open binding")
         require_string(state["last_command_id"], RANDOM_ID, "state.last_command_id")
     return state
 
@@ -903,7 +1060,21 @@ def parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--binding-file", required=True, type=Path)
     prepare_parser.add_argument("--state-directory", required=True, type=Path)
     prepare_parser.add_argument("--expected-revision", required=True, type=int)
-    prepare_parser.add_argument("--mutation", choices=("open", "emergency_close"), required=True)
+    prepare_parser.add_argument(
+        "--mutation",
+        choices=(
+            "begin_qualification",
+            "end_qualification",
+            "open",
+            "emergency_close",
+        ),
+        required=True,
+    )
+    prepare_parser.add_argument(
+        "--binding-kind",
+        choices=("qualification", "open"),
+        help="required only for emergency_close because its binding is the installed sum variant",
+    )
     prepare_parser.add_argument("--command-id")
     prepare_parser.add_argument(
         "--command-lifetime-seconds",

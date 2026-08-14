@@ -8,6 +8,7 @@
   [ADR-0042](0042-volume-authority-and-disk-lifecycle.md)、
   [ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)、
   [ADR-0044](0044-independent-route-v2-signing-authority.md)
+- 后续闭合：[ADR-0052](0052-bounded-production-qualification-admission.md)
 - 规格：[Production reset and final-open authority v1](../specs/production-reset-open-authority-v1.md)
 
 ## 背景

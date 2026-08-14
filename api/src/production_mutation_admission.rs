@@ -33,6 +33,22 @@ pub const PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER: &str = "cats-production-cutov
 pub const PRODUCTION_CUTOVER_SIGNATURE_HEADER: &str = "cats-production-cutover-signature";
 pub const PRODUCTION_CUTOVER_COMMAND_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 pub const PRODUCTION_CUTOVER_CLOCK_SKEW_MS: u64 = 30 * 1_000;
+pub const PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_FILE: &str =
+    "production-mutation-qualification-begin.receipt.json";
+pub const PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_KIND: &str =
+    "cats.production-mutation-qualification-begin-receipt.v1";
+pub const PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_FILE: &str =
+    "production-mutation-qualification-terminal.receipt.json";
+pub const PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND: &str =
+    "cats.production-mutation-qualification-terminal-receipt.v1";
+
+pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 4] = [
+    ProductionQualificationMutationClass::CatCreate,
+    ProductionQualificationMutationClass::DiskCreate,
+    ProductionQualificationMutationClass::DiskDelete,
+    ProductionQualificationMutationClass::RuntimeMutation,
+];
 
 const SIGNATURE_DOMAIN: &[u8] = b"cats.production-mutation-admission.command.v1";
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -118,7 +134,7 @@ pub struct ProductionCutoverOperatorPrincipal {
 /// from every admitted product write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProductionMutationAdmissionBinding {
+pub struct ProductionMutationOpenBinding {
     pub reset_id: Id,
     pub deployment_id: Id,
     pub release_id: Id,
@@ -142,11 +158,98 @@ pub struct ProductionMutationAdmissionBinding {
     pub vhost_user_qualification_bundle_sha256: Sha256Digest,
 }
 
+/// Exact ADR-0038 cell scope admitted only long enough to produce release
+/// qualification evidence.  It intentionally cannot carry any final-reset
+/// proof: a qualification cell must be able to qualify the same default-
+/// Closed build whose terminal receipts are later consumed by `Open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionQualificationAdmissionBinding {
+    pub qualification_id: Id,
+    pub deployment_id: Id,
+    pub release_id: Id,
+    pub source_commit_sha: String,
+    pub control_schema_version: WireU64,
+    pub source_manifest_sha256: Sha256Digest,
+    pub source_bundle_sha256: Sha256Digest,
+    pub build_receipt_sha256: Sha256Digest,
+    pub release_manifest_sha256: Sha256Digest,
+    pub worker_bundle_sha256: Sha256Digest,
+    pub qualification_catalog_sha256: Sha256Digest,
+    pub qualification_cell_manifest_sha256: Sha256Digest,
+    pub aws_partition: ProductionCutoverAwsPartition,
+    pub aws_account_id: String,
+    pub aws_region: String,
+    pub cell_id: Id,
+    pub cell_namespace: String,
+    pub cats_account_id: Id,
+    pub workspace_id: Id,
+    pub allowed_mutation_classes: Vec<ProductionQualificationMutationClass>,
+    pub qualification_expires_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionQualificationMutationClass {
+    CatCreate,
+    DiskCreate,
+    DiskDelete,
+    RuntimeMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "binding",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ProductionMutationAdmissionBinding {
+    Qualification(ProductionQualificationAdmissionBinding),
+    Open(ProductionMutationOpenBinding),
+}
+
+impl ProductionMutationAdmissionBinding {
+    pub fn deployment_id(&self) -> &Id {
+        match self {
+            Self::Qualification(binding) => &binding.deployment_id,
+            Self::Open(binding) => &binding.deployment_id,
+        }
+    }
+
+    pub fn release_id(&self) -> &Id {
+        match self {
+            Self::Qualification(binding) => &binding.release_id,
+            Self::Open(binding) => &binding.release_id,
+        }
+    }
+
+    pub fn source_commit_sha(&self) -> &str {
+        match self {
+            Self::Qualification(binding) => &binding.source_commit_sha,
+            Self::Open(binding) => &binding.source_commit_sha,
+        }
+    }
+
+    pub fn control_schema_version(&self) -> WireU64 {
+        match self {
+            Self::Qualification(binding) => binding.control_schema_version,
+            Self::Open(binding) => binding.control_schema_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProductionMutationAdmissionMutation {
+    BeginQualification {
+        binding: ProductionQualificationAdmissionBinding,
+    },
+    EndQualification {
+        binding: ProductionQualificationAdmissionBinding,
+    },
     Open {
-        binding: ProductionMutationAdmissionBinding,
+        binding: ProductionMutationOpenBinding,
     },
     EmergencyClose {
         binding: ProductionMutationAdmissionBinding,
@@ -154,9 +257,43 @@ pub enum ProductionMutationAdmissionMutation {
 }
 
 impl ProductionMutationAdmissionMutation {
-    pub fn binding(&self) -> &ProductionMutationAdmissionBinding {
+    pub fn state_binding(&self) -> ProductionMutationAdmissionBinding {
         match self {
-            Self::Open { binding } | Self::EmergencyClose { binding } => binding,
+            Self::BeginQualification { binding } | Self::EndQualification { binding } => {
+                ProductionMutationAdmissionBinding::Qualification(binding.clone())
+            }
+            Self::Open { binding } => ProductionMutationAdmissionBinding::Open(binding.clone()),
+            Self::EmergencyClose { binding } => binding.clone(),
+        }
+    }
+
+    pub fn deployment_id(&self) -> &Id {
+        match self {
+            Self::BeginQualification { binding } | Self::EndQualification { binding } => {
+                &binding.deployment_id
+            }
+            Self::Open { binding } => &binding.deployment_id,
+            Self::EmergencyClose { binding } => binding.deployment_id(),
+        }
+    }
+
+    pub fn release_id(&self) -> &Id {
+        match self {
+            Self::BeginQualification { binding } | Self::EndQualification { binding } => {
+                &binding.release_id
+            }
+            Self::Open { binding } => &binding.release_id,
+            Self::EmergencyClose { binding } => binding.release_id(),
+        }
+    }
+
+    pub fn source_commit_sha(&self) -> &str {
+        match self {
+            Self::BeginQualification { binding } | Self::EndQualification { binding } => {
+                &binding.source_commit_sha
+            }
+            Self::Open { binding } => &binding.source_commit_sha,
+            Self::EmergencyClose { binding } => binding.source_commit_sha(),
         }
     }
 }
@@ -177,6 +314,7 @@ pub struct ProductionMutationAdmissionCommand {
 #[serde(rename_all = "snake_case")]
 pub enum ProductionMutationAdmissionMode {
     Closed,
+    Qualification,
     Open,
 }
 
@@ -209,6 +347,55 @@ pub struct ProductionMutationAdmissionCommandReceipt {
     pub principal: ProductionCutoverOperatorPrincipal,
     pub outcome: ProductionMutationAdmissionStoredOutcome,
     pub committed_at_unix_ms: UnixMillis,
+}
+
+/// Framework receipt published only after the official BeginQualification
+/// command is durably discoverable.  The receipt does not hash the eventual
+/// qualification manifest, which would make the manifest closed set
+/// recursive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionQualificationBeginReceipt {
+    pub kind: String,
+    pub version: ContractVersion,
+    pub qualification_id: Id,
+    pub binding_sha256: Sha256Digest,
+    pub begin_command_id: RandomId128,
+    pub begin_request_sha256: Sha256Digest,
+    pub begin_command_receipt_sha256: Sha256Digest,
+    pub resulting_revision: Epoch,
+    pub qualification_expires_at_unix_ms: UnixMillis,
+}
+
+/// Terminal framework receipt for one successful qualification run.
+///
+/// EndQualification takes the singleton `FOR UPDATE`, so the final Closed
+/// revision is ordered after every admitted cleanup mutation.  The producer
+/// must then obtain the two canonical read-only receipts named here.  E9
+/// terminalization deliberately follows this boundary and is consumed later
+/// by the final Open proof rather than by this receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionQualificationTerminalReceipt {
+    pub kind: String,
+    pub version: ContractVersion,
+    pub qualification_id: Id,
+    pub binding_sha256: Sha256Digest,
+    pub begin_command_id: RandomId128,
+    pub begin_request_sha256: Sha256Digest,
+    pub begin_command_receipt_sha256: Sha256Digest,
+    pub begin_resulting_revision: Epoch,
+    pub end_command_id: RandomId128,
+    pub end_request_sha256: Sha256Digest,
+    pub end_command_receipt_sha256: Sha256Digest,
+    pub final_admission_state_sha256: Sha256Digest,
+    pub final_closed_revision: Epoch,
+    pub fleet_closed_receipt_sha256: Sha256Digest,
+    pub cleanup_inventory_receipt_sha256: Sha256Digest,
+    pub active_guard_count: WireU64,
+    pub product_resource_count: WireU64,
+    pub residue_count: WireU64,
+    pub completed_at_unix_ms: UnixMillis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -255,9 +442,9 @@ pub fn sign_production_mutation_admission_command(
         .ok_or(ProductionMutationAdmissionContractError::Invalid)?;
     let command = decode_production_mutation_admission_command(exact_body)?;
     if !sts_matches_scope(&command.operator, &credential.scope)
-        || command.mutation.binding().deployment_id != trust.deployment_id
-        || command.mutation.binding().release_id != trust.release_id
-        || command.mutation.binding().source_commit_sha != trust.source_commit_sha
+        || command.mutation.deployment_id() != &trust.deployment_id
+        || command.mutation.release_id() != &trust.release_id
+        || command.mutation.source_commit_sha() != trust.source_commit_sha
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
@@ -329,11 +516,10 @@ fn verify_production_mutation_admission_command_inner(
         .iter()
         .find(|credential| credential.credential_id.as_str() == credential_id)
         .ok_or(ProductionMutationAdmissionContractError::Invalid)?;
-    let binding = command.mutation.binding();
     if !sts_matches_scope(&command.operator, &credential.scope)
-        || binding.deployment_id != trust.deployment_id
-        || binding.release_id != trust.release_id
-        || binding.source_commit_sha != trust.source_commit_sha
+        || command.mutation.deployment_id() != &trust.deployment_id
+        || command.mutation.release_id() != &trust.release_id
+        || command.mutation.source_commit_sha() != trust.source_commit_sha
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
@@ -417,6 +603,38 @@ pub fn encode_production_mutation_admission_command_receipt(
     )
 }
 
+pub fn decode_production_qualification_begin_receipt(
+    body: &[u8],
+) -> Result<ProductionQualificationBeginReceipt, ProductionMutationAdmissionContractError> {
+    decode_canonical(body, validate_qualification_begin_receipt)
+}
+
+pub fn encode_production_qualification_begin_receipt(
+    receipt: &ProductionQualificationBeginReceipt,
+) -> Result<Vec<u8>, ProductionMutationAdmissionContractError> {
+    validate_qualification_begin_receipt(receipt)?;
+    encode_canonical(
+        receipt,
+        PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
+    )
+}
+
+pub fn decode_production_qualification_terminal_receipt(
+    body: &[u8],
+) -> Result<ProductionQualificationTerminalReceipt, ProductionMutationAdmissionContractError> {
+    decode_canonical(body, validate_qualification_terminal_receipt)
+}
+
+pub fn encode_production_qualification_terminal_receipt(
+    receipt: &ProductionQualificationTerminalReceipt,
+) -> Result<Vec<u8>, ProductionMutationAdmissionContractError> {
+    validate_qualification_terminal_receipt(receipt)?;
+    encode_canonical(
+        receipt,
+        PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
+    )
+}
+
 pub fn production_mutation_admission_command_sha256(
     command: &ProductionMutationAdmissionCommand,
 ) -> Result<Sha256Digest, ProductionMutationAdmissionContractError> {
@@ -428,7 +646,7 @@ pub fn production_mutation_admission_command_sha256(
 pub fn production_mutation_admission_binding_sha256(
     binding: &ProductionMutationAdmissionBinding,
 ) -> Result<Sha256Digest, ProductionMutationAdmissionContractError> {
-    validate_binding(binding)?;
+    validate_state_binding(binding)?;
     Ok(Sha256Digest::from_bytes(
         sha2::Sha256::digest(encode_canonical(
             binding,
@@ -490,7 +708,28 @@ fn validate_command(
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
-    validate_binding(command.mutation.binding())
+    match &command.mutation {
+        ProductionMutationAdmissionMutation::BeginQualification { binding } => {
+            validate_qualification_binding(binding)?;
+            if binding.qualification_expires_at_unix_ms <= command.expires_at_unix_ms
+                || binding
+                    .qualification_expires_at_unix_ms
+                    .get()
+                    .saturating_sub(command.issued_at_unix_ms.get())
+                    > PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS
+            {
+                return Err(ProductionMutationAdmissionContractError::Invalid);
+            }
+            Ok(())
+        }
+        ProductionMutationAdmissionMutation::EndQualification { binding } => {
+            validate_qualification_binding(binding)
+        }
+        ProductionMutationAdmissionMutation::Open { binding } => validate_open_binding(binding),
+        ProductionMutationAdmissionMutation::EmergencyClose { binding } => {
+            validate_state_binding(binding)
+        }
+    }
 }
 
 fn validate_trust_bundle(
@@ -589,8 +828,8 @@ fn decode_base64url_exact<const N: usize>(
         .map_err(|_| ProductionMutationAdmissionContractError::Invalid)
 }
 
-fn validate_binding(
-    binding: &ProductionMutationAdmissionBinding,
+fn validate_open_binding(
+    binding: &ProductionMutationOpenBinding,
 ) -> Result<(), ProductionMutationAdmissionContractError> {
     if binding.control_schema_version.get() != PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION
         || binding.source_commit_sha.len() != 40
@@ -604,6 +843,94 @@ fn validate_binding(
     Ok(())
 }
 
+fn validate_qualification_binding(
+    binding: &ProductionQualificationAdmissionBinding,
+) -> Result<(), ProductionMutationAdmissionContractError> {
+    if binding.control_schema_version.get() != PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION
+        || !valid_source_commit(&binding.source_commit_sha)
+        || !valid_account_id(&binding.aws_account_id)
+        || !valid_aws_region(&binding.aws_region)
+        || !valid_dns_label(&binding.cell_namespace)
+        || binding.allowed_mutation_classes.as_slice()
+            != PRODUCTION_QUALIFICATION_MUTATION_CLASSES.as_slice()
+    {
+        return Err(ProductionMutationAdmissionContractError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_qualification_begin_receipt(
+    receipt: &ProductionQualificationBeginReceipt,
+) -> Result<(), ProductionMutationAdmissionContractError> {
+    if receipt.kind != PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_KIND
+        || receipt.version != ContractVersion::V1
+    {
+        return Err(ProductionMutationAdmissionContractError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_qualification_terminal_receipt(
+    receipt: &ProductionQualificationTerminalReceipt,
+) -> Result<(), ProductionMutationAdmissionContractError> {
+    if receipt.kind != PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND
+        || receipt.version != ContractVersion::V1
+        || receipt.begin_command_id == receipt.end_command_id
+        || receipt.begin_resulting_revision.get().checked_add(1)
+            != Some(receipt.final_closed_revision.get())
+        || receipt.active_guard_count.get() != 0
+        || receipt.product_resource_count.get() != 0
+        || receipt.residue_count.get() != 0
+        || receipt.completed_at_unix_ms.get() == 0
+    {
+        return Err(ProductionMutationAdmissionContractError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_state_binding(
+    binding: &ProductionMutationAdmissionBinding,
+) -> Result<(), ProductionMutationAdmissionContractError> {
+    match binding {
+        ProductionMutationAdmissionBinding::Qualification(binding) => {
+            validate_qualification_binding(binding)
+        }
+        ProductionMutationAdmissionBinding::Open(binding) => validate_open_binding(binding),
+    }
+}
+
+fn valid_source_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_aws_region(value: &str) -> bool {
+    (3..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value.contains('-')
+}
+
+fn valid_dns_label(value: &str) -> bool {
+    (1..=63).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 fn validate_state(
     state: &ProductionMutationAdmissionState,
 ) -> Result<(), ProductionMutationAdmissionContractError> {
@@ -611,8 +938,17 @@ fn validate_state(
         || state
             .binding
             .as_ref()
-            .is_some_and(|binding| validate_binding(binding).is_err())
-        || matches!(state.mode, ProductionMutationAdmissionMode::Open) && state.binding.is_none()
+            .is_some_and(|binding| validate_state_binding(binding).is_err())
+        || matches!(state.mode, ProductionMutationAdmissionMode::Qualification)
+            && !matches!(
+                state.binding.as_ref(),
+                Some(ProductionMutationAdmissionBinding::Qualification(_))
+            )
+        || matches!(state.mode, ProductionMutationAdmissionMode::Open)
+            && !matches!(
+                state.binding.as_ref(),
+                Some(ProductionMutationAdmissionBinding::Open(_))
+            )
         || state.binding.is_none() != state.last_command_id.is_none()
         || state.binding.is_none() && state.revision.get() != 1
     {
@@ -635,13 +971,17 @@ fn validate_receipt(
         validate_state(state)?;
         if state.last_command_id.as_ref() != Some(&receipt.command.command_id)
             || state.updated_at_unix_ms != receipt.committed_at_unix_ms
-            || state.binding.as_ref() != Some(receipt.command.mutation.binding())
+            || state.binding.as_ref() != Some(&receipt.command.mutation.state_binding())
             || match &receipt.command.mutation {
+                ProductionMutationAdmissionMutation::BeginQualification { .. } => {
+                    state.mode != ProductionMutationAdmissionMode::Qualification
+                }
+                ProductionMutationAdmissionMutation::EndQualification { .. }
+                | ProductionMutationAdmissionMutation::EmergencyClose { .. } => {
+                    state.mode != ProductionMutationAdmissionMode::Closed
+                }
                 ProductionMutationAdmissionMutation::Open { .. } => {
                     state.mode != ProductionMutationAdmissionMode::Open
-                }
-                ProductionMutationAdmissionMutation::EmergencyClose { .. } => {
-                    state.mode != ProductionMutationAdmissionMode::Closed
                 }
             }
         {
@@ -659,8 +999,8 @@ mod tests {
         Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
     }
 
-    fn binding() -> ProductionMutationAdmissionBinding {
-        ProductionMutationAdmissionBinding {
+    fn binding() -> ProductionMutationOpenBinding {
+        ProductionMutationOpenBinding {
             reset_id: Id::new("reset_a").unwrap(),
             deployment_id: Id::new("deployment_a").unwrap(),
             release_id: Id::new("release_a").unwrap(),
@@ -682,6 +1022,37 @@ mod tests {
             old_host_coverage_sha256: digest('d'),
             kernel_nbd_qualification_bundle_sha256: digest('e'),
             vhost_user_qualification_bundle_sha256: digest('f'),
+        }
+    }
+
+    fn qualification_binding() -> ProductionQualificationAdmissionBinding {
+        ProductionQualificationAdmissionBinding {
+            qualification_id: Id::new("qualification_a").unwrap(),
+            deployment_id: Id::new("deployment_a").unwrap(),
+            release_id: Id::new("release_a").unwrap(),
+            source_commit_sha: "a".repeat(40),
+            control_schema_version: WireU64::new(16).unwrap(),
+            source_manifest_sha256: digest('0'),
+            source_bundle_sha256: digest('1'),
+            build_receipt_sha256: digest('2'),
+            release_manifest_sha256: digest('3'),
+            worker_bundle_sha256: digest('4'),
+            qualification_catalog_sha256: digest('5'),
+            qualification_cell_manifest_sha256: digest('6'),
+            aws_partition: ProductionCutoverAwsPartition::Aws,
+            aws_account_id: "123456789012".to_owned(),
+            aws_region: "us-east-1".to_owned(),
+            cell_id: Id::new("qualification-cell-a").unwrap(),
+            cell_namespace: "cats-qualification".to_owned(),
+            cats_account_id: Id::new("account_a").unwrap(),
+            workspace_id: Id::new("workspace_a").unwrap(),
+            allowed_mutation_classes: vec![
+                ProductionQualificationMutationClass::CatCreate,
+                ProductionQualificationMutationClass::DiskCreate,
+                ProductionQualificationMutationClass::DiskDelete,
+                ProductionQualificationMutationClass::RuntimeMutation,
+            ],
+            qualification_expires_at_unix_ms: UnixMillis::new(3_600_000).unwrap(),
         }
     }
 
@@ -739,6 +1110,102 @@ mod tests {
         assert_eq!(
             decode_production_mutation_admission_command(&noncanonical),
             Err(ProductionMutationAdmissionContractError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn qualification_is_a_distinct_bounded_binding_not_a_partial_open() {
+        let command = ProductionMutationAdmissionCommand {
+            version: ContractVersion::V1,
+            command_id: RandomId128::new("2".repeat(32)).unwrap(),
+            issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+            expires_at_unix_ms: UnixMillis::new(61_000).unwrap(),
+            operator: operator(),
+            expected_revision: Epoch::new(1).unwrap(),
+            mutation: ProductionMutationAdmissionMutation::BeginQualification {
+                binding: qualification_binding(),
+            },
+        };
+        let encoded = encode_production_mutation_admission_command(&command).unwrap();
+        assert_eq!(
+            decode_production_mutation_admission_command(&encoded).unwrap(),
+            command
+        );
+
+        let mut unsorted = qualification_binding();
+        unsorted.allowed_mutation_classes.swap(0, 1);
+        let invalid = ProductionMutationAdmissionCommand {
+            mutation: ProductionMutationAdmissionMutation::BeginQualification { binding: unsorted },
+            ..command.clone()
+        };
+        assert_eq!(
+            encode_production_mutation_admission_command(&invalid),
+            Err(ProductionMutationAdmissionContractError::Invalid)
+        );
+
+        let mut subset = qualification_binding();
+        subset.allowed_mutation_classes.pop();
+        let invalid = ProductionMutationAdmissionCommand {
+            mutation: ProductionMutationAdmissionMutation::BeginQualification { binding: subset },
+            ..command
+        };
+        assert_eq!(
+            encode_production_mutation_admission_command(&invalid),
+            Err(ProductionMutationAdmissionContractError::Invalid)
+        );
+    }
+
+    #[test]
+    fn qualification_framework_receipts_are_nonrecursive_and_terminal_closed() {
+        let begin = ProductionQualificationBeginReceipt {
+            kind: PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_KIND.to_owned(),
+            version: ContractVersion::V1,
+            qualification_id: Id::new("qualification_a").unwrap(),
+            binding_sha256: digest('0'),
+            begin_command_id: RandomId128::new("1".repeat(32)).unwrap(),
+            begin_request_sha256: digest('1'),
+            begin_command_receipt_sha256: digest('2'),
+            resulting_revision: Epoch::new(2).unwrap(),
+            qualification_expires_at_unix_ms: UnixMillis::new(3_600_000).unwrap(),
+        };
+        let begin_bytes = encode_production_qualification_begin_receipt(&begin).unwrap();
+        assert_eq!(
+            decode_production_qualification_begin_receipt(&begin_bytes).unwrap(),
+            begin
+        );
+
+        let terminal = ProductionQualificationTerminalReceipt {
+            kind: PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND.to_owned(),
+            version: ContractVersion::V1,
+            qualification_id: begin.qualification_id.clone(),
+            binding_sha256: begin.binding_sha256.clone(),
+            begin_command_id: begin.begin_command_id.clone(),
+            begin_request_sha256: begin.begin_request_sha256.clone(),
+            begin_command_receipt_sha256: begin.begin_command_receipt_sha256.clone(),
+            begin_resulting_revision: begin.resulting_revision,
+            end_command_id: RandomId128::new("2".repeat(32)).unwrap(),
+            end_request_sha256: digest('3'),
+            end_command_receipt_sha256: digest('4'),
+            final_admission_state_sha256: digest('5'),
+            final_closed_revision: Epoch::new(3).unwrap(),
+            fleet_closed_receipt_sha256: digest('6'),
+            cleanup_inventory_receipt_sha256: digest('7'),
+            active_guard_count: WireU64::new(0).unwrap(),
+            product_resource_count: WireU64::new(0).unwrap(),
+            residue_count: WireU64::new(0).unwrap(),
+            completed_at_unix_ms: UnixMillis::new(4_000).unwrap(),
+        };
+        let terminal_bytes = encode_production_qualification_terminal_receipt(&terminal).unwrap();
+        assert_eq!(
+            decode_production_qualification_terminal_receipt(&terminal_bytes).unwrap(),
+            terminal
+        );
+
+        let mut nonzero = terminal;
+        nonzero.product_resource_count = WireU64::new(1).unwrap();
+        assert_eq!(
+            encode_production_qualification_terminal_receipt(&nonzero),
+            Err(ProductionMutationAdmissionContractError::Invalid)
         );
     }
 

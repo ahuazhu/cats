@@ -477,6 +477,12 @@ mod tests {
             )
             .unwrap()
         });
+        tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &workspace,
+            );
+        });
         let cat_id = tokio::task::block_in_place(|| {
             crate::store::runtime_authority::product_tests::seed_a2_http_cat(
                 handle.state.store.as_ref(),
@@ -649,6 +655,12 @@ mod tests {
                     .id,
             )
             .unwrap()
+        });
+        tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &workspace,
+            );
         });
         let cat_id = tokio::task::block_in_place(|| {
             crate::store::runtime_authority::product_tests::seed_a2_http_cat(

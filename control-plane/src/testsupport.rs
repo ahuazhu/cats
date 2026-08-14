@@ -227,6 +227,241 @@ pub fn test_production_cutover_operator_trust_bundle(
     }
 }
 
+/// Enter the exact workspace-scoped ADR-0052 Qualification mode through the
+/// same dedicated signature verifier and Store CAS used by production.
+///
+/// This is deliberately an explicit fixture action after Account/Workspace
+/// provisioning. It is neither an automatic schema default nor a Store
+/// bypass, and it cannot construct a final `Open` binding.
+#[cfg(any(test, feature = "test-support"))]
+pub fn begin_production_qualification_for_product_test(
+    store: &crate::store::Store,
+    workspace_id: &cats_api::runtime_reconciliation::Id,
+) -> cats_api::production_mutation_admission::ProductionQualificationAdmissionBinding {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionMutationAdmissionBinding,
+        ProductionMutationAdmissionCommand, ProductionMutationAdmissionMode,
+        ProductionMutationAdmissionMutation, ProductionMutationAdmissionStoredOutcome,
+        ProductionQualificationAdmissionBinding, PRODUCTION_QUALIFICATION_MUTATION_CLASSES,
+    };
+    use cats_api::runtime_reconciliation::{
+        ContractVersion, Epoch, Id, RandomId128, Sha256Digest, UnixMillis, WireU64,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let cats_account_id: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT account_id FROM workspaces WHERE id=$1",
+                    &[&workspace_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .expect("load exact qualification Account/Workspace scope");
+    let mut state = store
+        .production_mutation_admission_state()
+        .expect("discover default-Closed qualification admission state");
+    if state.mode == ProductionMutationAdmissionMode::Qualification {
+        let ProductionMutationAdmissionBinding::Qualification(installed) = state
+            .binding
+            .as_ref()
+            .expect("Qualification mode has a binding")
+        else {
+            panic!("Qualification mode did not carry a Qualification binding")
+        };
+        if &installed.workspace_id == workspace_id {
+            return installed.clone();
+        }
+        end_production_qualification_for_product_test(store);
+        state = store
+            .production_mutation_admission_state()
+            .expect("discover Closed state after test Qualification End");
+    }
+    assert_eq!(state.mode, ProductionMutationAdmissionMode::Closed);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("test time fits u64");
+    let digest = |byte: char| {
+        Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64)))
+            .expect("test digest is valid")
+    };
+    let binding = ProductionQualificationAdmissionBinding {
+        qualification_id: Id::new(format!("qualification_{workspace_id}"))
+            .expect("valid test qualification ID"),
+        deployment_id: Id::new("deployment_a").expect("valid test deployment ID"),
+        release_id: Id::new("release_a").expect("valid test release ID"),
+        source_commit_sha: "a".repeat(40),
+        control_schema_version: WireU64::new(16).expect("valid schema version"),
+        source_manifest_sha256: digest('0'),
+        source_bundle_sha256: digest('1'),
+        build_receipt_sha256: digest('2'),
+        release_manifest_sha256: digest('3'),
+        worker_bundle_sha256: digest('4'),
+        qualification_catalog_sha256: digest('5'),
+        qualification_cell_manifest_sha256: digest('6'),
+        aws_partition: ProductionCutoverAwsPartition::Aws,
+        aws_account_id: "123456789012".to_owned(),
+        aws_region: "us-east-1".to_owned(),
+        cell_id: Id::new("test-cell-a").expect("valid test cell ID"),
+        cell_namespace: "cats-qualification".to_owned(),
+        cats_account_id: Id::new(cats_account_id).expect("valid Cats account ID"),
+        workspace_id: workspace_id.clone(),
+        allowed_mutation_classes: PRODUCTION_QUALIFICATION_MUTATION_CLASSES.to_vec(),
+        qualification_expires_at_unix_ms: UnixMillis::new(now + 60 * 60 * 1_000)
+            .expect("valid qualification expiry"),
+    };
+    let command_id = RandomId128::new(hex::encode(
+        &Sha256::digest(format!("{workspace_id}:{}", state.revision.get()).as_bytes())[..16],
+    ))
+    .expect("valid deterministic test command ID");
+    let command = ProductionMutationAdmissionCommand {
+        version: ContractVersion::V1,
+        command_id,
+        issued_at_unix_ms: UnixMillis::new(now).expect("valid issued time"),
+        expires_at_unix_ms: UnixMillis::new(now + 60_000).expect("valid command expiry"),
+        operator: test_production_cutover_sts_principal(),
+        expected_revision: Epoch::new(state.revision.get()).expect("positive state revision"),
+        mutation: ProductionMutationAdmissionMutation::BeginQualification {
+            binding: binding.clone(),
+        },
+    };
+    let receipt = apply_production_admission_for_product_test(store, &command, now);
+    assert!(matches!(
+        receipt.outcome,
+        ProductionMutationAdmissionStoredOutcome::Applied { ref state }
+            if state.mode == ProductionMutationAdmissionMode::Qualification
+                && state.binding.as_ref()
+                    == Some(&cats_api::production_mutation_admission::ProductionMutationAdmissionBinding::Qualification(binding.clone()))
+    ));
+    binding
+}
+
+/// Leave an installed test Qualification through the official signed End CAS.
+/// Disposable product fixtures use this only when they intentionally move the
+/// singleton to another exact Workspace scope.
+#[cfg(any(test, feature = "test-support"))]
+pub fn end_production_qualification_for_product_test(store: &crate::store::Store) {
+    use cats_api::production_mutation_admission::{
+        ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
+        ProductionMutationAdmissionMode, ProductionMutationAdmissionMutation,
+        ProductionMutationAdmissionStoredOutcome,
+    };
+    use cats_api::runtime_reconciliation::{ContractVersion, Epoch, RandomId128, UnixMillis};
+    use sha2::{Digest as _, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let state = store
+        .production_mutation_admission_state()
+        .expect("discover installed test Qualification");
+    let ProductionMutationAdmissionBinding::Qualification(binding) = state
+        .binding
+        .clone()
+        .expect("test Qualification has a binding")
+    else {
+        panic!("test Qualification did not carry a Qualification binding")
+    };
+    assert_eq!(state.mode, ProductionMutationAdmissionMode::Qualification);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("test time fits u64");
+    let command_id = RandomId128::new(hex::encode(
+        &Sha256::digest(
+            format!("end:{}:{}", binding.qualification_id, state.revision.get()).as_bytes(),
+        )[..16],
+    ))
+    .expect("valid deterministic test End command ID");
+    let command = ProductionMutationAdmissionCommand {
+        version: ContractVersion::V1,
+        command_id,
+        issued_at_unix_ms: UnixMillis::new(now).expect("valid issued time"),
+        expires_at_unix_ms: UnixMillis::new(now + 60_000).expect("valid command expiry"),
+        operator: test_production_cutover_sts_principal(),
+        expected_revision: Epoch::new(state.revision.get()).expect("positive state revision"),
+        mutation: ProductionMutationAdmissionMutation::EndQualification { binding },
+    };
+    let receipt = apply_production_admission_for_product_test(store, &command, now);
+    assert!(matches!(
+        receipt.outcome,
+        ProductionMutationAdmissionStoredOutcome::Applied { ref state }
+            if state.mode == ProductionMutationAdmissionMode::Closed
+    ));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_production_cutover_sts_principal(
+) -> cats_api::production_mutation_admission::ProductionCutoverStsPrincipal {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionCutoverStsPrincipal,
+    };
+
+    ProductionCutoverStsPrincipal {
+        aws_partition: ProductionCutoverAwsPartition::Aws,
+        account_id: "123456789012".to_owned(),
+        role_arn: "arn:aws:iam::123456789012:role/cats-production-cutover".to_owned(),
+        principal_arn:
+            "arn:aws:sts::123456789012:assumed-role/cats-production-cutover/test-session".to_owned(),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn apply_production_admission_for_product_test(
+    store: &crate::store::Store,
+    command: &cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+    now_unix_ms: u64,
+) -> cats_api::production_mutation_admission::ProductionMutationAdmissionCommandReceipt {
+    use cats_api::agent_registration::Ed25519RequestSigner;
+    use cats_api::production_mutation_admission::{
+        encode_production_mutation_admission_command, sign_production_mutation_admission_command,
+        verify_production_mutation_admission_command,
+    };
+    use cats_api::runtime_reconciliation::Id;
+
+    let body = encode_production_mutation_admission_command(command)
+        .expect("canonical test production admission command");
+    let mut pkcs8 =
+        hex::decode("302e020100300506032b657004220420").expect("valid test PKCS#8 prefix");
+    pkcs8.extend_from_slice(
+        &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .expect("valid test Ed25519 seed"),
+    );
+    let signer = Ed25519RequestSigner::from_pkcs8_der(
+        Id::new("cutover_a").expect("valid test credential ID"),
+        &pkcs8,
+    )
+    .expect("valid test cutover signer");
+    let trust = test_production_cutover_operator_trust_bundle();
+    let proof = sign_production_mutation_admission_command(&trust, &signer, &body)
+        .expect("sign test production admission command");
+    let principal = verify_production_mutation_admission_command(
+        &trust,
+        &proof.credential_id,
+        &proof.signature,
+        &body,
+        now_unix_ms,
+    )
+    .expect("verify test production admission command through production verifier");
+    let request = crate::store::AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+    let outcome = store
+        .apply_production_mutation_admission_command_request(&principal, command, &request)
+        .expect("apply test production admission through production Store");
+    let crate::store::runtime_authority::production_mutation_admission::ProductionMutationAdmissionCommandStoreOutcome::Stored(receipt) = outcome else {
+        panic!("test production admission command was not stored: {outcome:?}");
+    };
+    receipt
+}
+
 /// Seed a disposable schema with a typed provisioner-trust revision before a
 /// server using the next revision is started.
 pub fn seed_runtime_provisioner_trust_bundle(

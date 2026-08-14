@@ -969,6 +969,176 @@ pub fn router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    const MUTATION_ROUTE_AUTHORITY: &[(&str, &str)] = &[
+        (
+            "DELETE /v1/accounts/{account}/members/{membership}",
+            "identity_workos",
+        ),
+        ("DELETE /v1/admin/nodes/{id}", "retired_unregistered"),
+        (
+            "DELETE /v1/workspaces/{workspace}/cats/{cat}",
+            "runtime_product_transaction",
+        ),
+        (
+            "DELETE /v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}",
+            "runtime_product_transaction",
+        ),
+        (
+            "DELETE /v1/workspaces/{workspace}/disks/{disk}",
+            "runtime_product_transaction",
+        ),
+        (
+            "DELETE /v1/workspaces/{workspace}/tokens/{token}",
+            "identity_workos",
+        ),
+        (
+            "PATCH /v1/accounts/{account}/members/{membership}",
+            "identity_workos",
+        ),
+        ("PATCH /v1/workspaces/{workspace}", "identity_workos"),
+        ("POST /auth/workspace", "identity_session"),
+        ("POST /v1/accounts/{account}/invitations", "identity_workos"),
+        (
+            "POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke",
+            "identity_workos",
+        ),
+        ("POST /v1/accounts/{account}/workspaces", "identity_workos"),
+        (
+            "POST /v1/admin/nodes/{id}/actions/{verb}",
+            "retired_unregistered",
+        ),
+        (
+            "POST /v1/admin/production/mutation-admission-command-discoveries",
+            "e13_read_only_discovery",
+        ),
+        (
+            "POST /v1/admin/production/mutation-admission-commands",
+            "e13_admission_authority",
+        ),
+        (
+            "POST /v1/admin/production/mutation-admission-state-discoveries",
+            "e13_read_only_discovery",
+        ),
+        (
+            "POST /v1/admin/runtime/node-authority-applies",
+            "independent_internal_authority",
+        ),
+        (
+            "POST /v1/admin/usage/source-terminal/discover",
+            "read_only_post",
+        ),
+        (
+            "POST /v1/admin/usage/target-terminal/begin",
+            "independent_usage_terminal_authority",
+        ),
+        (
+            "POST /v1/admin/usage/target-terminal/complete",
+            "independent_usage_terminal_authority",
+        ),
+        ("POST /v1/auth/logout", "identity_session"),
+        (
+            "POST /v1/billing/stripe/webhook",
+            "billing_stripe_event_authority",
+        ),
+        (
+            "POST /v1/internal/route-v2/signing-authority-commands",
+            "independent_route_rotation_authority",
+        ),
+        ("POST /v1/internal/routes/resolve", "read_only_post"),
+        (
+            "POST /v1/internal/runtime/agent-sessions",
+            "independent_internal_authority",
+        ),
+        ("POST /v1/internal/runtime/desired-reads", "read_only_post"),
+        (
+            "POST /v1/internal/runtime/observations",
+            "independent_internal_settlement",
+        ),
+        (
+            "POST /v1/internal/runtime/residue-authority",
+            "independent_internal_cleanup",
+        ),
+        (
+            "POST /v1/internal/runtime/volume-transition-evidence",
+            "read_only_post",
+        ),
+        (
+            "POST /v1/internal/runtime/volume-transitions",
+            "independent_internal_cleanup",
+        ),
+        (
+            "POST /v1/internal/usage/checkpoints",
+            "independent_usage_authority",
+        ),
+        ("POST /v1/nodes/{id}/actions/cordon", "retired_unregistered"),
+        ("POST /v1/routes/wake", "retired_unregistered"),
+        (
+            "POST /v1/workspaces/{workspace}/billing/checkout",
+            "billing_stripe_event_authority",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/actions/resume",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/actions/stop",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/actions/suspend",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/actions/warm",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
+            "retired_unregistered",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/endpoints",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/exec",
+            "retired_unregistered",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
+            "retired_unregistered",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/disks",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/disks/{disk}/actions/attach",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/disks/{disk}/actions/detach",
+            "runtime_product_transaction",
+        ),
+        (
+            "POST /v1/workspaces/{workspace}/disks/{disk}/snapshots",
+            "retired_unregistered",
+        ),
+        ("POST /v1/workspaces/{workspace}/tokens", "identity_workos"),
+        (
+            "PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend",
+            "retired_unregistered",
+        ),
+        (
+            "PUT /v1/workspaces/{workspace}/cats/{cat}/expiry",
+            "retired_unregistered",
+        ),
+    ];
+
     #[test]
     fn route_method_set_matches_snapshot() {
         let source = include_str!("mod.rs");
@@ -1195,5 +1365,97 @@ POST /v1/workspaces/{workspace}/tokens
 PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend
 PUT /v1/workspaces/{workspace}/cats/{cat}/expiry"#;
         assert_eq!(routes, expected.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn mutation_routes_have_one_closed_authority_classification() {
+        let mut classified = MUTATION_ROUTE_AUTHORITY
+            .iter()
+            .map(|(route, _)| *route)
+            .collect::<Vec<_>>();
+        let original_len = classified.len();
+        classified.sort_unstable();
+        classified.dedup();
+        assert_eq!(
+            classified.len(),
+            original_len,
+            "duplicate route classification"
+        );
+
+        let expected = r#"DELETE /v1/accounts/{account}/members/{membership}
+DELETE /v1/admin/nodes/{id}
+DELETE /v1/workspaces/{workspace}/cats/{cat}
+DELETE /v1/workspaces/{workspace}/cats/{cat}/endpoints/{endpoint}
+DELETE /v1/workspaces/{workspace}/disks/{disk}
+DELETE /v1/workspaces/{workspace}/tokens/{token}
+PATCH /v1/accounts/{account}/members/{membership}
+PATCH /v1/workspaces/{workspace}
+POST /auth/workspace
+POST /v1/accounts/{account}/invitations
+POST /v1/accounts/{account}/invitations/{invitation}/actions/revoke
+POST /v1/accounts/{account}/workspaces
+POST /v1/admin/nodes/{id}/actions/{verb}
+POST /v1/admin/production/mutation-admission-command-discoveries
+POST /v1/admin/production/mutation-admission-commands
+POST /v1/admin/production/mutation-admission-state-discoveries
+POST /v1/admin/runtime/node-authority-applies
+POST /v1/admin/usage/source-terminal/discover
+POST /v1/admin/usage/target-terminal/begin
+POST /v1/admin/usage/target-terminal/complete
+POST /v1/auth/logout
+POST /v1/billing/stripe/webhook
+POST /v1/internal/route-v2/signing-authority-commands
+POST /v1/internal/routes/resolve
+POST /v1/internal/runtime/agent-sessions
+POST /v1/internal/runtime/desired-reads
+POST /v1/internal/runtime/observations
+POST /v1/internal/runtime/residue-authority
+POST /v1/internal/runtime/volume-transition-evidence
+POST /v1/internal/runtime/volume-transitions
+POST /v1/internal/usage/checkpoints
+POST /v1/nodes/{id}/actions/cordon
+POST /v1/routes/wake
+POST /v1/workspaces/{workspace}/billing/checkout
+POST /v1/workspaces/{workspace}/cats
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/resume
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/stop
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/suspend
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/warm
+POST /v1/workspaces/{workspace}/cats/{cat}/actions/{verb}
+POST /v1/workspaces/{workspace}/cats/{cat}/endpoints
+POST /v1/workspaces/{workspace}/cats/{cat}/exec
+POST /v1/workspaces/{workspace}/cats/{cat}/oci-deployments
+POST /v1/workspaces/{workspace}/disks
+POST /v1/workspaces/{workspace}/disks/{disk}/actions/attach
+POST /v1/workspaces/{workspace}/disks/{disk}/actions/detach
+POST /v1/workspaces/{workspace}/disks/{disk}/snapshots
+POST /v1/workspaces/{workspace}/tokens
+PUT /v1/workspaces/{workspace}/cats/{cat}/auto-suspend
+PUT /v1/workspaces/{workspace}/cats/{cat}/expiry"#;
+        assert_eq!(classified, expected.lines().collect::<Vec<_>>());
+
+        let store_source = include_str!("../store/runtime_authority/product.rs");
+        assert_eq!(
+            store_source
+                .matches("require_production_product_mutation_admitted(")
+                .count(),
+            4,
+            "the four runtime product transaction roots must each take the admission SHARE lock",
+        );
+        for class in ["CatCreate", "DiskCreate", "DiskDelete", "RuntimeMutation"] {
+            assert_eq!(
+                store_source
+                    .matches(&format!("ProductionQualificationMutationClass::{class}"))
+                    .count(),
+                1,
+                "runtime mutation class must have exactly one transaction root",
+            );
+        }
+
+        let router_source = include_str!("mod.rs");
+        assert!(
+            router_source.contains("let retired_product_authority = Router::<AppState>::new();")
+        );
+        assert!(router_source.contains("let retired_cat_action = Router::<AppState>::new();"));
     }
 }

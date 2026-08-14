@@ -433,6 +433,12 @@ mod tests {
                 .unwrap()
                 .id
         });
+        tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &cats_api::runtime_reconciliation::Id::new(workspace_id.clone()).unwrap(),
+            );
+        });
         let body = br#"{"boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","durability":"strict","memory_bytes":2147483648,"name":"app","root_size_bytes":4194304,"vcpus":2}"#;
         let url = format!("{}/v1/workspaces/{workspace_id}/cats", handle.base_url());
         let client = reqwest::Client::new();
