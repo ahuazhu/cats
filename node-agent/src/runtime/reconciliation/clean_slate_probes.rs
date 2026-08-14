@@ -6522,6 +6522,26 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         if root_first != root_second || serving_first != serving_second || vmm_first != vmm_second {
             return Ok(unavailable(exact_running_negative_cats));
         }
+        let mut absent_serving_owners = BTreeSet::new();
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            for (key, inspection) in &serving_second {
+                let expectation = serving_expected
+                    .get(key)
+                    .expect("inspection keys originate from expectations");
+                if matches!(inspection, ServingBlockdProcessInspection::Absent)
+                    && matches!(
+                        expectation.frontend(),
+                        cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+                    )
+                    && before.retains_serving_owner(
+                        expectation.device_ownership_token(),
+                        &serving_socket_owner_authority_digest(expectation.prepared_device())?,
+                    )?
+                {
+                    absent_serving_owners.insert(key.clone());
+                }
+            }
+        }
         let mut root_proofs = BTreeMap::new();
         for (cat_id, inspection) in root_second {
             if let RootProvisionProcessInspection::Exact(evidence) = inspection {
@@ -6558,6 +6578,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 root_expected, root_proofs,
             )?
             .with_serving_blockds(serving_expected, serving_proofs)?
+            .with_absent_serving_owners(absent_serving_owners)?
             .with_vmms(vmm_expected, vmm_proofs)?
             .with_stop_receipt_sockets(stop_receipt_sockets)?;
         Ok(

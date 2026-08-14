@@ -818,6 +818,7 @@ impl NodeGlobalManagedProcessExpectation {
 pub(crate) struct NodeGlobalManagedProcessScanAdmission {
     entries: Vec<NodeGlobalManagedProcessExpectation>,
     stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+    absent_serving_owners: BTreeSet<ManagedServingKey>,
 }
 
 /// The same closed set after it is bound to the exact full observation sent
@@ -835,6 +836,7 @@ pub(crate) struct NodeGlobalManagedProcessAdmission {
     inventory_read_position: Sequence,
     entries: Vec<NodeGlobalManagedProcessExpectation>,
     stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+    absent_serving_owners: BTreeSet<ManagedServingKey>,
 }
 
 impl NodeGlobalManagedProcessScanAdmission {
@@ -1066,7 +1068,36 @@ impl NodeGlobalManagedProcessScanAdmission {
         Ok(Self {
             entries,
             stop_receipt_sockets: BTreeMap::new(),
+            absent_serving_owners: BTreeSet::new(),
         })
+    }
+
+    /// Bind scanner-private managed owner/intent residue to an absent Serving
+    /// process.  The public Device projection is necessarily empty in this
+    /// state and must not be used to reconstruct this cleanup authority.
+    pub(crate) fn with_absent_serving_owners(
+        mut self,
+        owners: BTreeSet<ManagedServingKey>,
+    ) -> anyhow::Result<Self> {
+        for key in &owners {
+            anyhow::ensure!(
+                self.entries.iter().any(|entry| matches!(
+                    entry,
+                    NodeGlobalManagedProcessExpectation::ServingBlockd {
+                        expectation,
+                        exact: None,
+                    } if expectation.cat_id() == key.cat_id()
+                        && expectation.volume_id() == key.volume_id()
+                        && matches!(
+                            expectation.frontend(),
+                            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+                        )
+                )),
+                "absent serving owner lacks its exact vhost expectation"
+            );
+        }
+        self.absent_serving_owners = owners;
+        Ok(self)
     }
 
     pub(crate) fn with_stop_receipt_sockets(
@@ -1521,6 +1552,7 @@ impl NodeGlobalManagedProcessScanAdmission {
             inventory_read_position,
             entries: self.entries,
             stop_receipt_sockets: self.stop_receipt_sockets,
+            absent_serving_owners: self.absent_serving_owners,
         })
     }
 
@@ -1537,6 +1569,7 @@ impl NodeGlobalManagedProcessScanAdmission {
             inventory_read_position: Sequence::new(1).unwrap(),
             entries: self.entries,
             stop_receipt_sockets: self.stop_receipt_sockets,
+            absent_serving_owners: self.absent_serving_owners,
         }
     }
 }
@@ -1603,6 +1636,7 @@ impl NodeGlobalManagedProcessAdmission {
         NodeGlobalManagedProcessScanAdmission {
             entries: self.entries.clone(),
             stop_receipt_sockets: self.stop_receipt_sockets.clone(),
+            absent_serving_owners: self.absent_serving_owners.clone(),
         }
         .bind(observation)
     }
@@ -1754,6 +1788,20 @@ impl NodeGlobalManagedProcessAdmission {
             }
             _ => None,
         })
+    }
+
+    pub(crate) fn retains_absent_vhost_owner(
+        &self,
+        cat_id: &Id,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    ) -> bool {
+        let key = ManagedServingKey::new(cat_id.clone(), prepared.volume_id.clone());
+        self.absent_serving_owners.contains(&key)
+            && self
+                .serving_blockd(cat_id, &prepared.volume_id)
+                .is_some_and(|(expectation, exact)| {
+                    exact.is_none() && expectation.matches_device_contract(cat_id, prepared)
+                })
     }
 
     pub(crate) fn serving_blockd_count(&self, cat_id: &Id) -> usize {

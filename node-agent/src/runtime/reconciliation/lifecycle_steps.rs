@@ -1423,14 +1423,19 @@ impl LifecycleStepEffect {
         } else if attempt == LifecyclePhysicalAttempt::ExactPostcondition {
             let successor = match &stored.checkpoint().step {
                 ReconcileStep::CleanupRelease { .. } => cleanup_postcondition_successor(
+                    context,
                     accepted,
                     desired,
                     runtime,
                     stored.checkpoint(),
                 )?,
-                ReconcileStep::StopRuntime { .. } => {
-                    stop_postcondition_successor(accepted, desired, runtime, stored.checkpoint())?
-                }
+                ReconcileStep::StopRuntime { .. } => stop_postcondition_successor(
+                    context,
+                    accepted,
+                    desired,
+                    runtime,
+                    stored.checkpoint(),
+                )?,
                 _ => exact_postcondition_successor(
                     context.state_directory().path(),
                     desired,
@@ -1555,6 +1560,7 @@ impl LifecycleStepEffect {
                 ) =>
             {
                 let successor = cleanup_postcondition_successor(
+                    context,
                     accepted,
                     desired,
                     runtime,
@@ -1602,6 +1608,7 @@ impl LifecycleStepEffect {
             ) {
                 Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
                     if let Some(successor) = cleanup_postcondition_successor(
+                        context,
                         accepted,
                         desired,
                         runtime,
@@ -2393,18 +2400,21 @@ struct FreshCleanupCursor {
 }
 
 fn cleanup_postcondition_successor(
+    context: &RuntimeDesiredEffectContext,
     accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
     let cursor = fresh_cleanup_cursor(accepted)?;
-    cleanup_postcondition_successor_at(
+    let absent_vhost = retained_absent_vhost_devices(context, accepted, desired, checkpoint)?;
+    cleanup_postcondition_successor_at_with_absent_vhost(
         desired,
         runtime,
         checkpoint,
         accepted.observation().residue.as_slice(),
         &cursor,
+        &absent_vhost,
     )
 }
 
@@ -2428,12 +2438,31 @@ fn fresh_cleanup_cursor(
     })
 }
 
+#[cfg(test)]
 fn cleanup_postcondition_successor_at(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
     residue: &[NodeResidue],
     cursor: &FreshCleanupCursor,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    cleanup_postcondition_successor_at_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        cursor,
+        &[],
+    )
+}
+
+fn cleanup_postcondition_successor_at_with_absent_vhost(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    cursor: &FreshCleanupCursor,
+    absent_vhost: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
     let ReconcileStep::CleanupRelease { cleanup: completed } = &checkpoint.step else {
         anyhow::bail!("cleanup successor planner received another lifecycle step")
@@ -2442,31 +2471,60 @@ fn cleanup_postcondition_successor_at(
         cleanup_target_is_absent(completed, runtime, residue),
         "cleanup successor planner did not receive the exact target-absent postcondition"
     );
-    remaining_cleanup_successor_at(desired, runtime, checkpoint, residue, cursor)
+    remaining_cleanup_successor_at_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        cursor,
+        absent_vhost,
+    )
 }
 
 fn stop_postcondition_successor(
+    context: &RuntimeDesiredEffectContext,
     accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
     let cursor = fresh_cleanup_cursor(accepted)?;
-    stop_postcondition_successor_at(
+    let absent_vhost = retained_absent_vhost_devices(context, accepted, desired, checkpoint)?;
+    stop_postcondition_successor_at_with_absent_vhost(
         desired,
         runtime,
         checkpoint,
         accepted.observation().residue.as_slice(),
         &cursor,
+        &absent_vhost,
     )
 }
 
+#[cfg(test)]
 fn stop_postcondition_successor_at(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
     residue: &[NodeResidue],
     cursor: &FreshCleanupCursor,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    stop_postcondition_successor_at_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        cursor,
+        &[],
+    )
+}
+
+fn stop_postcondition_successor_at_with_absent_vhost(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    cursor: &FreshCleanupCursor,
+    absent_vhost: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
     let ReconcileStep::StopRuntime {
         runtime_incarnation,
@@ -2499,9 +2557,17 @@ fn stop_postcondition_successor_at(
             }),
         "StopRuntime postcondition does not prove the exact VMM absent"
     );
-    remaining_cleanup_successor_at(desired, runtime, checkpoint, residue, cursor)
+    remaining_cleanup_successor_at_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        cursor,
+        absent_vhost,
+    )
 }
 
+#[cfg(test)]
 fn remaining_cleanup_successor_at(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
@@ -2509,7 +2575,31 @@ fn remaining_cleanup_successor_at(
     residue: &[NodeResidue],
     cursor: &FreshCleanupCursor,
 ) -> anyhow::Result<Option<RuntimeCheckpoint>> {
-    let mut plans = canonical_remaining_cleanup(desired, runtime, checkpoint, residue)?;
+    remaining_cleanup_successor_at_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        cursor,
+        &[],
+    )
+}
+
+fn remaining_cleanup_successor_at_with_absent_vhost(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    cursor: &FreshCleanupCursor,
+    absent_vhost: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let mut plans = canonical_remaining_cleanup_with_absent_vhost(
+        desired,
+        runtime,
+        checkpoint,
+        residue,
+        absent_vhost,
+    )?;
     // This order is the teardown dependency order, not history carried over
     // from the completed token.  Every successor is rebuilt from this one
     // accepted full inventory and the current Desired row.
@@ -2702,11 +2792,48 @@ fn device_token(device: &ObservedDevice) -> Option<&RandomId128> {
     }
 }
 
+fn retained_absent_vhost_devices(
+    context: &RuntimeDesiredEffectContext,
+    accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<Vec<cats_api::runtime_reconciliation::PreparedDeviceInput>> {
+    let admission = context.node_global_process()?;
+    anyhow::ensure!(
+        admission.matches_observation(accepted.observation()),
+        "absent vhost cleanup authority belongs to another full observation"
+    );
+    let Some(launch) = checkpoint.runtime_launch.identity() else {
+        return Ok(Vec::new());
+    };
+    Ok(launch
+        .devices
+        .iter()
+        .filter(|prepared| {
+            matches!(
+                &prepared.frontend,
+                cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+            ) && admission.retains_absent_vhost_owner(&desired.cat_id, prepared)
+        })
+        .cloned()
+        .collect())
+}
+
 fn canonical_remaining_cleanup(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
     checkpoint: &RuntimeCheckpoint,
     residue: &[NodeResidue],
+) -> anyhow::Result<Vec<PlannedCleanup>> {
+    canonical_remaining_cleanup_with_absent_vhost(desired, runtime, checkpoint, residue, &[])
+}
+
+fn canonical_remaining_cleanup_with_absent_vhost(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    residue: &[NodeResidue],
+    absent_vhost: &[cats_api::runtime_reconciliation::PreparedDeviceInput],
 ) -> anyhow::Result<Vec<PlannedCleanup>> {
     let launch = checkpoint.runtime_launch.identity();
     let mut plans = Vec::new();
@@ -2757,6 +2884,28 @@ fn canonical_remaining_cleanup(
                 target: CleanupTarget::Device {
                     volume_id: intent.volume_id.clone(),
                     ownership_token: token.clone(),
+                },
+                volume_release: None,
+            });
+        } else if let Some(prepared) = absent_vhost
+            .iter()
+            .find(|prepared| prepared.volume_id == intent.volume_id)
+        {
+            anyhow::ensure!(
+                launch.is_some_and(|launch| launch.devices.iter().any(|candidate| {
+                    candidate == prepared
+                        && matches!(
+                            &candidate.frontend,
+                            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+                        )
+                })),
+                "absent vhost cleanup target changed from retained launch authority"
+            );
+            plans.push(PlannedCleanup {
+                order: format!("0-device-{}-{}", intent.volume_id, prepared.ownership_token),
+                target: CleanupTarget::Device {
+                    volume_id: intent.volume_id.clone(),
+                    ownership_token: prepared.ownership_token.clone(),
                 },
                 volume_release: None,
             });
@@ -2847,6 +2996,21 @@ fn canonical_remaining_cleanup(
                 ownership_token,
                 ..
             } => {
+                if absent_vhost.iter().any(|prepared| {
+                    &prepared.serving_process.control_socket_path == socket_path
+                        || matches!(
+                            &prepared.frontend,
+                            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+                                socket_path: listener,
+                                ..
+                            } if listener == socket_path
+                        )
+                }) {
+                    // The scanner-private owner/intent admission above, not
+                    // this deliberately unowned public residue, carries the
+                    // deletion authority for the complete socket directory.
+                    continue;
+                }
                 if let Some(expected_token) = launch_token_for_socket(launch, socket_path) {
                     let token = valid_token(ownership_token).context(
                         "cleanup successor found an attributed control socket without a valid token",
@@ -3441,7 +3605,7 @@ fn stop_local() -> RuntimeDesiredEffectOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -4582,27 +4746,27 @@ mod tests {
     }
 
     #[test]
-    fn stopped_vmm_exact_vhost_cleanup_retires_the_serving_owner_and_converges_cold() {
+    fn absent_before_first_scan_vhost_owner_survives_restart_and_rejects_replacement() {
         let (desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
         let prepared = checkpoint.runtime_launch.identity().unwrap().devices[0].clone();
         let expectation =
             ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(&checkpoint, &desired)
                 .unwrap();
-        let exact = expectation
-            .clone()
-            .prove_exact_process(expectation.exact_evidence_for_test(51))
-            .unwrap();
-        let (_, vhost) = exact.vhost_device_projection().unwrap();
-        runtime.processes = vec![exact.clone().into_process_evidence()];
-        runtime.volumes[0].devices = vec![vhost];
-        checkpoint.processes = runtime.processes.clone();
-        checkpoint.volumes = runtime.volumes.clone();
-        let cleanup = CleanupRelease {
-            target: CleanupTarget::Device {
-                volume_id: prepared.volume_id.clone(),
-                ownership_token: prepared.ownership_token.clone(),
-            },
-            inventory_session: SessionBinding {
+        let vmm = runtime
+            .processes
+            .iter()
+            .find(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+            .unwrap()
+            .clone();
+        runtime.processes.clear();
+        runtime.volumes[0].devices.clear();
+        checkpoint.step = ReconcileStep::StopRuntime {
+            runtime_incarnation: checkpoint.runtime_incarnation.clone().unwrap(),
+            process_start_time_ticks: vmm.process_start_time_ticks,
+            scope_id: vmm.scope_id,
+        };
+        let cursor = FreshCleanupCursor {
+            session: SessionBinding {
                 node_id: checkpoint.node_id.clone(),
                 node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
                     "11111111111111111111111111111111".to_owned(),
@@ -4615,14 +4779,50 @@ mod tests {
             inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(7).unwrap(),
             inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
             desired_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
-            volume_release: None,
+            observed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_800_000_000_000)
+                .unwrap(),
         };
-        checkpoint.stable_state = None;
-        checkpoint.step = ReconcileStep::CleanupRelease {
-            cleanup: cleanup.clone(),
+        let cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            socket_path,
+            ..
+        } = &prepared.frontend
+        else {
+            unreachable!()
         };
+        let owner_residue = [
+            NodeResidue::ControlSocket {
+                socket_path: prepared.serving_process.control_socket_path.clone(),
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            },
+            NodeResidue::ControlSocket {
+                socket_path: socket_path.clone(),
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            },
+        ];
+        checkpoint = stop_postcondition_successor_at_with_absent_vhost(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &owner_residue,
+            &cursor,
+            std::slice::from_ref(&prepared),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            checkpoint.step,
+            ReconcileStep::CleanupRelease {
+                cleanup: CleanupRelease {
+                    target: CleanupTarget::Device { .. },
+                    ..
+                }
+            }
+        ));
+        assert!(checkpoint.runtime_launch.identity().is_some());
         runtime.stable_state = None;
-        runtime.step = ReconcileStep::CleanupRelease { cleanup };
+        runtime.step = checkpoint.step.clone();
 
         let directory = TempDir::new().unwrap();
         let store = FileCheckpointStore::open(
@@ -4634,39 +4834,48 @@ mod tests {
         let serving = Arc::new(VhostCleanupServingPort {
             retirements: Mutex::new(VecDeque::from([
                 ManagedBlockdSocketOwnerRetirement::Retired,
-                ManagedBlockdSocketOwnerRetirement::AlreadyAbsent,
             ])),
         });
         let physical = PlatformLifecyclePhysicalPort {
             network_ip_binary: PathBuf::new(),
-            serving_process: serving,
+            serving_process: serving.clone(),
             vmm_process: Arc::new(NeverVmmProcessPort),
             kernel_nbd_detach: None,
             blockd: PlatformPersistentBlockdControlPort,
             volume_authority: Arc::new(UnavailableVolumeAuthority),
         };
 
-        let live_scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+        let key = ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone());
+        let mut replacement_checkpoint = checkpoint.clone();
+        let RuntimeLaunch::Present(replacement_launch) = &mut replacement_checkpoint.runtime_launch
+        else {
+            unreachable!()
+        };
+        replacement_launch.devices[0].ownership_token =
+            RandomId128::new("99999999999999999999999999999999".to_owned()).unwrap();
+        let replacement = ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(
+            &replacement_checkpoint,
+            &desired,
+        )
+        .unwrap();
+        let replacement_scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
             BTreeMap::new(),
             BTreeMap::new(),
         )
         .unwrap()
         .with_serving_blockds(
-            BTreeMap::from([(
-                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
-                expectation.clone(),
-            )]),
-            BTreeMap::from([(
-                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
-                exact,
-            )]),
+            BTreeMap::from([(key.clone(), replacement)]),
+            BTreeMap::new(),
         )
+        .unwrap()
+        .with_absent_serving_owners(BTreeSet::from([key.clone()]))
         .unwrap();
-        let live_context = deleting_effect_context(&directory, &desired, runtime.clone());
-        let live_admission = live_scan
-            .bind(live_context.accepted_full().unwrap().observation())
+        let replacement_context = deleting_effect_context(&directory, &desired, runtime.clone());
+        let replacement_admission = replacement_scan
+            .bind(replacement_context.accepted_full().unwrap().observation())
             .unwrap();
-        let live_context = live_context.with_node_global_process_for_test(live_admission);
+        let replacement_context =
+            replacement_context.with_node_global_process_for_test(replacement_admission);
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
@@ -4676,59 +4885,78 @@ mod tests {
         assert_eq!(
             physical
                 .detach_exact_device(
-                    &live_context,
+                    &replacement_context,
                     &permit,
                     &prepared.volume_id,
                     &prepared.ownership_token,
                 )
                 .unwrap(),
-            LifecyclePhysicalAttempt::SubmittedOrAmbiguous,
-            "an exact process that stopped after the accepted scan needs a fresh absence scan"
+            LifecyclePhysicalAttempt::Conflict
         );
+        assert_eq!(serving.retirements.lock().unwrap().len(), 1);
 
-        runtime.processes.clear();
-        runtime.volumes[0].devices.clear();
         let absent_scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
             BTreeMap::new(),
             BTreeMap::new(),
         )
         .unwrap()
         .with_serving_blockds(
-            BTreeMap::from([(
-                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
-                expectation,
-            )]),
+            BTreeMap::from([(key.clone(), expectation)]),
             BTreeMap::new(),
         )
+        .unwrap()
+        .with_absent_serving_owners(BTreeSet::from([key]))
         .unwrap();
-        for expected in [
-            LifecyclePhysicalAttempt::SubmittedOrAmbiguous,
-            LifecyclePhysicalAttempt::ExactPostcondition,
-        ] {
-            let context = deleting_effect_context(&directory, &desired, runtime.clone());
-            let admission = absent_scan
-                .clone()
-                .bind(context.accepted_full().unwrap().observation())
-                .unwrap();
-            let context = context.with_node_global_process_for_test(admission);
-            let permit = LifecycleEffectPermit {
-                desired: &desired,
-                runtime: &runtime,
-                store: &store,
-                stored: &stored,
-            };
-            assert_eq!(
-                physical
-                    .detach_exact_device(
-                        &context,
-                        &permit,
-                        &prepared.volume_id,
-                        &prepared.ownership_token,
-                    )
-                    .unwrap(),
-                expected
-            );
-        }
+        let context = deleting_effect_context(&directory, &desired, runtime.clone());
+        let admission = absent_scan
+            .bind(context.accepted_full().unwrap().observation())
+            .unwrap();
+        assert!(admission.retains_absent_vhost_owner(&desired.cat_id, &prepared));
+        let context = context.with_node_global_process_for_test(admission);
+        let permit = LifecycleEffectPermit {
+            desired: &desired,
+            runtime: &runtime,
+            store: &store,
+            stored: &stored,
+        };
+        assert_eq!(
+            physical
+                .detach_exact_device(
+                    &context,
+                    &permit,
+                    &prepared.volume_id,
+                    &prepared.ownership_token,
+                )
+                .unwrap(),
+            LifecyclePhysicalAttempt::SubmittedOrAmbiguous
+        );
+        assert!(serving.retirements.lock().unwrap().is_empty());
+        assert_eq!(
+            store.load().unwrap().unwrap().checkpoint(),
+            &checkpoint,
+            "a crash after owner retirement must replay the retained Device token"
+        );
+
+        let volume_cleanup = cleanup_postcondition_successor_at_with_absent_vhost(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &[],
+            &cursor,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            volume_cleanup.step,
+            ReconcileStep::CleanupRelease {
+                cleanup: CleanupRelease {
+                    target: CleanupTarget::Volume { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(volume_cleanup.runtime_launch, RuntimeLaunch::Absent);
 
         runtime.networks.clear();
         runtime.mounts.clear();
@@ -4746,19 +4974,8 @@ mod tests {
             head,
         };
         runtime.volumes[0].local_lineages.clear();
-        let cursor = FreshCleanupCursor {
-            session: match &checkpoint.step {
-                ReconcileStep::CleanupRelease { cleanup } => cleanup.inventory_session.clone(),
-                _ => unreachable!(),
-            },
-            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(8).unwrap(),
-            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(10).unwrap(),
-            desired_read_position: cats_api::runtime_reconciliation::Sequence::new(10).unwrap(),
-            observed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_800_000_000_000)
-                .unwrap(),
-        };
         let successor =
-            cleanup_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor)
+            cleanup_postcondition_successor_at(&desired, &runtime, &volume_cleanup, &[], &cursor)
                 .unwrap()
                 .unwrap();
         assert!(matches!(

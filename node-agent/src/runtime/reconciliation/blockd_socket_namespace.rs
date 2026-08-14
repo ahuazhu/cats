@@ -1848,6 +1848,45 @@ struct ManagedBlockdSocketWholeOwnerSnapshot {
 }
 
 impl ManagedBlockdSocketWholeRootSnapshot {
+    /// Whether this closed scan retained an exact durable receipt or owner
+    /// directory for one expected owner generation.  Absence is also exact,
+    /// but only a retained generation needs the retirement edge.
+    fn retains_owner(&self, expected: &BlockdSocketOwnershipIntentV1) -> anyhow::Result<bool> {
+        let paths = expected.derived_paths(&self.root)?;
+        let owner = self
+            .owner_snapshots
+            .get(&paths.public_name)
+            .context("managed blockd owner is outside the closed whole-root snapshot")?;
+        anyhow::ensure!(
+            owner.intent == *expected,
+            "managed blockd owner snapshot names another generation"
+        );
+        Ok(owner.receipt.is_some() || owner.directory.is_some())
+    }
+
+    pub(crate) fn retains_serving_owner(
+        &self,
+        device_ownership_token: &RandomId128,
+        owner_authority_digest: &Sha256Digest,
+    ) -> anyhow::Result<bool> {
+        let mut matching = self.expected.iter().filter(|intent| {
+            matches!(
+                intent.owner(),
+                BlockdSocketOwnerV1::Serving {
+                    device_ownership_token: token,
+                } if token == device_ownership_token
+            ) && intent.owner_authority_digest() == owner_authority_digest
+        });
+        let Some(expected) = matching.next() else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "closed blockd snapshot duplicated one serving owner generation"
+        );
+        self.retains_owner(expected)
+    }
+
     pub(crate) fn socket_paths(&self) -> BTreeSet<HostPath> {
         self.owner_snapshots
             .values()
