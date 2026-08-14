@@ -35,6 +35,9 @@ USAGE_GLOBAL_FINALIZATION_FILE = (
 USAGE_GLOBAL_FINALIZATION_KIND = (
     "cats.usage-global-terminal-finalization.v1"
 )
+USAGE_GLOBAL_CASE_EVIDENCE_FILE = "case-evidence.jsonl"
+USAGE_GLOBAL_QUALIFICATION_CATALOG_FILE = "qualification-catalog.v1.json"
+USAGE_GLOBAL_SHA256SUMS_FILE = "SHA256SUMS"
 USAGE_TERMINAL_VERIFICATION_FILE = (
     "usage-target-terminal-verification.receipt.json"
 )
@@ -1561,14 +1564,53 @@ def _validate_global_usage_finalization(
     )
     if value["terminal_epoch_id"] != expected_epoch:
         raise ProofSetError("E9 terminal epoch is not the exact global derivation")
+    request = fields(
+        decode_json(
+            expected_request.data,
+            "E9 global target request",
+            canonical_lf=True,
+        ),
+        {
+            "contract_version",
+            "terminal_epoch_id",
+            "release_commit",
+            "artifact_sha256",
+            "created_at_unix_ms",
+            "old_target",
+            "fresh_target",
+            "sources",
+            "source_set_sha256",
+            "shards",
+        },
+        "E9 global target request",
+    )
+    request_sources = _usage_sources(
+        request["sources"],
+        "E9 global target request sources",
+    )
+    if (
+        request["contract_version"] != 1
+        or request["release_commit"] != context.release_commit
+        or request["artifact_sha256"]
+        != context.worker_bundle_sha256.removeprefix("sha256:")
+        or request_sources != sources
+        or request["source_set_sha256"] != source_set_sha256
+        or request["terminal_epoch_id"] != expected_epoch
+    ):
+        raise ProofSetError("E9 global target request rebound the qualified runs")
+    created_at = integer(
+        request["created_at_unix_ms"],
+        "E9 global target request creation time",
+        minimum=1,
+    )
     completed = integer(
         value["completed_at_unix_ms"],
         "E9 global completion time",
         minimum=1,
     )
     if completed < max(
-        qualified.qualification_completed_at_unix_ms
-        for qualified in qualified_runs
+        created_at,
+        *(qualified.qualification_completed_at_unix_ms for qualified in qualified_runs),
     ):
         raise ProofSetError("E9 global finalization predates Qualification Closed")
     if finalization_manifest.name != USAGE_GLOBAL_FINALIZATION_FILE:
@@ -1595,6 +1637,73 @@ def _validate_sha256sums(
     for name, verified in expected.items():
         if observed.get(name) != verified.sha256:
             raise ProofSetError(f"{label} does not close {name}")
+
+
+def _validate_global_sha256sums(
+    data: bytes,
+    expected: dict[str, VerifiedFile],
+) -> None:
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProofSetError("E9 global SHA256SUMS is not ASCII") from error
+    expected_names = sorted(expected)
+    lines = text.splitlines(keepends=True)
+    if not lines or any(not line.endswith("\n") for line in lines):
+        raise ProofSetError("E9 global SHA256SUMS has no exact terminal LF rows")
+    observed_names: list[str] = []
+    for line in lines:
+        match = re.fullmatch(
+            r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9_.-]{0,127})\n",
+            line,
+        )
+        if match is None:
+            raise ProofSetError("E9 global SHA256SUMS contains a malformed row")
+        name = match.group(2)
+        observed_names.append(name)
+        verified = expected.get(name)
+        if verified is None or verified.sha256 != "sha256:" + match.group(1):
+            raise ProofSetError("E9 global SHA256SUMS contains a foreign digest")
+    if observed_names != expected_names:
+        raise ProofSetError(
+            "E9 global SHA256SUMS is not the exact sorted seven-file set"
+        )
+
+
+def _validate_global_case_evidence(
+    evidence: VerifiedFile,
+    request: VerifiedFile,
+    receipt: VerifiedFile,
+    verification: VerifiedFile,
+) -> None:
+    expected = (
+        (USAGE_TERMINAL_REQUEST_FILE, request),
+        (USAGE_TERMINAL_RECEIPT_FILE, receipt),
+        (USAGE_TERMINAL_VERIFICATION_FILE, verification),
+    )
+    rows = _jsonl(evidence.data, "E9 global case evidence")
+    if len(rows) != len(expected):
+        raise ProofSetError("E9 global case evidence is not the exact three-row set")
+    for row, (filename, standalone) in zip(rows, expected, strict=True):
+        row = fields(
+            row,
+            {"case_id", "content", "filename", "kind", "sha256", "size_bytes"},
+            f"E9 global case evidence {filename}",
+        )
+        content = decode_json(
+            standalone.data,
+            f"E9 standalone {filename}",
+            canonical_lf=True,
+        )
+        if (
+            row["case_id"] != "usage-target-terminal-receipt"
+            or row["filename"] != filename
+            or row["kind"] != "json"
+            or row["content"] != content
+            or row["sha256"] != standalone.sha256
+            or row["size_bytes"] != standalone.size_bytes
+        ):
+            raise ProofSetError(f"E9 global case evidence rebound {filename}")
 
 
 def _validate_qualification_final_support(
@@ -2345,7 +2454,10 @@ def verify(
                 "route_v2_rotation_qualification_receipt",
                 "route_v2_rotation_qualification_node_ack_sets",
                 "route_v2_rotation_qualification_transcript",
+                "usage_global_case_evidence",
                 "usage_global_finalization_manifest",
+                "usage_global_qualification_catalog",
+                "usage_global_sha256sums",
                 "usage_terminal_targets",
                 "usage_terminal_request",
                 "usage_terminal_receipt",
@@ -2362,8 +2474,14 @@ def verify(
             if name != "qualification"
         }
         if (
-            proof_refs["usage_global_finalization_manifest"].file
+            proof_refs["usage_global_case_evidence"].file
+            != USAGE_GLOBAL_CASE_EVIDENCE_FILE
+            or proof_refs["usage_global_finalization_manifest"].file
             != USAGE_GLOBAL_FINALIZATION_FILE
+            or proof_refs["usage_global_qualification_catalog"].file
+            != USAGE_GLOBAL_QUALIFICATION_CATALOG_FILE
+            or proof_refs["usage_global_sha256sums"].file
+            != USAGE_GLOBAL_SHA256SUMS_FILE
             or proof_refs["usage_terminal_targets"].file
             != USAGE_TERMINAL_TARGETS_FILE
             or proof_refs["usage_terminal_request"].file
@@ -2418,6 +2536,10 @@ def verify(
         ):
             raise ProofSetError("qualification block paths reused one runner identity")
         qualified_runs = (kernel_run, vhost_run)
+        usage_case_evidence_file = directory.read_reference(
+            proof_refs["usage_global_case_evidence"],
+            "E9 global case evidence",
+        )
         usage_finalization_file = directory.read_reference(
             proof_refs["usage_global_finalization_manifest"],
             "E9 global terminal finalization manifest",
@@ -2425,6 +2547,16 @@ def verify(
         usage_targets_file = directory.read_reference(
             proof_refs["usage_terminal_targets"],
             "E9 expected targets",
+        )
+        usage_catalog_file = directory.read_reference(
+            proof_refs["usage_global_qualification_catalog"],
+            "E9 global qualification catalog",
+        )
+        if usage_catalog_file.data != qualification_catalog.data:
+            raise ProofSetError("E9 global qualification catalog is not the release copy")
+        usage_sha256sums_file = directory.read_reference(
+            proof_refs["usage_global_sha256sums"],
+            "E9 global SHA256SUMS",
         )
         usage_request_file = directory.read_reference(
             proof_refs["usage_terminal_request"], "E9 target-terminal request"
@@ -2446,6 +2578,24 @@ def verify(
             expected_request=usage_request_file,
             expected_targets=usage_targets_file,
             context=context,
+        )
+        _validate_global_case_evidence(
+            usage_case_evidence_file,
+            usage_request_file,
+            usage_file,
+            usage_verification_file,
+        )
+        _validate_global_sha256sums(
+            usage_sha256sums_file.data,
+            {
+                USAGE_GLOBAL_CASE_EVIDENCE_FILE: usage_case_evidence_file,
+                USAGE_GLOBAL_QUALIFICATION_CATALOG_FILE: usage_catalog_file,
+                USAGE_GLOBAL_FINALIZATION_FILE: usage_finalization_file,
+                USAGE_TERMINAL_RECEIPT_FILE: usage_file,
+                USAGE_TERMINAL_REQUEST_FILE: usage_request_file,
+                USAGE_TERMINAL_VERIFICATION_FILE: usage_verification_file,
+                USAGE_TERMINAL_TARGETS_FILE: usage_targets_file,
+            },
         )
         _validate_global_usage_finalization(
             decode_json(

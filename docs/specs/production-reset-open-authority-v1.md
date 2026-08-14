@@ -91,7 +91,10 @@ ProductionCutoverProofSetV1 {
     route_v2_rotation_qualification_receipt: ProofFileV1,
     route_v2_rotation_qualification_node_ack_sets: ProofFileV1,
     route_v2_rotation_qualification_transcript: ProofFileV1,
+    usage_global_case_evidence: ProofFileV1,
     usage_global_finalization_manifest: ProofFileV1,
+    usage_global_qualification_catalog: ProofFileV1,
+    usage_global_sha256sums: ProofFileV1,
     usage_terminal_targets: ProofFileV1,
     usage_terminal_request: ProofFileV1,
     usage_terminal_receipt: ProofFileV1,
@@ -169,6 +172,14 @@ run-wide finalizer create `usage-global-terminal-finalization.manifest.json`,
 `kernel-nbd` and `vhost-user` manifest/case-evidence/source-set digests, the exact union of their
 source epochs, the manifest-bound `usage-terminal-targets.json`, and every final target artifact.
 There is no per-block target-terminal effect.
+
+The global output is exactly seven files plus `SHA256SUMS`: `case-evidence.jsonl`, the copied
+`qualification-catalog.v1.json`, the manifest, request, receipt, verification receipt and target
+config. The checksum file has exactly those seven bytewise-sorted GNU rows, no self-row or extras.
+The three case-evidence rows are exactly request, receipt and verification in that order and embed
+the exact standalone canonical content/digest/size. The request's source list, source-set digest and
+terminal epoch must independently equal the two qualified-run union; receipt↔request validation
+alone cannot establish that relationship.
 
 Python closes these outer identities but does not duplicate E9's archive/barrier oracle. It invokes
 the release-bound Rust worker member exactly as follows and compares the newly produced canonical
