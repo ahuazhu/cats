@@ -115,6 +115,28 @@ fn release_surface_cannot_compose_the_debug_retired_authority() {
 }
 
 #[test]
+fn release_runtime_volume_authority_includes_the_feature_gated_residue_route() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))
+        .expect("read control-plane router");
+    let release_start = router
+        .find("#[cfg(not(debug_assertions))]\n    let runtime_volume_authority = {")
+        .expect("find release runtime volume authority composition");
+    let release_end = router[release_start..]
+        .find("#[cfg(debug_assertions)]\n    let runtime_operation_read")
+        .map(|offset| release_start + offset)
+        .expect("find end of release runtime volume authority composition");
+    let release = &router[release_start..release_end];
+
+    assert!(
+        release.contains(
+            "#[cfg(feature = \"proposed-node-residue-reclamation\")]\n        let router = router.route(\n            \"/v1/internal/runtime/residue-authority\",\n            post(runtime_volume_transitions::residue_authority)\n                .fallback(runtime_volume_transitions::residue_authority),\n        );"
+        ),
+        "release router must install residue authority only when its implementation feature is compiled"
+    );
+}
+
+#[test]
 fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))

@@ -1269,6 +1269,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
     #[tokio::test]
     async fn production_router_installs_the_residue_authority_route_by_default() {
         let context = Context::new().await;
@@ -1289,6 +1290,24 @@ mod tests {
             error.error.as_ref(),
             RuntimeVolumeTransitionErrorDetail::ContractError { .. }
         ));
+    }
+
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+    #[tokio::test]
+    async fn feature_disabled_router_does_not_install_the_residue_authority_route() {
+        let context = Context::new().await;
+        let node = context.register("residue-disabled", '8').await;
+        let response = context
+            .signed(
+                &node,
+                "/v1/internal/runtime/residue-authority",
+                b"{}".to_vec(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(decode_runtime_volume_transition_error(&response.bytes().await.unwrap()).is_err());
     }
 
     #[tokio::test]

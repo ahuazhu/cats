@@ -719,17 +719,26 @@ pub fn router(state: AppState) -> Router {
         router
     };
     #[cfg(not(debug_assertions))]
-    let runtime_volume_authority = Router::new()
-        .route(
-            "/v1/internal/runtime/volume-transitions",
-            post(runtime_volume_transitions::mutation)
-                .fallback(runtime_volume_transitions::mutation),
-        )
-        .route(
-            "/v1/internal/runtime/volume-transition-evidence",
-            post(runtime_volume_transitions::evidence)
-                .fallback(runtime_volume_transitions::evidence),
+    let runtime_volume_authority = {
+        let router = Router::new()
+            .route(
+                "/v1/internal/runtime/volume-transitions",
+                post(runtime_volume_transitions::mutation)
+                    .fallback(runtime_volume_transitions::mutation),
+            )
+            .route(
+                "/v1/internal/runtime/volume-transition-evidence",
+                post(runtime_volume_transitions::evidence)
+                    .fallback(runtime_volume_transitions::evidence),
+            );
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let router = router.route(
+            "/v1/internal/runtime/residue-authority",
+            post(runtime_volume_transitions::residue_authority)
+                .fallback(runtime_volume_transitions::residue_authority),
         );
+        router
+    };
     #[cfg(debug_assertions)]
     let runtime_operation_read = if state.retired_product_authority_for_tests() {
         Router::new()
