@@ -184,7 +184,7 @@ pub struct UsageTerminalEventEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum UsageStreamRecord {
-    Checkpoint(AttributedCheckpoint),
+    Checkpoint(Box<AttributedCheckpoint>),
     TerminalBarrier(UsageTerminalShardMarker),
 }
 

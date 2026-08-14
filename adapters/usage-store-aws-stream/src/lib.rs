@@ -921,7 +921,7 @@ async fn apply_projection(
         match &record.record {
             UsageStreamRecord::Checkpoint(value) => projection
                 .project_archived(&ArchivedUsageCheckpoint {
-                    value: value.clone(),
+                    value: value.as_ref().clone(),
                     archive,
                 })
                 .await
@@ -986,7 +986,8 @@ impl UsageStore for AwsUsageStreamStore {
                     "old Usage target is closed for terminal projection".into(),
                 ));
             }
-            let payload = serde_json::to_vec(&UsageStreamRecord::Checkpoint(value.clone()))?;
+            let payload =
+                serde_json::to_vec(&UsageStreamRecord::Checkpoint(Box::new(value.clone())))?;
             if payload.len() > KINESIS_RECORD_LIMIT {
                 return Err(cats_metering::MeteringError::Invalid(
                     "attributed checkpoint exceeds the Kinesis record limit".to_string(),
