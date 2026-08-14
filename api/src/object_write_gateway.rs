@@ -269,6 +269,17 @@ pub struct ObjectWriteCredentialRegistrationReceipt {
     pub registered_at_unix_ms: UnixMillis,
 }
 
+/// Durable public registration artifact consumed by the Node and its exact
+/// blockd child. It deliberately contains no private key bytes or ambient
+/// filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteCredentialRegisteredArtifact {
+    pub version: ContractVersion,
+    pub registration: ObjectWriteCredentialRegistration,
+    pub receipt: ObjectWriteCredentialRegistrationReceipt,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectWriteGatewayReceipt {
@@ -548,6 +559,131 @@ pub fn decode_object_write_credential_registration_receipt(
         return Err(ObjectWriteGatewayContractError::InvalidReceipt);
     }
     Ok(receipt)
+}
+
+pub fn encode_object_write_credential_registered_artifact(
+    artifact: &ObjectWriteCredentialRegisteredArtifact,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_registered_artifact(artifact)?;
+    let bytes = serde_json::to_vec(artifact)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidCredentialRegistration)?;
+    if bytes.len() > OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidCredentialRegistration);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_object_write_credential_registered_artifact(
+    bytes: &[u8],
+) -> Result<ObjectWriteCredentialRegisteredArtifact, ObjectWriteGatewayContractError> {
+    if bytes.len() > OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidCredentialRegistration);
+    }
+    let artifact: ObjectWriteCredentialRegisteredArtifact = serde_json::from_slice(bytes)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidCredentialRegistration)?;
+    validate_registered_artifact(&artifact)?;
+    if encode_object_write_credential_registered_artifact(&artifact)? != bytes {
+        return Err(ObjectWriteGatewayContractError::InvalidCredentialRegistration);
+    }
+    Ok(artifact)
+}
+
+/// Stable credential identity for one exact session-bound attachment.
+/// Random key bytes are generated and persisted separately; they are never
+/// derived from this identifier.
+pub fn object_write_credential_id(
+    session: &SessionBinding,
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: FenceEpoch,
+) -> Id {
+    derived_attachment_id(
+        b"cats.object-write.attachment-credential-id.v1",
+        "owcred1_",
+        session,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+    )
+}
+
+/// Stable root-only private artifact identity for the same attachment.
+pub fn object_write_private_artifact_id(
+    session: &SessionBinding,
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: FenceEpoch,
+) -> Id {
+    derived_attachment_id(
+        b"cats.object-write.private-artifact-id.v1",
+        "owpriv1_",
+        session,
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+    )
+}
+
+pub fn object_write_private_file_fsync_receipt_id(
+    private_artifact_id: &Id,
+    credential: &ObjectWriteCredentialReference,
+) -> AsciiText {
+    let mut hasher = sha2::Sha256::new();
+    frame(&mut hasher, b"cats.object-write.private-file-fsync.v1");
+    frame(&mut hasher, private_artifact_id.as_str().as_bytes());
+    frame(&mut hasher, credential.credential_id.as_str().as_bytes());
+    frame(
+        &mut hasher,
+        credential.public_key_spki_sha256.as_str().as_bytes(),
+    );
+    derived_ascii("owfilefsync1_", hasher)
+}
+
+pub fn object_write_private_directory_fsync_receipt_id(
+    private_artifact_id: &Id,
+    file_receipt_id: &AsciiText,
+) -> AsciiText {
+    let mut hasher = sha2::Sha256::new();
+    frame(&mut hasher, b"cats.object-write.private-directory-fsync.v1");
+    frame(&mut hasher, private_artifact_id.as_str().as_bytes());
+    frame(&mut hasher, file_receipt_id.as_str().as_bytes());
+    derived_ascii("owdirfsync1_", hasher)
+}
+
+pub fn object_write_private_key_file_name(private_artifact_id: &Id) -> String {
+    format!(
+        "{}{OBJECT_WRITE_PRIVATE_KEY_FILE_SUFFIX}",
+        private_artifact_id.as_str()
+    )
+}
+
+/// Stable locator for one attachment/epoch's pre-registration sidecar. It
+/// excludes the Agent session so a replacement Agent can recover the exact
+/// body after external registration commits.
+pub fn object_write_prepared_registration_file_name(
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: FenceEpoch,
+) -> String {
+    let mut hasher = sha2::Sha256::new();
+    frame(
+        &mut hasher,
+        b"cats.object-write.prepared-registration-file.v1",
+    );
+    frame(&mut hasher, volume_id.as_str().as_bytes());
+    frame(&mut hasher, attachment_id.as_str().as_bytes());
+    frame(&mut hasher, &attachment_epoch.get().to_be_bytes());
+    format!(
+        "owprepared1_{}{OBJECT_WRITE_PREPARED_REGISTRATION_FILE_SUFFIX}",
+        digest_hex(hasher)
+    )
+}
+
+pub fn object_write_registered_artifact_file_name(credential_id: &Id) -> String {
+    format!(
+        "{}{OBJECT_WRITE_REGISTERED_ARTIFACT_FILE_SUFFIX}",
+        credential_id.as_str()
+    )
 }
 
 pub fn encode_object_write_credential_registration(
