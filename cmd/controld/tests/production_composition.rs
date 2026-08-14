@@ -151,8 +151,8 @@ fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
     for route in [
         ".route(\"/v1/workspaces/{workspace}/cats\", cat_collection_route)",
         ".route(\"/v1/workspaces/{workspace}/disks\", disk_collection_route)",
-        ".route(\"/v1/workspaces/{workspace}/cats/{cat}\", cat_item_read)",
-        ".route(\"/v1/workspaces/{workspace}/disks/{disk}\", disk_item_read)",
+        ".route(\"/v1/workspaces/{workspace}/cats/{cat}\", cat_item_route)",
+        ".route(\"/v1/workspaces/{workspace}/disks/{disk}\", disk_item_route)",
         "get(runtime_operations::get_runtime_operation)",
     ] {
         assert!(router.contains(route), "release router lost {route:?}");
