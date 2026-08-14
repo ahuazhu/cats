@@ -3845,7 +3845,12 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
             "manual release publisher lost {required:?}"
         );
     }
-    for forbidden in ["docker build ", "docker buildx build", "terraform", "kubectl"] {
+    for forbidden in [
+        "docker build ",
+        "docker buildx build",
+        "terraform",
+        "kubectl",
+    ] {
         assert!(
             !publisher.contains(forbidden),
             "manual release publisher gained rebuild/deployment effect {forbidden:?}"
