@@ -99,7 +99,7 @@ pub async fn run_object_write_gateway(
         provider: Arc::new(Semaphore::new(OBJECT_WRITE_GATEWAY_PROVIDER_LIMIT)),
         ready: AtomicBool::new(false),
     });
-    recover_once(&service).await?;
+    recover_once(&service, true).await?;
     service.ready.store(true, Ordering::Release);
 
     let app = Router::new()
@@ -635,7 +635,7 @@ async fn run_recovery(
                 }
             }
             _ = interval.tick() => {
-                match recover_once(&service).await {
+                match recover_once(&service, false).await {
                     Ok(()) => service.ready.store(true, Ordering::Release),
                     Err(error) => {
                         service.ready.store(false, Ordering::Release);
@@ -647,7 +647,10 @@ async fn run_recovery(
     }
 }
 
-async fn recover_once(service: &Arc<GatewayService>) -> anyhow::Result<()> {
+async fn recover_once(
+    service: &Arc<GatewayService>,
+    startup_has_no_receivers: bool,
+) -> anyhow::Result<()> {
     let mut after = None;
     loop {
         let cursor = after.clone();
@@ -666,7 +669,7 @@ async fn recover_once(service: &Arc<GatewayService>) -> anyhow::Result<()> {
                 ObjectWriteIngressState::Receiving => {
                     match service
                         .spool
-                        .recover_receipt(&attempt.ingress, deadline)
+                        .recover_receipt(&attempt.ingress, startup_has_no_receivers, deadline)
                         .await
                     {
                         Ok(receipt) => {
@@ -711,7 +714,6 @@ async fn recover_once(service: &Arc<GatewayService>) -> anyhow::Result<()> {
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
     }
-    service.spool.cleanup_old_temporary_files().await;
     Ok(())
 }
 
