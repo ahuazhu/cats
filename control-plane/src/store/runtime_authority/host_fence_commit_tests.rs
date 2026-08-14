@@ -331,15 +331,15 @@ fn desired(
     desired
 }
 
-struct RecoveryFixture {
-    store: Store,
-    request: TrustedHostFenceRecoveryCommitV1,
-    current_volume: VolumeRecord,
-    old_identity: NodeIdentity,
-    old_session: AgentSession,
+pub(super) struct RecoveryFixture {
+    pub(super) store: Store,
+    pub(super) request: TrustedHostFenceRecoveryCommitV1,
+    pub(super) current_volume: VolumeRecord,
+    pub(super) old_identity: NodeIdentity,
+    pub(super) old_session: AgentSession,
 }
 
-fn recovery_fixture(slug: &str) -> RecoveryFixture {
+pub(super) fn recovery_fixture(slug: &str) -> RecoveryFixture {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
     let workspace_id = super::product_tests::bootstrap_workspace(&store, slug);
@@ -499,7 +499,9 @@ fn recovery_fixture(slug: &str) -> RecoveryFixture {
     }
 }
 
-fn add_second_recovery_cat(fixture: &RecoveryFixture) -> TrustedHostFenceRecoveryCommitV1 {
+pub(super) fn add_second_recovery_cat(
+    fixture: &RecoveryFixture,
+) -> TrustedHostFenceRecoveryCommitV1 {
     let now = fixture.store.authority_transaction(database_now).unwrap();
     let mut blank = fixture.current_volume.clone();
     blank.volume_id = id("volume-root-second");

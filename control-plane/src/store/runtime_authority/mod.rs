@@ -68,6 +68,9 @@ mod host_fence_commit_tests;
 mod host_fence_provider_queue_tests;
 
 #[cfg(test)]
+mod host_fence_recovery_batch_tests;
+
+#[cfg(test)]
 mod gateway_identity_tests;
 
 #[cfg(test)]

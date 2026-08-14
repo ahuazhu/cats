@@ -262,7 +262,7 @@ fn with_provider_session<T: Send>(
         .unwrap()
 }
 
-fn terminal_evidence(
+pub(super) fn terminal_evidence(
     request: &HostFenceAttemptRequest,
     receipt: ObjectWriteCutoffReceipt,
 ) -> HostFenceProviderEvidence {
