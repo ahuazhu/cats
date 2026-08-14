@@ -770,7 +770,17 @@ fn validate_strict_volume(
     if observed_volume.volume_intent_id.as_ref() != Some(&intent.volume_intent_id)
         || observed_volume.disk_id.as_ref() != Some(&intent.disk_id)
         || observed_volume.volume_id != intent.volume_id
+        || observed_volume.disk_kind
+            != match intent.disk_kind {
+                cats_api::runtime_reconciliation::DiskKind::Root => {
+                    cats_api::runtime_reconciliation::ObservedDiskKind::Root
+                }
+                cats_api::runtime_reconciliation::DiskKind::Persistent => {
+                    cats_api::runtime_reconciliation::ObservedDiskKind::Persistent
+                }
+            }
         || observed_volume.size_bytes != Some(volume.expected_current_volume.size_bytes)
+        || observed_volume.durability != Some(volume.expected_current_volume.durability)
     {
         return Err(TrustedHostFenceStrictVolumeProblemV1::ObservedVolumeBindingMismatch);
     }
@@ -1019,9 +1029,320 @@ fn digest_canonical<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::runtime_reconciliation::{
+        spec_digest, AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement,
+        CheckpointEvidence, DiskKind, Durability, Epoch, FenceEpoch, Generation,
+        GuestDeviceIdentity, GuestTransportEvidence, HostPath, Ipv4Address, IsolatedIpv4Kind,
+        LifecycleAdmission, LocalVolumeLineage, MacAddress, NetworkConfig, NormalAcquireRequest,
+        ObservedDiskKind, OperationPhase, ProviderScope, ReconcileStep, RemoteHead, Revision,
+        RuntimeConfig, RuntimeTarget, RuntimeTransition, Sequence, VolumeAccess, VolumeAcquire,
+        VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
+        WarmSnapshotEvidence,
+    };
+
+    use crate::authority::normal_acquire;
+    use crate::host_fence::ObjectWriterFenceTarget;
 
     fn id(value: &str) -> Id {
         Id::new(value.to_owned()).expect("test ID is valid")
+    }
+
+    fn epoch(value: u64) -> Epoch {
+        Epoch::new(value).expect("test epoch is nonzero")
+    }
+
+    fn revision(value: u64) -> Revision {
+        Revision::new(value).expect("test revision is nonzero")
+    }
+
+    fn generation(value: u64) -> Generation {
+        Generation::new(value).expect("test generation is valid")
+    }
+
+    fn fence_epoch(value: u64) -> FenceEpoch {
+        FenceEpoch::new(value).expect("test fence epoch is valid")
+    }
+
+    fn time(value: u64) -> UnixMillis {
+        UnixMillis::new(value).expect("test time is valid")
+    }
+
+    fn random(value: u128) -> RandomId128 {
+        RandomId128::new(format!("{value:032x}")).expect("test random ID is valid")
+    }
+
+    fn ascii(value: &str) -> AsciiText {
+        AsciiText::new(value.to_owned()).expect("test ASCII text is valid")
+    }
+
+    fn recovery_attempt(
+        durability: Durability,
+        inventory_available: bool,
+    ) -> TrustedHostFenceRecoveryAttemptV1 {
+        let node_id = id("node-old");
+        let node_boot_id = NodeBootId::new("11111111111111111111111111111111".to_owned())
+            .expect("test boot ID is valid");
+        let session = SessionBinding {
+            node_id: node_id.clone(),
+            node_boot_id: node_boot_id.clone(),
+            agent_instance_id: random(2),
+            agent_session_epoch: epoch(7),
+        };
+        let head = RemoteHead {
+            generation: generation(3),
+            root_hash: Some(Sha256Digest::from_bytes([3; 32])),
+            root_object_id: Some(ascii("volumes/volume-1/commits/3")),
+        };
+        let blank = VolumeRecord {
+            volume_id: id("volume-1"),
+            size_bytes: 4 * 1024 * 1024,
+            durability,
+            admin_state: VolumeAdminState::Active,
+            head,
+            lease_owner: None,
+            lease_epoch: fence_epoch(1),
+            lease_expires_at: None,
+            last_transition: None,
+        };
+        let transition_id = random(3);
+        let acquire = NormalAcquireRequest {
+            volume_id: blank.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: id("attachment-old"),
+            expected_unowned_epoch: blank.lease_epoch,
+            desired_revision: revision(1),
+            placement_epoch: epoch(5),
+            lease_duration_ms: 60_000,
+        };
+        let (volume, _) =
+            normal_acquire(&blank, &acquire, time(10)).expect("test volume acquire is valid");
+        let mut desired = DesiredRuntimeSpec {
+            version: ContractVersion::V1,
+            workspace_id: id("workspace-1"),
+            cat_id: id("cat-1"),
+            desired_revision: revision(1),
+            target: RuntimeTarget::Running,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: node_id.clone(),
+                placement_epoch: epoch(5),
+            },
+            runtime: RuntimeConfig {
+                vcpus: 1,
+                memory_bytes: 512 * 1024 * 1024,
+                boot_image_digest: Sha256Digest::from_bytes([4; 32]),
+                guest_config_digest: Sha256Digest::from_bytes([5; 32]),
+                network_config: NetworkConfig {
+                    kind: IsolatedIpv4Kind::IsolatedIpv4,
+                    network_id: id("network-1"),
+                    guest_mac: MacAddress::new("02:ca:00:00:00:02").expect("valid test MAC"),
+                    guest_ipv4: Ipv4Address::new("10.0.0.2").expect("valid test address"),
+                    prefix_length: 30,
+                    gateway_ipv4: Ipv4Address::new("10.0.0.1").expect("valid test gateway"),
+                },
+            },
+            volumes: vec![VolumeIntent {
+                volume_intent_id: id("intent-root"),
+                disk_id: id("disk-root"),
+                volume_id: volume.volume_id.clone(),
+                attachment_id: acquire.attachment_id.clone(),
+                size_bytes: volume.size_bytes,
+                disk_kind: DiskKind::Root,
+                access: VolumeAccess::ReadWriteOnce,
+                durability,
+                guest_device: GuestDeviceIdentity {
+                    serial: id("root-device"),
+                    slot: 0,
+                },
+                acquire: VolumeAcquire::Normal {
+                    transition_id: transition_id.clone(),
+                    expected_unowned_epoch: acquire.expected_unowned_epoch,
+                },
+                disposition: VolumeDisposition::Retain,
+                mount: None,
+            }],
+            endpoints: Vec::new(),
+            transition: RuntimeTransition::CancelAndDrain,
+            spec_digest: Sha256Digest::from_bytes([0; 32]),
+        };
+        desired.spec_digest = spec_digest(&desired).expect("test Desired is valid");
+        let operation = Operation {
+            version: ContractVersion::V1,
+            operation_id: id("operation-old"),
+            workspace_id: desired.workspace_id.clone(),
+            cat_id: desired.cat_id.clone(),
+            desired_revision: desired.desired_revision,
+            desired_spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: desired.target,
+            phase: OperationPhase::Pending,
+            terminal: None,
+            created_at_unix_ms: time(11),
+            updated_at_unix_ms: time(11),
+        };
+        let observed_volume = ObservedVolume {
+            volume_intent_id: Some(desired.volumes[0].volume_intent_id.clone()),
+            disk_id: Some(desired.volumes[0].disk_id.clone()),
+            volume_id: volume.volume_id.clone(),
+            disk_kind: ObservedDiskKind::Root,
+            size_bytes: Some(volume.size_bytes),
+            durability: Some(durability),
+            authority: VolumeAuthorityEvidence::Owned {
+                attachment_id: acquire.attachment_id.clone(),
+                attachment_epoch: volume.lease_epoch,
+                head: volume.head.clone(),
+            },
+            local_lineages: vec![LocalVolumeLineage {
+                attachment_id: acquire.attachment_id.clone(),
+                attachment_epoch: volume.lease_epoch,
+                acquire_origin: AcquireOrigin::Normal {
+                    transition_id: transition_id.clone(),
+                },
+                node_id: node_id.clone(),
+                placement_epoch: desired.placement.placement_epoch,
+                local_durable_generation: volume.head.generation,
+                remote_durable_generation: volume.head.generation,
+                data_directory: HostPath::new("/var/lib/cats/volumes/volume-1")
+                    .expect("valid test path"),
+                pending_pack_count: WireU64::new(0).expect("zero is a valid count"),
+                fenced: false,
+                state: LocalLineageState::Active,
+            }],
+            devices: Vec::new(),
+        };
+        let observed_runtime = ObservedRuntimeStatus {
+            cat_id: desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: None,
+            step: ReconcileStep::InspectInventory {
+                inventory_epoch: epoch(9),
+            },
+            checkpoint: CheckpointEvidence::Missing {
+                checkpoint_path: HostPath::new("/var/lib/cats/runtime/cat-1.json")
+                    .expect("valid test path"),
+            },
+            processes: Vec::new(),
+            volumes: vec![observed_volume.clone()],
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        };
+        let cat = TrustedHostFenceAssignedCatV1 {
+            expected_current_desired: desired,
+            expected_old_operation: operation,
+            inventory: if inventory_available {
+                TrustedHostFenceAssignedCatInventoryV1::AcceptedFull {
+                    observed_runtime: Box::new(observed_runtime),
+                }
+            } else {
+                TrustedHostFenceAssignedCatInventoryV1::Unavailable
+            },
+            volumes: vec![TrustedHostFenceExpectedVolumeAuthorityV1 {
+                volume_intent_id: id("intent-root"),
+                expected_current_volume: volume.clone(),
+                expected_owner: VolumeOwnerBinding {
+                    volume_id: volume.volume_id.clone(),
+                    owner_node_id: node_id.clone(),
+                    attachment_id: acquire.attachment_id,
+                    attachment_epoch: volume.lease_epoch,
+                },
+                inventory: if inventory_available {
+                    TrustedHostFenceAssignedVolumeInventoryV1::AcceptedFull {
+                        observed_volume: Box::new(observed_volume),
+                    }
+                } else {
+                    TrustedHostFenceAssignedVolumeInventoryV1::Unavailable
+                },
+            }],
+        };
+        let assigned_cats = vec![cat];
+        let assigned_set_sha256 = trusted_host_fence_assigned_set_sha256(&assigned_cats)
+            .expect("test assigned set is canonical");
+        let provider_scope = ProviderScope {
+            provider: id("aws"),
+            partition: id("aws-partition"),
+            account_id: id("account-1"),
+            region: id("region-1"),
+        };
+        let mut binding = HostFenceBinding {
+            provider_scope: provider_scope.clone(),
+            immutable_host_id: id("host-old"),
+            node_id,
+            expected_node_boot_id: node_boot_id,
+            expected_agent_session_epoch: epoch(7),
+            fence_attempt_id: id("pending-fence-attempt"),
+        };
+        let apply_id = random(4);
+        binding.fence_attempt_id =
+            trusted_host_fence_recovery_attempt_id(&apply_id, &binding, &assigned_set_sha256)
+                .expect("test fence attempt ID derives");
+        let provider_request = HostFenceAttemptRequest {
+            binding: binding.clone(),
+            network_quarantine_boundary_id: ascii("quarantine-boundary-1"),
+            object_writer: ObjectWriterFenceTarget {
+                writer_authority_id: id("writer-authority-1"),
+                provider_scope,
+                workload_principal_id: ascii("arn:aws:iam::account-1:role/gateway"),
+                object_store_scope_id: ascii("arn:aws:s3:::bucket/volumes"),
+            },
+        };
+        let source_inventory = if inventory_available {
+            TrustedHostFenceSourceInventoryV1::AcceptedFull {
+                session: session.clone(),
+                attestation: Box::new(AdmissionInventoryAttestation {
+                    version: ContractVersion::V1,
+                    node_id: session.node_id.clone(),
+                    agent_session_epoch: session.agent_session_epoch,
+                    inventory_epoch: epoch(9),
+                    inventory_digest: Sha256Digest::from_bytes([9; 32]),
+                    inventory_read_position: Sequence::new(10)
+                        .expect("test read position is valid"),
+                    accepted_at_unix_ms: time(12),
+                }),
+                full_observation: TrustedHostFenceCanonicalArtifactV1 {
+                    content_sha256: Sha256Digest::from_bytes([10; 32]),
+                    length_bytes: WireU64::new(1_024).expect("test length is valid"),
+                },
+                assigned_snapshot: TrustedHostFenceCanonicalArtifactV1 {
+                    content_sha256: Sha256Digest::from_bytes([11; 32]),
+                    length_bytes: WireU64::new(2_048).expect("test length is valid"),
+                },
+            }
+        } else {
+            TrustedHostFenceSourceInventoryV1::Unavailable {
+                session,
+                reason: TrustedHostFenceInventoryUnavailableReasonV1::NoAcceptedFullInventory,
+                recorded_at_unix_ms: time(12),
+            }
+        };
+        let attempt = TrustedHostFenceRecoveryAttemptV1 {
+            version: ContractVersion::V1,
+            apply_id,
+            principal: FleetPolicyPrincipal::WorkosFleetAdministrator {
+                subject: id("fleet-admin"),
+                organization_id: id("organization-1"),
+            },
+            binding,
+            provider_request,
+            source_inventory,
+            assigned_cats,
+            assigned_set_sha256,
+            requested_at_unix_ms: time(13),
+        };
+        validate_trusted_host_fence_recovery_attempt_v1(&attempt)
+            .expect("test recovery attempt is valid");
+        attempt
     }
 
     #[test]
@@ -1060,6 +1381,76 @@ mod tests {
         assert_eq!(
             canonicalize_trusted_host_fence_recovery_blocked_reasons_v1(&mut duplicates),
             Err(TrustedHostFenceRecoveryError::BlockedReceipt)
+        );
+    }
+
+    #[test]
+    fn relaxed_volume_is_blocked_even_when_inventory_has_equal_local_and_remote_heads() {
+        let attempt = recovery_attempt(Durability::Relaxed, true);
+
+        assert_eq!(
+            trusted_host_fence_recovery_blockers(&attempt).expect("valid attempt is classified"),
+            vec![
+                TrustedHostFenceRecoveryBlockedReasonV1::RelaxedDurabilityUnprovableAfterInventory {
+                    cat_id: id("cat-1"),
+                    volume_id: id("volume-1"),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_source_inventory_is_a_terminal_recovery_blocker() {
+        let attempt = recovery_attempt(Durability::Strict, false);
+
+        let blockers =
+            trusted_host_fence_recovery_blockers(&attempt).expect("valid attempt is classified");
+        assert!(blockers.contains(
+            &TrustedHostFenceRecoveryBlockedReasonV1::SourceInventoryUnavailable {
+                reason: TrustedHostFenceInventoryUnavailableReasonV1::NoAcceptedFullInventory,
+            }
+        ));
+    }
+
+    #[test]
+    fn strict_volume_with_exact_owned_head_and_drained_lineage_is_recoverable() {
+        let attempt = recovery_attempt(Durability::Strict, true);
+
+        assert_eq!(
+            trusted_host_fence_recovery_blockers(&attempt).expect("valid attempt is classified"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn strict_volume_rejects_observed_durability_drift() {
+        let mut attempt = recovery_attempt(Durability::Strict, true);
+        let TrustedHostFenceAssignedVolumeInventoryV1::AcceptedFull { observed_volume } =
+            &mut attempt.assigned_cats[0].volumes[0].inventory
+        else {
+            panic!("test fixture has accepted inventory")
+        };
+        observed_volume.durability = Some(Durability::Relaxed);
+        attempt.assigned_set_sha256 =
+            trusted_host_fence_assigned_set_sha256(&attempt.assigned_cats)
+                .expect("mutated assigned set is canonical");
+        attempt.binding.fence_attempt_id = trusted_host_fence_recovery_attempt_id(
+            &attempt.apply_id,
+            &attempt.binding,
+            &attempt.assigned_set_sha256,
+        )
+        .expect("mutated attempt ID derives");
+        attempt.provider_request.binding = attempt.binding.clone();
+
+        assert_eq!(
+            trusted_host_fence_recovery_blockers(&attempt).expect("valid attempt is classified"),
+            vec![
+                TrustedHostFenceRecoveryBlockedReasonV1::StrictVolumeNotSafelyRecoverable {
+                    cat_id: id("cat-1"),
+                    volume_id: id("volume-1"),
+                    problem: TrustedHostFenceStrictVolumeProblemV1::ObservedVolumeBindingMismatch,
+                }
+            ]
         );
     }
 }
