@@ -170,7 +170,7 @@ impl PostgresUsageStore {
         let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let poisoned = Arc::clone(&self.poisoned);
-        let job = Box::new(move |client| {
+        let job: Job = Box::new(move |client| {
             // A request that timed out while this job waited in the
             // bounded queue has dropped its receiver. Do not perform its
             // database effect after cancellation.
@@ -930,7 +930,7 @@ fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>, schema: &str) -> Res
 
 fn connect_client(url: &str, ca_file: Option<&str>, schema: &str) -> Result<Client> {
     let connector = tls_connector(ca_file)?;
-    let mut config = client_config(url)?;
+    let config = client_config(url)?;
     let mut client = config
         .connect(MakeTlsConnector::new(connector))
         .map_err(|error| pg_error("connect PostgreSQL", error))?;
