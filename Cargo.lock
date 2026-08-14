@@ -399,6 +399,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ec2"
+version = "1.241.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36d274d82dfee2c5f8c43c023a32605521ff86a0342ed2279c6c02ed5401cefc"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.2",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-kinesis"
 version = "1.111.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,6 +1209,23 @@ dependencies = [
  "tungstenite",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "cats-host-fence-aws"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-ec2",
+ "aws-sdk-s3",
+ "aws-sdk-sts",
+ "base64",
+ "cats-api",
+ "cats-storage",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

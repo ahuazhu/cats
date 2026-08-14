@@ -8,6 +8,7 @@ members = [
     "storage",
     "adapters/object-store-file",
     "adapters/object-store-aws-s3",
+    "adapters/host-fence-aws",
     "adapters/metadata-store-sqlite",
     "adapters/metadata-store-postgres",
     "adapters/usage-store-postgres",
@@ -37,6 +38,7 @@ cats-blockd = { path = "blockd" }
 cats-storage = { path = "storage" }
 cats-object-store-file = { path = "adapters/object-store-file" }
 cats-object-store-aws-s3 = { path = "adapters/object-store-aws-s3" }
+cats-host-fence-aws = { path = "adapters/host-fence-aws" }
 cats-metadata-store-sqlite = { path = "adapters/metadata-store-sqlite" }
 cats-metadata-store-postgres = { path = "adapters/metadata-store-postgres" }
 cats-usage-store-postgres = { path = "adapters/usage-store-postgres" }
@@ -105,8 +107,10 @@ tar = "0.4"
 zstd = "0.13"
 aws-config = "1"
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-kinesis = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 # rust-vmm ecosystem (Linux-only data plane: vhost-user-blk frontend, ADR-0004).
 vhost = "0.17"
