@@ -2584,24 +2584,6 @@ fn stop_postcondition_successor_at_with_absent_vhost(
     )
 }
 
-#[cfg(test)]
-fn remaining_cleanup_successor_at(
-    desired: &DesiredRuntimeSpec,
-    runtime: &ObservedRuntimeStatus,
-    checkpoint: &RuntimeCheckpoint,
-    residue: &[NodeResidue],
-    cursor: &FreshCleanupCursor,
-) -> anyhow::Result<Option<RuntimeCheckpoint>> {
-    remaining_cleanup_successor_at_with_absent_vhost(
-        desired,
-        runtime,
-        checkpoint,
-        residue,
-        cursor,
-        &[],
-    )
-}
-
 fn remaining_cleanup_successor_at_with_absent_vhost(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
