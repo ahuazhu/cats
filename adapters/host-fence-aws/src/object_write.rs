@@ -8,12 +8,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::operation::RequestId as _;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::operation::{RequestId as _, RequestIdExt as _};
+use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use cats_api::object_write_gateway::object_write_key;
+use cats_api::object_write_gateway::{
+    ObjectWriteProviderRequestObservationV1, ObjectWriteSuccessfulPutV1,
+};
 #[cfg(test)]
 use cats_api::runtime_reconciliation::Id;
 use cats_api::runtime_reconciliation::{AsciiText, ProviderScope, Sha256Digest, UnixMillis};
@@ -228,11 +231,28 @@ impl AwsObjectWriteGatewayDownstream {
                 {
                     return Err(ObjectWriteDownstreamError::Ambiguous);
                 }
-                Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
-                    provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
-                    put_receipt_id: put_receipt_id(&request.descriptor, &observation, b"created")?,
-                    completed_at_unix_ms: observation.completed_at_unix_ms,
-                })
+                let put_receipt_id = put_receipt_id(&request.descriptor, &observation, b"created")?;
+                if request.descriptor.qualification_fault.is_some() {
+                    Ok(
+                        ObjectWriteDownstreamPutOutcome::QualificationSuccessfulPut {
+                            successful_put: ObjectWriteSuccessfulPutV1 {
+                                provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
+                                put_receipt_id,
+                                provider_request: put_provider_request_observation(
+                                    &request.descriptor,
+                                    &observation,
+                                ),
+                                completed_at_unix_ms: observation.completed_at_unix_ms,
+                            },
+                        },
+                    )
+                } else {
+                    Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
+                        provider_attempt_id: request.descriptor.provider_attempt_id.clone(),
+                        put_receipt_id,
+                        completed_at_unix_ms: observation.completed_at_unix_ms,
+                    })
+                }
             }
             Err(S3CallError::PreconditionFailed) => match self
                 .s3
@@ -285,6 +305,10 @@ impl AwsObjectWriteGatewayDownstream {
                 Ok(ObjectWriteVisibilityOutcome::VisibleExact {
                     provider_attempt_id: descriptor.provider_attempt_id.clone(),
                     visibility_receipt_id: visibility_receipt_id(descriptor, &observation)?,
+                    provider_request: Box::new(head_provider_request_observation(
+                        descriptor,
+                        &observation,
+                    )?),
                     observed_at_unix_ms: observation.observed_at_unix_ms,
                 })
             }
@@ -325,6 +349,7 @@ fn validate_descriptor_for_discovery(
             &descriptor.key,
             &descriptor.content_sha256,
             descriptor.content_length,
+            descriptor.qualification_fault.as_ref(),
         )
         .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?
             != descriptor.request_id
@@ -335,6 +360,37 @@ fn validate_descriptor_for_discovery(
         return Err(ObjectWriteDownstreamError::InvalidRequest);
     }
     Ok(())
+}
+
+fn put_provider_request_observation(
+    descriptor: &ObjectPutDescriptor,
+    observation: &PutObservation,
+) -> ObjectWriteProviderRequestObservationV1 {
+    ObjectWriteProviderRequestObservationV1 {
+        request_id: observation.request_id.clone(),
+        extended_request_id: observation.extended_request_id.clone(),
+        content_sha256: descriptor.content_sha256.clone(),
+        content_length: None,
+        entity_tag: observation.e_tag.clone(),
+        version_id: observation.version_id.clone(),
+    }
+}
+
+fn head_provider_request_observation(
+    descriptor: &ObjectPutDescriptor,
+    observation: &HeadObservation,
+) -> Result<ObjectWriteProviderRequestObservationV1, ObjectWriteDownstreamError> {
+    Ok(ObjectWriteProviderRequestObservationV1 {
+        request_id: observation.request_id.clone(),
+        extended_request_id: observation.extended_request_id.clone(),
+        content_sha256: descriptor.content_sha256.clone(),
+        content_length: Some(
+            cats_api::runtime_reconciliation::WireU64::new(observation.content_length)
+                .ok_or(ObjectWriteDownstreamError::InvalidRequest)?,
+        ),
+        entity_tag: observation.e_tag.clone(),
+        version_id: observation.version_id.clone(),
+    })
 }
 
 fn valid_bucket_name(bucket: &str) -> bool {
@@ -493,6 +549,7 @@ struct ExactPutRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PutObservation {
     request_id: AsciiText,
+    extended_request_id: Option<AsciiText>,
     checksum_sha256: String,
     e_tag: Option<AsciiText>,
     version_id: Option<AsciiText>,
@@ -502,6 +559,7 @@ struct PutObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadObservation {
     request_id: AsciiText,
+    extended_request_id: Option<AsciiText>,
     checksum_sha256: String,
     content_length: u64,
     metadata: BTreeMap<String, String>,
@@ -587,6 +645,7 @@ impl ExactS3Api for SdkExactS3Api {
                 .to_owned();
             Ok(PutObservation {
                 request_id: required_ascii(output.request_id())?,
+                extended_request_id: optional_ascii(output.extended_request_id())?,
                 checksum_sha256,
                 e_tag: optional_ascii(output.e_tag())?,
                 version_id: optional_ascii(output.version_id())?,
@@ -628,6 +687,7 @@ impl ExactS3Api for SdkExactS3Api {
                 .collect();
             Ok(HeadObservation {
                 request_id: required_ascii(output.request_id())?,
+                extended_request_id: optional_ascii(output.extended_request_id())?,
                 checksum_sha256,
                 content_length: length,
                 metadata,
@@ -925,7 +985,8 @@ mod tests {
     use std::time::Duration;
 
     use cats_api::object_write_gateway::{
-        object_write_key, ObjectWriteImmutableKey, VolumeDataObjectKind,
+        object_write_key, ObjectWriteCredentialReference, ObjectWriteImmutableKey,
+        ObjectWriteQualificationFaultV1, VolumeDataObjectKind,
     };
     use cats_api::runtime_reconciliation::RandomId128;
     use cats_api::runtime_reconciliation::WireU64;
@@ -1029,6 +1090,7 @@ mod tests {
             &key,
             &content_sha256,
             content_length,
+            None,
         )
         .unwrap();
         ObjectPutDescriptor {
@@ -1036,13 +1098,41 @@ mod tests {
             accepted_sequence: WireU64::new(7).unwrap(),
             provider_attempt_id: object_put_provider_attempt_id(&request_id).unwrap(),
             request_id,
+            credential: ObjectWriteCredentialReference {
+                credential_id: id("object-write-credential-1"),
+                public_key_spki_sha256: Sha256Digest::from_bytes([7_u8; 32]),
+            },
             volume_id,
             key,
             target,
             content_sha256,
             content_length,
+            qualification_fault: None,
             accepted_at_unix_ms: millis(20),
         }
+    }
+
+    fn qualification_descriptor(body: &[u8]) -> ObjectPutDescriptor {
+        let mut descriptor = descriptor(body);
+        descriptor.qualification_fault =
+            Some(ObjectWriteQualificationFaultV1::SuccessfulPutResponseLoss {
+                qualification_id: id("qualification-1"),
+                fault_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                qualification_catalog_sha256: Sha256Digest::from_bytes([8_u8; 32]),
+            });
+        descriptor.request_id = object_put_request_id(
+            &descriptor.writer_authority_id,
+            &descriptor.target,
+            &descriptor.volume_id,
+            &descriptor.key,
+            &descriptor.content_sha256,
+            descriptor.content_length,
+            descriptor.qualification_fault.as_ref(),
+        )
+        .unwrap();
+        descriptor.provider_attempt_id =
+            object_put_provider_attempt_id(&descriptor.request_id).unwrap();
+        descriptor
     }
 
     fn write_spool(
@@ -1081,6 +1171,7 @@ mod tests {
     fn put_observation(descriptor: &ObjectPutDescriptor) -> PutObservation {
         PutObservation {
             request_id: ascii("aws-request-put-1"),
+            extended_request_id: Some(ascii("aws-extended-put-1")),
             checksum_sha256: STANDARD.encode(descriptor.content_sha256.as_bytes()),
             e_tag: Some(ascii("etag-1")),
             version_id: Some(ascii("version-1")),
@@ -1091,6 +1182,7 @@ mod tests {
     fn head_observation(descriptor: &ObjectPutDescriptor) -> HeadObservation {
         HeadObservation {
             request_id: ascii("aws-request-head-1"),
+            extended_request_id: Some(ascii("aws-extended-head-1")),
             checksum_sha256: STANDARD.encode(descriptor.content_sha256.as_bytes()),
             content_length: descriptor.content_length.get(),
             metadata: BTreeMap::from([
@@ -1204,6 +1296,69 @@ mod tests {
             puts[0].checksum_sha256,
             STANDARD.encode(descriptor.content_sha256.as_bytes())
         );
+    }
+
+    #[tokio::test]
+    async fn qualification_marker_classifies_only_a_real_successful_put() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"qualified response loss";
+        let descriptor = qualification_descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let observation = put_observation(&descriptor);
+        let s3 = Arc::new(FakeS3::new(vec![Ok(observation.clone())], vec![]));
+        let downstream =
+            AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
+
+        let outcome = downstream
+            .put_exact(
+                ObjectWriteDownstreamPut {
+                    descriptor: descriptor.clone(),
+                    spool,
+                },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ObjectWriteDownstreamPutOutcome::QualificationSuccessfulPut {
+                successful_put: ObjectWriteSuccessfulPutV1 {
+                    provider_attempt_id,
+                    provider_request: ObjectWriteProviderRequestObservationV1 {
+                        request_id,
+                        content_length: None,
+                        ..
+                    },
+                    completed_at_unix_ms,
+                    ..
+                }
+            } if provider_attempt_id == descriptor.provider_attempt_id
+                && request_id == observation.request_id
+                && completed_at_unix_ms == observation.completed_at_unix_ms
+        ));
+        assert_eq!(s3.puts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn qualification_marker_does_not_reclassify_an_ambiguous_provider_result() {
+        let temporary = tempfile::tempdir().unwrap();
+        let body = b"provider timeout";
+        let descriptor = qualification_descriptor(body);
+        let spool = write_spool(temporary.path(), &descriptor, body);
+        let s3 = Arc::new(FakeS3::new(vec![Err(S3CallError::Ambiguous)], vec![]));
+        let downstream =
+            AwsObjectWriteGatewayDownstream::with_api(config(temporary.path()), s3.clone());
+
+        assert_eq!(
+            downstream
+                .put_exact(
+                    ObjectWriteDownstreamPut { descriptor, spool },
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .await,
+            Err(ObjectWriteDownstreamError::Ambiguous)
+        );
+        assert_eq!(s3.puts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1416,6 +1571,7 @@ mod tests {
             &descriptor.key,
             &descriptor.content_sha256,
             descriptor.content_length,
+            descriptor.qualification_fault.as_ref(),
         )
         .unwrap();
         descriptor.provider_attempt_id =
