@@ -109,7 +109,7 @@ provision原子写两者，provisioned identity缺policy是stored corruption并�
 NodeIdentity的immutable Host/state-path lineage继续以ADR-0040/A19a为权威，policy不能改写它。
 持久logical row就是§1完整`NodePlacementPolicy`，没有另一个mutable capacity/schedulable projection；物理列若
 为查询复制revision/state，Store每次读取必须与closed policy逐字段相等，任何差异使replica unready。
-required transport-target JSON/projection与exact catalog CHECK继续属于clean-slate authority schema 14；
+required transport-target JSON/projection与exact catalog CHECK继续属于clean-slate authority schema 15；
 任何早期版本不做in-place ALTER，startup必须拒绝并要求operator创建空的version-14 schema。
 
 policy只有本文件§3的node-authority apply transaction能创建或更新。Node的A19 credential、AgentSession、

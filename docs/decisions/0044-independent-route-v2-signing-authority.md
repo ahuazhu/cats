@@ -43,16 +43,19 @@ provisioner key。这三者都拥有不同 principal、签名 domain、轮换和
 production full-inventory 对已安装 public ring 的只读 exact observation。Control 的 signer snapshot 会消费
 该 observation 中的 exact version/digest/sorted kids；artifact 缺席保持 unavailable，存在但无法完整验证时
 不接受该轮 full inventory。PostgreSQL保存immutable exact descriptor/ring revision、current exact projection、
-permanent key/secret-reference lineage、retirement与nonsecret deletion receipt；startup只允许initial install或
+permanent key/secret-reference lineage与retirement；startup只允许initial install或
 exact replay，不把合法本地successor自动当作rotation authority。Node successor installer在durable rename与
 verifier swap后才ACK；typed writer在singleton lock内完成两轮schedulable full ACK、strict retention、uncordon
-current ACK与emergency disable/fresh activation。该G3 catalog保留最终schema 17，必须在E9 v15/V3 v16后集成。
+current ACK与emergency disable/fresh activation。该G3 catalog是候选schema 14的唯一delta，并将exact
+clean-slate authority schema推进为15；它不依赖或预留E9/V3 schema。
 Control现已用固定CA/server artifact组成独立TLS 1.3/HTTP/1.1 machine listener；每次签发在同一shared-lock
 snapshot内同时重验Gateway principal、hostname-derived Workspace、Route/Desired/ring ACK与本进程signer的PG
 current binding。disabled或stale signer保持503，不能用测试constructor或旧authority补齐。
 
-上述Gateway与signer表共同属于exact clean-slate authority schema 14最终形态；此前Gateway-only中间提交
-不构成可独立部署migration，也不允许当前stamp启动时补表或repair catalog。
+上述Gateway与signer表及G3 ring/retirement lineage共同属于exact clean-slate authority schema 15最终形态；
+此前schema 14不构成可兼容升级的migration，也不允许当前stamp启动时补表或repair catalog。ADR没有授予
+A23、startup artifact或新DSN principal触发rotation的权限；Store transition不是operator transport，在另有
+Accepted authority前production触发入口保持关闭。
 
 ## 后果
 

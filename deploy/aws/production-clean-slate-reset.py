@@ -51,7 +51,7 @@ COMPONENTS = ("gateway", "controller", "node_agent", "vmm", "blockd")
 MAX_JSON_BYTES = 64 * 1024
 MAX_LIST_PAGES = 100_000
 MAX_S3_ENTRIES = 5_000_000
-EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "14"
+EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "15"
 POST_GREEN_MAX_AGE_SECONDS = 15 * 60
 POSTGRES_QUERY_PARAMETERS = {
     "channel_binding",
@@ -1426,7 +1426,7 @@ FROM outside;
         )
         if fresh_control["schema_version"] != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION:
             raise ResetError(
-                "fresh control schema is not the required terminal schema version 14"
+                "fresh control schema is not the required terminal schema version 15"
             )
         fresh_usage = self._database_schema(
             self.new_usage_dsn,

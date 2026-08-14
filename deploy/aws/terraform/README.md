@@ -431,7 +431,7 @@ HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
 a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
-fail closed. `cats-controld` opens only exact clean-slate authority schema 14;
+fail closed. `cats-controld` opens only exact clean-slate authority schema 15;
 it does not migrate an earlier stamp or partial catalog in place.
 The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret

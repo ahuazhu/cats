@@ -13,7 +13,7 @@ use cats_api::route_grant_v2::{
 };
 use cats_api::runtime_reconciliation::{
     key_ring_digest, Base64UrlNoPad, Epoch, Id, KeyId, LifecycleAdmission, NodeIdentityState,
-    RandomId128, RouteGateState, RuntimeSchedulingState, Sha256Digest, UnixMillis,
+    RouteGateState, RuntimeSchedulingState, Sha256Digest, UnixMillis,
 };
 use cats_storage::authority::AuthorityError;
 use postgres::{Row, Transaction};
@@ -62,7 +62,6 @@ pub(crate) enum RouteGrantV2SigningAuthorityCommandKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RouteGrantV2SigningAuthorityCommand {
-    pub(crate) command_id: RandomId128,
     pub(crate) successor: RouteGrantV2SignerReference,
     pub(crate) kind: RouteGrantV2SigningAuthorityCommandKind,
 }
@@ -73,26 +72,13 @@ pub(crate) enum RouteGrantV2SigningAuthorityCommandResult {
     Applied {
         signer_revision: Epoch,
         public_key_ring_version: Epoch,
-        secret_deletion_authorizations: Vec<RouteGrantV2SecretDeletionAuthorization>,
     },
-    PreconditionFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RouteGrantV2SecretDeletionAuthorization {
-    pub(crate) authorization_id: RandomId128,
-    pub(crate) deployment_id: Id,
-    pub(crate) kid: KeyId,
-    pub(crate) secret_reference_id: Id,
-    pub(crate) retired_signer_revision: Epoch,
-    pub(crate) authorized_at_unix_ms: UnixMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteGrantV2SigningAuthorityStoreOutcome {
-    Stored(RouteGrantV2SigningAuthorityCommandResult),
-    CommandIdConflict,
+    Committed(RouteGrantV2SigningAuthorityCommandResult),
+    PreconditionFailed,
 }
 
 /// Startup-pinned, non-secret signer facts compared on every resolve. The
@@ -184,10 +170,9 @@ impl Store {
         })
     }
 
-    /// Execute or exact-replay one bounded rotation/disable command. The
-    /// trusted composition constructs this typed value after its independent
-    /// machine-admin authentication; no legacy bearer or SQL surface reaches
-    /// the writer directly.
+    /// Execute one bounded rotation/disable transition. This Store method is
+    /// not itself an operator principal or transport; a production caller is
+    /// intentionally absent until an Accepted authority can invoke it.
     #[allow(
         dead_code,
         reason = "typed G3 admin/control boundary awaiting its independent machine-auth transport"
@@ -201,10 +186,10 @@ impl Store {
         self.authority_request_transaction(request, |transaction| {
             let outcome = apply_command_in(transaction, command)?;
             Ok(match outcome {
-                RouteGrantV2SigningAuthorityStoreOutcome::Stored(_) => {
+                RouteGrantV2SigningAuthorityStoreOutcome::Committed(_) => {
                     AuthorityRequestDisposition::Commit(outcome)
                 }
-                RouteGrantV2SigningAuthorityStoreOutcome::CommandIdConflict => {
+                RouteGrantV2SigningAuthorityStoreOutcome::PreconditionFailed => {
                     AuthorityRequestDisposition::Reject(outcome)
                 }
             })
@@ -284,12 +269,10 @@ fn ensure_signer_tables_empty(transaction: &mut Transaction<'_>) -> AuthorityTxR
             (SELECT count(*) FROM route_v2_signer_revisions),
             (SELECT count(*) FROM route_v2_signer_key_lineage),
             (SELECT count(*) FROM route_v2_public_key_ring_revisions),
-            (SELECT count(*) FROM route_v2_signer_retirements),
-            (SELECT count(*) FROM route_v2_secret_deletion_authorizations),
-            (SELECT count(*) FROM route_v2_signing_authority_commands)",
+            (SELECT count(*) FROM route_v2_signer_retirements)",
         &[],
     )?;
-    if (0..6)
+    if (0..4)
         .map(|index| row.try_get::<_, i64>(index))
         .collect::<std::result::Result<Vec<_>, _>>()?
         .iter()
@@ -408,18 +391,6 @@ fn apply_command_in(
     command: &RouteGrantV2SigningAuthorityCommand,
 ) -> AuthorityTxResult<RouteGrantV2SigningAuthorityStoreOutcome> {
     lock_route_v2_machine_authority_exclusive(transaction)?;
-    let request_bytes = canonical_json(command)?;
-    let request_sha256 = Sha256Digest::from_bytes(Sha256::digest(&request_bytes).into());
-    if let Some((stored_request, stored_outcome)) = load_command(transaction, &command.command_id)?
-    {
-        if stored_request != request_bytes {
-            return Ok(RouteGrantV2SigningAuthorityStoreOutcome::CommandIdConflict);
-        }
-        return Ok(RouteGrantV2SigningAuthorityStoreOutcome::Stored(
-            stored_outcome,
-        ));
-    }
-
     let Some(pointer) = load_pointer(transaction, "FOR UPDATE")? else {
         return Ok(precondition_failed());
     };
@@ -468,7 +439,7 @@ fn apply_command_in(
             &pointer,
             &current,
             current_ring,
-            command,
+            &command.successor,
             committed_at,
         )?,
         RouteGrantV2SigningAuthorityCommandKind::Disable => disable_in(
@@ -484,28 +455,18 @@ fn apply_command_in(
             &pointer,
             &current,
             current_ring,
-            command,
+            &command.successor,
             committed_at,
         )?,
     };
     let Some(result) = applied else {
         return Ok(precondition_failed());
     };
-    insert_command(
-        transaction,
-        command,
-        &request_bytes,
-        &request_sha256,
-        &result,
-        committed_at,
-    )?;
-    Ok(RouteGrantV2SigningAuthorityStoreOutcome::Stored(result))
+    Ok(RouteGrantV2SigningAuthorityStoreOutcome::Committed(result))
 }
 
 fn precondition_failed() -> RouteGrantV2SigningAuthorityStoreOutcome {
-    RouteGrantV2SigningAuthorityStoreOutcome::Stored(
-        RouteGrantV2SigningAuthorityCommandResult::PreconditionFailed,
-    )
+    RouteGrantV2SigningAuthorityStoreOutcome::PreconditionFailed
 }
 
 fn successor_of_current(
@@ -613,7 +574,7 @@ fn publish_overlap_in(
             successor_ring.ring_version,
         )?;
     }
-    Ok(Some(applied(successor, Vec::new())))
+    Ok(Some(applied(successor)))
 }
 
 fn switch_active_in(
@@ -661,7 +622,7 @@ fn switch_active_in(
         committed_at,
         "normal",
     )?;
-    Ok(Some(applied(successor, Vec::new())))
+    Ok(Some(applied(successor)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -711,7 +672,7 @@ fn publish_new_only_in(
         &retirement.kid,
         successor_ring.ring_version,
     )?;
-    Ok(Some(applied(successor, Vec::new())))
+    Ok(Some(applied(successor)))
 }
 
 fn retire_normal_in(
@@ -719,10 +680,9 @@ fn retire_normal_in(
     pointer: &RouteV2SignerPointer,
     current: &RouteGrantV2SignerBinding,
     current_ring: &RouteGrantV2PublicKeyRingArtifact,
-    command: &RouteGrantV2SigningAuthorityCommand,
+    successor: &RouteGrantV2SignerReference,
     committed_at: UnixMillis,
 ) -> AuthorityTxResult<Option<RouteGrantV2SigningAuthorityCommandResult>> {
-    let successor = &command.successor;
     if successor.signer != current.reference.signer
         || successor.public_key_ring_version != current_ring.ring_version
         || successor.public_key_ring_digest != current_ring.digest().map_err(corrupt)?
@@ -743,15 +703,14 @@ fn retire_normal_in(
     }
     insert_signer_revision(transaction, successor, committed_at)?;
     update_pointer(transaction, successor)?;
-    let receipt = retire_key_and_authorize_deletion(
+    retire_key(
         transaction,
         &pointer.deployment_id,
         retirement,
-        command.command_id.clone(),
         successor.signer_revision,
         committed_at,
     )?;
-    Ok(Some(applied(successor, vec![receipt])))
+    Ok(Some(applied(successor)))
 }
 
 fn disable_in(
@@ -803,7 +762,7 @@ fn disable_in(
             "emergency",
         )?;
     }
-    Ok(Some(applied(successor, Vec::new())))
+    Ok(Some(applied(successor)))
 }
 
 fn activate_in(
@@ -811,10 +770,9 @@ fn activate_in(
     pointer: &RouteV2SignerPointer,
     current: &RouteGrantV2SignerBinding,
     current_ring: &RouteGrantV2PublicKeyRingArtifact,
-    command: &RouteGrantV2SigningAuthorityCommand,
+    successor: &RouteGrantV2SignerReference,
     committed_at: UnixMillis,
 ) -> AuthorityTxResult<Option<RouteGrantV2SigningAuthorityCommandResult>> {
-    let successor = &command.successor;
     let RouteGrantV2SignerSelection::Active {
         active_kid,
         secret_reference_id,
@@ -851,29 +809,22 @@ fn activate_in(
     }
     insert_signer_revision(transaction, successor, committed_at)?;
     update_pointer(transaction, successor)?;
-    let mut receipts = Vec::with_capacity(retirements.len());
-    for (index, retirement) in retirements.iter().enumerate() {
-        let authorization_id = derived_authorization_id(&command.command_id, index)?;
-        receipts.push(retire_key_and_authorize_deletion(
+    for retirement in &retirements {
+        retire_key(
             transaction,
             &pointer.deployment_id,
             retirement,
-            authorization_id,
             successor.signer_revision,
             committed_at,
-        )?);
+        )?;
     }
-    Ok(Some(applied(successor, receipts)))
+    Ok(Some(applied(successor)))
 }
 
-fn applied(
-    successor: &RouteGrantV2SignerReference,
-    secret_deletion_authorizations: Vec<RouteGrantV2SecretDeletionAuthorization>,
-) -> RouteGrantV2SigningAuthorityCommandResult {
+fn applied(successor: &RouteGrantV2SignerReference) -> RouteGrantV2SigningAuthorityCommandResult {
     RouteGrantV2SigningAuthorityCommandResult::Applied {
         signer_revision: successor.signer_revision,
         public_key_ring_version: successor.public_key_ring_version,
-        secret_deletion_authorizations,
     }
 }
 
@@ -1352,14 +1303,13 @@ pub(super) fn strictly_after_retention(
     Ok(now.get() > deadline)
 }
 
-fn retire_key_and_authorize_deletion(
+fn retire_key(
     transaction: &mut Transaction<'_>,
     deployment_id: &Id,
     retirement: &RetirementRow,
-    authorization_id: RandomId128,
     retired_signer_revision: Epoch,
     retired_at: UnixMillis,
-) -> AuthorityTxResult<RouteGrantV2SecretDeletionAuthorization> {
+) -> AuthorityTxResult<()> {
     exactly_one(transaction.execute(
         "UPDATE route_v2_signer_key_lineage
             SET state='retired', retired_at_unix_ms=$3
@@ -1386,203 +1336,7 @@ fn retire_key_and_authorize_deletion(
             &retired_at.to_pg().map_err(corrupt)?,
         ],
     )?)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO route_v2_secret_deletion_authorizations (
-            authorization_id, deployment_id, kid, secret_reference_id,
-            retired_signer_revision, authorized_at_unix_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6)",
-        &[
-            &authorization_id.as_str(),
-            &deployment_id.as_str(),
-            &retirement.kid.as_str(),
-            &retirement.secret_reference_id.as_str(),
-            &retired_signer_revision.to_pg().map_err(corrupt)?,
-            &retired_at.to_pg().map_err(corrupt)?,
-        ],
-    )?)?;
-    Ok(RouteGrantV2SecretDeletionAuthorization {
-        authorization_id,
-        deployment_id: deployment_id.clone(),
-        kid: retirement.kid.clone(),
-        secret_reference_id: retirement.secret_reference_id.clone(),
-        retired_signer_revision,
-        authorized_at_unix_ms: retired_at,
-    })
-}
-
-fn derived_authorization_id(
-    command_id: &RandomId128,
-    index: usize,
-) -> AuthorityTxResult<RandomId128> {
-    let mut digest = Sha256::new();
-    digest.update(b"cats.route-v2.secret-deletion-authorization.v1");
-    digest.update([0]);
-    digest.update(command_id.as_str().as_bytes());
-    digest.update([0]);
-    digest.update(u64::try_from(index).map_err(corrupt)?.to_be_bytes());
-    let encoded = hex::encode(digest.finalize());
-    RandomId128::new(encoded[..32].to_owned())
-        .ok_or_else(|| corrupt("derived Route v2 authorization ID is invalid"))
-}
-
-fn canonical_json<T: serde::Serialize>(value: &T) -> AuthorityTxResult<Vec<u8>> {
-    serde_json::to_vec(value).map_err(corrupt)
-}
-
-fn insert_command(
-    transaction: &mut Transaction<'_>,
-    command: &RouteGrantV2SigningAuthorityCommand,
-    request_bytes: &[u8],
-    request_sha256: &Sha256Digest,
-    result: &RouteGrantV2SigningAuthorityCommandResult,
-    committed_at: UnixMillis,
-) -> AuthorityTxResult<()> {
-    let outcome = canonical_json(result)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO route_v2_signing_authority_commands (
-            command_id, request_bytes, request_sha256, kind, deployment_id,
-            successor_signer_revision, successor_signer_reference_sha256,
-            outcome, committed_at_unix_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        &[
-            &command.command_id.as_str(),
-            &request_bytes,
-            &request_sha256.as_str(),
-            &command_kind(&command.kind),
-            &command.successor.deployment_id.as_str(),
-            &command.successor.signer_revision.to_pg().map_err(corrupt)?,
-            &command.successor.digest().map_err(corrupt)?.as_str(),
-            &outcome,
-            &committed_at.to_pg().map_err(corrupt)?,
-        ],
-    )?)
-}
-
-fn load_command(
-    transaction: &mut Transaction<'_>,
-    command_id: &RandomId128,
-) -> AuthorityTxResult<Option<(Vec<u8>, RouteGrantV2SigningAuthorityCommandResult)>> {
-    transaction
-        .query_opt(
-            "SELECT request_bytes, request_sha256, kind, deployment_id,
-                    successor_signer_revision,
-                    successor_signer_reference_sha256, outcome,
-                    committed_at_unix_ms
-               FROM route_v2_signing_authority_commands WHERE command_id=$1",
-            &[&command_id.as_str()],
-        )?
-        .map(|row| {
-            let request: Vec<u8> = row.try_get("request_bytes")?;
-            let stored_digest = parse_digest(row.try_get("request_sha256")?)?;
-            if Sha256Digest::from_bytes(Sha256::digest(&request).into()) != stored_digest {
-                return Err(corrupt("stored Route v2 command digest mismatch"));
-            }
-            let stored_command: RouteGrantV2SigningAuthorityCommand =
-                serde_json::from_slice(&request).map_err(corrupt)?;
-            if canonical_json(&stored_command)? != request
-                || stored_command.command_id != *command_id
-                || validate_command(&stored_command).is_err()
-                || row.try_get::<_, String>("kind")? != command_kind(&stored_command.kind)
-                || parse_id(row.try_get("deployment_id")?)?
-                    != stored_command.successor.deployment_id
-                || from_pg::<Epoch>(row.try_get("successor_signer_revision")?)?
-                    != stored_command.successor.signer_revision
-                || parse_digest(row.try_get("successor_signer_reference_sha256")?)?
-                    != stored_command.successor.digest().map_err(corrupt)?
-            {
-                return Err(corrupt("stored Route v2 command projection mismatch"));
-            }
-            let _: UnixMillis = from_pg(row.try_get("committed_at_unix_ms")?)?;
-            let outcome_bytes: Vec<u8> = row.try_get("outcome")?;
-            let outcome: RouteGrantV2SigningAuthorityCommandResult =
-                serde_json::from_slice(&outcome_bytes).map_err(corrupt)?;
-            if canonical_json(&outcome)? != outcome_bytes
-                || matches!(
-                    outcome,
-                    RouteGrantV2SigningAuthorityCommandResult::PreconditionFailed
-                )
-            {
-                return Err(corrupt("stored Route v2 command outcome is invalid"));
-            }
-            validate_stored_command_outcome(transaction, &stored_command, &outcome)?;
-            Ok((request, outcome))
-        })
-        .transpose()
-}
-
-fn validate_stored_command_outcome(
-    transaction: &mut Transaction<'_>,
-    command: &RouteGrantV2SigningAuthorityCommand,
-    outcome: &RouteGrantV2SigningAuthorityCommandResult,
-) -> AuthorityTxResult<()> {
-    let RouteGrantV2SigningAuthorityCommandResult::Applied {
-        signer_revision,
-        public_key_ring_version,
-        secret_deletion_authorizations,
-    } = outcome
-    else {
-        return Err(corrupt("stored Route v2 command outcome is not applied"));
-    };
-    if *signer_revision != command.successor.signer_revision
-        || *public_key_ring_version != command.successor.public_key_ring_version
-        || (!matches!(
-            &command.kind,
-            RouteGrantV2SigningAuthorityCommandKind::Retire
-                | RouteGrantV2SigningAuthorityCommandKind::Activate
-        ) && !secret_deletion_authorizations.is_empty())
-        || (matches!(
-            &command.kind,
-            RouteGrantV2SigningAuthorityCommandKind::Retire
-        ) && secret_deletion_authorizations.len() != 1)
-    {
-        return Err(corrupt(
-            "stored Route v2 command outcome projection mismatch",
-        ));
-    }
-    let persisted = transaction
-        .query(
-            "SELECT authorization_id, deployment_id, kid, secret_reference_id,
-                    retired_signer_revision, authorized_at_unix_ms
-               FROM route_v2_secret_deletion_authorizations
-              WHERE deployment_id=$1 AND retired_signer_revision=$2
-              ORDER BY kid COLLATE \"C\"",
-            &[
-                &command.successor.deployment_id.as_str(),
-                &command.successor.signer_revision.to_pg().map_err(corrupt)?,
-            ],
-        )?
-        .iter()
-        .map(|row| {
-            Ok(RouteGrantV2SecretDeletionAuthorization {
-                authorization_id: RandomId128::new(row.try_get::<_, String>("authorization_id")?)
-                    .ok_or_else(|| {
-                    corrupt("stored Route v2 authorization ID is malformed")
-                })?,
-                deployment_id: parse_id(row.try_get("deployment_id")?)?,
-                kid: parse_kid(row.try_get("kid")?)?,
-                secret_reference_id: parse_id(row.try_get("secret_reference_id")?)?,
-                retired_signer_revision: from_pg(row.try_get("retired_signer_revision")?)?,
-                authorized_at_unix_ms: from_pg(row.try_get("authorized_at_unix_ms")?)?,
-            })
-        })
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    if persisted != *secret_deletion_authorizations {
-        return Err(corrupt(
-            "stored Route v2 command/deletion authorization mismatch",
-        ));
-    }
     Ok(())
-}
-
-fn command_kind(kind: &RouteGrantV2SigningAuthorityCommandKind) -> &'static str {
-    match kind {
-        RouteGrantV2SigningAuthorityCommandKind::PublishOverlap { .. } => "publish_overlap",
-        RouteGrantV2SigningAuthorityCommandKind::SwitchActive => "switch_active",
-        RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly { .. } => "publish_new_only",
-        RouteGrantV2SigningAuthorityCommandKind::Retire => "retire",
-        RouteGrantV2SigningAuthorityCommandKind::Disable => "disable",
-        RouteGrantV2SigningAuthorityCommandKind::Activate => "activate",
-    }
 }
 
 fn lock_current_provisioned_fleet(

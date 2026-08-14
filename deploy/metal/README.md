@@ -67,7 +67,7 @@ Each initial cordoned A23 policy also carries the operator-reviewed canonical
 `node_transport_target` (`https://<lowercase-dns-name>:7444` for the production Route v2 machine listener). The deployment provisioner/admin owns
 that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
 Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
-The matching Control rollout requires exact clean-slate Store authority schema version 14; every earlier version is
+The matching Control rollout requires exact clean-slate Store authority schema version 15; every earlier version is
 rejected rather than altered in place, so create or recreate the empty version-14 schema before any new Control
 replica starts.
 
@@ -153,7 +153,7 @@ RootDisk expands online at first boot; provision at least 1 GiB for normal use.
 legacy create/exec/Suspend/Warm/Cold/destroy APIs and produced the retained
 physical evidence below. The production clean-slate route map deliberately
 does not expose those legacy APIs, so running this script from the current
-branch is not a qualification for schema 14 or the signed Runtime cutover.
+branch is not a qualification for schema 15 or the signed Runtime cutover.
 
 The historical harness checked create, Guest/systemd readiness, networking,
 durable writes, Suspend/Resume, Warm snapshot/restore, Cold boot and destroy

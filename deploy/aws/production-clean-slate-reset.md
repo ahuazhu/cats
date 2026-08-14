@@ -145,7 +145,7 @@ The executor proves old/fresh schemas, stream names, checkpoint table names and
 usage archive buckets are distinct. ChunkStore prefixes must not overlap when
 they share a bucket. It independently verifies both old and fresh resource
 identities and inventories; the fresh control schema must be terminal schema
-version 14.
+version 15.
 
 Deleting the old Kinesis stream/table additionally requires a signed final
 usage epoch/barrier receipt from E9. A Proposed producer/parser now exists for

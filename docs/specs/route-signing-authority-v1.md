@@ -1,8 +1,8 @@
 # Route v2 Signing Authority v1
 
-- 状态：Frozen target contract；artifact codecs/readers、PG exact lineage/current binding、Control machine
-  resolve current compare、Node durable successor installer及持久rotation/revocation rollout已实现；G3 catalog
-  保留最终authority schema 17，须在E9 schema 15与V3 schema 16之后集成，当前独立分支不改变release stamp
+- 状态：Frozen contract；artifact codecs/readers、PG exact lineage/current binding、Control machine resolve
+  current compare、Node durable successor installer及schema 15持久rotation/revocation state machine已实现；
+  ADR尚未授予production caller/transport触发该Store transition的权限，因此production invocation保持关闭
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -142,7 +142,9 @@ exact bytes SHA-256 是
 secret-reference/kid lineage；same exact revision replay零写，same revision不同bytes、gap、stale、曾retire
 的reference/kid复用全部fail startup。当前initial-install slice只接受revision 1/null previous或其exact
 零写replay；即使本地artifact是合法successor也不会自动推进PG current。后续revision只由typed rotation/
-revocation command在singleton lock内推进；caller不能提供ACK布尔值、private bytes或时间。
+revocation transition在singleton lock内推进；调用者不能提供ACK布尔值、private bytes或时间。该Store边界
+本身不建立operator principal、wire protocol或DSN权限；A23与startup artifact均不得调用它，在另有Accepted
+authority前production没有触发入口。
 
 每次resolve的单一PG signer snapshot最终还必须比较进程内`deployment_id/signer_revision/reference digest/
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
@@ -166,8 +168,9 @@ disabled、stale或投影损坏时，触发请求返回503，同时永久关闭�
    equality仍不可retire。此间只能在old private仍存在且overlap ring仍发布时回切。
 4. deadline后发布只含new的下一ring revision；已有overlap ACK的Node仍可接new token，移除artifact逐Node
    原子加载。再次等待全部schedulable Node exact ACK。
-5. signer CAS确认retention、new-only published pointer及全部ACK后永久retire old kid/reference lineage；随后
-   secret channel才可删除old private material。public/private deletion不能提前，也不靠文件缺席推断retire。
+5. signer CAS确认retention、new-only published pointer及全部ACK后永久retire old kid/reference lineage；
+   secret channel只能以该持久retired lineage为前提删除old private material。public/private deletion不能提前，
+   也不靠文件缺席推断retire。
 
 resolve只为其同一fresh observation ring中含current active kid的Node签发。因此staging期间old-only和overlap
 Node可继续接old token；switch后任何回退到old-only artifact的Node立即不可签发。ring version/digest主要是
@@ -198,6 +201,6 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | signer pair | active kid在exact ring；private->SPKI->kid exact；mismatch/wrong algorithm/malformed PEM不构造signer；disabled不读private |
 | separation | A19/A23/V1 keys、shared bearer、header identity均不能构造descriptor、signer或ring ACK |
 | persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
-| rotation | overlap ACK -> switch -> strict >305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK；并发replica exact replay |
-| revocation | persisted disable先于新签发停止；reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK后才activate；只发nonsecret deletion receipt |
+| rotation | overlap ACK -> switch -> strict >305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK；并发replica只提交一个exact successor，stale retry零写 |
+| revocation | persisted disable先于新签发停止；reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK后才activate；retired lineage是secret删除前提 |
 | deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |

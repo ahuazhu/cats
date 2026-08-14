@@ -347,7 +347,7 @@ The operator must review the first line as
 `<EXPECTED_DATABASE>|<EXPECTED_ROLE>|ABSENT`, the mutation output as `CREATE SCHEMA`, and the final
 line as `<FRESH_CONTROL_SCHEMA>|<FRESH_CONTROL_DATABASE_ROLE>`. This SQL is a declared production
 mutation, not a provisioner route; it creates one previously absent schema and performs no
-retirement. The exact release will install the complete schema-14 catalog and stamp atomically on
+retirement. The exact release will install the complete schema-15 catalog and stamp atomically on
 its first Control connection. The application plan must preserve the current Usage target
 byte-for-byte while selecting this fresh Control schema and prefix.
 

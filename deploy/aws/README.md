@@ -309,7 +309,7 @@ The same central provisioner must put the reviewed private-DNS Node listener int
 not from worker registration, observation, IMDS, the listener source address, or legacy `nodes.agent_url`.
 Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
 rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
-This contract uses the exact clean-slate Control Store authority schema version 14. An existing earlier schema is
+This contract uses the exact clean-slate Control Store authority schema version 15. An existing earlier schema is
 not altered in place and refuses startup; provision or recreate an empty version-14 schema before starting any new
 Control replica, with no mixed-version rolling window.
 
@@ -395,7 +395,7 @@ does not start the retired NodeJob reconciler or billing-enforcer singleton.
 Existing API-replica and advisory-lock tests do not by themselves prove a
 current public-spawn PostgreSQL-to-physical runtime takeover.
 
-The authority database carries exact clean-slate schema version 14.
+The authority database carries exact clean-slate schema version 15.
 `cats-controld` does not migrate an earlier authority schema in place and fails
 closed on any other stamp or catalog shape. The pre-cutover
 `cats-control-data` PVC is no longer part of the runtime; its final snapshot
@@ -406,7 +406,7 @@ safe-header collection, Pod-UID recheck and PDB-governed eviction are retained
 as historical V1 control-plane HA evidence. Its reconciler-owner oracle targets
 the retired singleton and therefore must not be run from `main` or cited as a
 clean-slate runtime qualification. A replacement must use the production
-public spawn, schema 14 and the signed Runtime composition, preserve the exact
+public spawn, schema 15 and the signed Runtime composition, preserve the exact
 tested SHA, and pass before this boundary is promoted.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1
