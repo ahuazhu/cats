@@ -934,7 +934,7 @@ with ad hoc ingress or Node commands.
 - Stage A uses a fresh Control schema and ChunkStore prefix but the reviewed current Usage target;
   Stage B requires a disjoint final fresh Usage target.
 - A23 initial policies are cordoned; E12 proves the exact empty fleet and key-ring ACK.
-- Both E3 block paths pass all eight cases with checksum-valid evidence.
+- Both E3 block paths pass all nine cases with checksum-valid evidence.
 - Local/full, compatibility Linux, native x86_64 Linux and real metal evidence are retained.
 - Reset planning begins only in Stage B and repeats every exact target; production execute remains
   blocked today.
