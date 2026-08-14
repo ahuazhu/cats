@@ -589,8 +589,10 @@ pub struct Config {
 /// validated Route v2 signer/binding.
 pub struct GatewayMachineConfig {
     listen: String,
+    rotation_listen: Option<String>,
     gateway_authority: GatewayWorkloadIdentityAuthority,
     tls_config: crate::gateway_machine::GatewayMachineTlsConfig,
+    rotation_tls_config: Option<crate::route_rotation_machine::RouteRotationMachineTlsConfig>,
     signing_authority: Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
     rotation_operator_trust: Option<InstalledRouteV2RotationOperatorTrust>,
     rotation_release_commit_sha: Option<String>,
@@ -599,21 +601,31 @@ pub struct GatewayMachineConfig {
 impl GatewayMachineConfig {
     pub fn new(
         listen: impl Into<String>,
+        rotation_listen: impl Into<String>,
         gateway_artifacts: InstalledGatewayMachineArtifacts,
         signer_artifacts: InstalledRouteGrantV2Signer,
         rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
         route_grant_ttl_seconds: u64,
     ) -> anyhow::Result<Self> {
         let listen = listen.into();
+        let rotation_listen = rotation_listen.into();
         anyhow::ensure!(
             !listen.is_empty(),
             "Gateway machine listen address is empty"
+        );
+        anyhow::ensure!(
+            !rotation_listen.is_empty() && rotation_listen != listen,
+            "Route rotation machine listen must be nonempty and independent"
         );
         // Complete TLS/key-pair validation before PostgreSQL installation or
         // either network bind. Raw fixed private bytes drop on return.
         let tls_config = crate::gateway_machine::GatewayMachineTlsConfig::from_installed_artifacts(
             &gateway_artifacts,
         )?;
+        let rotation_tls_config =
+            crate::route_rotation_machine::RouteRotationMachineTlsConfig::from_installed_artifacts(
+                &gateway_artifacts,
+            )?;
         let signing_authority = Arc::new(
             crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_installed_artifacts(
                 &signer_artifacts,
@@ -625,8 +637,10 @@ impl GatewayMachineConfig {
         )?;
         Ok(Self {
             listen,
+            rotation_listen: Some(rotation_listen),
             gateway_authority: gateway_artifacts.authority().clone(),
             tls_config,
+            rotation_tls_config: Some(rotation_tls_config),
             signing_authority,
             rotation_operator_trust: Some(rotation_operator_trust),
             rotation_release_commit_sha: Some(rotation_release_commit_sha),
@@ -647,8 +661,10 @@ impl GatewayMachineConfig {
         );
         Ok(Self {
             listen,
+            rotation_listen: None,
             gateway_authority,
             tls_config,
+            rotation_tls_config: None,
             signing_authority,
             rotation_operator_trust: None,
             rotation_release_commit_sha: None,
@@ -733,6 +749,9 @@ pub struct Handle {
     /// Bound only when `spawn_with_gateway_machine` receives a complete fixed
     /// machine composition.
     pub gateway_machine_addr: Option<std::net::SocketAddr>,
+    /// Bound whenever the production Route rotation authority is installed,
+    /// including while the loaded signer is disabled and readiness is closed.
+    pub route_rotation_machine_addr: Option<std::net::SocketAddr>,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
     reconciler_task: Option<ManagedSingletonTask>,
@@ -743,6 +762,8 @@ pub struct Handle {
     >,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     gateway_machine_listener: Option<crate::gateway_machine::GatewayMachineListener>,
+    route_rotation_machine_listener:
+        Option<crate::route_rotation_machine::RouteRotationMachineListener>,
 }
 
 /// Joinable ownership of one elected background role.
@@ -795,6 +816,9 @@ impl Handle {
         format!("http://{}", self.addr)
     }
     fn begin_shutdown(&self) {
+        if let Some(listener) = &self.route_rotation_machine_listener {
+            listener.begin_shutdown();
+        }
         if let Some(listener) = &self.gateway_machine_listener {
             listener.begin_shutdown();
         }
@@ -887,6 +911,13 @@ impl Handle {
                 Ok(())
             }
         };
+        let route_rotation_machine = async {
+            if let Some(listener) = &self.route_rotation_machine_listener {
+                listener.shutdown().await
+            } else {
+                Ok(())
+            }
+        };
         let (
             _,
             transition_result,
@@ -899,6 +930,7 @@ impl Handle {
             route_rotation_result,
             manifest_result,
             gateway_machine_result,
+            route_rotation_machine_result,
             reconciler_result,
             billing_enforcer_result,
             volume_delete_sweeper_result,
@@ -914,6 +946,7 @@ impl Handle {
             route_rotation_resolutions,
             manifest_reads,
             gateway_machine,
+            route_rotation_machine,
             reconciler,
             billing_enforcer,
             volume_delete_sweeper
@@ -928,6 +961,7 @@ impl Handle {
         fleet_verification_result?;
         route_result?;
         gateway_machine_result?;
+        route_rotation_machine_result?;
         reconciler_result?;
         billing_enforcer_result?;
         volume_delete_sweeper_result?;
@@ -1514,6 +1548,11 @@ async fn spawn_inner(
         ),
     );
     let readiness = Arc::new(ReadinessLatch::new());
+    let gateway_machine_control = gateway_machine.as_ref().map(|_| {
+        Arc::new(
+            crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(&readiness)),
+        )
+    });
     let route_v2_signing_operator = match gateway_machine.as_ref() {
         Some(machine) => match (
             machine.rotation_operator_trust.as_ref(),
@@ -1526,6 +1565,7 @@ async fn spawn_inner(
                     release.clone(),
                     Arc::clone(&readiness),
                     Arc::new(machine.signing_authority.binding().clone()),
+                    gateway_machine_control.clone(),
                 )?,
             )),
             (None, None) => None,
@@ -1585,15 +1625,33 @@ async fn spawn_inner(
         retired_product_authority_for_tests,
     };
 
-    let gateway_machine_listener = if let Some(machine) = gateway_machine {
+    let (gateway_machine_listener, route_rotation_machine_listener) = if let Some(mut machine) =
+        gateway_machine
+    {
+        let route_rotation_machine_listener = match (
+            machine.rotation_listen.take(),
+            machine.rotation_tls_config.take(),
+        ) {
+            (Some(listen), Some(tls)) => Some(
+                crate::route_rotation_machine::RouteRotationMachineListener::spawn(
+                    &listen,
+                    tls,
+                    state.clone(),
+                )
+                .await?,
+            ),
+            (None, None) if machine.rotation_operator_trust.is_none() => None,
+            _ => anyhow::bail!("incomplete Route rotation machine-listener composition"),
+        };
         let signer = machine.signing_authority.signer().cloned().map(Arc::new);
         let binding = Arc::new(machine.signing_authority.binding().clone());
-        if gateway_machine_signer_may_serve_at_startup(&state.readiness, signer.is_some()) {
-            let control = Arc::new(
-                crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(
-                    &state.readiness,
-                )),
-            );
+        let gateway_machine_listener = if gateway_machine_signer_may_serve_at_startup(
+            &state.readiness,
+            signer.is_some(),
+        ) {
+            let control = gateway_machine_control
+                .clone()
+                .context("Gateway machine control disappeared before listener bind")?;
             let service = Arc::new(
                 crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
                     Arc::clone(&state.store),
@@ -1622,9 +1680,10 @@ async fn spawn_inner(
                 "Route Grant v2 signer is disabled; Gateway machine serving and readiness remain closed until process restart after installing an active authority"
             );
             None
-        }
+        };
+        (gateway_machine_listener, route_rotation_machine_listener)
     } else {
-        None
+        (None, None)
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -1735,10 +1794,14 @@ async fn spawn_inner(
     let gateway_machine_addr = gateway_machine_listener
         .as_ref()
         .map(crate::gateway_machine::GatewayMachineListener::addr);
-    tracing::info!(%addr, ?gateway_machine_addr, "control plane ready");
+    let route_rotation_machine_addr = route_rotation_machine_listener
+        .as_ref()
+        .map(crate::route_rotation_machine::RouteRotationMachineListener::addr);
+    tracing::info!(%addr, ?gateway_machine_addr, ?route_rotation_machine_addr, "control plane ready");
     Ok(Handle {
         addr,
         gateway_machine_addr,
+        route_rotation_machine_addr,
         state,
         server_task,
         reconciler_task,
@@ -1747,6 +1810,7 @@ async fn spawn_inner(
         image_manifest_resolver: image_manifests,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
         gateway_machine_listener,
+        route_rotation_machine_listener,
     })
 }
 

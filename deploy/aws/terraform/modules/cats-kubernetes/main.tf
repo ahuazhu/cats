@@ -365,6 +365,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "0.0.0.0:7300",
             "--route-v2-machine-listen",
             "0.0.0.0:7443",
+            "--route-v2-rotation-listen",
+            "0.0.0.0:7444",
             "--control-store-url-file",
             "/etc/cats/runtime/CATS_POSTGRES_URL",
             "--guest-runtime-profile-receipt-file",
@@ -427,6 +429,11 @@ resource "kubernetes_deployment_v1" "control_plane" {
           port {
             name           = "route-v2"
             container_port = 7443
+          }
+
+          port {
+            name           = "route-rotation"
+            container_port = 7444
           }
 
           resources {
@@ -634,6 +641,34 @@ resource "kubernetes_service_v1" "control_plane_route_v2" {
       name        = "route-v2"
       port        = 7443
       target_port = "route-v2"
+    }
+  }
+}
+
+# Signed Route rotation and public successor/current discovery remain reachable
+# while a disabled Control replica intentionally fails its public readiness
+# probe. This server-authenticated TLS Service has no public Ingress and does
+# not carry the mandatory Gateway client-certificate principal.
+resource "kubernetes_service_v1" "control_plane_route_v2_rotation" {
+  metadata {
+    name      = "cats-controld-route-rotation"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-controld"
+    })
+  }
+
+  spec {
+    publish_not_ready_addresses = true
+
+    selector = {
+      "app.kubernetes.io/name" = "cats-controld"
+    }
+
+    port {
+      name        = "route-rotation"
+      port        = 7444
+      target_port = "route-rotation"
     }
   }
 }

@@ -56,6 +56,7 @@ use super::{
 use crate::stable_unix_fs::{c_os_name, mkdir_at};
 
 const CONTROL_MACHINE_DNS: &str = "cats-controld-route-v2.cats.svc.cluster.local";
+const CONTROL_ROTATION_MACHINE_DNS: &str = "cats-controld-route-rotation.cats.svc.cluster.local";
 const HTTP_11_ALPN: &[u8] = b"http/1.1";
 const MAX_PEM_BYTES: usize = 65_536;
 const MAX_PRIVATE_KEY_BYTES: usize = 16_384;
@@ -2494,7 +2495,10 @@ fn generate(candidate: &Candidate, inputs: &Inputs, openssl_executable: &Path) -
             label: "control",
             common_name: "Cats Route v2 Control machine",
             extended_key_usage: "serverAuth",
-            dns_names: &[CONTROL_MACHINE_DNS.to_owned()],
+            dns_names: &[
+                CONTROL_MACHINE_DNS.to_owned(),
+                CONTROL_ROTATION_MACHINE_DNS.to_owned(),
+            ],
         },
         &ca_key,
         &ca_certificate,
@@ -3268,8 +3272,13 @@ fn verify(candidate: &Candidate, inputs: &Inputs) -> Result<VerificationReceipt>
     )?;
     let control_peer = handshake(
         Arc::clone(&gateway_client),
-        control_server,
+        Arc::clone(&control_server),
         CONTROL_MACHINE_DNS,
+    )?;
+    handshake(
+        Arc::clone(&gateway_client),
+        control_server,
+        CONTROL_ROTATION_MACHINE_DNS,
     )?;
     let expected_gateway_digest = Sha256Digest::from_bytes(Sha256::digest(&gateway_spki).into());
     anyhow::ensure!(

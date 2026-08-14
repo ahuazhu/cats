@@ -146,6 +146,12 @@ struct Args {
     /// its frozen installed path; there are no path or inline-byte options.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
     route_v2_machine_listen: Option<String>,
+    /// Independent server-auth TLS listener for signed Route v2 rotation and
+    /// public successor/current discovery. Production composes it whenever
+    /// the Gateway machine listener is configured, and it stays bound while
+    /// the loaded signer is disabled.
+    #[arg(long, env = "CATS_ROUTE_V2_ROTATION_LISTEN")]
+    route_v2_rotation_listen: Option<String>,
     #[arg(
         long,
         env = "CATS_ROUTE_GRANT_V2_TTL_SECONDS",
@@ -547,7 +553,10 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_production_cutover_operator_trust_bundle(
             &args.production_cutover_operator_trust_file,
         )?;
-    let gateway_machine = if let Some(listen) = args.route_v2_machine_listen {
+    let gateway_machine = if let (Some(listen), Some(rotation_listen)) = (
+        args.route_v2_machine_listen.clone(),
+        args.route_v2_rotation_listen.clone(),
+    ) {
         use cats_api::gateway_workload_identity::{
             CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
             GATEWAY_CLIENT_CA_BUNDLE_PATH, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
@@ -577,12 +586,17 @@ async fn main() -> anyhow::Result<()> {
             )?;
         Some(cats_control_plane::server::GatewayMachineConfig::new(
             listen,
+            rotation_listen,
             gateway_artifacts,
             signer_artifacts,
             rotation_operator_trust,
             args.route_grant_v2_ttl_seconds,
         )?)
     } else {
+        anyhow::ensure!(
+            args.route_v2_machine_listen.is_none() && args.route_v2_rotation_listen.is_none(),
+            "--route-v2-machine-listen and --route-v2-rotation-listen must be configured together"
+        );
         None
     };
     let server_config = cats_control_plane::server::Config {

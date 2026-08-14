@@ -13,6 +13,11 @@ output "control_plane_route_v2_service" {
   value       = "${kubernetes_service_v1.control_plane_route_v2.metadata[0].name}.${var.namespace}.svc.cluster.local:7443"
 }
 
+output "control_plane_route_v2_rotation_service" {
+  description = "Cluster-local server-authenticated Route v2 rotation authority, including while Control readiness is closed."
+  value       = "${kubernetes_service_v1.control_plane_route_v2_rotation.metadata[0].name}.${var.namespace}.svc.cluster.local:7444"
+}
+
 output "gateway_service" {
   description = "Cluster-local cats-gatewayd public-proxy service name."
   value       = "${kubernetes_service_v1.gateway.metadata[0].name}.${var.namespace}.svc"

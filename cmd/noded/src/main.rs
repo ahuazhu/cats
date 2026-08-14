@@ -30,6 +30,11 @@ struct Args {
     /// Absence keeps this ingress closed and does not read its fixed artifacts.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
     route_v2_machine_listen: Option<String>,
+    /// Server-authenticated HTTPS origin for adjacent Route v2 ring delivery.
+    /// It is mandatory with the machine listener and is independent from the
+    /// public management Control origin.
+    #[arg(long, env = "CATS_ROUTE_V2_ROTATION_ORIGIN")]
+    route_v2_rotation_origin: Option<String>,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -222,8 +227,11 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
-    let route_v2_machine = match args.route_v2_machine_listen {
-        Some(listen) => {
+    let route_v2_machine = match (
+        args.route_v2_machine_listen,
+        args.route_v2_rotation_origin.as_deref(),
+    ) {
+        (Some(listen), Some(rotation_origin)) => {
             let artifacts =
                 cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
                     &args.route_v2_public_key_ring_file,
@@ -235,10 +243,13 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 agent_registration.identity().node_id.clone(),
                 &artifacts,
-                &args.control_plane_url,
+                rotation_origin,
             )?)
         }
-        None => None,
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
+        ),
     };
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),

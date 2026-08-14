@@ -524,6 +524,11 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
         "route_v2_gateway_artifact_secret_name",
         "--route-v2-machine-listen",
         "0.0.0.0:7443",
+        "--route-v2-rotation-listen",
+        "0.0.0.0:7444",
+        "resource \"kubernetes_service_v1\" \"control_plane_route_v2_rotation\"",
+        "cats-controld-route-rotation",
+        "publish_not_ready_addresses = true",
         "resource \"kubernetes_deployment_v1\" \"gateway\"",
         "resource \"kubernetes_service_v1\" \"gateway\"",
         "cats-gatewayd",
@@ -568,6 +573,8 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
         "gateway-client-ca-bundle.pem",
         "node-machine-server-certificate.pem",
         "node-machine-server-private-key.pem",
+        "CATS_ROUTE_V2_ROTATION_ORIGIN",
+        "route_v2_rotation_origin",
     ] {
         assert!(
             worker.contains(expected) || worker_variables.contains(expected),
@@ -604,6 +611,7 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
     assert!(worker_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
+    assert!(worker_unit.contains("--route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN"));
     assert!(!worker_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
     assert!(!worker_unit.contains("--route-grant-public-key-file"));
 

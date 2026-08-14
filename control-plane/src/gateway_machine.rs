@@ -249,6 +249,61 @@ fn build_tls_config_from_pem(
     Ok(Arc::new(config))
 }
 
+/// Compose the same fixed Control server identity for the independent Route
+/// rotation transport, but deliberately do not request or accept a client
+/// certificate. The signed Ed25519 command envelope remains the only mutation
+/// principal on that listener.
+pub(crate) fn build_server_auth_tls_config(
+    artifacts: &InstalledGatewayMachineArtifacts,
+) -> anyhow::Result<Arc<ServerConfig>> {
+    build_server_auth_tls_config_from_pem(
+        artifacts.server_certificate_pem(),
+        artifacts.server_private_key_pem(),
+    )
+}
+
+fn build_server_auth_tls_config_from_pem(
+    server_certificate_pem: &[u8],
+    server_private_key_pem: &[u8],
+) -> anyhow::Result<Arc<ServerConfig>> {
+    let server_certificate_count = validate_pem_sequence(
+        server_certificate_pem,
+        "CERTIFICATE",
+        PemCardinality::OneOrMore,
+    )?;
+    let server_certificates = CertificateDer::pem_slice_iter(server_certificate_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .context("decode fixed rotation-transport Control server chain")?;
+    anyhow::ensure!(
+        server_certificates.len() == server_certificate_count,
+        "fixed rotation-transport Control server chain contains an unsupported PEM section"
+    );
+    let server_leaf = server_certificates
+        .first()
+        .context("fixed rotation-transport Control server chain has no leaf")?;
+    leaf_ed25519_spki_sha256(server_leaf.as_ref())
+        .context("fixed rotation-transport Control server leaf is not canonical Ed25519")?;
+    validate_pem_sequence(
+        server_private_key_pem,
+        "PRIVATE KEY",
+        PemCardinality::ExactlyOne,
+    )?;
+    let server_private_key = PrivatePkcs8KeyDer::from_pem_slice(server_private_key_pem)
+        .context("decode fixed rotation-transport Control PKCS#8 server private key")?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("build TLS 1.3-only Route rotation machine configuration")?
+        .with_no_client_auth()
+        .with_single_cert(
+            server_certificates,
+            PrivateKeyDer::Pkcs8(server_private_key),
+        )
+        .context("validate fixed rotation-transport Control server identity")?;
+    config.alpn_protocols = vec![HTTP_11_ALPN.to_vec()];
+    Ok(Arc::new(config))
+}
+
 #[derive(Clone, Copy)]
 enum PemCardinality {
     OneOrMore,

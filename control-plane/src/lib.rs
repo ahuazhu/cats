@@ -7,6 +7,7 @@ pub mod controller;
 pub(crate) mod gateway_machine;
 pub mod route_grant;
 pub(crate) mod route_grant_v2;
+pub(crate) mod route_rotation_machine;
 pub mod server;
 pub mod store;
 #[doc(hidden)]

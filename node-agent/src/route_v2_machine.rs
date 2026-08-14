@@ -78,7 +78,8 @@ pub struct RouteV2MachineConfig {
 
 #[derive(Clone)]
 struct RouteV2RingDeliveryConfig {
-    control_plane_origin: reqwest::Url,
+    rotation_origin: reqwest::Url,
+    control_server_roots: Vec<reqwest::Certificate>,
     trust: RouteV2RotationOperatorTrust,
     expected_release_commit_sha: String,
 }
@@ -100,7 +101,7 @@ impl RouteV2MachineConfig {
         listen: String,
         local_node_id: Id,
         artifacts: &InstalledNodeRouteV2MachineArtifacts,
-        control_plane_url: &str,
+        rotation_origin: &str,
     ) -> anyhow::Result<Self> {
         let (ring, tls) = compose_node_route_v2_machine_artifacts(artifacts)?;
         let trust = artifacts.rotation_operator_trust().trust().clone();
@@ -113,7 +114,10 @@ impl RouteV2MachineConfig {
             verifier: Arc::new(RouteGrantV2Verifier::new(ring)),
             ring_install_serialized: Arc::new(Mutex::new(())),
             delivery: Some(RouteV2RingDeliveryConfig {
-                control_plane_origin: validate_control_plane_origin(control_plane_url)?,
+                rotation_origin: validate_rotation_origin(rotation_origin)?,
+                control_server_roots: route_rotation_control_roots(
+                    artifacts.gateway_client_ca_bundle_pem(),
+                )?,
                 trust,
                 expected_release_commit_sha,
             }),
@@ -183,7 +187,7 @@ fn embedded_route_v2_rotation_release_commit_sha(trust_release: &str) -> anyhow:
     Ok(embedded.to_owned())
 }
 
-fn validate_control_plane_origin(input: &str) -> anyhow::Result<reqwest::Url> {
+fn validate_rotation_origin(input: &str) -> anyhow::Result<reqwest::Url> {
     let origin = reqwest::Url::parse(input).context("parse Route v2 delivery Control origin")?;
     anyhow::ensure!(
         origin.scheme() == "https"
@@ -193,9 +197,26 @@ fn validate_control_plane_origin(input: &str) -> anyhow::Result<reqwest::Url> {
             && origin.path() == "/"
             && origin.query().is_none()
             && origin.fragment().is_none(),
-        "Route v2 delivery Control origin must be one HTTPS origin"
+        "Route v2 delivery rotation origin must be one HTTPS origin"
     );
     Ok(origin)
+}
+
+fn route_rotation_control_roots(pem: &[u8]) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    let roots = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .context("decode Route v2 rotation Control CA bundle")?;
+    anyhow::ensure!(
+        !roots.is_empty(),
+        "Route v2 rotation Control CA bundle is empty"
+    );
+    roots
+        .into_iter()
+        .map(|certificate| {
+            reqwest::Certificate::from_der(certificate.as_ref())
+                .context("compose Route v2 rotation Control CA root")
+        })
+        .collect()
 }
 
 /// Validate the complete, immutable revision-1 Node artifact transaction.
@@ -376,11 +397,16 @@ async fn run_ring_delivery(
     installer: Arc<RouteGrantV2RingInstaller>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
+    let mut client = reqwest::Client::builder()
         .https_only(true)
+        .tls_built_in_root_certs(false)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(RING_DELIVERY_REQUEST_DEADLINE)
-        .timeout(RING_DELIVERY_REQUEST_DEADLINE)
+        .timeout(RING_DELIVERY_REQUEST_DEADLINE);
+    for root in config.control_server_roots.iter().cloned() {
+        client = client.add_root_certificate(root);
+    }
+    let client = client
         .build()
         .context("build Route v2 ring delivery client")?;
     let mut interval = tokio::time::interval(RING_DELIVERY_POLL_INTERVAL);
@@ -412,7 +438,7 @@ async fn run_ring_delivery(
                 current.digest(),
             );
             let mut url = config
-                .control_plane_origin
+                .rotation_origin
                 .join(ROUTE_V2_RING_SUCCESSOR_PATH)
                 .context("compose Route v2 ring delivery URL")?;
             url.set_query(Some(&query));

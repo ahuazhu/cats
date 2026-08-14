@@ -204,6 +204,17 @@ variable "worker_managed_environment" {
   default     = {}
 }
 
+variable "route_v2_rotation_origin" {
+  description = "Independent server-authenticated HTTPS origin for Route v2 ring delivery and disabled-signer recovery."
+  type        = string
+  default     = "https://cats-controld-route-rotation.cats.svc.cluster.local:7444"
+
+  validation {
+    condition     = var.route_v2_rotation_origin == "https://cats-controld-route-rotation.cats.svc.cluster.local:7444"
+    error_message = "the first terminal release uses the fixed reviewed Route v2 rotation Service authority."
+  }
+}
+
 variable "worker_runtime_secret_data" {
   description = "Optional legacy CATS_POSTGRES_URL compatibility map. Signed workers must not receive CATS_AUTH_TOKEN."
   type        = map(string)

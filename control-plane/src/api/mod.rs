@@ -785,22 +785,6 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::Extension(std::sync::Arc::new(
             route_resolve_v2::RouteResolveV2Service::from_app_state(&state),
         )));
-    let route_v2_rotation_operator = Router::<AppState>::new()
-        .route(
-            "/v1/internal/route-v2/signing-authority-commands",
-            post(route_signing_operator::apply).fallback(route_signing_operator::apply),
-        )
-        .route(
-            "/v1/internal/route-v2/public-ring-successors",
-            get(route_signing_operator::discover_successor)
-                .fallback(route_signing_operator::discover_successor),
-        )
-        .route(
-            "/v1/internal/route-v2/signing-authority-current",
-            get(route_signing_operator::discover_current)
-                .fallback(route_signing_operator::discover_current),
-        );
-
     Router::new()
         .route("/", get(crate::ui::portal))
         .route("/zh-CN", get(crate::ui::zh_home_redirect))
@@ -958,12 +942,33 @@ pub fn router(state: AppState) -> Router {
         .merge(runtime_product_read)
         .merge(runtime_volume_authority)
         .merge(route_resolve_v2)
-        .merge(route_v2_rotation_operator)
         .merge(product_mutations_v2)
         .merge(retired_product_support)
         .merge(retired_cat_action)
         .merge(retired_product_authority)
         .fallback(crate::ui::not_found)
+        .with_state(state)
+}
+
+/// Closed router for the independent server-authenticated Route v2 rotation
+/// transport. It is deliberately absent from the public management listener
+/// and from the mandatory-client-certificate Gateway listener.
+pub(crate) fn route_v2_rotation_machine_router(state: AppState) -> Router {
+    Router::<AppState>::new()
+        .route(
+            "/v1/internal/route-v2/signing-authority-commands",
+            post(route_signing_operator::apply).fallback(route_signing_operator::apply),
+        )
+        .route(
+            "/v1/internal/route-v2/public-ring-successors",
+            get(route_signing_operator::discover_successor)
+                .fallback(route_signing_operator::discover_successor),
+        )
+        .route(
+            "/v1/internal/route-v2/signing-authority-current",
+            get(route_signing_operator::discover_current)
+                .fallback(route_signing_operator::discover_current),
+        )
         .with_state(state)
 }
 

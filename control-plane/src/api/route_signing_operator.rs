@@ -159,6 +159,8 @@ pub(crate) struct RouteV2SigningOperatorService {
     readiness: Arc<crate::server::ReadinessLatch>,
     loaded_signer_binding:
         Arc<crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding>,
+    gateway_machine_control:
+        Option<Arc<crate::api::route_resolve_v2::RouteResolveV2MachineControl>>,
     global: Arc<tokio::sync::Semaphore>,
     operator: Arc<tokio::sync::Semaphore>,
     accepting: tokio::sync::watch::Sender<bool>,
@@ -174,6 +176,9 @@ impl RouteV2SigningOperatorService {
         loaded_signer_binding: Arc<
             crate::store::runtime_authority::route_signing_authority::RouteGrantV2SignerBinding,
         >,
+        gateway_machine_control: Option<
+            Arc<crate::api::route_resolve_v2::RouteResolveV2MachineControl>,
+        >,
     ) -> anyhow::Result<Self> {
         trust.validate()?;
         anyhow::ensure!(
@@ -187,6 +192,7 @@ impl RouteV2SigningOperatorService {
             expected_release_commit_sha,
             readiness,
             loaded_signer_binding,
+            gateway_machine_control,
             global: Arc::new(tokio::sync::Semaphore::new(GLOBAL_IN_FLIGHT)),
             operator: Arc::new(tokio::sync::Semaphore::new(OPERATOR_IN_FLIGHT)),
             accepting,
@@ -227,6 +233,27 @@ impl RouteV2SigningOperatorService {
                     self.resolutions.active_count()
                 )
             })
+    }
+
+    fn fence_superseded_loaded_signer(&self, result: &RouteGrantV2SigningAuthorityCommandResult) {
+        let RouteGrantV2SigningAuthorityCommandResult::Applied {
+            signer_revision,
+            public_key_ring_version,
+        } = result
+        else {
+            return;
+        };
+        let loaded = self.loaded_signer_binding.reference();
+        if loaded.signer_revision == *signer_revision
+            && loaded.public_key_ring_version == *public_key_ring_version
+        {
+            // Exact replay on the already restarted successor process.
+            return;
+        }
+        self.readiness.poison();
+        if let Some(control) = &self.gateway_machine_control {
+            control.fail_closed();
+        }
     }
 
     async fn apply(
@@ -560,6 +587,7 @@ pub(super) async fn apply(State(state): State<AppState>, request: Request<Body>)
         .await;
     match outcome {
         Ok(AuthenticatedRouteV2SigningCommandOutcome::Stored(receipt)) => {
+            service.fence_superseded_loaded_signer(&receipt.result);
             let status = match receipt.result {
                 RouteGrantV2SigningAuthorityCommandResult::Applied { .. } => StatusCode::OK,
                 RouteGrantV2SigningAuthorityCommandResult::AuthorityPreconditionFailed => {

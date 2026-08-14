@@ -31,6 +31,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --listen 0.0.0.0:7301 \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
   --route-v2-machine-listen 0.0.0.0:7444 \
+  --route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \

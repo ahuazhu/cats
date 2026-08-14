@@ -80,6 +80,19 @@ variable "control_postgres_schema" {
   }
 }
 
+variable "route_v2_rotation_origin" {
+  description = "Exact independent server-authenticated HTTPS origin for Route v2 ring delivery while Control readiness is closed."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[1-9][0-9]{0,4}$", var.route_v2_rotation_origin)) &&
+      !strcontains(var.route_v2_rotation_origin, "..")
+    )
+    error_message = "route_v2_rotation_origin must be one canonical HTTPS DNS origin with an explicit port."
+  }
+}
+
 variable "worker_bundle_path" {
   description = "Absolute local path to the reviewed linux/amd64 worker tar.zst bundle."
   type        = string
