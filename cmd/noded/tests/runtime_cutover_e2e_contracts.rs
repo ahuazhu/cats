@@ -671,12 +671,69 @@ fn operator_e3_window_closes_and_verifies_every_early_failure_or_term() {
     let events = fs::read_to_string(trace).expect("read saved-plan E3 window trace");
     assert!(events.ends_with("saved-close\ne12\n"));
     assert!(!events.contains("emergency-close"));
+
+    for failure_mode in ["term-in-re-cordon", "term-in-saved-close"] {
+        let trace = temp.path().join(format!("{failure_mode}.trace"));
+        let output = Command::new("bash")
+            .arg(&fixture)
+            .arg(&library)
+            .arg(&trace)
+            .arg("finish")
+            .arg(failure_mode)
+            .output()
+            .expect("run in-cleanup TERM fixture");
+        assert_eq!(
+            output.status.code(),
+            Some(143),
+            "cleanup TERM lost at {failure_mode}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events = fs::read_to_string(trace).expect("read in-cleanup TERM trace");
+        assert!(events.ends_with("re-cordon\nsaved-close\ne12\n"));
+        for effect in ["re-cordon", "saved-close", "e12"] {
+            assert_eq!(
+                events.lines().filter(|event| *event == effect).count(),
+                1,
+                "{effect} repeated at {failure_mode}: {events}"
+            );
+        }
+    }
+
+    let trace = temp.path().join("term-and-close-failure.trace");
+    let output = Command::new("bash")
+        .arg(&fixture)
+        .arg(&library)
+        .arg(&trace)
+        .arg("finish")
+        .arg("term-and-close-failure")
+        .output()
+        .expect("run cleanup-error precedence fixture");
+    assert_eq!(output.status.code(), Some(57));
+    let events = fs::read_to_string(trace).expect("read cleanup-error precedence trace");
+    assert!(events.ends_with("re-cordon\nsaved-close\ne12\n"));
+}
+
+#[test]
+fn emergency_ingress_close_plan_validator_accepts_only_the_closed_shape() {
+    let root = workspace_root();
+    let fixture = root.join("deploy/metal/tests/runtime-cutover-ingress-close-plan-fixture.sh");
+    let validator = root.join("deploy/metal/runtime-cutover-ingress-close-plan.sh");
+    let output = Command::new("bash")
+        .arg(fixture)
+        .arg(validator)
+        .output()
+        .expect("run emergency ingress close plan fixtures");
+    assert_success(&output);
 }
 
 #[test]
 fn runbook_installs_the_allowlisted_early_guard_before_public_ingress() {
-    let runbook = fs::read_to_string(workspace_root().join("docs/production-cutover-runbook.md"))
+    let root = workspace_root();
+    let runbook = fs::read_to_string(root.join("docs/production-cutover-runbook.md"))
         .expect("read production cutover runbook");
+    let validator =
+        fs::read_to_string(root.join("deploy/metal/runtime-cutover-ingress-close-plan.sh"))
+            .expect("read emergency close plan validator");
     for target in [
         "-target=module.cats_kubernetes.kubernetes_namespace_v1.cats",
         "-target=module.cats_kubernetes.kubernetes_manifest.ingress_class_params",
@@ -689,7 +746,8 @@ fn runbook_installs_the_allowlisted_early_guard_before_public_ingress() {
             "missing emergency target {target}"
         );
     }
-    assert!(runbook.contains("select(.mode == \"managed\" and .change.actions != [\"no-op\"])"));
+    assert!(runbook.contains("runtime-cutover-ingress-close-plan.sh"));
+    assert!(validator.contains("select(.mode == \"managed\" and .change.actions != [\"no-op\"])"));
     for gate in [
         ".prior_state.values | resources",
         ".planned_values | resources",
@@ -697,7 +755,10 @@ fn runbook_installs_the_allowlisted_early_guard_before_public_ingress() {
         ".change.actions == [\"delete\"] and .change.after == null",
         ".values.metadata[0].labels[\"cats.run/ingress\"]] == [\"disabled\"]",
     ] {
-        assert!(runbook.contains(gate), "missing emergency plan gate {gate}");
+        assert!(
+            validator.contains(gate),
+            "missing emergency plan gate {gate}"
+        );
     }
     let guard = runbook.find("cats_e3_window_install_guard").unwrap();
     let initiated = runbook.find("\ningress_open_initiated=1\n").unwrap();

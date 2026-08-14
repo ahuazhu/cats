@@ -8,9 +8,21 @@ cats_e3_window_fixture_run() {
   . "$library"
 
   cats_e3_window_emergency_close() { printf '%s\n' emergency-close >>"$fixture_trace"; }
-  cats_e3_window_saved_close() { printf '%s\n' saved-close >>"$fixture_trace"; }
+  cats_e3_window_saved_close() {
+    printf '%s\n' saved-close >>"$fixture_trace"
+    case "$failure_mode" in
+      term-in-saved-close) kill -TERM "$$" ;;
+      term-and-close-failure)
+        kill -TERM "$$"
+        return 57
+        ;;
+    esac
+  }
   cats_e3_window_apply_schedulable_policy() { printf '%s\n' replay >>"$fixture_trace"; }
-  cats_e3_window_exact_re_cordon() { printf '%s\n' re-cordon >>"$fixture_trace"; }
+  cats_e3_window_exact_re_cordon() {
+    printf '%s\n' re-cordon >>"$fixture_trace"
+    [[ $failure_mode != term-in-re-cordon ]] || kill -TERM "$$"
+  }
   cats_e3_window_run_e12() { printf '%s\n' e12 >>"$fixture_trace"; }
 
   fail_at_checkpoint() {
@@ -34,6 +46,16 @@ cats_e3_window_fixture_run() {
   fail_at_checkpoint before-switch
   cats_e3_window_use_saved_close
   fail_at_checkpoint after-switch
+  if [[ $checkpoint == finish ]]; then
+    qualification_transition=terminal_schedulable
+    set +e
+    cleanup_status=0
+    cats_e3_window_finish || cleanup_status=$?
+    set -e
+    if [[ $cleanup_status -ne 0 ]]; then
+      exit "$cleanup_status"
+    fi
+  fi
   exit 0
 }
 

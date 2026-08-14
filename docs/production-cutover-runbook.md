@@ -657,13 +657,17 @@ cleanup first exact-re-cordons the Node, then applies the saved ingress-close pl
 exact E12 fleet verifier. If the schedulable apply response is ambiguous, cleanup first replays that
 same durable CLI request to a terminal result before it submits the exact next-revision re-cordon.
 Failure of one cleanup action must not suppress the later actions; all three must be attempted and
-all three must succeed:
+all three must succeed. INT/TERM received during cleanup is latched rather than starting recursive
+cleanup: each effect runs at most once, remaining effects continue, and the first cleanup error wins
+over the pending 130/143 status; otherwise that pending signal status is returned exactly:
 
 ```sh
 set -euo pipefail
 test "$(git rev-parse HEAD)" = <FINAL_RELEASE_SHA>
 test "$(git hash-object deploy/metal/runtime-cutover-e3-window.sh)" = \
   "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-e3-window.sh)"
+test "$(git hash-object deploy/metal/runtime-cutover-ingress-close-plan.sh)" = \
+  "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-ingress-close-plan.sh)"
 . deploy/metal/runtime-cutover-e3-window.sh
 
 cats_e3_window_emergency_close() {
@@ -679,42 +683,7 @@ cats_e3_window_emergency_close() {
   terraform -chdir=deploy/aws/terraform/stacks/production-application show \
     -json /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
     > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
-  jq -e '
-    def resources:
-      [.root_module | recurse(.child_modules[]?) | .resources[]?];
-    def is_public_ingress_address:
-      . == "module.cats_kubernetes.kubernetes_manifest.ingress_class_params[\"enabled\"]"
-      or . == "module.cats_kubernetes.kubernetes_ingress_class_v1.public[0]"
-      or . == "module.cats_kubernetes.kubernetes_ingress_v1.public[0]"
-      or (startswith("aws_route53_record.public[") and endswith("]"));
-    (.prior_state.values | resources) as $prior
-    | (.planned_values | resources) as $planned
-    | [.resource_changes[]?
-        | select(.mode == "managed" and .change.actions != ["no-op"])] as $changes
-    | ([.resource_changes[]?
-        | select(.mode == "managed")
-        | .change.after_unknown | .. | booleans]
-      | all(. == false))
-    and ([$planned[]
-      | select(.address == "module.cats_kubernetes.kubernetes_namespace_v1.cats")
-      | .values.metadata[0].labels["cats.run/ingress"]] == ["disabled"])
-    and ([$planned[] | select(.address | is_public_ingress_address)] | length == 0)
-    and (($changes | length) != 0
-      or (([$prior[]
-          | select(.address == "module.cats_kubernetes.kubernetes_namespace_v1.cats")
-          | .values.metadata[0].labels["cats.run/ingress"]] == ["disabled"])
-        and ([$prior[] | select(.address | is_public_ingress_address)] | length == 0)))
-    and all($changes[];
-      if .address == "module.cats_kubernetes.kubernetes_namespace_v1.cats" then
-        .change.actions == ["update"]
-        and .change.before.metadata[0].labels["cats.run/ingress"] == "enabled"
-        and .change.after.metadata[0].labels["cats.run/ingress"] == "disabled"
-        and ((.change.before
-          | setpath(["metadata",0,"labels","cats.run/ingress"]; "disabled")) == .change.after)
-      elif (.address | is_public_ingress_address) then
-        .change.actions == ["delete"] and .change.after == null
-      else false end)
-    ' \
+  deploy/metal/runtime-cutover-ingress-close-plan.sh \
     /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
   terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
     -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
@@ -817,7 +786,9 @@ cleanup_status=0
 cats_e3_window_finish || cleanup_status=$?
 set -e
 
-[ "$cleanup_status" -eq 0 ]
+if [ "$cleanup_status" -ne 0 ]; then
+  exit "$cleanup_status"
+fi
 
 case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
 ```
