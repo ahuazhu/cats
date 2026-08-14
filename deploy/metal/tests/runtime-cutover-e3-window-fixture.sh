@@ -34,8 +34,11 @@ cats_e3_window_fixture_run() {
     esac
   }
 
+  fixture_state_dir=${trace}.state
+  mkdir -m 0700 "$fixture_state_dir"
+  cats_e3_window_bind "$fixture_state_dir" fixture-window >/dev/null
   cats_e3_window_install_guard
-  ingress_open_initiated=1
+  cats_e3_window_mark_open_initiated
   printf '%s\n' open >>"$fixture_trace"
   fail_at_checkpoint open
   printf '%s\n' plan >>"$fixture_trace"
@@ -47,7 +50,8 @@ cats_e3_window_fixture_run() {
   cats_e3_window_use_saved_close
   fail_at_checkpoint after-switch
   if [[ $checkpoint == finish ]]; then
-    qualification_transition=terminal_schedulable
+    cats_e3_window_mark_qualification_initiated
+    cats_e3_window_mark_qualification_terminal
     set +e
     cleanup_status=0
     cats_e3_window_finish || cleanup_status=$?
