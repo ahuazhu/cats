@@ -93,6 +93,12 @@ fn identity() -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id("host_a"),
         credential_id: id("credential_a"),
         credential_binding: CredentialBinding::PublicKey {

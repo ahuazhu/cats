@@ -150,6 +150,12 @@ fn fixture_at(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id("host_a"),
         credential_id: id("credential_a"),
         credential_binding: CredentialBinding::PublicKey {
@@ -441,6 +447,12 @@ fn numbered_identity(index: usize) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(format!("node_{index:03}")),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(format!("host_{index:03}")),
         credential_id: id(format!("credential_{index:03}")),
         credential_binding: CredentialBinding::PublicKey {
@@ -884,6 +896,12 @@ pub(super) fn establish_empty_admission_for(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(format!("node_{suffix}")),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(format!("host_{suffix}")),
         credential_id: id(format!("credential_{suffix}")),
         credential_binding: CredentialBinding::PublicKey {
