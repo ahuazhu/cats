@@ -367,9 +367,9 @@ variable "host_fence_provider_namespace" {
 }
 
 variable "host_fence_provider_service_account" {
-  description = "Kubernetes ServiceAccount allowed to stop only Cats workers and quarantine only their primary ENIs."
+  description = "Dedicated Kubernetes ServiceAccount allowed to stop only Cats workers and quarantine only their primary ENIs."
   type        = string
-  default     = "cats-controld"
+  default     = "cats-host-fence-provider"
 
   validation {
     condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_service_account))

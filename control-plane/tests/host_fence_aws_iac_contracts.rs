@@ -174,6 +174,13 @@ fn chunkstore_scope_and_service_accounts_are_explicit_validated_inputs() {
     ] {
         assert!(variables.contains(input), "missing explicit input: {input}");
     }
+    let host_fence_service_account = between(
+        &variables,
+        "variable \"host_fence_provider_service_account\"",
+        "variable \"metal_workers\"",
+    );
+    assert!(host_fence_service_account.contains("default     = \"cats-host-fence-provider\""));
+    assert!(!host_fence_service_account.contains("cats-controld"));
 }
 
 #[test]
