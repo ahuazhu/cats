@@ -143,6 +143,44 @@ atomic_json_path() {
   durable_case_file "$destination"
 }
 
+file_link_count() {
+  local path=$1 count
+  if count=$(stat -c '%h' "$path" 2>/dev/null); then
+    :
+  elif count=$(stat -f '%l' "$path" 2>/dev/null); then
+    :
+  else
+    fail "could not read file link count"
+  fi
+  [[ $count =~ ^[1-9][0-9]*$ ]] || fail "file link count is invalid"
+  printf '%s' "$count"
+}
+
+recover_interrupted_adoption() {
+  local destination=$1 directory link_count candidate
+  local same_inode_links=()
+  directory=${destination%/*}
+  [[ -f $destination && ! -L $destination && -O $destination ]] || \
+    fail "adopted destination is not an owner-controlled regular file"
+  link_count=$(file_link_count "$destination")
+  if [[ $link_count == 2 ]]; then
+    shopt -s nullglob
+    for candidate in "$directory/.${destination##*/}."*; do
+      if [[ -f $candidate && ! -L $candidate && -O $candidate && \
+        $candidate -ef $destination ]]; then
+        same_inode_links+=("$candidate")
+      fi
+    done
+    shopt -u nullglob
+    ((${#same_inode_links[@]} == 1)) || \
+      fail "interrupted no-replace adoption has no unique private temporary link"
+    rm -f "${same_inode_links[0]}"
+    sync -f "$directory"
+    link_count=$(file_link_count "$destination")
+  fi
+  [[ $link_count == 1 ]] || fail "adopted destination is not single-link"
+}
+
 prepare_rotation_journal() {
   local mode
   if [[ ! -e $ROTATION_JOURNAL ]]; then
@@ -159,6 +197,8 @@ durable_case_file() {
   local path=$1
   [[ $path == "$CASE_DIR/"* && -f $path && ! -L $path && -O $path ]] || \
     fail "Route rotation journal entry is not an owner-controlled regular file"
+  [[ $(file_link_count "$path") == 1 ]] || \
+    fail "Route rotation journal entry is not single-link"
   chmod 0600 "$path"
   sync -f "$path"
   sync -f "${path%/*}"
@@ -170,6 +210,14 @@ adopt_rotation_file() {
     fail "Route rotation adoption escaped the private journal"
   [[ -f $source && ! -L $source && -O $source ]] || \
     fail "Route rotation adoption source is unsafe"
+  [[ $(file_link_count "$source") == 1 ]] || \
+    fail "Route rotation adoption source is not single-link"
+  if [[ -e $destination ]]; then
+    recover_interrupted_adoption "$destination"
+    cmp -s "$source" "$destination" || \
+      fail "adopted Route rotation bytes changed across resume"
+    return
+  fi
   temporary=$(mktemp "$ROTATION_JOURNAL/.${destination##*/}.XXXXXX")
   cp "$source" "$temporary"
   chmod 0600 "$temporary"
@@ -180,8 +228,7 @@ adopt_rotation_file() {
     return
   fi
   rm -f "$temporary"
-  [[ -f $destination && ! -L $destination && -O $destination ]] || \
-    fail "adopted Route rotation file is not an owner-controlled regular file"
+  recover_interrupted_adoption "$destination"
   cmp -s "$source" "$destination" || \
     fail "adopted Route rotation bytes changed across resume"
 }
@@ -192,9 +239,17 @@ adopt_case_file() {
     fail "durable case adoption escaped the case directory"
   [[ -f $source && ! -L $source && -O $source ]] || \
     fail "durable case adoption source is unsafe"
+  [[ $(file_link_count "$source") == 1 ]] || \
+    fail "durable case adoption source is not single-link"
   directory=${destination%/*}
   [[ -d $directory && ! -L $directory && -O $directory ]] || \
     fail "durable case adoption parent is unsafe"
+  if [[ -e $destination ]]; then
+    recover_interrupted_adoption "$destination"
+    cmp -s "$source" "$destination" || \
+      fail "durable case bytes changed across exact replay"
+    return
+  fi
   temporary=$(mktemp "$directory/.${destination##*/}.XXXXXX")
   cp "$source" "$temporary"
   chmod 0600 "$temporary"
@@ -205,8 +260,7 @@ adopt_case_file() {
     return
   fi
   rm -f "$temporary"
-  [[ -f $destination && ! -L $destination && -O $destination ]] || \
-    fail "durable case destination is unsafe"
+  recover_interrupted_adoption "$destination"
   cmp -s "$source" "$destination" || \
     fail "durable case bytes changed across exact replay"
 }

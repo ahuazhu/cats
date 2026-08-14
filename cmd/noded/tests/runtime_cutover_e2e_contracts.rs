@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -1715,7 +1715,7 @@ fn rotation_replay_probes_never_overwrite_canonical_crash_artifacts() {
     let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
     let adoption = shell_section(
         driver,
-        "adopt_rotation_file() {",
+        "file_link_count() {",
         "\ninitialize_rotation_journal() {",
     );
     let mutations = shell_section(driver, "operation_wait() {", "\nfleet_verify_to() {");
@@ -1739,6 +1739,7 @@ CASE_DIR=$1
 readonly CASE_DIR
 MODE=$2
 FAKE_CATS=$3
+CRASH_AFTER_LINK=${CRASH_AFTER_LINK:-false}
 readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
 CATS_E3_WORKSPACE_ID=workspace_fixture
 CATS_E3_RUN_ID=run_fixture
@@ -1794,6 +1795,30 @@ case "$MODE" in
     printf '%s\n' '{"canonical":"operation"}' >"$ROTATION_JOURNAL/fixture-operation-op_fixture.json"
     operation_wait op_fixture running "$ROTATION_JOURNAL" fixture-
     ;;
+  journal-link-crash)
+    candidate=$ROTATION_JOURNAL/journal-candidate.json
+    destination=$ROTATION_JOURNAL/journal-canonical.json
+    printf '%s\n' '{"candidate":"journal"}' >"$candidate"
+    if [[ $CRASH_AFTER_LINK == true ]]; then
+      rm() {
+        if [[ $1 == -f && -e $destination && $2 -ef $destination ]]; then exit 99; fi
+        command rm "$@"
+      }
+    fi
+    adopt_rotation_file "$candidate" "$destination"
+    ;;
+  case-link-crash)
+    candidate=$CASE_DIR/case-candidate.json
+    destination=$CASE_DIR/case-canonical.json
+    printf '%s\n' '{"candidate":"case"}' >"$candidate"
+    if [[ $CRASH_AFTER_LINK == true ]]; then
+      rm() {
+        if [[ $1 == -f && -e $destination && $2 -ef $destination ]]; then exit 99; fi
+        command rm "$@"
+      }
+    fi
+    adopt_case_file "$candidate" "$destination"
+    ;;
   *) exit 65 ;;
 esac
 "#;
@@ -1846,5 +1871,48 @@ esac
             fs::read_to_string(case_dir.join(relative)).unwrap(),
             original
         );
+    }
+
+    for (mode, relative, original) in [
+        (
+            "journal-link-crash",
+            "route-v2-rotation-journal.v1/journal-canonical.json",
+            "{\"candidate\":\"journal\"}\n",
+        ),
+        (
+            "case-link-crash",
+            "case-canonical.json",
+            "{\"candidate\":\"case\"}\n",
+        ),
+    ] {
+        let case_dir = temp.path().join(mode);
+        fs::create_dir(&case_dir).unwrap();
+        let crashed = Command::new("bash")
+            .arg(&harness)
+            .arg(&case_dir)
+            .arg(mode)
+            .arg(&fake_cats)
+            .env("CRASH_AFTER_LINK", "true")
+            .output()
+            .unwrap();
+        assert_eq!(crashed.status.code(), Some(99));
+        let destination = case_dir.join(relative);
+        assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), original);
+
+        let recovered = Command::new("bash")
+            .arg(&harness)
+            .arg(&case_dir)
+            .arg(mode)
+            .arg(&fake_cats)
+            .output()
+            .unwrap();
+        assert!(
+            recovered.status.success(),
+            "{mode} recovery failed: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(fs::metadata(&destination).unwrap().nlink(), 1);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), original);
     }
 }
