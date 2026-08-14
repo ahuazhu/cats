@@ -1928,7 +1928,7 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "node_identity_lineage_is_immutable",
         "control_node_identity_lineage_is_immutable",
         BEFORE_ROW_UPDATE,
-        "474f612481baad907dbb4697502dcf7e187ed2ae06594e361be6bedf2ba9e43a",
+        "519b3ceb50adb00acb363cc3707c97f3e8aef5621a3f06c015bf2259d6bdcca3",
     ),
     (
         "node_identities",

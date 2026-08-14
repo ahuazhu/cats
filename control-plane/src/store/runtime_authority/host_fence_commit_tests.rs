@@ -1,15 +1,16 @@
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{
-    guest_config_digest, spec_digest, AgentRegistrationAttempt, AgentSession, AsciiText,
-    AssignedKind, AssignedPlacement, AuthorizationRecord, AuthorizationState, ContractVersion,
-    CredentialBinding, DesiredRuntimeSpec, DiskKind, Epoch, FenceEpoch, Generation,
-    GuestDeviceIdentity, GuestRuntimeProfileReceipt, Id, Ipv4Address, IsolatedIpv4Kind, MacAddress,
-    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NormalAcquireRequest, Operation,
-    OperationFailure, OperationPhase, OperationTerminal, ProviderScope, RandomId128, RemoteHead,
-    Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, Sha256Digest, UnixMillis,
-    VolumeAccess, VolumeAcquire, VolumeAdminState, VolumeAuthorization, VolumeDisposition,
-    VolumeDurability, VolumeIntent, VolumeRecord, VolumeTakeoverAuthorization, WireU64,
+    encode_desired_runtime_spec, guest_config_digest, spec_digest, AgentRegistrationAttempt,
+    AgentSession, AsciiText, AssignedKind, AssignedPlacement, AuthorizationRecord,
+    AuthorizationState, ContractVersion, CredentialBinding, DesiredRuntimeSpec, DiskKind, Epoch,
+    FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt, Id, Ipv4Address,
+    IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState,
+    NormalAcquireRequest, Operation, OperationFailure, OperationPhase, OperationTerminal,
+    ProviderScope, RandomId128, RemoteHead, Revision, RuntimeConfig, RuntimeTarget,
+    RuntimeTransition, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire, VolumeAdminState,
+    VolumeAuthorization, VolumeDisposition, VolumeDurability, VolumeIntent, VolumeRecord,
+    VolumeTakeoverAuthorization, WireU64,
 };
 use cats_storage::authority::{normal_acquire, VolumeOwnerBinding};
 use cats_storage::host_fence::{
@@ -24,11 +25,11 @@ use super::host_fence_commit::{TrustedHostFenceRecoveryCommitV1, TrustedTakeover
 use super::product::CatRecord;
 use super::product_rows::{
     insert_cat, insert_desired, insert_operation, load_desired_for_update,
-    load_operation_for_update,
+    load_operation_for_update, update_operation,
 };
 use super::rows::{
     database_now, insert_volume, load_authorization_for_update, load_stored_volume_for_update,
-    update_volume_owner,
+    update_volume, update_volume_owner,
 };
 use crate::store::agent_sessions::{
     load_current_session_for_update, load_identity_by_node_for_update,
@@ -334,6 +335,8 @@ struct RecoveryFixture {
     store: Store,
     request: TrustedHostFenceRecoveryCommitV1,
     current_volume: VolumeRecord,
+    old_identity: NodeIdentity,
+    old_session: AgentSession,
 }
 
 fn recovery_fixture(slug: &str) -> RecoveryFixture {
@@ -477,8 +480,8 @@ fn recovery_fixture(slug: &str) -> RecoveryFixture {
         store,
         request: TrustedHostFenceRecoveryCommitV1 {
             terminal_event: event,
-            expected_old_node_id: old_identity.node_id,
-            expected_old_node_boot_id: session.node_boot_id,
+            expected_old_node_id: old_identity.node_id.clone(),
+            expected_old_node_boot_id: session.node_boot_id.clone(),
             expected_old_agent_session_epoch: session.agent_session_epoch,
             expected_current_desired: current_desired,
             takeover_authorizations: vec![TrustedTakeoverAuthorizationV1 {
@@ -491,6 +494,8 @@ fn recovery_fixture(slug: &str) -> RecoveryFixture {
             recovery_operation,
         },
         current_volume,
+        old_identity,
+        old_session: session,
     }
 }
 
@@ -510,6 +515,37 @@ fn output_counts(store: &Store) -> (i64, i64, i64) {
         .unwrap()
 }
 
+fn assert_no_recovery_writes(fixture: &RecoveryFixture) {
+    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
+    fixture
+        .store
+        .authority_transaction(|transaction| {
+            assert_eq!(
+                load_desired_for_update(
+                    transaction,
+                    &fixture.request.expected_current_desired.cat_id,
+                )?
+                .unwrap(),
+                fixture.request.expected_current_desired
+            );
+            assert_eq!(
+                load_operation_for_update(
+                    transaction,
+                    &fixture.request.expected_old_operation.operation_id,
+                )?
+                .unwrap(),
+                fixture.request.expected_old_operation
+            );
+            assert!(load_operation_for_update(
+                transaction,
+                &fixture.request.recovery_operation.operation_id,
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
 fn terminal_fence_recovery_commits_once_and_exact_replay_returns_the_receipt() {
     let fixture = recovery_fixture("host-recovery-success");
@@ -522,6 +558,15 @@ fn terminal_fence_recovery_commits_once_and_exact_replay_returns_the_receipt() {
         .commit_trusted_host_fence_recovery_v1(&fixture.request)
         .unwrap();
     assert_eq!(replay, first);
+    assert_eq!(output_counts(&fixture.store), (1, 1, 1));
+
+    let mut conflicting_replay = fixture.request.clone();
+    conflicting_replay.recovery_operation.operation_id = id("operation-recovery-other");
+    let error = fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&conflicting_replay)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(output_counts(&fixture.store), (1, 1, 1));
 
     fixture
@@ -637,34 +682,141 @@ fn stale_node_owner_binding_rejects_the_whole_recovery_without_side_effects() {
         .commit_trusted_host_fence_recovery_v1(&fixture.request)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(output_counts(&fixture.store), (0, 0, 0));
+    assert_no_recovery_writes(&fixture);
+}
+
+#[test]
+fn replaced_source_session_rejects_the_whole_recovery_without_side_effects() {
+    let fixture = recovery_fixture("host-recovery-stale-session");
+    let authenticated = AuthenticatedNodeCredential::new(
+        fixture.old_identity.credential_id.clone(),
+        fixture.old_identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(&runtime_release()).unwrap();
+    let replacement_attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: fixture.old_identity.node_id.clone(),
+        immutable_host_id: fixture.old_identity.immutable_host_id.clone(),
+        node_boot_id: boot_id(4),
+        agent_instance_id: random_id(5),
+        registration_attempt_id: random_id(6),
+        guest_config_digest: policy.approved_guest_config_digest().clone(),
+        expected_agent_session_epoch: Some(fixture.old_session.agent_session_epoch),
+    };
+    let AgentRegistrationOutcome::Registered(replacement_session) = fixture
+        .store
+        .register_agent_session(&authenticated, &replacement_attempt, &policy)
+        .unwrap()
+    else {
+        panic!("replacement source session was rejected")
+    };
+    assert!(replacement_session.agent_session_epoch > fixture.old_session.agent_session_epoch);
+
+    let error = fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&fixture.request)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_no_recovery_writes(&fixture);
+}
+
+#[test]
+fn retired_source_identity_rejects_the_whole_recovery_without_side_effects() {
+    let fixture = recovery_fixture("host-recovery-stale-identity");
     fixture
         .store
-        .authority_transaction(|transaction| {
-            assert_eq!(
-                load_desired_for_update(
-                    transaction,
-                    &fixture.request.expected_current_desired.cat_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_current_desired
-            );
-            assert_eq!(
-                load_operation_for_update(
-                    transaction,
-                    &fixture.request.expected_old_operation.operation_id,
-                )?
-                .unwrap(),
-                fixture.request.expected_old_operation
-            );
-            assert!(load_operation_for_update(
-                transaction,
-                &fixture.request.recovery_operation.operation_id,
-            )?
-            .is_none());
-            Ok(())
-        })
+        .retire_node_identity(&fixture.old_identity.node_id)
         .unwrap();
+
+    let error = fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&fixture.request)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_no_recovery_writes(&fixture);
+}
+
+#[test]
+fn stale_head_desired_or_operation_rejects_without_recovery_writes() {
+    for drift in ["head", "desired", "operation"] {
+        let fixture = recovery_fixture(&format!("host-recovery-stale-{drift}"));
+        match drift {
+            "head" => {
+                let mut advanced = fixture.current_volume.clone();
+                advanced.head = RemoteHead {
+                    generation: generation(1),
+                    root_hash: Some(Sha256Digest::from_bytes([41; 32])),
+                    root_object_id: Some(text("roots/1")),
+                };
+                fixture
+                    .store
+                    .authority_transaction(|transaction| update_volume(transaction, &advanced))
+                    .unwrap();
+            }
+            "desired" => {
+                let desired = &fixture.request.replacement_desired;
+                let json =
+                    String::from_utf8(encode_desired_runtime_spec(desired).unwrap()).unwrap();
+                let changed = fixture
+                    .store
+                    .with(|client| {
+                        client.execute(
+                            "UPDATE desired_runtime_specs SET
+                                record=$2::TEXT::jsonb, desired_revision=$3,
+                                spec_digest=$4, node_id=$5, placement_epoch=$6
+                              WHERE cat_id=$1",
+                            &[
+                                &desired.cat_id.as_str(),
+                                &json,
+                                &i64::try_from(desired.desired_revision.get()).unwrap(),
+                                &desired.spec_digest.as_str(),
+                                &desired.placement.node_id.as_str(),
+                                &i64::try_from(desired.placement.placement_epoch.get()).unwrap(),
+                            ],
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(changed, 1);
+            }
+            "operation" => {
+                let mut changed = fixture.request.expected_old_operation.clone();
+                changed.updated_at_unix_ms =
+                    time(changed.updated_at_unix_ms.get().checked_add(1).unwrap());
+                fixture
+                    .store
+                    .authority_transaction(|transaction| update_operation(transaction, &changed))
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let error = fixture
+            .store
+            .commit_trusted_host_fence_recovery_v1(&fixture.request)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict, "wrong result for {drift}");
+        assert_eq!(output_counts(&fixture.store), (0, 0, 0));
+    }
+}
+
+#[test]
+fn already_expired_takeover_deadline_rejects_before_any_recovery_write() {
+    let mut fixture = recovery_fixture("host-recovery-expired-authorization");
+    let VolumeAuthorization::Takeover(authorization) = &mut fixture.request.takeover_authorizations
+        [0]
+    .authorization
+    .authorization
+    else {
+        unreachable!()
+    };
+    authorization.not_after = fixture.request.terminal_event.committed_at_unix_ms;
+
+    let error = fixture
+        .store
+        .commit_trusted_host_fence_recovery_v1(&fixture.request)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert_no_recovery_writes(&fixture);
 }
 
 #[test]

@@ -309,7 +309,7 @@ fn validate_recovery_shape(
     });
     expected_settlement.updated_at_unix_ms = completed_at;
     if request.settled_old_operation != expected_settlement
-        || completed_at < request.expected_old_operation.created_at_unix_ms
+        || completed_at < request.expected_old_operation.updated_at_unix_ms
     {
         return Err(rejected("old Operation HostLost settlement is not exact"));
     }
