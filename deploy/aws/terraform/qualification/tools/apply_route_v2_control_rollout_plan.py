@@ -153,6 +153,13 @@ def produce(args: argparse.Namespace) -> None:
     phase = exact_phase(bundle, args.phase, successor)
     descriptor = recovery_descriptor(descriptor_bytes, bundle, ca_bytes)
     descriptor_phase = descriptor_phase_entry(descriptor, args.phase)
+    enforce_phase_order(
+        args,
+        state_directory,
+        descriptor,
+        args.server_ca_bundle,
+        cats_bytes,
+    )
 
     plan_json = plan_validator.terraform_show(args.terraform, args.saved_plan)
     plan = plan_validator.canonical_object(
@@ -178,6 +185,14 @@ def produce(args: argparse.Namespace) -> None:
         != digest(validation_bytes)
     ):
         raise Rejected("recovery descriptor does not freeze the exact reviewed plan")
+    rollout_required_bytes = wait_for_rollout_requirement(
+        args,
+        state_directory,
+        descriptor,
+        bundle,
+        previous,
+        phase,
+    )
 
     attempt = apply_once_or_recover(
         args,
@@ -186,6 +201,7 @@ def produce(args: argparse.Namespace) -> None:
         descriptor_phase,
         saved_plan_bytes,
         validation_bytes,
+        rollout_required_bytes,
     )
     current_bytes, current = discover_exact_current(
         descriptor,
@@ -470,6 +486,265 @@ def descriptor_phase_entry(
     return matches[0]
 
 
+def enforce_phase_order(
+    args: argparse.Namespace,
+    state_directory: Path,
+    descriptor: dict[str, Any],
+    ca_path: Path,
+    cats_bytes: bytes,
+) -> None:
+    phases = [entry["phase"] for entry in descriptor["phases"]]
+    index = phases.index(args.phase)
+    state_suffixes = (
+        "terraform-apply.pending.v1.json",
+        "terraform-apply.completed.v1.json",
+        "terraform-apply.stdout",
+        "terraform-apply.stderr",
+        "apply-receipt-payload.v1.json",
+        "apply-receipt.signed.v1.json",
+        "apply-receipt.prior-verification.v1.json",
+        "rollout-required-current.v1.json",
+    )
+    for future in descriptor["phases"][index + 1 :]:
+        if any(
+            (state_directory / f"{future['phase']}.{suffix}").exists()
+            for suffix in state_suffixes
+        ):
+            raise Rejected("future rollout state exists before the requested phase")
+        future_body = https_request(
+            future["receipt_url"],
+            descriptor["receipt_inbox_server_name"],
+            ca_path,
+            "GET",
+            None,
+            expected=(404,),
+        )
+        if future_body:
+            raise Rejected("absent future rollout receipt returned a body")
+
+    for previous in descriptor["phases"][:index]:
+        phase_name = previous["phase"]
+        signed_path = state_directory / f"{phase_name}.apply-receipt.signed.v1.json"
+        signed_bytes = checked_file(
+            signed_path, private=True, maximum=MAX_DESCRIPTOR_BYTES
+        )
+        published = https_request(
+            previous["receipt_url"],
+            descriptor["receipt_inbox_server_name"],
+            ca_path,
+            "GET",
+            None,
+            expected=(200,),
+        )
+        if published != signed_bytes:
+            raise Rejected("prior rollout receipt inbox bytes differ from controller state")
+        verification_path = (
+            state_directory / f"{phase_name}.apply-receipt.prior-verification.v1.json"
+        )
+        command = [
+            os.fspath(args.cats),
+            "--json",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-control-rollout-apply-receipt",
+            "--trust",
+            os.fspath(args.operator_trust),
+            "--command-bundle",
+            os.fspath(args.command_bundle),
+            "--phase",
+            phase_name,
+            "--qualification-catalog-sha256",
+            descriptor["qualification_catalog_sha256"],
+            "--saved-plan-sha256",
+            previous["saved_plan_sha256"],
+            "--receipt",
+            os.fspath(signed_path),
+            "--output",
+            os.fspath(verification_path),
+        ]
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+            timeout=30,
+            check=False,
+        )
+        if (
+            completed.returncode != 0
+            or len(completed.stdout) > MAX_CLI_OUTPUT_BYTES
+            or len(completed.stderr) > MAX_CLI_OUTPUT_BYTES
+            or digest(
+                plan_validator.checked_file(
+                    args.cats, private=False, executable=True
+                )
+            )
+            != digest(cats_bytes)
+        ):
+            raise Rejected("prior rollout receipt failed release-bound verification")
+        verification_bytes = checked_file(
+            verification_path, private=True, maximum=MAX_DESCRIPTOR_BYTES
+        )
+        verification = canonical_compact_object(
+            verification_bytes, "prior rollout receipt verification"
+        )
+        try:
+            report = json.loads(completed.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise Rejected("prior rollout receipt verifier report is malformed") from error
+        if (
+            report != verification
+            or verification.get("case_id") != descriptor["case_id"]
+            or verification.get("qualification_run_id")
+            != descriptor["qualification_run_id"]
+            or verification.get("source_commit_sha") != descriptor["source_commit_sha"]
+            or verification.get("qualification_catalog_sha256")
+            != descriptor["qualification_catalog_sha256"]
+            or verification.get("phase") != phase_name
+            or verification.get("signer_revision") != previous["signer_revision"]
+            or verification.get("saved_plan_sha256")
+            != previous["saved_plan_sha256"]
+            or verification.get("receipt_signer_executable_sha256")
+            != digest(cats_bytes)
+            or verification.get("exact_signed_receipt_sha256")
+            != digest(signed_bytes)
+            or verification.get("terminal_marker") != "current_process_bound"
+        ):
+            raise Rejected("prior rollout receipt does not bind the exact ordered run")
+
+
+def wait_for_rollout_requirement(
+    args: argparse.Namespace,
+    state_directory: Path,
+    descriptor: dict[str, Any],
+    bundle: dict[str, Any],
+    previous: dict[str, Any],
+    phase: dict[str, Any],
+) -> bytes:
+    output = state_directory / f"{args.phase}.rollout-required-current.v1.json"
+    if output.exists():
+        installed = checked_file(output, private=True, maximum=MAX_DESCRIPTOR_BYTES)
+        current = canonical_compact_object(installed, "rollout-required current discovery")
+        if not predecessor_requires_rollout(
+            current, bundle, previous, args.phase, phase
+        ):
+            raise Rejected("durable rollout requirement does not bind the exact predecessor")
+        return installed
+
+    deadline = time.monotonic() + args.discovery_timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            body = https_request(
+                descriptor["rotation_origin"] + CURRENT_PATH,
+                descriptor["rotation_server_name"],
+                args.server_ca_bundle,
+                "GET",
+                None,
+                expected=(200,),
+            )
+            current = canonical_compact_object(body, "rollout-required current discovery")
+            if predecessor_requires_rollout(
+                current, bundle, previous, args.phase, phase
+            ):
+                publish_exact(output, body)
+                return body
+        except Rejected:
+            pass
+        time.sleep(1)
+    raise Rejected("Control never proved the exact stale predecessor requiring this rollout")
+
+
+def predecessor_requires_rollout(
+    current: dict[str, Any],
+    bundle: dict[str, Any],
+    previous: dict[str, Any],
+    phase_name: str,
+    phase: dict[str, Any],
+) -> bool:
+    expected_signer, expected_ring_version = predecessor_process_coordinate(
+        bundle, phase_name, phase
+    )
+    expected_state = expected_signer.get("state")
+    expected_active_kid = (
+        expected_signer.get("active_kid") if expected_state == "active" else None
+    )
+    return (
+        set(current)
+        == {
+            "version",
+            "authority_id",
+            "route_deployment_id",
+            "release_commit_sha",
+            "rotation_operator_trust_sha256",
+            "loaded_signer_revision",
+            "loaded_signer_reference_sha256",
+            "loaded_signer_state",
+            "loaded_active_kid",
+            "loaded_public_key_ring_version",
+            "loaded_public_key_ring_digest",
+            "database_current",
+            "process_ready",
+        }
+        and current.get("version") == 1
+        and current.get("authority_id") == bundle["rotation_operator_authority_id"]
+        and current.get("route_deployment_id") == bundle["route_deployment_id"]
+        and current.get("release_commit_sha") == bundle["source_commit_sha"]
+        and current.get("rotation_operator_trust_sha256")
+        == bundle["rotation_operator_trust_sha256"]
+        and current.get("loaded_signer_revision") == previous["signer_revision"]
+        and current.get("loaded_signer_reference_sha256")
+        == previous["signer_reference_sha256"]
+        and current.get("loaded_signer_state") == expected_state
+        and current.get("loaded_active_kid") == expected_active_kid
+        and current.get("loaded_public_key_ring_version") == expected_ring_version
+        and current.get("loaded_public_key_ring_digest")
+        == previous["public_key_ring_digest"]
+        and current.get("database_current") is False
+        and current.get("process_ready") is False
+    )
+
+
+def predecessor_process_coordinate(
+    bundle: dict[str, Any], phase_name: str, phase: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    phases = [entry["phase"] for entry in bundle["commands"]]
+    index = phases.index(phase_name)
+    if index == 0:
+        successor = phase["successor"]
+        ring_version = successor.get("public_key_ring_version")
+        signer = successor.get("signer")
+        if (
+            not isinstance(ring_version, int)
+            or isinstance(ring_version, bool)
+            or ring_version <= 1
+            or not isinstance(signer, dict)
+        ):
+            raise Rejected("first rollout command cannot identify its exact predecessor")
+        # PublishOverlap retains the installed signer and advances exactly one
+        # ring version.  The offline bundle verifier enforces that lineage.
+        return signer, ring_version - 1
+
+    prior = bundle["commands"][index - 1]
+    try:
+        command = json.loads(prior["exact_authority_command_json"])
+        successor = command["successor"]
+        signer = successor["signer"]
+        ring_version = successor["public_key_ring_version"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise Rejected("prior rollout command cannot identify its process coordinate") from error
+    if (
+        not isinstance(signer, dict)
+        or signer.get("state") not in {"active", "disabled"}
+        or not isinstance(ring_version, int)
+        or isinstance(ring_version, bool)
+        or ring_version <= 0
+    ):
+        raise Rejected("prior rollout process coordinate is malformed")
+    return signer, ring_version
+
+
 def exact_phase(
     bundle: dict[str, Any], phase_name: str, successor: dict[str, Any]
 ) -> dict[str, Any]:
@@ -498,6 +773,7 @@ def apply_once_or_recover(
     descriptor_phase: dict[str, Any],
     saved_plan_bytes: bytes,
     validation_bytes: bytes,
+    rollout_required_bytes: bytes,
 ) -> dict[str, Any]:
     pending_path = state_directory / f"{args.phase}.terraform-apply.pending.v1.json"
     completed_path = state_directory / f"{args.phase}.terraform-apply.completed.v1.json"
@@ -515,6 +791,7 @@ def apply_once_or_recover(
         "signer_revision": descriptor_phase["signer_revision"],
         "saved_plan_sha256": digest(saved_plan_bytes),
         "plan_validation_receipt_sha256": digest(validation_bytes),
+        "rollout_required_current_sha256": digest(rollout_required_bytes),
         "started_at_unix_ms": unix_millis(),
     }
     if pending_path.exists():
