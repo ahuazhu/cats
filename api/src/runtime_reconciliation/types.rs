@@ -1615,6 +1615,7 @@ pub struct VolumeTakeoverAuthorization {
     pub volume_id: Id,
     pub expected_attachment_id: Id,
     pub expected_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
     pub new_attachment_id: Id,
     pub desired_revision: Revision,
     pub new_placement_epoch: Epoch,
