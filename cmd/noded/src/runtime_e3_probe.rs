@@ -584,7 +584,7 @@ fn public_route(origin: &str, run_id: &str) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()?;
-    let mut response = client
+    let response = client
         .get(http_url.clone())
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()

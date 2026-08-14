@@ -26,12 +26,12 @@ cats_e3_ingress_close_plan_fixture_run() {
           ([ns("enabled")] + [$public[] | public(.)])}}},
        planned_values:{root_module:{resources:[ns("disabled")]}},
        resource_changes:
-         [{address:"module.cats_kubernetes.kubernetes_namespace_v1.cats",mode:"managed",
+         ([{address:"module.cats_kubernetes.kubernetes_namespace_v1.cats",mode:"managed",
            change:{actions:["update"],
              before:{metadata:[{labels:{"cats.run/ingress":"enabled",stable:"same"}}]},
              after:{metadata:[{labels:{"cats.run/ingress":"disabled",stable:"same"}}]},
              after_unknown:false}}]
-         + [$public[] | deletion(.)]}
+         + [$public[] | deletion(.)])}
   ' >"$valid"
   "$validator" "$valid"
 
