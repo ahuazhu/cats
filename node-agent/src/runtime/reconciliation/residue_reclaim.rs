@@ -20,9 +20,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     residue_reclaim_proof_is_closed, CleanupTarget, ContractVersion, DesiredRuntimeSpec, HostPath,
-    Id, NodeObservation, NodeResidue, ReconcileStep, ResidueLineageEvidence,
+    Id, NodeObservation, NodeResidue, ObservedRuntimeStatus, ReconcileStep, ResidueLineageEvidence,
     RuntimeResidueAuthorityOutcome, RuntimeResidueAuthorityRequest, SessionBinding,
 };
+use cats_storage::authority::VolumeDataAuthority;
 
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
@@ -609,6 +610,122 @@ impl DataDirectoryReclaimEffect {
             .revalidate_current(stored, current)
             .context("revalidate exact cleanup checkpoint before DataDirectory unlink")?;
         retained.revalidate_chain()?;
+        retained.reclaim(context)?;
+        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+    }
+
+    /// Reclaim the one cache which an exact Cold membership detach removes.
+    /// Control's generic residue endpoint intentionally cannot qualify this
+    /// case because the current Desired no longer contains the intent. The
+    /// durable typed CleanupRelease token, the accepted descriptor and one
+    /// fresh exact Unowned Volume read close this narrower local-cache edge.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_apply_cold_membership_detach(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
+        volume_authority: &dyn VolumeDataAuthority,
+    ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
+        if !super::lifecycle_steps::cold_membership_detach_cleanup_is_supported(
+            desired,
+            stored.checkpoint(),
+            &runtime.volumes,
+        ) {
+            return Ok(None);
+        }
+        let ReconcileStep::CleanupRelease { cleanup } = &stored.checkpoint().step else {
+            unreachable!("typed Cold detach helper checked CleanupRelease")
+        };
+        let CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        } = &cleanup.target
+        else {
+            unreachable!("typed Cold detach helper checked Volume target")
+        };
+        let accepted = context.accepted_full()?;
+        let Some(admission) = context.optional_data_directory_reclaim() else {
+            return Ok(None);
+        };
+        let Some((residue, retained)) =
+            admission.exact(accepted.observation(), &desired.cat_id, volume_id)
+        else {
+            return Ok(None);
+        };
+        let processes = context.node_global_process()?;
+        let networks = context.node_global_network()?;
+        if !processes.matches_observation(accepted.observation())
+            || processes.exact_process_count(&desired.cat_id) != 0
+            || processes.stop_receipt_socket(&desired.cat_id).is_some()
+            || !networks.matches_observation(accepted.observation())
+            || context.optional_kernel_nbd_pool().is_some_and(|pool| {
+                !pool.matches_observation(accepted.observation())
+                    || pool.device_count(&desired.cat_id) != 0
+            })
+            || accepted.observation().residue.as_slice() != [residue.clone()]
+        {
+            return Ok(Some(stop_local()));
+        }
+        let Some(request) = authority_request(accepted.session(), residue) else {
+            return Ok(Some(stop_local()));
+        };
+        let Some(checkpointed) = stored
+            .checkpoint()
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == *volume_id)
+        else {
+            return Ok(Some(stop_local()));
+        };
+        let Some(checkpoint_head) = (match &checkpointed.authority {
+            cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Unowned { head, .. } => {
+                Some(head)
+            }
+            _ => None,
+        }) else {
+            return Ok(Some(stop_local()));
+        };
+        if request.lineage.cat_id != desired.cat_id
+            || request.lineage.disk_kind != cats_api::runtime_reconciliation::DiskKind::Persistent
+            || request.lineage.volume_id != *volume_id
+            || request.lineage.attachment_id != *attachment_id
+            || request.lineage.attachment_epoch != *attachment_epoch
+            || request.lineage.desired_revision != desired.desired_revision
+            || request.lineage.spec_digest != desired.spec_digest
+            || request.lineage.placement != desired.placement
+            || request.lineage.remote_head != *checkpoint_head
+            || request.lineage.local_durable_generation != request.lineage.remote_durable_generation
+            || request.lineage.pending_pack_count.get() != 0
+            || !request.lineage.fenced
+        {
+            return Ok(Some(stop_local()));
+        }
+
+        let _node_global = context.lock_node_global_effect()?;
+        context.check_active()?;
+        store
+            .revalidate_current(stored, current)
+            .context("revalidate typed Cold detach checkpoint before cache unlink")?;
+        retained.revalidate_chain()?;
+        let record = match volume_authority.load_volume(volume_id) {
+            Ok(record) => record,
+            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+        };
+        if !super::lifecycle_steps::released_cache_record_matches_cleanup_checkpoint(
+            &record,
+            stored.checkpoint(),
+        ) {
+            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        }
+        context.check_active()?;
+        store
+            .revalidate_current(stored, current)
+            .context("revalidate typed Cold detach checkpoint at cache unlink")?;
         retained.reclaim(context)?;
         Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
     }

@@ -2165,6 +2165,27 @@ pub(crate) fn classify_local_publication_recovery(
                         },
                     );
                 }
+                if let Some((cat_id, _)) = all_checkpoints.iter().find(|(cat_id, checkpoint)| {
+                    context
+                        .coordinates()
+                        .desired
+                        .desired_specs
+                        .iter()
+                        .find(|desired| &desired.cat_id == *cat_id)
+                        .is_some_and(|desired| {
+                            super::lifecycle_steps::cold_membership_detach_cleanup_checkpoint_is_supported(
+                                desired,
+                                checkpoint,
+                            ) && released_cleanup_prefix_matches(checkpoint, prefix)
+                        })
+                }) {
+                    return Ok(
+                        LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix {
+                            cat_id: cat_id.clone(),
+                            retained: Arc::clone(retained),
+                        },
+                    );
+                }
             }
         }
     }

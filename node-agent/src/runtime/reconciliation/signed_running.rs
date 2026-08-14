@@ -677,13 +677,6 @@ impl SignedRunningPublicationRecovery {
         let CleanupTarget::Volume { volume_id, .. } = &cleanup.target else {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         };
-        let Some(volume) = desired
-            .volumes
-            .iter()
-            .find(|volume| &volume.volume_id == volume_id)
-        else {
-            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
-        };
         let Some(expected_generation) = cleanup
             .volume_release
             .as_ref()
@@ -699,11 +692,41 @@ impl SignedRunningPublicationRecovery {
         if record.head.generation != expected_generation {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         }
-        let request = release_transition_request(desired, cleanup.clone());
-        let recovery =
-            recover_lifecycle_release_from_authority(&request, volume, &record.head, &record);
-        if !matches!(recovery, Ok(NormalReleaseAuthorityRecovery::Released(_))) {
-            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        if let Some(volume) = desired
+            .volumes
+            .iter()
+            .find(|volume| &volume.volume_id == volume_id)
+        {
+            let request = release_transition_request(desired, cleanup.clone());
+            let recovery =
+                recover_lifecycle_release_from_authority(&request, volume, &record.head, &record);
+            if !matches!(recovery, Ok(NormalReleaseAuthorityRecovery::Released(_))) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
+        } else {
+            if !super::lifecycle_steps::cold_membership_detach_cleanup_checkpoint_is_supported(
+                desired,
+                stored.checkpoint(),
+            ) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
+            let Some(checkpointed) = stored
+                .checkpoint()
+                .volumes
+                .iter()
+                .find(|volume| &volume.volume_id == volume_id)
+            else {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            };
+            if !super::lifecycle_steps::released_cache_record_matches_checkpoint(
+                &record,
+                checkpointed,
+            ) || !super::lifecycle_steps::released_cache_record_matches_cleanup_checkpoint(
+                &record,
+                stored.checkpoint(),
+            ) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
         }
         let current = store
             .assert_current(&stored)
