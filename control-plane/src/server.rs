@@ -712,17 +712,21 @@ pub struct Handle {
     gateway_machine_listener: Option<crate::gateway_machine::GatewayMachineListener>,
 }
 
-pub(crate) struct ManagedSingletonTask {
+/// Joinable ownership of one elected background role.
+pub struct ManagedSingletonTask {
     shutdown: tokio::sync::watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ManagedSingletonTask {
-    pub(crate) fn begin_shutdown(&self) {
+    /// Stop election retries and signal an active role to relinquish leadership.
+    pub fn begin_shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
 
-    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+    /// Signal shutdown and wait for the role, retained resolutions and
+    /// PostgreSQL advisory-lock release to complete.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
         let task = self
             .task
@@ -928,7 +932,8 @@ where
     tokio::spawn(run_singleton_election(store, role, make_task, None))
 }
 
-fn spawn_managed_singleton_task<F, Fut>(
+/// Run one background role under a joinable PostgreSQL singleton election.
+pub fn spawn_managed_singleton_task<F, Fut>(
     store: Arc<Store>,
     role: SingletonRole,
     make_task: F,
@@ -1161,11 +1166,17 @@ async fn run_elected_singleton<Fut>(
     resolutions.close();
     resolutions.wait_empty().await;
     if let Some(session) = session {
-        let _ = crate::store::execute_leadership(move || {
+        if let Err(error) = crate::store::execute_leadership_cleanup(move || {
             session.close_now();
-            Ok(())
         })
-        .await;
+        .await
+        {
+            tracing::error!(
+                role = role.name(),
+                %error,
+                "singleton advisory session cleanup failed"
+            );
+        }
     }
 }
 

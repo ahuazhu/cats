@@ -1145,6 +1145,51 @@ pub(crate) async fn execute_leadership<T: Send + 'static>(
     .await
 }
 
+/// Run connection/session destruction on the leadership executor and do not
+/// return until it has physically completed. Cleanup admission is reserved
+/// from ordinary leadership work; temporary saturation waits instead of
+/// dropping an advisory-lock owner into an unjoinable fallback.
+pub(crate) async fn execute_leadership_cleanup(
+    operation: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    execute_leadership_cleanup_on(control_store_leadership_executor()?, operation).await
+}
+
+async fn execute_leadership_cleanup_on(
+    executor: &executor::BlockingExecutor,
+    operation: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    type CleanupJob = Box<dyn FnOnce() + Send + 'static>;
+
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let mut cleanup: CleanupJob = Box::new(move || {
+        operation();
+        let _ = completed.send(());
+    });
+    let mut recorded_saturation = false;
+    loop {
+        match executor.try_execute_cleanup(cleanup) {
+            Ok(()) => break,
+            Err(executor::CleanupSubmitError::Full(returned)) => {
+                cleanup = returned;
+                if !recorded_saturation {
+                    metrics::record_rejection(metrics::RejectionKind::LeadershipCleanup);
+                    recorded_saturation = true;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(executor::CleanupSubmitError::Shutdown(_)) => {
+                return Err(ApiError::unavailable(
+                    "control-store leadership cleanup executor is shutting down",
+                ));
+            }
+        }
+    }
+    completion.await.map_err(|_| {
+        ApiError::internal("control-store leadership cleanup failed before completion")
+    })
+}
+
 async fn execute_on<T: Send + 'static>(
     executor: &'static executor::BlockingExecutor,
     queue_capacity: usize,

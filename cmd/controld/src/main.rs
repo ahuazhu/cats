@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
         None => cats_control_plane::server::spawn(server_config).await?,
     };
     let usage_projector_task = usage_projector.map(|projector| {
-        cats_control_plane::server::spawn_singleton_task(
+        cats_control_plane::server::spawn_managed_singleton_task(
             handle.state.store.clone(),
             cats_control_plane::store::SingletonRole::UsageProjector,
             move || projector.clone().run_projector(),
@@ -608,10 +608,19 @@ async fn main() -> anyhow::Result<()> {
     // cats-controld is PID 1 in the production image. Explicitly handling
     // SIGTERM stops the reconciler as soon as Kubernetes removes the Pod from
     // Service endpoints, so the deployment gap cannot look like Node loss.
-    if let Some(task) = usage_projector_task {
-        task.abort();
+    if let Some(task) = &usage_projector_task {
+        task.begin_shutdown();
     }
-    handle.shutdown().await?;
+    let usage_projector_shutdown = async {
+        match &usage_projector_task {
+            Some(task) => task.shutdown().await,
+            None => Ok(()),
+        }
+    };
+    let (projector_result, control_result) =
+        tokio::join!(usage_projector_shutdown, handle.shutdown());
+    projector_result?;
+    control_result?;
     println!("SHUTDOWN");
     Ok(())
 }
