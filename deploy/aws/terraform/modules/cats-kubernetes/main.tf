@@ -16,6 +16,11 @@ locals {
   effective_object_write_gateway_replicas = var.maintenance_mode ? 0 : var.object_write_gateway_replicas
   effective_public_ingress                = var.enable_public_ingress && !var.maintenance_mode
 
+  # These immutable pre-created Secrets carry two different SECURITY DEFINER
+  # caller roles. Terraform receives only their fixed names, never either DSN.
+  object_write_gateway_postgres_secret_name = "cats-object-write-gateway-postgres"
+  host_fence_provider_postgres_secret_name  = "cats-host-fence-provider-postgres"
+
   runtime_secret_data = merge(
     var.runtime_secret_data,
     {
@@ -97,6 +102,13 @@ check "control_postgres_search_path" {
       length(regexall("(^|[?&])options=-csearch_path%3D${var.control_postgres_schema}(&|$)", var.storage_postgres_url)) == 1
     )
     error_message = "storage_postgres_url must select exactly control_postgres_schema through one canonical options=-csearch_path%3D<schema> query item."
+  }
+}
+
+check "provider_database_credentials_are_separate" {
+  assert {
+    condition     = local.object_write_gateway_postgres_secret_name != local.host_fence_provider_postgres_secret_name
+    error_message = "ObjectWrite Gateway and HostFence provider must use distinct dedicated PostgreSQL role Secrets."
   }
 }
 
@@ -232,24 +244,6 @@ resource "kubernetes_secret_v1" "runtime" {
 
   type = "Opaque"
   data = local.runtime_secret_data
-}
-
-# Least-privilege database material for the ObjectWrite Gateway. It receives
-# no WorkOS/admin/billing secrets from cats-runtime and reads the DSN only as a
-# mounted file.
-resource "kubernetes_secret_v1" "object_write_gateway_database" {
-  metadata {
-    name      = "cats-object-write-gateway-database"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels = merge(local.labels, {
-      "app.kubernetes.io/name" = "cats-object-write-gateway"
-    })
-  }
-
-  type = "Opaque"
-  data = {
-    CATS_CONTROL_POSTGRES_URL = var.storage_postgres_url
-  }
 }
 
 # Separate from runtime credentials so the signing key is mounted as a file
@@ -842,7 +836,7 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
             "--listen",
             "0.0.0.0:7443",
             "--control-store-url-file",
-            "/etc/cats/object-write-database/CATS_CONTROL_POSTGRES_URL",
+            "/run/cats/object-write-gateway/postgres/url",
             "--control-store-ca-file",
             "/etc/cats/rds-ca.pem",
             "--server-certificate-file",
@@ -925,7 +919,7 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
 
           volume_mount {
             name       = "object-write-database"
-            mount_path = "/etc/cats/object-write-database"
+            mount_path = "/run/cats/object-write-gateway/postgres"
             read_only  = true
           }
 
@@ -952,8 +946,15 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
           name = "object-write-database"
 
           secret {
-            secret_name  = kubernetes_secret_v1.object_write_gateway_database.metadata[0].name
+            secret_name  = local.object_write_gateway_postgres_secret_name
             default_mode = "0400"
+            optional     = false
+
+            items {
+              key  = "url"
+              path = "url"
+              mode = "0400"
+            }
           }
         }
 

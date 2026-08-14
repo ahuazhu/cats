@@ -184,6 +184,42 @@ fn chunkstore_scope_and_service_accounts_are_explicit_validated_inputs() {
 }
 
 #[test]
+fn provider_database_roles_use_distinct_precreated_secrets() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(kubernetes.contains("check \"provider_database_credentials_are_separate\""));
+    assert!(kubernetes.contains(
+        "local.object_write_gateway_postgres_secret_name != local.host_fence_provider_postgres_secret_name"
+    ));
+    assert!(kubernetes.contains(
+        "object_write_gateway_postgres_secret_name = \"cats-object-write-gateway-postgres\""
+    ));
+    assert!(kubernetes.contains(
+        "host_fence_provider_postgres_secret_name  = \"cats-host-fence-provider-postgres\""
+    ));
+    assert!(
+        !kubernetes.contains("resource \"kubernetes_secret_v1\" \"object_write_gateway_database\"")
+    );
+    let gateway_database = between(
+        &kubernetes,
+        "volume {\n          name = \"object-write-database\"",
+        "volume {\n          name = \"rds-ca\"",
+    );
+    for contract in [
+        "secret_name  = local.object_write_gateway_postgres_secret_name",
+        "key  = \"url\"",
+        "path = \"url\"",
+        "optional     = false",
+    ] {
+        assert!(
+            gateway_database.contains(contract),
+            "missing gateway PG mount contract: {contract}"
+        );
+    }
+    assert!(!gateway_database.contains("storage_postgres_url"));
+    assert!(kubernetes.contains("/run/cats/object-write-gateway/postgres/url"));
+}
+
+#[test]
 fn accepted_put_spools_are_encrypted_cross_replica_and_retained() {
     let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf");
     let file_system = between(
