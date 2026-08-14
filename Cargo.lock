@@ -1229,6 +1229,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cats-host-fence-provider-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "cats-api",
+ "cats-control-plane",
+ "cats-host-fence-aws",
+ "cats-storage",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [

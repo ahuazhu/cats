@@ -21,6 +21,7 @@ members = [
     "cmd/blockd",
     "cmd/controld",
     "cmd/object-write-gatewayd",
+    "cmd/host-fence-providerd",
     "cmd/noded",
     "tests/support",
     "tests",
