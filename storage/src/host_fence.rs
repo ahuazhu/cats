@@ -10,13 +10,131 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use cats_api::runtime_reconciliation::{
-    AsciiText, Epoch, Id, NodeBootId, ProviderScope, Sha256Digest, UnixMillis, WireU64,
+    AsciiText, ContractVersion, Epoch, Id, NodeBootId, ProviderScope, Sha256Digest, UnixMillis,
+    WireU64,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const HOST_FENCE_PROVIDER_EVIDENCE_VERSION: u16 = 1;
 pub const MAX_HOST_FENCE_NETWORK_INTERFACES: usize = 64;
+pub const HOST_FENCE_AUTHORITY_BINDINGS_ARTIFACT_BASENAME: &str =
+    "host-fence-authority-bindings.v1.json";
+pub const HOST_FENCE_AUTHORITY_BINDINGS_MAX_BYTES: usize = 256 * 1024;
+
+const HOST_FENCE_AUTHORITY_BINDINGS_DIGEST_DOMAIN: &[u8] = b"cats.host-fence-authority-bindings.v1";
+
+/// Non-secret, content-addressed authority facts shared by Control and the
+/// provider worker. Provider-only VPC/interface targets are deliberately not
+/// representable here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostFenceAuthorityBindingsV1 {
+    pub version: ContractVersion,
+    pub provider_scope: ProviderScope,
+    pub network_quarantine_boundary_id: AsciiText,
+    pub object_store_scope_id: AsciiText,
+    pub workload_principal_id: AsciiText,
+    pub hosts: Vec<HostFenceAuthorityHostBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostFenceAuthorityHostBindingV1 {
+    pub immutable_host_id: Id,
+    pub node_id: Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HostFenceAuthorityBindingsError {
+    #[error("Host-fence authority bindings are malformed or unsupported")]
+    Invalid,
+    #[error("Host-fence authority bindings are not canonical JSON")]
+    NonCanonical,
+    #[error("Host-fence authority bindings exceed their fixed byte bound")]
+    TooLarge,
+    #[error("Host-fence authority bindings do not contain the exact Host and Node")]
+    HostBindingMismatch,
+}
+
+pub fn encode_host_fence_authority_bindings_v1(
+    bindings: &HostFenceAuthorityBindingsV1,
+) -> Result<Vec<u8>, HostFenceAuthorityBindingsError> {
+    validate_host_fence_authority_bindings_v1(bindings)?;
+    let bytes =
+        serde_json::to_vec(bindings).map_err(|_| HostFenceAuthorityBindingsError::Invalid)?;
+    if bytes.len() > HOST_FENCE_AUTHORITY_BINDINGS_MAX_BYTES {
+        return Err(HostFenceAuthorityBindingsError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_host_fence_authority_bindings_v1(
+    bytes: &[u8],
+) -> Result<HostFenceAuthorityBindingsV1, HostFenceAuthorityBindingsError> {
+    if bytes.len() > HOST_FENCE_AUTHORITY_BINDINGS_MAX_BYTES {
+        return Err(HostFenceAuthorityBindingsError::TooLarge);
+    }
+    let bindings =
+        serde_json::from_slice(bytes).map_err(|_| HostFenceAuthorityBindingsError::Invalid)?;
+    validate_host_fence_authority_bindings_v1(&bindings)?;
+    if serde_json::to_vec(&bindings).map_err(|_| HostFenceAuthorityBindingsError::Invalid)? != bytes
+    {
+        return Err(HostFenceAuthorityBindingsError::NonCanonical);
+    }
+    Ok(bindings)
+}
+
+pub fn host_fence_authority_bindings_sha256(
+    bindings: &HostFenceAuthorityBindingsV1,
+) -> Result<Sha256Digest, HostFenceAuthorityBindingsError> {
+    let bytes = encode_host_fence_authority_bindings_v1(bindings)?;
+    let mut hasher = Sha256::new();
+    hasher.update(HOST_FENCE_AUTHORITY_BINDINGS_DIGEST_DOMAIN);
+    hasher.update([0]);
+    hasher.update(bytes);
+    Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
+}
+
+pub fn resolve_host_fence_authority_host_v1<'a>(
+    bindings: &'a HostFenceAuthorityBindingsV1,
+    immutable_host_id: &Id,
+    node_id: &Id,
+) -> Result<&'a HostFenceAuthorityHostBindingV1, HostFenceAuthorityBindingsError> {
+    validate_host_fence_authority_bindings_v1(bindings)?;
+    let index = bindings
+        .hosts
+        .binary_search_by(|host| {
+            host.immutable_host_id
+                .as_str()
+                .cmp(immutable_host_id.as_str())
+        })
+        .map_err(|_| HostFenceAuthorityBindingsError::HostBindingMismatch)?;
+    let host = &bindings.hosts[index];
+    if &host.node_id != node_id {
+        return Err(HostFenceAuthorityBindingsError::HostBindingMismatch);
+    }
+    Ok(host)
+}
+
+fn validate_host_fence_authority_bindings_v1(
+    bindings: &HostFenceAuthorityBindingsV1,
+) -> Result<(), HostFenceAuthorityBindingsError> {
+    if bindings.version != ContractVersion::V1 || bindings.hosts.is_empty() {
+        return Err(HostFenceAuthorityBindingsError::Invalid);
+    }
+    let mut node_ids = BTreeSet::new();
+    let mut prior_host: Option<&Id> = None;
+    for host in &bindings.hosts {
+        if prior_host.is_some_and(|prior| prior.as_str() >= host.immutable_host_id.as_str())
+            || !node_ids.insert(&host.node_id)
+        {
+            return Err(HostFenceAuthorityBindingsError::Invalid);
+        }
+        prior_host = Some(&host.immutable_host_id);
+    }
+    Ok(())
+}
 
 /// Exact Cats and provider lineage targeted by one fence attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -678,5 +796,103 @@ impl ObjectWriteCutoffPort for UnavailableObjectWriteCutoff {
         _absolute_deadline: Instant,
     ) -> HostFencePortFuture<'a, ObjectWriteCutoffEvidence> {
         Box::pin(async { Err(HostFenceProviderError::ObjectWriteBarrierUnavailable) })
+    }
+}
+
+#[cfg(test)]
+mod authority_binding_tests {
+    use super::*;
+
+    fn id(value: &str) -> Id {
+        Id::new(value.to_owned()).expect("test ID is valid")
+    }
+
+    fn text(value: &str) -> AsciiText {
+        AsciiText::new(value.to_owned()).expect("test text is valid")
+    }
+
+    fn bindings() -> HostFenceAuthorityBindingsV1 {
+        HostFenceAuthorityBindingsV1 {
+            version: ContractVersion::V1,
+            provider_scope: ProviderScope {
+                provider: id("aws"),
+                partition: id("aws-partition"),
+                account_id: id("account-1"),
+                region: id("region-1"),
+            },
+            network_quarantine_boundary_id: text("sg-0123456789abcdef0"),
+            object_store_scope_id: text("arn:aws:s3:::cats-bucket/volumes"),
+            workload_principal_id: text("arn:aws:iam::account-1:role/cats-object-write-gateway"),
+            hosts: vec![
+                HostFenceAuthorityHostBindingV1 {
+                    immutable_host_id: id("host-1"),
+                    node_id: id("node-1"),
+                },
+                HostFenceAuthorityHostBindingV1 {
+                    immutable_host_id: id("host-2"),
+                    node_id: id("node-2"),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn authority_binding_artifact_has_one_canonical_digest_and_exact_lookup() {
+        let expected = bindings();
+        let bytes = encode_host_fence_authority_bindings_v1(&expected)
+            .expect("test authority bindings encode");
+        assert_eq!(
+            decode_host_fence_authority_bindings_v1(&bytes)
+                .expect("test authority bindings decode"),
+            expected
+        );
+        assert_eq!(
+            host_fence_authority_bindings_sha256(&expected)
+                .expect("test authority bindings digest derives"),
+            Sha256Digest::new(
+                "sha256:9de3e2b4b6527ea682a8e07c18302c9ad31f409fdbb8b498cedf6ab9d0f0aa55"
+                    .to_owned(),
+            )
+            .expect("fixed test digest is valid")
+        );
+        assert_eq!(
+            resolve_host_fence_authority_host_v1(&expected, &id("host-2"), &id("node-2"))
+                .expect("exact Host binding resolves")
+                .node_id,
+            id("node-2")
+        );
+    }
+
+    #[test]
+    fn authority_binding_artifact_rejects_unordered_or_reused_host_lineage() {
+        let mut unordered = bindings();
+        unordered.hosts.swap(0, 1);
+        assert_eq!(
+            encode_host_fence_authority_bindings_v1(&unordered),
+            Err(HostFenceAuthorityBindingsError::Invalid)
+        );
+
+        let mut reused_node = bindings();
+        reused_node.hosts[1].node_id = reused_node.hosts[0].node_id.clone();
+        assert_eq!(
+            encode_host_fence_authority_bindings_v1(&reused_node),
+            Err(HostFenceAuthorityBindingsError::Invalid)
+        );
+    }
+
+    #[test]
+    fn authority_binding_artifact_rejects_noncanonical_bytes_and_cross_node_lookup() {
+        let expected = bindings();
+        let mut bytes = encode_host_fence_authority_bindings_v1(&expected)
+            .expect("test authority bindings encode");
+        bytes.push(b'\n');
+        assert_eq!(
+            decode_host_fence_authority_bindings_v1(&bytes),
+            Err(HostFenceAuthorityBindingsError::NonCanonical)
+        );
+        assert_eq!(
+            resolve_host_fence_authority_host_v1(&expected, &id("host-1"), &id("node-2")),
+            Err(HostFenceAuthorityBindingsError::HostBindingMismatch)
+        );
     }
 }
