@@ -60,6 +60,30 @@ case "$action" in
       jq -S -c -n --arg case_id "$case_id" \
         '{version:1,case_id:$case_id,unexpected:true}' >"$case_dir/extra-receipt.json"
     fi
+    if [[ $case_id == cat-create-running && -n ${CATS_E3_FIXTURE_RUNTIME_CAT_ID:-} ]]; then
+      runtime_state=${CATS_E3_RUNTIME_STATE:?missing fixture runtime state}
+      runtime_temporary=$(mktemp "${runtime_state%/*}/.runtime-state.fixture.XXXXXX")
+      jq -S -c --arg cat_id "$CATS_E3_FIXTURE_RUNTIME_CAT_ID" \
+        '.cat_id = $cat_id' "$runtime_state" >"$runtime_temporary"
+      chmod 0600 "$runtime_temporary"
+      mv -f "$runtime_temporary" "$runtime_state"
+      sync -f "${runtime_state%/*}"
+      jq -S -c -n --arg cat_id "$CATS_E3_FIXTURE_RUNTIME_CAT_ID" \
+        '{cat_id:$cat_id,operation_id:"operation-fixture-create"}' \
+        >"$case_dir/create-response.json"
+      chmod 0600 "$case_dir/create-response.json"
+      sync -f "$case_dir/create-response.json"
+      sync -f "$case_dir"
+    fi
+    if [[ ${CATS_E3_FIXTURE_SIGKILL_CASE:-} == "$case_id" && \
+      -n ${CATS_E3_FIXTURE_RUNNER_PID:-} && \
+      -n ${CATS_E3_FIXTURE_KILL_ONCE_FILE:-} && \
+      ! -e ${CATS_E3_FIXTURE_KILL_ONCE_FILE} ]]; then
+      : >"$CATS_E3_FIXTURE_KILL_ONCE_FILE"
+      kill -KILL "$CATS_E3_FIXTURE_RUNNER_PID"
+      sleep 1
+      exit 99
+    fi
     if [[ ${CATS_E3_FIXTURE_SECRETS:-false} == true ]]; then
       printf 'Authorization: Bearer fixture-token-must-not-survive\n'
       printf 'password=fixture-password-must-not-survive\n'

@@ -304,7 +304,7 @@ initialize_rotation_journal() {
       fail "Route rotation phase aggregate is not canonical JSON"
     rm -f "$ROTATION_JOURNAL/.phase-prefix.canonical"
   else
-    printf '[]' >"$phases"
+    printf '[]\n' >"$phases"
     durable_case_file "$phases"
   fi
 }
@@ -740,27 +740,209 @@ fleet_safe_summary() {
 }
 
 write_runtime_cat_id() {
-  local cat=$1 state temporary
+  local cat=$1 state
   state=$(nonsecret_path CATS_E3_RUNTIME_STATE)
-  temporary=$(mktemp "${state%/*}/.runtime-state.json.XXXXXX")
-  jq -S -c --arg cat_id "$cat" '.cat_id = $cat_id' "$state" >"$temporary"
-  chmod 0600 "$temporary"
-  mv -f "$temporary" "$state"
+  python3 - "$state" "$cat" "$CATS_E3_EXACT_COMMIT" "$BLOCK_PATH" \
+    "$CATS_E3_RUN_ID" <<'PY' || fail "runtime Cat identity is unsafe or changed across resume"
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+
+
+path, cat_id, exact_commit, block_path, run_id = sys.argv[1:]
+id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+if id_pattern.fullmatch(cat_id) is None:
+    raise SystemExit(1)
+directory = os.path.dirname(path)
+name = os.path.basename(path)
+directory_fd = os.open(
+    directory,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+descriptor = -1
+temporary_fd = -1
+temporary_path = None
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def closed_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+try:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    before = os.fstat(descriptor)
+    effective_uid = os.geteuid()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != effective_uid
+        or (effective_uid == 0 and before.st_gid != 0)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or not 1 <= before.st_size <= 65_536
+    ):
+        raise SystemExit(1)
+    raw = b""
+    while len(raw) < before.st_size:
+        chunk = os.read(descriptor, before.st_size - len(raw))
+        if not chunk:
+            raise SystemExit(1)
+        raw += chunk
+    if os.read(descriptor, 1) or identity(os.fstat(descriptor)) != identity(before):
+        raise SystemExit(1)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise SystemExit(1) from error
+    canonical = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    if (
+        raw != canonical
+        or not isinstance(value, dict)
+        or set(value)
+        != {"block_path", "cat_id", "exact_commit", "run_id", "version"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["exact_commit"] != exact_commit
+        or value["block_path"] != block_path
+        or value["run_id"] != run_id
+        or (
+            value["cat_id"] is not None
+            and (
+                not isinstance(value["cat_id"], str)
+                or id_pattern.fullmatch(value["cat_id"]) is None
+            )
+        )
+    ):
+        raise SystemExit(1)
+    if value["cat_id"] is not None:
+        if value["cat_id"] != cat_id:
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    value["cat_id"] = cat_id
+    replacement = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{name}.", dir=directory
+    )
+    os.fchmod(temporary_fd, 0o600)
+    offset = 0
+    while offset < len(replacement):
+        count = os.write(temporary_fd, replacement[offset:])
+        if count <= 0:
+            raise SystemExit(1)
+        offset += count
+    os.fsync(temporary_fd)
+    os.close(temporary_fd)
+    temporary_fd = -1
+    if identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) != identity(before):
+        raise SystemExit(1)
+    os.rename(
+        os.path.basename(temporary_path),
+        name,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+    )
+    temporary_path = None
+    os.fsync(directory_fd)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    if temporary_fd >= 0:
+        os.close(temporary_fd)
+    if temporary_path is not None:
+        try:
+            os.unlink(os.path.basename(temporary_path), dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            pass
+    os.close(directory_fd)
+PY
 }
 
 run_create() {
-  local output cat_id operation_id expected_name expected_node placement_snapshot
+  local output pending cat_id operation_id expected_name expected_node placement_snapshot
+  local runtime_cat_id
   expected_name=$(required CATS_E3_CAT_NAME)
   output=$CASE_DIR/create-response.json
-  run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
-    create "$expected_name" \
-    --boot-image-digest "$(required CATS_E3_BOOT_IMAGE_DIGEST)" \
-    --cpus "${CATS_E3_CPUS:-1}" --memory "${CATS_E3_MEMORY:-512MiB}" \
-    --root-size "${CATS_E3_ROOT_SIZE:-1GiB}" --durability strict >"$output"
+  pending=$CASE_DIR/create-response.pending.json
+  runtime_cat_id=$(jq -er '.cat_id // empty' "$(nonsecret_path CATS_E3_RUNTIME_STATE)" \
+    2>/dev/null || true)
+  if [[ -n $runtime_cat_id ]]; then
+    canonical_id runtime_state_cat_id "$runtime_cat_id"
+    [[ -e $output || -e $pending || -L $output || -L $pending ]] || \
+      fail "durable Cat identity has no adjacent create response"
+  fi
+  if [[ ! -e $output && ! -L $output && ! -e $pending && ! -L $pending ]]; then
+    if ! (umask 077; run_cats --api-url "$(control_origin)" \
+      --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
+      create "$expected_name" \
+      --boot-image-digest "$(required CATS_E3_BOOT_IMAGE_DIGEST)" \
+      --cpus "${CATS_E3_CPUS:-1}" --memory "${CATS_E3_MEMORY:-512MiB}" \
+      --root-size "${CATS_E3_ROOT_SIZE:-1GiB}" --durability strict >"$pending"); then
+      fail "Cat create did not reach one durable accepted identity"
+    fi
+    durable_case_file "$pending"
+  fi
+  if [[ -e $pending || -L $pending ]]; then
+    [[ -f $pending && ! -L $pending && -O $pending ]] || \
+      fail "pending Cat create response is unsafe"
+    [[ $(file_link_count "$pending") == 1 ]] || \
+      fail "pending Cat create response is not single-link"
+    [[ $(stat -c '%a' "$pending") == 600 ]] || \
+      fail "pending Cat create response is not private"
+    jq -e 'keys == ["cat_id","operation_id"]' "$pending" >/dev/null || \
+      fail "pending Cat create response has a foreign shape"
+    adopt_case_file "$pending" "$output"
+    rm -f "$pending"
+    sync -f "$CASE_DIR"
+  else
+    recover_interrupted_adoption "$output"
+  fi
+  [[ -f $output && ! -L $output && -O $output && \
+    $(file_link_count "$output") == 1 && $(stat -c '%a' "$output") == 600 ]] || \
+    fail "durable Cat create response is unsafe"
+  jq -e 'keys == ["cat_id","operation_id"]' "$output" >/dev/null || \
+    fail "durable Cat create response has a foreign shape"
   cat_id=$(json_field "$output" '.cat_id')
   operation_id=$(json_field "$output" '.operation_id')
   canonical_id cat_id "$cat_id"
   canonical_id operation_id "$operation_id"
+  [[ -z $runtime_cat_id || $runtime_cat_id == "$cat_id" ]] || \
+    fail "durable Cat identity differs from the accepted create response"
   write_runtime_cat_id "$cat_id"
   operation_wait "$operation_id" running
   run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
@@ -2508,8 +2690,11 @@ validate_rotation_terminal_evidence() {
   local receipt=$CASE_DIR/route-v2-rotation-disable-live-delivery.receipt.json
   local node_acks=$CASE_DIR/route-v2-rotation-disable-live-delivery.node-acks.json
   local transcript=$CASE_DIR/route-v2-rotation-disable-live-delivery.transcript.log
-  local evidence filename
+  local evidence filename expected_nodes run_digest fresh_name
   local top_evidence=()
+  expected_nodes=$(printf '%s' "$(required CATS_E3_EXPECTED_NODES)" | jq -R 'split(",") | sort')
+  run_digest=$(printf '%s' "$CASE_ID:$CATS_E3_RUN_ID" | sha256sum | awk '{print $1}')
+  fresh_name=g3-${run_digest:0:24}
   for evidence in "$receipt" "$node_acks" "$transcript"; do
     [[ -f $evidence && ! -L $evidence && -O $evidence ]] || \
       fail "Route rotation terminal evidence is missing or unsafe"
@@ -2520,11 +2705,23 @@ validate_rotation_terminal_evidence() {
     --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
     --arg commit "$CATS_E3_EXACT_COMMIT" \
     --arg catalog "$(required CATS_E3_QUALIFICATION_CATALOG_SHA256)" \
+    --arg authority "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID)" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --arg trust "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256)" \
+    --arg command_bundle_sha "$(sha256_wire "$(rotation_input route-rotation-command-bundle)")" \
+    --arg recovery_transport_sha "$(sha256_wire "$(rotation_input route-rotation-recovery)")" \
+    --arg endpoint_name "$(required CATS_E3_ENDPOINT_NAME)" \
+    --arg endpoint_hostname "$(required CATS_E3_ENDPOINT_HOSTNAME)" \
+    --arg fresh_name "$fresh_name" \
     --arg node_acks_sha "$(sha256_wire "$node_acks")" \
     --arg transcript_sha "$(sha256_wire "$transcript")" '
     .version == 1 and .kind == "route_v2_rotation_terminal_receipt_v1"
     and .case_id == $case_id and .qualification_run_id == $run_id
     and .source_commit_sha == $commit and .qualification_catalog_sha256 == $catalog
+    and .authority_id == $authority and .route_deployment_id == $deployment
+    and .rotation_operator_trust_sha256 == $trust
+    and .command_bundle_sha256 == $command_bundle_sha
+    and .recovery_transport_sha256 == $recovery_transport_sha
     and (.phase_receipts | length) == 7
     and .disabled_checkpoint.public_route_closed == true
     and .disabled_checkpoint.public_route_closed_observation_count == 3
@@ -2533,20 +2730,33 @@ validate_rotation_terminal_evidence() {
     and .recovery_checkpoint.process_ready == true
     and .recovery_checkpoint.all_nodes_acknowledged == true
     and .recovery_checkpoint.all_active_guards_zero == true
+    and .fresh_endpoint.old_endpoint.name == $endpoint_name
+    and .fresh_endpoint.old_endpoint.hostname == $endpoint_hostname
+    and .fresh_endpoint.fresh_endpoint.name == $fresh_name
+    and .fresh_endpoint.fresh_endpoint.hostname == $endpoint_hostname
+    and .fresh_endpoint.fresh_endpoint.route_epoch == 1
+    and .fresh_endpoint.fresh_endpoint.endpoint_id
+      != .fresh_endpoint.old_endpoint.endpoint_id
     and .fresh_endpoint.http_guest_body == true
     and .fresh_endpoint.websocket_guest_echo == true
     and .node_acks_sha256 == $node_acks_sha and .transcript_sha256 == $transcript_sha
     and .terminal_marker == "route_v2_rotation_disable_recovered_active_http_ws"' \
     "$receipt" >/dev/null || fail "Route rotation terminal receipt changed across resume"
   jq -e --arg case_id "$CASE_ID" --arg run_id "$CATS_E3_RUN_ID" \
-    --arg commit "$CATS_E3_EXACT_COMMIT" '
+    --arg commit "$CATS_E3_EXACT_COMMIT" \
+    --arg deployment "$(required CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID)" \
+    --argjson expected_nodes "$expected_nodes" '
     .version == 1 and .kind == "route_v2_node_ring_ack_set_v1"
     and .case_id == $case_id and .qualification_run_id == $run_id
     and .source_commit_sha == $commit
+    and .route_deployment_id == $deployment
+    and .expected_nodes == $expected_nodes
     and .disabled_all_nodes_closed_or_fenced == true
     and all(.checkpoints[];
       .store_precondition_satisfied == true and .precondition.satisfied == true)
     and .all_nodes_acknowledged == true and .all_active_guards_zero == true
+    and .terminal_signing_authority.deployment_id == $deployment
+    and .terminal_signing_authority.signer_revision == 8
     and .terminal_marker == "recovery_ring_acked_and_active_routes_reopened"' \
     "$node_acks" >/dev/null || fail "Route rotation Node ACK evidence changed across resume"
   shopt -s nullglob
@@ -3296,7 +3506,13 @@ run_usage_source_terminals() {
   previous_keys=$CASE_DIR/usage-source-keys.previous.json
   receipt_dir=$CASE_DIR/source-terminal-receipts
   sources_work=$CASE_DIR/usage-terminal-sources.jsonl
-  mkdir -m 0700 "$receipt_dir"
+  if [[ ! -e $receipt_dir && ! -L $receipt_dir ]]; then
+    mkdir -m 0700 "$receipt_dir"
+    sync -f "$CASE_DIR"
+  fi
+  [[ -d $receipt_dir && ! -L $receipt_dir && -O $receipt_dir && \
+    $(stat -c '%a' "$receipt_dir") == 700 ]] || \
+    fail "Usage source terminal receipt directory is not protected resume state"
   : >"$sources_work"
 
   # Product deletion and the framework EndQualification/Closed hook have

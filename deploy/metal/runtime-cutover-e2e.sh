@@ -8,6 +8,14 @@ set -euo pipefail
 # Executing this file always enters the root-only main path below; sourcing it
 # only exposes this deterministic case/evidence loop to repository tests.
 cats_e3_run_cases_post_preflight() {
+  local phase=${1:-fixture-all}
+  case "$phase" in
+    product|source) ;;
+    fixture-all)
+      [[ ${CATS_E3_FIXTURE_MODE:-} == enabled ]] || return 125
+      ;;
+    *) return 125 ;;
+  esac
   atomic_copy() {
     local source=$1 destination=$2 temporary
     temporary=$(mktemp "$output_dir/.${destination}.XXXXXX")
@@ -147,11 +155,41 @@ cats_e3_run_cases_post_preflight() {
     atomic_copy "$evidence_work" case-evidence.jsonl
   }
 
-  failed_cases=0
-  blocked_cases=0
-  passed_cases=0
+  if [[ $phase == fixture-all ]]; then
+    failed_cases=0
+    blocked_cases=0
+    passed_cases=0
+  elif [[ $phase == product ]]; then
+    failed_cases=0
+    blocked_cases=0
+    passed_cases=${first_incomplete_case_index:-0}
+  else
+    [[ ${qualification_terminalized:-false} == true ]] || return 125
+    jq -e --arg run_id "$run_id" --arg workspace_id "$workspace_id" \
+      --arg exact_commit "$exact_commit" \
+      --arg catalog_sha256 "sha256:$qualification_catalog_authority_sha256" '
+      .kind == "cats.production-mutation-qualification-terminal-receipt.v1"
+      and .version == 1 and .qualification_id == $run_id
+      and .workspace_id == $workspace_id and .source_commit_sha == $exact_commit
+      and .qualification_catalog_sha256 == $catalog_sha256
+      and .close_kind == "end_qualification"
+      and .terminal_outcome == "qualified_closed"
+      and .active_guard_count == 0 and .product_resource_count == 0
+      and .residue_count == 0' \
+      "$output_dir/production-mutation-qualification-terminal.receipt.json" >/dev/null || \
+      return 125
+  fi
   for index in "${!case_ids[@]}"; do
     case_id=${case_ids[$index]}
+    if [[ $phase == product && $case_id == usage-source-terminal-receipts ]]; then
+      continue
+    fi
+    if [[ $phase == source && $case_id != usage-source-terminal-receipts ]]; then
+      continue
+    fi
+    if [[ $phase == product && $index -lt ${first_incomplete_case_index:-0} ]]; then
+      continue
+    fi
     deadline=${case_deadlines[$index]}
     cleanup_deadline=${case_cleanup_deadlines[$index]}
     expected_outcome=${case_expected_outcomes[$index]}
@@ -160,8 +198,13 @@ cats_e3_run_cases_post_preflight() {
     if [[ $case_id == route-v2-rotation-disable-live-delivery ]]; then
       kill_after=30
     fi
-    case_dir=$scratch/case-$case_id
-    mkdir -m 0700 "$case_dir"
+    if [[ $phase != fixture-all && -n ${persistent_cases_dir:-} ]]; then
+      case_dir=$(printf '%s/%02d-%s' "$persistent_cases_dir" "$index" "$case_id")
+      cats_e3_private_state_subdirectory "$case_dir" || return 125
+    else
+      case_dir=$scratch/case-$case_id
+      mkdir -m 0700 "$case_dir"
+    fi
     run_summary=$case_dir/run-summary.txt
     cleanup_summary=$case_dir/cleanup-summary.txt
     diagnostic_summary=$case_dir/diagnostic-summary.txt
@@ -255,8 +298,22 @@ cats_e3_run_cases_post_preflight() {
         evidence_exit_code:$evidence_exit_code}' \
       >>"$results_work"
     atomic_copy "$results_work" scenario-results.jsonl
+    if [[ $phase == product && -n ${persistent_case_prefix_dir:-} ]]; then
+      if [[ $status != passed ]]; then
+        break
+      fi
+      cats_e3_persist_case_prefix "$index" "$case_id" || return 125
+      first_incomplete_case_index=$((index + 1))
+      atomic_copy "$persistent_runtime_state" runtime-state.json
+    fi
   done
 
+  if [[ $phase == fixture-all ]]; then
+    cats_e3_collect_final_inventory
+  fi
+}
+
+cats_e3_collect_final_inventory() {
   inventory_work=$scratch/final-inventory.json
   set +e
   "$timeout_bin" --signal=TERM --kill-after=5 180 \
@@ -270,16 +327,265 @@ cats_e3_run_cases_post_preflight() {
     failed_cases=$((failed_cases + 1))
     printf '%s\n' '{"status":"unavailable"}' >"$inventory_work"
     printf '%s\n' '[final inventory command or evidence filter failed closed]' >"$scratch/inventory-diagnostic.txt"
-    append_summary final-inventory diagnostics "$scratch/inventory-diagnostic.txt"
+    if declare -F append_summary >/dev/null; then
+      append_summary final-inventory diagnostics "$scratch/inventory-diagnostic.txt"
+    fi
   fi
   atomic_copy "$inventory_work" final-inventory.json
+}
+
+cats_e3_run_qualification_operator() {
+  local command_name=$1 output expected_receipt receipt receipt_sha256 actual_sha256
+  shift
+  case "$command_name" in
+    qualification-begin)
+      expected_receipt=$output_dir/production-mutation-qualification-begin.receipt.json
+      ;;
+    qualification-close)
+      expected_receipt=$qualification_operator_state/production-mutation-qualification-final-admission-state.json
+      ;;
+    qualification-product-inventory)
+      expected_receipt=$output_dir/production-mutation-qualification-product-inventory.receipt.json
+      ;;
+    qualification-terminalize)
+      expected_receipt=$output_dir/production-mutation-qualification-terminal.receipt.json
+      ;;
+    *) return 125 ;;
+  esac
+  output=$(mktemp "$scratch/.production-mutation-admission.XXXXXX")
+  if ! PYTHONDONTWRITEBYTECODE=1 "$qualification_operator" "$command_name" \
+    "${qualification_common_args[@]}" "$@" >"$output"; then
+    rm -f "$output"
+    return 1
+  fi
+  jq -e '
+    keys == ["receipt","sha256"]
+    and (.receipt | type == "string" and startswith("/"))
+    and (.sha256 | test("^sha256:[0-9a-f]{64}$"))' \
+    "$output" >/dev/null || {
+      rm -f "$output"
+      return 1
+    }
+  receipt=$(jq -er '.receipt' "$output") || {
+    rm -f "$output"
+    return 1
+  }
+  receipt_sha256=$(jq -er '.sha256' "$output") || {
+    rm -f "$output"
+    return 1
+  }
+  [[ $receipt == "$expected_receipt" && -f $receipt && ! -L $receipt && -O $receipt && \
+    $(stat -c '%u:%g:%a:%h' "$receipt") == 0:0:600:1 ]] || {
+    rm -f "$output"
+    return 1
+  }
+  actual_sha256=sha256:$(sha256sum "$receipt" | awk '{print $1}')
+  [[ $actual_sha256 == "$receipt_sha256" ]] || {
+    rm -f "$output"
+    return 1
+  }
+  if [[ $command_name == qualification-close ]]; then
+    local evidence_state=$output_dir/production-mutation-qualification-final-admission-state.json
+    [[ -f $evidence_state && ! -L $evidence_state && -O $evidence_state && \
+      $(stat -c '%u:%g:%a:%h' "$evidence_state") == 0:0:600:1 && \
+      sha256:$(sha256sum "$evidence_state" | awk '{print $1}') == "$actual_sha256" ]] || {
+      rm -f "$output"
+      return 1
+    }
+  fi
+  rm -f "$output"
+}
+
+cats_e3_qualification_begin() {
+  qualification_lifecycle_attempted=true
+  cats_e3_run_qualification_operator qualification-begin \
+    --private-key-file "$production_cutover_operator_private_key_file" \
+    --command-lifetime-seconds 240 || return $?
+  qualification_begin_applied=true
+}
+
+cats_e3_qualification_close() {
+  local close_kind=$1
+  qualification_close_attempted=true
+  cats_e3_run_qualification_operator qualification-close \
+    --private-key-file "$production_cutover_operator_private_key_file" \
+    --command-lifetime-seconds 240 \
+    --close-kind "$close_kind" || return $?
+  qualification_close_applied=true
+}
+
+cats_e3_qualification_product_inventory() {
+  local close_kind=$1
+  cats_e3_run_qualification_operator qualification-product-inventory \
+    --close-kind "$close_kind"
+}
+
+cats_e3_publish_qualification_zero_wrappers() {
+  local inventory=$output_dir/final-inventory.json
+  local product=$output_dir/production-mutation-qualification-product-inventory.receipt.json
+  local fleet=$output_dir/production-mutation-qualification-final-fleet-closed.receipt.json
+  local cleanup=$output_dir/production-mutation-qualification-cleanup-inventory.receipt.json
+  local fleet_source=$scratch/production-mutation-qualification-final-fleet.source.json
+  local cleanup_source=$scratch/production-mutation-qualification-cleanup.source.json
+  local fleet_sha256 product_sha256 product_evaluated now_ms evaluated
+  jq -e --arg commit "$exact_commit" --arg block_path "$block_path" \
+    --slurpfile expected_nodes "$expected_nodes_work" '
+    keys == ["block_path","current_runtime_observation_count","desired_runtime_count",
+      "nodes","release_commit_sha","version"]
+    and .version == 1 and .release_commit_sha == $commit and .block_path == $block_path
+    and .desired_runtime_count == 0 and .current_runtime_observation_count == 0
+    and ([.nodes[].node_id] == $expected_nodes[0])
+    and all(.nodes[];
+      keys == ["active_guard_count","assigned_desired_count","cancellation_pending_count",
+        "complete_inventory","lifecycle_open_count","node_id","quarantined_condition_count",
+        "residue_count","route_active_count","route_closed_count","runtime_count"]
+      and .complete_inventory == true
+      and .assigned_desired_count == 0 and .runtime_count == 0
+      and .residue_count == 0 and .lifecycle_open_count == 0
+      and .route_active_count == 0 and .route_closed_count == 0
+      and .active_guard_count == 0 and .cancellation_pending_count == 0
+      and .quarantined_condition_count == 0)' \
+    "$inventory" >/dev/null || return 1
+  jq -e --arg run_id "$run_id" --arg workspace_id "$workspace_id" \
+    --arg exact_commit "$exact_commit" \
+    --arg catalog_sha256 "sha256:$qualification_catalog_authority_sha256" '
+    .kind == "cats.production-mutation-qualification-product-inventory.v1"
+    and .version == 1 and .qualification_id == $run_id
+    and .workspace_id == $workspace_id and .source_commit_sha == $exact_commit
+    and .qualification_catalog_sha256 == $catalog_sha256
+    and .complete == true and .product_resource_count == 0
+    and (.evaluated_at_unix_ms | type == "number" and . > 0 and floor == .)' \
+    "$product" >/dev/null || return 1
+  fleet_sha256=sha256:$(sha256sum "$inventory" | awk '{print $1}')
+  product_sha256=sha256:$(sha256sum "$product" | awk '{print $1}')
+  product_evaluated=$(jq -er '.evaluated_at_unix_ms' "$product")
+  now_ms=$(python3 - <<'PY'
+import time
+print(time.time_ns() // 1_000_000)
+PY
+  )
+  evaluated=$now_ms
+  (( evaluated >= product_evaluated )) || evaluated=$product_evaluated
+  jq -S -c -n \
+    --arg qualification_id "$run_id" --arg workspace_id "$workspace_id" \
+    --arg source_commit_sha "$exact_commit" --arg block_path "$block_path" \
+    --argjson evaluated_at_unix_ms "$evaluated" \
+    --arg fleet_verification_receipt_sha256 "$fleet_sha256" \
+    --slurpfile expected_node_ids "$expected_nodes_work" '
+    {active_guard_count:0,block_path:$block_path,complete:true,
+     current_runtime_observation_count:0,desired_runtime_count:0,
+     evaluated_at_unix_ms:$evaluated_at_unix_ms,
+     expected_node_ids:$expected_node_ids[0],
+     fleet_verification_receipt_sha256:$fleet_verification_receipt_sha256,
+     kind:"cats.production-mutation-qualification-final-fleet-closed.v1",
+     qualification_id:$qualification_id,residue_count:0,
+     source_commit_sha:$source_commit_sha,version:1,workspace_id:$workspace_id}' \
+    >"$fleet_source"
+  atomic_copy "$fleet_source" "${fleet##*/}"
+  jq -S -c -n \
+    --arg qualification_id "$run_id" --arg workspace_id "$workspace_id" \
+    --arg source_commit_sha "$exact_commit" --arg block_path "$block_path" \
+    --argjson evaluated_at_unix_ms "$evaluated" \
+    --arg product_inventory_receipt_sha256 "$product_sha256" '
+    {active_guard_count:0,block_path:$block_path,complete:true,
+     current_runtime_observation_count:0,desired_runtime_count:0,
+     evaluated_at_unix_ms:$evaluated_at_unix_ms,
+     kind:"cats.production-mutation-qualification-cleanup-inventory.v1",
+     product_inventory_receipt_sha256:$product_inventory_receipt_sha256,
+     product_resource_count:0,qualification_id:$qualification_id,residue_count:0,
+     source_commit_sha:$source_commit_sha,version:1,workspace_id:$workspace_id}' \
+    >"$cleanup_source"
+  atomic_copy "$cleanup_source" "${cleanup##*/}"
+}
+
+cats_e3_qualification_terminalize() {
+  local close_kind=$1
+  cats_e3_run_qualification_operator qualification-terminalize \
+    --close-kind "$close_kind" \
+    --fleet-closed-receipt \
+      "$output_dir/production-mutation-qualification-final-fleet-closed.receipt.json" \
+    --product-inventory-receipt \
+      "$output_dir/production-mutation-qualification-product-inventory.receipt.json" \
+    --cleanup-inventory-receipt \
+      "$output_dir/production-mutation-qualification-cleanup-inventory.receipt.json" || return $?
+  qualification_terminalized=true
+}
+
+cats_e3_close_on_exit() {
+  [[ ${qualification_cleanup_disarmed:-false} != true && \
+    ${qualification_lifecycle_attempted:-false} == true && \
+    ${qualification_terminalized:-false} != true && \
+    ${qualification_close_forbidden:-false} != true ]] || return 0
+  local decision=$state_directory/qualification-close-decision.v1.json
+  local begin_status=0 cleanup_status=0 close_status=0 proof_status=0
+  if [[ ${qualification_begin_applied:-false} != true ]]; then
+    if cats_e3_qualification_begin >/dev/null 2>&1; then
+      begin_status=0
+    else
+      begin_status=$?
+    fi
+  fi
+  [[ $begin_status -eq 0 ]] || return "$begin_status"
+  if cats_e3_forward_recover_g3_on_exit; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+  fi
+  if [[ -z ${qualification_close_kind:-} ]]; then
+    if [[ -e $decision || -L $decision ]]; then
+      qualification_close_kind=$(cats_e3_load_close_decision) || return 1
+    else
+      qualification_close_kind=emergency_close
+    fi
+  fi
+  cats_e3_persist_close_decision "$qualification_close_kind" >/dev/null 2>&1 || close_status=125
+  if [[ $close_status -eq 0 && ${qualification_close_applied:-false} != true ]]; then
+    if cats_e3_qualification_close "$qualification_close_kind" >/dev/null 2>&1; then
+      close_status=0
+    else
+      close_status=$?
+    fi
+  fi
+  if [[ $close_status -eq 0 ]]; then
+    cats_e3_qualification_product_inventory "$qualification_close_kind" \
+      >/dev/null 2>&1 || proof_status=$?
+    cats_e3_collect_final_inventory
+  fi
+  if [[ $close_status -eq 0 && $proof_status -eq 0 ]]; then
+    cats_e3_publish_qualification_zero_wrappers >/dev/null 2>&1 || proof_status=$?
+  fi
+  if [[ $close_status -eq 0 && $proof_status -eq 0 ]]; then
+    cats_e3_qualification_terminalize "$qualification_close_kind" \
+      >/dev/null 2>&1 || proof_status=$?
+  fi
+  [[ $cleanup_status -eq 0 && $close_status -eq 0 && $proof_status -eq 0 ]]
+}
+
+cats_e3_forward_recover_g3_on_exit() {
+  local summary statuses command_status filter_status
+  [[ -n ${persistent_route_case_dir:-} && -d $persistent_route_case_dir && \
+    -n ${scenario_driver:-} && -x $scenario_driver && -n ${timeout_bin:-} && \
+    -n ${filter:-} && -x $filter ]] || return 0
+  summary=$persistent_route_case_dir/exit-forward-cleanup-summary.txt
+  set +e
+  "$timeout_bin" --signal=TERM --kill-after=30 1800 \
+    "$scenario_driver" cleanup route-v2-rotation-disable-live-delivery \
+      "$block_path" "$persistent_route_case_dir" 2>&1 \
+    | "$filter" --mode text --max-bytes 16384 >"$summary"
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  chmod 0600 "$summary"
+  sync -f "$persistent_route_case_dir" || return 125
+  command_status=${statuses[0]:-125}
+  filter_status=${statuses[1]:-125}
+  [[ $command_status -eq 0 && $filter_status -eq 0 ]]
 }
 
 cats_e3_clear_ambient() {
   local environment_name
   while IFS='=' read -r environment_name _; do
     case "$environment_name" in
-      CATS_TOKEN|CATS_E3_*) unset "$environment_name" ;;
+      CATS_CONFIG_DIR|CATS_TOKEN|CATS_E3_*) unset "$environment_name" ;;
     esac
   done < <(env)
 }
@@ -299,10 +605,14 @@ cats_e3_export_qualification_environment() {
   printf -v CATS_E3_EXPECTED_NODES '%s,' "${expected_nodes[@]}"
   CATS_E3_EXPECTED_NODES=${CATS_E3_EXPECTED_NODES%,}
   export CATS_E3_EXPECTED_NODES
-  export CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID=$route_rotation_operator_authority_id
-  export CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID=$route_rotation_operator_route_deployment_id
-  export CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256=$route_rotation_operator_trust_sha256
-  export CATS_E3_QUALIFICATION_CATALOG_SHA256=sha256:$qualification_catalog_authority_sha256
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_AUTHORITY_ID=${route_rotation_operator_authority_id:-}
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_ROUTE_DEPLOYMENT_ID=${route_rotation_operator_route_deployment_id:-}
+  export CATS_E3_ROUTE_ROTATION_OPERATOR_TRUST_SHA256=${route_rotation_operator_trust_sha256:-}
+  if [[ -n ${qualification_catalog_authority_sha256:-} ]]; then
+    export CATS_E3_QUALIFICATION_CATALOG_SHA256=sha256:$qualification_catalog_authority_sha256
+  else
+    unset CATS_E3_QUALIFICATION_CATALOG_SHA256
+  fi
 }
 
 cats_e3_environment_labels_are_unique() {
@@ -362,7 +672,14 @@ file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW
 effective_owner = (os.geteuid(), os.getegid())
 if effective_owner[0] == 0 and effective_owner != (0, 0):
     fail()
-allowed_directory_owners = {(0, 0), effective_owner}
+
+
+def actor_owned(metadata):
+    return metadata.st_uid == effective_owner[0] and (
+        effective_owner[0] != 0 or metadata.st_gid == 0
+    )
+
+
 directory = open_checked("/", directory_flags)
 try:
     for component in components[:-1]:
@@ -372,7 +689,7 @@ try:
         metadata = os.fstat(child)
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or (metadata.st_uid, metadata.st_gid) not in allowed_directory_owners
+            or not (metadata.st_uid == 0 or actor_owned(metadata))
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             os.close(child)
@@ -383,7 +700,7 @@ try:
     parent = os.fstat(directory)
     if (
         not stat.S_ISDIR(parent.st_mode)
-        or (parent.st_uid, parent.st_gid) != effective_owner
+        or not actor_owned(parent)
         or stat.S_IMODE(parent.st_mode) & 0o022
     ):
         fail()
@@ -403,7 +720,7 @@ try:
         )
         if (
             not stat.S_ISREG(before.st_mode)
-            or (before.st_uid, before.st_gid) != effective_owner
+            or not actor_owned(before)
             or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) != 0o600
             or not 1 <= before.st_size <= 16_384
@@ -591,13 +908,819 @@ finally:
 PY
 }
 
+cats_e3_bind_persistent_state() {
+  python3 - "$1" "$2" "${3:-qualification-state-binding.v1.json}" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+
+directory = Path(sys.argv[1])
+source = Path(sys.argv[2])
+name = sys.argv[3]
+effective_uid = os.geteuid()
+
+
+def actor_owned(metadata):
+    return metadata.st_uid == effective_uid and (effective_uid != 0 or metadata.st_gid == 0)
+
+
+fixed_names = {
+    "qualification-state-binding.v1.json",
+    "qualification-close-decision.v1.json",
+    "runtime-state.json",
+}
+case_prefix = re.fullmatch(r"[0-9]{2}-[a-z0-9][a-z0-9-]{0,63}\.v1\.json", name)
+if name not in fixed_names and case_prefix is None:
+    raise SystemExit(1)
+prefix = f".{name}."
+expected = source.read_bytes()
+maximum = 16 * 1024 * 1024 if case_prefix is not None else 65536
+if not 1 <= len(expected) <= maximum:
+    raise SystemExit(1)
+directory_fd = os.open(
+    directory,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def read_existing():
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not actor_owned(before)
+            or before.st_nlink not in {1, 2}
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size != len(expected)
+        ):
+            raise SystemExit(1)
+        if before.st_nlink == 2:
+            siblings = []
+            for candidate in os.listdir(directory_fd):
+                if not candidate.startswith(prefix):
+                    continue
+                metadata = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and (metadata.st_dev, metadata.st_ino) == (before.st_dev, before.st_ino)
+                ):
+                    siblings.append(candidate)
+            if len(siblings) != 1:
+                raise SystemExit(1)
+            os.unlink(siblings[0], dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            before = os.fstat(descriptor)
+            if before.st_nlink != 1:
+                raise SystemExit(1)
+        data = b""
+        while len(data) < before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(data))
+            if not chunk:
+                raise SystemExit(1)
+            data += chunk
+        if os.read(descriptor, 1) or identity(os.fstat(descriptor)) != identity(before):
+            raise SystemExit(1)
+        if data != expected:
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+
+
+temporary_fd = -1
+temporary_name = None
+try:
+    try:
+        read_existing()
+    except FileNotFoundError:
+        temporary_fd, temporary_name = tempfile.mkstemp(prefix=prefix, dir=directory)
+        os.fchmod(temporary_fd, 0o600)
+        offset = 0
+        while offset < len(expected):
+            offset += os.write(temporary_fd, expected[offset:])
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        try:
+            os.link(
+                temporary_name,
+                name,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            read_existing()
+        else:
+            os.unlink(temporary_name)
+            temporary_name = None
+            os.fsync(directory_fd)
+            read_existing()
+finally:
+    if temporary_fd >= 0:
+        os.close(temporary_fd)
+    if temporary_name is not None:
+        try:
+            os.unlink(temporary_name)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            pass
+    os.close(directory_fd)
+PY
+}
+
+cats_e3_load_close_decision() {
+  local decision=$state_directory/qualification-close-decision.v1.json
+  local canonical=$scratch/qualification-close-decision.canonical.json
+  local state_binding_sha256
+  state_binding_sha256=sha256:$(
+    sha256sum "$state_directory/qualification-state-binding.v1.json" | awk '{print $1}'
+  )
+  [[ -f $decision && ! -L $decision && -O $decision && \
+    $(stat -c '%u:%g:%a:%h' "$decision") == 0:0:600:1 ]] || return 1
+  jq -S -c . "$decision" >"$canonical" || return 125
+  cmp -s "$decision" "$canonical" || return 125
+  jq -er --arg run_id "$run_id" --arg block_path "$block_path" \
+    --arg binding_sha256 "$qualification_binding_sha256" \
+    --arg state_binding_sha256 "$state_binding_sha256" '
+    keys == ["block_path","close_kind","kind","qualification_binding_sha256",
+      "qualification_state_binding_sha256","run_id","version"]
+    and .kind == "cats.production-mutation-qualification-close-decision.v1"
+    and .version == 1 and .run_id == $run_id and .block_path == $block_path
+    and .qualification_binding_sha256 == $binding_sha256
+    and .qualification_state_binding_sha256 == $state_binding_sha256
+    and (.close_kind == "end_qualification" or .close_kind == "emergency_close")' \
+    "$decision" >/dev/null || return 125
+  jq -er '.close_kind' "$decision"
+}
+
+cats_e3_persist_close_decision() {
+  local close_kind=$1 source=$scratch/qualification-close-decision.v1.json
+  local state_binding_sha256
+  case "$close_kind" in end_qualification|emergency_close) ;; *) return 125 ;; esac
+  state_binding_sha256=sha256:$(
+    sha256sum "$state_directory/qualification-state-binding.v1.json" | awk '{print $1}'
+  )
+  jq -S -c -n --arg run_id "$run_id" --arg block_path "$block_path" \
+    --arg close_kind "$close_kind" --arg binding_sha256 "$qualification_binding_sha256" \
+    --arg state_binding_sha256 "$state_binding_sha256" '
+    {block_path:$block_path,close_kind:$close_kind,
+     kind:"cats.production-mutation-qualification-close-decision.v1",
+     qualification_binding_sha256:$binding_sha256,
+     qualification_state_binding_sha256:$state_binding_sha256,
+     run_id:$run_id,version:1}' \
+    >"$source"
+  chmod 0600 "$source"
+  cats_e3_bind_persistent_state "$state_directory" "$source" \
+    qualification-close-decision.v1.json
+}
+
+cats_e3_persist_case_prefix() {
+  local case_index=$1 case_id=$2 marker_name marker_source
+  local qualification_state_sha256 runtime_state_sha256
+  marker_name=$(printf '%02d-%s.v1.json' "$case_index" "$case_id")
+  marker_source=$scratch/$marker_name
+  qualification_state_sha256=sha256:$(
+    sha256sum "$state_directory/qualification-state-binding.v1.json" | awk '{print $1}'
+  )
+  runtime_state_sha256=sha256:$(sha256sum "$persistent_runtime_state" | awk '{print $1}')
+  jq -S -c -n \
+    --arg block_path "$block_path" --arg case_id "$case_id" \
+    --arg exact_commit "$exact_commit" --arg run_id "$run_id" \
+    --arg workspace_id "$workspace_id" \
+    --arg qualification_catalog_sha256 "sha256:$qualification_catalog_authority_sha256" \
+    --arg qualification_state_sha256 "$qualification_state_sha256" \
+    --arg runtime_state_sha256 "$runtime_state_sha256" \
+    --argjson case_index "$case_index" \
+    --slurpfile results "$results_work" --slurpfile evidence "$evidence_work" \
+    --rawfile journal_summary "$journal_work" \
+    --slurpfile runtime_state "$persistent_runtime_state" '
+    {block_path:$block_path,case_id:$case_id,case_index:$case_index,
+     completed_case_ids:[$results[].case_id],evidence:$evidence,
+     exact_commit:$exact_commit,journal_summary:$journal_summary,
+     kind:"cats.runtime-cutover-case-prefix.v1",
+     qualification_catalog_sha256:$qualification_catalog_sha256,
+     qualification_state_sha256:$qualification_state_sha256,results:$results,
+     run_id:$run_id,runtime_state:$runtime_state[0],
+     runtime_state_sha256:$runtime_state_sha256,version:1,workspace_id:$workspace_id}' \
+    >"$marker_source"
+  chmod 0600 "$marker_source"
+  cats_e3_bind_persistent_state "$persistent_case_prefix_dir" "$marker_source" "$marker_name"
+}
+
+cats_e3_restore_case_prefix() {
+  python3 - \
+    "$persistent_case_prefix_dir" \
+    "$state_directory/qualification-state-binding.v1.json" \
+    "$persistent_runtime_state" \
+    "$persistent_cases_dir" \
+    "$catalog_work" \
+    "$results_work" "$evidence_work" "$journal_work" \
+    "$run_id" "$block_path" "$workspace_id" "$exact_commit" \
+    "sha256:$qualification_catalog_authority_sha256" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+
+(
+    prefix_path,
+    qualification_state_path,
+    runtime_state_path,
+    cases_path,
+    catalog_path,
+    results_path,
+    evidence_path,
+    journal_path,
+    run_id,
+    block_path,
+    workspace_id,
+    exact_commit,
+    catalog_sha256,
+) = sys.argv[1:]
+marker_pattern = re.compile(r"([0-9]{2})-([a-z0-9][a-z0-9-]{0,63})\.v1\.json\Z")
+temporary_pattern = re.compile(
+    r"\.([0-9]{2}-[a-z0-9][a-z0-9-]{0,63}\.v1\.json)\..+\Z"
+)
+digest_pattern = re.compile(r"sha256:[0-9a-f]{64}\Z")
+id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+maximum_marker_bytes = 16 * 1024 * 1024
+effective_uid = os.geteuid()
+
+
+def actor_owned(metadata):
+    return metadata.st_uid == effective_uid and (effective_uid != 0 or metadata.st_gid == 0)
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def canonical(value):
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def stable_read_at(directory_fd, name, maximum):
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not actor_owned(before)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or not 1 <= before.st_size <= maximum
+        ):
+            raise SystemExit(1)
+        raw = b""
+        while len(raw) < before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(raw))
+            if not chunk:
+                raise SystemExit(1)
+            raw += chunk
+        if os.read(descriptor, 1) or identity(os.fstat(descriptor)) != identity(before):
+            raise SystemExit(1)
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def stable_read_path(path, maximum):
+    directory = os.path.dirname(path)
+    name = os.path.basename(path)
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        return stable_read_at(directory_fd, name, maximum)
+    finally:
+        os.close(directory_fd)
+
+
+def decode(raw, label):
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid {label}") from error
+    if raw != canonical(value):
+        raise SystemExit(f"noncanonical {label}")
+    return value
+
+
+def closed_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def validate_runtime_state(value):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"block_path", "cat_id", "exact_commit", "run_id", "version"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["exact_commit"] != exact_commit
+        or value["block_path"] != block_path
+        or value["run_id"] != run_id
+        or (
+            value["cat_id"] is not None
+            and (
+                not isinstance(value["cat_id"], str)
+                or id_pattern.fullmatch(value["cat_id"]) is None
+            )
+        )
+    ):
+        raise SystemExit(1)
+    return value
+
+
+prefix_fd = os.open(
+    prefix_path,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    entries = os.listdir(prefix_fd)
+    destinations = {entry for entry in entries if marker_pattern.fullmatch(entry)}
+    temporary_by_destination = {}
+    for entry in entries:
+        if entry in destinations:
+            continue
+        match = temporary_pattern.fullmatch(entry)
+        if match is None:
+            raise SystemExit(1)
+        destination = match.group(1)
+        temporary_by_destination.setdefault(destination, []).append(entry)
+    for destination, temporaries in temporary_by_destination.items():
+        if len(temporaries) != 1:
+            raise SystemExit(1)
+        temporary = temporaries[0]
+        temporary_metadata = os.stat(
+            temporary,
+            dir_fd=prefix_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or not actor_owned(temporary_metadata)
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+            or temporary_metadata.st_nlink not in {1, 2}
+        ):
+            raise SystemExit(1)
+        if destination in destinations:
+            destination_metadata = os.stat(
+                destination,
+                dir_fd=prefix_fd,
+                follow_symlinks=False,
+            )
+            if (
+                temporary_metadata.st_nlink != 2
+                or (temporary_metadata.st_dev, temporary_metadata.st_ino)
+                != (destination_metadata.st_dev, destination_metadata.st_ino)
+            ):
+                raise SystemExit(1)
+        elif temporary_metadata.st_nlink != 1:
+            raise SystemExit(1)
+        os.unlink(temporary, dir_fd=prefix_fd)
+    if temporary_by_destination:
+        os.fsync(prefix_fd)
+    marker_names = sorted(
+        entry for entry in os.listdir(prefix_fd) if marker_pattern.fullmatch(entry)
+    )
+
+    catalog_records = []
+    for line in Path(catalog_path).read_text(encoding="utf-8").splitlines():
+        value = json.loads(line)
+        if value["case_id"] != "usage-source-terminal-receipts":
+            catalog_records.append(value)
+    expected_names = [
+        f"{index:02d}-{record['case_id']}.v1.json"
+        for index, record in enumerate(catalog_records)
+    ]
+    if marker_names != expected_names[: len(marker_names)]:
+        raise SystemExit(1)
+    create_indices = [
+        index
+        for index, record in enumerate(catalog_records)
+        if record["case_id"] == "cat-create-running"
+    ]
+    if len(create_indices) != 1:
+        raise SystemExit(1)
+    create_index = create_indices[0]
+
+    qualification_state_raw = stable_read_path(qualification_state_path, 65_536)
+    qualification_state_sha256 = "sha256:" + hashlib.sha256(
+        qualification_state_raw
+    ).hexdigest()
+    runtime_state_raw = stable_read_path(runtime_state_path, 65_536)
+    runtime_state = validate_runtime_state(decode(runtime_state_raw, "runtime state"))
+
+    previous_results = []
+    previous_evidence = []
+    expected_cat_id = None
+    last = None
+    for index, marker_name in enumerate(marker_names):
+        raw = stable_read_at(prefix_fd, marker_name, maximum_marker_bytes)
+        value = decode(raw, "case prefix")
+        expected_keys = {
+            "block_path",
+            "case_id",
+            "case_index",
+            "completed_case_ids",
+            "evidence",
+            "exact_commit",
+            "journal_summary",
+            "kind",
+            "qualification_catalog_sha256",
+            "qualification_state_sha256",
+            "results",
+            "run_id",
+            "runtime_state",
+            "runtime_state_sha256",
+            "version",
+            "workspace_id",
+        }
+        expected_case_ids = [record["case_id"] for record in catalog_records[: index + 1]]
+        if (
+            not isinstance(value, dict)
+            or set(value) != expected_keys
+            or value["kind"] != "cats.runtime-cutover-case-prefix.v1"
+            or type(value["version"]) is not int
+            or value["version"] != 1
+            or type(value["case_index"]) is not int
+            or value["case_index"] != index
+            or value["case_id"] != expected_case_ids[-1]
+            or value["completed_case_ids"] != expected_case_ids
+            or value["run_id"] != run_id
+            or value["block_path"] != block_path
+            or value["workspace_id"] != workspace_id
+            or value["exact_commit"] != exact_commit
+            or value["qualification_catalog_sha256"] != catalog_sha256
+            or value["qualification_state_sha256"] != qualification_state_sha256
+            or not isinstance(value["journal_summary"], str)
+            or len(value["journal_summary"].encode("utf-8")) > 131_072
+            or "\0" in value["journal_summary"]
+        ):
+            raise SystemExit(1)
+        results = value["results"]
+        evidence = value["evidence"]
+        if (
+            not isinstance(results, list)
+            or len(results) != index + 1
+            or [result.get("case_id") for result in results] != expected_case_ids
+            or results[: len(previous_results)] != previous_results
+            or not isinstance(evidence, list)
+            or evidence[: len(previous_evidence)] != previous_evidence
+        ):
+            raise SystemExit(1)
+        result_keys = {
+            "case_id",
+            "cleanup_deadline_seconds",
+            "cleanup_exit_code",
+            "deadline_seconds",
+            "diagnostic_exit_code",
+            "ended_at_unix_seconds",
+            "evidence_exit_code",
+            "expected_outcome",
+            "observed_outcome",
+            "outcome_matches",
+            "run_exit_code",
+            "started_at_unix_seconds",
+            "status",
+        }
+        for result_index, result in enumerate(results):
+            catalog_record = catalog_records[result_index]
+            if (
+                not isinstance(result, dict)
+                or set(result) != result_keys
+                or result["case_id"] != catalog_record["case_id"]
+                or result["expected_outcome"] != catalog_record["expected_outcome"]
+                or result["deadline_seconds"] != catalog_record["deadline_seconds"]
+                or result["cleanup_deadline_seconds"]
+                != catalog_record["cleanup_deadline_seconds"]
+                or result["status"] != "passed"
+                or result["observed_outcome"] != "passed"
+                or result["outcome_matches"] is not True
+                or result["run_exit_code"] != 0
+                or result["diagnostic_exit_code"] != 0
+                or result["cleanup_exit_code"] != 0
+                or result["evidence_exit_code"] != 0
+                or type(result["started_at_unix_seconds"]) is not int
+                or type(result["ended_at_unix_seconds"]) is not int
+                or result["started_at_unix_seconds"] < 0
+                or result["ended_at_unix_seconds"] < result["started_at_unix_seconds"]
+            ):
+                raise SystemExit(1)
+            for field in (
+                "cleanup_deadline_seconds",
+                "cleanup_exit_code",
+                "deadline_seconds",
+                "diagnostic_exit_code",
+                "ended_at_unix_seconds",
+                "evidence_exit_code",
+                "run_exit_code",
+                "started_at_unix_seconds",
+            ):
+                if type(result[field]) is not int or result[field] < 0:
+                    raise SystemExit(1)
+            if (
+                result_index > 0
+                and result["started_at_unix_seconds"]
+                < results[result_index - 1]["ended_at_unix_seconds"]
+            ):
+                raise SystemExit(1)
+        evidence_keys = {"case_id", "content", "filename", "kind", "sha256", "size_bytes"}
+        expected_evidence = [
+            (record["case_id"], required["filename"], required["kind"])
+            for record in catalog_records[: index + 1]
+            for required in record["required_evidence"]
+        ]
+        actual_evidence = [
+            (row.get("case_id"), row.get("filename"), row.get("kind"))
+            if isinstance(row, dict)
+            else None
+            for row in evidence
+        ]
+        if actual_evidence != expected_evidence or len(set(actual_evidence)) != len(actual_evidence):
+            raise SystemExit(1)
+        for row in evidence:
+            if (
+                not isinstance(row, dict)
+                or set(row) != evidence_keys
+                or not isinstance(row["filename"], str)
+                or not isinstance(row["sha256"], str)
+                or digest_pattern.fullmatch(row["sha256"]) is None
+                or type(row["size_bytes"]) is not int
+                or row["size_bytes"] <= 0
+            ):
+                raise SystemExit(1)
+            if row["kind"] == "json":
+                content = canonical(row["content"])
+            elif isinstance(row["content"], str):
+                content = row["content"].encode("utf-8")
+            else:
+                raise SystemExit(1)
+            if (
+                len(content) != row["size_bytes"]
+                or "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
+            ):
+                raise SystemExit(1)
+        marker_runtime = validate_runtime_state(value["runtime_state"])
+        marker_runtime_raw = canonical(marker_runtime)
+        if (
+            "sha256:" + hashlib.sha256(marker_runtime_raw).hexdigest()
+            != value["runtime_state_sha256"]
+        ):
+            raise SystemExit(1)
+        marker_cat_id = marker_runtime["cat_id"]
+        if index < create_index:
+            if marker_cat_id is not None:
+                raise SystemExit(1)
+        else:
+            if marker_cat_id is None:
+                raise SystemExit(1)
+            if expected_cat_id is None:
+                expected_cat_id = marker_cat_id
+            elif marker_cat_id != expected_cat_id:
+                raise SystemExit(1)
+        previous_results = results
+        previous_evidence = evidence
+        last = value
+
+    if last is not None:
+        last_runtime = canonical(last["runtime_state"])
+        if runtime_state_raw != last_runtime:
+            allow_incomplete_create = (
+                len(marker_names) == create_index
+                and last["runtime_state"].get("cat_id") is None
+                and runtime_state.get("cat_id") is not None
+            )
+            response = (
+                Path(cases_path)
+                / f"{create_index:02d}-cat-create-running"
+                / "create-response.json"
+            )
+            if not allow_incomplete_create or not response.is_file() or response.is_symlink():
+                raise SystemExit(1)
+            response_raw = stable_read_path(str(response), 65_536)
+            try:
+                response_value = json.loads(
+                    response_raw.decode("utf-8"), object_pairs_hook=closed_object
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise SystemExit(1) from error
+            if (
+                response_value.get("cat_id") != runtime_state["cat_id"]
+                or not isinstance(response_value.get("operation_id"), str)
+                or id_pattern.fullmatch(response_value["operation_id"]) is None
+            ):
+                raise SystemExit(1)
+        results = last["results"]
+        evidence = last["evidence"]
+        journal = last["journal_summary"]
+    else:
+        if runtime_state["cat_id"] is not None:
+            raise SystemExit(1)
+        results = []
+        evidence = []
+        journal = ""
+
+    Path(results_path).write_bytes(b"".join(canonical(value) for value in results))
+    Path(evidence_path).write_bytes(b"".join(canonical(value) for value in evidence))
+    Path(journal_path).write_text(journal, encoding="utf-8")
+    print(len(marker_names))
+finally:
+    os.close(prefix_fd)
+PY
+}
+
+cats_e3_private_state_subdirectory() {
+  local path=$1
+  python3 - "$path" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+
+path = Path(sys.argv[1])
+effective_uid = os.geteuid()
+if not path.is_absolute() or str(path) != os.path.normpath(path):
+    raise SystemExit(1)
+parent = path.parent
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    try:
+        os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    directory_fd = os.open(
+        path.name,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != effective_uid
+            or (effective_uid == 0 and metadata.st_gid != 0)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(directory_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
 cats_e3_private_stage=
+cats_e3_remove_private_stage() {
+  local parent=$1
+  python3 - "$parent" <<'PY'
+import os
+import stat
+import sys
+
+
+parent = sys.argv[1]
+name = "invocation-secrets"
+effective_uid = os.geteuid()
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    try:
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        raise SystemExit(0)
+    try:
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != effective_uid
+            or (effective_uid == 0 and directory.st_gid != 0)
+            or stat.S_IMODE(directory.st_mode) != 0o700
+        ):
+            raise SystemExit(1)
+        allowed = {
+            "control-token",
+            "production-cutover-operator-key",
+            "route-rotation-operator-key",
+        }
+        entries = os.listdir(directory_fd)
+        if not set(entries) <= allowed:
+            raise SystemExit(1)
+        for entry in entries:
+            metadata = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != effective_uid
+                or (effective_uid == 0 and metadata.st_gid != 0)
+                or metadata.st_nlink != 1
+            ):
+                raise SystemExit(1)
+            os.unlink(entry, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
 cats_e3_cleanup_private_stage() {
   local status=$?
   trap - EXIT INT TERM
+  if ! cats_e3_close_on_exit; then
+    [[ $status -ne 0 ]] || status=125
+  fi
   if [[ -n $cats_e3_private_stage ]]; then
-    rm -f -- "$cats_e3_private_stage/control-token" || status=125
-    rmdir -- "$cats_e3_private_stage" || status=125
+    cats_e3_remove_private_stage "${cats_e3_private_stage%/*}" || status=125
     cats_e3_private_stage=
   fi
   exit "$status"
@@ -606,11 +1729,14 @@ cats_e3_cleanup_private_stage() {
 cats_e3_prepare_private_stage() {
   local parent=$1
   [[ -z $cats_e3_private_stage && $parent == /* && -d $parent && ! -L $parent ]] || return 1
-  cats_e3_private_stage=$(mktemp -d "$parent/.cats-e3-secrets.XXXXXX") || return 1
+  cats_e3_remove_private_stage "$parent" || return 1
+  cats_e3_private_stage=$parent/invocation-secrets
+  mkdir -m 0700 "$cats_e3_private_stage" || return 1
+  cats_e3_private_state_subdirectory "$cats_e3_private_stage" || return 1
+  sync -f "$parent" || return 1
   trap cats_e3_cleanup_private_stage EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  chmod 0700 "$cats_e3_private_stage"
 }
 
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
@@ -624,6 +1750,7 @@ usage: runtime-cutover-e2e.sh \
   --block-path <kernel-nbd|vhost-user> \
   --run-id <stable-id> \
   --output-dir </absolute/new/directory> \
+  --state-directory </absolute/persistent/root-only/directory> \
   --build-receipt </absolute/build-receipt.json> \
   --release-manifest </absolute/release-manifest.json> \
   --release-manifest-sha256 <sha256:64hex> \
@@ -656,6 +1783,7 @@ exact_commit=
 block_path=
 run_id=
 output_dir=
+state_directory=
 build_receipt=
 release_manifest=
 release_manifest_sha256=
@@ -685,7 +1813,7 @@ while [[ $# -gt 0 ]]; do
       production_cutover_operator_private_key_file_count=$((production_cutover_operator_private_key_file_count + 1))
       shift 2
       ;;
-    --exact-commit|--block-path|--run-id|--output-dir|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--token-file|--control-origin|--workspace-id|--qualification-node|--cat-name|--boot-image-digest|--endpoint-name|--endpoint-hostname|--guest-kernel|--scenario-driver)
+    --exact-commit|--block-path|--run-id|--output-dir|--state-directory|--build-receipt|--release-manifest|--release-manifest-sha256|--installer-receipt|--token-file|--control-origin|--workspace-id|--qualification-node|--cat-name|--boot-image-digest|--endpoint-name|--endpoint-hostname|--guest-kernel|--scenario-driver)
       [[ $# -ge 2 ]] || usage
       name=${1#--}
       name=${name//-/_}
@@ -721,6 +1849,7 @@ done
 case "$block_path" in kernel-nbd|vhost-user) ;; *) fail "--block-path must be kernel-nbd or vhost-user" ;; esac
 [[ $run_id =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || fail "--run-id is not canonical"
 [[ $output_dir == /* ]] || fail "--output-dir must be an absolute output path"
+[[ $state_directory == /* ]] || fail "--state-directory must be absolute"
 [[ -n $build_receipt && $build_receipt == /* ]] || fail "--build-receipt must be absolute"
 [[ -n $release_manifest && $release_manifest == /* ]] || fail "--release-manifest must be absolute"
 [[ $release_manifest_sha256 =~ ^sha256:[0-9a-f]{64}$ ]] || \
@@ -751,6 +1880,9 @@ for node in "${expected_nodes[@]}"; do
   seen_expected_nodes+="$node|"
   [[ $node != "$qualification_node" ]] || qualification_node_matches=$((qualification_node_matches + 1))
 done
+expected_nodes_sorted=$(printf '%s\n' "${expected_nodes[@]}" | LC_ALL=C sort -u)
+[[ $expected_nodes_sorted == "$(printf '%s\n' "${expected_nodes[@]}")" ]] || \
+  fail "--expected-node values must be unique and C-sorted"
 [[ $qualification_node_matches -eq 1 ]] || \
   fail "--qualification-node must equal exactly one --expected-node"
 [[ $guest_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || fail "--guest-kernel is not a bounded nonsecret release string"
@@ -766,7 +1898,7 @@ cats_e3_environment_labels_are_unique false "${config_entries[@]}" || \
 cats_e3_validate_private_key_input "$production_cutover_operator_private_key_file" || \
   fail "production cutover operator private key is not protected root-only input"
 
-for command_name in git jq python3 sha256sum; do
+for command_name in cmp flock git jq python3 sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
 
@@ -780,6 +1912,7 @@ repo=$(cd "$script_dir/../.." && pwd -P)
 filter=$script_dir/runtime-cutover-evidence-filter.py
 runner=$script_dir/runtime-cutover-e2e.sh
 qualification_catalog=$script_dir/runtime-cutover-e2e-catalog.v1.json
+qualification_operator=$repo/deploy/aws/production-mutation-admission.py
 
 canonical_existing() {
   local path=$1
@@ -805,6 +1938,33 @@ build_receipt=$(canonical_existing "$build_receipt") || fail "build receipt must
 release_manifest=$(canonical_existing "$release_manifest") || fail "release manifest must be a regular non-symlink file"
 installer_receipt=$(canonical_existing "$installer_receipt") || fail "installer receipt must be a regular non-symlink file"
 token_file=$(canonical_existing "$token_file") || fail "token file must be a regular non-symlink file"
+state_directory_requested=$state_directory
+state_directory=$(canonical_existing "$state_directory") || \
+  fail "state directory must be an existing non-symlink directory"
+[[ $state_directory == "$state_directory_requested" && -d $state_directory ]] || \
+  fail "state directory path and ancestors must be canonical real directories"
+python3 - "$state_directory" <<'PY' || fail "state directory must be protected root-only persistence"
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+metadata = os.stat(path, follow_symlinks=False)
+parent = os.stat(os.path.dirname(path), follow_symlinks=False)
+assert stat.S_ISDIR(metadata.st_mode) and not os.path.islink(path)
+assert (metadata.st_uid, metadata.st_gid) == (0, 0)
+assert stat.S_IMODE(metadata.st_mode) == 0o700
+assert stat.S_ISDIR(parent.st_mode) and (parent.st_uid, parent.st_gid) == (0, 0)
+assert stat.S_IMODE(parent.st_mode) & 0o022 == 0
+PY
+state_lock=$state_directory/.runtime-cutover.lock
+[[ ! -L $state_lock ]] || fail "persistent state lock must not be a symlink"
+(umask 077; : >>"$state_lock") || fail "persistent state lock is unavailable"
+[[ -f $state_lock && ! -L $state_lock && -O $state_lock && \
+  $(stat -c '%u:%g:%a:%h' "$state_lock") == 0:0:600:1 ]] || \
+  fail "persistent state lock is not protected root-only state"
+exec {state_lock_fd}<>"$state_lock"
+flock -n "$state_lock_fd" || fail "another runner owns this persistent qualification state"
 [[ $installer_receipt == /opt/cats/release/worker-installation-receipt.v1.json ]] || \
   fail "installer receipt path must resolve to the canonical production path"
 scenario_driver=$(canonical_existing "$scenario_driver") || fail "scenario driver must be a regular non-symlink file"
@@ -812,6 +1972,8 @@ qualification_catalog=$(canonical_existing "$qualification_catalog") || \
   fail "qualification catalog must be the fixed regular non-symlink repository file"
 output_dir=$(canonical_output "$output_dir") || fail "absolute output parent must already exist and be a real directory"
 [[ ! -e $output_dir && ! -L $output_dir ]] || fail "output directory already exists; refusing to overwrite evidence"
+case "$output_dir/" in "$state_directory/"*) fail "output directory must not be inside persistent state" ;; esac
+case "$state_directory/" in "$output_dir/"*) fail "persistent state must not be inside output evidence" ;; esac
 
 [[ $(git -C "$repo" rev-parse HEAD) == "$exact_commit" ]] || fail "checkout HEAD does not equal the exact commit"
 [[ $(git -C "$repo" rev-parse "${exact_commit}^{commit}") == "$exact_commit" ]] || fail "exact commit is not a commit object"
@@ -835,6 +1997,7 @@ verify_exact_repo_file() {
 verify_exact_repo_file "$runner"
 verify_exact_repo_file "$filter"
 verify_exact_repo_file "$scenario_driver"
+verify_exact_repo_file "$qualification_operator"
 verify_exact_repo_blob "$qualification_catalog"
 
 python3 - "$qualification_catalog" <<'PY' || fail "qualification catalog is not canonical or violates its closed schema"
@@ -998,6 +2161,8 @@ PY
 
 qualification_catalog_sha256=$(sha256sum "$qualification_catalog" | awk '{print $1}')
 qualification_catalog_size=$(wc -c <"$qualification_catalog" | tr -d ' ')
+qualification_operator_sha256=$(sha256sum "$qualification_operator" | awk '{print $1}')
+qualification_operator_size=$(wc -c <"$qualification_operator" | tr -d ' ')
 
 [[ $(wc -c <"$build_receipt") -le 1048576 ]] || fail "build receipt is too large"
 [[ $(wc -c <"$release_manifest") -le 1048576 ]] || fail "release manifest is too large"
@@ -1008,11 +2173,15 @@ jq -e --arg commit "$exact_commit" \
 jq -e --arg commit "$exact_commit" \
   --arg catalog_sha256 "sha256:$qualification_catalog_sha256" \
   --argjson catalog_size "$qualification_catalog_size" \
+  --arg operator_sha256 "sha256:$qualification_operator_sha256" \
+  --argjson operator_size "$qualification_operator_size" \
   '.version == 1 and .source.commit == $commit
     and (.artifacts.worker.bundle_sha256 | test("^sha256:[0-9a-f]{64}$"))
     and (.artifacts.worker.members | type == "object" and length > 0)
     and .build_inputs.files.qualification_catalog
-      == {sha256:$catalog_sha256,size_bytes:$catalog_size}' \
+      == {sha256:$catalog_sha256,size_bytes:$catalog_size}
+    and .build_inputs.files.production_mutation_admission_operator
+      == {sha256:$operator_sha256,size_bytes:$operator_size}' \
   "$release_manifest" >/dev/null || fail "release manifest does not bind the exact commit"
 approved_release_manifest_sha256=${release_manifest_sha256#sha256:}
 [[ $(sha256sum "$release_manifest" | awk '{print $1}') == "$approved_release_manifest_sha256" ]] || \
@@ -1081,7 +2250,7 @@ installer_worker_bundle_sha256=$(jq -er '.worker_bundle_sha256' "$installer_rece
 
 schema_version=$(git -C "$repo" show "${exact_commit}:storage/src/authority.rs" |
   sed -nE 's/^pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p')
-[[ $schema_version =~ ^[1-9][0-9]*$ ]] || fail "exact source does not expose one authority schema version"
+[[ $schema_version == 16 ]] || fail "exact source must expose the one frozen authority schema version 16"
 
 mkdir -m 0700 "$output_dir"
 scratch=$output_dir/.scratch
@@ -1147,6 +2316,7 @@ runner_authority_sha256=$(sha256sum "$runner" | awk '{print $1}')
 filter_authority_sha256=$(sha256sum "$filter" | awk '{print $1}')
 scenario_driver_authority_sha256=$(sha256sum "$scenario_driver" | awk '{print $1}')
 qualification_catalog_authority_sha256=$(sha256sum "$qualification_catalog" | awk '{print $1}')
+qualification_operator_authority_sha256=$(sha256sum "$qualification_operator" | awk '{print $1}')
 build_receipt_authority_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
 installer_receipt_authority_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
 token_file_original=$token_file
@@ -1157,12 +2327,20 @@ verify_exact_repo_file "$scenario_driver"
 stage_input runner "$runner" "$stage/runtime-cutover-e2e.sh" 0700 "$runner_authority_sha256"
 stage_input evidence-filter "$filter" "$stage/runtime-cutover-evidence-filter.py" 0700 "$filter_authority_sha256"
 stage_input scenario-driver "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh" 0700 "$scenario_driver_authority_sha256"
+stage_input production-mutation-admission-operator "$qualification_operator" \
+  "$stage/production-mutation-admission.py" 0700 "$qualification_operator_authority_sha256"
 stage_input qualification-catalog "$qualification_catalog" "$stage/qualification-catalog.v1.json" 0600 "$qualification_catalog_authority_sha256"
 stage_input build-receipt "$build_receipt" "$stage/build-receipt.json" 0600 "$build_receipt_authority_sha256"
 stage_input release-manifest "$release_manifest" "$stage/release-manifest.json" 0600 "$approved_release_manifest_sha256"
 stage_input installer-receipt "$installer_receipt" "$stage/installer-receipt.json" 0600 "$installer_receipt_authority_sha256"
-cats_e3_prepare_private_stage "${token_file_original%/*}" || \
-  fail "create root-only private token stage"
+cats_e3_prepare_private_stage "$state_directory" || \
+  fail "create root-only invocation secret stage"
+production_cutover_operator_private_key_file_original=$production_cutover_operator_private_key_file
+production_cutover_operator_private_key_file=$cats_e3_private_stage/production-cutover-operator-key
+cats_e3_stage_route_rotation_operator_key \
+  "$production_cutover_operator_private_key_file_original" \
+  "$production_cutover_operator_private_key_file" || \
+  fail "stage the protected ProductionCutoverOperator private key"
 token_file=$cats_e3_private_stage/control-token
 token_before=$(sha256sum "$token_file_original" | awk '{print $1}')
 [[ $token_before == "$token_file_authority_sha256" ]] || fail "token changed before its private stable-stage copy"
@@ -1181,9 +2359,11 @@ verify_staged_repo_file() {
 verify_staged_repo_file "$runner" "$stage/runtime-cutover-e2e.sh"
 verify_staged_repo_file "$filter" "$stage/runtime-cutover-evidence-filter.py"
 verify_staged_repo_file "$scenario_driver" "$stage/runtime-cutover-v2-scenarios.sh"
+verify_staged_repo_file "$qualification_operator" "$stage/production-mutation-admission.py"
 verify_staged_repo_file "$qualification_catalog" "$stage/qualification-catalog.v1.json"
 filter=$stage/runtime-cutover-evidence-filter.py
 scenario_driver=$stage/runtime-cutover-v2-scenarios.sh
+qualification_operator=$stage/production-mutation-admission.py
 qualification_catalog=$stage/qualification-catalog.v1.json
 
 jq -e --arg commit "$exact_commit" \
@@ -1192,9 +2372,13 @@ jq -e --arg commit "$exact_commit" \
 jq -e --arg commit "$exact_commit" \
   --arg catalog_sha256 "sha256:$qualification_catalog_authority_sha256" \
   --argjson catalog_size "$qualification_catalog_size" \
+  --arg operator_sha256 "sha256:$qualification_operator_authority_sha256" \
+  --argjson operator_size "$qualification_operator_size" \
   '.version == 1 and .source.commit == $commit
     and .build_inputs.files.qualification_catalog
-      == {sha256:$catalog_sha256,size_bytes:$catalog_size}' \
+      == {sha256:$catalog_sha256,size_bytes:$catalog_size}
+    and .build_inputs.files.production_mutation_admission_operator
+      == {sha256:$operator_sha256,size_bytes:$operator_size}' \
   "$stage/release-manifest.json" >/dev/null || fail "staged release manifest changed authority"
 jq -e '
   (keys == ["host_tools","members","service","version","worker_bundle_sha256"])
@@ -1318,7 +2502,7 @@ for entry in "${config_entries[@]}"; do
   esac
   seen_config_environment_labels+="$environment_label|"
   if [[ $label == route-rotation-operator-key ]]; then
-    staged=$stage/configs/route-rotation-operator-key
+    staged=$cats_e3_private_stage/route-rotation-operator-key
     cats_e3_stage_route_rotation_operator_key "$path" "$staged" || \
       fail "route-rotation-operator-key is not one protected root-only secret input"
     CATS_E3_CONFIG_ROUTE_ROTATION_OPERATOR_KEY=$staged
@@ -1462,6 +2646,11 @@ PY
       fail "route-rotation-operator-trust does not expose exact coordinates"
     route_rotation_operator_trust_sha256=sha256:$digest
   fi
+  if [[ $label == production-cutover-operator-trust ]]; then
+    [[ $path == /etc/cats/production-cutover-operator-trust.v1.json && \
+      $canonical == "$path" ]] || \
+      fail "production-cutover-operator-trust must use the canonical installed path"
+  fi
   staged=$stage/configs/$label
   stage_input "config:$label" "$canonical" "$staged" 0600 "$digest"
   jq -S -c -n --arg label "$label" --arg path "$canonical" --arg staged_path "$staged" \
@@ -1474,6 +2663,9 @@ done
 for required_config in \
   qualification-ingress-open-plan \
   qualification-ingress-close-plan \
+  production-cutover-operator-trust \
+  production-mutation-qualification-binding \
+  production-qualification-cell-manifest \
   route-rotation-operator-trust \
   route-rotation-command-bundle \
   route-rotation-recovery \
@@ -1534,12 +2726,259 @@ done < <(jq -S -c '
   | .cases[]
   | .required_evidence = (.required_evidence + $framework)' "$qualification_catalog")
 [[ ${#case_ids[@]} -gt 0 ]] || fail "qualification catalog contains no cases"
+product_case_count=0
+route_rotation_case_index=
+for index in "${!case_ids[@]}"; do
+  case_id=${case_ids[$index]}
+  if [[ $case_id == usage-source-terminal-receipts ]]; then
+    continue
+  fi
+  product_case_count=$((product_case_count + 1))
+  if [[ $case_id == route-v2-rotation-disable-live-delivery ]]; then
+    route_rotation_case_index=$index
+  fi
+done
+[[ $product_case_count -gt 0 && $route_rotation_case_index =~ ^[0-9]+$ ]] || \
+  fail "qualification catalog has no exact product/G3 case prefix"
 expected_nodes_work=$scratch/expected-nodes.json
 printf '%s\n' "${expected_nodes[@]}" | jq -Rsc 'split("\n")[:-1]' >"$expected_nodes_work"
 
-started_at_unix_seconds=$(date +%s)
+runtime_state_initial=$scratch/runtime-state.initial.json
+jq -S -c -n \
+  --arg exact_commit "$exact_commit" --arg block_path "$block_path" --arg run_id "$run_id" \
+  '{version:1,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,cat_id:null}' \
+  >"$runtime_state_initial"
+initial_runtime_state_sha256=sha256:$(sha256sum "$runtime_state_initial" | awk '{print $1}')
+configuration_manifest=$scratch/qualification-nonsecret-config-manifest.json
+jq -s -S -c '
+  sort_by(.label)
+  | map({label,sha256:("sha256:" + .sha256),size_bytes})' \
+  "$configs_work" >"$configuration_manifest"
+configuration_manifest_sha256=sha256:$(sha256sum "$configuration_manifest" | awk '{print $1}')
+qualification_binding_sha256=sha256:$(
+  sha256sum "$stage/configs/production-mutation-qualification-binding" | awk '{print $1}'
+)
+qualification_cell_manifest_sha256=sha256:$(
+  sha256sum "$stage/configs/production-qualification-cell-manifest" | awk '{print $1}'
+)
+production_cutover_operator_trust_sha256=sha256:$(
+  sha256sum "$stage/configs/production-cutover-operator-trust" | awk '{print $1}'
+)
+route_rotation_command_bundle_sha256=sha256:$(
+  sha256sum "$stage/configs/route-rotation-command-bundle" | awk '{print $1}'
+)
+route_rotation_recovery_sha256=sha256:$(
+  sha256sum "$stage/configs/route-rotation-recovery" | awk '{print $1}'
+)
+route_rotation_server_ca_sha256=sha256:$(
+  sha256sum "$stage/configs/route-rotation-server-ca" | awk '{print $1}'
+)
 host_kernel=$(uname -r)
-[[ $host_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || fail "Host kernel release is not a bounded nonsecret string"
+[[ $host_kernel =~ ^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$ ]] || \
+  fail "Host kernel release is not a bounded nonsecret string"
+started_at_unix_seconds=$(python3 - \
+  "$state_directory/qualification-state-binding.v1.json" \
+  "$run_id" "$block_path" "$workspace_id" "$exact_commit" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+
+path = Path(sys.argv[1])
+run_id, block_path, workspace_id, exact_commit = sys.argv[2:]
+now = int(time.time())
+if not path.exists() and not path.is_symlink():
+    print(now)
+    raise SystemExit(0)
+parent_fd = os.open(
+    path.parent,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    descriptor = os.open(
+        path.name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or not 1 <= before.st_size <= 65_536
+        ):
+            raise SystemExit(1)
+        raw = b""
+        while len(raw) < before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(raw))
+            if not chunk:
+                raise SystemExit(1)
+            raw += chunk
+        if os.read(descriptor, 1):
+            raise SystemExit(1)
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(parent_fd)
+try:
+    value = json.loads(raw.decode("utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+canonical = (
+    json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    + "\n"
+).encode("utf-8")
+started = value.get("run_started_at_unix_seconds") if isinstance(value, dict) else None
+if (
+    raw != canonical
+    or value.get("kind") != "cats.runtime-cutover-persistent-state.v1"
+    or value.get("version") != 1
+    or value.get("run_id") != run_id
+    or value.get("block_path") != block_path
+    or value.get("workspace_id") != workspace_id
+    or value.get("exact_commit") != exact_commit
+    or type(started) is not int
+    or not 1 <= started <= now
+):
+    raise SystemExit(1)
+print(started)
+PY
+) || fail "persistent run start is unsafe or belongs to another run"
+qualification_state_binding=$scratch/qualification-state-binding.v1.json
+jq -S -c -n \
+  --arg block_path "$block_path" --arg exact_commit "$exact_commit" \
+  --arg run_id "$run_id" --arg workspace_id "$workspace_id" \
+  --arg control_origin "$control_origin" --arg guest_kernel "$guest_kernel" \
+  --arg host_kernel "$host_kernel" \
+  --arg build_receipt_sha256 "sha256:$build_receipt_authority_sha256" \
+  --arg installer_receipt_sha256 "sha256:$installer_receipt_authority_sha256" \
+  --arg runner_sha256 "sha256:$runner_authority_sha256" \
+  --arg evidence_filter_sha256 "sha256:$filter_authority_sha256" \
+  --arg scenario_driver_sha256 "sha256:$scenario_driver_authority_sha256" \
+  --arg qualification_operator_sha256 "sha256:$qualification_operator_authority_sha256" \
+  --arg qualification_node_id "$qualification_node" --arg cat_name "$cat_name" \
+  --arg boot_image_digest "$boot_image_digest" --arg endpoint_name "$endpoint_name" \
+  --arg endpoint_hostname "$endpoint_hostname" \
+  --arg release_manifest_sha256 "sha256:$approved_release_manifest_sha256" \
+  --arg worker_bundle_sha256 "$manifest_worker_bundle_sha256" \
+  --arg qualification_catalog_sha256 "sha256:$qualification_catalog_authority_sha256" \
+  --arg qualification_binding_sha256 "$qualification_binding_sha256" \
+  --arg qualification_cell_manifest_sha256 "$qualification_cell_manifest_sha256" \
+  --arg production_cutover_operator_trust_sha256 "$production_cutover_operator_trust_sha256" \
+  --arg route_rotation_operator_authority_id "$route_rotation_operator_authority_id" \
+  --arg route_rotation_route_deployment_id "$route_rotation_operator_route_deployment_id" \
+  --arg route_rotation_operator_trust_sha256 "$route_rotation_operator_trust_sha256" \
+  --arg route_rotation_command_bundle_sha256 "$route_rotation_command_bundle_sha256" \
+  --arg route_rotation_recovery_sha256 "$route_rotation_recovery_sha256" \
+  --arg route_rotation_server_ca_sha256 "$route_rotation_server_ca_sha256" \
+  --arg configuration_manifest_sha256 "$configuration_manifest_sha256" \
+  --arg initial_runtime_state_sha256 "$initial_runtime_state_sha256" \
+  --argjson authority_schema_version "$schema_version" \
+  --argjson run_started_at_unix_seconds "$started_at_unix_seconds" \
+  --slurpfile expected_node_ids "$expected_nodes_work" '
+  {authority_schema_version:$authority_schema_version,block_path:$block_path,
+   boot_image_digest:$boot_image_digest,build_receipt_sha256:$build_receipt_sha256,
+   case_id:"route-v2-rotation-disable-live-delivery",cat_name:$cat_name,
+   cats_cli_recovery_namespace:"cats-cli",
+   configuration_manifest_sha256:$configuration_manifest_sha256,control_origin:$control_origin,
+   endpoint_hostname:$endpoint_hostname,endpoint_name:$endpoint_name,
+   evidence_filter_sha256:$evidence_filter_sha256,
+   exact_commit:$exact_commit,expected_node_ids:$expected_node_ids[0],
+   guest_kernel:$guest_kernel,host_kernel:$host_kernel,
+   initial_runtime_state_sha256:$initial_runtime_state_sha256,
+   installer_receipt_sha256:$installer_receipt_sha256,
+   kind:"cats.runtime-cutover-persistent-state.v1",
+   production_cutover_operator_trust_sha256:$production_cutover_operator_trust_sha256,
+   qualification_binding_sha256:$qualification_binding_sha256,
+   qualification_catalog_sha256:$qualification_catalog_sha256,
+   qualification_cell_manifest_sha256:$qualification_cell_manifest_sha256,
+   qualification_node_id:$qualification_node_id,
+   qualification_operator_sha256:$qualification_operator_sha256,
+   release_manifest_sha256:$release_manifest_sha256,run_id:$run_id,version:1,
+   run_started_at_unix_seconds:$run_started_at_unix_seconds,
+   route_rotation_command_bundle_sha256:$route_rotation_command_bundle_sha256,
+   route_rotation_operator_authority_id:$route_rotation_operator_authority_id,
+   route_rotation_operator_trust_sha256:$route_rotation_operator_trust_sha256,
+   route_rotation_recovery_sha256:$route_rotation_recovery_sha256,
+   route_rotation_route_deployment_id:$route_rotation_route_deployment_id,
+   route_rotation_server_ca_sha256:$route_rotation_server_ca_sha256,
+   runner_sha256:$runner_sha256,scenario_driver_sha256:$scenario_driver_sha256,
+   worker_bundle_sha256:$worker_bundle_sha256,workspace_id:$workspace_id}' \
+  >"$qualification_state_binding"
+chmod 0600 "$qualification_state_binding"
+cats_e3_bind_persistent_state "$state_directory" "$qualification_state_binding" || \
+  fail "persistent qualification state belongs to different run coordinates"
+qualification_operator_state=$state_directory/production-mutation-admission
+persistent_cases_dir=$state_directory/cases
+persistent_case_prefix_dir=$state_directory/case-prefix
+persistent_runtime_state=$state_directory/runtime-state.json
+persistent_cli_state_dir=$state_directory/cats-cli
+persistent_route_case_dir=$(printf '%s/%02d-%s' "$persistent_cases_dir" \
+  "$route_rotation_case_index" route-v2-rotation-disable-live-delivery)
+cats_e3_private_state_subdirectory "$qualification_operator_state" || \
+  fail "production mutation admission state is not protected"
+cats_e3_private_state_subdirectory "$persistent_cases_dir" || \
+  fail "persistent case state is not protected"
+cats_e3_private_state_subdirectory "$persistent_case_prefix_dir" || \
+  fail "persistent case prefix is not protected"
+cats_e3_private_state_subdirectory "$persistent_cli_state_dir" || \
+  fail "persistent Cats CLI recovery state is not protected"
+export CATS_CONFIG_DIR=$persistent_cli_state_dir
+if [[ ! -e $persistent_runtime_state && ! -L $persistent_runtime_state ]]; then
+  cats_e3_bind_persistent_state "$state_directory" "$runtime_state_initial" runtime-state.json || \
+    fail "initialize persistent runtime state"
+fi
+first_incomplete_case_index=$(cats_e3_restore_case_prefix) || \
+  fail "persistent case prefix or Cat runtime state is invalid"
+[[ $first_incomplete_case_index =~ ^[0-9]+$ && \
+  $first_incomplete_case_index -le $product_case_count ]] || \
+  fail "persistent case prefix is outside the exact catalog"
+qualification_common_args=(
+  --origin "$control_origin"
+  --trust-file "$stage/configs/production-cutover-operator-trust"
+  --binding-file "$stage/configs/production-mutation-qualification-binding"
+  --cell-manifest-file "$stage/configs/production-qualification-cell-manifest"
+  --release-manifest-file "$stage/release-manifest.json"
+  --qualification-catalog-file "$qualification_catalog"
+  --state-directory "$qualification_operator_state"
+  --evidence-directory "$output_dir"
+  --run-id "$run_id"
+  --workspace-id "$workspace_id"
+  --exact-commit "$exact_commit"
+  --block-path "$block_path"
+  --resolution-timeout-seconds 120
+)
+qualification_lifecycle_attempted=false
+qualification_begin_applied=false
+qualification_close_attempted=false
+qualification_close_applied=false
+qualification_close_forbidden=false
+qualification_terminalized=false
+qualification_cleanup_disarmed=false
+
 build_receipt_sha256=$(sha256sum "$build_receipt" | awk '{print $1}')
 release_manifest_sha256=$(sha256sum "$release_manifest" | awk '{print $1}')
 installer_receipt_sha256=$(sha256sum "$installer_receipt" | awk '{print $1}')
@@ -1548,8 +2987,23 @@ scenario_catalog_sha256=$(sha256sum "$catalog_work" | awk '{print $1}')
 
 write_manifest() {
   local state=$1 exit_value=$2 ended=$3 temporary case_evidence_sha256 case_evidence_count
+  local qualification_admission_required_evidence='[]' begin_file terminal_file begin_sha terminal_sha
   case_evidence_sha256=$(sha256sum "$evidence_work" | awk '{print $1}')
   case_evidence_count=$(wc -l <"$evidence_work" | tr -d ' ')
+  begin_file=$output_dir/production-mutation-qualification-begin.receipt.json
+  terminal_file=$output_dir/production-mutation-qualification-terminal.receipt.json
+  if [[ -f $begin_file && ! -L $begin_file && -f $terminal_file && ! -L $terminal_file ]]; then
+    begin_sha=sha256:$(sha256sum "$begin_file" | awk '{print $1}')
+    terminal_sha=sha256:$(sha256sum "$terminal_file" | awk '{print $1}')
+    qualification_admission_required_evidence=$(jq -S -c -n \
+      --arg begin_sha "$begin_sha" --arg terminal_sha "$terminal_sha" \
+      --argjson begin_size "$(wc -c <"$begin_file" | tr -d ' ')" \
+      --argjson terminal_size "$(wc -c <"$terminal_file" | tr -d ' ')" '
+      [{filename:"production-mutation-qualification-begin.receipt.json",kind:"json",
+        sha256:$begin_sha,size_bytes:$begin_size},
+       {filename:"production-mutation-qualification-terminal.receipt.json",kind:"json",
+        sha256:$terminal_sha,size_bytes:$terminal_size}]')
+  fi
   temporary=$(mktemp "$output_dir/.manifest.json.XXXXXX")
   jq -S -c -n \
     --arg state "$state" \
@@ -1590,6 +3044,8 @@ write_manifest() {
     --argjson started_at_unix_seconds "$started_at_unix_seconds" \
     --argjson ended_at_unix_seconds "$ended" \
     --argjson exit_code "$exit_value" \
+    --argjson qualification_admission_required_evidence \
+      "$qualification_admission_required_evidence" \
     --slurpfile binaries "$binaries_work" \
     --slurpfile configs "$configs_work" \
     --slurpfile key_fingerprints "$fingerprints_work" \
@@ -1617,6 +3073,7 @@ write_manifest() {
         endpoint_hostname:$endpoint_hostname,public_origin:("https://" + $endpoint_hostname)},
       scenario_catalog_sha256:$scenario_catalog_sha256,binaries:$binaries,configs:$configs,
       key_fingerprints:$key_fingerprints,scenarios:$scenarios,
+      qualification_admission_required_evidence:$qualification_admission_required_evidence,
       started_at_unix_seconds:$started_at_unix_seconds,
       ended_at_unix_seconds:$ended_at_unix_seconds,exit_code:$exit_code}' \
     >"$temporary"
@@ -1634,17 +3091,88 @@ export CATS_E3_EXACT_COMMIT=$exact_commit
 export CATS_E3_BLOCK_PATH=$block_path
 export CATS_E3_RUN_ID=$run_id
 export CATS_E3_OUTPUT_DIR=$output_dir
-export CATS_E3_RUNTIME_STATE=$output_dir/runtime-state.json
+export CATS_E3_RUNTIME_STATE=$persistent_runtime_state
 export CATS_E3_RUN_STARTED_AT_UNIX_MS=$((started_at_unix_seconds * 1000))
 export CATS_E3_WORKER_BUNDLE_SHA256=${manifest_worker_bundle_sha256#sha256:}
 
-jq -S -c -n \
-  --arg exact_commit "$exact_commit" --arg block_path "$block_path" --arg run_id "$run_id" \
-  '{version:1,exact_commit:$exact_commit,block_path:$block_path,run_id:$run_id,cat_id:null}' \
-  >"$scratch/runtime-state.initial.json"
-atomic_copy "$scratch/runtime-state.initial.json" runtime-state.json
+atomic_copy "$persistent_runtime_state" runtime-state.json
 
-cats_e3_run_cases_post_preflight
+failed_cases=0
+blocked_cases=0
+passed_cases=0
+qualification_begin_ok=false
+qualification_close_ok=false
+qualification_inventory_ok=false
+qualification_wrappers_ok=false
+qualification_close_kind=
+qualification_close_decision=$state_directory/qualification-close-decision.v1.json
+if [[ -e $qualification_close_decision || -L $qualification_close_decision ]]; then
+  qualification_close_kind=$(cats_e3_load_close_decision) || \
+    fail "persistent qualification close decision is unsafe or belongs to another run"
+fi
+if cats_e3_qualification_begin; then
+  qualification_begin_ok=true
+  if [[ -z $qualification_close_kind ]]; then
+    cats_e3_run_cases_post_preflight product
+    qualification_close_kind=emergency_close
+    if [[ $failed_cases -eq 0 && $blocked_cases -eq 0 && \
+      $first_incomplete_case_index -eq $product_case_count ]]; then
+      qualification_close_kind=end_qualification
+    fi
+    cats_e3_persist_close_decision "$qualification_close_kind" || \
+      fail "could not durably bind the qualification close decision"
+  elif [[ $qualification_close_kind == end_qualification && \
+    $first_incomplete_case_index -ne $product_case_count ]]; then
+    qualification_close_attempted=true
+    qualification_close_forbidden=true
+    fail "EndQualification decision exists without the exact closed product case prefix"
+  fi
+  if [[ $qualification_close_kind == emergency_close && \
+    $failed_cases -eq 0 && $blocked_cases -eq 0 ]]; then
+    failed_cases=$((failed_cases + 1))
+  fi
+else
+  failed_cases=$((failed_cases + 1))
+fi
+
+if [[ $qualification_begin_ok == true ]]; then
+  if cats_e3_qualification_close "$qualification_close_kind"; then
+    qualification_close_ok=true
+  else
+    failed_cases=$((failed_cases + 1))
+  fi
+fi
+if [[ $qualification_close_ok == true ]]; then
+  if cats_e3_qualification_product_inventory "$qualification_close_kind"; then
+    qualification_inventory_ok=true
+  else
+    failed_cases=$((failed_cases + 1))
+  fi
+fi
+
+# This is the sole post-close Fleet read.  It is copied byte-for-byte into the
+# exact19 bundle and its digest is the final Fleet wrapper's authority.
+cats_e3_collect_final_inventory
+if [[ $qualification_inventory_ok == true ]] && \
+  cats_e3_publish_qualification_zero_wrappers; then
+  qualification_wrappers_ok=true
+else
+  failed_cases=$((failed_cases + 1))
+fi
+if [[ $qualification_wrappers_ok == true ]]; then
+  if ! cats_e3_qualification_terminalize "$qualification_close_kind"; then
+    failed_cases=$((failed_cases + 1))
+  fi
+fi
+
+# Usage source closure is read-only and is intentionally absent from the
+# product loop.  It becomes reachable only after the exact EndQualification
+# successor and its qualified_closed terminal receipt are durable.
+if [[ $qualification_close_kind == end_qualification && \
+  $qualification_terminalized == true && $failed_cases -eq 0 && $blocked_cases -eq 0 ]]; then
+  cats_e3_run_cases_post_preflight source
+fi
+atomic_copy "$persistent_runtime_state" runtime-state.json
 
 input_rehash_work=$scratch/input-rehash-diagnostic.txt
 : >"$input_rehash_work"
@@ -1692,9 +3220,17 @@ if [[ -s $coordinate_recheck ]]; then
   append_summary qualification-coordinates diagnostics "$coordinate_recheck"
 fi
 
+# Resolve any ambiguous Begin/close or interrupted post-close proof sequence
+# while the private signing input and scratch evidence workspace still exist.
+if ! cats_e3_close_on_exit; then
+  failed_cases=$((failed_cases + 1))
+fi
+
 final_exit=0
 final_state=passed
-if [[ $failed_cases -ne 0 || $blocked_cases -ne 0 ]]; then
+if [[ $failed_cases -ne 0 || $blocked_cases -ne 0 || \
+  $qualification_close_kind != end_qualification || \
+  $qualification_terminalized != true ]]; then
   final_exit=1
   final_state=failed
 fi
@@ -1702,19 +3238,50 @@ atomic_text exit-code "$final_exit"$'\n'
 ended_at_unix_seconds=$(date +%s)
 write_manifest "$final_state" "$final_exit" "$ended_at_unix_seconds"
 
+qualification_cleanup_disarmed=true
 rm -rf "$scratch"
 checksums_tmp=$(mktemp "$output_dir/.SHA256SUMS.XXXXXX")
+expected_output_names=(
+  case-evidence.jsonl
+  component-journal-summary.txt
+  exit-code
+  final-inventory.json
+  manifest.json
+  production-mutation-qualification-begin.command-receipt.json
+  production-mutation-qualification-begin.pending.json
+  production-mutation-qualification-begin.receipt.json
+  production-mutation-qualification-cleanup-inventory.receipt.json
+  production-mutation-qualification-close.command-receipt.json
+  production-mutation-qualification-close.pending.json
+  production-mutation-qualification-final-admission-state.json
+  production-mutation-qualification-final-fleet-closed.receipt.json
+  production-mutation-qualification-product-inventory.receipt.json
+  production-mutation-qualification-terminal.receipt.json
+  qualification-catalog.v1.json
+  runtime-state.json
+  scenario-results.jsonl
+)
+checksum_names=()
+shopt -s nullglob dotglob
+for output_entry in "$output_dir"/*; do
+  output_name=${output_entry##*/}
+  [[ $output_name != SHA256SUMS && $output_entry != "$checksums_tmp" ]] || continue
+  [[ -f $output_entry && ! -L $output_entry && -O $output_entry && \
+    $(stat -c '%u:%g:%a:%h' "$output_entry") == 0:0:600:1 ]] || \
+    fail "output evidence contains an unsafe direct child"
+  checksum_names+=("$output_name")
+done
+shopt -u nullglob dotglob
+IFS=$'\n' checksum_names=($(printf '%s\n' "${checksum_names[@]}" | LC_ALL=C sort))
+unset IFS
+if [[ $final_state == passed ]]; then
+  [[ $(printf '%s\n' "${checksum_names[@]}") == \
+    "$(printf '%s\n' "${expected_output_names[@]}")" ]] || \
+    fail "passed qualification output is not the exact18 closed file set"
+fi
 (
   cd "$output_dir"
-  LC_ALL=C sha256sum \
-    component-journal-summary.txt \
-    case-evidence.jsonl \
-    exit-code \
-    final-inventory.json \
-    manifest.json \
-    qualification-catalog.v1.json \
-    runtime-state.json \
-    scenario-results.jsonl
+  LC_ALL=C sha256sum "${checksum_names[@]}"
 ) >"$checksums_tmp"
 chmod 0600 "$checksums_tmp"
 mv -f "$checksums_tmp" "$output_dir/SHA256SUMS"

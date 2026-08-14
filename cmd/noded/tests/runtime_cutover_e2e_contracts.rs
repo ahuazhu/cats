@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -53,6 +54,7 @@ struct Fixture {
     timeout: PathBuf,
     timeout_trace: PathBuf,
     trace: PathBuf,
+    state_directory: PathBuf,
 }
 
 #[allow(dead_code)]
@@ -69,6 +71,10 @@ impl Fixture {
         let timeout = temp.path().join("timeout");
         let timeout_trace = temp.path().join("timeout-trace");
         let trace = temp.path().join("trace");
+        let state_directory = temp.path().join("persistent-state");
+        fs::create_dir(&state_directory).expect("create persistent-state fixture");
+        fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700))
+            .expect("protect persistent-state fixture");
 
         fs::write(
             &build_receipt,
@@ -118,6 +124,7 @@ exec "$@"
             timeout,
             timeout_trace,
             trace,
+            state_directory,
         }
     }
 
@@ -149,6 +156,8 @@ exec "$@"
             .args(["--run-id", "fixture-run"])
             .arg("--output-dir")
             .arg(output_dir)
+            .arg("--state-directory")
+            .arg(&self.state_directory)
             .arg("--build-receipt")
             .arg(&self.build_receipt)
             .arg("--release-manifest")
@@ -463,6 +472,7 @@ jq -S -c -n --argjson passed "$passed_cases" --argjson blocked "$blocked_cases" 
                     .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
             )
             .env("CATS_E3_FIXTURE_MODE", "enabled")
+            .env("CATS_E3_FIXTURE_TIMEOUT_TRACE", &self.timeout_trace)
             .env("CATS_E3_FIXTURE_TRACE", &self.trace)
             .env(
                 "CATS_E3_FIXTURE_CATALOG",
@@ -493,6 +503,7 @@ installed_noded_path=/opt/cats/bin/cats-noded
 token_file=/private/staged/control-token
 expected_nodes=(node_other node_qualification)
 export CATS_TOKEN=wrong-secret
+export CATS_CONFIG_DIR=/wrong/ephemeral/cli-state
 export CATS_E3_CONTROL_ORIGIN=https://wrong.example.test
 export CATS_E3_WORKSPACE_ID=wrong-workspace
 export CATS_E3_EXPECTED_NODES=wrong-node
@@ -500,6 +511,7 @@ export CATS_E3_QUALIFICATION_NODE_ID=wrong-node
 cats_e3_clear_ambient
 cats_e3_export_qualification_environment
 test -z "${CATS_TOKEN:-}"
+test -z "${CATS_CONFIG_DIR:-}"
 test "$CATS_E3_CONTROL_ORIGIN" = "$control_origin"
 test "$CATS_E3_WORKSPACE_ID" = "$workspace_id"
 test "$CATS_E3_EXPECTED_NODES" = node_other,node_qualification
@@ -747,6 +759,26 @@ chown 1:1 "$key"
     assert!(output.stdout.is_empty(), "secret staging wrote stdout");
 }
 
+fn assert_tree_has_no_secret(path: &Path, secret: &[u8]) {
+    for entry in fs::read_dir(path).expect("read retained state directory") {
+        let entry = entry.expect("read retained state entry");
+        if entry
+            .file_type()
+            .expect("read retained state entry type")
+            .is_dir()
+        {
+            assert_tree_has_no_secret(&entry.path(), secret);
+            continue;
+        }
+        let bytes = fs::read(entry.path()).expect("read retained state file");
+        assert!(
+            !bytes.windows(secret.len()).any(|window| window == secret),
+            "retained state contains private bytes at {}",
+            entry.path().display()
+        );
+    }
+}
+
 fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) {
     let stage =
         fs::read_to_string(output_dir.join("private-stage-path")).expect("read private stage path");
@@ -758,24 +790,6 @@ fn assert_private_stage_removed_without_secret(output_dir: &Path, secret: &str) 
         !Path::new(stage.trim()).exists(),
         "private stage survived exit"
     );
-    fn assert_tree_has_no_secret(path: &Path, secret: &[u8]) {
-        for entry in fs::read_dir(path).expect("read retained evidence directory") {
-            let entry = entry.expect("read retained evidence entry");
-            if entry
-                .file_type()
-                .expect("read evidence entry type")
-                .is_dir()
-            {
-                assert_tree_has_no_secret(&entry.path(), secret);
-                continue;
-            }
-            let bytes = fs::read(entry.path()).expect("read retained evidence file");
-            assert!(
-                !bytes.windows(secret.len()).any(|window| window == secret),
-                "retained evidence contains control token bytes"
-            );
-        }
-    }
     assert_tree_has_no_secret(output_dir, secret.as_bytes());
 }
 
@@ -1196,6 +1210,410 @@ fn runtime_cutover_runner_writes_atomic_checksummed_artifacts() {
 }
 
 #[test]
+fn runtime_cutover_runner_orders_qualification_and_closes_exact19() {
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    let lifecycle_start = runner
+        .rfind("qualification_begin_ok=false")
+        .expect("production Qualification lifecycle");
+    let lifecycle = &runner[lifecycle_start..];
+    let begin = lifecycle
+        .find("if cats_e3_qualification_begin; then")
+        .expect("BeginQualification");
+    let product = lifecycle
+        .find("cats_e3_run_cases_post_preflight product")
+        .expect("product case phase");
+    let close = lifecycle
+        .find("cats_e3_qualification_close \"$qualification_close_kind\"")
+        .expect("durable close");
+    let product_inventory = lifecycle
+        .find("cats_e3_qualification_product_inventory \"$qualification_close_kind\"")
+        .expect("post-close product inventory");
+    let final_inventory = lifecycle
+        .find("cats_e3_collect_final_inventory")
+        .expect("post-close Fleet inventory");
+    let wrappers = lifecycle
+        .find("cats_e3_publish_qualification_zero_wrappers")
+        .expect("zero wrappers");
+    let terminalize = lifecycle
+        .find("cats_e3_qualification_terminalize \"$qualification_close_kind\"")
+        .expect("qualified Closed terminal receipt");
+    let source = lifecycle
+        .find("cats_e3_run_cases_post_preflight source")
+        .expect("read-only Usage source closure");
+    assert!(
+        begin < product
+            && product < close
+            && close < product_inventory
+            && product_inventory < final_inventory
+            && final_inventory < wrappers
+            && wrappers < terminalize
+            && terminalize < source
+    );
+    assert!(lifecycle.contains("$qualification_close_kind != end_qualification"));
+    assert!(lifecycle.contains("$qualification_terminalized != true"));
+
+    let exact18_start = lifecycle
+        .find("expected_output_names=(")
+        .expect("exact18 output list");
+    let exact18 = &lifecycle[exact18_start..];
+    let exact18_end = exact18
+        .find("\n)\nchecksum_names=()")
+        .expect("exact18 output list boundary");
+    let actual = exact18[..exact18_end]
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            "case-evidence.jsonl",
+            "component-journal-summary.txt",
+            "exit-code",
+            "final-inventory.json",
+            "manifest.json",
+            "production-mutation-qualification-begin.command-receipt.json",
+            "production-mutation-qualification-begin.pending.json",
+            "production-mutation-qualification-begin.receipt.json",
+            "production-mutation-qualification-cleanup-inventory.receipt.json",
+            "production-mutation-qualification-close.command-receipt.json",
+            "production-mutation-qualification-close.pending.json",
+            "production-mutation-qualification-final-admission-state.json",
+            "production-mutation-qualification-final-fleet-closed.receipt.json",
+            "production-mutation-qualification-product-inventory.receipt.json",
+            "production-mutation-qualification-terminal.receipt.json",
+            "qualification-catalog.v1.json",
+            "runtime-state.json",
+            "scenario-results.jsonl",
+        ]
+    );
+    assert!(lifecycle.contains("LC_ALL=C sha256sum \"${checksum_names[@]}\""));
+}
+
+#[test]
+fn runtime_cutover_runner_persists_exact_reentry_and_close_authority() {
+    let runner = include_str!("../../../deploy/metal/runtime-cutover-e2e.sh");
+    for required in [
+        "--state-directory </absolute/persistent/root-only/directory>",
+        "flock -n \"$state_lock_fd\"",
+        "qualification-state-binding.v1.json",
+        "qualification-close-decision.v1.json",
+        "cats.production-mutation-qualification-close-decision.v1",
+        "configuration_manifest_sha256",
+        "initial_runtime_state_sha256",
+        "run_started_at_unix_seconds",
+        "authority_schema_version:$authority_schema_version",
+        "control_origin:$control_origin",
+        "guest_kernel:$guest_kernel,host_kernel:$host_kernel",
+        "build_receipt_sha256:$build_receipt_sha256",
+        "installer_receipt_sha256:$installer_receipt_sha256",
+        "runner_sha256:$runner_sha256,scenario_driver_sha256:$scenario_driver_sha256",
+        "cats_cli_recovery_namespace:\"cats-cli\"",
+        "export CATS_CONFIG_DIR=$persistent_cli_state_dir",
+        "expected_node_ids:$expected_node_ids[0]",
+        "qualification_node_id:$qualification_node_id",
+        "route_rotation_operator_authority_id:$route_rotation_operator_authority_id",
+        "route_rotation_route_deployment_id:$route_rotation_route_deployment_id",
+        "route_rotation_command_bundle_sha256:$route_rotation_command_bundle_sha256",
+        "route_rotation_recovery_sha256:$route_rotation_recovery_sha256",
+        "route_rotation_server_ca_sha256:$route_rotation_server_ca_sha256",
+        "exact source must expose the one frozen authority schema version 16",
+    ] {
+        assert!(
+            runner.contains(required),
+            "missing re-entry guard {required}"
+        );
+    }
+    let decision = runner
+        .rfind("qualification_close_decision=$state_directory/")
+        .expect("load durable close decision");
+    let begin = runner
+        .rfind("if cats_e3_qualification_begin; then")
+        .expect("BeginQualification invocation");
+    assert!(
+        decision < begin,
+        "close decision must be loaded before Begin replay"
+    );
+    assert!(runner
+        .contains("cats_e3_persist_close_decision \"$qualification_close_kind\" >/dev/null 2>&1"));
+    assert!(runner.contains("cats_e3_run_qualification_operator qualification-close"));
+    assert!(runner.contains("--close-kind \"$close_kind\" || return $?"));
+    assert!(runner.contains("cats_e3_run_qualification_operator qualification-terminalize"));
+}
+
+#[test]
+fn runner_exit_recovery_forward_completes_g3_before_emergency_terminalization() {
+    let fixture = Fixture::new();
+    let trace = fixture._temp.path().join("runner-exit-recovery.trace");
+    let state = fixture._temp.path().join("runner-exit-recovery-state");
+    fs::create_dir(&state).expect("create exit recovery state");
+    let script = r#"
+set -euo pipefail
+source "$1"
+trace=$2
+state_directory=$3
+qualification_lifecycle_attempted=true
+qualification_begin_applied=false
+qualification_close_applied=false
+qualification_close_forbidden=false
+qualification_close_kind=
+cats_e3_qualification_begin() {
+  printf '%s\n' begin-replay >>"$trace"
+  qualification_begin_applied=true
+}
+cats_e3_forward_recover_g3_on_exit() { printf '%s\n' g3-forward >>"$trace"; }
+cats_e3_persist_close_decision() {
+  test "$1" = emergency_close
+  printf '%s\n' decision >>"$trace"
+}
+cats_e3_qualification_close() {
+  test "$1" = emergency_close
+  printf '%s\n' close >>"$trace"
+  qualification_close_applied=true
+}
+cats_e3_qualification_product_inventory() { printf '%s\n' product-inventory >>"$trace"; }
+cats_e3_collect_final_inventory() { printf '%s\n' fleet-inventory >>"$trace"; }
+cats_e3_publish_qualification_zero_wrappers() { printf '%s\n' wrappers >>"$trace"; }
+cats_e3_qualification_terminalize() { printf '%s\n' terminalize >>"$trace"; }
+cats_e3_close_on_exit
+"#;
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .args(["-c", script, "runtime-cutover-exit-recovery"])
+        .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+        .arg(&trace)
+        .arg(&state)
+        .output()
+        .expect("run exit recovery lifecycle fixture");
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
+        concat!(
+            "begin-replay\n",
+            "g3-forward\n",
+            "decision\n",
+            "close\n",
+            "product-inventory\n",
+            "fleet-inventory\n",
+            "wrappers\n",
+            "terminalize\n"
+        )
+    );
+}
+
+#[test]
+fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
+    let fixture = Fixture::new();
+    let harness = fixture._temp.path().join("runner-reentry-harness.sh");
+    let trace = fixture._temp.path().join("runner-reentry.trace");
+    let state = fixture._temp.path().join("runner-reentry-state");
+    fs::create_dir(&state).expect("create reentry state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("protect reentry state");
+    fs::write(
+        &harness,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+source "$1"
+output_dir=$2
+state_directory=$3
+trace=$4
+scenario_driver=$5
+filter=$6
+catalog=$7
+mode=$8
+timeout_bin=$9
+block_path=kernel-nbd
+run_id=fixture-reentry
+workspace_id=workspace-fixture
+exact_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+operator_secret=fixture-production-cutover-operator-key-must-not-survive
+cats_e3_prepare_private_stage "$state_directory"
+printf '%s' "$operator_secret" \
+  >"$cats_e3_private_stage/production-cutover-operator-key"
+chmod 0600 "$cats_e3_private_stage/production-cutover-operator-key"
+scratch=$output_dir/.scratch
+mkdir -m 0700 "$output_dir" "$scratch"
+results_work=$scratch/scenario-results.jsonl
+journal_work=$scratch/component-journal-summary.txt
+evidence_work=$scratch/case-evidence.jsonl
+catalog_work=$scratch/scenario-catalog.jsonl
+: >"$results_work"
+: >"$journal_work"
+: >"$evidence_work"
+: >"$catalog_work"
+case_ids=()
+case_deadlines=()
+case_cleanup_deadlines=()
+case_expected_outcomes=()
+case_required_evidence=()
+while IFS= read -r case_record; do
+  case_ids+=("$(jq -r '.case_id' <<<"$case_record")")
+  case_deadlines+=("$(jq -r '.deadline_seconds' <<<"$case_record")")
+  case_cleanup_deadlines+=("$(jq -r '.cleanup_deadline_seconds' <<<"$case_record")")
+  case_expected_outcomes+=("$(jq -c '.expected_outcome' <<<"$case_record")")
+  case_required_evidence+=("$(jq -c '.required_evidence' <<<"$case_record")")
+  printf '%s\n' "$case_record" >>"$catalog_work"
+done < <(jq -S -c '
+  .framework_required_evidence as $framework
+  | .cases[:3][]
+  | .required_evidence = (.required_evidence + $framework)' "$catalog")
+qualification_catalog_authority_sha256=$(sha256sum "$catalog" | awk '{print $1}')
+persistent_cases_dir=$state_directory/cases
+persistent_case_prefix_dir=$state_directory/case-prefix
+persistent_runtime_state=$state_directory/runtime-state.json
+cats_e3_private_state_subdirectory "$persistent_cases_dir"
+cats_e3_private_state_subdirectory "$persistent_case_prefix_dir"
+binding_source=$scratch/qualification-state-binding.v1.json
+jq -S -c -n --arg run_id "$run_id" --arg workspace_id "$workspace_id" \
+  '{kind:"cats.fixture-runner-binding.v1",run_id:$run_id,version:1,workspace_id:$workspace_id}' \
+  >"$binding_source"
+chmod 0600 "$binding_source"
+cats_e3_bind_persistent_state "$state_directory" "$binding_source"
+runtime_source=$scratch/runtime-state.initial.json
+jq -S -c -n --arg exact_commit "$exact_commit" --arg block_path "$block_path" \
+  --arg run_id "$run_id" \
+  '{block_path:$block_path,cat_id:null,exact_commit:$exact_commit,run_id:$run_id,version:1}' \
+  >"$runtime_source"
+chmod 0600 "$runtime_source"
+if [[ ! -e $persistent_runtime_state ]]; then
+  cats_e3_bind_persistent_state "$state_directory" "$runtime_source" runtime-state.json
+fi
+first_incomplete_case_index=$(cats_e3_restore_case_prefix)
+export CATS_E3_FIXTURE_MODE=enabled
+export CATS_E3_FIXTURE_TRACE=$trace
+export CATS_E3_FIXTURE_CATALOG=$catalog
+export CATS_E3_FIXTURE_RUNTIME_CAT_ID=cat-fixture-reentry
+export CATS_E3_RUNTIME_STATE=$persistent_runtime_state
+if [[ $mode == kill ]]; then
+  export CATS_E3_FIXTURE_SIGKILL_CASE=cat-create-running
+  export CATS_E3_FIXTURE_RUNNER_PID=$$
+  export CATS_E3_FIXTURE_KILL_ONCE_FILE=$state_directory/kill-once
+fi
+cats_e3_run_cases_post_preflight product
+printf '%s\n' "$first_incomplete_case_index" >"$output_dir/first-incomplete"
+"#,
+    )
+    .expect("write reentry harness");
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755))
+        .expect("make reentry harness executable");
+
+    let invoke = |mode: &str, output: &Path| {
+        Command::new("bash")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .env("CATS_E3_FIXTURE_TIMEOUT_TRACE", &fixture.timeout_trace)
+            .arg(&harness)
+            .arg(fixture.root.join("deploy/metal/runtime-cutover-e2e.sh"))
+            .arg(output)
+            .arg(&state)
+            .arg(&trace)
+            .arg(
+                fixture
+                    .root
+                    .join("deploy/metal/tests/runtime-cutover-e2e-scenario-fixture.sh"),
+            )
+            .arg(
+                fixture
+                    .root
+                    .join("deploy/metal/runtime-cutover-evidence-filter.py"),
+            )
+            .arg(
+                fixture
+                    .root
+                    .join("deploy/metal/runtime-cutover-e2e-catalog.v1.json"),
+            )
+            .arg(mode)
+            .arg(&fixture.timeout)
+            .output()
+            .expect("run cross-process reentry fixture")
+    };
+
+    let first_output = fixture.output_dir("runner-reentry-first");
+    let killed = invoke("kill", &first_output);
+    assert_eq!(
+        killed.status.signal(),
+        Some(9),
+        "first process was not SIGKILLed: status={:?} stderr={}",
+        killed.status,
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(state
+        .join("case-prefix/00-control-startup-schema.v1.json")
+        .is_file());
+    assert!(state
+        .join("case-prefix/01-node-registration-full-inventory.v1.json")
+        .is_file());
+    assert!(!state
+        .join("case-prefix/02-cat-create-running.v1.json")
+        .exists());
+    let runtime_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("runtime-state.json")).unwrap()).unwrap();
+    assert_eq!(runtime_state["cat_id"], "cat-fixture-reentry");
+    const OPERATOR_SECRET: &str = "fixture-production-cutover-operator-key-must-not-survive";
+    assert_eq!(
+        fs::read(state.join("invocation-secrets/production-cutover-operator-key")).unwrap(),
+        OPERATOR_SECRET.as_bytes()
+    );
+    assert_tree_has_no_secret(&first_output, OPERATOR_SECRET.as_bytes());
+
+    let resumed_output = fixture.output_dir("runner-reentry-resumed");
+    let resumed = invoke("resume", &resumed_output);
+    assert_success(&resumed);
+    assert!(!state.join("invocation-secrets").exists());
+    assert_tree_has_no_secret(&first_output, OPERATOR_SECRET.as_bytes());
+    assert_tree_has_no_secret(&resumed_output, OPERATOR_SECRET.as_bytes());
+    assert_tree_has_no_secret(&state, OPERATOR_SECRET.as_bytes());
+    assert_eq!(
+        fs::read_to_string(resumed_output.join("first-incomplete")).unwrap(),
+        "3\n"
+    );
+    assert_eq!(
+        fs::read_to_string(resumed_output.join("scenario-results.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    let events = fs::read_to_string(&trace).expect("read reentry trace");
+    for (case_id, expected_runs) in [
+        ("control-startup-schema", 1),
+        ("node-registration-full-inventory", 1),
+        ("cat-create-running", 2),
+    ] {
+        assert_eq!(
+            events
+                .lines()
+                .filter(|line| *line == format!("run|{case_id}|kernel-nbd"))
+                .count(),
+            expected_runs,
+            "wrong replay count for {case_id}: {events}"
+        );
+    }
+
+    fs::write(
+        state.join("runtime-state.json"),
+        concat!(
+            "{\"block_path\":\"kernel-nbd\",\"cat_id\":\"cat-foreign\",",
+            "\"exact_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+            "\"run_id\":\"fixture-reentry\",\"version\":1}\n"
+        ),
+    )
+    .expect("inject foreign Cat identity");
+    let rejected_output = fixture.output_dir("runner-reentry-foreign-cat");
+    let rejected = invoke("resume", &rejected_output);
+    assert!(
+        !rejected.status.success(),
+        "foreign Cat identity unexpectedly resumed: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+    assert!(!state.join("invocation-secrets").exists());
+    assert_tree_has_no_secret(&rejected_output, OPERATOR_SECRET.as_bytes());
+    assert_tree_has_no_secret(&state, OPERATOR_SECRET.as_bytes());
+}
+
+#[test]
 fn runtime_cutover_runner_redacts_and_bounds_diagnostics() {
     let fixture = Fixture::new();
     let output_dir = fixture.output_dir("redaction");
@@ -1403,6 +1821,12 @@ fn production_v2_driver_places_source_terminal_after_delete_and_preserves_typed_
     assert!(driver.contains("/v1/admin/usage/source-terminal/discover"));
     assert!(catalog.contains("usage-source-terminal-receipts.json"));
     assert!(driver.contains("CATS_E3_RUN_STARTED_AT_UNIX_MS"));
+    assert!(driver.contains("create-response.pending.json"));
+    assert!(driver.contains("durable Cat identity has no adjacent create response"));
+    assert!(driver.contains("os.fsync(directory_fd)"));
+    assert!(
+        driver.contains("Usage source terminal receipt directory is not protected resume state")
+    );
     assert!(driver.contains(".source_epoch | type == \"string\" and length > 0"));
     assert!(!driver.contains("run_focused"));
     assert!(!driver.contains("before_agent_session:"));
@@ -1461,6 +1885,27 @@ fn production_v2_rotation_recovery_keeps_a_durable_prefix_and_closed_evidence_se
     assert!(driver.contains("policy=forward_recovered_active_fresh_endpoint_for_agent_restart"));
     assert!(!driver.contains("signed_command_exact_json"));
     assert!(!driver.contains("signed_apply_receipt_exact_json"));
+    let terminal_validation = shell_section(
+        driver,
+        "validate_rotation_terminal_evidence() {",
+        "\nensure_rotation_baseline() {",
+    );
+    for binding in [
+        ".authority_id == $authority",
+        ".route_deployment_id == $deployment",
+        ".rotation_operator_trust_sha256 == $trust",
+        ".command_bundle_sha256 == $command_bundle_sha",
+        ".recovery_transport_sha256 == $recovery_transport_sha",
+        ".fresh_endpoint.old_endpoint.name == $endpoint_name",
+        ".fresh_endpoint.fresh_endpoint.name == $fresh_name",
+        ".expected_nodes == $expected_nodes",
+        ".terminal_signing_authority.signer_revision == 8",
+    ] {
+        assert!(
+            terminal_validation.contains(binding),
+            "terminal fast-path omits current staged binding {binding}"
+        );
+    }
     for terminal in [
         "route-v2-rotation-disable-live-delivery.receipt.json",
         "route-v2-rotation-disable-live-delivery.node-acks.json",
@@ -1468,6 +1913,77 @@ fn production_v2_rotation_recovery_keeps_a_durable_prefix_and_closed_evidence_se
     ] {
         assert!(driver.contains(terminal));
     }
+}
+
+#[test]
+fn route_rotation_empty_prefix_survives_init_sigkill_and_resume() {
+    let driver = include_str!("../../../deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let production = shell_section(
+        driver,
+        "file_link_count() {",
+        "\nrotation_require_budget() {",
+    );
+    let temp = tempfile::tempdir().expect("Route rotation init crash fixture");
+    let harness = temp.path().join("rotation-init-crash.sh");
+    let case_dir = temp.path().join("case");
+    fs::create_dir(&case_dir).expect("create Route rotation case");
+    let preamble = r#"#!/usr/bin/env bash
+set -euo pipefail
+CASE_DIR=$1
+readonly CASE_DIR
+MODE=$2
+readonly CASE_ID=route-v2-rotation-disable-live-delivery
+readonly ROTATION_JOURNAL=$CASE_DIR/route-v2-rotation-journal.v1
+ROTATION_INVOCATION_DEADLINE_UNIX_SECONDS=
+CATS_E3_RUN_ID=fixture-run
+CATS_E3_EXACT_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+fail() { printf 'fixture failure: %s\n' "$*" >&2; exit 64; }
+stat() {
+  if [[ ${1:-} == -c && ${2:-} == %a ]]; then
+    python3 - "$3" <<'PY'
+import os
+import stat
+import sys
+print(format(stat.S_IMODE(os.stat(sys.argv[1], follow_symlinks=False).st_mode), "o"))
+PY
+    return
+  fi
+  command stat "$@"
+}
+"#;
+    let dispatch = r#"
+initialize_rotation_journal
+if [[ $MODE == kill ]]; then
+  kill -KILL $$
+fi
+jq -e 'type == "array" and length == 0' \
+  "$ROTATION_JOURNAL/rotation-phase-receipts.json" >/dev/null
+"#;
+    fs::write(&harness, [preamble, production, dispatch].join("\n"))
+        .expect("write Route rotation init crash harness");
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755))
+        .expect("make Route rotation init crash harness executable");
+
+    let killed = Command::new("bash")
+        .arg(&harness)
+        .arg(&case_dir)
+        .arg("kill")
+        .output()
+        .expect("initialize then SIGKILL Route rotation journal");
+    assert_eq!(killed.status.signal(), Some(9));
+    assert_eq!(
+        fs::read(case_dir.join("route-v2-rotation-journal.v1/rotation-phase-receipts.json"))
+            .unwrap(),
+        b"[]\n"
+    );
+
+    let resumed = Command::new("bash")
+        .arg(&harness)
+        .arg(&case_dir)
+        .arg("resume")
+        .output()
+        .expect("resume Route rotation journal after SIGKILL");
+    assert_success(&resumed);
 }
 
 fn shell_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -1514,7 +2030,7 @@ atomic_json_path() {
     observations=$(jq -r '.observations | length' "$destination")
     if [[ $observations -eq $CRASH_AFTER_OBSERVATIONS ]]; then
       : >"$CASE_DIR/crash-fired"
-      exit 99
+      kill -KILL $$
     fi
   fi
 }
@@ -1550,7 +2066,7 @@ run_probe() {
         let sequence = case_dir.join("sequence");
         fs::write(&sequence, "ok\nok\nok\nok\n").unwrap();
         let crashed = run(&case_dir, &sequence, Some(crash_after));
-        assert_eq!(crashed.status.code(), Some(99));
+        assert_eq!(crashed.status.signal(), Some(9));
         assert!(!case_dir
             .join("route-v2-rotation-journal.v1/disabled-public-route.json")
             .exists());
