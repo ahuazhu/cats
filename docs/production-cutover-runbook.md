@@ -114,11 +114,18 @@ cats-checkout-exact-sha \
 
 cats-run-build \
   <FINAL_RELEASE_SHA> <SOURCE_MANIFEST_SHA256> <SOURCE_BUNDLE_SHA256> \
-  --with-postgres -- ./scripts/quality.sh full
+  --with-postgres -- /bin/bash -c \
+  'set -o pipefail
+   ./scripts/quality.sh full 2>&1 |
+     tee "$CATS_BUILD_OUTPUT_DIR/quality-full.log"'
 
 cats-publish-content-addressed evidence \
-  /srv/cats-build/jobs/<QUALIFICATION_JOB_ID>/output/<FROZEN_FULL_LOG>
+  /srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/<QUALIFICATION_JOB_ID>/output/quality-full.log
 ```
+
+Take `<QUALIFICATION_JOB_ID>` from the successful Host-local immutable build receipt. Run the
+publisher only after `cats-run-build` returns zero and freezes that exact root-owned job output;
+never select a job by recency or publish a still-running log.
 
 On the approved native x86_64 release builder, build the two digest-pinned images and worker
 bundle from the same clean checkout:
@@ -925,11 +932,21 @@ final SHA and invalidates E12/E3; it is not a same-window patch.
 
 cats-run-build \
   <FINAL_RELEASE_SHA> <SOURCE_MANIFEST_SHA256> <SOURCE_BUNDLE_SHA256> \
-  --with-postgres -- ./scripts/quality.sh full
+  --with-postgres -- /bin/bash -c \
+  'set -o pipefail
+   ./scripts/quality.sh full 2>&1 |
+     tee "$CATS_BUILD_OUTPUT_DIR/quality-full.log"'
+
+cats-publish-content-addressed evidence \
+  /srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/<FINAL_QUALIFICATION_JOB_ID>/output/quality-full.log
 
 sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/SHA256SUMS
 sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/SHA256SUMS
 ```
+
+Take `<FINAL_QUALIFICATION_JOB_ID>` only from this successful final native build receipt, then
+publish its frozen log before retaining the final publication receipt. Do not reuse the phase 0
+job ID or its earlier green receipt.
 
 The Docker Linux command is an iteration/compatibility signal, not a substitute for the native
 x86_64 Linux `full` receipt. The two metal manifests remain the real KVM qualification.

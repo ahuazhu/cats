@@ -159,6 +159,56 @@ fn production_cutover_runbook_orders_gates_and_fences_destructive_commands() {
 }
 
 #[test]
+fn production_cutover_native_full_log_is_frozen_before_exact_job_publication() {
+    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
+    assert!(
+        !runbook.contains("/srv/cats-build/jobs/"),
+        "the qualification runner stores immutable job outputs below /srv/cats-build/target"
+    );
+
+    let phase_zero = runbook
+        .split_once("## 0. Freeze and qualify the exact release before the window")
+        .and_then(|(_, remainder)| {
+            remainder.split_once("<!-- cutover-stage: 10-maintenance-ingress-closed -->")
+        })
+        .map(|(section, _)| section)
+        .expect("Stage A phase 0 release qualification section");
+    let final_gates = runbook
+        .split_once("## 8. Recheck final full, Linux and metal gates")
+        .and_then(|(_, remainder)| remainder.split_once("## Stage B"))
+        .map(|(section, _)| section)
+        .expect("Stage A final gates section");
+
+    for (section, job_id) in [
+        (phase_zero, "<QUALIFICATION_JOB_ID>"),
+        (final_gates, "<FINAL_QUALIFICATION_JOB_ID>"),
+    ] {
+        let run = section.find("cats-run-build").expect("native full runner");
+        let pipefail = section[run..]
+            .find("set -o pipefail")
+            .map(|position| run + position)
+            .expect("native full pipefail gate");
+        let log = section[pipefail..]
+            .find("tee \"$CATS_BUILD_OUTPUT_DIR/quality-full.log\"")
+            .map(|position| pipefail + position)
+            .expect("native full frozen log writer");
+        let publish = section[log..]
+            .find("cats-publish-content-addressed evidence")
+            .map(|position| log + position)
+            .expect("native full evidence publisher");
+        let expected_path = format!(
+            "/srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/{job_id}/output/quality-full.log"
+        );
+        let exact_output = section[publish..]
+            .find(&expected_path)
+            .map(|position| publish + position)
+            .expect("exact immutable job output path");
+
+        assert!(run < pipefail && pipefail < log && log < publish && publish < exact_output);
+    }
+}
+
+#[test]
 fn production_platform_defaults_to_independent_az_dependencies() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let example =
