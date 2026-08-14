@@ -34,7 +34,9 @@ use super::authorized_blockd::{
     authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
     validate_running_physical_desired_successor, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
-use super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence;
+use super::blockd_socket_namespace::{
+    ExactManagedBlockdSocketOwnerStartAbsence, ManagedBlockdSocketOwnerRetirement,
+};
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
@@ -100,6 +102,14 @@ pub(crate) trait ServingBlockdProcessGlobalPort:
         expected: &ServingBlockdExpectation,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessInspection>;
+
+    fn retire_absent_socket_owner(
+        &self,
+        _expected: &ServingBlockdExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+        anyhow::bail!("Serving socket-owner retirement requires the production Node-global scanner")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +155,104 @@ pub(crate) struct ServingBlockdExpectation {
 }
 
 impl ServingBlockdExpectation {
+    #[cfg(test)]
+    pub(crate) fn from_lifecycle_checkpoint_for_test(
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Self> {
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .context("lifecycle Serving fixture lacks a retained launch")?;
+        let prepared = launch
+            .devices
+            .first()
+            .context("lifecycle Serving fixture lacks a prepared device")?
+            .clone();
+        let intent = desired
+            .volumes
+            .iter()
+            .find(|intent| intent.volume_id == prepared.volume_id)
+            .context("lifecycle Serving fixture lacks its Desired Volume")?
+            .clone();
+        let (
+            cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            },
+            cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                transition_id: prepared_transition,
+            },
+        ) = (&intent.acquire, &prepared.acquire_origin)
+        else {
+            anyhow::bail!("lifecycle Serving fixture requires one Normal acquire")
+        };
+        anyhow::ensure!(
+            transition_id == prepared_transition,
+            "lifecycle Serving fixture changed its acquire origin"
+        );
+        let lease_expires_at =
+            UnixMillis::new(1_900_000_120_000).expect("fixed lifecycle fixture time is positive");
+        let request = cats_api::runtime_reconciliation::NormalAcquireRequest {
+            volume_id: intent.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: intent.attachment_id.clone(),
+            expected_unowned_epoch: *expected_unowned_epoch,
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+        };
+        let result = cats_api::runtime_reconciliation::NormalAcquireResult {
+            volume_id: intent.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: intent.attachment_id.clone(),
+            resulting_epoch: prepared.attachment_epoch,
+            resulting_head: prepared.expected_head.clone(),
+            lease_expires_at,
+        };
+        let volume = AuthorizedBlockdCheckpoint {
+            version: cats_api::runtime_reconciliation::ContractVersion::V1,
+            desired: desired.clone(),
+            volume: intent.clone(),
+            attachment: cats_storage::authority::AuthorizedServingAttachment {
+                identity: cats_storage::authority::AttachmentLineageIdentity {
+                    volume_id: intent.volume_id.clone(),
+                    attachment_id: intent.attachment_id.clone(),
+                    attachment_epoch: prepared.attachment_epoch,
+                    acquire_origin: prepared.acquire_origin.clone(),
+                    node_id: desired.placement.node_id.clone(),
+                    placement_epoch: desired.placement.placement_epoch,
+                },
+                size_bytes: intent.size_bytes,
+                durability: intent.durability,
+                head: prepared.expected_head.clone(),
+                lease_expires_at,
+                acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                    request,
+                    result,
+                },
+            },
+        };
+        let process = &prepared.serving_process;
+        let executable_path = process.executable_path.clone();
+        Ok(Self {
+            volume,
+            unit_id: process.scope_id.clone(),
+            cgroup_path: HostPath::new(format!("/sys/fs/cgroup/system.slice/{}", process.scope_id))
+                .context("lifecycle Serving fixture has a non-canonical cgroup path")?,
+            executable_path: executable_path.clone(),
+            command_line: vec![OsString::from(executable_path.as_str())],
+            control_socket_path: process.control_socket_path.clone(),
+            data_directory: process.data_directory.clone(),
+            process_identity_token: process.process_identity_token.clone(),
+            device_ownership_token: prepared.ownership_token.clone(),
+            frontend: prepared.frontend.clone(),
+            prepared_device: prepared.clone(),
+            expected_remote_head: prepared.expected_head.clone(),
+            authority_lease_expires_at: lease_expires_at,
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "inventory closes one prepared device across immutable storage, Desired, authority, and installed process config"

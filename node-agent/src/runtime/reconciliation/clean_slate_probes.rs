@@ -6680,6 +6680,26 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
             }
         }
     }
+
+    fn retire_absent_socket_owner(
+        &self,
+        expected: &ServingBlockdExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
+        let absence = self
+            .retain_start_socket_absence(expected, context)?
+            .context("fresh full scan did not seal serving socket-owner absence")?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(context.state_directory().clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &current_boot,
+            expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(expected.prepared_device())?,
+        )?;
+        root.retire_absent_owner(&intents, &intent, &current_boot, absence)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -6688,19 +6708,7 @@ pub(crate) fn retire_absent_serving_socket_owner_for_test(
     expected: &ServingBlockdExpectation,
     context: &crate::runtime_spine::RuntimeDesiredEffectContext,
 ) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
-    let absence = process
-        .retain_start_socket_absence(expected, context)?
-        .context("fresh full scan did not seal serving socket-owner absence")?;
-    let current_boot = CurrentBlockdSocketBoot::read()?;
-    let root = RetainedManagedBlockdSocketRoot::open_installed()?;
-    let intents = BlockdSocketIntentStore::open_existing(context.state_directory().clone())?;
-    let intent = BlockdSocketOwnershipIntentV1::serving(
-        &root,
-        &current_boot,
-        expected.device_ownership_token().clone(),
-        serving_socket_owner_authority_digest(expected.prepared_device())?,
-    )?;
-    root.retire_absent_owner(&intents, &intent, &current_boot, absence)
+    process.retire_absent_socket_owner(expected, context)
 }
 
 impl vmm_process_sealed::Sealed for PlatformRootProcessInventoryBridge {}

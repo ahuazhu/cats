@@ -29,6 +29,7 @@ use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
 };
 
+use super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{KernelNbdDetachPort, KernelNbdDetachResult};
 use super::persistent_filesystem::{
@@ -493,13 +494,124 @@ impl PlatformLifecyclePhysicalPort {
         volume_id: &Id,
         ownership_token: &RandomId128,
     ) -> anyhow::Result<LifecyclePhysicalAttempt> {
-        detach_exact_kernel_nbd_device(
-            self.kernel_nbd_detach.as_deref(),
-            context,
-            permit,
-            volume_id,
-            ownership_token,
-        )
+        let vhost = permit
+            .checkpoint()
+            .runtime_launch
+            .identity()
+            .and_then(|launch| {
+                let mut matching = launch.devices.iter().filter(|device| {
+                    &device.volume_id == volume_id && &device.ownership_token == ownership_token
+                });
+                let prepared = matching.next()?;
+                matching.next().is_none().then_some(prepared)
+            })
+            .filter(|prepared| {
+                matches!(
+                    &prepared.frontend,
+                    cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+                )
+            });
+        match vhost {
+            Some(prepared) => self.retire_exact_vhost_device(context, permit, prepared),
+            None => detach_exact_kernel_nbd_device(
+                self.kernel_nbd_detach.as_deref(),
+                context,
+                permit,
+                volume_id,
+                ownership_token,
+            ),
+        }
+    }
+
+    fn retire_exact_vhost_device(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        permit: &LifecycleEffectPermit<'_>,
+        prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        if permit
+            .runtime()
+            .processes
+            .iter()
+            .any(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+        {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let accepted = context.accepted_full()?;
+        let processes = context.node_global_process()?;
+        if !processes.matches_observation(accepted.observation()) {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        let Some((expected, admitted)) =
+            processes.serving_blockd(&permit.desired().cat_id, &prepared.volume_id)
+        else {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        };
+        if !expected.matches_device_contract(&permit.desired().cat_id, prepared) {
+            return Ok(LifecyclePhysicalAttempt::Conflict);
+        }
+        match admitted {
+            Some(admitted) => self.stop_exact_serving(context, expected, admitted),
+            None => {
+                match self
+                    .serving_process
+                    .inspect_serving_exact_or_absent_after_node_global_sweep(expected, context)?
+                {
+                    ServingBlockdProcessInspection::Absent => {
+                        match self
+                            .serving_process
+                            .retire_absent_socket_owner(expected, context)?
+                        {
+                            ManagedBlockdSocketOwnerRetirement::Retired => {
+                                Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+                            }
+                            ManagedBlockdSocketOwnerRetirement::AlreadyAbsent => {
+                                Ok(LifecyclePhysicalAttempt::ExactPostcondition)
+                            }
+                        }
+                    }
+                    ServingBlockdProcessInspection::Unavailable => {
+                        Ok(LifecyclePhysicalAttempt::Unavailable)
+                    }
+                    ServingBlockdProcessInspection::Exact(_)
+                    | ServingBlockdProcessInspection::Conflict(_) => {
+                        Ok(LifecyclePhysicalAttempt::Conflict)
+                    }
+                }
+            }
+        }
+    }
+
+    fn stop_exact_serving(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        expected: &super::serving_blockd_process::ServingBlockdExpectation,
+        admitted: &super::serving_blockd_process::ExactServingBlockdProcessProof,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        match self
+            .serving_process
+            .inspect_serving_exact_or_absent_after_node_global_sweep(expected, context)?
+        {
+            ServingBlockdProcessInspection::Absent => {
+                Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+            }
+            ServingBlockdProcessInspection::Exact(fresh)
+                if fresh.as_ref() == admitted.evidence() =>
+            {
+                if admitted.assert_listener_current(context).is_err() {
+                    return Ok(LifecyclePhysicalAttempt::Conflict);
+                }
+                signal_exact_process_bounded(
+                    context,
+                    fresh.as_ref().clone().into_process_evidence(),
+                )
+            }
+            ServingBlockdProcessInspection::Unavailable => {
+                Ok(LifecyclePhysicalAttempt::Unavailable)
+            }
+            ServingBlockdProcessInspection::Exact(_)
+            | ServingBlockdProcessInspection::Conflict(_) => Ok(LifecyclePhysicalAttempt::Conflict),
+        }
     }
 
     fn remove_exact_network(
@@ -634,32 +746,7 @@ impl PlatformLifecyclePhysicalPort {
                 if !admitted.matches_public_process(public) {
                     return Ok(LifecyclePhysicalAttempt::Conflict);
                 }
-                match self
-                    .serving_process
-                    .inspect_serving_exact_or_absent_after_node_global_sweep(expected, context)?
-                {
-                    ServingBlockdProcessInspection::Absent => {
-                        Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
-                    }
-                    ServingBlockdProcessInspection::Exact(fresh)
-                        if fresh.as_ref() == admitted.evidence() =>
-                    {
-                        if admitted.assert_listener_current(context).is_err() {
-                            return Ok(LifecyclePhysicalAttempt::Conflict);
-                        }
-                        signal_exact_process_bounded(
-                            context,
-                            fresh.as_ref().clone().into_process_evidence(),
-                        )
-                    }
-                    ServingBlockdProcessInspection::Unavailable => {
-                        Ok(LifecyclePhysicalAttempt::Unavailable)
-                    }
-                    ServingBlockdProcessInspection::Exact(_)
-                    | ServingBlockdProcessInspection::Conflict(_) => {
-                        Ok(LifecyclePhysicalAttempt::Conflict)
-                    }
-                }
+                self.stop_exact_serving(context, expected, admitted)
             }
         }
     }
@@ -3354,7 +3441,7 @@ fn stop_local() -> RuntimeDesiredEffectOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -3367,6 +3454,19 @@ mod tests {
 
     use super::super::checkpoint::WriteStage;
     use super::super::kernel_nbd::{KernelNbdDetachPort, KernelNbdDetachResult};
+    use super::super::root_provision_process::{
+        ManagedServingKey, NodeGlobalManagedProcessScanAdmission,
+    };
+    use super::super::serving_blockd_process::{
+        global_sealed as serving_global_sealed, process_sealed as serving_process_sealed,
+        CheckpointedServingBlockdProcess, ServingBlockdExpectation, ServingBlockdProcessPort,
+        ServingBlockdProcessStart,
+    };
+    use super::super::vmm_process::{
+        global_sealed as vmm_global_sealed, sealed as vmm_process_sealed, CheckpointedVmmProcess,
+        VmmGateSuccessorProof, VmmProcessGlobalInspection, VmmProcessInspection, VmmProcessPort,
+        VmmProcessStart,
+    };
 
     fn fixtures(
         target: RuntimeTarget,
@@ -3800,6 +3900,96 @@ mod tests {
             _request: &cats_storage::authority::VolumeHeadCasRequest,
         ) -> cats_storage::authority::Result<cats_storage::authority::VolumeHeadCasResult> {
             Err(cats_storage::authority::AuthorityError::BackendUnknown)
+        }
+    }
+
+    struct VhostCleanupServingPort {
+        retirements: Mutex<VecDeque<ManagedBlockdSocketOwnerRetirement>>,
+    }
+
+    impl serving_process_sealed::Sealed for VhostCleanupServingPort {}
+    impl serving_global_sealed::Sealed for VhostCleanupServingPort {}
+
+    impl ServingBlockdProcessPort for VhostCleanupServingPort {
+        fn inspect(
+            &self,
+            _expected: &ServingBlockdExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<ServingBlockdProcessInspection> {
+            Ok(ServingBlockdProcessInspection::Absent)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedServingBlockdProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ServingBlockdProcessStart> {
+            panic!("vhost cleanup regression must not start blockd")
+        }
+    }
+
+    impl ServingBlockdProcessGlobalPort for VhostCleanupServingPort {
+        fn inspect_serving_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &ServingBlockdExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ServingBlockdProcessInspection> {
+            Ok(ServingBlockdProcessInspection::Absent)
+        }
+
+        fn retire_absent_socket_owner(
+            &self,
+            _expected: &ServingBlockdExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+            Ok(self
+                .retirements
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("vhost cleanup regression exhausted retirement outcomes"))
+        }
+    }
+
+    struct NeverVmmProcessPort;
+
+    impl vmm_process_sealed::Sealed for NeverVmmProcessPort {}
+    impl vmm_global_sealed::Sealed for NeverVmmProcessPort {}
+
+    impl VmmProcessPort for NeverVmmProcessPort {
+        fn inspect(
+            &self,
+            _expected: &super::super::vmm_process::VmmProcessExpectation,
+            _context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        ) -> anyhow::Result<VmmProcessInspection> {
+            Ok(VmmProcessInspection::Unavailable)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<VmmProcessStart> {
+            panic!("vhost cleanup regression must not start a VMM")
+        }
+    }
+
+    impl super::super::vmm_process::VmmProcessGlobalPort for NeverVmmProcessPort {
+        fn inspect_vmm_exact_or_absent_after_node_global_sweep(
+            &self,
+            _expected: &super::super::vmm_process::VmmProcessExpectation,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<VmmProcessGlobalInspection> {
+            Ok(VmmProcessGlobalInspection::Unavailable)
+        }
+
+        fn inspect_vmm_gate_successor_exact_after_node_global_sweep(
+            &self,
+            _admitted_predecessor: &super::super::vmm_process::ExactVmmProcessProof,
+            _successor: &VmmGateSuccessorProof,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<VmmProcessGlobalInspection> {
+            Ok(VmmProcessGlobalInspection::Unavailable)
         }
     }
 
@@ -4389,6 +4579,195 @@ mod tests {
             );
             assert!(detach.calls.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn stopped_vmm_exact_vhost_cleanup_retires_the_serving_owner_and_converges_cold() {
+        let (desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        let prepared = checkpoint.runtime_launch.identity().unwrap().devices[0].clone();
+        let expectation =
+            ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(&checkpoint, &desired)
+                .unwrap();
+        let exact = expectation
+            .clone()
+            .prove_exact_process(expectation.exact_evidence_for_test(51))
+            .unwrap();
+        let (_, vhost) = exact.vhost_device_projection().unwrap();
+        runtime.processes = vec![exact.clone().into_process_evidence()];
+        runtime.volumes[0].devices = vec![vhost];
+        checkpoint.processes = runtime.processes.clone();
+        checkpoint.volumes = runtime.volumes.clone();
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Device {
+                volume_id: prepared.volume_id.clone(),
+                ownership_token: prepared.ownership_token.clone(),
+            },
+            inventory_session: SessionBinding {
+                node_id: checkpoint.node_id.clone(),
+                node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                    "11111111111111111111111111111111".to_owned(),
+                )
+                .unwrap(),
+                agent_instance_id: RandomId128::new("22222222222222222222222222222222".to_owned())
+                    .unwrap(),
+                agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+            },
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(7).unwrap(),
+            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
+            desired_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
+            volume_release: None,
+        };
+        checkpoint.stable_state = None;
+        checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: cleanup.clone(),
+        };
+        runtime.stable_state = None;
+        runtime.step = ReconcileStep::CleanupRelease { cleanup };
+
+        let directory = TempDir::new().unwrap();
+        let store = FileCheckpointStore::open(
+            &directory.path().join(CHECKPOINT_NAMESPACE),
+            &checkpoint.cat_id,
+        )
+        .unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        let serving = Arc::new(VhostCleanupServingPort {
+            retirements: Mutex::new(VecDeque::from([
+                ManagedBlockdSocketOwnerRetirement::Retired,
+                ManagedBlockdSocketOwnerRetirement::AlreadyAbsent,
+            ])),
+        });
+        let physical = PlatformLifecyclePhysicalPort {
+            network_ip_binary: PathBuf::new(),
+            serving_process: serving,
+            vmm_process: Arc::new(NeverVmmProcessPort),
+            kernel_nbd_detach: None,
+            blockd: PlatformPersistentBlockdControlPort,
+            volume_authority: Arc::new(UnavailableVolumeAuthority),
+        };
+
+        let live_scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(
+                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
+                expectation.clone(),
+            )]),
+            BTreeMap::from([(
+                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
+                exact,
+            )]),
+        )
+        .unwrap();
+        let live_context = deleting_effect_context(&directory, &desired, runtime.clone());
+        let live_admission = live_scan
+            .bind(live_context.accepted_full().unwrap().observation())
+            .unwrap();
+        let live_context = live_context.with_node_global_process_for_test(live_admission);
+        let permit = LifecycleEffectPermit {
+            desired: &desired,
+            runtime: &runtime,
+            store: &store,
+            stored: &stored,
+        };
+        assert_eq!(
+            physical
+                .detach_exact_device(
+                    &live_context,
+                    &permit,
+                    &prepared.volume_id,
+                    &prepared.ownership_token,
+                )
+                .unwrap(),
+            LifecyclePhysicalAttempt::SubmittedOrAmbiguous,
+            "an exact process that stopped after the accepted scan needs a fresh absence scan"
+        );
+
+        runtime.processes.clear();
+        runtime.volumes[0].devices.clear();
+        let absent_scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(
+                ManagedServingKey::new(desired.cat_id.clone(), prepared.volume_id.clone()),
+                expectation,
+            )]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        for expected in [
+            LifecyclePhysicalAttempt::SubmittedOrAmbiguous,
+            LifecyclePhysicalAttempt::ExactPostcondition,
+        ] {
+            let context = deleting_effect_context(&directory, &desired, runtime.clone());
+            let admission = absent_scan
+                .clone()
+                .bind(context.accepted_full().unwrap().observation())
+                .unwrap();
+            let context = context.with_node_global_process_for_test(admission);
+            let permit = LifecycleEffectPermit {
+                desired: &desired,
+                runtime: &runtime,
+                store: &store,
+                stored: &stored,
+            };
+            assert_eq!(
+                physical
+                    .detach_exact_device(
+                        &context,
+                        &permit,
+                        &prepared.volume_id,
+                        &prepared.ownership_token,
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+
+        runtime.networks.clear();
+        runtime.mounts.clear();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        let (attachment_epoch, head) = match &runtime.volumes[0].authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_epoch,
+                head,
+                ..
+            } => (*attachment_epoch, head.clone()),
+            _ => panic!("vhost cleanup fixture lost its Owned authority"),
+        };
+        runtime.volumes[0].authority = VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: FenceEpoch::new(attachment_epoch.get() + 1).unwrap(),
+            head,
+        };
+        runtime.volumes[0].local_lineages.clear();
+        let cursor = FreshCleanupCursor {
+            session: match &checkpoint.step {
+                ReconcileStep::CleanupRelease { cleanup } => cleanup.inventory_session.clone(),
+                _ => unreachable!(),
+            },
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(8).unwrap(),
+            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(10).unwrap(),
+            desired_read_position: cats_api::runtime_reconciliation::Sequence::new(10).unwrap(),
+            observed_at: cats_api::runtime_reconciliation::UnixMillis::new(1_800_000_000_000)
+                .unwrap(),
+        };
+        let successor =
+            cleanup_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            successor.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        ));
+        assert_eq!(successor.runtime_launch, RuntimeLaunch::Absent);
     }
 
     #[test]
