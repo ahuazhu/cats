@@ -56,41 +56,56 @@ ProductionCutoverProofSetV1 {
   reset_id: Id,
   observed_at: RFC3339 UTC seconds,
   operator: {
-    kind: "aws_sts_assumed_role" | "aws_sts_user",
-    principal_arn: exact ARN,
-    account_id: 12 digits
+    aws_partition: "aws" | "aws-us-gov" | "aws-cn",
+    account_id: 12 digits,
+    role_arn: exact IAM role ARN,
+    principal_arn: exact STS assumed-role ARN
   },
   release: {
-    commit: 40 lowercase hex,
+    release_id: Id,
+    source_commit_sha: 40 lowercase hex,
     artifact_sha256: Sha256Digest,
     source_manifest_sha256: Sha256Digest,
     source_bundle_sha256: Sha256Digest,
+    qualification_manifest_sha256: Sha256Digest,
+    qualification_catalog_sha256: Sha256Digest,
     source_receipt: ProofFileV1,
     build_receipt: ProofFileV1,
-    release_manifest: ProofFileV1
+    release_manifest: ProofFileV1,
+    qualification_manifest: ProofFileV1,
+    qualification_catalog: ProofFileV1
   },
+  old: FreshTargetsV1,
   fresh: {
     deployment_id: Id,
     aws_partition: "aws" | "aws-us-gov" | "aws-cn",
+    aws_account_id: 12 digits,
     aws_region: canonical region,
-    eks_cluster_name: DNS label,
-    kubernetes_namespace: DNS label,
+    cell_id: Id,
+    cell_namespace: DNS label,
     control_schema_version: 16,
     targets: FreshTargetsV1
   },
   proofs: {
+    qualification_admission_begin: ProofFileV1,
+    qualification_admission_terminal: ProofFileV1,
     fleet_closed: ProofFileV1,
-    route_signing_command: ProofFileV1,
-    route_ring_delivery: ProofFileV1,
-    usage_terminal: ProofFileV1,
+    route_v2_rotation_qualification_receipt: ProofFileV1,
+    route_v2_rotation_qualification_node_ack_sets: ProofFileV1,
+    route_v2_rotation_qualification_transcript: ProofFileV1,
+    usage_terminal_request: ProofFileV1,
+    usage_terminal_receipt: ProofFileV1,
+    usage_terminal_verification: ProofFileV1,
     old_host_inventory: ProofFileV1,
-    old_host_coverage: [OldHostCoverageV1],
+    old_host_coverage: ProofFileV1,
     qualification: {
-      kernel_nbd: QualificationProofV1,
-      vhost_user: QualificationProofV1
+      kernel_nbd: RunnerBundleProofV1,
+      vhost_user: RunnerBundleProofV1
     }
   }
 }
+
+ProofFileV1 { file: direct-child name, sha256: Sha256Digest, size_bytes: u64 > 0 }
 ```
 
 `FreshTargetsV1` contains exactly the fresh Control schema, Usage schema, versioned ChunkStore
@@ -124,25 +139,38 @@ The reset preflight obtains a new fleet receipt within its closed freshness wind
 keeps the exact pre-start receipt binding but re-runs official read-only fleet discovery before every
 new destructive stage. A stale receipt alone never proves the live fleet remains Closed.
 
-### 3.2 G3 Route signing delivery
+### 3.2 G3 Route qualification and live Route state
 
-`route_signing_command` must be the committed immutable command receipt discovered by exact
-`(authority_id, command_id)`. It must bind exact canonical command bytes/digest, release ID,
-target deployment, expected signer predecessor and terminal `applied` outcome. The matching
-`route_ring_delivery` must be the same transaction's exact adjacent signed public-ring successor:
-source command/release, deployment, resulting ring version, expected predecessor, ring digest and
-signed envelope bytes/digest all match. The resulting signer/ring fields must equal the
-`fleet_closed` snapshot. `authority_precondition_failed`, missing delivery, a gap, replay with a
-different body, or a provider/operator projection fails closed.
+The three `route_v2_rotation_qualification_*` files are immutable evidence from the dedicated
+qualification cell. They prove disable plus full active recovery using the seven actual fresh signed
+commands/Store results, both the disabled checkpoint and recovered Node ACK sets, a fresh endpoint
+epoch and post-restart current-process discovery. They bind the exact runner/release/catalog and do
+not claim that production is currently disabled. Independently, `fleet_closed` must prove that the
+fresh production target is Closed while its expected active, nonempty ring is installed. E13 calls
+the reviewed G3 typed verifier over all three exact files; it does not decode provisional templates,
+AWS rollout details or a single phase receipt as terminal qualification evidence.
 
 ### 3.3 E9 final Usage terminal
 
-`usage_terminal` must be E9's committed terminal receipt discovered by its exact reset/source/release
-epoch identity. It must bind the old and fresh Usage schema/stream/table/archive targets, final event,
-immutable archive object digest, projector committed watermark and terminal outcome. The final
-event and watermark must prove all accepted pre-cutoff Usage events are archived and visible before
-old transport retirement. A provisional marker, an empty stream/table, a local counter or a receipt
-whose exact schema has not been accepted fails closed.
+The exact files are `usage-target-terminal-request.json`,
+`usage-target-terminal-receipt.json` and
+`usage-target-terminal-verification.receipt.json`. Python does not duplicate E9's archive/barrier
+oracle. It invokes the release-bound Rust worker member exactly as follows and compares the newly
+produced canonical verification receipt byte-for-byte with the referenced proof file:
+
+```text
+/opt/cats/bin/cats-usage-terminal-receipt-verifier
+  --receipt-file ABS/usage-target-terminal-receipt.json
+  --expected-request-file ABS/usage-target-terminal-request.json
+  --release-commit 40lowerhex
+  --worker-bundle-sha256 sha256:64lowerhex
+  --receipt-out ABS/usage-target-terminal-verification.receipt.json
+```
+
+Only exit 0 and stdout exactly `Usage terminal receipt verified\n` pass. The tool calls the canonical
+Rust target-terminal validator, requires exact request equality and release/worker binding, and emits
+kind `cats.usage-terminal-receipt-verification.v1`. A pre-existing JSON projection, a Python-only
+field check, absent source receipt, incomplete shard barrier or provisional marker fails closed.
 
 ### 3.4 Old Host coverage and V3
 
@@ -165,9 +193,9 @@ OldHostCoverageV1 {
 }
 ```
 
-Local receipts must be accepted `local_systemd` positive-stop receipts: exact machine/boot,
-idle preflight, protected VMM/blockd absence, loaded unit stop and stable process-tree absence. EC2
-Security Group isolation cannot appear as terminal coverage. A HostFence receipt must be a committed
+The current local positive-stop contract remains Proposed, so its typed verifier is unavailable and
+such an entry fails closed. EC2 Security Group isolation cannot appear as terminal coverage. A
+HostFence receipt must be a committed
 V3 core event in `Active` state, pass the core validator, bind provider scope + immutable Host + Node
 + boot + session + fence attempt, and include the mandatory object-write cutoff terminal proof.
 Provider-only evidence and AWS-specific fields are neither parsed nor accepted by E13.
@@ -177,9 +205,11 @@ or extra coverage fails closed.
 
 ### 3.5 V5 qualification
 
-Each `QualificationProofV1` contains exact `manifest.json`, `case-receipts.jsonl` and `SHA256SUMS`
-references. The manifest must be terminal `passed`, `exit_code=0`, have the exact block path, schema,
-release/build/installer identities and a checksum-closed output set. Required case receipts prove:
+Each `RunnerBundleProofV1` contains exact `manifest.json`, `case-evidence.jsonl`,
+`qualification-catalog.v1.json` and `SHA256SUMS` references. The manifest must be terminal `passed`,
+`exit_code=0`, have the exact raw block path (`kernel-nbd` or `vhost-user`), schema,
+release/build/installer/catalog identities and a checksum-closed output set. The unique embedded
+`volume-init-matrix/persistent-disk-receipt.json` evidence proves:
 fresh cell/target identity; Persistent create→Cold attach→first-format→`R==L` Initialized→mounted
 Ready→Cold drain/release→detach; Agent crash/restart adoption; stale epoch/ABA rejection; and final
 Closed gates, zero guards, complete inventory with no unknown residue. Both block paths are required;
@@ -270,17 +300,26 @@ Successful qualification publishes these non-recursive framework receipts:
 ```text
 production-mutation-qualification-begin.receipt.json {
   kind: "cats.production-mutation-qualification-begin-receipt.v1", version: 1,
-  qualification_id, binding_sha256,
+  qualification_id, workspace_id, release_id, source_commit_sha,
+  qualification_catalog_sha256,
+  allowed_mutation_classes: [
+    "cat_create", "disk_create", "disk_delete", "runtime_mutation"
+  ],
+  binding_sha256,
   begin_command_id, begin_request_sha256, begin_command_receipt_sha256,
   resulting_revision, qualification_expires_at_unix_ms
 }
 
 production-mutation-qualification-terminal.receipt.json {
   kind: "cats.production-mutation-qualification-terminal-receipt.v1", version: 1,
-  qualification_id, binding_sha256,
+  qualification_id, workspace_id, release_id, source_commit_sha,
+  qualification_catalog_sha256, allowed_mutation_classes,
+  qualification_expires_at_unix_ms, binding_sha256,
   begin_command_id, begin_request_sha256, begin_command_receipt_sha256,
   begin_resulting_revision,
-  end_command_id, end_request_sha256, end_command_receipt_sha256,
+  close_kind: "end_qualification" | "emergency_close",
+  terminal_outcome: "qualified_closed" | "emergency_closed",
+  close_command_id, close_request_sha256, close_command_receipt_sha256,
   final_admission_state_sha256, final_closed_revision,
   fleet_closed_receipt_sha256, cleanup_inventory_receipt_sha256,
   active_guard_count: 0, product_resource_count: 0, residue_count: 0,
@@ -289,10 +328,12 @@ production-mutation-qualification-terminal.receipt.json {
 ```
 
 `final_closed_revision == begin_resulting_revision + 1`. Cleanup product mutations finish before
-End. The final state/fleet/cleanup receipts are read afterward; E9 terminalization is later still.
-Failure may emergency-close and destroy the isolated cell but cannot publish the successful
-terminal receipt. The final qualification manifest hashes these receipts; neither receipt hashes
-that manifest, avoiding a recursive digest.
+End. The only valid pairs are `end_qualification -> qualified_closed` and
+`emergency_close -> emergency_closed`; the latter is mandatory failure/cancellation evidence but
+cannot authorize reset or Open. `qualification_id` is the exact runner run ID, not a reusable cell
+label. The final state/fleet/cleanup receipts are read afterward; E9 terminalization is later still.
+The final qualification manifest hashes these receipts; neither receipt hashes that manifest,
+avoiding a recursive digest.
 
 ## 5. Final-open transaction
 

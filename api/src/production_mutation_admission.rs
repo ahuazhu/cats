@@ -358,7 +358,14 @@ pub struct ProductionMutationAdmissionCommandReceipt {
 pub struct ProductionQualificationBeginReceipt {
     pub kind: String,
     pub version: ContractVersion,
+    /// The exact runner `run_id`; there is no second qualification-run
+    /// identity that could be rebound after Begin.
     pub qualification_id: Id,
+    pub workspace_id: Id,
+    pub release_id: Id,
+    pub source_commit_sha: String,
+    pub qualification_catalog_sha256: Sha256Digest,
+    pub allowed_mutation_classes: Vec<ProductionQualificationMutationClass>,
     pub binding_sha256: Sha256Digest,
     pub begin_command_id: RandomId128,
     pub begin_request_sha256: Sha256Digest,
@@ -380,14 +387,22 @@ pub struct ProductionQualificationTerminalReceipt {
     pub kind: String,
     pub version: ContractVersion,
     pub qualification_id: Id,
+    pub workspace_id: Id,
+    pub release_id: Id,
+    pub source_commit_sha: String,
+    pub qualification_catalog_sha256: Sha256Digest,
+    pub allowed_mutation_classes: Vec<ProductionQualificationMutationClass>,
+    pub qualification_expires_at_unix_ms: UnixMillis,
     pub binding_sha256: Sha256Digest,
     pub begin_command_id: RandomId128,
     pub begin_request_sha256: Sha256Digest,
     pub begin_command_receipt_sha256: Sha256Digest,
     pub begin_resulting_revision: Epoch,
-    pub end_command_id: RandomId128,
-    pub end_request_sha256: Sha256Digest,
-    pub end_command_receipt_sha256: Sha256Digest,
+    pub close_kind: ProductionQualificationCloseKind,
+    pub terminal_outcome: ProductionQualificationTerminalOutcome,
+    pub close_command_id: RandomId128,
+    pub close_request_sha256: Sha256Digest,
+    pub close_command_receipt_sha256: Sha256Digest,
     pub final_admission_state_sha256: Sha256Digest,
     pub final_closed_revision: Epoch,
     pub fleet_closed_receipt_sha256: Sha256Digest,
@@ -396,6 +411,20 @@ pub struct ProductionQualificationTerminalReceipt {
     pub product_resource_count: WireU64,
     pub residue_count: WireU64,
     pub completed_at_unix_ms: UnixMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionQualificationCloseKind {
+    EndQualification,
+    EmergencyClose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionQualificationTerminalOutcome {
+    QualifiedClosed,
+    EmergencyClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -864,6 +893,9 @@ fn validate_qualification_begin_receipt(
 ) -> Result<(), ProductionMutationAdmissionContractError> {
     if receipt.kind != PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_KIND
         || receipt.version != ContractVersion::V1
+        || !valid_source_commit(&receipt.source_commit_sha)
+        || receipt.allowed_mutation_classes.as_slice()
+            != PRODUCTION_QUALIFICATION_MUTATION_CLASSES.as_slice()
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
@@ -875,9 +907,22 @@ fn validate_qualification_terminal_receipt(
 ) -> Result<(), ProductionMutationAdmissionContractError> {
     if receipt.kind != PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND
         || receipt.version != ContractVersion::V1
-        || receipt.begin_command_id == receipt.end_command_id
+        || !valid_source_commit(&receipt.source_commit_sha)
+        || receipt.allowed_mutation_classes.as_slice()
+            != PRODUCTION_QUALIFICATION_MUTATION_CLASSES.as_slice()
+        || receipt.begin_command_id == receipt.close_command_id
         || receipt.begin_resulting_revision.get().checked_add(1)
             != Some(receipt.final_closed_revision.get())
+        || !matches!(
+            (receipt.close_kind, receipt.terminal_outcome),
+            (
+                ProductionQualificationCloseKind::EndQualification,
+                ProductionQualificationTerminalOutcome::QualifiedClosed
+            ) | (
+                ProductionQualificationCloseKind::EmergencyClose,
+                ProductionQualificationTerminalOutcome::EmergencyClosed
+            )
+        )
         || receipt.active_guard_count.get() != 0
         || receipt.product_resource_count.get() != 0
         || receipt.residue_count.get() != 0
@@ -1161,6 +1206,11 @@ mod tests {
             kind: PRODUCTION_QUALIFICATION_BEGIN_RECEIPT_KIND.to_owned(),
             version: ContractVersion::V1,
             qualification_id: Id::new("qualification_a").unwrap(),
+            workspace_id: Id::new("workspace_a").unwrap(),
+            release_id: Id::new("release_a").unwrap(),
+            source_commit_sha: "a".repeat(40),
+            qualification_catalog_sha256: digest('8'),
+            allowed_mutation_classes: PRODUCTION_QUALIFICATION_MUTATION_CLASSES.to_vec(),
             binding_sha256: digest('0'),
             begin_command_id: RandomId128::new("1".repeat(32)).unwrap(),
             begin_request_sha256: digest('1'),
@@ -1178,14 +1228,22 @@ mod tests {
             kind: PRODUCTION_QUALIFICATION_TERMINAL_RECEIPT_KIND.to_owned(),
             version: ContractVersion::V1,
             qualification_id: begin.qualification_id.clone(),
+            workspace_id: begin.workspace_id.clone(),
+            release_id: begin.release_id.clone(),
+            source_commit_sha: begin.source_commit_sha.clone(),
+            qualification_catalog_sha256: begin.qualification_catalog_sha256.clone(),
+            allowed_mutation_classes: begin.allowed_mutation_classes.clone(),
+            qualification_expires_at_unix_ms: begin.qualification_expires_at_unix_ms,
             binding_sha256: begin.binding_sha256.clone(),
             begin_command_id: begin.begin_command_id.clone(),
             begin_request_sha256: begin.begin_request_sha256.clone(),
             begin_command_receipt_sha256: begin.begin_command_receipt_sha256.clone(),
             begin_resulting_revision: begin.resulting_revision,
-            end_command_id: RandomId128::new("2".repeat(32)).unwrap(),
-            end_request_sha256: digest('3'),
-            end_command_receipt_sha256: digest('4'),
+            close_kind: ProductionQualificationCloseKind::EndQualification,
+            terminal_outcome: ProductionQualificationTerminalOutcome::QualifiedClosed,
+            close_command_id: RandomId128::new("2".repeat(32)).unwrap(),
+            close_request_sha256: digest('3'),
+            close_command_receipt_sha256: digest('4'),
             final_admission_state_sha256: digest('5'),
             final_closed_revision: Epoch::new(3).unwrap(),
             fleet_closed_receipt_sha256: digest('6'),
