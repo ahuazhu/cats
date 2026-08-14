@@ -946,11 +946,18 @@ mod tests {
                     _ => {}
                 }
             }
-            let call = &router[start..end - 1];
-            let path_start = call.find('"').expect("route path") + 1;
-            let path_end = path_start + call[path_start..].find('"').expect("route path end");
-            let path = &call[path_start..path_end];
-            let methods = &call[path_end + 1..];
+            let call = router[start..end - 1].trim_start();
+            let (path, methods) = if let Some(path_literal) = call.strip_prefix('"') {
+                let path_end = path_literal.find('"').expect("route path end");
+                (&path_literal[..path_end], &path_literal[path_end + 1..])
+            } else if let Some(methods) = call
+                .strip_prefix(stringify!(cats_api::metering::USAGE_CHECKPOINTS_PATH))
+                .and_then(|remaining| remaining.trim_start().strip_prefix(','))
+            {
+                (cats_api::metering::USAGE_CHECKPOINTS_PATH, methods)
+            } else {
+                panic!("unsupported non-literal route path: {call}");
+            };
             for (name, method) in [
                 ("get", "GET"),
                 ("post", "POST"),
