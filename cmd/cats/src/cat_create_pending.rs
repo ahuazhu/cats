@@ -191,7 +191,27 @@ impl PreparedCatCreate {
         Self::prepare_in(&state_root()?, origin, workspace_id, body)
     }
 
+    pub(crate) fn prepare_existing(
+        origin: &str,
+        workspace_id: &str,
+        body: &[u8],
+    ) -> Result<Option<Self>> {
+        Self::prepare_with_policy(&state_root()?, origin, workspace_id, body, true)
+    }
+
     fn prepare_in(root: &Path, origin: &str, workspace_id: &str, body: &[u8]) -> Result<Self> {
+        Self::prepare_with_policy(root, origin, workspace_id, body, false)?.context(
+            "Cat-create pending authority disappeared while ordinary preparation was enabled",
+        )
+    }
+
+    fn prepare_with_policy(
+        root: &Path,
+        origin: &str,
+        workspace_id: &str,
+        body: &[u8],
+        existing_only: bool,
+    ) -> Result<Option<Self>> {
         let desired = PendingRecord::new(origin, workspace_id, body)?;
         let request = desired.validate()?;
         let slot = request_slot(&desired.authenticated_workspace_id, request.name.as_str());
@@ -212,13 +232,16 @@ impl PreparedCatCreate {
                 existing
             }
             None => {
+                if existing_only {
+                    return Ok(None);
+                }
                 desired.validate_for_slot(&state.slot)?;
                 state.publish_pending(&desired)?;
                 desired
             }
         };
         record.validate_for_slot(&state.slot)?;
-        Ok(Self { state, record })
+        Ok(Some(Self { state, record }))
     }
 
     pub(crate) fn origin(&self) -> &str {
@@ -1484,6 +1507,38 @@ mod tests {
         assert_eq!(recovered.body().unwrap(), exact_body);
         recovered.clear().unwrap();
         assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn existing_only_reports_absence_without_publishing_and_reuses_exact_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("state");
+        assert!(PreparedCatCreate::prepare_with_policy(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &body(2),
+            true,
+        )
+        .unwrap()
+        .is_none());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+
+        let prepared =
+            PreparedCatCreate::prepare_in(&root, "https://control.example", "ws_01", &body(2))
+                .unwrap();
+        let key = prepared.idempotency_key().to_owned();
+        drop(prepared);
+        let recovered = PreparedCatCreate::prepare_with_policy(
+            &root,
+            "https://control.example",
+            "ws_01",
+            &body(2),
+            true,
+        )
+        .unwrap()
+        .expect("existing pending authority");
+        assert_eq!(recovered.idempotency_key(), key);
     }
 
     #[test]

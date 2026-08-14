@@ -893,56 +893,241 @@ finally:
 PY
 }
 
+create_response_private_file() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+
+path = sys.argv[1]
+try:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    value = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or (os.geteuid() == 0 and value.st_gid != 0)
+        or value.st_nlink != 1
+        or stat.S_IMODE(value.st_mode) != 0o600
+        or value.st_size > 65_536
+    ):
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+}
+
+create_response_is_accepted() {
+  local path=$1
+  create_response_private_file "$path" || return 1
+  [[ -s $path ]] || return 1
+  jq -e '
+    keys == ["cat_id","operation_id"]
+    and (.cat_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))
+    and (.operation_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))' \
+    "$path" >/dev/null 2>&1
+}
+
+create_response_is_no_pending() {
+  local path=$1
+  create_response_private_file "$path" || return 1
+  jq -e 'keys == ["pending_cat_create"] and .pending_cat_create == false' \
+    "$path" >/dev/null 2>&1
+}
+
+publish_create_response() {
+  local source=$1 destination=$2 directory source_canonical destination_canonical
+  directory=${destination%/*}
+  [[ $source == "$CASE_DIR/".create-response.json.* && \
+    $destination == "$CASE_DIR/create-response.json" ]] || \
+    fail "Cat create response adoption escaped its exact private names"
+  create_response_is_accepted "$source" || \
+    fail "Cat create response temp is not one complete accepted identity"
+  sync -f "$source" || fail "sync complete Cat create response temp"
+  if [[ -e $destination || -L $destination ]]; then
+    if [[ $source -ef $destination ]]; then
+      recover_interrupted_adoption "$destination"
+      create_response_is_accepted "$destination" || \
+        fail "recovered Cat create response is unsafe"
+      return
+    fi
+    recover_interrupted_adoption "$destination"
+    source_canonical=$(jq -S -c . "$source")
+    destination_canonical=$(jq -S -c . "$destination")
+    [[ $source_canonical == "$destination_canonical" ]] || \
+      fail "Cat create accepted identity changed across exact recovery"
+    rm -f "$source"
+    sync -f "$directory"
+    return
+  fi
+  if ln "$source" "$destination" 2>/dev/null; then
+    sync -f "$directory" || fail "sync no-replace Cat create response publication"
+    rm -f "$source"
+    sync -f "$directory" || fail "sync Cat create response temp removal"
+  else
+    recover_interrupted_adoption "$destination"
+    source_canonical=$(jq -S -c . "$source")
+    destination_canonical=$(jq -S -c . "$destination")
+    [[ $source_canonical == "$destination_canonical" ]] || \
+      fail "concurrent Cat create response publication changed accepted identity"
+    rm -f "$source"
+    sync -f "$directory"
+  fi
+  recover_interrupted_adoption "$destination"
+  create_response_is_accepted "$destination" || \
+    fail "published Cat create response is unsafe"
+}
+
+run_cat_create_to() {
+  local destination=$1 existing_only=$2 expected_name=$3 args
+  args=(--api-url "$(control_origin)" \
+    --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
+    create "$expected_name" \
+    --boot-image-digest "$(required CATS_E3_BOOT_IMAGE_DIGEST)" \
+    --cpus "${CATS_E3_CPUS:-1}" --memory "${CATS_E3_MEMORY:-512MiB}" \
+    --root-size "${CATS_E3_ROOT_SIZE:-1GiB}" --durability strict)
+  if [[ $existing_only == true ]]; then
+    args+=(--existing-pending-only)
+  fi
+  (umask 077; run_cats "${args[@]}" >"$destination")
+}
+
+resolve_cat_create_cli_journal() {
+  local output=$1 expected_name=$2 replay replay_canonical output_canonical
+  local replay_temps=()
+  shopt -s nullglob
+  replay_temps=("$CASE_DIR"/.create-response-replay.*)
+  shopt -u nullglob
+  for replay in "${replay_temps[@]}"; do
+    create_response_private_file "$replay" || \
+      fail "interrupted Cat create replay temp is unsafe"
+    rm -f "$replay"
+  done
+  ((${#replay_temps[@]} == 0)) || sync -f "$CASE_DIR"
+  replay=$(mktemp "$CASE_DIR/.create-response-replay.XXXXXX")
+  chmod 0600 "$replay"
+  if ! run_cat_create_to "$replay" true "$expected_name"; then
+    rm -f "$replay"
+    sync -f "$CASE_DIR"
+    return 1
+  fi
+  sync -f "$replay" || fail "sync Cat create exact-replay response"
+  if create_response_is_no_pending "$replay"; then
+    :
+  elif create_response_is_accepted "$replay"; then
+    replay_canonical=$(jq -S -c . "$replay")
+    output_canonical=$(jq -S -c . "$output")
+    [[ $replay_canonical == "$output_canonical" ]] || \
+      fail "durable CLI journal replay returned another accepted Cat identity"
+  else
+    fail "existing-only Cat create returned neither accepted identity nor typed absence"
+  fi
+  rm -f "$replay"
+  sync -f "$CASE_DIR"
+}
+
+fixture_kill_before_runtime_cat_state() {
+  [[ ${CATS_E3_FIXTURE_MODE:-} == enabled && \
+    ${CATS_E3_FIXTURE_CAT_CREATE_CRASH_POINT:-} == before-runtime-state ]] || return 0
+  local once=${CATS_E3_FIXTURE_KILL_ONCE_FILE:-} pid=${CATS_E3_FIXTURE_SCENARIO_PID:-}
+  [[ $once == /* && $pid =~ ^[1-9][0-9]*$ ]] || return 125
+  if [[ ! -e $once ]]; then
+    (umask 077; printf '%s\n' killed >"$once")
+    sync -f "${once%/*}"
+    kill -KILL "$pid"
+  fi
+}
+
 run_create() {
-  local output pending cat_id operation_id expected_name expected_node placement_snapshot
-  local runtime_cat_id
+  local output response_temp cat_id operation_id expected_name expected_node placement_snapshot
+  local runtime_cat_id response_canonical output_canonical
+  local response_temps=()
   expected_name=$(required CATS_E3_CAT_NAME)
   output=$CASE_DIR/create-response.json
-  pending=$CASE_DIR/create-response.pending.json
   runtime_cat_id=$(jq -er '.cat_id // empty' "$(nonsecret_path CATS_E3_RUNTIME_STATE)" \
     2>/dev/null || true)
   if [[ -n $runtime_cat_id ]]; then
     canonical_id runtime_state_cat_id "$runtime_cat_id"
-    [[ -e $output || -e $pending || -L $output || -L $pending ]] || \
+    [[ -e $output || -L $output ]] || \
       fail "durable Cat identity has no adjacent create response"
   fi
-  if [[ ! -e $output && ! -L $output && ! -e $pending && ! -L $pending ]]; then
-    if ! (umask 077; run_cats --api-url "$(control_origin)" \
-      --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \
-      create "$expected_name" \
-      --boot-image-digest "$(required CATS_E3_BOOT_IMAGE_DIGEST)" \
-      --cpus "${CATS_E3_CPUS:-1}" --memory "${CATS_E3_MEMORY:-512MiB}" \
-      --root-size "${CATS_E3_ROOT_SIZE:-1GiB}" --durability strict >"$pending"); then
-      fail "Cat create did not reach one durable accepted identity"
-    fi
-    durable_case_file "$pending"
-  fi
-  if [[ -e $pending || -L $pending ]]; then
-    [[ -f $pending && ! -L $pending && -O $pending ]] || \
-      fail "pending Cat create response is unsafe"
-    [[ $(file_link_count "$pending") == 1 ]] || \
-      fail "pending Cat create response is not single-link"
-    [[ $(stat -c '%a' "$pending") == 600 ]] || \
-      fail "pending Cat create response is not private"
-    jq -e 'keys == ["cat_id","operation_id"]' "$pending" >/dev/null || \
-      fail "pending Cat create response has a foreign shape"
-    adopt_case_file "$pending" "$output"
-    rm -f "$pending"
-    sync -f "$CASE_DIR"
-  else
+  if [[ -e $output || -L $output ]]; then
     recover_interrupted_adoption "$output"
+    create_response_is_accepted "$output" || \
+      fail "durable Cat create response is unsafe"
+    shopt -s nullglob
+    response_temps=("$CASE_DIR"/.create-response.json.*)
+    shopt -u nullglob
+    for response_temp in "${response_temps[@]}"; do
+      create_response_private_file "$response_temp" || \
+        fail "interrupted Cat create response temp is unsafe"
+      if create_response_is_accepted "$response_temp"; then
+        response_canonical=$(jq -S -c . "$response_temp")
+        output_canonical=$(jq -S -c . "$output")
+        [[ $response_canonical == "$output_canonical" ]] || \
+          fail "interrupted Cat create response temp conflicts with durable identity"
+      fi
+      rm -f "$response_temp"
+    done
+    ((${#response_temps[@]} == 0)) || sync -f "$CASE_DIR"
+    resolve_cat_create_cli_journal "$output" "$expected_name" || \
+      fail "could not resolve the exact durable Cat create CLI journal"
+  else
+    shopt -s nullglob
+    response_temps=("$CASE_DIR"/.create-response.json.*)
+    shopt -u nullglob
+    ((${#response_temps[@]} <= 1)) || \
+      fail "Cat create has multiple interrupted response temps"
+    if ((${#response_temps[@]} == 1)); then
+      response_temp=${response_temps[0]}
+      create_response_private_file "$response_temp" || \
+        fail "interrupted Cat create response temp is unsafe"
+      if create_response_is_accepted "$response_temp"; then
+        publish_create_response "$response_temp" "$output"
+        resolve_cat_create_cli_journal "$output" "$expected_name" || \
+          fail "could not resolve the exact durable Cat create CLI journal"
+      else
+        if run_cat_create_to "$response_temp" true "$expected_name"; then
+          sync -f "$response_temp" || fail "sync exact Cat create replay response"
+        else
+          fail "exact pending Cat create replay remained ambiguous"
+        fi
+        if create_response_is_no_pending "$response_temp"; then
+          rm -f "$response_temp"
+          sync -f "$CASE_DIR"
+          response_temp=$(mktemp "$CASE_DIR/.create-response.json.XXXXXX")
+          chmod 0600 "$response_temp"
+          run_cat_create_to "$response_temp" false "$expected_name" || \
+            fail "Cat create did not reach one durable accepted identity"
+          sync -f "$response_temp"
+        fi
+        create_response_is_accepted "$response_temp" || \
+          fail "exact Cat create replay did not return one accepted identity"
+        publish_create_response "$response_temp" "$output"
+      fi
+    else
+      response_temp=$(mktemp "$CASE_DIR/.create-response.json.XXXXXX")
+      chmod 0600 "$response_temp"
+      run_cat_create_to "$response_temp" false "$expected_name" || \
+        fail "Cat create did not reach one durable accepted identity"
+      sync -f "$response_temp"
+      create_response_is_accepted "$response_temp" || \
+        fail "Cat create returned no complete accepted identity"
+      publish_create_response "$response_temp" "$output"
+    fi
   fi
-  [[ -f $output && ! -L $output && -O $output && \
-    $(file_link_count "$output") == 1 && $(stat -c '%a' "$output") == 600 ]] || \
-    fail "durable Cat create response is unsafe"
-  jq -e 'keys == ["cat_id","operation_id"]' "$output" >/dev/null || \
-    fail "durable Cat create response has a foreign shape"
+  create_response_is_accepted "$output" || fail "durable Cat create response is unsafe"
   cat_id=$(json_field "$output" '.cat_id')
   operation_id=$(json_field "$output" '.operation_id')
   canonical_id cat_id "$cat_id"
   canonical_id operation_id "$operation_id"
   [[ -z $runtime_cat_id || $runtime_cat_id == "$cat_id" ]] || \
     fail "durable Cat identity differs from the accepted create response"
+  fixture_kill_before_runtime_cat_state
   write_runtime_cat_id "$cat_id"
   operation_wait "$operation_id" running
   run_cats --api-url "$(control_origin)" --workspace "$(required CATS_E3_WORKSPACE_ID)" --json \

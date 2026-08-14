@@ -36,6 +36,16 @@ impl PreparedCatCreate {
         )
     }
 
+    pub(crate) fn prepare_existing(
+        _origin: &str,
+        _workspace_id: &str,
+        _body: &[u8],
+    ) -> Result<Option<Self>> {
+        bail!(
+            "durable Cat-create recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
     pub(crate) fn origin(&self) -> &str {
         match *self {}
     }

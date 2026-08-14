@@ -130,6 +130,10 @@ pub enum Command {
         /// writes, so choose `strict` when that is not acceptable.
         #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
         durability: String,
+        /// Resolve only an already-durable Cat-create request. Used by the
+        /// production cutover runner after an interrupted stdout capture.
+        #[arg(long, hide = true)]
+        existing_pending_only: bool,
     },
     /// List cats.
     Ls,
@@ -1637,6 +1641,7 @@ pub fn run(cli: Cli) -> Result<()> {
             memory,
             root_size,
             durability,
+            existing_pending_only,
         } => {
             let durability = match durability.as_str() {
                 "strict" => cats_api::runtime_reconciliation::Durability::Strict,
@@ -1653,14 +1658,34 @@ pub fn run(cli: Cli) -> Result<()> {
             )
             .context("invalid Cat-create request")?;
             let request_body = serde_json::to_vec(&body)?;
-            let pending = cat_create_pending::PreparedCatCreate::prepare(
-                &client.base,
-                &client.workspace_id,
-                &request_body,
-            )
-            .context(
-                "could not durably prepare Cat-create recovery state; no HTTP request was sent",
-            )?;
+            let pending = if *existing_pending_only {
+                match cat_create_pending::PreparedCatCreate::prepare_existing(
+                    &client.base,
+                    &client.workspace_id,
+                    &request_body,
+                )
+                .context("could not inspect exact Cat-create recovery state")?
+                {
+                    Some(pending) => pending,
+                    None => {
+                        if cli.json {
+                            println!("{{\"pending_cat_create\":false}}")
+                        } else {
+                            println!("no matching pending Cat-create request")
+                        }
+                        return Ok(());
+                    }
+                }
+            } else {
+                cat_create_pending::PreparedCatCreate::prepare(
+                    &client.base,
+                    &client.workspace_id,
+                    &request_body,
+                )
+                .context(
+                    "could not durably prepare Cat-create recovery state; no HTTP request was sent",
+                )?
+            };
             let response = client.send_cat_create(&pending).with_context(|| {
                 format!(
                     "Cat-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",

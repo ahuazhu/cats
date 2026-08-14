@@ -1899,6 +1899,287 @@ PY
 }
 
 #[test]
+fn cat_create_partial_stdout_replays_the_durable_cli_journal_in_a_new_process() {
+    let fixture = Fixture::new();
+    let root = fs::canonicalize(fixture._temp.path()).expect("canonical fixture root");
+    let token = root.join("control-token");
+    fs::write(&token, b"fixture-token\n").expect("write token");
+    let fake_cats = root.join("fake-cats");
+    fs::write(
+        &fake_cats,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+journal=$CATS_CONFIG_DIR/fake-cat-create.pending
+arguments=" $* "
+if [[ $arguments == *" create "* ]]; then
+  existing_only=false
+  [[ $arguments != *" --existing-pending-only "* ]] || existing_only=true
+  if [[ $existing_only == true && ! -e $journal ]]; then
+    printf '%s\n' existing-absent >>"$FAKE_CREATE_TRACE"
+    sync -f "$FAKE_CREATE_TRACE"
+    printf '%s\n' '{"pending_cat_create":false}'
+    exit 0
+  fi
+  if [[ $existing_only == true ]]; then
+    printf '%s\n' existing >>"$FAKE_CREATE_TRACE"
+  else
+    printf '%s\n' normal >>"$FAKE_CREATE_TRACE"
+  fi
+  sync -f "$FAKE_CREATE_TRACE"
+  if [[ ! -e $journal ]]; then
+    printf '%s\n' fixture-request >"$journal"
+    sync -f "$CATS_CONFIG_DIR"
+  fi
+  case "${FAKE_CREATE_CRASH_POINT:-none}" in
+    before-response)
+      kill -KILL "$CATS_E3_FIXTURE_SCENARIO_PID"
+      exit 99
+      ;;
+    during-response)
+      printf '%s' '{"cat_id":"cat-fixture"'
+      kill -KILL "$CATS_E3_FIXTURE_SCENARIO_PID"
+      exit 99
+      ;;
+  esac
+  printf '%s\n' '{"cat_id":"cat-fixture","operation_id":"op-fixture"}'
+  rm -f "$journal"
+  sync -f "$CATS_CONFIG_DIR"
+  exit 0
+fi
+if [[ $arguments == *" operation wait "* ]]; then
+  printf '%s\n' '{"operation_id":"op-fixture","workspace_id":"workspace-fixture","phase":"succeeded","target":"running","terminal":{"kind":"succeeded","result":{"observed_target":"running"}}}'
+  exit 0
+fi
+if [[ $arguments == *" get cat-fixture "* ]]; then
+  printf '%s\n' '{"id":"cat-fixture","desired":{"target":"running"},"observed":{"stable_state":"running","conditions":["ready"]}}'
+  exit 0
+fi
+exit 97
+"#,
+    )
+    .expect("write fake Cats CLI");
+    fs::set_permissions(&fake_cats, fs::Permissions::from_mode(0o755))
+        .expect("make fake Cats CLI executable");
+    let fake_probe = root.join("fake-runtime-e3-probe");
+    fs::write(
+        &fake_probe,
+        concat!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n",
+            "printf '%s\\n' '{\"version\":1,\"cat_id\":\"cat-fixture\",",
+            "\"node_id\":\"node-fixture\",\"runtime_incarnation\":\"inc-fixture\",",
+            "\"root_block_frontend\":\"kernel-nbd\"}'\n",
+        ),
+    )
+    .expect("write fake runtime probe");
+    fs::set_permissions(&fake_probe, fs::Permissions::from_mode(0o755))
+        .expect("make fake runtime probe executable");
+    let fake_bin = root.join("fake-coreutils");
+    fs::create_dir(&fake_bin).expect("create fake coreutils directory");
+    let fake_stat = fake_bin.join("stat");
+    fs::write(
+        &fake_stat,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == -c ]]; then
+  format=$2
+  shift 2
+  case "$format" in
+    %h) exec /usr/bin/stat -f '%l' "$@" ;;
+    %a) exec /usr/bin/stat -f '%Lp' "$@" ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+"#,
+    )
+    .expect("write portable stat fixture");
+    fs::set_permissions(&fake_stat, fs::Permissions::from_mode(0o755))
+        .expect("make stat fixture executable");
+    let fixture_path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").expect("test PATH")
+    );
+
+    // The fake CLI needs the scenario PID, so launch through one tiny process
+    // wrapper that exports its own PID before exec'ing the production driver.
+    let wrapper = root.join("scenario-wrapper.sh");
+    fs::write(
+        &wrapper,
+        "#!/usr/bin/env bash\nexport CATS_E3_FIXTURE_SCENARIO_PID=$$\nexec \"$@\"\n",
+    )
+    .expect("write scenario wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+        .expect("make scenario wrapper executable");
+
+    let driver = fixture
+        .root
+        .join("deploy/metal/runtime-cutover-v2-scenarios.sh");
+    let invoke = |case_dir: &Path,
+                  cli_state: &Path,
+                  runtime_state: &Path,
+                  fake_crash_point: &str,
+                  crash_before_runtime_state: bool| {
+        let mut command = Command::new(&wrapper);
+        command
+            .env_clear()
+            .env("PATH", &fixture_path)
+            .env("CATS_CONFIG_DIR", cli_state)
+            .env("CATS_E3_TOKEN_FILE", &token)
+            .env("CATS_E3_BINARY_CATS", &fake_cats)
+            .env("CATS_E3_BINARY_RUNTIME_E3_PROBE", &fake_probe)
+            .env("CATS_E3_CONTROL_ORIGIN", "https://control.example")
+            .env("CATS_E3_WORKSPACE_ID", "workspace-fixture")
+            .env("CATS_E3_QUALIFICATION_NODE_ID", "node-fixture")
+            .env("CATS_E3_CAT_NAME", "fixture-cat")
+            .env(
+                "CATS_E3_BOOT_IMAGE_DIGEST",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .env(
+                "CATS_E3_EXACT_COMMIT",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .env("CATS_E3_RUN_ID", "fixture-create-recovery")
+            .env("CATS_E3_RUNTIME_STATE", runtime_state)
+            .env("FAKE_CREATE_CRASH_POINT", fake_crash_point)
+            .env("FAKE_CREATE_TRACE", cli_state.join("create.trace"))
+            .arg(&driver)
+            .args(["run", "cat-create-running", "kernel-nbd"])
+            .arg(case_dir);
+        if crash_before_runtime_state {
+            command
+                .env("CATS_E3_FIXTURE_MODE", "enabled")
+                .env(
+                    "CATS_E3_FIXTURE_CAT_CREATE_CRASH_POINT",
+                    "before-runtime-state",
+                )
+                .env(
+                    "CATS_E3_FIXTURE_KILL_ONCE_FILE",
+                    cli_state.join("before-runtime-state.kill-once"),
+                );
+        }
+        command
+    };
+
+    for (label, fake_crash_point, crash_before_runtime_state, expected_replay) in [
+        ("before-response", "before-response", false, "existing"),
+        ("during-response", "during-response", false, "existing"),
+        ("before-runtime-state", "none", true, "existing-absent"),
+    ] {
+        let case_dir = root.join(format!("cat-create-response-{label}"));
+        let cli_state = root.join(format!("cat-create-cli-{label}"));
+        fs::create_dir(&case_dir).expect("create Cat-create case directory");
+        fs::create_dir(&cli_state).expect("create fake CLI state directory");
+        for directory in [&case_dir, &cli_state] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("protect Cat-create fixture directory");
+        }
+        let runtime_state = root.join(format!("cat-create-runtime-{label}.json"));
+        fs::write(
+            &runtime_state,
+            concat!(
+                "{\"block_path\":\"kernel-nbd\",\"cat_id\":null,",
+                "\"exact_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+                "\"run_id\":\"fixture-create-recovery\",\"version\":1}\n"
+            ),
+        )
+        .expect("write initial runtime state");
+        fs::set_permissions(&runtime_state, fs::Permissions::from_mode(0o600))
+            .expect("protect runtime state");
+
+        let killed = invoke(
+            &case_dir,
+            &cli_state,
+            &runtime_state,
+            fake_crash_point,
+            crash_before_runtime_state,
+        )
+        .output()
+        .expect("run interrupted Cat-create process");
+        assert_eq!(
+            killed.status.signal(),
+            Some(9),
+            "{label} Cat-create fixture was not killed: status={:?} stderr={}",
+            killed.status,
+            String::from_utf8_lossy(&killed.stderr)
+        );
+
+        let response_temps: Vec<_> = fs::read_dir(&case_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".create-response.json.")
+            })
+            .collect();
+        if crash_before_runtime_state {
+            assert!(response_temps.is_empty());
+            assert!(case_dir.join("create-response.json").exists());
+        } else {
+            assert_eq!(response_temps.len(), 1, "{label} response temp count");
+            let interrupted_bytes = fs::read(&response_temps[0]).unwrap();
+            if fake_crash_point == "before-response" {
+                assert!(interrupted_bytes.is_empty());
+            } else {
+                assert_eq!(interrupted_bytes, br#"{"cat_id":"cat-fixture""#);
+            }
+            assert!(!case_dir.join("create-response.json").exists());
+            assert!(cli_state.join("fake-cat-create.pending").exists());
+        }
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&runtime_state).unwrap())
+                .unwrap()["cat_id"],
+            serde_json::Value::Null,
+            "{label} published runtime Cat state before its crash point"
+        );
+
+        let resumed = invoke(
+            &case_dir,
+            &cli_state,
+            &runtime_state,
+            "none",
+            crash_before_runtime_state,
+        )
+        .output()
+        .expect("resume Cat-create process");
+        assert_success(&resumed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(case_dir.join("create-response.json")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"cat_id":"cat-fixture","operation_id":"op-fixture"})
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&runtime_state).unwrap())
+                .unwrap()["cat_id"],
+            "cat-fixture"
+        );
+        assert!(!case_dir.join("create-response.pending.json").exists());
+        assert!(!cli_state.join("fake-cat-create.pending").exists());
+        let response_temp_residue: Vec<_> = fs::read_dir(&case_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".create-response"))
+            .collect();
+        assert!(
+            response_temp_residue.is_empty(),
+            "{label} left response temps: {response_temp_residue:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(cli_state.join("create.trace"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["normal", expected_replay],
+            "{label} did not use exactly one normal create plus one journal resolution"
+        );
+    }
+}
+
+#[test]
 fn runtime_cutover_runner_sigkill_reentry_skips_the_closed_prefix() {
     let fixture = Fixture::new();
     let harness = fixture._temp.path().join("runner-reentry-harness.sh");
@@ -2317,7 +2598,9 @@ fn production_v2_driver_places_source_terminal_after_delete_and_preserves_typed_
     assert!(driver.contains("/v1/admin/usage/source-terminal/discover"));
     assert!(catalog.contains("usage-source-terminal-receipts.json"));
     assert!(driver.contains("CATS_E3_RUN_STARTED_AT_UNIX_MS"));
-    assert!(driver.contains("create-response.pending.json"));
+    assert!(!driver.contains("create-response.pending.json"));
+    assert!(driver.contains(".create-response.json.XXXXXX"));
+    assert!(driver.contains("--existing-pending-only"));
     assert!(driver.contains("durable Cat identity has no adjacent create response"));
     assert!(driver.contains("os.fsync(directory_fd)"));
     assert!(
