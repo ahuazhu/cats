@@ -12,13 +12,16 @@ use std::time::Instant;
 use cats_api::object_write_gateway::{
     encode_object_write_qualification_ambiguity_receipt,
     encode_object_write_qualification_authorization,
+    encode_object_write_qualification_head_evidence,
     encode_object_write_qualification_response_loss, object_write_key,
-    object_write_qualification_authorization_sha256, ObjectWriteCredentialReference,
-    ObjectWriteCredentialRegistration, ObjectWriteImmutableKey, ObjectWriteIngressDescriptor,
-    ObjectWriteProviderRequestObservationV1, ObjectWriteQualificationAmbiguityReceiptV1,
-    ObjectWriteQualificationAuthorizationRequestV1, ObjectWriteQualificationAuthorizationV1,
-    ObjectWriteQualificationFaultV1, ObjectWriteQualificationMutationClassV1,
-    ObjectWriteQualificationResponseLossV1, ObjectWriteSuccessfulPutV1,
+    object_write_qualification_authorization_sha256, ObjectWriteConditionalRequestEvidenceV1,
+    ObjectWriteCredentialReference, ObjectWriteCredentialRegistration, ObjectWriteImmutableKey,
+    ObjectWriteIngressDescriptor, ObjectWriteProviderRequestObservationV1,
+    ObjectWriteQualificationAmbiguityReceiptV1, ObjectWriteQualificationAuthorizationRequestV1,
+    ObjectWriteQualificationAuthorizationV1, ObjectWriteQualificationFaultV1,
+    ObjectWriteQualificationHeadEvidenceV1, ObjectWriteQualificationMutationClassV1,
+    ObjectWriteQualificationResponseLossV1, ObjectWriteQualificationUnprovenReasonV1,
+    ObjectWriteSuccessfulPutV1,
 };
 use cats_api::runtime_reconciliation::{
     AsciiText, Base64UrlNoPad, ContractVersion, Epoch, FenceEpoch, Id, NodeBootId, ProviderScope,
@@ -229,6 +232,13 @@ pub enum ObjectPutTerminalState {
         failure_receipt_id: AsciiText,
         failed_at_unix_ms: UnixMillis,
     },
+    /// The exact object is visible, but the guarded successful-PUT
+    /// response-loss receipt was absent. This closes the immutable request
+    /// without claiming the qualification ambiguity.
+    QualificationUnprovenVisible {
+        reason: ObjectWriteQualificationUnprovenReasonV1,
+        head_evidence: Box<ObjectWriteQualificationHeadEvidenceV1>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +331,15 @@ pub enum ObjectWriteDownstreamPutOutcome {
     QualificationSuccessfulPut {
         successful_put: ObjectWriteSuccessfulPutV1,
     },
+    /// A fault-bearing conditional create observed its precondition and a
+    /// subsequent exact HEAD found the requested immutable bytes, but no
+    /// guarded response-loss receipt exists. The gateway drops any fresh
+    /// guard without committing it and settles the identically-shaped
+    /// terminal; it never converts this to ordinary success.
+    QualificationUnprovenVisible {
+        reason: ObjectWriteQualificationUnprovenReasonV1,
+        head_evidence: Box<ObjectWriteQualificationHeadEvidenceV1>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +348,9 @@ pub enum ObjectWriteVisibilityOutcome {
         provider_attempt_id: AsciiText,
         visibility_receipt_id: AsciiText,
         provider_request: Box<ObjectWriteProviderRequestObservationV1>,
+        /// Optional provider-neutral evidence from a legacy/already-issued
+        /// conditional retry. Fresh fault recovery HEADs before any retry.
+        preceding_conditional_request: Option<Box<ObjectWriteConditionalRequestEvidenceV1>>,
         observed_at_unix_ms: UnixMillis,
     },
     NotVisible,
@@ -636,6 +658,22 @@ pub fn validate_object_put_attempt(
                 } if descriptor.qualification_fault.is_some() => {
                     return Err(ObjectWriteAuthorityError::CorruptState);
                 }
+                ObjectPutTerminalState::QualificationUnprovenVisible {
+                    reason,
+                    head_evidence,
+                } => {
+                    validate_qualification_unproven_visible(
+                        descriptor,
+                        descriptor.accepted_at_unix_ms,
+                        *reason,
+                        head_evidence,
+                    )?;
+                }
+                ObjectPutTerminalState::PermanentlyFailed { .. }
+                    if descriptor.qualification_fault.is_some() =>
+                {
+                    return Err(ObjectWriteAuthorityError::CorruptState);
+                }
                 _ => {}
             }
         }
@@ -867,6 +905,33 @@ fn validate_qualification_response_loss(
     Ok(())
 }
 
+fn validate_qualification_unproven_visible(
+    descriptor: &ObjectPutDescriptor,
+    issued_at_unix_ms: UnixMillis,
+    reason: ObjectWriteQualificationUnprovenReasonV1,
+    head: &ObjectWriteQualificationHeadEvidenceV1,
+) -> Result<(), ObjectWriteAuthorityError> {
+    if descriptor.qualification_fault.is_none()
+        || reason != ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent
+    {
+        return Err(ObjectWriteAuthorityError::BindingMismatch);
+    }
+    encode_object_write_qualification_head_evidence(head)
+        .map_err(|_| ObjectWriteAuthorityError::BindingMismatch)?;
+    if head.provider_attempt_id != descriptor.provider_attempt_id
+        || head.provider_request.content_sha256 != descriptor.content_sha256
+        || head.provider_request.content_length != Some(descriptor.content_length)
+        || head.observed_at_unix_ms < issued_at_unix_ms
+        || head
+            .preceding_conditional_request
+            .as_ref()
+            .is_some_and(|conditional| conditional.observed_at_unix_ms < issued_at_unix_ms)
+    {
+        return Err(ObjectWriteAuthorityError::BindingMismatch);
+    }
+    Ok(())
+}
+
 fn validate_qualification_ambiguity(
     descriptor: &ObjectPutDescriptor,
     receipt: &ObjectWriteQualificationAmbiguityReceiptV1,
@@ -937,31 +1002,88 @@ pub trait QualificationFaultAuthority: Send + Sync {
 pub enum ObjectWriteQualificationPreparation<'a> {
     Ordinary,
     StoredResponseLoss(Box<ObjectWriteQualificationResponseLossV1>),
+    /// A response-loss lookup has durably returned absent for this existing
+    /// ProviderIssued attempt. The opaque token permits exactly the HEAD
+    /// continuation; it cannot authorize a PUT by itself.
+    DiscoverIssuedVisibility(Box<ObjectWriteQualificationHeadProbe>),
     Authorized(Box<dyn QualificationFaultAuthorizationGuard + 'a>),
 }
 
-/// Prepare exactly one provider dispatch. A fault-bearing request cannot
-/// conditionally fall back to the ordinary path: it returns stored evidence,
-/// a live guard, or an error.
+/// One-shot proof that an existing fault-bearing ProviderIssued attempt has
+/// performed durable response-loss discovery before its recovery HEAD. Its
+/// fields are private so callers cannot skip that ordering boundary.
+pub struct ObjectWriteQualificationHeadProbe {
+    request: ObjectWriteQualificationAuthorizationRequestV1,
+    issued_at_unix_ms: UnixMillis,
+}
+
+pub enum ObjectWriteQualificationHeadResolution<'a> {
+    QualificationUnprovenVisible {
+        reason: ObjectWriteQualificationUnprovenReasonV1,
+        head_evidence: Box<ObjectWriteQualificationHeadEvidenceV1>,
+    },
+    StoredResponseLoss(Box<ObjectWriteQualificationResponseLossV1>),
+    Authorized(Box<dyn QualificationFaultAuthorizationGuard + 'a>),
+    ConflictingObject,
+}
+
+/// Prepare one provider dispatch or the mandatory recovery HEAD. A
+/// fault-bearing request cannot conditionally fall back to the ordinary path:
+/// it returns stored evidence, a discovery token, a live guard, or an error.
 pub async fn prepare_object_write_qualification<'a>(
     authority: &'a dyn QualificationFaultAuthority,
-    descriptor: &ObjectPutDescriptor,
+    attempt: &ObjectPutAttempt,
     absolute_deadline: Instant,
 ) -> Result<ObjectWriteQualificationPreparation<'a>, QualificationFaultAuthorityError> {
+    let descriptor = &attempt.descriptor;
     let request = object_write_qualification_authorization_request(descriptor)
         .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
     let Some(request) = request else {
         return Ok(ObjectWriteQualificationPreparation::Ordinary);
     };
+    let issued_at_unix_ms = match &attempt.state {
+        ObjectPutState::AcceptedSpooled { .. } => None,
+        ObjectPutState::ProviderIssued {
+            issued_at_unix_ms, ..
+        } => Some(*issued_at_unix_ms),
+        ObjectPutState::QualificationResponseLost {
+            issued_at_unix_ms,
+            response_loss,
+            ..
+        } => {
+            validate_qualification_response_loss(descriptor, *issued_at_unix_ms, response_loss)
+                .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
+            return Ok(ObjectWriteQualificationPreparation::StoredResponseLoss(
+                response_loss.clone(),
+            ));
+        }
+        ObjectPutState::Terminal { .. } => {
+            return Err(QualificationFaultAuthorityError::Conflict);
+        }
+    };
     if let Some(stored) = authority
         .discover_response_loss(&request, absolute_deadline)
         .await?
     {
-        validate_qualification_response_loss(descriptor, descriptor.accepted_at_unix_ms, &stored)
-            .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
+        validate_qualification_response_loss(
+            descriptor,
+            issued_at_unix_ms.unwrap_or(descriptor.accepted_at_unix_ms),
+            &stored,
+        )
+        .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
         return Ok(ObjectWriteQualificationPreparation::StoredResponseLoss(
             Box::new(stored),
         ));
+    }
+    if let Some(issued_at_unix_ms) = issued_at_unix_ms {
+        return Ok(
+            ObjectWriteQualificationPreparation::DiscoverIssuedVisibility(Box::new(
+                ObjectWriteQualificationHeadProbe {
+                    request,
+                    issued_at_unix_ms,
+                },
+            )),
+        );
     }
     let guard = authority
         .authorize(request.clone(), absolute_deadline)
@@ -972,6 +1094,94 @@ pub async fn prepare_object_write_qualification<'a>(
         return Err(QualificationFaultAuthorityError::InvalidEvidence);
     }
     Ok(ObjectWriteQualificationPreparation::Authorized(guard))
+}
+
+/// Continue recovery only after the opaque discovery token above was issued.
+/// Exact visibility settles without consulting current admission, so End or
+/// Close cannot strand an already-visible immutable write. Only a second
+/// durable absence followed by HEAD NotVisible may acquire a fresh guard for
+/// another conditional PUT.
+pub async fn resolve_object_write_qualification_after_head<'a>(
+    authority: &'a dyn QualificationFaultAuthority,
+    attempt: &ObjectPutAttempt,
+    probe: Box<ObjectWriteQualificationHeadProbe>,
+    visibility: ObjectWriteVisibilityOutcome,
+    absolute_deadline: Instant,
+) -> Result<ObjectWriteQualificationHeadResolution<'a>, QualificationFaultAuthorityError> {
+    let ObjectPutState::ProviderIssued {
+        issued_at_unix_ms, ..
+    } = &attempt.state
+    else {
+        return Err(QualificationFaultAuthorityError::Conflict);
+    };
+    let expected_request = object_write_qualification_authorization_request(&attempt.descriptor)
+        .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?
+        .ok_or(QualificationFaultAuthorityError::InvalidEvidence)?;
+    if probe.request != expected_request || probe.issued_at_unix_ms != *issued_at_unix_ms {
+        return Err(QualificationFaultAuthorityError::Conflict);
+    }
+    match visibility {
+        ObjectWriteVisibilityOutcome::VisibleExact {
+            provider_attempt_id,
+            visibility_receipt_id,
+            provider_request,
+            preceding_conditional_request,
+            observed_at_unix_ms,
+        } => {
+            let head_evidence = ObjectWriteQualificationHeadEvidenceV1 {
+                provider_attempt_id,
+                visibility_receipt_id,
+                preceding_conditional_request,
+                provider_request: *provider_request,
+                observed_at_unix_ms,
+            };
+            let reason = ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent;
+            validate_qualification_unproven_visible(
+                &attempt.descriptor,
+                *issued_at_unix_ms,
+                reason,
+                &head_evidence,
+            )
+            .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
+            Ok(
+                ObjectWriteQualificationHeadResolution::QualificationUnprovenVisible {
+                    reason,
+                    head_evidence: Box::new(head_evidence),
+                },
+            )
+        }
+        ObjectWriteVisibilityOutcome::NotVisible => {
+            if let Some(stored) = authority
+                .discover_response_loss(&probe.request, absolute_deadline)
+                .await?
+            {
+                validate_qualification_response_loss(
+                    &attempt.descriptor,
+                    *issued_at_unix_ms,
+                    &stored,
+                )
+                .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
+                return Ok(ObjectWriteQualificationHeadResolution::StoredResponseLoss(
+                    Box::new(stored),
+                ));
+            }
+            let guard = authority
+                .authorize(probe.request.clone(), absolute_deadline)
+                .await?;
+            validate_qualification_authorization_for_descriptor(
+                &attempt.descriptor,
+                guard.authorization(),
+            )
+            .map_err(|_| QualificationFaultAuthorityError::InvalidEvidence)?;
+            if guard.authorization().request != probe.request {
+                return Err(QualificationFaultAuthorityError::InvalidEvidence);
+            }
+            Ok(ObjectWriteQualificationHeadResolution::Authorized(guard))
+        }
+        ObjectWriteVisibilityOutcome::ConflictingObject => {
+            Ok(ObjectWriteQualificationHeadResolution::ConflictingObject)
+        }
+    }
 }
 
 pub fn object_write_spool_id(
@@ -1045,6 +1255,9 @@ fn terminal_at(outcome: &ObjectPutTerminalState) -> UnixMillis {
         ObjectPutTerminalState::PermanentlyFailed {
             failed_at_unix_ms, ..
         } => *failed_at_unix_ms,
+        ObjectPutTerminalState::QualificationUnprovenVisible { head_evidence, .. } => {
+            head_evidence.observed_at_unix_ms
+        }
     }
 }
 
@@ -1235,7 +1448,22 @@ pub fn complete_object_write_terminal(
                 ..
             },
         ) if attempt.descriptor.qualification_fault.is_none() => {}
-        (None, ObjectPutTerminalState::PermanentlyFailed { .. }) => {}
+        (None, ObjectPutTerminalState::PermanentlyFailed { .. })
+            if attempt.descriptor.qualification_fault.is_none() => {}
+        (
+            None,
+            ObjectPutTerminalState::QualificationUnprovenVisible {
+                reason,
+                head_evidence,
+            },
+        ) if attempt.descriptor.qualification_fault.is_some() => {
+            validate_qualification_unproven_visible(
+                &attempt.descriptor,
+                issued_at_unix_ms,
+                *reason,
+                head_evidence,
+            )?;
+        }
         _ => return Err(ObjectWriteAuthorityError::InvalidTransition),
     }
     if terminal_at(&outcome) < issued_at_unix_ms {
@@ -1631,6 +1859,20 @@ pub fn advance_terminal_prefix_sha256(
             hash_frame(&mut hasher, failure_receipt_id.as_str().as_bytes())?;
             hash_frame(&mut hasher, &failed_at_unix_ms.get().to_be_bytes())?;
         }
+        ObjectPutTerminalState::QualificationUnprovenVisible {
+            reason,
+            head_evidence,
+        } => {
+            hash_frame(&mut hasher, b"qualification-unproven-visible")?;
+            match reason {
+                ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent => {
+                    hash_frame(&mut hasher, b"response-loss-receipt-absent")?;
+                }
+            }
+            let evidence = encode_object_write_qualification_head_evidence(head_evidence)
+                .map_err(|_| ObjectWriteAuthorityError::CorruptState)?;
+            hash_frame(&mut hasher, &evidence)?;
+        }
     }
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
@@ -1680,6 +1922,7 @@ pub trait ObjectWriteGatewayDownstream: Send + Sync {
 mod tests {
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -1779,8 +2022,8 @@ mod tests {
         }
     }
 
-    fn issued_attempt(descriptor: ObjectPutDescriptor) -> ObjectPutAttempt {
-        let spool = DurableObjectWriteSpoolReceipt {
+    fn spool(descriptor: &ObjectPutDescriptor) -> DurableObjectWriteSpoolReceipt {
+        DurableObjectWriteSpoolReceipt {
             spool_id: object_write_spool_id(&descriptor.request_id).unwrap(),
             request_id: descriptor.request_id.clone(),
             content_sha256: descriptor.content_sha256.clone(),
@@ -1788,7 +2031,19 @@ mod tests {
             file_fsync_receipt_id: ascii("file-fsync-a"),
             directory_fsync_receipt_id: ascii("directory-fsync-a"),
             durable_at_unix_ms: millis(10),
-        };
+        }
+    }
+
+    fn accepted_attempt(descriptor: ObjectPutDescriptor) -> ObjectPutAttempt {
+        let spool = spool(&descriptor);
+        ObjectPutAttempt {
+            descriptor,
+            state: ObjectPutState::AcceptedSpooled { spool },
+        }
+    }
+
+    fn issued_attempt(descriptor: ObjectPutDescriptor) -> ObjectPutAttempt {
+        let spool = spool(&descriptor);
         ObjectPutAttempt {
             descriptor,
             state: ObjectPutState::ProviderIssued {
@@ -1870,6 +2125,7 @@ mod tests {
             head: cats_api::object_write_gateway::ObjectWriteQualificationHeadEvidenceV1 {
                 provider_attempt_id: descriptor.provider_attempt_id.clone(),
                 visibility_receipt_id: ascii("visibility-receipt-a"),
+                preceding_conditional_request: None,
                 provider_request: ObjectWriteProviderRequestObservationV1 {
                     request_id: ascii("provider-head-request-a"),
                     extended_request_id: Some(ascii("provider-head-extended-a")),
@@ -1880,6 +2136,43 @@ mod tests {
                 },
                 observed_at_unix_ms: millis(30),
             },
+        }
+    }
+
+    fn head_evidence(descriptor: &ObjectPutDescriptor) -> ObjectWriteQualificationHeadEvidenceV1 {
+        ObjectWriteQualificationHeadEvidenceV1 {
+            provider_attempt_id: descriptor.provider_attempt_id.clone(),
+            visibility_receipt_id: ascii("visibility-unproven-a"),
+            preceding_conditional_request: None,
+            provider_request: ObjectWriteProviderRequestObservationV1 {
+                request_id: ascii("provider-head-unproven-a"),
+                extended_request_id: Some(ascii("provider-head-unproven-extended-a")),
+                content_sha256: descriptor.content_sha256.clone(),
+                content_length: Some(descriptor.content_length),
+                entity_tag: Some(ascii("entity-tag-unproven-a")),
+                version_id: Some(ascii("version-unproven-a")),
+            },
+            observed_at_unix_ms: millis(30),
+        }
+    }
+
+    fn exact_visibility(descriptor: &ObjectPutDescriptor) -> ObjectWriteVisibilityOutcome {
+        let evidence = head_evidence(descriptor);
+        ObjectWriteVisibilityOutcome::VisibleExact {
+            provider_attempt_id: evidence.provider_attempt_id,
+            visibility_receipt_id: evidence.visibility_receipt_id,
+            provider_request: Box::new(evidence.provider_request),
+            preceding_conditional_request: evidence.preceding_conditional_request,
+            observed_at_unix_ms: evidence.observed_at_unix_ms,
+        }
+    }
+
+    fn unproven_terminal(
+        head_evidence: ObjectWriteQualificationHeadEvidenceV1,
+    ) -> ObjectPutTerminalState {
+        ObjectPutTerminalState::QualificationUnprovenVisible {
+            reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
+            head_evidence: Box::new(head_evidence),
         }
     }
 
@@ -1931,6 +2224,7 @@ mod tests {
     struct TestAuthority {
         discover_calls: AtomicUsize,
         authorize_calls: AtomicUsize,
+        events: Mutex<Vec<&'static str>>,
         stored: Option<ObjectWriteQualificationResponseLossV1>,
     }
 
@@ -1939,8 +2233,13 @@ mod tests {
             Self {
                 discover_calls: AtomicUsize::new(0),
                 authorize_calls: AtomicUsize::new(0),
+                events: Mutex::new(Vec::new()),
                 stored,
             }
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
         }
     }
 
@@ -1952,6 +2251,7 @@ mod tests {
         ) -> QualificationFaultAuthorityFuture<'a, Option<ObjectWriteQualificationResponseLossV1>>
         {
             self.discover_calls.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push("discover");
             Box::pin(async { Ok(self.stored.clone()) })
         }
 
@@ -1962,6 +2262,7 @@ mod tests {
         ) -> QualificationFaultAuthorityFuture<'a, Box<dyn QualificationFaultAuthorizationGuard + 'a>>
         {
             self.authorize_calls.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push("authorize");
             Box::pin(async move {
                 Ok(Box::new(TestGuard {
                     authorization: authorization(request),
@@ -1975,10 +2276,11 @@ mod tests {
     fn ordinary_request_preserves_digest_and_never_invokes_fault_authority() {
         let authority = authority();
         let ordinary = descriptor(&authority, None);
+        let ordinary_attempt = issued_attempt(ordinary.clone());
         let fault_authority = TestAuthority::new(None);
         let preparation = poll_ready(prepare_object_write_qualification(
             &fault_authority,
-            &ordinary,
+            &ordinary_attempt,
             Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
@@ -1998,12 +2300,12 @@ mod tests {
     fn fault_requires_guard_then_committed_receipt_and_head_only_terminal() {
         let authority = authority();
         let descriptor = descriptor(&authority, Some(fault()));
-        let issued = issued_attempt(descriptor.clone());
-        validate_object_put_attempt(&authority, &issued).unwrap();
+        let accepted = accepted_attempt(descriptor.clone());
+        validate_object_put_attempt(&authority, &accepted).unwrap();
         let fault_authority = TestAuthority::new(None);
         let preparation = poll_ready(prepare_object_write_qualification(
             &fault_authority,
-            &descriptor,
+            &accepted,
             Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
@@ -2016,6 +2318,7 @@ mod tests {
             guard.authorization().mutation_class,
             ObjectWriteQualificationMutationClassV1::ObjectWriteAmbiguity
         );
+        let issued = mark_object_write_provider_issued(&authority, &accepted, millis(12)).unwrap();
         let response_loss = poll_ready(guard.commit_response_loss(
             successful_put(&descriptor, "provider-put-request-a"),
             Instant::now() + Duration::from_secs(1),
@@ -2065,11 +2368,12 @@ mod tests {
     fn durable_response_loss_replay_is_discovered_before_current_admission() {
         let authority = authority();
         let descriptor = descriptor(&authority, Some(fault()));
+        let issued = issued_attempt(descriptor.clone());
         let stored = response_loss(&descriptor);
         let fault_authority = TestAuthority::new(Some(stored.clone()));
         let preparation = poll_ready(prepare_object_write_qualification(
             &fault_authority,
-            &descriptor,
+            &issued,
             Instant::now() + Duration::from_secs(1),
         ))
         .unwrap();
@@ -2081,6 +2385,230 @@ mod tests {
         }
         assert_eq!(fault_authority.discover_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fault_authority.authorize_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn issued_fault_discovers_receipt_then_heads_and_settles_visible_without_current_gate() {
+        let authority = authority();
+        let descriptor = descriptor(&authority, Some(fault()));
+        let issued = issued_attempt(descriptor.clone());
+        let fault_authority = TestAuthority::new(None);
+
+        let preparation = poll_ready(prepare_object_write_qualification(
+            &fault_authority,
+            &issued,
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap();
+        let ObjectWriteQualificationPreparation::DiscoverIssuedVisibility(probe) = preparation
+        else {
+            panic!("an issued fault must discover durable response loss before HEAD");
+        };
+        assert_eq!(fault_authority.events(), vec!["discover"]);
+
+        let resolution = poll_ready(resolve_object_write_qualification_after_head(
+            &fault_authority,
+            &issued,
+            probe,
+            exact_visibility(&descriptor),
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap();
+        let ObjectWriteQualificationHeadResolution::QualificationUnprovenVisible {
+            reason,
+            head_evidence,
+        } = resolution
+        else {
+            panic!("exact HEAD without a durable response-loss receipt must be unproven");
+        };
+        assert_eq!(fault_authority.events(), vec!["discover"]);
+        let outcome = ObjectPutTerminalState::QualificationUnprovenVisible {
+            reason,
+            head_evidence,
+        };
+        let terminal =
+            complete_object_write_terminal(&authority, &issued, outcome.clone()).unwrap();
+        assert_eq!(
+            complete_object_write_terminal(&authority, &terminal, outcome.clone()).unwrap(),
+            terminal
+        );
+
+        let mut different = outcome;
+        let ObjectPutTerminalState::QualificationUnprovenVisible { head_evidence, .. } =
+            &mut different
+        else {
+            unreachable!();
+        };
+        head_evidence.visibility_receipt_id = ascii("visibility-unproven-b");
+        assert_eq!(
+            complete_object_write_terminal(&authority, &terminal, different),
+            Err(ObjectWriteAuthorityError::StaleAttempt)
+        );
+
+        let ambiguity = ambiguity(&descriptor, response_loss(&descriptor));
+        assert_eq!(
+            complete_object_write_terminal(
+                &authority,
+                &terminal,
+                ObjectPutTerminalState::SucceededVisible {
+                    put_receipt_id: ambiguity
+                        .response_loss
+                        .successful_put
+                        .put_receipt_id
+                        .clone(),
+                    put_completed_at_unix_ms: ambiguity
+                        .response_loss
+                        .successful_put
+                        .completed_at_unix_ms,
+                    visibility_receipt_id: ambiguity.head.visibility_receipt_id.clone(),
+                    visible_at_unix_ms: ambiguity.head.observed_at_unix_ms,
+                    qualification_ambiguity: Some(Box::new(ambiguity)),
+                },
+            ),
+            Err(ObjectWriteAuthorityError::StaleAttempt)
+        );
+
+        let original_prefix = authority.terminal_prefix_sha256.clone();
+        let (cutoff, retired) =
+            begin_object_writer_cutoff(&authority, &[], &id("fence-a"), millis(31)).unwrap();
+        assert!(retired.is_empty());
+        let prefixed =
+            advance_object_write_terminal_prefix(&cutoff, std::slice::from_ref(&terminal)).unwrap();
+        assert_eq!(prefixed.terminal_prefix_sequence, WireU64::new(1).unwrap());
+        assert_ne!(prefixed.terminal_prefix_sha256, original_prefix);
+        let (_, receipt) = complete_object_writer_cutoff(&prefixed, millis(32)).unwrap();
+        assert_eq!(receipt.terminal_sequence, WireU64::new(1).unwrap());
+        assert_eq!(
+            receipt.terminal_prefix_sha256,
+            prefixed.terminal_prefix_sha256
+        );
+
+        let removed = mark_terminal_object_write_spool_removed(
+            &authority,
+            &terminal,
+            ascii("spool-removal-a"),
+            millis(33),
+        )
+        .unwrap();
+        assert!(matches!(
+            removed.state,
+            ObjectPutState::Terminal {
+                spool: TerminalObjectWriteSpool::Removed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn head_not_visible_rechecks_durable_receipt_before_fresh_current_gate() {
+        let authority = authority();
+        let descriptor = descriptor(&authority, Some(fault()));
+        let issued = issued_attempt(descriptor);
+        let fault_authority = TestAuthority::new(None);
+        let preparation = poll_ready(prepare_object_write_qualification(
+            &fault_authority,
+            &issued,
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap();
+        let ObjectWriteQualificationPreparation::DiscoverIssuedVisibility(probe) = preparation
+        else {
+            panic!("issued fault must HEAD before retry authorization");
+        };
+        let resolution = poll_ready(resolve_object_write_qualification_after_head(
+            &fault_authority,
+            &issued,
+            probe,
+            ObjectWriteVisibilityOutcome::NotVisible,
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert!(matches!(
+            resolution,
+            ObjectWriteQualificationHeadResolution::Authorized(_)
+        ));
+        assert_eq!(
+            fault_authority.events(),
+            vec!["discover", "discover", "authorize"]
+        );
+    }
+
+    #[test]
+    fn unproven_visible_rejects_wrong_fault_state_or_head_binding() {
+        let authority = authority();
+        let fault_descriptor = descriptor(&authority, Some(fault()));
+        let issued = issued_attempt(fault_descriptor.clone());
+        let valid = head_evidence(&fault_descriptor);
+
+        let ordinary_descriptor = descriptor(&authority, None);
+        let ordinary_issued = issued_attempt(ordinary_descriptor.clone());
+        assert_eq!(
+            complete_object_write_terminal(
+                &authority,
+                &ordinary_issued,
+                unproven_terminal(head_evidence(&ordinary_descriptor)),
+            ),
+            Err(ObjectWriteAuthorityError::InvalidTransition)
+        );
+        assert_eq!(
+            complete_object_write_terminal(
+                &authority,
+                &accepted_attempt(fault_descriptor.clone()),
+                unproven_terminal(valid.clone()),
+            ),
+            Err(ObjectWriteAuthorityError::InvalidTransition)
+        );
+        let lost = mark_object_write_qualification_response_lost(
+            &authority,
+            &issued,
+            response_loss(&fault_descriptor),
+        )
+        .unwrap();
+        assert_eq!(
+            complete_object_write_terminal(&authority, &lost, unproven_terminal(valid.clone()),),
+            Err(ObjectWriteAuthorityError::InvalidTransition)
+        );
+
+        let mut wrong_attempt = valid.clone();
+        wrong_attempt.provider_attempt_id = ascii("owpa1_wrong");
+        assert!(complete_object_write_terminal(
+            &authority,
+            &issued,
+            unproven_terminal(wrong_attempt),
+        )
+        .is_err());
+        let mut wrong_sha = valid.clone();
+        wrong_sha.provider_request.content_sha256 = Sha256Digest::from_bytes([8; 32]);
+        assert!(
+            complete_object_write_terminal(&authority, &issued, unproven_terminal(wrong_sha),)
+                .is_err()
+        );
+        let mut wrong_length = valid.clone();
+        wrong_length.provider_request.content_length = Some(WireU64::new(65).unwrap());
+        assert!(complete_object_write_terminal(
+            &authority,
+            &issued,
+            unproven_terminal(wrong_length),
+        )
+        .is_err());
+        let mut stale_head = valid;
+        stale_head.observed_at_unix_ms = millis(11);
+        assert!(
+            complete_object_write_terminal(&authority, &issued, unproven_terminal(stale_head),)
+                .is_err()
+        );
+
+        assert_eq!(
+            complete_object_write_terminal(
+                &authority,
+                &issued,
+                ObjectPutTerminalState::PermanentlyFailed {
+                    failure_receipt_id: ascii("ordinary-failure-a"),
+                    failed_at_unix_ms: millis(30),
+                },
+            ),
+            Err(ObjectWriteAuthorityError::InvalidTransition)
+        );
     }
 
     #[test]

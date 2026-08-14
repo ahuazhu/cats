@@ -36,6 +36,7 @@ pub const OBJECT_WRITE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES: usize = 32 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AUTHORIZATION_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_RESPONSE_LOSS_MAX_BYTES: usize = 32 * 1024;
+pub const OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AMBIGUITY_RECEIPT_MAX_BYTES: usize = 48 * 1024;
 pub const OBJECT_WRITE_GATEWAY_RECEIPT_MAX_BYTES: usize = 64 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION: u64 = 16;
@@ -170,6 +171,27 @@ pub struct ObjectWriteProviderRequestObservationV1 {
     pub version_id: Option<AsciiText>,
 }
 
+/// Provider-neutral classification of a conditional request which did not
+/// create another object. The provider adapter may retain its opaque request
+/// IDs, but no SDK error or provider-specific status crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectWriteConditionalRequestOutcomeV1 {
+    PreconditionFailed,
+}
+
+/// Optional evidence that a legacy/already-issued retry observed the
+/// immutable key's create precondition before the fresh exact HEAD. New
+/// recovery code HEADs first and therefore normally leaves this `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteConditionalRequestEvidenceV1 {
+    pub provider_attempt_id: AsciiText,
+    pub outcome: ObjectWriteConditionalRequestOutcomeV1,
+    pub provider_request: ObjectWriteProviderRequestObservationV1,
+    pub observed_at_unix_ms: UnixMillis,
+}
+
 /// Provider-neutral evidence returned only for a real successful conditional
 /// PUT. Exact-replay visibility is a different outcome and cannot populate
 /// this type.
@@ -195,15 +217,27 @@ pub struct ObjectWriteQualificationResponseLossV1 {
     pub injected_at_unix_ms: UnixMillis,
 }
 
-/// Fresh exact visibility evidence obtained after the durable response-loss
-/// state. The recovery state machine is HEAD-only from that boundary.
+/// Fresh exact visibility evidence obtained after durable response-loss
+/// discovery. A committed receipt makes recovery HEAD-only; an absent receipt
+/// plus exact visibility closes as qualification-unproven without another PUT.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectWriteQualificationHeadEvidenceV1 {
     pub provider_attempt_id: AsciiText,
     pub visibility_receipt_id: AsciiText,
+    /// `Some` only records a conditional precondition observed before this
+    /// HEAD. It never proves that a successful PUT response was received.
+    pub preceding_conditional_request: Option<Box<ObjectWriteConditionalRequestEvidenceV1>>,
     pub provider_request: ObjectWriteProviderRequestObservationV1,
     pub observed_at_unix_ms: UnixMillis,
+}
+
+/// A visible exact object can safely close the writer while still failing the
+/// qualification: no durable guarded response-loss receipt exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectWriteQualificationUnprovenReasonV1 {
+    ResponseLossReceiptAbsent,
 }
 
 /// Closed proof for one deliberately lost successful PUT response followed by
@@ -305,6 +339,10 @@ pub enum ObjectWriteGatewayTerminalReceipt {
     PermanentlyFailed {
         failure_receipt_id: AsciiText,
         failed_at_unix_ms: UnixMillis,
+    },
+    QualificationUnprovenVisible {
+        reason: ObjectWriteQualificationUnprovenReasonV1,
+        head_evidence: Box<ObjectWriteQualificationHeadEvidenceV1>,
     },
 }
 
@@ -472,6 +510,23 @@ pub fn decode_object_write_qualification_response_loss(
         bytes,
         OBJECT_WRITE_QUALIFICATION_RESPONSE_LOSS_MAX_BYTES,
         validate_qualification_response_loss,
+    )
+}
+
+pub fn encode_object_write_qualification_head_evidence(
+    evidence: &ObjectWriteQualificationHeadEvidenceV1,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_qualification_head_evidence(evidence)?;
+    encode_bounded_receipt(evidence, OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES)
+}
+
+pub fn decode_object_write_qualification_head_evidence(
+    bytes: &[u8],
+) -> Result<ObjectWriteQualificationHeadEvidenceV1, ObjectWriteGatewayContractError> {
+    decode_bounded_receipt(
+        bytes,
+        OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES,
+        validate_qualification_head_evidence,
     )
 }
 
@@ -967,7 +1022,23 @@ fn validate_receipt(
             }
             Ok(())
         }
-        _ => Ok(()),
+        ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
+            reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
+            head_evidence,
+        } => {
+            validate_qualification_head_evidence(head_evidence)?;
+            let expected_provider_attempt = receipt
+                .request_id
+                .as_str()
+                .strip_prefix("sha256:")
+                .and_then(|value| AsciiText::new(format!("owpa1_{value}")))
+                .ok_or(ObjectWriteGatewayContractError::InvalidReceipt)?;
+            if head_evidence.provider_attempt_id != expected_provider_attempt {
+                return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+            }
+            Ok(())
+        }
+        ObjectWriteGatewayTerminalReceipt::PermanentlyFailed { .. } => Ok(()),
     }
 }
 
@@ -1045,6 +1116,32 @@ fn validate_provider_request_observation(
     Ok(())
 }
 
+fn validate_qualification_head_evidence(
+    evidence: &ObjectWriteQualificationHeadEvidenceV1,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    validate_provider_request_observation(&evidence.provider_request)?;
+    let Some(head_length) = evidence.provider_request.content_length else {
+        return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+    };
+    if let Some(conditional) = &evidence.preceding_conditional_request {
+        validate_provider_request_observation(&conditional.provider_request)?;
+        if conditional.provider_attempt_id != evidence.provider_attempt_id
+            || conditional.outcome != ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed
+            || conditional.provider_request.request_id == evidence.provider_request.request_id
+            || conditional.provider_request.content_sha256
+                != evidence.provider_request.content_sha256
+            || conditional
+                .provider_request
+                .content_length
+                .is_some_and(|length| length != head_length)
+            || conditional.observed_at_unix_ms > evidence.observed_at_unix_ms
+        {
+            return Err(ObjectWriteGatewayContractError::InvalidReceipt);
+        }
+    }
+    Ok(())
+}
+
 fn validate_qualification_response_loss(
     response_loss: &ObjectWriteQualificationResponseLossV1,
 ) -> Result<(), ObjectWriteGatewayContractError> {
@@ -1090,7 +1187,7 @@ fn validate_qualification_ambiguity_receipt(
     receipt: &ObjectWriteQualificationAmbiguityReceiptV1,
 ) -> Result<(), ObjectWriteGatewayContractError> {
     validate_qualification_response_loss(&receipt.response_loss)?;
-    validate_provider_request_observation(&receipt.head.provider_request)?;
+    validate_qualification_head_evidence(&receipt.head)?;
     let request = &receipt.response_loss.authorization.request;
     let put = &receipt.response_loss.successful_put;
     let head = &receipt.head;
@@ -1109,6 +1206,7 @@ fn validate_qualification_ambiguity_receipt(
         || head.provider_request.request_id == put.provider_request.request_id
         || head.provider_request.content_sha256 != request.content_sha256
         || head.provider_request.content_length != Some(request.content_length)
+        || head.preceding_conditional_request.is_some()
         || head.observed_at_unix_ms < receipt.response_loss.injected_at_unix_ms
         || head.visibility_receipt_id == put.put_receipt_id
         || !etag_matches
@@ -1327,6 +1425,7 @@ mod tests {
             head: ObjectWriteQualificationHeadEvidenceV1 {
                 provider_attempt_id,
                 visibility_receipt_id: ascii("visibility-receipt-a"),
+                preceding_conditional_request: None,
                 provider_request: ObjectWriteProviderRequestObservationV1 {
                     request_id: ascii("provider-head-request-a"),
                     extended_request_id: Some(ascii("provider-head-extended-a")),
@@ -1470,6 +1569,11 @@ mod tests {
             decode_object_write_qualification_response_loss(&response_loss_bytes).unwrap(),
             receipt.response_loss
         );
+        let head_bytes = encode_object_write_qualification_head_evidence(&receipt.head).unwrap();
+        assert_eq!(
+            decode_object_write_qualification_head_evidence(&head_bytes).unwrap(),
+            receipt.head
+        );
         let receipt_bytes = encode_object_write_qualification_ambiguity_receipt(&receipt).unwrap();
         assert_eq!(
             decode_object_write_qualification_ambiguity_receipt(&receipt_bytes).unwrap(),
@@ -1486,6 +1590,79 @@ mod tests {
                 OBJECT_WRITE_QUALIFICATION_AMBIGUITY_RECEIPT_MAX_BYTES
                     + 1
             ]),
+            Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
+        assert_eq!(
+            decode_object_write_qualification_head_evidence(&vec![
+                b'x';
+                OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES
+                    + 1
+            ]),
+            Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
+    }
+
+    #[test]
+    fn unproven_visible_is_a_distinct_bounded_terminal_without_ambiguity_proof() {
+        let ambiguity = qualification_ambiguity_receipt();
+        let request = &ambiguity.response_loss.authorization.request;
+        let mut head = ambiguity.head.clone();
+        head.preceding_conditional_request =
+            Some(Box::new(ObjectWriteConditionalRequestEvidenceV1 {
+                provider_attempt_id: head.provider_attempt_id.clone(),
+                outcome: ObjectWriteConditionalRequestOutcomeV1::PreconditionFailed,
+                provider_request: ObjectWriteProviderRequestObservationV1 {
+                    request_id: ascii("provider-conditional-request-a"),
+                    extended_request_id: Some(ascii("provider-conditional-extended-a")),
+                    content_sha256: request.content_sha256.clone(),
+                    content_length: Some(request.content_length),
+                    entity_tag: None,
+                    version_id: None,
+                },
+                observed_at_unix_ms: millis(29),
+            }));
+        let receipt = ObjectWriteGatewayReceipt {
+            version: ContractVersion::V1,
+            writer_authority_id: request.writer_authority_id.clone(),
+            request_id: request.request_id.clone(),
+            accepted_sequence: WireU64::new(1).unwrap(),
+            terminal: ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
+                reason: ObjectWriteQualificationUnprovenReasonV1::ResponseLossReceiptAbsent,
+                head_evidence: Box::new(head.clone()),
+            },
+        };
+        let bytes = encode_object_write_gateway_receipt(&receipt).unwrap();
+        assert_eq!(
+            decode_object_write_gateway_receipt(&bytes).unwrap(),
+            receipt
+        );
+        let wire = String::from_utf8(bytes).unwrap();
+        assert!(wire.contains("\"kind\":\"qualification_unproven_visible\""));
+        assert!(wire.contains("\"reason\":\"response_loss_receipt_absent\""));
+        assert!(!wire.contains("qualification_ambiguity"));
+
+        let mut wrong_attempt = receipt.clone();
+        let ObjectWriteGatewayTerminalReceipt::QualificationUnprovenVisible {
+            head_evidence, ..
+        } = &mut wrong_attempt.terminal
+        else {
+            unreachable!("fixture is the unproven terminal")
+        };
+        head_evidence.provider_attempt_id = ascii("owpa1_wrong");
+        assert_eq!(
+            encode_object_write_gateway_receipt(&wrong_attempt),
+            Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
+
+        let mut wrong_conditional = head;
+        wrong_conditional
+            .preceding_conditional_request
+            .as_mut()
+            .unwrap()
+            .provider_request
+            .request_id = wrong_conditional.provider_request.request_id.clone();
+        assert_eq!(
+            encode_object_write_qualification_head_evidence(&wrong_conditional),
             Err(ObjectWriteGatewayContractError::InvalidReceipt)
         );
     }
