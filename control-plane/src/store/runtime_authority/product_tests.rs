@@ -1513,19 +1513,29 @@ async fn runtime_sweeper_leadership_loss_cancels_the_rest_of_a_claimed_page() {
 
     let (url, setup, _unused, workspace) = stores();
     let mut operation_ids = Vec::new();
-    for sequence in [90, 91] {
+    for (sequence, node_discriminator, admission_discriminator, fence_discriminator) in [
+        (90_u64, 90_u8, 900_u128, 901_u128),
+        (91_u64, 91_u8, 910_u128, 911_u128),
+    ] {
         let mut create = request(
             &workspace,
             &format!("maintenance-cancel-{sequence}"),
             sequence,
             &format!("maintenance-cancel-{sequence}-create"),
         );
-        let (identity, policy, release) = prepare_mutation_node(&setup, &mut create, sequence);
+        let (identity, policy, release) =
+            prepare_mutation_node(&setup, &mut create, node_discriminator);
         setup
             .create_cat_covered_without_admission_for_product_test(&create)
             .unwrap();
-        let target = refresh_mutation_target(&setup, &identity, &policy, &release, sequence * 10);
-        let event = active_host_fence_event(&target, sequence * 10 + 1);
+        let target = refresh_mutation_target(
+            &setup,
+            &identity,
+            &policy,
+            &release,
+            admission_discriminator,
+        );
+        let event = active_host_fence_event(&target, fence_discriminator);
         setup
             .authority_transaction(|transaction| insert_event(transaction, &event))
             .unwrap();
