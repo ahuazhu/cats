@@ -919,6 +919,15 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | OpenAdmission | exact runtime incarnation及原样retained `runtime_launch`; 先持久`stable_state=null`/lifecycle Closed/routes empty的prepared token，再持久完整Stable/Open successor | 只用于current完整Desired的`endpoints=[]`。最后一次checkpoint fsync后，以accepted physical predecessor与durable Stable/Open successor做sealed Host sweep和Guest mounted-set challenge，随后才compare-and-open同一incarnation；cell后无post-CAS。crash在cell前保留Closed并重新barrier，结果不明只确认exact cell postcondition。Desired有任一Endpoint时禁止，改由第一条InstallGate打开lifecycle |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch；先持久Closed prepared token+同进程edge，再持久Active token | 以immutable launch Desired、live gate predecessor和current Endpoint successor三层authority，在Active fsync后做sealed Host/Guest barrier，随后才compare-and-install cell并持久completed postcondition。prepared只可由同进程exact edge重放；Active可由该edge继续，或在cell已等于exact postcondition时只完成持久结算。重启默认Closed并烧掉Active/结果不明epoch。cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
+资格环境覆盖FormatFilesystem的response-loss crash point时，只能使用固定
+`/run/cats/qualification/filesystem-fault.v1.json`。普通生产环境没有该文件。它是root-only、4 KiB内的
+canonical one-shot artifact，逐字段绑定本次run、attachment、initialization token和filesystem UUID，唯一
+action为`drop_validated_format_response_once`。Guest必须先完成真实mkfs、device sync、第二次stable
+observation及normal Exact response验证，并证明该UUID的mkfs计数为1，随后以同inode no-replace consume和
+文件/目录fsync闭合artifact，才可关闭该request socket而不写响应。retry仍走本节既有UUID/current-head
+postcondition discovery并采用同一filesystem，绝不再次mkfs。该oracle不增加wire、checkpoint、planner step或
+production format authority；任一binding/权限/形态不匹配都保留正常响应。
+
 Running-tail private admission不能仅因Guest已经出现预期mount就提前mint。无Persistent卷时只允许合法
 StartRuntime/Running tail；有Persistent卷时，Format、Drain、Commit及非最后一个Persistent的
 MountFilesystem都保持Closed。只有按canonical slot排序的最后一个Persistent处于MountFilesystem，或已经进入

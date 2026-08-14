@@ -116,6 +116,26 @@ revision的Operation置为Succeeded。Node不接受hot-detach。
 Persistent、Owned、epoch/head/init不匹配返回固定412。错误结果也在covered事务内持久化，避免重复请求在
 并发状态变化后得到另一种含义。
 
+### 6. 资格环境只丢失一次已验证的format响应
+
+真实metal资格环境可在Guest固定路径
+`/run/cats/qualification/filesystem-fault.v1.json`预置一个一次性fault artifact，专门覆盖“ext4已经成功
+格式化，但响应在Node看到前丢失”的恢复分支。普通生产安装不创建该文件；不存在时Guest路径逐字节保持
+正常行为。资格目录必须是root:root、mode 0700，artifact必须是root:root、mode 0600、regular、非symlink、
+`nlink=1`且不超过4 KiB的canonical JSON。其闭集字段精确绑定`version=1`、本次`run_id`、
+`attachment_id`、`initialization_token`、`filesystem_uuid`和唯一action
+`drop_validated_format_response_once`。
+
+Guest只有在真实`mkfs.ext4`成功、device sync完成、第二次stable filesystem observation成立、normal
+`FilesystemControlResponseV1`验证为同一Initialize binding的`Exact`，且该UUID的实际mkfs计数精确为1后，
+才可no-replace消费artifact。消费必须为同inode hard-link、fsync文件、unlink active name并fsync目录，最终
+留下单link root-only consumed receipt；transport随后只关闭该request socket而不写已经验证的响应。Node
+重放同一请求时必须通过UUID和current head发现原postcondition，`mkfs_invocations`仍为1。wrong run/
+attachment/token/UUID、重复artifact、非Exact结果或第二次mkfs都不得丢响应。
+
+这个artifact只是一条资格故障oracle，不是产品配置、Guest ABI、checkpoint字段或format authority；它不能
+选择filesystem identity、制造成功结果或为生产runner增加旁路。
+
 ## 后果
 
 - 产品binding、Node物理effects、filesystem初始化和Operation终态共享一个Desired lineage；
