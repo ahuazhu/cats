@@ -3205,8 +3205,11 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         node_id: "node_a".to_string(),
         checkpoints: vec![future_checkpoint],
     };
+    // The bumped generation no longer matches the checkpoint's signed source
+    // binding, so the signed pipeline classifies the pair as invalid input
+    // rather than a settling conflict.
     let future = ctx.post_signed_usage(&usage_node, &future_request).await;
-    assert_eq!(future.status(), StatusCode::CONFLICT);
+    assert_eq!(future.status(), StatusCode::BAD_REQUEST);
 
     let deleted = ctx
         .http
@@ -3826,8 +3829,8 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         );
     }
 
-    // Endpoint list and all legacy disk actions left the production method
-    // set. They must not be revived merely to preserve a debug-only handler.
+    // Endpoint list is a real v2 production read (A6); for an unknown Cat it
+    // answers through the runtime read authority, never a legacy handler.
     assert_eq!(
         client
             .get(format!("{workspace_base}/cats/signed-cutover/endpoints"))
@@ -3836,7 +3839,7 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             .await
             .unwrap()
             .status(),
-        StatusCode::METHOD_NOT_ALLOWED,
+        StatusCode::NOT_FOUND,
     );
     for url in [
         format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
