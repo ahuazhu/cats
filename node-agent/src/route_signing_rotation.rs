@@ -262,15 +262,6 @@ impl RouteGrantV2RingInstaller {
     }
 
     #[cfg(test)]
-    fn for_test_with_serialized(
-        root: &Path,
-        verifier: Arc<RouteGrantV2Verifier>,
-        serialized: Arc<Mutex<()>>,
-    ) -> Self {
-        Self::for_test_with_parts(root, verifier, serialized, Arc::new(|| {}))
-    }
-
-    #[cfg(test)]
     fn for_test_with_emergency_close(
         root: &Path,
         verifier: Arc<RouteGrantV2Verifier>,
