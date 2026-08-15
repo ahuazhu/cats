@@ -66,8 +66,10 @@ impl RuntimeOperationsTableLockForTest {
                                AND waiting.locktype='relation'
                                AND namespace.nspname=current_schema()
                                AND relation.relname='runtime_operations'
-                               AND activity.query LIKE
+                               AND (activity.query LIKE
                                    '%workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2%'
+                                 OR activity.query LIKE
+                                   '%FROM runtime_operations WHERE operation_id=$1%')
                          )",
                         &[&own_pid],
                     )
