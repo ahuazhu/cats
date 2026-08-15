@@ -333,6 +333,7 @@ variable "metal_worker_ssh_from_instance_connect" {
   default     = true
 }
 
+<<<<<<< HEAD
 variable "host_fence_provider_namespace" {
   description = "Kubernetes namespace containing the AWS HostFence provider."
   type        = string
@@ -375,6 +376,28 @@ variable "metal_workers" {
   }
 
   validation {
+=======
+variable "metal_workers" {
+  description = <<-EOT
+    Bare-metal workers keyed by their stable Node name. subnet_index pins the
+    existing Host to one private subnet without making list position an
+    identity. root_volume_encrypted records the live root contract: only the
+    legacy metal-2 may temporarily be false, and changing it to true is the
+    explicit forward-only replacement requested for the maintenance window.
+  EOT
+  type = map(object({
+    subnet_index          = number
+    root_volume_encrypted = bool
+  }))
+  default = {
+    metal-1 = {
+      subnet_index          = 0
+      root_volume_encrypted = true
+    }
+  }
+
+  validation {
+>>>>>>> fix/111-125-metal-fleet-terraform
     condition     = length(var.metal_workers) > 0
     error_message = "metal_workers must contain at least one worker."
   }
