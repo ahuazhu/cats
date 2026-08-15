@@ -62,11 +62,11 @@ struct EntryIdentity {
 impl EntryIdentity {
     fn from_stat(stat: &libc::stat) -> anyhow::Result<Self> {
         Ok(Self {
-            device: u64::try_from(stat.st_dev).context("entry device is negative")?,
+            device: stat_device_number(stat.st_dev)?,
             inode: stat.st_ino,
             uid: stat.st_uid,
-            mode: stat.st_mode.into(),
-            links: stat.st_nlink.into(),
+            mode: stat_mode_bits(stat.st_mode),
+            links: stat_link_count(stat.st_nlink),
             size: u64::try_from(stat.st_size).context("entry size is negative")?,
             blocks: u64::try_from(stat.st_blocks).context("entry block count is negative")?,
             modified_seconds: stat.st_mtime,
@@ -77,7 +77,7 @@ impl EntryIdentity {
     }
 
     fn file_type(self) -> u32 {
-        self.mode & u32::from(libc::S_IFMT)
+        self.mode & stat_mode_bits(libc::S_IFMT)
     }
 }
 
@@ -795,10 +795,10 @@ fn entry_names_directory(
     // SAFETY: successful fstatat initialized the value.
     let stat = unsafe { stat.assume_init() };
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR
-        && u64::try_from(stat.st_dev).ok() == Some(expected.device)
+        && stat_device_number(stat.st_dev).ok() == Some(expected.device)
         && stat.st_ino == expected.inode
         && stat.st_uid == expected.uid
-        && u32::from(stat.st_mode) == expected.mode)
+        && stat_mode_bits(stat.st_mode) == expected.mode)
 }
 
 fn snapshot_tree(
@@ -821,11 +821,11 @@ fn snapshot_tree(
             "data-directory reclaim found a foreign owner"
         );
         let retained_entry = match identity.file_type() {
-            kind if kind == u32::from(libc::S_IFREG) => {
+            kind if kind == stat_mode_bits(libc::S_IFREG) => {
                 anyhow::ensure!(stat.st_nlink == 1, "reclaim file is multiply linked");
                 RetainedTreeEntry::File(identity)
             }
-            kind if kind == u32::from(libc::S_IFDIR) => {
+            kind if kind == stat_mode_bits(libc::S_IFDIR) => {
                 let child = open_child_directory(directory, &name, &stat, expected_uid)?;
                 RetainedTreeEntry::Directory {
                     identity,
@@ -914,7 +914,7 @@ fn remove_empty_ancestor(
     let current = stat_at(parent, &name_c)?;
     let retained_identity = DirectoryIdentity::from_file(retained)?;
     anyhow::ensure!(
-        u64::try_from(current.st_dev).ok() == Some(retained_identity.device)
+        stat_device_number(current.st_dev).ok() == Some(retained_identity.device)
             && current.st_ino == retained_identity.inode,
         "empty reclaim ancestor changed identity"
     );
@@ -975,7 +975,7 @@ fn open_child_directory(
     anyhow::ensure!(
         metadata.is_dir()
             && metadata.uid() == expected_uid
-            && u64::try_from(enumerated.st_dev).ok() == Some(metadata.dev())
+            && stat_device_number(enumerated.st_dev).ok() == Some(metadata.dev())
             && enumerated.st_ino == metadata.ino(),
         "reclaim child changed identity after enumeration"
     );
@@ -1062,6 +1062,33 @@ fn set_errno_zero() {
 fn set_errno_zero() {
     // SAFETY: libc returns this thread's errno location.
     unsafe { *libc::__errno_location() = 0 };
+}
+
+// libc exposes stat field widths differently per target. Generic bounds keep
+// the conversions lossless without making an identity conversion visible to
+// Clippy on targets where the alias already matches (see
+// blockd_socket_namespace's stat helpers).
+fn stat_device_number<T>(device: T) -> anyhow::Result<u64>
+where
+    T: TryInto<u64>,
+{
+    device
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("entry device number is negative"))
+}
+
+fn stat_mode_bits<T>(mode: T) -> u32
+where
+    u32: From<T>,
+{
+    u32::from(mode)
+}
+
+fn stat_link_count<T>(links: T) -> u64
+where
+    u64: From<T>,
+{
+    u64::from(links)
 }
 
 #[cfg(test)]

@@ -4795,7 +4795,7 @@ fn exact_residue_descriptor_metadata(
         && enumerated.st_ino == metadata.ino()
         && enumerated.st_uid == root_uid
         && metadata.uid() == root_uid
-        && u32::from(enumerated.st_mode) == metadata.mode()
+        && raw_mode_to_u32(enumerated.st_mode) == metadata.mode()
         && raw_link_count_to_u64(enumerated.st_nlink) == metadata.nlink()
         && u64::try_from(enumerated.st_size).ok() == Some(metadata.len())
         && raw_blocks_to_u64(enumerated.st_blocks) == Some(metadata.blocks())
@@ -4941,6 +4941,15 @@ fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
     u64::try_from(device).ok()
+}
+
+// See raw_link_count_to_u64: the generic bound hides the identity conversion
+// from Clippy on targets where mode_t is already u32.
+fn raw_mode_to_u32<T>(mode: T) -> u32
+where
+    u32: From<T>,
+{
+    u32::from(mode)
 }
 
 // libc exposes `nlink_t` at different unsigned widths on supported targets.
