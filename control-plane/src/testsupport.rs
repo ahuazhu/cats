@@ -41,12 +41,17 @@ impl RuntimeOperationsTableLockForTest {
                 .get(0);
             ready_tx.send(()).unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Pure poll upper bound; a saturated gate host can take far
+            // longer than an idle one to schedule the handler onto the lock.
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if release_rx.try_recv().is_ok() {
                     client.batch_execute("ROLLBACK").unwrap();
                     return;
                 }
+                // Background sweepers also scan runtime_operations; only the
+                // handler's by-id Operation read proves the claimed request
+                // reached the lock barrier, so bind the waiter to its query.
                 let blocked: bool = client
                     .query_one(
                         "SELECT EXISTS (
@@ -55,10 +60,14 @@ impl RuntimeOperationsTableLockForTest {
                               JOIN pg_class relation ON relation.oid=waiting.relation
                               JOIN pg_namespace namespace
                                 ON namespace.oid=relation.relnamespace
+                              JOIN pg_stat_activity activity
+                                ON activity.pid=waiting.pid
                              WHERE waiting.pid<>$1 AND NOT waiting.granted
                                AND waiting.locktype='relation'
                                AND namespace.nspname=current_schema()
                                AND relation.relname='runtime_operations'
+                               AND activity.query LIKE
+                                   '%workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2%'
                          )",
                         &[&own_pid],
                     )
@@ -86,7 +95,7 @@ impl RuntimeOperationsTableLockForTest {
 
     pub async fn wait_until_query_blocked(&mut self) {
         assert!(
-            tokio::time::timeout(Duration::from_secs(6), &mut self.blocked)
+            tokio::time::timeout(Duration::from_secs(35), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
                 .expect("runtime_operations table-lock worker stopped"),
