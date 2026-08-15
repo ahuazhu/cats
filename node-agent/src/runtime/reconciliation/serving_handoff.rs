@@ -4646,6 +4646,19 @@ mod tests {
             let node_global_effect = context.lock_node_global_effect()?;
             let listeners = self.listeners.take();
             drop(listeners);
+            // Same closing-window hazard the Root owner awaits: a loaded
+            // kernel can briefly keep the dropped listener connectable, so
+            // wait for refusal before treating a connect as a live listener.
+            for socket in self.socket_paths() {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while UnixStream::connect(socket).is_ok() {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "isolated managed Serving listener still accepted connects after drop"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             self.assert_listeners_absent("before the absence sweep")?;
             let capture =
                 self.root
