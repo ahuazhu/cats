@@ -397,6 +397,100 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
 }
 
 #[test]
+fn production_cutover_proof_set_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-cutover-proof-set-fixture.py"))
+        .output()
+        .expect("run production cutover proof-set fixture");
+    assert!(
+        output.status.success(),
+        "cutover proof-set fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn e3_operator_window_persistence_contract_passes_offline_fixture() {
+    let output = Command::new("bash")
+        .arg(
+            workspace_root()
+                .join("deploy/metal/tests/runtime-cutover-e3-window-persistence-fixture.sh"),
+        )
+        .arg(workspace_root().join("deploy/metal/runtime-cutover-e3-window.sh"))
+        .output()
+        .expect("run E3 operator window persistence fixture");
+    assert!(
+        output.status.success(),
+        "E3 window persistence fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("all cases passed"));
+}
+
+/// The operator-trust and installer fixtures sign with a real Ed25519-capable
+/// openssl; macOS's LibreSSL lacks the algorithm, so probe the well-known
+/// locations and fail (never skip) when none qualifies.
+fn ed25519_openssl() -> String {
+    for candidate in [
+        "/usr/bin/openssl",
+        "/opt/homebrew/bin/openssl",
+        "/usr/local/bin/openssl",
+    ] {
+        let Ok(output) = Command::new(candidate)
+            .args(["list", "-public-key-algorithms"])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("ed25519")
+        {
+            return candidate.to_owned();
+        }
+    }
+    panic!("no Ed25519-capable openssl found at the well-known locations");
+}
+
+#[test]
+fn production_cutover_operator_trust_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-cutover-operator-trust-fixture.py"))
+        .arg("--tool")
+        .arg(workspace_root().join("deploy/aws/production-cutover-operator-trust.py"))
+        .arg("--openssl")
+        .arg(ed25519_openssl())
+        .output()
+        .expect("run production cutover operator trust fixture");
+    assert!(
+        output.status.success(),
+        "operator trust fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn install_operator_tools_contract_passes_offline_fixture() {
+    let output = Command::new("bash")
+        .arg(workspace_root().join("deploy/aws/install-operator-tools-fixture.sh"))
+        .arg("--openssl")
+        .arg(ed25519_openssl())
+        .output()
+        .expect("run install-operator-tools fixture");
+    assert!(
+        output.status.success(),
+        "install-operator-tools fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn production_final_open_contract_passes_offline_fixture() {
     let output = Command::new("python3")
         .arg(workspace_root().join("deploy/aws/production-final-open-fixture.py"))

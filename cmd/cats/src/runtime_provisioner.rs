@@ -1379,6 +1379,26 @@ mod tests {
             std::fs::read(marker.join(PRIVATE_KEY_FILE)).unwrap(),
             first_key
         );
+        // Provider scope is part of the immutable Host identity: a replay
+        // that keeps every other field but changes the scope must fail.
+        assert!(node_command(
+            root,
+            RuntimeProvisionerNodeIdentityCommand::Prepare {
+                node_id: "node_a".to_owned(),
+                host_provider: "aws".to_owned(),
+                host_partition: "aws".to_owned(),
+                host_account_id: "acct_other".to_owned(),
+                host_region: "us-east-1".to_owned(),
+                immutable_host_id: "host_a".to_owned(),
+                state_path_id: "state_path_a".to_owned(),
+                credential_id: "credential_a".to_owned(),
+            },
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(marker.join(PRIVATE_KEY_FILE)).unwrap(),
+            first_key
+        );
     }
 
     #[test]

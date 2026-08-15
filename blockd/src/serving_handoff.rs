@@ -425,5 +425,21 @@ mod tests {
             encode_serving_handoff_record(&wrong_target_digest),
             Err(ServingHandoffCodecError::Invalid { .. })
         ));
+
+        // The canonical encoding omits an unbound object-write credential
+        // entirely; an explicit null member re-encodes without it, so the
+        // round-trip codec must reject the null-carrying bytes.
+        let mut explicit_null =
+            serde_json::from_slice::<Value>(fixed_serving_handoff_record()).unwrap();
+        explicit_null["target_control_authorization"]["artifact"]["attachment"]
+            .as_object_mut()
+            .unwrap()
+            .insert("object_write_credential".to_owned(), Value::Null);
+        let mut null_bytes = Vec::new();
+        write_canonical_json(&explicit_null, &mut null_bytes).unwrap();
+        assert!(matches!(
+            decode_serving_handoff_record(&null_bytes),
+            Err(ServingHandoffCodecError::NonCanonical { .. })
+        ));
     }
 }
