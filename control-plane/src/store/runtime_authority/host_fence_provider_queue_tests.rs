@@ -456,10 +456,16 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
     // than an idle one to schedule both enqueue threads onto the lock. A
     // thread that finishes while the source lock is still held failed early;
     // surface its real error instead of a misleading deadline panic.
+    //
+    // Poll on a dedicated autocommit connection, never on `source_lock`:
+    // PostgreSQL snapshots dynamic statistics views once per transaction, so
+    // inside the held BEGIN a first poll that races ahead of the enqueue
+    // threads would observe 0 blocked forever.
+    let mut monitor = postgres::Client::connect(&fixture.url, postgres::NoTls).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     let (mut first, mut second) = (Some(first), Some(second));
     loop {
-        let blocked: i64 = source_lock
+        let blocked: i64 = monitor
             .query_one(
                 "SELECT count(*)
                    FROM pg_stat_activity
