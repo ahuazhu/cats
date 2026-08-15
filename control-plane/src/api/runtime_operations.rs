@@ -213,7 +213,11 @@ mod tests {
         assert!(handler.await.unwrap_err().is_cancelled());
         table_lock.release();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Pure poll upper bound: the store worker settles the cancelled
+        // read before poisoning, which can take far longer on a saturated
+        // gate host than on an idle one; the poll exits as soon as
+        // readiness closes.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while handle.state.readiness.is_ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
