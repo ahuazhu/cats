@@ -67,15 +67,15 @@ use ring::signature::Ed25519KeyPair;
 
 #[cfg(target_os = "linux")]
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, decode_runtime_checkpoint, encode_agent_registration_attempt,
-    inventory_digest, spec_digest, AcquireOrigin, AdmissionInventoryAttestation, AsciiText,
-    AssignedKind, ControlHandshakeEvidence, DiskKind, Durability, Generation, HttpProtocol,
-    IsolatedIpv4Kind, LastVolumeTransition, LocalLineageState, NodeObservation,
-    ObservationAcceptance, ObservationInventoryAcceptance, ObservedDevice, ObservedDiskKind,
-    ObservedNetwork, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    ProcessEvidence, ProcessRole, ProcessState, RemoteHead, RuntimeCheckpoint,
-    RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition, SessionBinding, VolumeAccess,
-    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
+    checkpoint_content_digest, encode_agent_registration_attempt, inventory_digest, spec_digest,
+    AcquireOrigin, AdmissionInventoryAttestation, AsciiText, AssignedKind,
+    ControlHandshakeEvidence, DiskKind, Durability, Generation, IsolatedIpv4Kind,
+    LastVolumeTransition, LocalLineageState, NodeObservation, ObservationAcceptance,
+    ObservationInventoryAcceptance, ObservedDevice, ObservedDiskKind, ObservedNetwork,
+    OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput, ProcessEvidence,
+    ProcessRole, ProcessState, ProgressingReason, RemoteHead, RuntimeCheckpoint,
+    RuntimeNetworkIdentity, RuntimeTransition, SessionBinding, VolumeAccess, VolumeAcquire,
+    VolumeAuthorityEvidence, VolumeDisposition,
 };
 #[cfg(target_os = "linux")]
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
