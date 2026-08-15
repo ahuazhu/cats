@@ -119,6 +119,8 @@ Independent review must find exactly one replacement,
 `aws_instance.metal_worker["metal-1"]`. Apply only that exact saved plan. Keep
 the value `true` afterward; reverting it would request another replacement.
 
+Four things about this stack are easy to get wrong.
+
 **The certificate cannot validate before the registrar moves.** A Route 53
 hosted zone cannot be transferred between accounts, so this stack creates a new
 zone with new name servers. ACM's DNS validation only resolves once the
