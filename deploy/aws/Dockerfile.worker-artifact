@@ -50,6 +50,7 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent \
     && install -D -m 0755 target/release/cats-e3-guest-workload /out/cats-e3-guest-workload
 
+COPY deploy/metal/setup-guest-network.sh /out/setup-guest-network.sh
 COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
 COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
 COPY --chmod=0755 deploy/aws/old-host-positive-stop.py /out/old-host-positive-stop.py
@@ -72,6 +73,7 @@ COPY --from=builder /out/cats-usage-terminal-receipt-verifier /cats-usage-termin
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/cats-e3-guest-workload /cats-e3-guest-workload
+COPY --from=builder /out/setup-guest-network.sh /setup-guest-network.sh
 COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
 COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
 COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py

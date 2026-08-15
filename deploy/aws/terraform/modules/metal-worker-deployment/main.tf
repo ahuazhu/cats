@@ -275,6 +275,8 @@ locals {
     cats_worker_deployment_crash_probe after-install-idle-guard
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
     cats_worker_deployment_crash_probe after-install-postgres-renderer
+    install -D -m 0755 "$stage_path/setup-guest-network.sh" "${var.install_root}/bin/setup-guest-network"
+    cats_worker_deployment_crash_probe after-install-guest-network-setup
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
     cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer

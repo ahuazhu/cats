@@ -3919,6 +3919,19 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     assert!(worker_image.contains(
         "COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py"
     ));
+
+    // cats-worker.service requires /opt/cats/bin/setup-guest-network before
+    // start; the bundle must carry it and the bundle-driven installer must
+    // install it, or a bundle-deployed worker can never start its unit.
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("ExecStartPre=/opt/cats/bin/setup-guest-network"));
+    assert!(worker_image
+        .contains("COPY --from=builder /out/setup-guest-network.sh /setup-guest-network.sh"));
+    let worker_module =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(worker_module.contains(
+        "install -D -m 0755 \"$stage_path/setup-guest-network.sh\" \"${var.install_root}/bin/setup-guest-network\""
+    ));
     for release_binding in [
         "ARG CATS_RELEASE_COMMIT_SHA",
         "ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}",
