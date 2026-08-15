@@ -1,5 +1,6 @@
 //! Shared protected-file and durable-receipt boundary for Usage host verifiers.
 
+#[cfg(not(target_os = "linux"))]
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
