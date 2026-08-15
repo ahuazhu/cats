@@ -431,8 +431,11 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
         second_store.enqueue_host_fence_provider_attempt_for_test(&second_request)
     });
     // Pure poll upper bound: a saturated gate machine can take far longer
-    // than an idle one to schedule both enqueue threads onto the lock.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // than an idle one to schedule both enqueue threads onto the lock. A
+    // thread that finishes while the source lock is still held failed early;
+    // surface its real error instead of a misleading deadline panic.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let (mut first, mut second) = (Some(first), Some(second));
     loop {
         let blocked: i64 = source_lock
             .query_one(
@@ -449,6 +452,17 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
         if blocked == 2 {
             break;
         }
+        for early in [&mut first, &mut second] {
+            if early.as_ref().is_some_and(|thread| thread.is_finished()) {
+                early
+                    .take()
+                    .expect("checked above")
+                    .join()
+                    .unwrap()
+                    .expect("an enqueue finished under the held source lock");
+                panic!("an enqueue completed while the source row lock was still held");
+            }
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "both exact enqueues did not reach the serialized source lock ({blocked} blocked)"
@@ -457,8 +471,8 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
     }
     source_lock.batch_execute("COMMIT").unwrap();
 
-    let first = first.join().unwrap().unwrap();
-    let second = second.join().unwrap().unwrap();
+    let first = first.expect("still joined below").join().unwrap().unwrap();
+    let second = second.expect("still joined below").join().unwrap().unwrap();
     assert_eq!(first, second);
     assert_eq!(
         queue_and_authority_state(&fixture.store),
