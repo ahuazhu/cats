@@ -162,6 +162,9 @@ impl AgentRegistrationConfig {
             "test credential binding does not match signer"
         );
         std::fs::create_dir_all(&state_path)?;
+        // blockd's serving-handoff reader requires the production state-dir
+        // contract (owner-only 0700); create_dir_all's umask default is wider.
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o700))?;
         let state_parent_path = state_path
             .parent()
             .context("test state path has no parent")?;
