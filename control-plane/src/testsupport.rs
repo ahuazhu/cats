@@ -233,7 +233,7 @@ pub fn test_production_cutover_operator_trust_bundle(
 /// This is deliberately an explicit fixture action after Account/Workspace
 /// provisioning. It is neither an automatic schema default nor a Store
 /// bypass, and it cannot construct a final `Open` binding.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub fn begin_production_qualification_for_product_test(
     store: &crate::store::Store,
     workspace_id: &cats_api::runtime_reconciliation::Id,
@@ -345,7 +345,7 @@ pub fn begin_production_qualification_for_product_test(
 /// Leave an installed test Qualification through the official signed End CAS.
 /// Disposable product fixtures use this only when they intentionally move the
 /// singleton to another exact Workspace scope.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub fn end_production_qualification_for_product_test(store: &crate::store::Store) {
     use cats_api::production_mutation_admission::{
         ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
@@ -397,7 +397,7 @@ pub fn end_production_qualification_for_product_test(store: &crate::store::Store
     ));
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 fn test_production_cutover_sts_principal(
 ) -> cats_api::production_mutation_admission::ProductionCutoverStsPrincipal {
     use cats_api::production_mutation_admission::{
@@ -413,7 +413,7 @@ fn test_production_cutover_sts_principal(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 fn apply_production_admission_for_product_test(
     store: &crate::store::Store,
     command: &cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,

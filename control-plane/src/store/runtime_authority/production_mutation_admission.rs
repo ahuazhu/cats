@@ -1014,11 +1014,11 @@ fn qualified_release_commit() -> Option<&'static str> {
     if let Some(release) = option_env!("CATS_RELEASE_COMMIT_SHA") {
         return Some(release);
     }
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     {
         Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     }
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(not(any(test, debug_assertions, feature = "test-support")))]
     {
         None
     }

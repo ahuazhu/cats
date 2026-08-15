@@ -703,6 +703,13 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         .expect("bootstrap account has one default Workspace");
     let workspace_id = workspace.id;
     let account_id = workspace.account_id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &context.first.state.store,
+            &admission_workspace,
+        );
+    });
     let idempotency_key = "two-replica-cat-create";
     let (first_create, second_create) = send_through_replica_barrier(
         context.cat_create_request(&context.first, &workspace_id, idempotency_key),
@@ -1567,6 +1574,13 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace")
         .id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &billed.state.store,
+            &admission_workspace,
+        );
+    });
 
     let key = "funding-change-replay";
     let first = context
@@ -1705,6 +1719,13 @@ async fn cat_exact_replay_precedes_mutable_funding_admission() {
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace")
         .id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &billed.state.store,
+            &admission_workspace,
+        );
+    });
 
     let key = "cat-funding-change-replay";
     let first = context
