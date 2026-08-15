@@ -606,6 +606,10 @@ def provision_final_open_state_layout(
             require_root=require_root,
         )
         layout_parent.verify()
+        # Linux fdopendir inherits the descriptor offset (macOS rewinds); an
+        # already-consumed offset would list nothing and let foreign entries
+        # hide, so rewind before enumerating.
+        os.lseek(layout_parent.descriptor, 0, os.SEEK_SET)
         direct_children = sorted(os.listdir(layout_parent.descriptor))
         layout_parent.verify()
         if direct_children != ["admission-state", "receipts"]:

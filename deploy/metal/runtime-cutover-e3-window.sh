@@ -277,6 +277,9 @@ def read_existing():
             raise SystemExit(1)
         if before.st_nlink == 2:
             siblings = []
+            # Linux fdopendir inherits the descriptor offset (macOS rewinds);
+            # rewind so the sibling scan sees the whole directory.
+            os.lseek(directory_fd, 0, os.SEEK_SET)
             for candidate in os.listdir(directory_fd):
                 if not candidate.startswith(prefix):
                     continue
@@ -402,6 +405,9 @@ LOCK = ".cats-e3-window.lock"
 BINDING = "00-window-binding.v1.json"
 
 directory_fd = os.dup(int(sys.argv[1]))
+# Linux fdopendir inherits the descriptor offset (macOS rewinds); rewind so
+# the marker scan sees the whole directory.
+os.lseek(directory_fd, 0, os.SEEK_SET)
 effective_uid = os.geteuid()
 
 
