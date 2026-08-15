@@ -36,14 +36,23 @@ fn workspace_root() -> PathBuf {
 /// scratch prefers the gate's ext4-backed target volume. Plain hosts keep
 /// their ambient temp directory.
 fn fixture_scratch_base() -> PathBuf {
-    if let Some(directory) = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY") {
+    // The native build host has neither the gate volume nor a writable
+    // checkout, but relocates the cargo target via CARGO_TARGET_DIR with
+    // non-sticky root-owned ancestry, which the E3 runner accepts.
+    if let Some(directory) = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY")
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
+    {
         let base = PathBuf::from(directory).join("cutover-contract-fixture-tmp");
         std::fs::create_dir_all(&base).expect("create cutover fixture scratch base");
         return base
             .canonicalize()
             .expect("canonicalize cutover fixture scratch base");
     }
+    // macOS's $TMPDIR sits under the /var -> private/var symlink, which the
+    // O_NOFOLLOW ancestry walk rejects; canonicalize resolves it away.
     std::env::temp_dir()
+        .canonicalize()
+        .expect("canonicalize ambient temp scratch base")
 }
 
 fn git_head(root: &Path) -> String {

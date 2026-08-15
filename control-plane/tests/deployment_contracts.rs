@@ -407,8 +407,11 @@ fn contract_fixture_tmpdir() -> std::path::PathBuf {
         // Prefer the gate's target volume: the repository bind mount on a
         // macOS Docker host is virtiofs, which cannot re-resolve a replaced
         // inode through /proc/self/fd the way the held-descriptor races
-        // require.
+        // require. The native build host relocates the cargo target outside
+        // its read-only checkout via CARGO_TARGET_DIR; the workspace target
+        // stays the last resort for writable checkouts.
         let base = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY")
+            .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| workspace_root().join("target"))
             .join("contract-fixture-tmp");
