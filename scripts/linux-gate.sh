@@ -696,7 +696,7 @@ main() {
       create --name "$LINUX_SYSTEMD_GATE" \
       --label "$LINUX_OWNER_LABEL" --platform "$LINUX_PLATFORM" \
       --privileged --cgroupns=private --cgroup-parent system.slice \
-      --tmpfs /run --tmpfs /run/lock -e container=docker \
+      --tmpfs /run:exec --tmpfs /run/lock -e container=docker \
       -e CARGO_BUILD_JOBS="$LINUX_JOBS" \
       -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${LINUX_PG}:5432/postgres" \
       --network "$LINUX_NETWORK" \
