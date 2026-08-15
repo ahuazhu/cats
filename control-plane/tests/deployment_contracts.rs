@@ -1246,6 +1246,17 @@ fn release_build_publishes_the_control_plane_runtime_target() {
         .map(|(stage, _)| stage)
         .expect("dedicated control-plane runtime stage");
     assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/cats-controld\"]"));
+
+    // The object-write gateway Deployment reuses this image and starts
+    // /usr/local/bin/cats-object-write-gatewayd by explicit command; the
+    // runtime stage must ship that binary or the pod crash-loops on start.
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(
+        kubernetes.contains("command           = [\"/usr/local/bin/cats-object-write-gatewayd\"]")
+    );
+    assert!(runtime.contains(
+        "COPY --from=builder /out/cats-object-write-gatewayd /usr/local/bin/cats-object-write-gatewayd"
+    ));
 }
 
 #[test]
