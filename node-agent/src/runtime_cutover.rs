@@ -1602,6 +1602,26 @@ mod tests {
         std::future::pending().await
     }
 
+    /// The composition tests provision the installed `/run/cats` namespaces,
+    /// which requires root. The Docker and metal root gates execute the full
+    /// bodies; the unprivileged native build-host sandbox cannot create the
+    /// installed roots and skips them, matching the runbook contract-test
+    /// precedent for root-only fixtures.
+    #[cfg(target_os = "linux")]
+    fn skip_without_root_installed_namespaces() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: installed /run/cats namespaces require the root gates");
+            return true;
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn skip_without_root_installed_namespaces() -> bool {
+        false
+    }
+
     fn registration_config(
         state_path: std::path::PathBuf,
     ) -> anyhow::Result<AgentRegistrationConfig> {
@@ -2019,6 +2039,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn production_composition_retires_stale_boot_receipt_before_fresh_full_scan() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state_path = root.path().join("state");
         let desired = stale_boot_composition_desired_spec();
@@ -2110,6 +2133,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_acquire_runner_composition_restarts_from_a22_files_and_checkpoint() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state_path = root.path().join("state");
         let desired = composition_desired_spec();
@@ -2323,6 +2349,9 @@ mod tests {
 
     #[tokio::test]
     async fn runner_owns_host_lock_until_all_runtime_workers_are_joined() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let state_path = state_root.path().join("state");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2405,6 +2434,9 @@ mod tests {
 
     #[tokio::test]
     async fn stubborn_effect_child_keeps_readiness_and_host_lease_closed_past_timeout() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let state_path = state_root.path().join("state");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2498,6 +2530,9 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_overflow_fails_before_registration_or_listener_binding() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2546,6 +2581,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_acquire_lease_fails_before_registration_or_listener_binding() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

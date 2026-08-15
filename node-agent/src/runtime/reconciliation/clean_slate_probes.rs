@@ -16317,6 +16317,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
+        // Provisioning the installed /run/cats namespace requires root; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: installed /run/cats namespace requires the root gates");
+            return;
+        }
         let environment = TestEnvironment::new();
         let state = StateDirectory::unanchored(environment.state.clone());
         #[cfg(target_os = "linux")]

@@ -2563,6 +2563,23 @@ mod tests {
         file
     }
 
+    /// A tempdir parent whose metadata stays quiet for the test's lifetime.
+    /// `/root` is Cargo's live cache parent in the Linux gate: its metadata
+    /// can legitimately change while another test builds a helper,
+    /// invalidating an otherwise exact retained ancestor. The root Docker
+    /// gate uses `/var/lib`; the unprivileged native build host cannot write
+    /// there, but its relocated CARGO_TARGET_DIR subtree is equally quiet.
+    #[cfg(target_os = "linux")]
+    fn quiet_scratch_parent() -> PathBuf {
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let base = std::path::Path::new(&target).join("cats-quiet-scratch");
+            if std::fs::create_dir_all(&base).is_ok() {
+                return base;
+            }
+        }
+        PathBuf::from("/var/lib")
+    }
+
     #[cfg(target_os = "linux")]
     fn inspect_after_checkpoint_cas(
         tail: RunningTail,
@@ -2572,10 +2589,7 @@ mod tests {
     ) -> VmmRuntimePathInspection {
         let temporary = tempfile::Builder::new()
             .prefix("cats-fd64-")
-            // `/root` is Cargo's live cache parent in the Linux gate. Its
-            // metadata can legitimately change while another test builds a
-            // helper, invalidating an otherwise exact retained ancestor.
-            .tempdir_in("/var/lib")
+            .tempdir_in(quiet_scratch_parent())
             .unwrap();
         let root = temporary.path();
         let original = launch_checkpoint_for_paths(root);
@@ -2679,7 +2693,7 @@ mod tests {
     fn pinned_runtime_path_fixture() -> (tempfile::TempDir, PathBuf, PinnedRuntimePath) {
         let temporary = tempfile::Builder::new()
             .prefix("cats-runtime-path-")
-            .tempdir_in("/var/lib")
+            .tempdir_in(quiet_scratch_parent())
             .unwrap();
         let ancestor = temporary.path().join("runtime");
         std::fs::create_dir(&ancestor).unwrap();
