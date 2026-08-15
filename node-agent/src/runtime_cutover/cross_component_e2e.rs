@@ -3005,6 +3005,16 @@ async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_
         .into_iter()
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
     assert_eq!(
         node_image_blob.reads.load(Ordering::SeqCst),
         0,
@@ -5013,6 +5023,16 @@ async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_st
         .into_iter()
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
     let create = context
         .http
         .post(format!(
@@ -5345,6 +5365,16 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
         .into_iter()
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
     let create = context
         .http
         .post(format!(

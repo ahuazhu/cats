@@ -12208,9 +12208,14 @@ mod tests {
         head: RemoteHead,
     ) {
         attachment.head = head.clone();
-        let AuthorizedServingAcquire::Takeover { receipt, .. } = &mut attachment.acquire else {
+        let AuthorizedServingAcquire::Takeover {
+            authorization,
+            receipt,
+        } = &mut attachment.acquire
+        else {
             panic!("takeover fixture must retain a takeover attachment")
         };
+        authorization.expected_head = head.clone();
         receipt.resulting_head = head.clone();
         record.head = head.clone();
         let VolumeAuthorityEvidence::Owned {
@@ -12223,6 +12228,11 @@ mod tests {
         let VolumeEvidenceRecovery::Validated { evidence, decision } = evidence else {
             panic!("takeover fixture must retain validated evidence")
         };
+        if let cats_api::runtime_reconciliation::VolumeAuthorization::Takeover(inner) =
+            &mut evidence.authorization.authorization
+        {
+            inner.expected_head = head.clone();
+        }
         let AuthorizationState::Consumed(stored) = &mut evidence.authorization.state else {
             panic!("takeover fixture authorization must remain consumed")
         };

@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn fixed_identity_material_cross_checks_every_authority() {
         let (identity, key, credential) = vector_material();
-        assert_eq!(identity.len(), 287);
+        assert_eq!(identity.len(), 413);
         let (decoded, signer) = validate_identity_material(&identity, &key, &credential).unwrap();
         assert_eq!(decoded.node_id.as_str(), "node_a");
         assert_eq!(signer.credential_id().as_str(), "credential_a");

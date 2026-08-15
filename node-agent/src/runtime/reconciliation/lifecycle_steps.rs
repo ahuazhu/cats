@@ -4695,10 +4695,10 @@ mod tests {
         runtime: &mut ObservedRuntimeStatus,
     ) {
         let mut intent = desired.volumes[0].clone();
-        intent.volume_intent_id = Id::new("vint_data").unwrap();
-        intent.disk_id = Id::new("disk_data").unwrap();
-        intent.volume_id = Id::new("vol_data").unwrap();
-        intent.attachment_id = Id::new("att_data").unwrap();
+        intent.volume_intent_id = Id::new("vint_z_data").unwrap();
+        intent.disk_id = Id::new("disk_z_data").unwrap();
+        intent.volume_id = Id::new("vol_z_data").unwrap();
+        intent.attachment_id = Id::new("att_z_data").unwrap();
         intent.disk_kind = cats_api::runtime_reconciliation::DiskKind::Persistent;
         intent.guest_device.serial = Id::new("cats-data").unwrap();
         intent.guest_device.slot = 1;
@@ -4780,10 +4780,10 @@ mod tests {
             root_object_id: None,
         };
         let persistent = VolumeIntent {
-            volume_intent_id: Id::new("vint_data").unwrap(),
-            disk_id: Id::new("disk_data").unwrap(),
-            volume_id: Id::new("vol_data").unwrap(),
-            attachment_id: Id::new("att_data").unwrap(),
+            volume_intent_id: Id::new("vint_z_data").unwrap(),
+            disk_id: Id::new("disk_z_data").unwrap(),
+            volume_id: Id::new("vol_z_data").unwrap(),
+            attachment_id: Id::new("att_z_data").unwrap(),
             size_bytes: 4_294_967_296,
             disk_kind: DiskKind::Persistent,
             access: cats_api::runtime_reconciliation::VolumeAccess::ReadWriteOnce,
@@ -5368,9 +5368,10 @@ mod tests {
 
         let mut head_aba = record.clone();
         head_aba.head.root_hash = Some(
-            cats_api::runtime_reconciliation::Sha256Digest::new(
-                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            )
+            cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+                "sha256:{}",
+                "f".repeat(64)
+            ))
             .unwrap(),
         );
         assert!(!released_cache_record_matches_checkpoint(
