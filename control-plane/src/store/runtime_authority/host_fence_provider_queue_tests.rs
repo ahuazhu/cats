@@ -424,12 +424,34 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
 
     let first_request = fixture.request.clone();
     let second_request = fixture.request.clone();
-    let first = std::thread::spawn(move || {
-        first_store.enqueue_host_fence_provider_attempt_for_test(&first_request)
-    });
-    let second = std::thread::spawn(move || {
-        second_store.enqueue_host_fence_provider_attempt_for_test(&second_request)
-    });
+    // The enqueue transaction carries a bounded server-side lock deadline and
+    // fails closed while the observer still holds the source row. Real
+    // callers retry that Unavailable outcome, and so do these threads;
+    // anything else surfaces immediately.
+    fn enqueue_with_deadline_retries(
+        store: &Store,
+        request: &HostFenceAttemptRequest,
+    ) -> crate::store::Result<
+        crate::store::runtime_authority::host_fence_provider_queue::HostFenceProviderQueueRecordV1,
+    > {
+        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            match store.enqueue_host_fence_provider_attempt_for_test(request) {
+                Err(error)
+                    if error.code == ErrorCode::Unavailable
+                        && error.message.contains("deadline elapsed")
+                        && std::time::Instant::now() < retry_until =>
+                {
+                    continue;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+    let first =
+        std::thread::spawn(move || enqueue_with_deadline_retries(&first_store, &first_request));
+    let second =
+        std::thread::spawn(move || enqueue_with_deadline_retries(&second_store, &second_request));
     // Pure poll upper bound: a saturated gate machine can take far longer
     // than an idle one to schedule both enqueue threads onto the lock. A
     // thread that finishes while the source lock is still held failed early;
