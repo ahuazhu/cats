@@ -6464,8 +6464,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         // An absent serving writer whose durable owner intent is still
         // retained (an unretired hard-stop) keeps naming its managed socket
         // paths: they are the retirement effect's responsibility, not stale
-        // residue for the sweep to reclassify.
+        // residue for the sweep to reclassify. Only paths the managed-root
+        // snapshot itself retains stay allowed.
         if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            let retained_paths = before.socket_paths();
             for (key, inspection) in &serving_first {
                 let expectation = serving_expected
                     .get(key)
@@ -6476,9 +6478,14 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                         &serving_socket_owner_authority_digest(expectation.prepared_device())?,
                     )?
                 {
-                    allowed_sockets
-                        .insert(PathBuf::from(expectation.control_socket_path().as_str()));
-                    allowed_sockets.insert(PathBuf::from(expectation.listener_path().as_str()));
+                    for socket in [
+                        expectation.control_socket_path(),
+                        expectation.listener_path(),
+                    ] {
+                        if retained_paths.contains(socket) {
+                            allowed_sockets.insert(PathBuf::from(socket.as_str()));
+                        }
+                    }
                 }
             }
         }
