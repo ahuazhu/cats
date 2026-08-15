@@ -396,10 +396,30 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
     assert!(stdout.contains("post-open forward/credential-independent cleanup verification"));
 }
 
+/// The cutover tools refuse group- or world-writable ancestors. The Linux
+/// gate's default /tmp is sticky, so scratch space moves under the
+/// workspace target directory there; macOS's per-user /var/folders default
+/// already satisfies the contract (and the workspace itself sits under the
+/// group-writable /Users, so it cannot serve as the base).
+fn contract_fixture_tmpdir() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let base = workspace_root().join("target/contract-fixture-tmp");
+        std::fs::create_dir_all(&base).expect("create contract fixture tmpdir");
+        base.canonicalize()
+            .expect("canonicalize contract fixture tmpdir")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 #[test]
 fn production_cutover_proof_set_contract_passes_offline_fixture() {
     let output = Command::new("python3")
         .arg(workspace_root().join("deploy/aws/production-cutover-proof-set-fixture.py"))
+        .env("TMPDIR", contract_fixture_tmpdir())
         .output()
         .expect("run production cutover proof-set fixture");
     assert!(
@@ -418,6 +438,7 @@ fn e3_operator_window_persistence_contract_passes_offline_fixture() {
                 .join("deploy/metal/tests/runtime-cutover-e3-window-persistence-fixture.sh"),
         )
         .arg(workspace_root().join("deploy/metal/runtime-cutover-e3-window.sh"))
+        .env("TMPDIR", contract_fixture_tmpdir())
         .output()
         .expect("run E3 operator window persistence fixture");
     assert!(
@@ -464,6 +485,7 @@ fn production_cutover_operator_trust_contract_passes_offline_fixture() {
         .arg(workspace_root().join("deploy/aws/production-cutover-operator-trust.py"))
         .arg("--openssl")
         .arg(ed25519_openssl())
+        .env("TMPDIR", contract_fixture_tmpdir())
         .output()
         .expect("run production cutover operator trust fixture");
     assert!(
@@ -480,6 +502,7 @@ fn install_operator_tools_contract_passes_offline_fixture() {
         .arg(workspace_root().join("deploy/aws/install-operator-tools-fixture.sh"))
         .arg("--openssl")
         .arg(ed25519_openssl())
+        .env("TMPDIR", contract_fixture_tmpdir())
         .output()
         .expect("run install-operator-tools fixture");
     assert!(
