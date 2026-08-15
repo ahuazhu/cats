@@ -1492,9 +1492,32 @@ fn production_cutover_config(
     let data_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
     let inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority> = authority;
     let blob_store: Arc<dyn BlobStore> = blob_store;
+    // The production loop's inventory scan acknowledges the installed
+    // route-v2 ring; without a machine config the observation carries no
+    // ring ACK and the G3 gate refuses to make the Node Schedulable.
+    let route_public_key = cats_api::route_grant_v2::RouteGrantV2PublicKey::from_public_key_pem(
+        include_bytes!("../../../tests/fixtures/route_grant_v2_public_ed25519.pem"),
+    )
+    .unwrap();
+    assert_eq!(route_public_key.kid().as_str(), ROUTE_V2_KID);
+    let route_ring =
+        RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![route_public_key]).unwrap();
+    let route_v2_machine = RouteV2MachineConfig::for_test(
+        "127.0.0.1:0".to_owned(),
+        registration.identity().node_id.clone(),
+        include_bytes!("../../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_certificate.pem"
+        ),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_private_key.pem"
+        ),
+        Arc::new(RouteGrantV2Verifier::new(route_ring)),
+    )
+    .unwrap();
     super::SignedRuntimeCutoverConfig {
         listen: "127.0.0.1:0".into(),
-        route_v2_machine: None,
+        route_v2_machine: Some(route_v2_machine),
         control_plane_url: context.server.base_url(),
         agent_registration: registration,
         ch_config: production_ch_config(context),
@@ -2818,7 +2841,10 @@ async fn postgres_runtime_schema_write_barrier_calibrates_retired_route_zero_wri
 #[ignore = "requires Linux real systemd PID 1; quality.sh linux runs it explicitly"]
 async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart(
 ) {
-    let context = ControlContext::spawn().await;
+    // The uncordon below crosses the G3 gate: Schedulable requires the Node's
+    // accepted inventory to acknowledge the published route-v2 ring, which
+    // exists only when the control spawns with the route-v2 machine.
+    let context = ControlContext::spawn_route_v2().await;
     let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
     let identity = node_identity(&production_node_signer());
 
