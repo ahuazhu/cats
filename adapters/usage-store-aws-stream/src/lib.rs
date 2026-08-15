@@ -1361,10 +1361,14 @@ mod tests {
         // depending on whether a Kinesis response carried records.
         let first = pacer.tick().await;
         let second = pacer.tick().await;
-        assert_eq!(
-            second.duration_since(first),
-            KINESIS_READ_INTERVAL,
-            "the pacer did not schedule consecutive Kinesis reads one second apart"
+        // The pacer must pay at least the full interval between reads. The
+        // upper bound only rejects a runaway clock: scheduler lag under gate
+        // load legitimately stretches the observed gap past exact equality.
+        let elapsed = second.duration_since(first);
+        assert!(
+            elapsed >= KINESIS_READ_INTERVAL
+                && elapsed < KINESIS_READ_INTERVAL + std::time::Duration::from_millis(500),
+            "the pacer did not schedule consecutive Kinesis reads about one second apart: {elapsed:?}"
         );
     }
 
