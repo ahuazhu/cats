@@ -4298,7 +4298,14 @@ mod tests {
 
     #[test]
     fn generator_immediately_revalidates_the_complete_revision_one_transaction() {
-        let root = TempDir::new().unwrap();
+        // The production reader rejects world-writable ancestors, so the
+        // accepted-candidate root cannot live under a sticky /tmp (the Linux
+        // gate's default). The workspace target directory satisfies the
+        // ancestor contract on every gate host.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/route-v2-r1-test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = TempDir::new_in(&base).unwrap();
         let output = root.path().join("route-v2-r1");
         let inputs = Inputs::new(
             &output,
