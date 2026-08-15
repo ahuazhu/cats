@@ -181,8 +181,22 @@ fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() 
         Err(AuthorityError::BackendUnknown)
     );
 
+    // The exact owner may publish past the frozen attachment head, so a
+    // strictly newer generation is the accepted successor; only an
+    // equal-generation divergence stays unknown state.
+    let mut published_head = record.clone();
+    published_head.head = head(9);
+    assert_eq!(
+        validate_authorized_serving_record(
+            &published_head,
+            &attachment,
+            Some(attachment.lease_expires_at)
+        ),
+        Ok(())
+    );
     let mut wrong_head = record.clone();
-    wrong_head.head = head(9);
+    wrong_head.head.root_hash =
+        Some(Sha256Digest::new(format!("sha256:{:064x}", 0xdead_beef_u64)).unwrap());
     assert_eq!(
         validate_authorized_serving_record(
             &wrong_head,

@@ -3676,14 +3676,18 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                         && u64::try_from(cache.st_size).ok() == Some(attachment.size_bytes),
                     "root-provision control-only cache has unsafe identity or size"
                 );
-                if inspect_empty_dirty_bitmap_at(
-                    &epoch_directory,
-                    &by_name["dirty.bitmap"],
-                    root,
-                    attachment.size_bytes,
-                    context,
-                )?
-                .is_none()
+                // Once the sealed serving handoff exists, the serving lineage
+                // owns the engine files: Relaxed writes legitimately dirty the
+                // bitmap, so only a still-control-only dir must stay clean.
+                if !has_unvalidated_handoff_artifact
+                    && inspect_empty_dirty_bitmap_at(
+                        &epoch_directory,
+                        &by_name["dirty.bitmap"],
+                        root,
+                        attachment.size_bytes,
+                        context,
+                    )?
+                    .is_none()
                 {
                     scan.complete = false;
                     continue;
@@ -3703,8 +3707,11 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     scan.complete = false;
                     continue;
                 };
+                // Once the sealed serving handoff exists, the serving lineage
+                // owns these engine files and Relaxed pending packs are its
+                // unique data; only a still-control-only dir must stay empty.
                 anyhow::ensure!(
-                    pending_entries.is_empty(),
+                    pending_entries.is_empty() || has_unvalidated_handoff_artifact,
                     "root-provision control-only blockd retains a pending pack"
                 );
                 AuthorizedBlockdControlState::ExactControlOnlyEmpty
@@ -5240,9 +5247,14 @@ impl PlatformRootProcessInventoryBridge {
             ManagedBlockdStartTarget::Root(expected) => admission
                 .root_control(&expected.cat_id)
                 .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+            // Lease read skew between the admission mint and this start gate
+            // is not an identity mismatch; see
+            // ServingBlockdExpectation::matches_admitted.
             ManagedBlockdStartTarget::Serving(expected) => admission
                 .serving_blockd(expected.cat_id(), expected.volume_id())
-                .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+                .is_some_and(|(admitted, exact)| {
+                    expected.matches_admitted(admitted) && exact.is_none()
+                }),
         };
         anyhow::ensure!(
             admitted_absent,
@@ -6124,10 +6136,16 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_admitted
-            || serving_first != serving_admitted
-            || vmm_first != vmm_admitted
-        {
+        // Serving evidence carries the live engine's durability counters,
+        // which a Relaxed writer mutates between the admission mint and this
+        // read; compare the stable identity instead of byte equality.
+        let serving_matches_admitted = serving_first.len() == serving_admitted.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_admitted
+                    .get(key)
+                    .is_some_and(|admitted| first.stable_identity_eq(admitted))
+            });
+        if root_first != root_admitted || !serving_matches_admitted || vmm_first != vmm_admitted {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
 
@@ -6236,7 +6254,13 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_second || serving_first != serving_second || vmm_first != vmm_second {
+        let serving_stable = serving_first.len() == serving_second.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_second
+                    .get(key)
+                    .is_some_and(|second| first.stable_identity_eq(second))
+            });
+        if root_first != root_second || !serving_stable || vmm_first != vmm_second {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
         Ok(AdmittedManagedProcessInspection::Exact {
@@ -6437,6 +6461,27 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 );
             }
         }
+        // An absent serving writer whose durable owner intent is still
+        // retained (an unretired hard-stop) keeps naming its managed socket
+        // paths: they are the retirement effect's responsibility, not stale
+        // residue for the sweep to reclassify.
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            for (key, inspection) in &serving_first {
+                let expectation = serving_expected
+                    .get(key)
+                    .expect("inspection keys originate from expectations");
+                if matches!(inspection, ServingBlockdProcessInspection::Absent)
+                    && before.retains_serving_owner(
+                        expectation.device_ownership_token(),
+                        &serving_socket_owner_authority_digest(expectation.prepared_device())?,
+                    )?
+                {
+                    allowed_sockets
+                        .insert(PathBuf::from(expectation.control_socket_path().as_str()));
+                    allowed_sockets.insert(PathBuf::from(expectation.listener_path().as_str()));
+                }
+            }
+        }
         for inspection in vmm_first.values() {
             if let VmmProcessInspection::Exact(evidence) = inspection {
                 anyhow::ensure!(
@@ -6534,7 +6579,9 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         let root_second =
             match inspect_root_process_set(self.port.as_ref(), &root_expected, context) {
                 Ok(Some(inspected)) => inspected,
-                Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+                Ok(None) => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
                 Err(_problem) if context.check_active().is_err() => {
                     return Ok(unavailable(exact_running_negative_cats));
                 }
@@ -6546,7 +6593,9 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             context,
         ) {
             Ok(Some(inspected)) => inspected,
-            Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+            Ok(None) => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
             Err(_problem) if context.check_active().is_err() => {
                 return Ok(unavailable(exact_running_negative_cats));
             }
@@ -6555,13 +6604,24 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         let vmm_second =
             match inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context) {
                 Ok(Some(inspected)) => inspected,
-                Ok(None) => return Ok(unavailable(exact_running_negative_cats)),
+                Ok(None) => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
                 Err(_problem) if context.check_active().is_err() => {
                     return Ok(unavailable(exact_running_negative_cats));
                 }
                 Err(problem) => return Err(problem),
             };
-        if root_first != root_second || serving_first != serving_second || vmm_first != vmm_second {
+        // Serving evidence carries the live engine's durability counters,
+        // which a Relaxed writer mutates between the two reads; compare the
+        // stable identity instead of byte equality.
+        let serving_stable = serving_first.len() == serving_second.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_second
+                    .get(key)
+                    .is_some_and(|second| first.stable_identity_eq(second))
+            });
+        if root_first != root_second || !serving_stable || vmm_first != vmm_second {
             return Ok(unavailable(exact_running_negative_cats));
         }
         let mut absent_serving_owners = BTreeSet::new();
@@ -6715,7 +6775,9 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
                 ServingBlockdProcessConflict::IdentityMismatch,
             ));
         };
-        if admitted_target != expected {
+        // Lease read skew between the admission mint and this sweep is not an
+        // identity mismatch; see ServingBlockdExpectation::matches_admitted.
+        if !expected.matches_admitted(admitted_target) {
             return Ok(ServingBlockdProcessInspection::Conflict(
                 ServingBlockdProcessConflict::IdentityMismatch,
             ));

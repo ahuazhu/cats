@@ -1358,9 +1358,11 @@ impl PrepareNetworkReservationEffect {
         let ServingBlockdProcessInspection::Exact(current_process) = inspection else {
             anyhow::bail!("PrepareNetwork serving authority is no longer exact")
         };
+        // Identity stays exact; the live engine's durability counters
+        // legitimately advance between the admission mint and this read.
         anyhow::ensure!(
             current_process.exactly_matches(expected)
-                && current_process.as_ref() == admitted.evidence(),
+                && current_process.stable_identity_eq(admitted.evidence()),
             "PrepareNetwork serving process/status authority drifted"
         );
         let current_authority = self
@@ -1461,10 +1463,13 @@ pub(super) fn prepare_network_volume_admission_is_exact(
         && lineage.acquire_origin == device.acquire_origin
         && lineage.node_id == desired.placement.node_id
         && lineage.placement_epoch == desired.placement.placement_epoch
-        && lineage.local_durable_generation == head.generation
-        && lineage.remote_durable_generation == head.generation
+        // Monotonic durability pins: a live Relaxed writer legitimately
+        // advances the local generation past the provisioned head while
+        // pending packs hold the unpublished window (see the NodeObservation
+        // lineage contract).
+        && lineage.remote_durable_generation >= head.generation
+        && lineage.local_durable_generation >= lineage.remote_durable_generation
         && lineage.data_directory == device.serving_process.data_directory
-        && lineage.pending_pack_count.get() == 0
         && !lineage.fenced
         && lineage.state == LocalLineageState::Active
 }

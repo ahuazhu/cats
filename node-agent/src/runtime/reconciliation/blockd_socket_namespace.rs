@@ -84,6 +84,19 @@ impl CurrentBlockdSocketBoot {
 pub(crate) fn serving_socket_owner_authority_digest(
     prepared: &PreparedDeviceInput,
 ) -> anyhow::Result<Sha256Digest> {
+    // The socket owner digest binds the immutable owner identity. The
+    // expected head evolves with every published generation under this same
+    // grant, so it is normalized to the blank sentinel before hashing; the
+    // receipt written at spawn must keep naming the same owner after later
+    // durable writes advance the head.
+    let mut prepared = prepared.clone();
+    prepared.expected_head = cats_api::runtime_reconciliation::RemoteHead {
+        generation: cats_api::runtime_reconciliation::Generation::new(0)
+            .context("blank sentinel generation")?,
+        root_hash: None,
+        root_object_id: None,
+    };
+    let prepared = &prepared;
     let value = serde_json::to_value(prepared).context("encode Serving socket owner authority")?;
     let bytes = canonical_json_bytes(&value);
     let decoded: PreparedDeviceInput =

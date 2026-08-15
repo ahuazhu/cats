@@ -247,11 +247,20 @@ pub fn validate_authorized_serving_record(
 ) -> Result<()> {
     validate_authorized_serving_attachment(attachment)?;
     validate_volume_record(record)?;
+    // The exact owner under the exact epoch may have published past the
+    // frozen attachment head, so a strictly newer generation is the expected
+    // evolution of this same grant; only an equal-generation divergence or a
+    // regression below the frozen head is unknown state.
+    let head_is_current = if record.head.generation == attachment.head.generation {
+        record.head == attachment.head
+    } else {
+        record.head.generation > attachment.head.generation
+    };
     if record.volume_id != attachment.identity.volume_id
         || record.size_bytes != attachment.size_bytes
         || record.durability != attachment.durability
         || !matches!(record.admin_state, VolumeAdminState::Active)
-        || record.head != attachment.head
+        || !head_is_current
         || record.lease_owner.as_ref() != Some(&attachment.identity.attachment_id)
         || record.lease_epoch != attachment.identity.attachment_epoch
         || expected_expiry.is_some_and(|expiry| record.lease_expires_at != Some(expiry))

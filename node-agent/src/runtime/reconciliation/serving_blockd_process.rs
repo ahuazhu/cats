@@ -126,6 +126,18 @@ pub(crate) enum ServingBlockdProcessInspection {
     Unavailable,
 }
 
+impl ServingBlockdProcessInspection {
+    /// See [`ServingBlockdProcessEvidence::stable_identity_eq`].
+    pub(crate) fn stable_identity_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) | (Self::Unavailable, Self::Unavailable) => true,
+            (Self::Exact(first), Self::Exact(second)) => first.stable_identity_eq(second),
+            (Self::Conflict(first), Self::Conflict(second)) => first == second,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServingBlockdProcessStart {
     Submitted,
@@ -521,8 +533,69 @@ impl ServingBlockdExpectation {
         Ok(self)
     }
 
+    /// Admission equality for a freshly re-derived expectation: every
+    /// identity field must match the admitted start exactly. The attachment
+    /// lease expiry is deliberately excluded: the admission and the effect
+    /// read the continuously renewed lease at different instants, so any
+    /// equality or ordering requirement between the two reads livelocks the
+    /// serving start. Lease liveness is enforced separately against the
+    /// current authority record.
+    pub(super) fn matches_admitted(&self, admitted: &Self) -> bool {
+        let Self {
+            volume,
+            unit_id,
+            cgroup_path,
+            executable_path,
+            command_line,
+            control_socket_path,
+            data_directory,
+            process_identity_token,
+            device_ownership_token,
+            frontend,
+            prepared_device,
+            expected_remote_head,
+            authority_lease_expires_at: _,
+        } = self;
+        *volume == admitted.volume
+            && *unit_id == admitted.unit_id
+            && *cgroup_path == admitted.cgroup_path
+            && *executable_path == admitted.executable_path
+            && *command_line == admitted.command_line
+            && *control_socket_path == admitted.control_socket_path
+            && *data_directory == admitted.data_directory
+            && *process_identity_token == admitted.process_identity_token
+            && *device_ownership_token == admitted.device_ownership_token
+            && *frontend == admitted.frontend
+            && *prepared_device == admitted.prepared_device
+            // Publishes advance the remote head monotonically between the
+            // admission mint and this recomputation, in either read order;
+            // a same-generation tuple must stay byte-exact.
+            && (cats_storage::authority::remote_head_is_same_or_later(
+                expected_remote_head,
+                &admitted.expected_remote_head,
+            ) || cats_storage::authority::remote_head_is_same_or_later(
+                &admitted.expected_remote_head,
+                expected_remote_head,
+            ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_renewed_lease_for_test(mut self, expiry: UnixMillis) -> Self {
+        self.authority_lease_expires_at = expiry;
+        self
+    }
+
     fn status_is_exact_at_head(&self, status: &DurabilityStatus, head: &RemoteHead) -> bool {
-        let remote_generation = i64::try_from(head.generation.get()).ok().unwrap_or(-1);
+        // The engine's own remote head is the live binding target: the writer
+        // under this exact grant may already have published past the retained
+        // head, so the live head must only be the same or a later generation.
+        let Some(live_head) = status.remote_head.as_ref() else {
+            return false;
+        };
+        if !cats_storage::authority::remote_head_is_same_or_later(live_head, head) {
+            return false;
+        }
+        let remote_generation = i64::try_from(live_head.generation.get()).ok().unwrap_or(-1);
         let generation_gap = status
             .local_durable_generation
             .checked_sub(status.remote_durable_generation);
@@ -532,7 +605,7 @@ impl ServingBlockdExpectation {
             &self.unit_id,
             &self.process_identity_token,
             &self.device_ownership_token,
-            head,
+            live_head,
         ) && status.remote_durable_generation == remote_generation
             && generation_gap.is_some_and(|gap| {
                 gap >= 0
@@ -587,7 +660,13 @@ impl ServingBlockdExpectation {
             && current
                 .lease_expires_at
                 .is_some_and(|expiry| expiry >= self.authority_lease_expires_at)
-            && current.head == self.expected_remote_head
+            // The running writer under this exact grant may already have
+            // published past the retained head; only a same-generation
+            // divergence or a regression is a conflict.
+            && cats_storage::authority::remote_head_is_same_or_later(
+                &current.head,
+                &self.expected_remote_head,
+            )
             && current.last_transition == Some(attachment.expected_last_transition())
     }
 
@@ -937,6 +1016,46 @@ pub(crate) struct ServingBlockdProcessEvidence {
 }
 
 impl ServingBlockdProcessEvidence {
+    /// Double-read stability for the Node-global sweep: every identity field
+    /// must be unchanged between the two reads, while the live engine's
+    /// durability counters legitimately advance (a Relaxed writer retrying
+    /// its background publish mutates them continuously).
+    pub(crate) fn stable_identity_eq(&self, other: &Self) -> bool {
+        let Self {
+            process_id,
+            unit_main_process_id,
+            process_start_time_ticks,
+            executable_path,
+            unit_id,
+            cgroup_path,
+            cgroup_process_ids,
+            command_line,
+            control_socket_path,
+            data_directory,
+            process_identity_token,
+            device_ownership_token,
+            frontend,
+            listener_identity,
+            handshake_peer_process_id,
+            status: _,
+        } = self;
+        *process_id == other.process_id
+            && *unit_main_process_id == other.unit_main_process_id
+            && *process_start_time_ticks == other.process_start_time_ticks
+            && *executable_path == other.executable_path
+            && *unit_id == other.unit_id
+            && *cgroup_path == other.cgroup_path
+            && *cgroup_process_ids == other.cgroup_process_ids
+            && *command_line == other.command_line
+            && *control_socket_path == other.control_socket_path
+            && *data_directory == other.data_directory
+            && *process_identity_token == other.process_identity_token
+            && *device_ownership_token == other.device_ownership_token
+            && *frontend == other.frontend
+            && *listener_identity == other.listener_identity
+            && *handshake_peer_process_id == other.handshake_peer_process_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_inspected(
         process_id: u32,
@@ -1663,7 +1782,7 @@ impl ServingBlockdStartEffect {
                 Err(_) => return Ok(Some(stop_local())),
             };
             let expected = retained.expectation(&self.systemd, desired, &first_authority)?;
-            if &expected != admitted_expected {
+            if !expected.matches_admitted(admitted_expected) {
                 return Ok(Some(stop_local()));
             }
             let Some(first_lease_expiry) = first_authority.lease_expires_at else {
@@ -1709,7 +1828,7 @@ impl ServingBlockdStartEffect {
                 }
                 (Some(admitted), ServingBlockdProcessInspection::Exact(evidence))
                     if evidence.exactly_matches(&entry.expected)
-                        && evidence.as_ref() == admitted.evidence() => {}
+                        && evidence.stable_identity_eq(admitted.evidence()) => {}
                 (_, ServingBlockdProcessInspection::Conflict(_)) => {
                     return Ok(Some(stop_local()));
                 }

@@ -7846,6 +7846,9 @@ fn prepared_volume_is_exact(
         DiskKind::Root => observed.disk_kind == ObservedDiskKind::Root,
         DiskKind::Persistent => observed.disk_kind == ObservedDiskKind::Persistent,
     };
+    // The serving writer under this same grant may already have published
+    // past the prepared head: a strictly newer generation is the expected
+    // evolution, while a same-generation tuple must stay byte-exact.
     let authority_is_exact = matches!(
         &observed.authority,
         VolumeAuthorityEvidence::Owned {
@@ -7854,8 +7857,14 @@ fn prepared_volume_is_exact(
             head,
         } if attachment_id == &input.attachment_id
             && attachment_epoch == &input.attachment_epoch
-            && head == &input.expected_head
+            && (head.generation > input.expected_head.generation
+                || head == &input.expected_head)
     );
+    // The lineage identity is pinned exactly, while the live durability
+    // coordinates are pinned monotonically: once the serving writer attaches,
+    // a Relaxed FLUSH legitimately advances the local generation past the
+    // provisioned head while pending packs hold the unpublished window, so an
+    // equality pin would make that flagship state unobservable on the wire.
     let lineage_is_exact = matches!(
         observed.local_lineages.as_slice(),
         [lineage]
@@ -7864,10 +7873,9 @@ fn prepared_volume_is_exact(
                 && lineage.acquire_origin == input.acquire_origin
                 && lineage.node_id == *node_id
                 && lineage.placement_epoch == *placement_epoch
-                && lineage.local_durable_generation == input.expected_head.generation
-                && lineage.remote_durable_generation == input.expected_head.generation
+                && lineage.remote_durable_generation >= input.expected_head.generation
+                && lineage.local_durable_generation >= lineage.remote_durable_generation
                 && lineage.data_directory == input.serving_process.data_directory
-                && lineage.pending_pack_count.get() == 0
                 && !lineage.fenced
                 && lineage.state == LocalLineageState::Active
     );

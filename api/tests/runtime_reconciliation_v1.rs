@@ -3867,9 +3867,9 @@ fn launch_phase_steps_require_exact_volume_authority_and_lineage() {
             "lineage_origin",
             "lineage_node",
             "lineage_placement",
-            "lineage_generations",
+            "lineage_remote_regression",
+            "lineage_local_below_remote",
             "lineage_directory",
-            "lineage_pending",
             "lineage_fenced",
             "lineage_state",
             "missing_lineage",
@@ -3897,11 +3897,14 @@ fn launch_phase_steps_require_exact_volume_authority_and_lineage() {
                 "authority_epoch" => {
                     checkpoint["volumes"][0]["authority"]["attachment_epoch"] = 9.into()
                 }
+                // A strictly newer generation under the same grant is the
+                // legal published successor; only a same-generation
+                // divergence stays rejected.
                 "authority_head" => {
                     checkpoint["volumes"][0]["authority"]["head"] = serde_json::json!({
-                        "generation": 2,
-                        "root_hash": ZERO_DIGEST,
-                        "root_object_id": "volumes/vol_root/roots/2",
+                        "generation": 1,
+                        "root_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                        "root_object_id": "volumes/vol_root/roots/1",
                     })
                 }
                 "lineage_attachment" => {
@@ -3923,18 +3926,24 @@ fn launch_phase_steps_require_exact_volume_authority_and_lineage() {
                 "lineage_placement" => {
                     checkpoint["volumes"][0]["local_lineages"][0]["placement_epoch"] = 4.into()
                 }
-                "lineage_generations" => {
+                // A Relaxed writer legitimately advances the local generation
+                // past the provisioned head with pending packs holding the
+                // unpublished window; only monotonicity violations reject.
+                "lineage_remote_regression" => {
+                    checkpoint["volumes"][0]["local_lineages"][0]["remote_durable_generation"] =
+                        0.into();
                     checkpoint["volumes"][0]["local_lineages"][0]["local_durable_generation"] =
-                        2.into();
+                        0.into();
+                }
+                "lineage_local_below_remote" => {
                     checkpoint["volumes"][0]["local_lineages"][0]["remote_durable_generation"] =
                         2.into();
+                    checkpoint["volumes"][0]["local_lineages"][0]["local_durable_generation"] =
+                        1.into();
                 }
                 "lineage_directory" => {
                     checkpoint["volumes"][0]["local_lineages"][0]["data_directory"] =
                         "/var/lib/cats/foreign".into()
-                }
-                "lineage_pending" => {
-                    checkpoint["volumes"][0]["local_lineages"][0]["pending_pack_count"] = 1.into()
                 }
                 "lineage_fenced" => {
                     checkpoint["volumes"][0]["local_lineages"][0]["fenced"] = true.into()

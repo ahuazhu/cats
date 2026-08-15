@@ -599,7 +599,7 @@ impl PlatformLifecyclePhysicalPort {
                 Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
             }
             ServingBlockdProcessInspection::Exact(fresh)
-                if fresh.as_ref() == admitted.evidence() =>
+                if fresh.stable_identity_eq(admitted.evidence()) =>
             {
                 if admitted.assert_listener_current(context).is_err() {
                     return Ok(LifecyclePhysicalAttempt::Conflict);
@@ -6571,6 +6571,41 @@ mod tests {
             );
             assert!(detach.calls.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn admitted_serving_expectation_ignores_lease_read_skew() {
+        // The admission and the effect read the continuously renewed
+        // attachment lease at different instants, in either order. Any
+        // equality or ordering requirement between the two reads livelocked
+        // the PrepareDevice serving start; identity fields stay exact while
+        // the lease expiry is excluded from admission equality.
+        let (desired, checkpoint, _runtime) = fixtures(RuntimeTarget::Running);
+        let admitted =
+            ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(&checkpoint, &desired)
+                .unwrap();
+        // The test constructor pins a fixed lease expiry; skew one step past it.
+        let skewed_expiry =
+            cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_120_001).unwrap();
+        let skewed = admitted.clone().with_renewed_lease_for_test(skewed_expiry);
+        assert!(skewed.matches_admitted(&admitted));
+        assert!(
+            admitted.matches_admitted(&skewed),
+            "lease read skew in either direction must not reject the admitted start"
+        );
+
+        // Calibrate the negative: an identity drift (a Desired targeting
+        // Cold instead of Running inside the authorized volume) fails closed.
+        let (cold_desired, cold_checkpoint, _cold_runtime) = fixtures(RuntimeTarget::Cold);
+        let foreign = ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(
+            &cold_checkpoint,
+            &cold_desired,
+        )
+        .unwrap();
+        assert!(
+            !foreign.matches_admitted(&admitted),
+            "identity drift must stay rejected while lease skew is tolerated"
+        );
     }
 
     #[test]

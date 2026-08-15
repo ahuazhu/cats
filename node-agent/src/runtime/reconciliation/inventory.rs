@@ -2095,20 +2095,23 @@ fn runtime_from_inventory(
                     .as_ref()
                     .is_some_and(|release| release.generation == head.generation)
             }
+            // The serving writer under this same grant may already have
+            // published past the checkpointed head; a later durable write
+            // advances it, while a same-generation tuple must stay byte-exact.
             (
                 ReconcileStep::PrepareDevice { devices },
                 VolumeAuthorityEvidence::Owned { head, .. },
             ) => devices
                 .iter()
                 .find(|device| device.volume_id == volume.volume_id)
-                .is_some_and(|device| &device.expected_head == head),
+                .is_some_and(|device| remote_head_is_same_or_later(head, &device.expected_head)),
             (
                 ReconcileStep::PrepareNetwork { devices, .. },
                 VolumeAuthorityEvidence::Owned { head, .. },
             ) => devices
                 .iter()
                 .find(|device| device.volume_id == volume.volume_id)
-                .is_some_and(|device| &device.expected_head == head),
+                .is_some_and(|device| remote_head_is_same_or_later(head, &device.expected_head)),
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id

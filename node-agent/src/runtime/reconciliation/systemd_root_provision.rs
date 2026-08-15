@@ -2631,10 +2631,12 @@ pub(super) fn platform_listener_peer(
     }
     match proc_unix_listener_inode(socket, context)? {
         ListenerInodeInspection::Exact(inode) if inode == socket_inode => {}
-        ListenerInodeInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
-        ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Conflict => {
-            return Ok(ListenerPeerInspection::Conflict)
+        // The listener-to-accepted transition between the two reads swaps
+        // the identity inode; that is a retryable race, not a foreign holder.
+        ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Unavailable => {
+            return Ok(ListenerPeerInspection::Unavailable)
         }
+        ListenerInodeInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
     }
     match node_global_listener_fd_owner(expected_process_id, socket_inode, context)? {
         ListenerHolderInspection::Exact => {}
@@ -2780,7 +2782,8 @@ fn inspect_proc_net_unix_text(
             .eq(["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",]),
         "/proc/net/unix header changed shape"
     );
-    let mut matching = Vec::new();
+    let mut listeners = Vec::new();
+    let mut connected = Vec::new();
     for (index, line) in lines.enumerate() {
         anyhow::ensure!(
             !line.trim().is_empty(),
@@ -2789,15 +2792,26 @@ fn inspect_proc_net_unix_text(
         let fields = parse_proc_net_unix_line(line)
             .with_context(|| format!("parse /proc/net/unix row {}", index + 2))?;
         if fields.path == socket_path.as_str() {
-            if fields.flags != "00010000" || fields.socket_type != "0001" || fields.state != "01" {
+            if fields.socket_type != "0001" {
                 return Ok(ListenerInodeInspection::Conflict);
             }
-            matching.push(fields.inode);
+            if fields.flags == "00010000" && fields.state == "01" {
+                listeners.push(fields.inode);
+            } else if fields.flags == "00000000" && fields.state == "03" {
+                // An accepted stream conversation shows the bound path as a
+                // second row (state 03). The vhost daemon drops its listener
+                // after the frontend attaches, so the sole conversation is
+                // the live socket identity once no listener remains.
+                connected.push(fields.inode);
+            } else {
+                return Ok(ListenerInodeInspection::Conflict);
+            }
         }
     }
-    Ok(match matching.as_slice() {
-        [inode] => ListenerInodeInspection::Exact(*inode),
-        [] => ListenerInodeInspection::Unavailable,
+    Ok(match (listeners.as_slice(), connected.as_slice()) {
+        ([inode], _) => ListenerInodeInspection::Exact(*inode),
+        ([], [inode]) => ListenerInodeInspection::Exact(*inode),
+        ([], []) => ListenerInodeInspection::Unavailable,
         _ => ListenerInodeInspection::Conflict,
     })
 }
