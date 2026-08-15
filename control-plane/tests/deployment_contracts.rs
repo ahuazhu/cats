@@ -3965,6 +3965,13 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
 fn production_deployment_builds_the_same_guest_payload_as_release() {
     let release = read_workspace_file(".github/workflows/release.yml");
     let production = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert_eq!(
+        production
+            .matches("      - name: Build the one Guest payload\n")
+            .count(),
+        1,
+        "the production deployment must build the Guest payload exactly once"
+    );
     let payload_build = production
         .find("      - name: Build the one Guest payload\n")
         .expect("production Guest payload build");
