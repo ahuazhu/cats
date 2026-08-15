@@ -1263,12 +1263,10 @@ mod tests {
                     "cumulative_quantity": sequence_number
                 },
                 "source_binding": {
-                    "session": {
-                        "node_id": "metal-1",
-                        "node_boot_id": "11111111111111111111111111111111",
-                        "agent_instance_id": "22222222222222222222222222222222",
-                        "agent_session_epoch": 1
-                    },
+                    "node_id": "metal-1",
+                    "node_boot_id": "11111111111111111111111111111111",
+                    "agent_instance_id": "22222222222222222222222222222222",
+                    "agent_epoch": 1,
                     "desired_revision": 1,
                     "runtime_incarnation": "33333333333333333333333333333333"
                 },
