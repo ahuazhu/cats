@@ -17511,12 +17511,18 @@ mod tests {
                 process_ids: Mutex::new(VecDeque::from([None, None])),
             }),
         );
-        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
-            .expect_err("live managed listeners were projected as absent");
-        assert!(
-            format!("{error:#}").contains("retains a live Unix listener"),
-            "{error:#}"
-        );
+        // A live listener whose owner process reports Absent is scan
+        // incompleteness: the joint inspection fails closed as Unavailable,
+        // never completing inventory and never touching local state.
+        let outcome = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect("mismatched live listeners fail closed as incomplete inventory");
+        let crate::runtime::reconciliation::inventory::RootProcessInventoryBridgeOutcome::Unavailable {
+            exact_running_negative_cats,
+        } = outcome
+        else {
+            panic!("live managed listeners entered a completed inventory: {outcome:?}");
+        };
+        assert!(exact_running_negative_cats.is_empty());
         assert_eq!(
             before,
             [
@@ -17715,12 +17721,18 @@ mod tests {
                 process_ids: Mutex::new(VecDeque::from([None, None])),
             }),
         );
-        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
-            .expect_err("same-name managed marker inode ABA entered a complete full inventory");
-        assert!(
-            format!("{error:#}").contains("changed across full Node-global inventory"),
-            "{error:#}"
-        );
+        // A same-name marker whose inode changed mid-scan is scan
+        // incompleteness: the joint inspection fails closed as Unavailable,
+        // never completing inventory and never touching local state.
+        let outcome = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect("marker inode ABA fails closed as incomplete inventory");
+        let crate::runtime::reconciliation::inventory::RootProcessInventoryBridgeOutcome::Unavailable {
+            exact_running_negative_cats,
+        } = outcome
+        else {
+            panic!("same-name marker inode ABA entered a completed inventory: {outcome:?}");
+        };
+        assert!(exact_running_negative_cats.is_empty());
         assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
         let marker_after = file_bytes_and_inode(&marker);
         assert_eq!(marker_after.0, marker_before.0);
