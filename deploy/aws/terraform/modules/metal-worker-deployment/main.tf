@@ -191,6 +191,11 @@ locals {
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
     test "${var.install_root}" = /opt/cats
+    # Host-lifetime prerequisites come from the host bootstrap, not this
+    # release transaction. cats-worker.service consumes both at start; fail
+    # here on a fresh host instead of crash-looping the unit later.
+    test -s /etc/cats/rds-ca.pem
+    test -x "${var.install_root}/bin/cloud-hypervisor"
     release_installer="${var.install_root}/bin/install-guest-runtime-release"
     cats_acquire_worker_deployment_lock
 
