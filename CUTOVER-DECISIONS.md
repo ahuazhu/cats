@@ -46,8 +46,13 @@ DEFERRED.md #1–#9、#12 维持：E9 逐事件 terminal receipt 协议、source
 跨 Node tail、N1/N2 各类精确回收许可、A3 tombstone GC、V5 live PersistentDisk
 矩阵（随 D1 延后）。
 
-## D. 待用户拍板（不阻塞当前推进）
+## D. 用户已拍板（2026-08-15）
 
-- **D5**：GitHub Actions 账单何时恢复——决定 G6（HA 重认证）与 E11（ECR 信任收紧）
-  的排期；恢复前两项都不阻塞窗口。
+- **CI/CD 完全绕开 GitHub Actions**：不修复不等待 Actions；发布唯一通路 =
+  manual-release-bundle + 手工门禁（本地 full/linux + build host 原生 full +
+  metal E3）。D4 定案为"显式停用 workflow"；D5 不再跟踪，G6/E11 改本地驱动或
+  无限期延后。
+- **窗口时间 = 尽快**：门禁绿 + 合 main 后立即连续执行工件重建 → terraform
+  applies → A23 发放 → metal E3 qualification → 窗口（reset → deploy → E12 →
+  final-open），不留调度间隔。destructive forward-only 点前仍按 runbook 停点确认。
 - 上表 A 中任何一项如需推翻，请直接说明编号。
