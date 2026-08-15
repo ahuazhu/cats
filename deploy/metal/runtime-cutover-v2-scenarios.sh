@@ -150,7 +150,7 @@ file_link_count() {
   elif count=$(stat -f '%l' "$path" 2>/dev/null); then
     :
   else
-    fail "could not read file link count"
+    fail "could not read file link count: $path"
   fi
   [[ $count =~ ^[1-9][0-9]*$ ]] || fail "file link count is invalid"
   printf '%s' "$count"

@@ -966,6 +966,16 @@ fn runner_uses_only_the_fixed_root_private_tmpfs_stage_in_production() {
         // gate executes the fixed tmpfs and cleanup checks below.
         return;
     }
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").expect("read fixture mountinfo");
+    if !mountinfo
+        .lines()
+        .any(|line| line.contains(" /run ") && line.contains(" tmpfs "))
+    {
+        // Root inside the unprivileged workspace gate container has no /run
+        // tmpfs; the privileged PID-1 phase and the native root gate execute
+        // the fixed-stage checks below.
+        return;
+    }
     let stage_name = format!("invocation-{:064x}", std::process::id());
     let script = r#"
 set -euo pipefail
@@ -2094,6 +2104,11 @@ exit 97
         &fake_stat,
         r#"#!/usr/bin/env bash
 set -euo pipefail
+# GNU stat (Linux) takes -c directly; only the BSD stat behind macOS needs
+# the flag translation below.
+if [[ ${1:-} == -c ]] && /usr/bin/stat -c '%h' /dev/null >/dev/null 2>&1; then
+  exec /usr/bin/stat "$@"
+fi
 if [[ ${1:-} == -c ]]; then
   format=$2
   shift 2
