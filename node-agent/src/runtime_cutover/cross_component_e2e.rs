@@ -2108,6 +2108,9 @@ fn serving_status(control_socket: &HostPath) -> DurabilityStatus {
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Retained for the wire-expressible fault-injection redesign tracked in
+// DEFERRED.md.
+#[allow(dead_code)]
 enum ServingObservationFault {
     WrongAcquireOrigin,
     WrongAuthorityHead,
@@ -2134,6 +2137,10 @@ impl FaultInjectingServingScanner {
         }
     }
 
+    // Retained for the wire-expressible fault-injection redesign tracked in
+    // DEFERRED.md; the current negatives are descoped because the wire
+    // contract already rejects them client-side.
+    #[allow(dead_code)]
     fn arm(&self, fault: ServingObservationFault) {
         let mut armed = self.armed.lock().unwrap();
         assert!(

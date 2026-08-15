@@ -15,3 +15,9 @@ E14：Cross-component Closed mutation-admission proof 尚无已接受的可消�
 V3/E13：Node 侧 object-write credential 生成 + A19 注册未组合；`AuthorizedServingAttachment.object_write_credential` 定为 `Option`，普通 serving 走 `None`，qualified object-write 发布路径对 `None` fail-closed（与手工围栏 D7 一致）。组合落地后回收该 Option。
 E3/D6：operator 私钥 prepare/apply 远程签名分离受 4 分钟 command lifetime 限制未接入 runner；v1 按 CUTOVER-DECISIONS.md D6 妥协执行，改造延后。
 E13：install-operator-tools.sh 的 bundle sha256 校验与 tar 提取按路径分次打开（TOCTOU）；合并后改为单 fd 打开、对 /dev/fd/N 校验并从同一 fd 提取（照 E3 窗口脚本的 fd-pinning 模式）。操作员 Host 无低权限本地用户，窗口内风险有限。
+
+## E2E 注错负段重设计（wire-expressible faults）
+聚焦 E2E 的 wrong-origin / wrong-head 注错负段已降级：NodeObservation 线协议
+把 device 阶段观测的 lineage 起源与权威头钉死到观测到的 step，两种注错在线上
+都不可表达（更早的合同层已包含该防御）。需要重设计为线协议可表达的负例
+（例如在非 device 阶段注错，或直接以合同层拒收为断言目标）后再恢复。
