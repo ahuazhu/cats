@@ -4300,10 +4300,15 @@ mod tests {
     fn generator_immediately_revalidates_the_complete_revision_one_transaction() {
         // The production reader rejects world-writable ancestors, so the
         // accepted-candidate root cannot live under a sticky /tmp (the Linux
-        // gate's default). The workspace target directory satisfies the
-        // ancestor contract on every gate host.
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/route-v2-r1-test-tmp");
+        // gate's default). The cargo target directory satisfies the ancestor
+        // contract on every gate host; the build host relocates it outside the
+        // read-only source checkout via CARGO_TARGET_DIR.
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+            })
+            .join("route-v2-r1-test-tmp");
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
         let root = TempDir::new_in(&base).unwrap();
