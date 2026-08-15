@@ -70,7 +70,11 @@ impl ProtectedFile {
         Ok(bytes)
     }
 
+    // Shared verifier-support surface: the schema verifier consumes this on
+    // Linux while the terminal-receipt verifier compiles the same module
+    // without needing it, so its per-binary dead-code analysis is expected.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn proc_fd_path(&self) -> String {
         use std::os::fd::AsRawFd;
         format!("/proc/self/fd/{}", self.file.as_raw_fd())
