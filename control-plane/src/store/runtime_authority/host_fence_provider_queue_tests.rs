@@ -432,7 +432,7 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
     });
     // Pure poll upper bound: a saturated gate machine can take far longer
     // than an idle one to schedule both enqueue threads onto the lock.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let blocked: i64 = source_lock
             .query_one(
@@ -451,7 +451,7 @@ fn concurrent_exact_enqueue_rechecks_after_the_source_lock() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "both exact enqueues did not reach the serialized source lock"
+            "both exact enqueues did not reach the serialized source lock ({blocked} blocked)"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
