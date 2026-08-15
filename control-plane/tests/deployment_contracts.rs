@@ -404,7 +404,14 @@ fn production_clean_slate_reset_contract_passes_offline_fixture() {
 fn contract_fixture_tmpdir() -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     {
-        let base = workspace_root().join("target/contract-fixture-tmp");
+        // Prefer the gate's target volume: the repository bind mount on a
+        // macOS Docker host is virtiofs, which cannot re-resolve a replaced
+        // inode through /proc/self/fd the way the held-descriptor races
+        // require.
+        let base = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace_root().join("target"))
+            .join("contract-fixture-tmp");
         std::fs::create_dir_all(&base).expect("create contract fixture tmpdir");
         base.canonicalize()
             .expect("canonicalize contract fixture tmpdir")
