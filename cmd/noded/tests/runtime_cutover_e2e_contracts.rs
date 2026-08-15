@@ -30,6 +30,22 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The E3 runner rejects sticky/world-writable state ancestry (the gate
+/// container's /tmp) and the repository bind mount on a macOS Docker host is
+/// virtiofs with unreliable link-count/inode re-resolution, so fixture
+/// scratch prefers the gate's ext4-backed target volume. Plain hosts keep
+/// their ambient temp directory.
+fn fixture_scratch_base() -> PathBuf {
+    if let Some(directory) = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY") {
+        let base = PathBuf::from(directory).join("cutover-contract-fixture-tmp");
+        std::fs::create_dir_all(&base).expect("create cutover fixture scratch base");
+        return base
+            .canonicalize()
+            .expect("canonicalize cutover fixture scratch base");
+    }
+    std::env::temp_dir()
+}
+
 fn git_head(root: &Path) -> String {
     // The Linux gate mounts a worktree whose .git file points at the host
     // repository, so `git rev-parse` cannot work there; the gate exports the
@@ -73,7 +89,7 @@ impl Fixture {
     fn new() -> Self {
         let root = workspace_root();
         let exact_commit = git_head(&root);
-        let temp = tempfile::tempdir().expect("runtime cutover fixture");
+        let temp = tempfile::tempdir_in(fixture_scratch_base()).expect("runtime cutover fixture");
         let build_receipt = temp.path().join("build-receipt.json");
         let release_manifest = temp.path().join("release-manifest.json");
         let installer_receipt = temp.path().join("installer-receipt.json");
@@ -602,7 +618,8 @@ fn runner_keeps_the_production_cutover_key_out_of_staged_authority() {
         );
     }
 
-    let temp = tempfile::tempdir_in(workspace_root()).expect("private-key validation fixture");
+    let temp =
+        tempfile::tempdir_in(fixture_scratch_base()).expect("private-key validation fixture");
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
         .expect("protect private-key fixture parent");
     let script = r#"
@@ -980,7 +997,7 @@ fn operator_e3_window_closes_and_verifies_every_early_failure_or_term() {
     let root = workspace_root();
     let library = root.join("deploy/metal/runtime-cutover-e3-window.sh");
     let fixture = root.join("deploy/metal/tests/runtime-cutover-e3-window-fixture.sh");
-    let temp = tempfile::tempdir().expect("E3 window fixture");
+    let temp = tempfile::tempdir_in(fixture_scratch_base()).expect("E3 window fixture");
     for checkpoint in ["open", "plan", "show", "before-switch"] {
         for (failure_mode, expected_status) in [("failure", 23), ("term", 143)] {
             let trace = temp
@@ -2896,7 +2913,8 @@ fn route_rotation_empty_prefix_survives_init_sigkill_and_resume() {
         "file_link_count() {",
         "\nrotation_require_budget() {",
     );
-    let temp = tempfile::tempdir().expect("Route rotation init crash fixture");
+    let temp =
+        tempfile::tempdir_in(fixture_scratch_base()).expect("Route rotation init crash fixture");
     let harness = temp.path().join("rotation-init-crash.sh");
     let case_dir = temp.path().join("case");
     fs::create_dir(&case_dir).expect("create Route rotation case");
@@ -2976,7 +2994,7 @@ fn disabled_route_probe_crashes_never_promote_one_or_two_observations() {
         "disabled_public_route_observation_is_exact() {",
         "\nrotation_disabled_fleet_is_exact() {",
     );
-    let temp = tempfile::tempdir().expect("disabled probe fixture");
+    let temp = tempfile::tempdir_in(fixture_scratch_base()).expect("disabled probe fixture");
     let harness = temp.path().join("disabled-probe-harness.sh");
     let preamble = r#"#!/usr/bin/env bash
 set -euo pipefail
