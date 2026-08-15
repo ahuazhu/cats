@@ -31,6 +31,15 @@ fn workspace_root() -> PathBuf {
 }
 
 fn git_head(root: &Path) -> String {
+    // The Linux gate mounts a worktree whose .git file points at the host
+    // repository, so `git rev-parse` cannot work there; the gate exports the
+    // exact provenance head instead.
+    if let Ok(head) = std::env::var("CATS_SOURCE_PROVENANCE_HEAD") {
+        let head = head.trim().to_owned();
+        if !head.is_empty() {
+            return head;
+        }
+    }
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(root)
