@@ -4305,6 +4305,7 @@ mod tests {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/route-v2-r1-test-tmp");
         std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
         let root = TempDir::new_in(&base).unwrap();
         let output = root.path().join("route-v2-r1");
         let inputs = Inputs::new(
