@@ -343,8 +343,8 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
         .expect("Kubernetes module enable_public_ingress variable");
     assert!(module_public_ingress.contains("default     = false"));
     for expected in [
-        "maintenance_mode                      = var.maintenance_mode",
-        "enable_public_ingress                 = var.enable_public_ingress",
+        "maintenance_mode                           = var.maintenance_mode",
+        "enable_public_ingress                      = var.enable_public_ingress",
         "var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode",
     ] {
         assert!(
@@ -463,10 +463,15 @@ fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
     assert!(specification.contains("不是 ADR-0040 的 `HostFenceEvent`"));
     assert!(specification.contains("不能解除"));
 
+    // The mechanical block is the fail-closed proof-set default: without the
+    // explicit D7 operator attestation input, the positive-stop proof branch
+    // raises before any destructive step.
     let reset = read_workspace_file("deploy/aws/production-clean-slate-reset.py");
-    assert!(reset.contains("def _require_accepted_execute_prerequisites"));
-    assert!(reset.contains("positive-stop/isolation proof format is accepted and verified"));
-    assert!(reset.contains("self._require_accepted_execute_prerequisites()"));
+    assert!(reset.contains("--accept-manual-fence-evidence"));
+    assert!(reset.contains("local_positive_stop_verifier"));
+    let proof_set = read_workspace_file("deploy/aws/production_cutover_proof_set.py");
+    assert!(proof_set.contains("class _UnavailableLocalPositiveStopVerifier"));
+    assert!(proof_set.contains("local positive-stop evidence remains Proposed with no accepted"));
 }
 
 #[test]
@@ -575,7 +580,7 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     assert!(kubernetes.contains("default_mode = \"0400\""));
     assert!(kubernetes.contains("run_as_user                = 0"));
     assert!(kubernetes_variables
-        .contains("endswith(var.route_v2_control_artifact_secret_name, \"-r1\")"));
+        .contains("endswith(var.route_v2_control_artifact_secret_name, \"-r${var.route_v2_control_artifact_signer_revision}\")"));
     assert!(kubernetes_variables
         .contains("endswith(var.route_v2_gateway_artifact_secret_name, \"-r1\")"));
 
@@ -944,8 +949,8 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
         read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
     assert_eq!(
         infrastructure.matches("= var.chunkstore_prefix").count(),
-        2,
-        "one reviewed infrastructure input must feed both usage IAM and the worker deployment"
+        3,
+        "one reviewed infrastructure input must feed usage IAM, the fresh usage instance and the worker deployment"
     );
     assert!(infrastructure
         .lines()
@@ -1034,7 +1039,9 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
 
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
-    assert!(application.contains("chunkstore_prefix                     = var.chunkstore_prefix"));
+    assert!(
+        application.contains("chunkstore_prefix                          = var.chunkstore_prefix")
+    );
     assert!(application
         .lines()
         .any(|line| line.split_whitespace().collect::<Vec<_>>()
