@@ -1243,8 +1243,10 @@ fn release_build_publishes_the_control_plane_runtime_target() {
     assert!(build.contains("target: runtime"));
 
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.control-plane");
+    // Split on the stage name, not the base image: the base moved to Amazon
+    // ECR Public because the build host cannot reach Docker Hub.
     let runtime = dockerfile
-        .split_once("FROM debian:bookworm-slim AS runtime")
+        .split_once(" AS runtime\n")
         .and_then(|(_, rest)| rest.split_once("FROM runtime AS credential-refresher"))
         .map(|(stage, _)| stage)
         .expect("dedicated control-plane runtime stage");
@@ -4056,6 +4058,13 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "docker image load --input \"$gateway_load_archive\"",
         // Those copies are build scratch and must never reach the handoff.
         "rm -f -- \"$control_load_archive\" \"$gateway_load_archive\"",
+        // Cargo publishes a release binary as a hard link to its deps
+        // artifact, so the verifier's single-link rule needs a private copy.
+        "cp \"$guest_agent_bin\" \"$guest_agent_fingerprint\"",
+        "--input-file \"guest_agent_binary=$guest_agent_fingerprint\"",
+        // A failed release build must leave its partial tree for diagnosis
+        // under a name that cannot be mistaken for a release.
+        "incomplete release retained for diagnosis",
         "cats-control-plane-image.tar",
         "cats-gateway-image.tar",
         "> SHA256SUMS",

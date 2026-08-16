@@ -159,6 +159,7 @@ control_container=
 gateway_container=
 root_touched_stage=false
 output_incomplete=
+failed_output=
 cleanup() {
   if [[ -n $control_container ]]; then
     docker rm -f "$control_container" >/dev/null 2>&1 || true
@@ -169,8 +170,17 @@ cleanup() {
   if [[ $root_touched_stage == true ]]; then
     sudo -n chown -Rh "$(id -u):$(id -g)" "$stage_parent" 2>/dev/null || true
   fi
-  if [[ -n $output_incomplete ]]; then
-    rm -rf -- "$output_incomplete"
+  if [[ -n $output_incomplete && -d $output_incomplete ]]; then
+    # A release build takes tens of minutes; discarding everything on failure
+    # leaves nothing to diagnose. Keep the partial tree under a name that can
+    # never be mistaken for a release, and say where it is.
+    if [[ -e $failed_output || -L $failed_output ]]; then
+      rm -rf -- "$output_incomplete"
+    else
+      mv -- "$output_incomplete" "$failed_output" \
+        && echo "incomplete release retained for diagnosis: $failed_output" >&2 \
+        || rm -rf -- "$output_incomplete"
+    fi
   fi
   rm -rf -- "$stage_parent"
 }
@@ -201,6 +211,7 @@ output_parent=$(dirname "$output_root")
   exit 1
 }
 output_incomplete="$output_parent/.$(basename "$output_root").incomplete.$$"
+failed_output="$output_parent/$(basename "$output_root").failed.$$"
 [[ ! -e $output_incomplete && ! -L $output_incomplete ]] || {
   echo "private incomplete output already exists: $output_incomplete" >&2
   exit 1
@@ -216,6 +227,11 @@ mkdir -m 0700 "$guest_output"
   cargo build --locked --release -p cats-guest-agent --target x86_64-unknown-linux-musl
 )
 guest_agent_bin="$source_root/target/x86_64-unknown-linux-musl/release/cats-guest-agent"
+# Cargo exposes a release binary as a hard link to its deps artifact, so the
+# build tree copy is never single-link. Fingerprint a private copy instead;
+# the digest is identical and the release output is unchanged.
+guest_agent_fingerprint="$stage_parent/guest-agent-binary"
+cp "$guest_agent_bin" "$guest_agent_fingerprint"
 guest_kernel="/boot/vmlinuz-$(uname -r)"
 [[ -f $guest_kernel && ! -L $guest_kernel ]] || {
   echo "native build Host kernel is unavailable: $guest_kernel" >&2
@@ -434,7 +450,7 @@ verifier_arguments=(
   --input-file "guest_host_modules=/lib/modules/$(uname -r)/modules.dep"
   --input-file "guest_build_sums=$guest_output/SHA256SUMS"
   --input-file "guest_rootfs_manifest=$guest_output/rootfs.manifest"
-  --input-file "guest_agent_binary=$guest_agent_bin"
+  --input-file "guest_agent_binary=$guest_agent_fingerprint"
   --input-file "control_build_metadata=$control_metadata"
   --input-file "worker_build_metadata=$worker_metadata"
   --input-file "release_verifier=$source_root/deploy/aws/tools/verify-manual-release.py"
@@ -497,4 +513,5 @@ if [[ $export_images == true ]]; then
     "$output_incomplete/SHA256SUMS"
 fi
 mv "$output_incomplete" "$output_root"
+output_incomplete=
 echo "manual release ready: $output_root"
