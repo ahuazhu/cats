@@ -13833,7 +13833,7 @@ mod tests {
             });
 
             reached_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("descriptor scan did not reach its pre-projection barrier");
             let (entry_path, retained_path) = match boundary {
                 DataDirectoryProjectionBoundary::Epoch => (
@@ -18936,7 +18936,7 @@ mod tests {
             let _ = complete_tx.send(outcome);
         });
         let outcome = complete_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("production launch authority deadlocked on its checkpoint guard")
             .unwrap();
         assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));

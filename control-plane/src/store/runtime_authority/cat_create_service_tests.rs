@@ -887,7 +887,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
     });
 
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let count: i64 = observer
                     .with(|client| {
@@ -920,7 +920,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
             !shutdown.is_finished(),
             "shutdown returned while the detached commit owner was unresolved"
         );
-        tokio::time::timeout(Duration::from_secs(3), shutdown)
+        tokio::time::timeout(cats_test_support::poll_bound(), shutdown)
             .await
             .expect("commit resolution must converge")
             .unwrap()
@@ -965,7 +965,7 @@ fn queued_pre_commit_owner_is_cancelled_when_its_handler_is_aborted() {
         async move { service.create(request).await }
     });
     batch_ready_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("the request must finish its fresh identity batch");
 
     // Hold this exact Store's one-connection lane only after fast replay has
@@ -987,12 +987,12 @@ fn queued_pre_commit_owner_is_cancelled_when_its_handler_is_aborted() {
         }
     });
     blocker_started_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("the same-Store lane blocker must start");
     release_batch_tx.send(()).unwrap();
     let registered = Instant::now();
     while service.active_commit_resolutions() != 1 {
-        assert!(registered.elapsed() < Duration::from_secs(3));
+        assert!(registered.elapsed() < cats_test_support::poll_bound());
         std::thread::yield_now();
     }
     assert!(!handler.is_finished());
@@ -1005,7 +1005,7 @@ fn queued_pre_commit_owner_is_cancelled_when_its_handler_is_aborted() {
     runtime
         .block_on(async {
             tokio::time::timeout(
-                Duration::from_secs(2),
+                cats_test_support::poll_bound(),
                 service.shutdown_commit_resolutions(),
             )
             .await
@@ -1103,7 +1103,7 @@ fn post_commit_resolver_waits_for_the_original_api_key_owner() {
     );
     blocker_tx.commit().unwrap();
     assert!(done_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap()
         .unwrap()
         .is_none());

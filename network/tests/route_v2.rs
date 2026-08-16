@@ -242,7 +242,7 @@ async fn shutdown_cancels_resolver_and_fails_all_waiters_closed() {
         lookup.await.unwrap().unwrap_err(),
         RouteCacheError::Shutdown
     );
-    tokio::time::timeout(Duration::from_secs(1), cancelled_rx)
+    tokio::time::timeout(cats_test_support::poll_bound(), cancelled_rx)
         .await
         .expect("resolver future was cancelled")
         .unwrap();
@@ -301,7 +301,7 @@ async fn cache_entry_waiter_and_response_limits_apply_before_more_work_is_admitt
     let cache = RouteCache::new(bounded_config, resolver).unwrap();
     let leader_cache = cache.clone();
     let leader = tokio::spawn(async move { leader_cache.lookup("app.cats.run").await });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while cache.stats().in_flight_keys == 0 {
             tokio::task::yield_now().await;
         }
@@ -310,7 +310,7 @@ async fn cache_entry_waiter_and_response_limits_apply_before_more_work_is_admitt
     .expect("leader did not install the in-flight entry");
     let follower_cache = cache.clone();
     let follower = tokio::spawn(async move { follower_cache.lookup("app.cats.run").await });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while cache.stats().waiters == 0 {
             tokio::task::yield_now().await;
         }
@@ -396,9 +396,12 @@ async fn resolver_panic_wakes_waiters_and_removes_the_in_flight_entry() {
         panic!("simulated resolver panic before returning its future")
     });
     let cache = RouteCache::new(cache_config(), resolver).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(1), cache.lookup("app.cats.run"))
-        .await
-        .expect("panic must not strand the cache waiter");
+    let result = tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        cache.lookup("app.cats.run"),
+    )
+    .await
+    .expect("panic must not strand the cache waiter");
     assert_eq!(result.unwrap_err(), RouteCacheError::InFlightLost);
     assert_eq!(cache.stats().in_flight_keys, 0);
 }

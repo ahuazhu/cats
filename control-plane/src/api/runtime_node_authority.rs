@@ -1717,7 +1717,7 @@ mod tests {
 
     async fn wait_for_store_advisory_lock_wait(dsn: &str, backend_pid: i32) {
         let mut monitor = TestPgClient::connect(dsn);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let waiting = monitor.with(|monitor| {
                     monitor
@@ -1884,7 +1884,7 @@ mod tests {
                 .get::<_, bool>(0)
         }));
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while server
                 .state
                 .runtime_node_authority
@@ -1921,7 +1921,7 @@ mod tests {
             async move { request.send().await }
         });
         tokio::time::timeout(
-            Duration::from_secs(2),
+            cats_test_support::poll_bound(),
             service.wait_for_registration_pause_for_test(),
         )
         .await
@@ -1991,7 +1991,7 @@ mod tests {
             .inject_request_committed_response_loss_once_after(Duration::from_millis(500));
         let request = signed_request(&server);
         let response = tokio::spawn(async move { request.send().await });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while server
                 .state
                 .store
@@ -2034,7 +2034,7 @@ mod tests {
             let request = signed_request(&server);
             async move { request.send().await }
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while server
                 .state
                 .store
@@ -2080,7 +2080,7 @@ mod tests {
             }),
             1
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while server.state.readiness.is_ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }

@@ -883,7 +883,9 @@ mod tests {
 
         // Simulate the worker having dequeued the job but being stuck before
         // the last-moment claim (for example while reconnecting).
-        let job = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let job = receiver
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         let error = caller.join().unwrap().unwrap_err();
         assert!(
             error.to_string().contains("timed out before execution"),

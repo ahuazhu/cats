@@ -1154,7 +1154,7 @@ mod request_context_tests {
     #[tokio::test]
     async fn cancellation_waiter_wakes_at_the_absolute_request_deadline() {
         let context = AuthorityRequestContext::new(Instant::now() + Duration::from_millis(20));
-        tokio::time::timeout(Duration::from_secs(1), context.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), context.cancelled())
             .await
             .expect("request deadline did not wake its cancellation waiter");
         assert!(context.is_cancelled_or_expired());

@@ -6188,12 +6188,14 @@ exit 0
         fs::set_permissions(&fixture.client, fs::Permissions::from_mode(0o700)).unwrap();
         let context = RuntimeDesiredEffectContext::for_test(
             StateDirectory::unanchored(fixture.state.clone()),
-            Instant::now() + Duration::from_secs(2),
+            // Strictly wider than the canceller's poll bound below so the
+            // cancellation always lands while the operation still runs.
+            Instant::now() + cats_test_support::poll_bound() + Duration::from_secs(10),
         );
         let cancellation = context.clone();
         let cancel_pid_file = pid_file.clone();
         let canceller = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             while fs::read_to_string(&cancel_pid_file)
                 .ok()
                 .and_then(|contents| contents.parse::<libc::pid_t>().ok())

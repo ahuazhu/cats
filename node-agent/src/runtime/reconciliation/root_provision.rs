@@ -702,14 +702,14 @@ mod tests {
 
         fn wait_for_request(&self) {
             self.request_received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("server did not receive the exact request");
         }
     }
 
     impl Drop for TestServer {
         fn drop(&mut self) {
-            let _ = self.done.recv_timeout(Duration::from_secs(2));
+            let _ = self.done.recv_timeout(cats_test_support::poll_bound());
         }
     }
 
@@ -952,7 +952,9 @@ mod tests {
             &RootProvisionResponseHint::Unknown(RootProvisionUnknownReason::PeerIdentityMismatch)
         );
         assert_eq!(
-            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            received
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap(),
             Vec::<u8>::new()
         );
         server.join().unwrap();
@@ -1034,7 +1036,9 @@ mod tests {
                 )
             );
             assert_eq!(
-                received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                received
+                    .recv_timeout(cats_test_support::poll_bound())
+                    .unwrap(),
                 Vec::<u8>::new()
             );
             server.join().unwrap();

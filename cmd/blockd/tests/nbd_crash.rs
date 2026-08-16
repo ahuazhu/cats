@@ -364,7 +364,7 @@ impl Server {
     }
 
     fn connect(&mut self) -> NbdClient {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         loop {
             if let Ok(client) = NbdClient::connect_unix(&self.socket) {
                 return client;
@@ -457,7 +457,7 @@ fn crash_matrix_every_window_recovers_exactly_once() {
                 matches!(err, NbdError::Io(_)),
                 "{point}: expected io error, got {err:?}"
             );
-            server.wait_exit(Duration::from_secs(10));
+            server.wait_exit(cats_test_support::poll_bound());
         }
         let mut server = Server::spawn(&env, "a", "att_a", 1, None);
         let mut client = server.connect();
@@ -503,7 +503,7 @@ fn fenced_writer_gets_eperm_and_new_host_takes_over() {
     // External authority fences the old tuple; blockd never performs this
     // transition itself.
     env.install_grant("att_a", 2);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         match client_a.write(0, b"stale") {
             Err(NbdError::Server(error)) if error == EPERM => break,

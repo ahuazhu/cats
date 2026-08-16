@@ -1173,7 +1173,9 @@ async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_r
             })
             .unwrap();
     });
-    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    locked_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
 
     let leader =
         Arc::new(Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap());
@@ -1210,7 +1212,7 @@ async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_r
             }
         },
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while leader_starts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1241,7 +1243,7 @@ async fn singleton_cancellation_retains_leadership_until_claimed_system_commit_r
 
     release_tx.send(()).unwrap();
     holder_thread.join().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while standby_starts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1306,7 +1308,7 @@ async fn cancelled_singleton_shutdown_can_rejoin_exact_resolution_and_lock_relea
             }
         },
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let revision = setup
                 .with(|client| {
@@ -1364,11 +1366,11 @@ async fn cancelled_singleton_shutdown_can_rejoin_exact_resolution_and_lock_relea
         0,
         "cancelling a shutdown waiter must not release leadership before exact resolution"
     );
-    tokio::time::timeout(Duration::from_secs(5), &mut resumed_shutdown)
+    tokio::time::timeout(cats_test_support::poll_bound(), &mut resumed_shutdown)
         .await
         .expect("retried shutdown should return after exact resolution")
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while standby_starts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1572,7 +1574,9 @@ async fn runtime_sweeper_leadership_loss_cancels_the_rest_of_a_claimed_page() {
             })
             .unwrap();
     });
-    locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    locked_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
 
     let leader =
         Arc::new(Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap());
@@ -2878,7 +2882,8 @@ fn two_replicas_racing_from_one_revision_commit_exactly_one_successor() {
 }
 
 fn wait_for_advisory_lock_wait(store: &Store, application_name: &str) {
-    for _ in 0..200 {
+    let deadline = Instant::now() + cats_test_support::poll_bound();
+    while Instant::now() < deadline {
         let waiting = store
             .with(|client| {
                 client
@@ -4662,14 +4667,17 @@ fn desired_placement_cancellation_stops_before_a_later_a20_relation_wait() {
     assert!(cancellation.cancel_before_commit());
     session_release_tx.send(()).unwrap();
 
-    let prompt = result_rx.recv_timeout(Duration::from_secs(1));
+    // A regression that reaches the later A20 inventory wait stays parked
+    // until the release below, so the wide shared poll bound still
+    // discriminates while a healthy prompt return exits immediately.
+    let prompt = result_rx.recv_timeout(cats_test_support::poll_bound());
     inventory_release_tx.send(()).unwrap();
     session_thread.join().unwrap();
     inventory_thread.join().unwrap();
     let outcome = match prompt {
         Ok(outcome) => outcome,
         Err(_) => {
-            let _ = result_rx.recv_timeout(Duration::from_secs(5));
+            let _ = result_rx.recv_timeout(cats_test_support::poll_bound());
             worker_thread.join().unwrap();
             panic!("cancelled placement mutation reached the later A20 inventory wait");
         }

@@ -10,6 +10,27 @@ use std::time::{Duration, Instant};
 
 use postgres::NoTls;
 
+/// Private mirror of the canonical `cats_test_support::wait::poll_bound`.
+///
+/// This module is compiled into the production `cats-control-plane` library
+/// target so downstream crates' tests can reuse it, which means
+/// dev-dependencies such as `cats-test-support` are not visible here. Keep
+/// the contract in sync with `tests/support/src/wait.rs`: a pure polling
+/// upper bound is not a performance assertion — success exits early, so a
+/// healthy run pays nothing and the default must be absurdly wide instead of
+/// being calibrated against an idle development machine.
+fn poll_bound() -> Duration {
+    const ENV: &str = "CATS_TEST_POLL_BOUND_SECS";
+    match std::env::var(ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => panic!("{ENV} must be a positive whole number of seconds, got {raw:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => Duration::from_secs(180),
+        Err(err) => panic!("{ENV} is not readable: {err}"),
+    }
+}
+
 /// Hold an isolated test schema's runtime_operations table at an
 /// ACCESS-EXCLUSIVE barrier and report when one production Store query is
 /// waiting behind it. This is shared by unit and cross-router cancellation
@@ -45,7 +66,7 @@ impl RuntimeOperationsTableLockForTest {
             // full suite, with a bloated shared PostgreSQL catalog) can take
             // far longer than an idle one to schedule the handler onto the
             // lock. The poll exits as soon as the handler blocks.
-            let deadline = Instant::now() + Duration::from_secs(90);
+            let deadline = Instant::now() + poll_bound();
             loop {
                 if release_rx.try_recv().is_ok() {
                     client.batch_execute("ROLLBACK").unwrap();
@@ -83,10 +104,10 @@ impl RuntimeOperationsTableLockForTest {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            let _ = release_rx.recv_timeout(poll_bound());
             client.batch_execute("ROLLBACK").unwrap();
         });
-        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        tokio::time::timeout(poll_bound(), ready_rx)
             .await
             .expect("runtime_operations table lock was not acquired")
             .expect("runtime_operations table-lock worker stopped");
@@ -98,8 +119,10 @@ impl RuntimeOperationsTableLockForTest {
     }
 
     pub async fn wait_until_query_blocked(&mut self) {
+        // Strictly wider than the worker's own poll bound so the worker's
+        // diagnostic `blocked=false` report arrives instead of this timeout.
         assert!(
-            tokio::time::timeout(Duration::from_secs(100), &mut self.blocked)
+            tokio::time::timeout(poll_bound() + Duration::from_secs(10), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
                 .expect("runtime_operations table-lock worker stopped"),
@@ -814,7 +837,7 @@ impl RuntimeSchemaWriteBarrierForTest {
                 }
             }
         });
-        tokio::time::timeout(Duration::from_secs(10), ready_rx)
+        tokio::time::timeout(poll_bound(), ready_rx)
             .await
             .expect("Runtime schema write barrier did not acquire its bounded table locks")
             .expect("Runtime schema write-barrier worker stopped")
@@ -832,7 +855,7 @@ impl RuntimeSchemaWriteBarrierForTest {
     pub async fn calibrate_dml_blocked(&self) {
         let dsn = self.dsn.clone();
         tokio::time::timeout(
-            Duration::from_secs(5),
+            poll_bound(),
             tokio::task::spawn_blocking(move || calibrate_runtime_schema_dml_barrier(&dsn)),
         )
         .await
@@ -851,14 +874,14 @@ impl RuntimeSchemaWriteBarrierForTest {
             .expect("Runtime schema write-barrier command channel")
             .send(RuntimeSchemaWriteBarrierCommand::Finish { result: result_tx })
             .expect("Runtime schema write-barrier worker stopped");
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        let result = tokio::time::timeout(poll_bound(), result_rx)
             .await
             .expect("Runtime schema write-barrier settlement exceeded its deadline")
             .expect("Runtime schema write-barrier worker stopped before settlement");
         self.command.take();
         if let Some(worker) = self.worker.take() {
             tokio::time::timeout(
-                Duration::from_secs(2),
+                poll_bound(),
                 tokio::task::spawn_blocking(move || worker.join()),
             )
             .await

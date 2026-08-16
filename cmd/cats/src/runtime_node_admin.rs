@@ -2526,7 +2526,9 @@ mod tests {
         .is_err());
         assert_eq!(transport.request_count(), 0);
         drop(state);
-        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(receiver
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap());
         join.join().unwrap().unwrap();
     }
 
@@ -2569,7 +2571,9 @@ mod tests {
         .is_err());
         assert_eq!(transport.request_count(), 0);
         drop(state);
-        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(receiver
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap());
         join.join().unwrap().unwrap();
     }
 

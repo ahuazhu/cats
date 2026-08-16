@@ -247,7 +247,7 @@ impl BlkFrontend {
                 in_flight: 0,
                 next_slot: 0,
                 event_idx,
-                timeout: Duration::from_secs(20),
+                timeout: cats_test_support::poll_bound(),
                 spin_iterations: 0,
             }));
         }

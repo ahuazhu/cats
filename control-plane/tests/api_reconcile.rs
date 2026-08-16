@@ -917,7 +917,7 @@ impl Ctx {
     }
 
     async fn wait_observed(&self, name: &str, want: ObservedState) -> Cat {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             let cat: Cat = self
                 .http
@@ -941,7 +941,7 @@ impl Ctx {
     }
 
     async fn wait_operation(&self, op_id: &str) -> Operation {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             let op: Operation = self
                 .http
@@ -1301,7 +1301,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     assert_eq!(created_first.operation.id, created_second.operation.id);
     assert_eq!(first.state.store.list_cats(&workspace_id).unwrap().len(), 1);
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let cat = first
                 .state
@@ -1359,7 +1359,7 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
     assert_eq!(deleted_first.operation.id, deleted_second.operation.id);
     assert_eq!(deleted_first.operation.resource_generation, 3);
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             if first
                 .state
@@ -1426,7 +1426,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     let http = reqwest::Client::new();
     let cats_path = format!("/v1/workspaces/{workspace_id}/cats");
     let created = create_legacy_cat(&first, "handoff-suspend", None).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let cat = first
                 .state
@@ -1462,9 +1462,12 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         .json()
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
-        .await
-        .expect("the first leader never dispatched SuspendCat");
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        node.job_response_ready.notified(),
+    )
+    .await
+    .expect("the first leader never dispatched SuspendCat");
     let transitional = first
         .state
         .store
@@ -1488,7 +1491,7 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
     // deterministic job returns without applying SuspendCat twice.
     let second = spawn(config).await.unwrap();
     first.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let cat = second
                 .state
@@ -1539,7 +1542,7 @@ async fn wait_for_persisted_transition(
     observed: ObservedState,
     phase: OperationPhase,
 ) -> Cat {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let cat = cp.state.store.must_get_cat_by_id(cat_id).unwrap();
             let operation = cp.state.store.get_operation(operation_id).unwrap();
@@ -1594,9 +1597,12 @@ async fn reconciler_handoff_replays_persisted_warming_success_once() {
     node.quiesce().await;
     node.hold_next_job_response("warm_cat");
     let warm = ctx.action("handoff-warm", "warm").await;
-    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
-        .await
-        .expect("the first leader never dispatched WarmCat");
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        node.job_response_ready.notified(),
+    )
+    .await
+    .expect("the first leader never dispatched WarmCat");
     let transitional = ctx
         .cp
         .state
@@ -1647,9 +1653,12 @@ async fn reconciler_handoff_replays_persisted_stopping_success_once() {
     node.quiesce().await;
     node.hold_next_job_response("stop_cat");
     let stop = ctx.action("handoff-stop", "stop").await;
-    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
-        .await
-        .expect("the first leader never dispatched StopCat");
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        node.job_response_ready.notified(),
+    )
+    .await
+    .expect("the first leader never dispatched StopCat");
     let transitional = ctx
         .cp
         .state
@@ -1708,9 +1717,12 @@ async fn reconciler_handoff_failed_warm_replay_restores_suspended_source() {
         .insert("warm_cat".into(), usize::MAX);
     node.hold_next_job_response("warm_cat");
     let warm = ctx.action("handoff-warm-failure", "warm").await;
-    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
-        .await
-        .expect("the first leader never reached the failed WarmCat response");
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        node.job_response_ready.notified(),
+    )
+    .await
+    .expect("the first leader never reached the failed WarmCat response");
     assert_eq!(
         ctx.cp
             .state
@@ -1768,9 +1780,12 @@ async fn reconciler_handoff_failed_stop_replay_restores_running_source() {
         .insert("stop_cat".into(), usize::MAX);
     node.hold_next_job_response("stop_cat");
     let stop = ctx.action("handoff-stop-failure", "stop").await;
-    tokio::time::timeout(Duration::from_secs(10), node.job_response_ready.notified())
-        .await
-        .expect("the first leader never reached the failed StopCat response");
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        node.job_response_ready.notified(),
+    )
+    .await
+    .expect("the first leader never reached the failed StopCat response");
     assert_eq!(
         ctx.cp
             .state
@@ -1870,7 +1885,7 @@ async fn reconciler_handoff_finishes_a_converged_operation_without_replaying_nod
 
     let jobs_before_handoff = node.jobs.lock().unwrap().clone();
     let second = spawn(ctx.config.clone()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             if second
                 .state
@@ -2321,7 +2336,7 @@ async fn ambiguous_start_response_retries_the_same_node_job() {
     source.quiesce().await;
 
     ctx.create_cat("ambiguous-start", None).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         if !source.started_volumes.lock().unwrap().is_empty() {
             break;
@@ -2381,7 +2396,7 @@ async fn node_loss_preserves_placement_until_fencing_is_explicitly_confirmed() {
     // Heartbeat expiry marks both records unknown/lost but preserves the old
     // placement and storage claim. In particular, it must not start a second
     // Guest or revoke the old block engine's epoch.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         if ctx.cp.state.store.get_node("node_a").unwrap().state == NodeState::Lost {
             break;
@@ -2455,7 +2470,7 @@ async fn node_loss_preserves_placement_until_fencing_is_explicitly_confirmed() {
         telemetry: None,
     })
     .await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let cat = ctx.cp.state.store.must_get_cat_by_id(&cat.id).unwrap();
         if ctx.cp.state.store.get_node("node_a").unwrap().state == NodeState::Ready
@@ -2475,7 +2490,7 @@ async fn node_loss_preserves_placement_until_fencing_is_explicitly_confirmed() {
     // handoff; a positive confirmation means an external actor has stopped or
     // isolated the Host, so the control plane may now fence and reschedule.
     node_a.quiesce().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
         assert!(
             std::time::Instant::now() < deadline,
@@ -2897,7 +2912,7 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
     assert_eq!(resp.status(), 202);
 
     // Cat vanishes; persistent disk returns to Available; root disk is gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let resp = ctx
             .http
@@ -3219,7 +3234,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::ACCEPTED);
-    let delete_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let delete_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let response = ctx
             .http
@@ -4022,7 +4037,7 @@ async fn admin_can_monitor_and_drain_nodes() {
     assert_eq!(cat.node_id.as_deref(), Some("node_a"));
 
     // Wait for at least one telemetry-bearing heartbeat.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let nodes: ListResponse<NodeSummary> = ctx.get_json(ctx.url("/v1/admin/nodes")).await;
         if nodes
@@ -4056,7 +4071,7 @@ async fn admin_can_monitor_and_drain_nodes() {
     // only for the node level, as the loop above does, leaves `actual` empty
     // whenever the next heartbeat has not landed yet -- which is most of the
     // time on a loaded machine.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     let node_cats: ListResponse<NodeCatSummary> = loop {
         let listed: ListResponse<NodeCatSummary> =
             ctx.get_json(ctx.url("/v1/admin/nodes/node_a/cats")).await;
@@ -4110,7 +4125,7 @@ async fn admin_can_monitor_and_drain_nodes() {
         .unwrap();
     assert_eq!(drain.status(), StatusCode::ACCEPTED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let cat: Cat = ctx
             .http
@@ -4515,7 +4530,7 @@ async fn a_deploy_that_answers_early_still_releases_its_work_lease() {
     );
 
     ctx.wait_operation(&accepted.operation.id).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while ctx.live_control_leases(&cat_id) > 0 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -4685,7 +4700,7 @@ async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
     // Lose the Host first, so the delete below cannot be dispatched and stays a
     // preserved claim -- the state production was wedged in.
     node_a.quiesce().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
         assert!(
             std::time::Instant::now() < deadline,
@@ -4733,7 +4748,7 @@ async fn a_deleting_cat_does_not_block_its_lost_node_from_recovering() {
 
     // And once recovered the delete finally converges, which is what makes the
     // deadlock gone rather than merely deferred.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while ctx
         .cp
         .state
@@ -4773,7 +4788,7 @@ async fn a_running_claim_missing_from_the_inventory_still_holds_the_node_lost() 
     let omitted = ctx.wait_observed("omitted", ObservedState::Running).await;
 
     node_a.quiesce().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while ctx.cp.state.store.get_node("node_a").unwrap().state != NodeState::Lost {
         assert!(
             std::time::Instant::now() < deadline,
@@ -5017,7 +5032,7 @@ async fn admin_node_summary(ctx: &Ctx, node_id: &str) -> NodeSummary {
 
 /// Wait until the node's summary shows exactly `want` orphan runtimes.
 async fn wait_orphan_cats(ctx: &Ctx, node_id: &str, want: u64) -> NodeSummary {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let summary = admin_node_summary(ctx, node_id).await;
         if summary.orphan_cats == want {
@@ -5105,7 +5120,7 @@ async fn a_drain_stops_agent_reported_orphans_before_cordoning() {
         .unwrap();
     assert_eq!(drain.status(), StatusCode::ACCEPTED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let summary = admin_node_summary(&ctx, "node_a").await;
         if summary.node.state == NodeState::Cordoned {
@@ -5208,7 +5223,7 @@ async fn a_drain_with_an_unstoppable_orphan_stays_draining_and_backs_off() {
         .lock()
         .unwrap()
         .insert("stop_cat".into(), 0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         let summary = admin_node_summary(&ctx, "node_a").await;
         if summary.node.state == NodeState::Cordoned && summary.orphan_cats == 0 {

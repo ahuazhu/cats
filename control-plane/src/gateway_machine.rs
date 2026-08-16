@@ -139,7 +139,7 @@ impl GatewayMachineListener {
 
     #[cfg(test)]
     pub(crate) async fn wait_until_stopped_for_test(&self) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let stopped = self
                     .task

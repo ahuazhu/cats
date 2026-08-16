@@ -448,7 +448,7 @@ mod tests {
     }
 
     fn wait_until_exited(handle: &mut ProcHandle) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while !handle.exited().expect("probe process") {
             assert!(Instant::now() < deadline, "process never exited");
             std::thread::sleep(ADOPTED_EXIT_POLL);
@@ -590,7 +590,7 @@ mod tests {
         };
         assert!(!pidfd.exited().unwrap());
         assert_eq!(pidfd.signal(libc::SIGKILL).unwrap(), PidFdSignal::Submitted);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while !pidfd.exited().unwrap() {
             assert!(
                 Instant::now() < deadline,

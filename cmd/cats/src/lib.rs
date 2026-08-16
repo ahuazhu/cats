@@ -3548,7 +3548,7 @@ mod tests {
             // Keep the response open longer than the client's total wait
             // budget. The test releases this promptly once the bounded wait
             // returns; an unbounded second GET instead stalls here.
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_rx.recv_timeout(cats_test_support::poll_bound());
         });
 
         let started = Instant::now();
@@ -3560,7 +3560,7 @@ mod tests {
 
         assert!(
             second_request_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(cats_test_support::poll_bound())
                 .is_ok(),
             "wait did not issue the expected second GET"
         );

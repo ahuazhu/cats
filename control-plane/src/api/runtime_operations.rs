@@ -106,7 +106,6 @@ fn exact_operation_segment<'a>(uri: &'a Uri, workspace_id: &Id) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use axum::http::{header, HeaderValue};
     use cats_metering::SqliteUsageStore;
@@ -217,13 +216,11 @@ mod tests {
         // read before poisoning, which can take far longer on a saturated
         // gate host than on an idle one; the poll exits as soon as
         // readiness closes.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while handle.state.readiness.is_ready() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("claimed corrupt Store closure did not poison readiness");
+        cats_test_support::wait_until_async(
+            "claimed corrupt Store closure poisons readiness",
+            || async { !handle.state.readiness.is_ready() },
+        )
+        .await;
         handle.shutdown().await.unwrap();
     }
 }

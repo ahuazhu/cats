@@ -220,7 +220,7 @@ fn run_checkpoint_process_probe(root: &Path, mode: &str) -> std::process::ExitSt
         .env("CATS_CHECKPOINT_OPEN_PROBE_MODE", mode)
         .spawn()
         .expect("spawn checkpoint open probe");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         if let Some(status) = child.try_wait().expect("poll checkpoint open probe") {
             return status;

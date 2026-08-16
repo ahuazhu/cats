@@ -900,8 +900,10 @@ fn a_locked_node_identity_does_not_serialize_another_node() {
             ))
             .unwrap();
     });
+    // A regression that waits on the locked identity stays parked until the
+    // release below, so the wide shared poll bound still discriminates.
     let outcome = result_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("another Node must not wait for the locked identity")
         .unwrap();
     assert!(matches!(outcome, AgentRegistrationOutcome::Registered(_)));
@@ -1103,7 +1105,8 @@ async fn cancelled_active_registration_commits_once_and_exact_retry_recovers_res
     });
 
     let mut waiting_on_identity = false;
-    for _ in 0..200 {
+    let lock_wait_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
+    while std::time::Instant::now() < lock_wait_deadline {
         waiting_on_identity = observer
             .with(|client| {
                 client
@@ -1133,7 +1136,8 @@ async fn cancelled_active_registration_commits_once_and_exact_retry_recovers_res
     locker.join().unwrap();
 
     let mut committed = false;
-    for _ in 0..200 {
+    let commit_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
+    while std::time::Instant::now() < commit_deadline {
         if counts(&observer, &identity.node_id) == (1, 1) {
             committed = true;
             break;

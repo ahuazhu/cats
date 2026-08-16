@@ -7,6 +7,7 @@ pub mod blob_doubles;
 pub mod node_builder;
 pub mod sqlite_volume_authority;
 pub mod storage_contract;
+pub mod wait;
 
 pub use node_builder::{
     sqlite_node_runtime_blockd_fixture, workspace_bin, workspace_example, NodeConfigBuilder,
@@ -17,3 +18,4 @@ pub use sqlite_volume_authority::{
     SqliteTestVolumeGrant,
 };
 pub use storage_contract::{blob_store_contract, metadata_store_contract};
+pub use wait::{bounded, poll_bound, wait_until, wait_until_async, POLL_BOUND_ENV};

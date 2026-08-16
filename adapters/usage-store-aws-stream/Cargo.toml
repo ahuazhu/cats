@@ -19,5 +19,8 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+cats-test-support = { workspace = true }
+
 [lints]
 workspace = true

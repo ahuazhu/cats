@@ -830,7 +830,8 @@ mod tests {
             drop(listener);
         });
 
-        let first = connect_unix_before(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let first =
+            connect_unix_before(&path, Instant::now() + cats_test_support::poll_bound()).unwrap();
         accepted_rx.recv().unwrap();
         let mut fillers = vec![first];
         let mut saturated = false;

@@ -13,7 +13,6 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use cats_api::runtime_reconciliation::Id;
 use cats_block_client::NbdClient;
@@ -478,7 +477,7 @@ fn works_without_event_idx() {
     // notification path.
     let mut frontend = harness.connect_with(1, false);
     let queue = frontend.queue(0);
-    queue.set_timeout(Duration::from_secs(20));
+    queue.set_timeout(cats_test_support::poll_bound());
     let data = pattern(4096, 21);
     assert_eq!(
         queue.write_at(16, &data).expect("write").status,

@@ -9,6 +9,7 @@ use cats_storage::authority::{
 use cats_test_support::blob_doubles::{
     ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
 };
+use cats_test_support::poll_bound;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
@@ -1108,7 +1109,7 @@ fn remote_outage_is_observable_but_does_not_fail_relaxed_flush() {
         1,
         "remote failure must not become Guest EIO"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + poll_bound();
     loop {
         let status = e.durability_status();
         if status.last_publish_error.is_some() {
@@ -1243,7 +1244,7 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
         let e = e.clone();
         thread::spawn(move || e.flush())
     };
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + poll_bound();
     loop {
         if e.state.lock().unwrap().freezing.contains(&0) {
             break;
@@ -1274,7 +1275,7 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
     e.drain_staged().unwrap();
     flushing.join().unwrap().unwrap();
     let actual = read_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(poll_bound())
         .expect("reader did not wake after the pack became visible")
         .unwrap();
     reading.join().unwrap();
@@ -1375,7 +1376,7 @@ fn relaxed_dirty_cache_reserves_pack_space_and_cannot_deadlock_the_quota() {
         let result = worker.write(CHUNK_SIZE as u64, &second);
         let _ = tx.send(result);
     });
-    rx.recv_timeout(Duration::from_secs(5))
+    rx.recv_timeout(poll_bound())
         .expect("quota pressure deadlocked before a pack could be published")
         .unwrap();
     handle.join().unwrap();
@@ -2383,7 +2384,7 @@ fn eager_committer_drains_a_burst_without_the_timer() {
             .unwrap();
         e.flush().unwrap();
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + poll_bound();
     while e.generation() < 8 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -2429,7 +2430,7 @@ impl PutGate {
     }
 
     fn wait_until_entered(&self) -> std::result::Result<(), String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + poll_bound();
         let mut state = self.state.lock().unwrap();
         while !state.0 {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -2467,7 +2468,7 @@ impl ThreadRecordingBlob {
     /// it is recorded. Waiting for merely "some PUT" is racy because the
     /// committer's scoped upload workers can legitimately arrive first.
     fn wait_for_named_background_put(&self) -> std::result::Result<Vec<(String, bool)>, String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + poll_bound();
         let mut calls = self.put_calls.lock().unwrap();
         loop {
             if calls.iter().any(|(_, publisher)| !publisher) {
@@ -2497,7 +2498,7 @@ impl ThreadRecordingBlob {
 }
 
 fn wait_for_generation(engine: &ChunkEngine, target: i64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + poll_bound();
     while engine.generation() < target {
         assert!(
             std::time::Instant::now() < deadline,
@@ -2616,7 +2617,7 @@ fn a_slow_store_burst_publishes_only_on_the_background_committer() {
         // publisher remains blocked until after the result is received. A
         // FLUSH that synchronously waits for it cannot satisfy this ordering.
         let generation = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(poll_bound())
             .expect("Relaxed FLUSH waited for the active background publisher")
             .unwrap();
         assert_eq!(generation, 4);
@@ -2664,7 +2665,7 @@ fn guest_side_put_is_detected_and_the_controlled_store_is_released() {
         });
 
         let put_error = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(poll_bound())
             .expect("Guest-context PUT blocked on the publisher gate")
             .unwrap_err();
         assert!(
@@ -2727,7 +2728,7 @@ fn backpressure_waits_for_the_background_publisher() {
     // Directly observe the staging-space waiter while the sole allowed pack
     // remains pinned behind the controlled remote call. This preserves the
     // admission-pressure assertion without measuring how long it waited.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + poll_bound();
     while e.backpressure_waiters.load(Ordering::Relaxed) == 0 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -3303,7 +3304,7 @@ fn the_gc_thread_sweeps_on_its_own_and_does_not_delay_detach() {
     assert_eq!(env.blob.list("volumes/vol_test/data/").unwrap().len(), 2);
 
     e.start_gc_thread(Duration::from_millis(50));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + poll_bound();
     while env.blob.list("volumes/vol_test/data/").unwrap().len() > 1 {
         assert!(
             std::time::Instant::now() < deadline,

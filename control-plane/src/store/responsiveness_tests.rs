@@ -31,10 +31,10 @@ async fn wait_for_postgres_activity(
     let query_pattern = query_pattern.to_string();
     let expected_query_pattern = query_pattern.clone();
     let found = tokio::time::timeout(
-        Duration::from_secs(5),
+        cats_test_support::poll_bound() + Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
             let mut observer = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             loop {
                 let found: bool = observer
                     .query_one(
@@ -219,7 +219,7 @@ impl FaultProxy {
     }
 
     async fn wait_for_connections(&self, minimum: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while self.active.load(Ordering::Acquire) < minimum {
                 tokio::task::yield_now().await;
             }
@@ -421,9 +421,13 @@ async fn observation_lane_shutdown_discards_waiter_and_joins_active_work() {
             })
             .await
     });
-    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(2)).unwrap())
-        .await
-        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap()
+    })
+    .await
+    .unwrap();
 
     let mutations = Arc::new(AtomicUsize::new(0));
     let queued_mutations = Arc::clone(&mutations);
@@ -508,7 +512,7 @@ async fn cancelling_a_queued_job_drops_captures_without_holding_the_queue_lock()
         .expect("the cancellable job fits in the queue");
     let cancel_thread = std::thread::spawn(move || drop(cancelled));
     drop_entered_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("cancellation must start dropping the queued closure");
 
     let (submitted_tx, submitted_rx) = mpsc::channel();
@@ -517,7 +521,10 @@ async fn cancelling_a_queued_job_drops_captures_without_holding_the_queue_lock()
         let replacement = submit_executor.try_execute(|| 42);
         let _ = submitted_tx.send(replacement);
     });
-    let replacement = match submitted_rx.recv_timeout(Duration::from_millis(500)) {
+    // A submit that waits behind the captured destructor stays parked until
+    // the error branch below releases it, so the wide shared poll bound
+    // still discriminates.
+    let replacement = match submitted_rx.recv_timeout(cats_test_support::poll_bound()) {
         Ok(Ok(replacement)) => replacement,
         Ok(Err(error)) => panic!("replacement unexpectedly rejected: {error:?}"),
         Err(error) => {
@@ -533,7 +540,7 @@ async fn cancelling_a_queued_job_drops_captures_without_holding_the_queue_lock()
     release_active.send(()).unwrap();
     active.await.unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_millis(500), replacement)
+        tokio::time::timeout(cats_test_support::poll_bound(), replacement)
             .await
             .expect("the worker must progress while cancellation Drop is blocked")
             .unwrap(),
@@ -624,11 +631,15 @@ async fn cleanup_has_reserved_capacity_and_runs_before_queued_requests() {
     release_active.send(()).unwrap();
     active.await.unwrap();
     assert_eq!(
-        order_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+        order_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap(),
         "cleanup"
     );
     assert_eq!(
-        order_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+        order_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap(),
         "request"
     );
     queued.await.unwrap();
@@ -692,7 +703,7 @@ async fn poisoned_store_mutex_still_releases_the_physical_connection() {
     assert!(store.client.is_poisoned());
     drop(store);
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let still_connected: bool = observer
                 .execute(move |store| {
@@ -1067,7 +1078,7 @@ async fn concurrent_oci_session_drop_releases_ownership_through_the_bounded_exec
     for operation_id in operation_ids {
         let second = Arc::clone(&second);
         reacquired.push(
-            tokio::time::timeout(Duration::from_secs(3), async move {
+            tokio::time::timeout(cats_test_support::poll_bound(), async move {
                 loop {
                     let operation_id = operation_id.clone();
                     if let Some(lease) = second
@@ -1287,7 +1298,7 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     second_started_rx.await.unwrap();
     let observer_dsn = direct_dsn.clone();
     let both_queries_started = tokio::time::timeout(
-        Duration::from_secs(8),
+        cats_test_support::poll_bound() + Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
             let bounded_observer_dsn = DsnSource::Literal(observer_dsn).resolve().unwrap();
             let mut observer = bounded_observer_dsn
@@ -1295,7 +1306,7 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
                 .unwrap()
                 .connect(postgres::NoTls)
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             loop {
                 let row = observer
                     .query_one(
@@ -1354,7 +1365,7 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     proxy.recover();
 
     let recover = |store: Arc<Store>| async move {
-        tokio::time::timeout(Duration::from_secs(8), async move {
+        tokio::time::timeout(cats_test_support::poll_bound(), async move {
             loop {
                 match store.execute(|store| store.list_all_cats()).await {
                     Ok(cats) => return cats,
@@ -1459,7 +1470,7 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     })
     .await
     .unwrap();
-    let recovered_owner = tokio::time::timeout(Duration::from_secs(8), async move {
+    let recovered_owner = tokio::time::timeout(cats_test_support::poll_bound(), async move {
         let mut session = recovered_owner;
         loop {
             let (returned, acquired) = execute_leadership(move || {
@@ -1492,7 +1503,7 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     .await
     .unwrap();
     assert!(!acquired, "only one recovered replica may own leadership");
-    let recovered_oci = tokio::time::timeout(Duration::from_secs(8), async {
+    let recovered_oci = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             if let Some(lease) = second
                 .execute(|store| store.try_oci_deployment_lease("fault-proxy-oci"))
@@ -1595,7 +1606,7 @@ async fn managed_usage_projector_shutdown_joins_before_standby_takeover() {
                 )
             }
         });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while starts.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1623,7 +1634,7 @@ async fn managed_usage_projector_shutdown_joins_before_standby_takeover() {
     assert_eq!(starts.load(Ordering::SeqCst), 1, "the standby is fenced");
 
     leader.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while starts.load(Ordering::SeqCst) != 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1680,7 +1691,7 @@ async fn faulted_singleton_session_stops_the_old_role_before_standby_starts() {
                 )
             }
         });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while starts.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1727,7 +1738,7 @@ async fn faulted_singleton_session_stops_the_old_role_before_standby_starts() {
     assert_eq!(starts.load(Ordering::SeqCst), 1, "the standby is waiting");
 
     proxy.sever_and_reject();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let events = events.lock().unwrap().clone();
             if events.iter().any(|event| event == "leader:stop")
@@ -1765,7 +1776,7 @@ async fn faulted_singleton_session_stops_the_old_role_before_standby_starts() {
     standby_task.abort();
     let _ = leader_task.await;
     let _ = standby_task.await;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while active.load(Ordering::SeqCst) != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

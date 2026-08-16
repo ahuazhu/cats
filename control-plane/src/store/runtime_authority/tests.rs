@@ -4466,7 +4466,7 @@ fn evidence_share_locks_hold_credential_rotation_until_snapshot_commit() {
         VolumeTransitionEvidenceLoad::Available(_)
     ));
     rotation_finished_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("rotation finishes after evidence commit")
         .unwrap();
     rotation_worker.join().unwrap();
@@ -4847,7 +4847,7 @@ fn desired_move_winning_the_pg_barrier_rejects_takeover_with_zero_writes() {
     mover_worker.join().unwrap().unwrap();
 
     let outcome = consume_done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("takeover did not resume after the Desired move")
         .unwrap();
     assert!(matches!(
@@ -4927,12 +4927,12 @@ fn takeover_winning_the_pg_barrier_serializes_before_desired_move() {
 
     finish_consume_tx.send(()).unwrap();
     let outcome = consume_done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("takeover did not resume after the HostFence barrier")
         .unwrap();
     assert!(matches!(outcome, VolumeTransitionStoreOutcome::Accepted(_)));
     move_done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("Desired move did not resume after takeover commit")
         .unwrap();
     consumer_worker.join().unwrap();
@@ -5114,7 +5114,7 @@ fn wrong_node_rejects_before_corrupt_foreign_authority_locks_or_decode() {
         finished_tx.send(result).unwrap();
     });
     let outcome = finished_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("wrong-Node routing touched the locked foreign authority graph")
         .unwrap();
     assert_eq!(
@@ -5761,7 +5761,7 @@ fn evidence_repeatable_read_never_mixes_takeover_before_and_after_images() {
     ));
     assert_eq!(before.current_volume, Some(owned));
     consume_finished_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("takeover finishes after evidence snapshot commits")
         .unwrap();
     consume_worker.join().unwrap();

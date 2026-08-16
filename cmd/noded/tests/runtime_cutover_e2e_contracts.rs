@@ -1890,10 +1890,8 @@ fi
     let child_a = run(&result_a, &gate_a, "runner-a");
     let child_b = run(&result_b, &gate_b, "runner-b");
     fs::write(&gate_a, b"go\n").expect("release runner A");
-    for _ in 0..500 {
-        if result_a.exists() {
-            break;
-        }
+    let barrier_a_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
+    while !result_a.exists() && std::time::Instant::now() < barrier_a_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(result_a.exists(), "runner A did not reach the barrier");
@@ -1901,10 +1899,8 @@ fi
     fs::rename(&checked, &held_a).expect("move checked inode A aside");
     fs::rename(&alternate, &checked).expect("install checked inode B");
     fs::write(&gate_b, b"go\n").expect("release runner B");
-    for _ in 0..500 {
-        if result_b.exists() {
-            break;
-        }
+    let barrier_b_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
+    while !result_b.exists() && std::time::Instant::now() < barrier_b_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(result_b.exists(), "runner B did not reach the barrier");

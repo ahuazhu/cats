@@ -1309,7 +1309,7 @@ mod tests {
         // SAFETY: `pid` names the live child created above and SIGINT carries
         // no pointer or process-local memory contract.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "stdout SIGINT child failed: {status}");

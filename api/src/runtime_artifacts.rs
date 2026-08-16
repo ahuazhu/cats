@@ -2446,6 +2446,26 @@ fn filesystem_error(path: &Path) -> RuntimeArtifactError {
 mod tests {
     use super::*;
 
+    /// Private mirror of the canonical `cats_test_support::wait::poll_bound`.
+    ///
+    /// `cats-test-support` depends on `cats-api`, so this crate cannot take
+    /// it as a dev-dependency without a cycle. Keep the contract in sync
+    /// with `tests/support/src/wait.rs`: a pure polling upper bound is not a
+    /// performance assertion, so it defaults absurdly wide and is only
+    /// overridden through `CATS_TEST_POLL_BOUND_SECS` (parse failure panics).
+    fn poll_bound() -> std::time::Duration {
+        use std::time::Duration;
+        const ENV: &str = "CATS_TEST_POLL_BOUND_SECS";
+        match std::env::var(ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => Duration::from_secs(secs),
+                _ => panic!("{ENV} must be a positive whole number of seconds, got {raw:?}"),
+            },
+            Err(std::env::VarError::NotPresent) => Duration::from_secs(180),
+            Err(err) => panic!("{ENV} is not readable: {err}"),
+        }
+    }
+
     const RECEIPT: &[u8] = br#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
     const MANIFEST: &[u8] = br#"{"guest_runtime_profile":{"path":"guest-runtime-profile.v1.json","sha256":"sha256:dae6f9b08706e17d03cbeece8141fef960185fe0758f80f999f9f2218d43e10a","size_bytes":301},"initramfs":{"path":"guest/initramfs.img","sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size_bytes":8388608},"kernel":{"path":"guest/vmlinuz","sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size_bytes":16777216},"version":1}"#;
     const ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
@@ -2753,11 +2773,10 @@ mod tests {
     ) {
         use std::os::unix::fs::OpenOptionsExt as _;
         use std::sync::mpsc;
-        use std::time::Duration;
 
         let (sender, receiver) = mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || sender.send(read()).unwrap());
-        let outcome = match receiver.recv_timeout(Duration::from_secs(2)) {
+        let outcome = match receiver.recv_timeout(poll_bound()) {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Cleanup for the pre-fix failure mode: pair with a reader
@@ -2769,7 +2788,7 @@ mod tests {
                     .open(fifo_path)
                     .expect("the timed-out FIFO reader must be waiting in open");
                 let outcome = receiver
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(poll_bound())
                     .expect("the FIFO reader must settle after cleanup");
                 drop(writer);
                 reader.join().unwrap();

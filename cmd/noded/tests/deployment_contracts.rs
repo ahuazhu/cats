@@ -1084,20 +1084,12 @@ impl Drop for DeploymentChild {
 fn wait_for_file(path: &Path, purpose: &str) {
     // Pure poll upper bound: a saturated gate host schedules the spawned
     // deployment shells far more slowly than an idle one.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {purpose}: {}",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    cats_test_support::wait_until(&format!("{purpose}: {}", path.display()), || path.exists());
 }
 
 #[cfg(target_os = "linux")]
 fn wait_for_success(child: &mut std::process::Child, purpose: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         if let Some(status) = child.try_wait().expect("poll deployment child") {
             assert!(status.success(), "{purpose} failed with {status}");
@@ -1714,7 +1706,7 @@ fi
             "commit must reject a replacement MainPID/start identity"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             if masked.exists()
                 && !active.exists()
@@ -2009,7 +2001,7 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     }
 
     fn wait_until_process_table_has(expected: &[(u32, &Path)]) -> std::result::Result<(), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             let output = std::process::Command::new("ps")
                 .args(["-A", "-o", "pid=", "-o", "args="])
@@ -2382,7 +2374,7 @@ systemctl stop cats-worker
     std::fs::write(&release_a, "release").unwrap();
     wait_for_file(&b_done, "deployment B to reject the locked idle recheck");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     let b_status = loop {
         if let Some(status) = deployment_b.try_wait().unwrap() {
             break status;

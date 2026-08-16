@@ -2214,7 +2214,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while control.observations.load(Ordering::SeqCst) == 0 {
             if Instant::now() >= deadline {
                 panic!(
@@ -2299,7 +2299,7 @@ mod tests {
         .unwrap();
         let checkpoint_path =
             runtime_checkpoint_path(&state_path.join("checkpoints"), &desired.cat_id);
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         let checkpoint_bytes = loop {
             if let Ok(bytes) = std::fs::read(&checkpoint_path) {
                 if matches!(
@@ -2359,7 +2359,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while control.observations.load(Ordering::SeqCst) == observations_before_restart {
             assert!(
                 Instant::now() < deadline,
@@ -2405,14 +2405,14 @@ mod tests {
             anyhow::Ok(())
         });
 
-        tokio::time::timeout(Duration::from_secs(1), reached.recv())
+        tokio::time::timeout(cats_test_support::poll_bound(), reached.recv())
             .await
             .expect("observation barrier was not reached")
             .expect("observation barrier sender dropped before reaching the test");
         assert!(!effect_dispatched.load(Ordering::Acquire));
         assert!(!waiter.is_finished());
         resume.send(()).expect("release observation barrier waiter");
-        tokio::time::timeout(Duration::from_secs(1), waiter)
+        tokio::time::timeout(cats_test_support::poll_bound(), waiter)
             .await
             .expect("released observation barrier waiter did not join")
             .expect("join released observation barrier waiter")
@@ -2421,12 +2421,12 @@ mod tests {
 
         let (mut barrier, mut reached, resume) = RuntimeObservationBarrierForTest::channel();
         let waiter = tokio::spawn(async move { barrier.wait_after_observation().await });
-        tokio::time::timeout(Duration::from_secs(1), reached.recv())
+        tokio::time::timeout(cats_test_support::poll_bound(), reached.recv())
             .await
             .expect("cancellation barrier was not reached")
             .expect("cancellation barrier sender dropped before reaching the test");
         waiter.abort();
-        let cancellation = tokio::time::timeout(Duration::from_secs(1), waiter)
+        let cancellation = tokio::time::timeout(cats_test_support::poll_bound(), waiter)
             .await
             .expect("cancelled observation barrier waiter did not join")
             .expect_err("cancelled observation barrier waiter unexpectedly succeeded");
@@ -2606,7 +2606,7 @@ mod tests {
         .unwrap();
 
         handle.request_runner_shutdown();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while owner.shutdowns.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }

@@ -1966,7 +1966,7 @@ mod tests {
             if let Some(entered) = self.entered.take() {
                 let _ = entered.send(tokio::runtime::Handle::try_current().is_err());
             }
-            let _ = self.release.recv_timeout(Duration::from_secs(2));
+            let _ = self.release.recv_timeout(cats_test_support::poll_bound());
             drop(self.permit.take());
         }
     }
@@ -1986,10 +1986,12 @@ mod tests {
     async fn synchronous_guard_owner_is_destroyed_off_the_async_runtime() {
         let (dropped, observed) = tokio::sync::oneshot::channel();
         drop(OffRuntimeOwned::new(RuntimeSensitiveDrop(Some(dropped))));
-        assert!(tokio::time::timeout(Duration::from_secs(2), observed)
-            .await
-            .expect("off-runtime destructor did not run")
-            .expect("off-runtime destructor lost its observation"));
+        assert!(
+            tokio::time::timeout(cats_test_support::poll_bound(), observed)
+                .await
+                .expect("off-runtime destructor did not run")
+                .expect("off-runtime destructor lost its observation")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2006,22 +2008,25 @@ mod tests {
             entered: Some(entered),
             release: released,
         }));
-        assert!(tokio::time::timeout(Duration::from_secs(2), observed)
-            .await
-            .expect("off-runtime destructor did not start")
-            .expect("off-runtime destructor lost its observation"));
+        assert!(
+            tokio::time::timeout(cats_test_support::poll_bound(), observed)
+                .await
+                .expect("off-runtime destructor did not start")
+                .expect("off-runtime destructor lost its observation")
+        );
         assert!(capacity.clone().try_acquire_owned().is_err());
         tokio::time::timeout(
-            Duration::from_millis(100),
+            cats_test_support::poll_bound(),
             tokio::time::sleep(Duration::from_millis(1)),
         )
         .await
         .expect("blocking session destructor stopped the Tokio heartbeat");
         release.send(()).expect("release blocking destructor");
-        let _permit = tokio::time::timeout(Duration::from_secs(2), capacity.acquire_owned())
-            .await
-            .expect("off-runtime destructor did not release capacity")
-            .expect("fixture semaphore remained open");
+        let _permit =
+            tokio::time::timeout(cats_test_support::poll_bound(), capacity.acquire_owned())
+                .await
+                .expect("off-runtime destructor did not release capacity")
+                .expect("fixture semaphore remained open");
     }
 
     #[test]

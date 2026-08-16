@@ -415,7 +415,7 @@ mod tests {
     }
 
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while !predicate() {
                 tokio::task::yield_now().await;
             }
@@ -447,7 +447,7 @@ mod tests {
         let overloaded = resolver.resolve(&digest).await.unwrap_err();
         assert_eq!(overloaded.code, cats_api::error::ErrorCode::Unavailable);
         tokio::time::timeout(
-            Duration::from_millis(100),
+            cats_test_support::poll_bound(),
             tokio::time::sleep(Duration::from_millis(10)),
         )
         .await
@@ -622,7 +622,7 @@ mod tests {
             read_resolver.resolve(&digest).await
         });
         tokio::time::timeout(
-            Duration::from_secs(1),
+            cats_test_support::poll_bound(),
             blob.entered_provider_read.notified(),
         )
         .await

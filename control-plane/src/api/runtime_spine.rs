@@ -724,7 +724,9 @@ mod tests {
     }
 
     async fn promptly(request: reqwest::RequestBuilder) -> reqwest::Response {
-        tokio::time::timeout(Duration::from_secs(2), request.send())
+        // The armed response-loss injection is the correctness oracle for
+        // entering COMMIT; this bound only rejects a hang.
+        tokio::time::timeout(cats_test_support::poll_bound(), request.send())
             .await
             .expect("a definite rejection entered the commit/deadline path")
             .unwrap()

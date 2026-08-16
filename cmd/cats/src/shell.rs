@@ -240,7 +240,9 @@ mod tests {
             started: started_tx,
             release: release_rx,
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         drop(input);
 
         let before = Instant::now();

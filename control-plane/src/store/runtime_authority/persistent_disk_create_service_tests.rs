@@ -455,7 +455,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
     });
 
     runtime.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let counts: (i64, i64, i64) = observer
                     .with(|client| {
@@ -494,7 +494,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
             !shutdown.is_finished(),
             "shutdown returned while the detached commit owner was unresolved"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(3), shutdown)
+        tokio::time::timeout(cats_test_support::poll_bound(), shutdown)
             .await
             .expect("commit resolution must converge")
             .unwrap()

@@ -636,13 +636,17 @@ async fn json_body(response: Response, expected_status: StatusCode) -> Vec<u8> {
 }
 
 async fn next_step(runner: &mut RuntimeSpineRunner) -> RuntimeSpineRunStep {
-    let deadlines =
-        RuntimeSpineDeadlinePolicy::new(Duration::from_secs(10), Duration::from_secs(10))
-            .unwrap()
-            .deadlines_from(Instant::now())
-            .unwrap();
+    let deadlines = RuntimeSpineDeadlinePolicy::new(
+        cats_test_support::poll_bound(),
+        cats_test_support::poll_bound(),
+    )
+    .unwrap()
+    .deadlines_from(Instant::now())
+    .unwrap();
+    // Strictly wider than the step deadlines so a stuck step settles inside
+    // the runner and reports precisely, instead of tripping this wrapper.
     tokio::time::timeout(
-        Duration::from_secs(15),
+        cats_test_support::poll_bound() + Duration::from_secs(10),
         runner.run_once_with_deadlines(deadlines),
     )
     .await
@@ -666,17 +670,20 @@ async fn route_v2_public_http_request(
         .await
         .unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
-        .await
-        .expect("public Gateway HTTP response exceeded its test deadline")
-        .unwrap();
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("public Gateway HTTP response exceeded its test deadline")
+    .unwrap();
     response
 }
 
 async fn route_v2_read_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt as _;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         let mut bytes = Vec::new();
         loop {
             let mut chunk = [0_u8; 1024];
@@ -1546,8 +1553,8 @@ fn production_cutover_config(
         blob_store,
         volume_lease_duration_ms: 60_000,
         deadline_policy: RuntimeSpineDeadlinePolicy::new(
-            Duration::from_secs(10),
-            Duration::from_secs(10),
+            cats_test_support::poll_bound(),
+            cats_test_support::poll_bound(),
         )
         .unwrap(),
         observation_barrier_for_test: Some(observation_barrier_for_test),
@@ -1561,7 +1568,7 @@ async fn wait_for_provision_root_checkpoint(
     handle: &super::SignedRuntimeCutoverHandle,
 ) -> (Vec<u8>, RuntimeCheckpoint) {
     let path = runtime_checkpoint_path(&state_path.join(PRODUCTION_CHECKPOINT_NAMESPACE), cat_id);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         if let Ok(bytes) = std::fs::read(&path) {
             let checkpoint = decode_runtime_checkpoint(&bytes).unwrap();
@@ -1755,7 +1762,7 @@ async fn wait_for_initial_empty_inventory(
     identity: &NodeIdentity,
     handle: &super::SignedRuntimeCutoverHandle,
 ) -> (AgentSession, AgentSession, Epoch) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         let fingerprint = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
             &context.server.state.store,
@@ -1849,7 +1856,7 @@ async fn wait_for_initial_empty_inventory(
 async fn wait_for_ready_health(handle: &super::SignedRuntimeCutoverHandle) {
     let client = reqwest::Client::new();
     let url = format!("http://{}/healthz", handle.addr);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         let response = client.get(&url).send().await.unwrap();
         if response.status() == StatusCode::OK {
@@ -1878,7 +1885,7 @@ async fn next_observation_barrier(
     handle: &super::SignedRuntimeCutoverHandle,
     phase: &'static str,
 ) {
-    match tokio::time::timeout(Duration::from_secs(30), reached.recv()).await {
+    match tokio::time::timeout(cats_test_support::poll_bound(), reached.recv()).await {
         Ok(Some(())) => {}
         Ok(None) => panic!(
             "production observation barrier closed unexpectedly during {phase}; runner_finished={}",
@@ -1905,7 +1912,7 @@ async fn next_local_contract_stop(
     // step logic, so a round that fails closed may first re-emit the exact
     // adoption event for this same Cat; skip that re-validation noise.
     let event = loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+        let event = tokio::time::timeout(cats_test_support::poll_bound(), steps.recv())
             .await
             .unwrap_or_else(|_| panic!("production effect did not settle during {phase}"))
             .unwrap_or_else(|| panic!("production effect-step observer closed during {phase}"));
@@ -1933,7 +1940,7 @@ async fn next_serving_adopted(
     cat_id: &Id,
     phase: &'static str,
 ) {
-    let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+    let event = tokio::time::timeout(cats_test_support::poll_bound(), steps.recv())
         .await
         .unwrap_or_else(|_| panic!("serving adoption did not settle during {phase}"))
         .unwrap_or_else(|| panic!("serving-adoption observer closed during {phase}"));
@@ -1952,7 +1959,7 @@ async fn next_refresh_inventory(
     cat_id: &Id,
     phase: &'static str,
 ) {
-    let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+    let event = tokio::time::timeout(cats_test_support::poll_bound(), steps.recv())
         .await
         .unwrap_or_else(|_| panic!("production effect did not settle during {phase}"))
         .unwrap_or_else(|| panic!("production effect-step observer closed during {phase}"));
@@ -2081,10 +2088,10 @@ fn blockd_control_command(control_socket: &HostPath, command: BlockdControlComma
     let mut stream = std::os::unix::net::UnixStream::connect(control_socket.as_str())
         .expect("connect exact serving blockd control socket");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(cats_test_support::poll_bound()))
         .unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
+        .set_write_timeout(Some(cats_test_support::poll_bound()))
         .unwrap();
     writeln!(stream, "{}", command.as_wire()).unwrap();
     let mut response = String::new();
@@ -2767,11 +2774,13 @@ async fn next_installed_process_scan(
     let coordinates = cursor.next();
     let scan = RuntimeInventoryScanContext::for_test(
         coordinates.clone(),
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + cats_test_support::poll_bound(),
     );
     let scanner = Arc::clone(scanner);
+    // Strictly wider than the scan-context deadline so a stuck scan settles
+    // as an Incomplete outcome instead of tripping this wrapper.
     let outcome = tokio::time::timeout(
-        Duration::from_secs(15),
+        cats_test_support::poll_bound() + Duration::from_secs(10),
         tokio::task::spawn_blocking(move || scanner.scan_complete(scan)),
     )
     .await
@@ -2796,7 +2805,7 @@ async fn wait_for_installed_serving_process_state(
     volume_id: &Id,
     expect_live: bool,
 ) -> (NodeObservation, NodeGlobalManagedProcessAdmission) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         if let Some((observation, admission)) = next_installed_process_scan(scanner, cursor).await {
             let matching = admission
@@ -4026,7 +4035,7 @@ async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_
         cats_blockd::test_vhost_user_frontend::STATUS_OK
     );
     assert_eq!(read_back.data, payload);
-    let dirty_deadline = Instant::now() + Duration::from_secs(15);
+    let dirty_deadline = Instant::now() + cats_test_support::poll_bound();
     let dirty_status = loop {
         let status = serving_status(&prepared.serving_process.control_socket_path);
         if status.local_durable_generation > status.remote_durable_generation
@@ -4259,7 +4268,7 @@ async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_
     // accepted observation and produces a clean successor full inventory,
     // still at the same process/checkpoint/attachment epoch.
     aws.set_publishes_enabled(true);
-    let publish_deadline = Instant::now() + Duration::from_secs(30);
+    let publish_deadline = Instant::now() + cats_test_support::poll_bound();
     let drained = loop {
         let status = serving_status(&prepared.serving_process.control_socket_path);
         if status.remote_durable_generation == status.local_durable_generation
@@ -4470,11 +4479,12 @@ async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_
     adopting_resume
         .send(())
         .expect("resume stale Agent3 after signed session replacement");
-    let stale_error = tokio::time::timeout(Duration::from_secs(30), &mut adopting.runner_task)
-        .await
-        .expect("stale Agent3 did not terminate after session replacement")
-        .expect("join stale Agent3 production runner")
-        .expect_err("stale Agent3 unexpectedly continued into a Desired effect");
+    let stale_error =
+        tokio::time::timeout(cats_test_support::poll_bound(), &mut adopting.runner_task)
+            .await
+            .expect("stale Agent3 did not terminate after session replacement")
+            .expect("join stale Agent3 production runner")
+            .expect_err("stale Agent3 unexpectedly continued into a Desired effect");
     assert!(
         format!("{stale_error:#}").contains("signed Runtime session was rejected"),
         "unexpected stale-session runner result: {stale_error:#}"
@@ -4868,7 +4878,7 @@ async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_st
         RuntimeNodeAuthorityOutcome::Provisioned
     );
     let session = tokio::time::timeout(
-        Duration::from_secs(10),
+        cats_test_support::poll_bound(),
         registration.register_until_session(&context.server.base_url()),
     )
     .await
@@ -5091,7 +5101,7 @@ async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_st
     );
     websocket.close(None).await.unwrap();
     drop(websocket);
-    let guard_deadline = Instant::now() + Duration::from_secs(3);
+    let guard_deadline = Instant::now() + cats_test_support::poll_bound();
     while admission_cell.active_guards(&endpoint.endpoint_id) != Some(0) {
         assert!(
             Instant::now() < guard_deadline,
@@ -5206,7 +5216,7 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
     );
 
     let session = tokio::time::timeout(
-        Duration::from_secs(10),
+        cats_test_support::poll_bound(),
         registration.register_until_session(&context.server.base_url()),
     )
     .await

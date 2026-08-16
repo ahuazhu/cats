@@ -387,11 +387,11 @@ fn begin_holds_host_barrier_before_waiting_for_source_identity() {
 
     identity_barrier.batch_execute("COMMIT").unwrap();
     begin_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap()
         .unwrap();
     let probe_error = probe_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap()
         .unwrap_err();
     assert_eq!(probe_error.code, ErrorCode::Conflict);

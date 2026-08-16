@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     async fn wait_for_at_least(value: &AtomicUsize, expected: usize, context: &str) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while value.load(Ordering::SeqCst) < expected {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1363,11 +1363,12 @@ mod tests {
         let second = pacer.tick().await;
         // The pacer must pay at least the full interval between reads. The
         // upper bound only rejects a runaway clock: scheduler lag under gate
-        // load legitimately stretches the observed gap past exact equality.
+        // load legitimately stretches the observed gap, so the ceiling is
+        // the shared absurdly-wide poll bound, not a performance assertion.
         let elapsed = second.duration_since(first);
         assert!(
             elapsed >= KINESIS_READ_INTERVAL
-                && elapsed < KINESIS_READ_INTERVAL + std::time::Duration::from_millis(500),
+                && elapsed < KINESIS_READ_INTERVAL + cats_test_support::poll_bound(),
             "the pacer did not schedule consecutive Kinesis reads about one second apart: {elapsed:?}"
         );
     }

@@ -3876,7 +3876,7 @@ mod tests {
 
         drop(effect_guard);
         result_receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("launcher did not acquire the shared guard after submit released EX")
             .unwrap();
         launcher.join().unwrap().unwrap();

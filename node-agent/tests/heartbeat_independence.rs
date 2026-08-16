@@ -488,7 +488,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn wait_for_exact_children_reaped(pids: WorkProducerPids) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     while process_exists(pids.guest) || process_exists(pids.blockd) {
         assert!(
             Instant::now() < deadline,
