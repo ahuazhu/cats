@@ -26,6 +26,24 @@ class TransportError(Exception):
     """The archive is not the one image named by the release manifest."""
 
 
+def canonical_image_name(reference: str) -> str:
+    """Return the fully qualified name BuildKit records for a tag reference.
+
+    BuildKit writes the normalized name into `io.containerd.image.name`, so a
+    short reference like `cats/control-plane:tag` is stored as
+    `docker.io/cats/control-plane:tag`. Applying the same registry-inference
+    rules here compares references rather than spellings.
+    """
+    head, separator, rest = reference.partition("/")
+    if separator and (
+        "." in head or ":" in head or head == "localhost" or head.endswith(".localhost")
+    ):
+        return reference
+    if not separator:
+        return f"docker.io/library/{reference}"
+    return f"docker.io/{reference}"
+
+
 def require_digest(value: Any, label: str) -> str:
     if not isinstance(value, str) or SHA256.fullmatch(value) is None:
         raise TransportError(f"{label} is not a canonical SHA-256 digest")
@@ -163,7 +181,9 @@ def verify(arguments: argparse.Namespace) -> None:
         if require_digest(image_descriptor.get("digest"), "OCI image digest") != expected_image:
             raise TransportError("OCI image digest differs from release manifest")
         annotations = image_descriptor.get("annotations")
-        if not isinstance(annotations, dict) or annotations.get("io.containerd.image.name") != arguments.reference:
+        if not isinstance(annotations, dict) or annotations.get(
+            "io.containerd.image.name"
+        ) != canonical_image_name(arguments.reference):
             raise TransportError("OCI image name differs from release manifest reference")
         platform = image_descriptor.get("platform")
         if platform is not None and (

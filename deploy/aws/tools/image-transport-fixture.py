@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -21,11 +22,46 @@ def run(command: list[str], *, succeeds: bool) -> subprocess.CompletedProcess[by
     return result
 
 
+def check_reference_rules(verifier: Path) -> None:
+    """Check the registry-inference rules without building an image.
+
+    BuildKit records the normalized name in `io.containerd.image.name`. The
+    end-to-end fixture below used only a reference whose first component looks
+    like a host, which is left untouched, so the short-reference rules stayed
+    unexercised until a real release build failed on them.
+    """
+    specification = importlib.util.spec_from_file_location(
+        "cats_verify_image_transport", verifier
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    expected = {
+        "cats/control-plane:cutover": "docker.io/cats/control-plane:cutover",
+        "debian:bookworm-slim": "docker.io/library/debian:bookworm-slim",
+        "cats.invalid/fixture/control-plane:exact": "cats.invalid/fixture/control-plane:exact",
+        "public.ecr.aws/docker/library/rust:1.97": "public.ecr.aws/docker/library/rust:1.97",
+        "localhost/probe:tag": "localhost/probe:tag",
+        "127.0.0.1:5000/probe:tag": "127.0.0.1:5000/probe:tag",
+    }
+    for reference, canonical in expected.items():
+        observed = module.canonical_image_name(reference)
+        assert observed == canonical, f"{reference!r} -> {observed!r} != {canonical!r}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier", required=True, type=Path)
+    parser.add_argument(
+        "--reference-rules-only",
+        action="store_true",
+        help="check the registry-inference rules only; requires no container runtime",
+    )
     arguments = parser.parse_args()
     verifier = arguments.verifier.resolve()
+    check_reference_rules(verifier)
+    if arguments.reference_rules_only:
+        print("image transport reference rules: PASS")
+        return 0
     with tempfile.TemporaryDirectory(prefix="cats-image-transport-") as temporary:
         root = Path(temporary)
         archive = root / "image.tar"

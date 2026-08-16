@@ -45,10 +45,30 @@ def workspace_metadata(root: Path) -> tuple[set[str], set[str]]:
     return packages, binaries
 
 
+def check_image_reference_rules(root: Path) -> list[str]:
+    """Run the transport verifier's registry-inference rules."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(root / "deploy/aws/tools/image-transport-fixture.py"),
+            "--verifier",
+            str(root / "deploy/aws/tools/verify-image-transport.py"),
+            "--reference-rules-only",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return [f"image transport reference rules: {result.stderr.strip()}"]
+    return []
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     packages, binaries = workspace_metadata(root)
-    failures: list[str] = []
+    failures: list[str] = check_image_reference_rules(root)
 
     for relative in DOCKERFILES:
         path = root / relative
