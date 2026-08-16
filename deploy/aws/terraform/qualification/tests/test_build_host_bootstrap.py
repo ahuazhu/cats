@@ -172,6 +172,11 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("/usr/bin/env -i", helper)
         self.assertIn("job_cgroup_drained:true", helper)
         self.assertIn("output_frozen:true", helper)
+        # rustup-init dispatches on argv[0]; saving the installer under the
+        # lock's underscore key made every prepare fail with "unknown proxy
+        # name", so the helper must download and execute the hyphenated name.
+        self.assertIn('"${work_dir}/rustup-init" -y', helper)
+        self.assertNotIn("${work_dir}/rustup_init", helper)
 
         snapshot_verifier = self.text("tools/verify_apt_snapshot.py")
         self.assertIn("manual-release-toolchain-lock-v1.json", snapshot_verifier)

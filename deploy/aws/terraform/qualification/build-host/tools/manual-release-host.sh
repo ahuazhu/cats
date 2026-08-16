@@ -293,20 +293,23 @@ prepare_host() {
     return
   fi
   verify_base_host
-  local work_dir stage_root prepared_receipt
+  # The EXIT trap runs outside this function's scope under errexit, so these
+  # cleanup paths must not be function locals.
   work_dir="$(mktemp -d /var/tmp/cats-manual-release-prepare.XXXXXX)"
   stage_root="/opt/cats-manual-release/.${manual_lock_sha256}.incomplete.$$"
   prepared_receipt=""
   cleanup_prepare() {
-    rm -rf -- "${work_dir}" "${stage_root}"
-    [[ -z ${prepared_receipt} || ! -e ${prepared_receipt} ]] || rm -f -- "${prepared_receipt}"
+    rm -rf -- "${work_dir:-/nonexistent}" "${stage_root:-/nonexistent}"
+    [[ -z ${prepared_receipt:-} || ! -e ${prepared_receipt:-} ]] || rm -f -- "${prepared_receipt}"
   }
   trap cleanup_prepare EXIT
   chmod 0700 "${work_dir}"
 
   local name destination url expected_sha actual_sha
   for name in buildx rustup_init; do
-    destination="${work_dir}/${name}"
+    # rustup-init dispatches on argv[0]; an underscore basename is rejected as
+    # an unknown proxy name, so downloads keep the canonical hyphenated names.
+    destination="${work_dir}/${name//_/-}"
     url="$(jq -er --arg name "${name}" '.downloads[$name].url' "${lock_file}")"
     expected_sha="$(jq -er --arg name "${name}" '.downloads[$name].sha256' "${lock_file}")"
     curl --fail --location --proto '=https' --tlsv1.2 --output "${destination}" "${url}"
@@ -338,7 +341,7 @@ prepare_host() {
       CARGO_HOME="${stage_root}/cargo" \
       RUSTUP_HOME="${stage_root}/rustup" \
       RUSTUP_INIT_SKIP_PATH_CHECK=yes \
-      "${work_dir}/rustup_init" -y --no-modify-path --profile minimal --default-toolchain none
+      "${work_dir}/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
     env CARGO_HOME="${stage_root}/cargo" RUSTUP_HOME="${stage_root}/rustup" \
       "${stage_root}/cargo/bin/rustup" toolchain install "${rust_toolchain}" \
       --profile minimal --target "${rust_target}"
