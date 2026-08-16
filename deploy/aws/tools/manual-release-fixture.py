@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -14,66 +15,36 @@ import tarfile
 import tempfile
 
 
-WORKER_FILES = {
-    "cats",
-    "cats-noded",
-    "cats-route-v2-node-r1-validator",
-    "cats-vmm-launcher",
-    "cats-runtime-e3-probe",
-    "cats-usage-schema-v16-verifier",
-    "cats-usage-terminal-receipt-verifier",
-    "cats-blockd",
-    "cats-guest-agent",
-    "cats-e3-guest-workload",
-    "update-guest-seed.sh",
-    "require-idle-worker.sh",
-    "old-host-positive-stop.py",
-    "render-postgres-url.sh",
-    "install-guest-runtime-release.sh",
-    "validate-node-identity-installation.sh",
-    "install-route-v2-node-r1.sh",
-    "worker-deployment-transaction.sh",
-    "guest-systemd/cats-grow-root.service",
-    "guest-systemd/cats-guest-agent.service",
-    "guest-systemd/cats-mount-propagation.service",
-    "guest-systemd/cats-network.service",
-    "cats-worker.service",
-    "cats-postgres-url.service",
-    "cats-postgres-url.timer",
-    "guest-runtime-release.v1/manifest.v1.json",
-    "guest-runtime-release.v1/guest-runtime-profile.v1.json",
-    "guest-runtime-release.v1/guest/vmlinuz",
-    "guest-runtime-release.v1/guest/initramfs.img",
-}
-WORKER_EXECUTABLE_FILES = {
-    "cats",
-    "cats-noded",
-    "cats-route-v2-node-r1-validator",
-    "cats-vmm-launcher",
-    "cats-runtime-e3-probe",
-    "cats-usage-schema-v16-verifier",
-    "cats-usage-terminal-receipt-verifier",
-    "cats-blockd",
-    "cats-guest-agent",
-    "cats-e3-guest-workload",
-    "update-guest-seed.sh",
-    "require-idle-worker.sh",
-    "old-host-positive-stop.py",
-    "render-postgres-url.sh",
-    "install-guest-runtime-release.sh",
-    "validate-node-identity-installation.sh",
-    "install-route-v2-node-r1.sh",
-    "worker-deployment-transaction.sh",
-}
-WORKER_BINARY_MEMBER_FILES = {
-    relative for relative in WORKER_EXECUTABLE_FILES if relative.startswith("cats")
-}
-WORKER_DIRECTORIES = {
-    ".",
-    "guest-systemd",
-    "guest-runtime-release.v1",
-    "guest-runtime-release.v1/guest",
-}
+def load_worker_contract(verifier: Path) -> dict[str, set[str]]:
+    """Load the frozen worker sets from the verifier under test.
+
+    Keeping a second copy here meant a new bundle member had to be added in
+    two places, and a miss only surfaced during a real release build. The
+    fixture exercises the verifier's checking logic, not its constants, so it
+    reads them from the module it is testing.
+    """
+    specification = importlib.util.spec_from_file_location(
+        "cats_verify_manual_release", verifier
+    )
+    module = importlib.util.module_from_spec(specification)
+    sys.path.insert(0, str(verifier.parent))
+    try:
+        specification.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(verifier.parent))
+    return {
+        "files": set(module.WORKER_STATIC_FILES)
+        | {"guest-runtime-release.v1/guest/initramfs.img"},
+        "executables": set(module.WORKER_EXECUTABLE_FILES),
+        "binaries": set(module.WORKER_BINARY_MEMBER_FILES),
+        "directories": set(module.WORKER_DIRECTORIES),
+    }
+
+
+WORKER_FILES: set[str] = set()
+WORKER_EXECUTABLE_FILES: set[str] = set()
+WORKER_BINARY_MEMBER_FILES: set[str] = set()
+WORKER_DIRECTORIES: set[str] = set()
 
 
 def canonical(value: object) -> bytes:
@@ -277,6 +248,13 @@ def main() -> int:
         print("usage: manual-release-fixture.py --verifier PATH", file=sys.stderr)
         return 2
     verifier = Path(sys.argv[2]).resolve()
+    contract = load_worker_contract(verifier)
+    global WORKER_FILES, WORKER_EXECUTABLE_FILES, WORKER_BINARY_MEMBER_FILES
+    global WORKER_DIRECTORIES
+    WORKER_FILES = contract["files"]
+    WORKER_EXECUTABLE_FILES = contract["executables"]
+    WORKER_BINARY_MEMBER_FILES = contract["binaries"]
+    WORKER_DIRECTORIES = contract["directories"]
     with tempfile.TemporaryDirectory(prefix="cats-release-fixture-") as temporary:
         root = Path(temporary)
         members = prepare_workspace(root)

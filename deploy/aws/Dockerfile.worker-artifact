@@ -58,16 +58,17 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
     && install -D -m 0755 target/release/cats-guest-agent /out/cats-guest-agent \
     && install -D -m 0755 target/release/cats-e3-guest-workload /out/cats-e3-guest-workload
 
-COPY deploy/metal/setup-guest-network.sh /out/setup-guest-network.sh
-COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
-COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
+COPY --chmod=0755 deploy/metal/setup-guest-network.sh /out/setup-guest-network.sh
+COPY --chmod=0755 deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh
+COPY --chmod=0755 deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh
 COPY --chmod=0755 deploy/aws/old-host-positive-stop.py /out/old-host-positive-stop.py
-COPY deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
+COPY --chmod=0755 deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
 COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh
 COPY --chmod=0755 deploy/aws/metal/validate-node-identity-installation.sh /out/validate-node-identity-installation.sh
 COPY --chmod=0755 deploy/aws/metal/install-route-v2-node-r1.sh /out/install-route-v2-node-r1.sh
 COPY --chmod=0755 deploy/aws/metal/worker-deployment-transaction.sh /out/worker-deployment-transaction.sh
 COPY deploy/metal/guest-systemd /out/guest-systemd
+RUN chmod 0755 /out/guest-systemd && chmod 0644 /out/guest-systemd/*
 
 FROM scratch AS artifact
 
@@ -81,19 +82,19 @@ COPY --from=builder /out/cats-usage-terminal-receipt-verifier /cats-usage-termin
 COPY --from=builder /out/cats-blockd /cats-blockd
 COPY --from=builder /out/cats-guest-agent /cats-guest-agent
 COPY --from=builder /out/cats-e3-guest-workload /cats-e3-guest-workload
-COPY --from=builder /out/setup-guest-network.sh /setup-guest-network.sh
-COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh
-COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh
+COPY --from=builder --chmod=0755 /out/setup-guest-network.sh /setup-guest-network.sh
+COPY --from=builder --chmod=0755 /out/update-guest-seed.sh /update-guest-seed.sh
+COPY --from=builder --chmod=0755 /out/require-idle-worker.sh /require-idle-worker.sh
 COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py
-COPY --from=builder /out/render-postgres-url.sh /render-postgres-url.sh
+COPY --from=builder --chmod=0755 /out/render-postgres-url.sh /render-postgres-url.sh
 COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh
 COPY --from=builder --chmod=0755 /out/validate-node-identity-installation.sh /validate-node-identity-installation.sh
 COPY --from=builder --chmod=0755 /out/install-route-v2-node-r1.sh /install-route-v2-node-r1.sh
 COPY --from=builder --chmod=0755 /out/worker-deployment-transaction.sh /worker-deployment-transaction.sh
 COPY --from=builder /out/guest-systemd /guest-systemd
-COPY deploy/aws/metal/cats-worker.service /cats-worker.service
-COPY deploy/aws/metal/cats-postgres-url.service /cats-postgres-url.service
-COPY deploy/aws/metal/cats-postgres-url.timer /cats-postgres-url.timer
+COPY --chmod=0644 deploy/aws/metal/cats-worker.service /cats-worker.service
+COPY --chmod=0644 deploy/aws/metal/cats-postgres-url.service /cats-postgres-url.service
+COPY --chmod=0644 deploy/aws/metal/cats-postgres-url.timer /cats-postgres-url.timer
 # The same immutable payload directory consumed by Dockerfile.control-plane.
 # No worker-local kernel/receipt generator is permitted in this build.
 COPY guest-runtime-release.v1 /guest-runtime-release.v1

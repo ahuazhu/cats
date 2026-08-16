@@ -3930,8 +3930,9 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     // install it, or a bundle-deployed worker can never start its unit.
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("ExecStartPre=/opt/cats/bin/setup-guest-network"));
-    assert!(worker_image
-        .contains("COPY --from=builder /out/setup-guest-network.sh /setup-guest-network.sh"));
+    assert!(worker_image.contains(
+        "COPY --from=builder --chmod=0755 /out/setup-guest-network.sh /setup-guest-network.sh"
+    ));
     let worker_module =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     assert!(worker_module.contains(
