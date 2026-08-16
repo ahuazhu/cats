@@ -614,11 +614,11 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     }
     for required in [
         "COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher",
-        "COPY deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
-        "COPY deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
+        "COPY --chmod=0755 deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
+        "COPY --chmod=0755 deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
         "COPY deploy/metal/guest-systemd /out/guest-systemd",
-        "COPY --from=builder /out/update-guest-seed.sh /update-guest-seed.sh",
-        "COPY --from=builder /out/require-idle-worker.sh /require-idle-worker.sh",
+        "COPY --from=builder --chmod=0755 /out/update-guest-seed.sh /update-guest-seed.sh",
+        "COPY --from=builder --chmod=0755 /out/require-idle-worker.sh /require-idle-worker.sh",
         "COPY --from=builder /out/guest-systemd /guest-systemd",
     ] {
         assert!(
